@@ -37,9 +37,17 @@ PROCESSED_DIR = BASE_DIR / "processed"
 CONFIG_DIR = BASE_DIR / "config"
 AUDIO_DIR = BASE_DIR / "audio"
 TASKS_FILE = BASE_DIR / "tasks.json"
+TASK_OUTPUTS_DIR = BASE_DIR / "task-outputs"
+
+# Scheduled Tasks Directories
+SCHEDULED_TASKS_DIR = Path.home() / "hyperion" / "scheduled-tasks"
+SCHEDULED_JOBS_FILE = SCHEDULED_TASKS_DIR / "jobs.json"
+SCHEDULED_TASKS_TASKS_DIR = SCHEDULED_TASKS_DIR / "tasks"
+SCHEDULED_TASKS_LOGS_DIR = SCHEDULED_TASKS_DIR / "logs"
 
 # Ensure directories exist
-for d in [INBOX_DIR, OUTBOX_DIR, PROCESSED_DIR, CONFIG_DIR, AUDIO_DIR]:
+for d in [INBOX_DIR, OUTBOX_DIR, PROCESSED_DIR, CONFIG_DIR, AUDIO_DIR, TASK_OUTPUTS_DIR,
+          SCHEDULED_TASKS_DIR, SCHEDULED_TASKS_TASKS_DIR, SCHEDULED_TASKS_LOGS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # OpenAI configuration for Whisper transcription
@@ -56,6 +64,10 @@ if not OPENAI_API_KEY:
 # Initialize tasks file if needed
 if not TASKS_FILE.exists():
     TASKS_FILE.write_text(json.dumps({"tasks": [], "next_id": 1}, indent=2))
+
+# Initialize scheduled jobs file if needed
+if not SCHEDULED_JOBS_FILE.exists():
+    SCHEDULED_JOBS_FILE.write_text(json.dumps({"jobs": {}}, indent=2))
 
 # Source configurations
 SOURCES = {
@@ -246,7 +258,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="transcribe_audio",
-            description="Transcribe a voice message to text using local Whisper (small model). Use this for messages with type='voice'. Runs entirely locally - no cloud API needed.",
+            description="Transcribe a voice message to text using local whisper.cpp (small model). Use this for messages with type='voice'. Runs entirely locally using whisper.cpp - no cloud API or API key needed.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -256,6 +268,136 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["message_id"],
+            },
+        ),
+        # Scheduled Jobs Tools
+        Tool(
+            name="create_scheduled_job",
+            description="Create a new scheduled job that runs automatically via cron. Jobs run in separate Claude instances and write outputs to the task-outputs inbox.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Unique name for the job (lowercase, hyphens allowed, e.g., 'morning-weather').",
+                    },
+                    "schedule": {
+                        "type": "string",
+                        "description": "Cron schedule expression (e.g., '0 9 * * *' for 9am daily, '*/30 * * * *' for every 30 mins).",
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Instructions for the job. Describe what the scheduled task should do.",
+                    },
+                },
+                "required": ["name", "schedule", "context"],
+            },
+        ),
+        Tool(
+            name="list_scheduled_jobs",
+            description="List all scheduled jobs with their status and schedules.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="get_scheduled_job",
+            description="Get detailed information about a specific scheduled job.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The job name to retrieve.",
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
+        Tool(
+            name="update_scheduled_job",
+            description="Update an existing scheduled job's schedule, context, or enabled status.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The job name to update.",
+                    },
+                    "schedule": {
+                        "type": "string",
+                        "description": "New cron schedule (optional).",
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "New instructions for the job (optional).",
+                    },
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "Enable or disable the job (optional).",
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
+        Tool(
+            name="delete_scheduled_job",
+            description="Delete a scheduled job and remove it from crontab.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The job name to delete.",
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
+        Tool(
+            name="check_task_outputs",
+            description="Check recent outputs from scheduled tasks. Use this to review what your scheduled jobs have done.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "since": {
+                        "type": "string",
+                        "description": "Only show outputs since this ISO timestamp (optional).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of outputs to return. Default 10.",
+                        "default": 10,
+                    },
+                    "job_name": {
+                        "type": "string",
+                        "description": "Filter by job name (optional).",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="write_task_output",
+            description="Write output from a scheduled task. Used by task instances to record their results.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "job_name": {
+                        "type": "string",
+                        "description": "The name of the job writing output.",
+                    },
+                    "output": {
+                        "type": "string",
+                        "description": "The output/result to record.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Status: 'success' or 'failed'. Default 'success'.",
+                        "default": "success",
+                    },
+                },
+                "required": ["job_name", "output"],
             },
         ),
     ]
@@ -289,6 +431,21 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return await handle_delete_task(arguments)
     elif name == "transcribe_audio":
         return await handle_transcribe_audio(arguments)
+    # Scheduled Jobs Tools
+    elif name == "create_scheduled_job":
+        return await handle_create_scheduled_job(arguments)
+    elif name == "list_scheduled_jobs":
+        return await handle_list_scheduled_jobs(arguments)
+    elif name == "get_scheduled_job":
+        return await handle_get_scheduled_job(arguments)
+    elif name == "update_scheduled_job":
+        return await handle_update_scheduled_job(arguments)
+    elif name == "delete_scheduled_job":
+        return await handle_delete_scheduled_job(arguments)
+    elif name == "check_task_outputs":
+        return await handle_check_task_outputs(arguments)
+    elif name == "write_task_output":
+        return await handle_write_task_output(arguments)
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -659,22 +816,13 @@ async def handle_delete_task(args: dict) -> list[TextContent]:
 
 
 # =============================================================================
-# Audio Transcription Handler (Local Whisper)
+# Audio Transcription Handler (Local Whisper.cpp)
 # =============================================================================
 
-# FFmpeg path for audio conversion
+# Paths for local whisper.cpp transcription
 FFMPEG_PATH = Path.home() / ".local" / "bin" / "ffmpeg"
-
-# Whisper model (lazy loaded)
-_whisper_model = None
-
-def get_whisper_model():
-    """Lazy load the whisper model."""
-    global _whisper_model
-    if _whisper_model is None:
-        import whisper
-        _whisper_model = whisper.load_model("small")
-    return _whisper_model
+WHISPER_CPP_PATH = Path.home() / "hyperion-workspace" / "whisper.cpp" / "build" / "bin" / "whisper-cli"
+WHISPER_MODEL_PATH = Path.home() / "hyperion-workspace" / "whisper.cpp" / "models" / "ggml-small.bin"
 
 
 async def convert_ogg_to_wav(ogg_path: Path, wav_path: Path) -> bool:
@@ -698,8 +846,45 @@ async def convert_ogg_to_wav(ogg_path: Path, wav_path: Path) -> bool:
     return proc.returncode == 0
 
 
+async def run_whisper_cpp(audio_path: Path) -> tuple[bool, str]:
+    """Run whisper.cpp CLI on an audio file. Returns (success, transcription_or_error)."""
+    if not WHISPER_CPP_PATH.exists():
+        return False, f"whisper.cpp not found at {WHISPER_CPP_PATH}"
+    if not WHISPER_MODEL_PATH.exists():
+        return False, f"Whisper model not found at {WHISPER_MODEL_PATH}"
+
+    cmd = [
+        str(WHISPER_CPP_PATH),
+        "-m", str(WHISPER_MODEL_PATH),
+        "-f", str(audio_path),
+        "-l", "en",      # English language
+        "-nt",           # No timestamps in output
+        "--no-prints",   # Suppress progress output
+    ]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        error_msg = stderr.decode().strip() if stderr else "Unknown error"
+        return False, f"whisper.cpp failed: {error_msg}"
+
+    # Parse output - whisper.cpp outputs the transcription to stdout
+    transcription = stdout.decode().strip()
+
+    # Remove any remaining timing info if present (lines starting with [)
+    lines = [line for line in transcription.split('\n') if not line.strip().startswith('[')]
+    transcription = ' '.join(lines).strip()
+
+    return True, transcription
+
+
 async def handle_transcribe_audio(args: dict) -> list[TextContent]:
-    """Transcribe a voice message using local Whisper (small model)."""
+    """Transcribe a voice message using local whisper.cpp (small model)."""
     message_id = args.get("message_id", "")
 
     if not message_id:
@@ -759,7 +944,7 @@ async def handle_transcribe_audio(args: dict) -> list[TextContent]:
     if not audio_path.exists():
         return [TextContent(type="text", text=f"Error: Audio file not found: {audio_path}")]
 
-    # Local Whisper transcription
+    # Local whisper.cpp transcription
     try:
         # Convert OGG to WAV if needed
         if audio_path.suffix.lower() in [".ogg", ".oga", ".opus"]:
@@ -772,16 +957,13 @@ async def handle_transcribe_audio(args: dict) -> list[TextContent]:
         else:
             transcribe_path = audio_path
 
-        # Run transcription in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
+        # Run whisper.cpp transcription
+        success, result = await run_whisper_cpp(transcribe_path)
 
-        def do_transcription():
-            model = get_whisper_model()
-            result = model.transcribe(str(transcribe_path), language="en")
-            return result["text"].strip()
+        if not success:
+            return [TextContent(type="text", text=f"Error: {result}")]
 
-        transcription = await loop.run_in_executor(None, do_transcription)
-
+        transcription = result
         if not transcription:
             return [TextContent(type="text", text="Error: Empty transcription returned.")]
 
@@ -789,15 +971,500 @@ async def handle_transcribe_audio(args: dict) -> list[TextContent]:
         msg_data["transcription"] = transcription
         msg_data["text"] = transcription  # Replace placeholder text
         msg_data["transcribed_at"] = datetime.now(timezone.utc).isoformat()
-        msg_data["transcription_model"] = "whisper-small-local"
+        msg_data["transcription_model"] = "whisper.cpp-small"
 
         with open(msg_file, "w") as fp:
             json.dump(msg_data, fp, indent=2)
 
-        return [TextContent(type="text", text=f"🎤 **Transcription complete (local whisper-small):**\n\n{transcription}")]
+        return [TextContent(type="text", text=f"🎤 **Transcription complete (whisper.cpp small):**\n\n{transcription}")]
 
     except Exception as e:
         return [TextContent(type="text", text=f"Error during transcription: {str(e)}")]
+
+
+# =============================================================================
+# Scheduled Jobs Handlers
+# =============================================================================
+
+import subprocess
+import re
+
+
+def load_scheduled_jobs() -> dict:
+    """Load scheduled jobs from file."""
+    try:
+        with open(SCHEDULED_JOBS_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {"jobs": {}}
+
+
+def save_scheduled_jobs(data: dict) -> None:
+    """Save scheduled jobs to file."""
+    with open(SCHEDULED_JOBS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def validate_cron_schedule(schedule: str) -> tuple[bool, str]:
+    """Validate a cron schedule expression. Returns (is_valid, error_message)."""
+    parts = schedule.strip().split()
+    if len(parts) != 5:
+        return False, f"Cron schedule must have 5 parts (minute hour day month weekday), got {len(parts)}"
+
+    # Basic validation for each field
+    field_names = ["minute", "hour", "day", "month", "weekday"]
+    field_ranges = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)]
+
+    for i, (part, name, (min_val, max_val)) in enumerate(zip(parts, field_names, field_ranges)):
+        # Allow *, */n, n, n-m, n,m,o patterns
+        if part == "*":
+            continue
+        if part.startswith("*/"):
+            try:
+                step = int(part[2:])
+                if step < 1:
+                    return False, f"Invalid step value in {name}: {part}"
+            except ValueError:
+                return False, f"Invalid step value in {name}: {part}"
+            continue
+
+        # Handle comma-separated values and ranges
+        for subpart in part.split(","):
+            if "-" in subpart:
+                try:
+                    start, end = subpart.split("-")
+                    start, end = int(start), int(end)
+                    if not (min_val <= start <= max_val and min_val <= end <= max_val):
+                        return False, f"Range out of bounds in {name}: {subpart}"
+                except ValueError:
+                    return False, f"Invalid range in {name}: {subpart}"
+            else:
+                try:
+                    val = int(subpart)
+                    if not (min_val <= val <= max_val):
+                        return False, f"Value out of range in {name}: {val} (must be {min_val}-{max_val})"
+                except ValueError:
+                    return False, f"Invalid value in {name}: {subpart}"
+
+    return True, ""
+
+
+def cron_to_human(schedule: str) -> str:
+    """Convert cron schedule to human-readable format."""
+    parts = schedule.strip().split()
+    if len(parts) != 5:
+        return schedule
+
+    minute, hour, day, month, weekday = parts
+
+    # Common patterns
+    if schedule == "* * * * *":
+        return "Every minute"
+    if minute.startswith("*/"):
+        mins = minute[2:]
+        if hour == "*" and day == "*" and month == "*" and weekday == "*":
+            return f"Every {mins} minutes"
+    if hour.startswith("*/"):
+        hrs = hour[2:]
+        if minute == "0" and day == "*" and month == "*" and weekday == "*":
+            return f"Every {hrs} hours"
+    if day == "*" and month == "*" and weekday == "*":
+        if minute != "*" and hour != "*":
+            return f"Daily at {hour}:{minute.zfill(2)}"
+    if weekday != "*" and day == "*" and month == "*":
+        days = {"0": "Sun", "1": "Mon", "2": "Tue", "3": "Wed", "4": "Thu", "5": "Fri", "6": "Sat", "7": "Sun"}
+        day_name = days.get(weekday, weekday)
+        if minute != "*" and hour != "*":
+            return f"Every {day_name} at {hour}:{minute.zfill(2)}"
+
+    return schedule
+
+
+def validate_job_name(name: str) -> tuple[bool, str]:
+    """Validate a job name. Returns (is_valid, error_message)."""
+    if not name:
+        return False, "Job name cannot be empty"
+    if not re.match(r'^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$', name):
+        return False, "Job name must be lowercase alphanumeric with hyphens, cannot start/end with hyphen"
+    if len(name) > 50:
+        return False, "Job name must be 50 characters or less"
+    return True, ""
+
+
+def sync_crontab() -> tuple[bool, str]:
+    """Sync jobs.json to crontab. Returns (success, message)."""
+    sync_script = SCHEDULED_TASKS_DIR / "sync-crontab.sh"
+    try:
+        result = subprocess.run(
+            [str(sync_script)],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            return True, result.stdout
+        else:
+            return False, result.stderr or "Sync failed"
+    except subprocess.TimeoutExpired:
+        return False, "Sync script timed out"
+    except Exception as e:
+        return False, str(e)
+
+
+async def handle_create_scheduled_job(args: dict) -> list[TextContent]:
+    """Create a new scheduled job."""
+    name = args.get("name", "").strip().lower()
+    schedule = args.get("schedule", "").strip()
+    context = args.get("context", "").strip()
+
+    # Validate name
+    valid, error = validate_job_name(name)
+    if not valid:
+        return [TextContent(type="text", text=f"Error: {error}")]
+
+    # Validate schedule
+    valid, error = validate_cron_schedule(schedule)
+    if not valid:
+        return [TextContent(type="text", text=f"Error: Invalid cron schedule - {error}")]
+
+    if not context:
+        return [TextContent(type="text", text="Error: context is required")]
+
+    # Check if job already exists
+    data = load_scheduled_jobs()
+    if name in data.get("jobs", {}):
+        return [TextContent(type="text", text=f"Error: Job '{name}' already exists. Use update_scheduled_job to modify it.")]
+
+    # Create task markdown file
+    now = datetime.now(timezone.utc)
+    task_file = SCHEDULED_TASKS_TASKS_DIR / f"{name}.md"
+    schedule_human = cron_to_human(schedule)
+
+    task_content = f"""# {name.replace('-', ' ').title()}
+
+**Job**: {name}
+**Schedule**: {schedule_human} (`{schedule}`)
+**Created**: {now.strftime('%Y-%m-%d %H:%M UTC')}
+
+## Context
+
+You are running as a scheduled task. The main Hyperion instance created this job.
+
+## Instructions
+
+{context}
+
+## Output
+
+When you complete your task, call `write_task_output` with:
+- job_name: "{name}"
+- output: Your results/summary
+- status: "success" or "failed"
+
+Keep output concise. The main Hyperion instance will review this later.
+"""
+
+    task_file.write_text(task_content)
+
+    # Add to jobs.json
+    data["jobs"][name] = {
+        "name": name,
+        "schedule": schedule,
+        "schedule_human": schedule_human,
+        "task_file": f"tasks/{name}.md",
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+        "enabled": True,
+        "last_run": None,
+        "last_status": None,
+    }
+    save_scheduled_jobs(data)
+
+    # Sync to crontab
+    success, msg = sync_crontab()
+    if not success:
+        return [TextContent(type="text", text=f"Job created but crontab sync failed: {msg}")]
+
+    return [TextContent(type="text", text=f"Created scheduled job '{name}'\nSchedule: {schedule_human} (`{schedule}`)\nTask file: {task_file}")]
+
+
+async def handle_list_scheduled_jobs(args: dict) -> list[TextContent]:
+    """List all scheduled jobs."""
+    data = load_scheduled_jobs()
+    jobs = data.get("jobs", {})
+
+    if not jobs:
+        return [TextContent(type="text", text="No scheduled jobs configured.\n\nUse `create_scheduled_job` to create one.")]
+
+    output = "**Scheduled Jobs:**\n\n"
+
+    for name, job in sorted(jobs.items()):
+        status_icon = "" if job.get("enabled", True) else " (disabled)"
+        schedule = job.get("schedule_human", job.get("schedule", ""))
+        last_run = job.get("last_run", "never")
+        last_status = job.get("last_status", "-")
+
+        if last_run and last_run != "never":
+            try:
+                # Parse and format nicely
+                dt = datetime.fromisoformat(last_run.replace("Z", "+00:00"))
+                last_run = dt.strftime("%Y-%m-%d %H:%M")
+            except:
+                pass
+
+        output += f"**{name}**{status_icon}\n"
+        output += f"  Schedule: {schedule}\n"
+        output += f"  Last run: {last_run} ({last_status})\n\n"
+
+    output += f"---\nTotal: {len(jobs)} job(s)"
+    return [TextContent(type="text", text=output)]
+
+
+async def handle_get_scheduled_job(args: dict) -> list[TextContent]:
+    """Get details of a scheduled job."""
+    name = args.get("name", "").strip().lower()
+
+    if not name:
+        return [TextContent(type="text", text="Error: name is required")]
+
+    data = load_scheduled_jobs()
+    job = data.get("jobs", {}).get(name)
+
+    if not job:
+        return [TextContent(type="text", text=f"Error: Job '{name}' not found")]
+
+    # Read task file content
+    task_file = SCHEDULED_TASKS_TASKS_DIR / f"{name}.md"
+    task_content = ""
+    if task_file.exists():
+        task_content = task_file.read_text()
+
+    output = f"**Job: {name}**\n\n"
+    output += f"**Schedule**: {job.get('schedule_human', '')} (`{job.get('schedule', '')}`)\n"
+    output += f"**Enabled**: {'Yes' if job.get('enabled', True) else 'No'}\n"
+    output += f"**Created**: {job.get('created_at', 'N/A')}\n"
+    output += f"**Updated**: {job.get('updated_at', 'N/A')}\n"
+    output += f"**Last Run**: {job.get('last_run', 'never')}\n"
+    output += f"**Last Status**: {job.get('last_status', '-')}\n\n"
+    output += f"---\n\n**Task File** (`{task_file}`):\n\n```markdown\n{task_content}\n```"
+
+    return [TextContent(type="text", text=output)]
+
+
+async def handle_update_scheduled_job(args: dict) -> list[TextContent]:
+    """Update a scheduled job."""
+    name = args.get("name", "").strip().lower()
+
+    if not name:
+        return [TextContent(type="text", text="Error: name is required")]
+
+    data = load_scheduled_jobs()
+    job = data.get("jobs", {}).get(name)
+
+    if not job:
+        return [TextContent(type="text", text=f"Error: Job '{name}' not found")]
+
+    updated = []
+
+    # Update schedule if provided
+    if "schedule" in args and args["schedule"]:
+        new_schedule = args["schedule"].strip()
+        valid, error = validate_cron_schedule(new_schedule)
+        if not valid:
+            return [TextContent(type="text", text=f"Error: Invalid cron schedule - {error}")]
+        job["schedule"] = new_schedule
+        job["schedule_human"] = cron_to_human(new_schedule)
+        updated.append(f"schedule -> {new_schedule}")
+
+    # Update enabled if provided
+    if "enabled" in args:
+        job["enabled"] = bool(args["enabled"])
+        updated.append(f"enabled -> {job['enabled']}")
+
+    # Update context if provided
+    if "context" in args and args["context"]:
+        new_context = args["context"].strip()
+        task_file = SCHEDULED_TASKS_TASKS_DIR / f"{name}.md"
+
+        # Rewrite task file
+        now = datetime.now(timezone.utc)
+        task_content = f"""# {name.replace('-', ' ').title()}
+
+**Job**: {name}
+**Schedule**: {job.get('schedule_human', '')} (`{job.get('schedule', '')}`)
+**Created**: {job.get('created_at', 'N/A')}
+**Updated**: {now.strftime('%Y-%m-%d %H:%M UTC')}
+
+## Context
+
+You are running as a scheduled task. The main Hyperion instance created this job.
+
+## Instructions
+
+{new_context}
+
+## Output
+
+When you complete your task, call `write_task_output` with:
+- job_name: "{name}"
+- output: Your results/summary
+- status: "success" or "failed"
+
+Keep output concise. The main Hyperion instance will review this later.
+"""
+        task_file.write_text(task_content)
+        updated.append("context (task file rewritten)")
+
+    if not updated:
+        return [TextContent(type="text", text="No changes specified. Provide schedule, context, or enabled.")]
+
+    job["updated_at"] = datetime.now(timezone.utc).isoformat()
+    save_scheduled_jobs(data)
+
+    # Sync to crontab
+    success, msg = sync_crontab()
+    sync_status = "" if success else f"\n(Warning: crontab sync failed: {msg})"
+
+    return [TextContent(type="text", text=f"Updated job '{name}':\n- " + "\n- ".join(updated) + sync_status)]
+
+
+async def handle_delete_scheduled_job(args: dict) -> list[TextContent]:
+    """Delete a scheduled job."""
+    name = args.get("name", "").strip().lower()
+
+    if not name:
+        return [TextContent(type="text", text="Error: name is required")]
+
+    data = load_scheduled_jobs()
+    if name not in data.get("jobs", {}):
+        return [TextContent(type="text", text=f"Error: Job '{name}' not found")]
+
+    # Remove from jobs.json
+    del data["jobs"][name]
+    save_scheduled_jobs(data)
+
+    # Delete task file
+    task_file = SCHEDULED_TASKS_TASKS_DIR / f"{name}.md"
+    if task_file.exists():
+        task_file.unlink()
+
+    # Sync to crontab
+    success, msg = sync_crontab()
+    sync_status = "" if success else f"\n(Warning: crontab sync failed: {msg})"
+
+    return [TextContent(type="text", text=f"Deleted job '{name}'" + sync_status)]
+
+
+async def handle_check_task_outputs(args: dict) -> list[TextContent]:
+    """Check recent task outputs."""
+    since = args.get("since")
+    limit = args.get("limit", 10)
+    job_name_filter = args.get("job_name", "").strip().lower()
+
+    # Get all output files
+    output_files = sorted(TASK_OUTPUTS_DIR.glob("*.json"), reverse=True)
+
+    if not output_files:
+        return [TextContent(type="text", text="No task outputs yet.\n\nOutputs will appear here when scheduled jobs complete.")]
+
+    outputs = []
+    since_dt = None
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        except:
+            pass
+
+    for f in output_files:
+        if len(outputs) >= limit:
+            break
+
+        try:
+            with open(f) as fp:
+                data = json.load(fp)
+
+            # Filter by job name
+            if job_name_filter and data.get("job_name", "").lower() != job_name_filter:
+                continue
+
+            # Filter by time
+            if since_dt:
+                try:
+                    output_dt = datetime.fromisoformat(data.get("timestamp", "").replace("Z", "+00:00"))
+                    if output_dt < since_dt:
+                        continue
+                except:
+                    pass
+
+            data["_filename"] = f.name
+            outputs.append(data)
+
+        except Exception:
+            continue
+
+    if not outputs:
+        filter_msg = ""
+        if job_name_filter:
+            filter_msg = f" for job '{job_name_filter}'"
+        if since:
+            filter_msg += f" since {since}"
+        return [TextContent(type="text", text=f"No task outputs found{filter_msg}.")]
+
+    result = f"**Recent Task Outputs** ({len(outputs)}):\n\n"
+
+    for out in outputs:
+        job = out.get("job_name", "unknown")
+        ts = out.get("timestamp", "")
+        status = out.get("status", "unknown")
+        output = out.get("output", "(no output)")
+        duration = out.get("duration_seconds")
+
+        status_icon = "" if status == "success" else ""
+        duration_str = f" ({duration}s)" if duration else ""
+
+        # Format timestamp nicely
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            ts = dt.strftime("%Y-%m-%d %H:%M")
+        except:
+            pass
+
+        result += f"---\n"
+        result += f"**{job}** {status_icon} {ts}{duration_str}\n\n"
+        result += f"> {output[:500]}{'...' if len(output) > 500 else ''}\n\n"
+
+    return [TextContent(type="text", text=result)]
+
+
+async def handle_write_task_output(args: dict) -> list[TextContent]:
+    """Write output from a scheduled task."""
+    job_name = args.get("job_name", "").strip().lower()
+    output = args.get("output", "").strip()
+    status = args.get("status", "success").lower()
+
+    if not job_name:
+        return [TextContent(type="text", text="Error: job_name is required")]
+    if not output:
+        return [TextContent(type="text", text="Error: output is required")]
+
+    if status not in ["success", "failed"]:
+        status = "success"
+
+    now = datetime.now(timezone.utc)
+    timestamp_str = now.strftime("%Y%m%d-%H%M%S")
+
+    output_data = {
+        "job_name": job_name,
+        "timestamp": now.isoformat(),
+        "status": status,
+        "output": output,
+    }
+
+    output_file = TASK_OUTPUTS_DIR / f"{timestamp_str}-{job_name}.json"
+    with open(output_file, "w") as f:
+        json.dump(output_data, f, indent=2)
+
+    return [TextContent(type="text", text=f"Output recorded for job '{job_name}'")]
 
 
 async def main():
