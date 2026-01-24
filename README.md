@@ -179,9 +179,24 @@ Hyperion supports voice message transcription using local whisper.cpp:
 - Transcription runs locally using whisper.cpp with the small model (~465MB)
 - No cloud API or API key required
 
-**Dependencies** (installed by setup.sh):
-- whisper.cpp - Local speech recognition
-- FFmpeg - Audio format conversion (OGG → WAV)
+**Dependencies:**
+- **whisper.cpp** - Local speech recognition (installed in `~/hyperion-workspace/whisper.cpp/`)
+- **FFmpeg** - Audio format conversion (OGG → WAV)
+
+**Setup:**
+```bash
+# Install FFmpeg (if not already installed)
+sudo apt-get install -y ffmpeg
+
+# Clone and compile whisper.cpp
+cd ~/hyperion-workspace
+git clone https://github.com/ggerganov/whisper.cpp.git
+cd whisper.cpp
+make -j$(nproc)
+
+# Download the small model (~465MB)
+bash models/download-ggml-model.sh small
+```
 
 ## Services
 

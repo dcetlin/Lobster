@@ -143,6 +143,7 @@ PACKAGES=(
     python3
     python3-pip
     python3-venv
+    cron
 )
 
 for pkg in "${PACKAGES[@]}"; do
@@ -228,9 +229,153 @@ success "Repository ready at $INSTALL_DIR"
 step "Creating directories..."
 
 mkdir -p "$WORKSPACE_DIR/logs"
-mkdir -p "$MESSAGES_DIR"/{inbox,outbox,processed,config}
+mkdir -p "$MESSAGES_DIR"/{inbox,outbox,processed,config,audio,task-outputs}
+mkdir -p "$INSTALL_DIR/scheduled-tasks"/{tasks,logs}
 
 success "Directories created"
+
+#===============================================================================
+# Scheduled Tasks Setup
+#===============================================================================
+
+step "Setting up scheduled tasks infrastructure..."
+
+# Create jobs.json if it doesn't exist
+JOBS_FILE="$INSTALL_DIR/scheduled-tasks/jobs.json"
+if [ ! -f "$JOBS_FILE" ]; then
+    echo '{"jobs": {}}' > "$JOBS_FILE"
+fi
+
+# Create run-job.sh
+cat > "$INSTALL_DIR/scheduled-tasks/run-job.sh" << 'RUNJOB'
+#!/bin/bash
+# Hyperion Scheduled Task Executor
+# Runs a scheduled job in a fresh Claude instance
+
+set -e
+
+# Ensure Claude is in PATH (cron doesn't inherit user PATH)
+export PATH="$HOME/.claude/bin:$HOME/.local/bin:$PATH"
+
+JOB_NAME="$1"
+
+if [ -z "$JOB_NAME" ]; then
+    echo "Usage: $0 <job-name>"
+    exit 1
+fi
+
+JOBS_DIR="$HOME/hyperion/scheduled-tasks"
+TASK_FILE="$JOBS_DIR/tasks/${JOB_NAME}.md"
+OUTPUT_DIR="$HOME/messages/task-outputs"
+LOG_DIR="$JOBS_DIR/logs"
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+JOBS_FILE="$JOBS_DIR/jobs.json"
+
+mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
+
+if [ ! -f "$TASK_FILE" ]; then
+    echo "Error: Task file not found: $TASK_FILE"
+    exit 1
+fi
+
+TASK_CONTENT=$(cat "$TASK_FILE")
+LOG_FILE="$LOG_DIR/${JOB_NAME}-${TIMESTAMP}.log"
+
+START_TIME=$(date +%s)
+START_ISO=$(date -Iseconds)
+
+echo "[$START_ISO] Starting job: $JOB_NAME" | tee "$LOG_FILE"
+
+claude -p "$TASK_CONTENT
+
+---
+
+IMPORTANT: You are running as a scheduled task. When you complete your task:
+1. Call write_task_output() with your results summary
+2. Keep output concise - the main Hyperion instance will review this later
+3. Exit after writing output - do not start a loop" \
+    --dangerously-skip-permissions \
+    --max-turns 15 \
+    2>&1 | tee -a "$LOG_FILE"
+
+EXIT_CODE=$?
+
+END_TIME=$(date +%s)
+END_ISO=$(date -Iseconds)
+DURATION=$((END_TIME - START_TIME))
+
+echo "" | tee -a "$LOG_FILE"
+echo "[$END_ISO] Job completed in ${DURATION}s with exit code: $EXIT_CODE" | tee -a "$LOG_FILE"
+
+if [ -f "$JOBS_FILE" ]; then
+    if command -v jq &> /dev/null; then
+        STATUS="success"
+        [ $EXIT_CODE -ne 0 ] && STATUS="failed"
+        TMP_FILE=$(mktemp)
+        jq --arg name "$JOB_NAME" \
+           --arg last_run "$END_ISO" \
+           --arg status "$STATUS" \
+           '.jobs[$name].last_run = $last_run | .jobs[$name].last_status = $status' \
+           "$JOBS_FILE" > "$TMP_FILE" && mv "$TMP_FILE" "$JOBS_FILE"
+    fi
+fi
+
+exit $EXIT_CODE
+RUNJOB
+chmod +x "$INSTALL_DIR/scheduled-tasks/run-job.sh"
+
+# Create sync-crontab.sh
+cat > "$INSTALL_DIR/scheduled-tasks/sync-crontab.sh" << 'SYNCCRON'
+#!/bin/bash
+# Hyperion Crontab Synchronizer
+
+set -e
+
+JOBS_FILE="$HOME/hyperion/scheduled-tasks/jobs.json"
+RUNNER="$HOME/hyperion/scheduled-tasks/run-job.sh"
+
+if ! command -v crontab &> /dev/null; then
+    echo "Warning: crontab not found. Install cron to enable scheduled tasks."
+    exit 0
+fi
+
+if [ ! -f "$JOBS_FILE" ]; then
+    echo "Error: Jobs file not found: $JOBS_FILE"
+    exit 1
+fi
+
+MARKER="# HYPERION-SCHEDULED"
+EXISTING=$(crontab -l 2>/dev/null | grep -v "$MARKER" | grep -v "$RUNNER" || true)
+
+if command -v jq &> /dev/null; then
+    CRON_ENTRIES=$(jq -r --arg runner "$RUNNER" --arg marker "$MARKER" '
+        .jobs | to_entries[] |
+        select(.value.enabled == true) |
+        "\(.value.schedule) \($runner) \(.key) \($marker)"
+    ' "$JOBS_FILE" 2>/dev/null || echo "")
+else
+    CRON_ENTRIES=""
+fi
+
+{
+    if [ -n "$EXISTING" ]; then
+        echo "$EXISTING"
+    fi
+    if [ -n "$CRON_ENTRIES" ]; then
+        echo "$CRON_ENTRIES"
+    fi
+} | crontab -
+
+echo "Crontab synchronized:"
+crontab -l 2>/dev/null | grep "$MARKER" || echo "(no hyperion jobs)"
+SYNCCRON
+chmod +x "$INSTALL_DIR/scheduled-tasks/sync-crontab.sh"
+
+# Enable cron service
+sudo systemctl enable cron 2>/dev/null || true
+sudo systemctl start cron 2>/dev/null || true
+
+success "Scheduled tasks infrastructure ready"
 
 #===============================================================================
 # Python Environment
@@ -483,6 +628,15 @@ You are **Hyperion**, an always-on AI assistant. You process messages from Teleg
 - `update_task(task_id, status?, ...)` - Update task
 - `get_task(task_id)` - Get task details
 - `delete_task(task_id)` - Delete task
+
+### Scheduled Jobs (Cron Tasks)
+- `create_scheduled_job(name, schedule, context)` - Create scheduled job
+- `list_scheduled_jobs()` - List all scheduled jobs
+- `get_scheduled_job(name)` - Get job details
+- `update_scheduled_job(name, schedule?, context?, enabled?)` - Update job
+- `delete_scheduled_job(name)` - Delete scheduled job
+- `check_task_outputs(since?, limit?, job_name?)` - Check job outputs
+- `write_task_output(job_name, output, status?)` - Write job output
 
 ## Behavior Guidelines
 

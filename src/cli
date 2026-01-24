@@ -14,6 +14,7 @@
 #   outbox      Check outbox for pending replies
 #   stats       Show message statistics
 #   test        Send a test message through the system
+#   update      Update Hyperion (pull changes, restart services)
 #   help        Show this help message
 #===============================================================================
 
@@ -250,6 +251,19 @@ EOF
     echo "Watch with: hyperion logs daemon"
 }
 
+cmd_update() {
+    local args=("$@")
+    local script="$HOME/hyperion/scripts/update-hyperion.sh"
+
+    if [ ! -f "$script" ]; then
+        echo -e "${RED}Error: Update script not found at $script${NC}"
+        exit 1
+    fi
+
+    # Pass all arguments through to the update script
+    exec "$script" "${args[@]}"
+}
+
 cmd_help() {
     echo -e "${BLUE}Hyperion CLI${NC} - Unified control for Hyperion message processing"
     echo ""
@@ -265,7 +279,15 @@ cmd_help() {
     echo "  outbox          Check outbox for pending replies"
     echo "  stats           Show message statistics"
     echo "  test            Create a test message in inbox"
+    echo "  update [opts]   Update Hyperion from git"
     echo "  help            Show this help message"
+    echo ""
+    echo "Update options:"
+    echo "  --check         Check for updates without applying"
+    echo "  --force         Continue even if health checks fail"
+    echo "  --skip-claude   Skip Claude CLI update"
+    echo "  --dry-run       Show what would happen"
+    echo "  --rollback      Restore from backup"
     echo ""
     echo "Examples:"
     echo "  hyperion start          # Start everything"
@@ -288,6 +310,7 @@ case "${1:-help}" in
     outbox)  cmd_outbox ;;
     stats)   cmd_stats ;;
     test)    cmd_test ;;
+    update)  shift; cmd_update "$@" ;;
     help|--help|-h) cmd_help ;;
     *)
         echo "Unknown command: $1"

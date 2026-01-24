@@ -9,6 +9,7 @@ Uses --resume to maintain a persistent session with full context.
 import asyncio
 import json
 import logging
+import signal
 import sys
 import time
 import uuid
@@ -36,6 +37,28 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("hyperion")
+
+# Graceful shutdown support
+shutdown_requested = False
+
+
+def handle_sigterm(signum, frame):
+    """Handle SIGTERM for graceful shutdown."""
+    global shutdown_requested
+    shutdown_requested = True
+    log.info("Shutdown requested (SIGTERM), finishing current work...")
+
+
+def handle_sigint(signum, frame):
+    """Handle SIGINT (Ctrl+C) for graceful shutdown."""
+    global shutdown_requested
+    shutdown_requested = True
+    log.info("Shutdown requested (SIGINT), finishing current work...")
+
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, handle_sigterm)
+signal.signal(signal.SIGINT, handle_sigint)
 
 
 def get_or_create_session_id() -> str:
@@ -161,6 +184,8 @@ Process ALL messages in the inbox."""
 
 async def daemon_loop():
     """Main daemon loop."""
+    global shutdown_requested
+
     log.info("=" * 60)
     log.info("Hyperion Daemon starting...")
     log.info(f"Workspace: {WORKSPACE}")
@@ -174,7 +199,7 @@ async def daemon_loop():
     consecutive_errors = 0
     max_errors = 5
 
-    while True:
+    while not shutdown_requested:
         loop_start = time.time()
 
         try:
@@ -211,6 +236,8 @@ async def daemon_loop():
         elapsed = time.time() - loop_start
         sleep_time = max(poll - elapsed, 1)
         await asyncio.sleep(sleep_time)
+
+    log.info("Shutdown complete - daemon exiting gracefully")
 
 
 def main():

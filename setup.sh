@@ -83,8 +83,14 @@ sudo apt install -y \
     python3-venv \
     ufw \
     fail2ban \
-    fontconfig
+    fontconfig \
+    cron
 print_success "Essential packages installed"
+
+print_step "Enabling cron service..."
+sudo systemctl enable cron 2>/dev/null || true
+sudo systemctl start cron 2>/dev/null || true
+print_success "Cron service enabled"
 
 #-------------------------------------------------------------------------------
 # Zsh + Oh-My-Zsh Setup
