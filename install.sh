@@ -488,6 +488,61 @@ EOF
 fi
 
 #===============================================================================
+# GitHub MCP Server (Optional)
+#===============================================================================
+
+step "GitHub Integration (Optional)..."
+
+echo ""
+echo -e "${BOLD}GitHub MCP Server Setup${NC}"
+echo ""
+echo "The GitHub MCP server lets Hyperion:"
+echo "  - Read and manage GitHub issues & PRs"
+echo "  - Browse repositories and code"
+echo "  - Access project boards"
+echo "  - Monitor GitHub Actions workflows"
+echo ""
+read -p "Set up GitHub integration? [y/N] " -n 1 -r
+echo
+
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo ""
+    echo "You need a GitHub Personal Access Token (PAT)."
+    echo ""
+    echo "To create one:"
+    echo "  1. Go to https://github.com/settings/tokens"
+    echo "  2. Click 'Generate new token (classic)'"
+    echo "  3. Select scopes: repo, read:org, read:project"
+    echo "  4. Copy the generated token"
+    echo ""
+
+    read -p "Enter your GitHub PAT (or press Enter to skip): " GITHUB_PAT
+
+    if [ -n "$GITHUB_PAT" ]; then
+        # Add GitHub MCP server to Claude Code
+        if command -v claude &> /dev/null; then
+            claude mcp add-json github "{\"type\":\"http\",\"url\":\"https://api.githubcopilot.com/mcp\",\"headers\":{\"Authorization\":\"Bearer $GITHUB_PAT\"}}" --scope user 2>/dev/null
+            success "GitHub MCP server configured"
+
+            # Save PAT to config (optional, for reference)
+            if [ -f "$CONFIG_FILE" ]; then
+                echo "" >> "$CONFIG_FILE"
+                echo "# GitHub Integration" >> "$CONFIG_FILE"
+                echo "GITHUB_PAT_CONFIGURED=true" >> "$CONFIG_FILE"
+            fi
+        else
+            warn "Claude Code not found. Configure GitHub MCP manually after install:"
+            echo "  claude mcp add-json github '{\"type\":\"http\",\"url\":\"https://api.githubcopilot.com/mcp\",\"headers\":{\"Authorization\":\"Bearer YOUR_PAT\"}}'"
+        fi
+    else
+        info "Skipped GitHub integration. You can set it up later:"
+        echo "  claude mcp add-json github '{\"type\":\"http\",\"url\":\"https://api.githubcopilot.com/mcp\",\"headers\":{\"Authorization\":\"Bearer YOUR_PAT\"}}'"
+    fi
+else
+    info "Skipped GitHub integration. You can set it up later - see README.md"
+fi
+
+#===============================================================================
 # Generate Service Files
 #===============================================================================
 
