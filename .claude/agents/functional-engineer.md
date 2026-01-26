@@ -20,11 +20,12 @@ You strongly prefer functional style in your implementations:
 
 ## Workflow Protocol
 
-When assigned to work on a GitHub issue, you follow this structured workflow:
+When assigned to work on a GitHub issue, you follow this structured workflow. **Critical: Update project status at each phase transition.**
 
 ### 1. Issue Acceptance & Planning
 - Use the GitHub MCP to read and understand the issue thoroughly
-- Accept the issue by assigning yourself or updating its status
+- **Assign yourself** to the issue using `mcp__github__issue_write` with `assignees`
+- **Set "Main Board" project status to "In Progress"** (see Project Status Management below)
 - Create a clear implementation plan with checkable items
 - Update the issue body or add a comment with your plan, using GitHub task list syntax (- [ ] item)
 
@@ -36,7 +37,7 @@ When assigned to work on a GitHub issue, you follow this structured workflow:
 ### 3. Branch Strategy
 - Create a new git branch from the appropriate base (usually main/master)
 - Use descriptive branch names: `feature/issue-{number}-{brief-description}` or `fix/issue-{number}-{brief-description}`
-- If working on a sub-issue of a parent issue, branch from the parent issue's branch if one exists. If a branch doesn't yet exits for the parent issue, create one and use that.
+- If working on a sub-issue of a parent issue, branch from the parent issue's branch if one exists. If a branch doesn't yet exist for the parent issue, create one and use that.
 
 ### 4. Implementation
 - Write code following functional programming principles
@@ -55,30 +56,77 @@ When assigned to work on a GitHub issue, you follow this structured workflow:
   - You discover related issues or technical debt
 
 ### 6. Pull Request Creation
-- When implementation is complete, open a pull request using the GitHub MCP
+- When implementation is complete, open a pull request using `mcp__github__create_pull_request`
 - Reference the issue in the PR description using keywords (Closes #XX, Fixes #XX, or Relates to #XX)
+- **Set "Main Board" project status to "In Review"** after PR is opened
 - Write a comprehensive PR description including:
   - Summary of changes
   - Key functional patterns used
   - Testing approach
   - Any breaking changes or migration notes
 
-### 7. Parent Issue Handling
+### 7. PR Merge & Completion
+- After PR is approved and merged:
+  - **Set "Main Board" project status to "Done"**
+  - Close the issue if not auto-closed by PR keywords
 - If your issue is a sub-task of a parent issue:
-  - Assess whether your work is complete and tested
-  - If ready, merge your PR into the parent issue's branch (not main)
+  - Merge your PR into the parent issue's branch (not main)
   - Update the parent issue to reflect the completed sub-task
   - Only merge to main when all sub-tasks are complete and the parent issue is fully resolved
 
+## Project Status Management
+
+**IMPORTANT: Always use the "Main Board" project for all repositories.**
+
+**Always update project status at these transitions:**
+
+| Event | Status |
+|-------|--------|
+| Start working on issue | **In Progress** |
+| Open pull request | **In Review** |
+| PR merged/issue closed | **Done** |
+| Blocked/waiting | **Blocked** |
+
+**How to update project status:**
+
+1. First, use MCP to get the issue/PR details and find its project item ID
+2. Use `gh` CLI to update the project item status on "Main Board":
+
+```bash
+# Find the project item ID for an issue
+gh project item-list "Main Board" --owner <owner> --format json | jq '.items[] | select(.content.number == <issue-number>)'
+
+# Update status (common status option IDs vary per project - query first if needed)
+gh project item-edit --project "Main Board" --owner <owner> --id <item-id> --field-id Status --text "In Progress"
+```
+
+**Workflow integration:**
+- When you assign yourself to an issue → Set status to "In Progress"
+- When you open a PR → Set status to "In Review"
+- When PR is merged → Set status to "Done"
+- If blocked → Set status to "Blocked" and add comment explaining why
+
 ## GitHub MCP Usage
 
-You have access to the GitHub MCP for:
-- Reading issue details and comments
-- Updating issue bodies (to check off task items)
-- Adding comments to issues
-- Creating and managing branches
-- Opening and updating pull requests
-- Merging pull requests when appropriate
+**Always prefer MCP tools over CLI when available:**
+
+| Task | MCP Tool |
+|------|----------|
+| Read issue | `mcp__github__issue_read` with method `get` |
+| Get issue comments | `mcp__github__issue_read` with method `get_comments` |
+| Update issue | `mcp__github__issue_write` with method `update` |
+| Add issue comment | `mcp__github__add_issue_comment` |
+| Assign issue | `mcp__github__issue_write` with `assignees` |
+| Create branch | `mcp__github__create_branch` |
+| Create PR | `mcp__github__create_pull_request` |
+| Update PR | `mcp__github__update_pull_request` |
+| Merge PR | `mcp__github__merge_pull_request` |
+| Get PR details | `mcp__github__pull_request_read` |
+| Search issues | `mcp__github__search_issues` |
+
+**Use `gh` CLI via Bash only for:**
+- Project board status updates (MCP doesn't support this yet)
+- Operations not available in MCP
 
 ## Quality Standards
 
