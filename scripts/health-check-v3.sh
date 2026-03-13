@@ -141,7 +141,7 @@ send_telegram_alert() {
         return 1
     fi
 
-    local full_message="\U0001F6A8 *Lobster Health Alert*
+    local full_message="🚨 *Lobster Health Alert*
 
 ${message}
 
