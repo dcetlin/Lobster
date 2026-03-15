@@ -9,6 +9,11 @@ It also scans the filesystem for agent output files that exist but have no
 corresponding DB entry — these "unregistered agents" indicate registration
 failures and would otherwise be invisible to monitoring.
 
+It also detects COMPLETED_NOT_UPDATED agents: DB entries still showing
+status=running even though the agent's transcript confirms write_result was
+called. These are auto-corrected to status=completed on every run (no flag
+needed — transcript evidence makes it safe).
+
 Usage:
     uv run scripts/ghost-detector.py
     uv run scripts/ghost-detector.py --threshold-minutes 60
@@ -92,6 +97,22 @@ class UnregisteredAgent:
     is_active: bool  # True if modified within UNREGISTERED_ACTIVE_THRESHOLD_MINUTES
 
 
+@dataclass(frozen=True)
+class CompletedNotUpdatedAgent:
+    """A DB entry still showing status=running whose transcript confirms write_result was called.
+
+    These are type-2 divergences: the agent completed normally but the DB was
+    never updated from 'running' to 'completed'. Auto-corrected unconditionally
+    because the transcript provides hard evidence of completion.
+    """
+
+    agent_id: str
+    task_id: str | None
+    description: str
+    spawned_at: str
+    output_file: str
+
+
 # ---------------------------------------------------------------------------
 # Pure data functions
 # ---------------------------------------------------------------------------
@@ -120,6 +141,44 @@ def compute_output_file_age_minutes(output_file: str | None, now: datetime) -> f
         return None
     mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
     return (now - mtime).total_seconds() / 60
+
+
+def check_transcript_for_write_result(output_file: str) -> bool:
+    """Return True if the agent's transcript shows write_result was called successfully.
+
+    Scans the JSONL output file for evidence of a successful
+    mcp__lobster-inbox__write_result tool call. The tool name appears
+    verbatim in JSONL tool_use blocks. Both substrings must be present
+    to avoid false positives from unrelated content mentioning "write_result".
+    """
+    if not output_file or not os.path.exists(output_file):
+        return False
+    try:
+        with open(output_file, "r") as f:
+            content = f.read()
+        return "write_result" in content and "mcp__lobster-inbox" in content
+    except Exception:
+        return False
+
+
+def detect_completed_not_updated(
+    rows: list[AgentRow],
+) -> list[CompletedNotUpdatedAgent]:
+    """Return DB-running agents whose transcripts confirm write_result was called.
+
+    Pure function — only reads filesystem, no writes.
+    """
+    return [
+        CompletedNotUpdatedAgent(
+            agent_id=row.agent_id,
+            task_id=row.task_id,
+            description=row.description,
+            spawned_at=row.spawned_at,
+            output_file=row.output_file or "",
+        )
+        for row in rows
+        if row.output_file and check_transcript_for_write_result(row.output_file)
+    ]
 
 
 def classify(
@@ -324,6 +383,13 @@ def format_agent_line(agent: ClassifiedAgent) -> str:
     return f"  - agent_id: {short_id}... | age: {age_str:>5} | file: {file_age_str:>15} | {task} — {desc}"
 
 
+def format_completed_not_updated_line(agent: CompletedNotUpdatedAgent) -> str:
+    short_id = agent.agent_id[:16]
+    task = agent.task_id or "(no task_id)"
+    desc = agent.description[:60]
+    return f"  - agent_id: {short_id}... | {task} — {desc} | output: {agent.output_file}"
+
+
 def format_unregistered_line(agent: UnregisteredAgent) -> str:
     short_id = agent.agent_id[:16]
     file_age_str = f"{agent.output_file_age_minutes:.0f}m ago"
@@ -337,6 +403,7 @@ def build_report(
     now: datetime,
     threshold_minutes: float,
     output_file_threshold_minutes: float,
+    completed_not_updated: list[CompletedNotUpdatedAgent] | None = None,
 ) -> str:
     order: list[Classification] = [
         "GHOST_CONFIRMED",
@@ -347,6 +414,8 @@ def build_report(
     by_class: dict[Classification, list[ClassifiedAgent]] = {k: [] for k in order}
     for agent in classified:
         by_class[agent.classification].append(agent)
+
+    completed_not_updated = completed_not_updated or []
 
     timestamp = now.strftime("%Y-%m-%d %H:%M UTC")
     lines: list[str] = [
@@ -363,6 +432,16 @@ def build_report(
         lines.append(f"{label} ({len(agents)}):")
         for a in agents:
             lines.append(format_agent_line(a))
+        lines.append("")
+
+    # COMPLETED_NOT_UPDATED — DB running but transcript confirms write_result called
+    if completed_not_updated:
+        lines.append(
+            f"COMPLETED_NOT_UPDATED ({len(completed_not_updated)}) — DB=running but transcript confirms write_result:"
+        )
+        lines.append("  (auto-correcting to status=completed)")
+        for c in completed_not_updated:
+            lines.append(format_completed_not_updated_line(c))
         lines.append("")
 
     # Unregistered agents — filesystem-only discoveries
@@ -392,6 +471,10 @@ def build_report(
         f"{len(by_class['GHOST_SUSPECTED'])} suspected, {len(by_class['STALE_NO_FILE'])} stale-no-file), "
         f"{healthy} healthy | ghost rate: {ghost_rate}"
     )
+    if completed_not_updated:
+        lines.append(
+            f"         {len(completed_not_updated)} completed-not-updated (auto-corrected to completed)"
+        )
     if unregistered:
         active_u = sum(1 for u in unregistered if u.is_active)
         lines.append(
@@ -472,6 +555,19 @@ def send_alert(
 # ---------------------------------------------------------------------------
 
 RELAUNCH_CHAT_ID = 8305714125
+
+
+def mark_agent_completed(db_path: Path, agent_id: str) -> None:
+    """Update a COMPLETED_NOT_UPDATED agent's status to 'completed' in agent_sessions.db."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "UPDATE agent_sessions SET status='completed', result_summary=? WHERE id=?",
+            ("auto-corrected by ghost-detector: transcript confirmed write_result was called", agent_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def mark_agent_failed(db_path: Path, agent_id: str) -> None:
@@ -617,6 +713,26 @@ def mark_failed_all_ghosts(confirmed: list[ClassifiedAgent], db_path: Path) -> N
     print(f"\nDone. {len(confirmed)} agent(s) marked failed; alerts queued for dispatcher.")
 
 
+def auto_correct_completed_not_updated(
+    agents: list[CompletedNotUpdatedAgent], db_path: Path
+) -> None:
+    """Update all COMPLETED_NOT_UPDATED agents to status=completed in the DB.
+
+    Always runs unconditionally — transcript evidence makes this safe regardless
+    of --mark-failed flag.
+    """
+    if not agents:
+        return
+
+    print(f"\nAuto-correcting {len(agents)} COMPLETED_NOT_UPDATED agent(s) to status=completed...")
+    for agent in agents:
+        label = agent.task_id or agent.description[:50]
+        mark_agent_completed(db_path, agent.agent_id)
+        print(f"  [auto-correct] {agent.agent_id[:16]}... | {label} → completed")
+
+    print(f"\nDone. {len(agents)} agent(s) corrected.")
+
+
 def mark_failed_unregistered_dead(unregistered: list[UnregisteredAgent]) -> None:
     """Queue inbox notifications for dead unregistered agents (used with --relaunch).
 
@@ -704,9 +820,16 @@ def main() -> int:
 
     running_agents = load_running_agents(db_path)
 
+    # Detect type-2 divergence: DB=running but transcript confirms write_result called.
+    # These are extracted before classification so they can be excluded from ghost logic.
+    completed_not_updated = detect_completed_not_updated(running_agents)
+    completed_agent_ids = {c.agent_id for c in completed_not_updated}
+
+    # Classify remaining running agents (exclude confirmed-completed ones)
     classified = [
         classify_agent(row, now, args.threshold_minutes, args.output_file_threshold_minutes)
         for row in running_agents
+        if row.agent_id not in completed_agent_ids
     ]
 
     # Filesystem scan — discover unregistered agents unless opted out
@@ -721,8 +844,12 @@ def main() -> int:
         now,
         args.threshold_minutes,
         args.output_file_threshold_minutes,
+        completed_not_updated=completed_not_updated,
     )
     print(report)
+
+    # Auto-correct COMPLETED_NOT_UPDATED — always safe, no flag required
+    auto_correct_completed_not_updated(completed_not_updated, db_path)
 
     confirmed = [a for a in classified if a.classification == "GHOST_CONFIRMED"]
 

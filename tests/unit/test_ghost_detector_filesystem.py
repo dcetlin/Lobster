@@ -344,3 +344,106 @@ class TestMarkFailedUnregisteredDead:
         gd.mark_failed_unregistered_dead([agent])
 
         assert dropped == []
+
+
+# ---------------------------------------------------------------------------
+# check_transcript_for_write_result
+# ---------------------------------------------------------------------------
+
+
+class TestCheckTranscriptForWriteResult:
+    def test_returns_true_when_write_result_present(self, tmp_path: Path) -> None:
+        """A transcript containing mcp__lobster-inbox__write_result → True."""
+        transcript = tmp_path / "transcript.jsonl"
+        transcript.write_text(
+            '{"type":"tool_use","name":"mcp__lobster-inbox__write_result","input":{"task_id":"t1"}}\n'
+        )
+        assert gd.check_transcript_for_write_result(str(transcript)) is True
+
+    def test_returns_false_for_empty_file(self, tmp_path: Path) -> None:
+        """Empty transcript → False."""
+        transcript = tmp_path / "transcript.jsonl"
+        transcript.write_text("")
+        assert gd.check_transcript_for_write_result(str(transcript)) is False
+
+    def test_returns_false_when_write_result_wrong_namespace(self, tmp_path: Path) -> None:
+        """write_result from a different namespace (not mcp__lobster-inbox) → False."""
+        transcript = tmp_path / "transcript.jsonl"
+        transcript.write_text(
+            '{"type":"tool_use","name":"some_other_tool__write_result","input":{}}\n'
+        )
+        assert gd.check_transcript_for_write_result(str(transcript)) is False
+
+    def test_returns_false_for_nonexistent_file(self) -> None:
+        """Non-existent file path → False (no exception raised)."""
+        assert gd.check_transcript_for_write_result("/tmp/does-not-exist-xyz.jsonl") is False
+
+    def test_returns_false_when_only_mcp_namespace_no_write_result(self, tmp_path: Path) -> None:
+        """mcp__lobster-inbox prefix present but no write_result call → False."""
+        transcript = tmp_path / "transcript.jsonl"
+        transcript.write_text(
+            '{"type":"tool_use","name":"mcp__lobster-inbox__send_reply","input":{}}\n'
+        )
+        assert gd.check_transcript_for_write_result(str(transcript)) is False
+
+    def test_returns_true_with_multiline_jsonl(self, tmp_path: Path) -> None:
+        """write_result appears after many other tool calls → True."""
+        transcript = tmp_path / "transcript.jsonl"
+        lines = [
+            '{"type":"tool_use","name":"mcp__lobster-inbox__send_reply","input":{}}\n',
+            '{"type":"tool_use","name":"Bash","input":{"command":"ls"}}\n',
+            '{"type":"tool_use","name":"mcp__lobster-inbox__write_result","input":{"task_id":"t99"}}\n',
+        ]
+        transcript.write_text("".join(lines))
+        assert gd.check_transcript_for_write_result(str(transcript)) is True
+
+
+# ---------------------------------------------------------------------------
+# detect_completed_not_updated
+# ---------------------------------------------------------------------------
+
+
+class TestDetectCompletedNotUpdated:
+    def _make_row(
+        self,
+        agent_id: str,
+        output_file: str | None,
+        description: str = "test agent",
+    ) -> gd.AgentRow:
+        return gd.AgentRow(
+            agent_id=agent_id,
+            task_id=None,
+            description=description,
+            chat_id="12345",
+            status="running",
+            spawned_at="2026-03-15T11:00:00+00:00",
+            output_file=output_file,
+            last_seen_at=None,
+        )
+
+    def test_detects_agent_with_write_result_in_transcript(self, tmp_path: Path) -> None:
+        transcript = tmp_path / "agent-abc.jsonl"
+        transcript.write_text(
+            '{"type":"tool_use","name":"mcp__lobster-inbox__write_result","input":{"task_id":"t1"}}\n'
+        )
+        row = self._make_row("abc", str(transcript))
+        result = gd.detect_completed_not_updated([row])
+        assert len(result) == 1
+        assert result[0].agent_id == "abc"
+
+    def test_skips_agent_with_no_write_result(self, tmp_path: Path) -> None:
+        transcript = tmp_path / "agent-def.jsonl"
+        transcript.write_text('{"type":"tool_use","name":"Bash","input":{}}\n')
+        row = self._make_row("def", str(transcript))
+        result = gd.detect_completed_not_updated([row])
+        assert result == []
+
+    def test_skips_agent_with_no_output_file(self) -> None:
+        row = self._make_row("ghi", None)
+        result = gd.detect_completed_not_updated([row])
+        assert result == []
+
+    def test_skips_agent_with_missing_file(self) -> None:
+        row = self._make_row("jkl", "/tmp/nonexistent-agent-jkl.jsonl")
+        result = gd.detect_completed_not_updated([row])
+        assert result == []
