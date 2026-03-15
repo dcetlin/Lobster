@@ -5,16 +5,21 @@ A "ghost agent" is a background subagent registered in agent_sessions.db with
 status=running that never completed (never called write_result). This tool
 queries the DB, checks output file liveness, and classifies each stale session.
 
+It also scans the filesystem for agent output files that exist but have no
+corresponding DB entry — these "unregistered agents" indicate registration
+failures and would otherwise be invisible to monitoring.
+
 Usage:
     uv run scripts/ghost-detector.py
     uv run scripts/ghost-detector.py --threshold-minutes 60
     uv run scripts/ghost-detector.py --output-file-threshold-minutes 5
     uv run scripts/ghost-detector.py --alert
     uv run scripts/ghost-detector.py --mark-failed
+    uv run scripts/ghost-detector.py --no-fs-scan
 
 Exit codes:
-    0 — no GHOST_CONFIRMED agents found
-    1 — one or more GHOST_CONFIRMED agents found
+    0 — no GHOST_CONFIRMED or UNREGISTERED agents found
+    1 — one or more GHOST_CONFIRMED or UNREGISTERED agents found
 """
 
 from __future__ import annotations
@@ -22,12 +27,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from glob import glob
 from pathlib import Path
 from typing import Literal
 
@@ -43,6 +50,16 @@ Classification = Literal[
 ]
 
 DB_PATH = Path.home() / "messages" / "config" / "agent_sessions.db"
+
+# Glob pattern for Claude Code session task directories.
+# The middle component is a session UUID that changes per Claude Code invocation.
+AGENT_OUTPUT_GLOB = "/tmp/claude-1000/-home-lobster-lobster-workspace/*/tasks/"
+
+# Pattern for agent JSONL symlink filenames: agent-<hex_id>.jsonl
+AGENT_SYMLINK_PATTERN = re.compile(r"^agent-([0-9a-f]+)\.jsonl$")
+
+# Age threshold for treating an unregistered output file as "active" (minutes)
+UNREGISTERED_ACTIVE_THRESHOLD_MINUTES = 30.0
 
 
 @dataclass(frozen=True)
@@ -63,6 +80,16 @@ class ClassifiedAgent:
     classification: Classification
     age_minutes: float
     output_file_age_minutes: float | None  # None if no file or file missing
+
+
+@dataclass(frozen=True)
+class UnregisteredAgent:
+    """An agent found via filesystem scan with no corresponding DB entry."""
+
+    agent_id: str
+    output_file: str
+    output_file_age_minutes: float
+    is_active: bool  # True if modified within UNREGISTERED_ACTIVE_THRESHOLD_MINUTES
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +172,90 @@ def classify_agent(
 
 
 # ---------------------------------------------------------------------------
+# Filesystem scan — pure data collection, no side effects
+# ---------------------------------------------------------------------------
+
+
+def find_agent_symlinks(tasks_dir: Path) -> list[Path]:
+    """Return all agent JSONL symlinks in a Claude Code tasks directory."""
+    if not tasks_dir.is_dir():
+        return []
+    return [
+        p
+        for p in tasks_dir.iterdir()
+        if p.is_symlink() and AGENT_SYMLINK_PATTERN.match(p.name)
+    ]
+
+
+def extract_agent_id_from_symlink(symlink: Path) -> str | None:
+    """Extract the hex agent_id from an agent-<id>.jsonl symlink filename."""
+    m = AGENT_SYMLINK_PATTERN.match(symlink.name)
+    return m.group(1) if m else None
+
+
+def compute_symlink_target_age_minutes(symlink: Path, now: datetime) -> float | None:
+    """Return minutes since the symlink *target* was last modified.
+
+    We stat the resolved target (the actual .jsonl file) rather than the
+    symlink itself, since symlink mtime is typically set at creation time.
+    """
+    try:
+        resolved = symlink.resolve()
+        if not resolved.exists():
+            return None
+        mtime = datetime.fromtimestamp(resolved.stat().st_mtime, tz=timezone.utc)
+        return (now - mtime).total_seconds() / 60
+    except OSError:
+        return None
+
+
+def scan_task_dirs(glob_base: str = AGENT_OUTPUT_GLOB) -> list[Path]:
+    """Return all task directories matching the Claude Code session glob."""
+    return [Path(p) for p in glob(glob_base)]
+
+
+def discover_filesystem_agents(
+    now: datetime,
+    known_agent_ids: set[str],
+    active_threshold_minutes: float = UNREGISTERED_ACTIVE_THRESHOLD_MINUTES,
+    glob_base: str = AGENT_OUTPUT_GLOB,
+) -> list[UnregisteredAgent]:
+    """Scan the filesystem for agent output files not present in the DB.
+
+    Returns UnregisteredAgent entries for any agent JSONL symlink whose
+    agent_id is not in known_agent_ids. Broken symlinks (missing targets)
+    are skipped.
+
+    All I/O is read-only — no side effects.
+    """
+    task_dirs = scan_task_dirs(glob_base)
+    unregistered: list[UnregisteredAgent] = []
+
+    for task_dir in task_dirs:
+        for symlink in find_agent_symlinks(task_dir):
+            agent_id = extract_agent_id_from_symlink(symlink)
+            if agent_id is None:
+                continue
+            if agent_id in known_agent_ids:
+                continue  # Already tracked in DB
+
+            file_age = compute_symlink_target_age_minutes(symlink, now)
+            if file_age is None:
+                continue  # Broken symlink or unreadable — skip
+
+            unregistered.append(
+                UnregisteredAgent(
+                    agent_id=agent_id,
+                    output_file=str(symlink),
+                    output_file_age_minutes=file_age,
+                    is_active=file_age <= active_threshold_minutes,
+                )
+            )
+
+    return unregistered
+
+
+# ---------------------------------------------------------------------------
 # DB query (isolated side effect)
 # ---------------------------------------------------------------------------
 
@@ -181,6 +292,20 @@ def load_running_agents(db_path: Path) -> list[AgentRow]:
     ]
 
 
+def load_all_known_agent_ids(db_path: Path) -> set[str]:
+    """Return all agent IDs from agent_sessions.db, regardless of status.
+
+    Used to cross-reference filesystem discoveries against the DB so we don't
+    surface completed/failed agents as "unregistered".
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute("SELECT id FROM agent_sessions").fetchall()
+    finally:
+        conn.close()
+    return {row[0] for row in rows}
+
+
 # ---------------------------------------------------------------------------
 # Report formatting (pure)
 # ---------------------------------------------------------------------------
@@ -199,8 +324,16 @@ def format_agent_line(agent: ClassifiedAgent) -> str:
     return f"  - agent_id: {short_id}... | age: {age_str:>5} | file: {file_age_str:>15} | {task} — {desc}"
 
 
+def format_unregistered_line(agent: UnregisteredAgent) -> str:
+    short_id = agent.agent_id[:16]
+    file_age_str = f"{agent.output_file_age_minutes:.0f}m ago"
+    status = "ACTIVE" if agent.is_active else "STALE"
+    return f"  - agent_id: {short_id}... | file: {file_age_str:>12} | [{status}] {agent.output_file}"
+
+
 def build_report(
     classified: list[ClassifiedAgent],
+    unregistered: list[UnregisteredAgent],
     now: datetime,
     threshold_minutes: float,
     output_file_threshold_minutes: float,
@@ -232,7 +365,24 @@ def build_report(
             lines.append(format_agent_line(a))
         lines.append("")
 
-    ghost_count = len(by_class["GHOST_CONFIRMED"]) + len(by_class["GHOST_SUSPECTED"]) + len(by_class["STALE_NO_FILE"])
+    # Unregistered agents — filesystem-only discoveries
+    if unregistered:
+        active_count = sum(1 for u in unregistered if u.is_active)
+        stale_count = len(unregistered) - active_count
+        lines.append(f"UNREGISTERED ({len(unregistered)}) — found on filesystem, not in DB:")
+        lines.append(
+            f"  (active: {active_count} modified within {UNREGISTERED_ACTIVE_THRESHOLD_MINUTES:.0f}m"
+            f" | stale: {stale_count})"
+        )
+        for u in unregistered:
+            lines.append(format_unregistered_line(u))
+        lines.append("")
+
+    ghost_count = (
+        len(by_class["GHOST_CONFIRMED"])
+        + len(by_class["GHOST_SUSPECTED"])
+        + len(by_class["STALE_NO_FILE"])
+    )
     total = len(classified)
     healthy = len(by_class["HEALTHY"])
     ghost_rate = f"{ghost_count}/{total} = {ghost_count/total*100:.0f}%" if total else "0/0"
@@ -242,6 +392,12 @@ def build_report(
         f"{len(by_class['GHOST_SUSPECTED'])} suspected, {len(by_class['STALE_NO_FILE'])} stale-no-file), "
         f"{healthy} healthy | ghost rate: {ghost_rate}"
     )
+    if unregistered:
+        active_u = sum(1 for u in unregistered if u.is_active)
+        lines.append(
+            f"         {len(unregistered)} unregistered ({active_u} active, "
+            f"{len(unregistered) - active_u} stale) — likely registration failures"
+        )
 
     return "\n".join(lines)
 
@@ -251,20 +407,35 @@ def build_report(
 # ---------------------------------------------------------------------------
 
 
-def send_alert(confirmed: list[ClassifiedAgent], report: str) -> None:
-    """Send Telegram alert via lobster-inbox MCP if GHOST_CONFIRMED agents found."""
-    if not confirmed:
+def send_alert(
+    confirmed: list[ClassifiedAgent],
+    unregistered: list[UnregisteredAgent],
+    report: str,
+) -> None:
+    """Send Telegram alert if GHOST_CONFIRMED or UNREGISTERED agents found."""
+    if not confirmed and not unregistered:
         return
 
-    # Build a condensed alert rather than the full report
-    agent_lines = "\n".join(
-        f"  • {a.row.agent_id[:16]}... | {a.age_minutes:.0f}m old | {a.row.task_id or a.row.description[:40]}"
-        for a in confirmed
-    )
+    parts: list[str] = []
+    if confirmed:
+        agent_lines = "\n".join(
+            f"  • {a.row.agent_id[:16]}... | {a.age_minutes:.0f}m old | {a.row.task_id or a.row.description[:40]}"
+            for a in confirmed
+        )
+        parts.append(f"{len(confirmed)} GHOST_CONFIRMED agent(s):\n{agent_lines}")
+
+    if unregistered:
+        active_u = [u for u in unregistered if u.is_active]
+        unreg_lines = "\n".join(
+            f"  • {u.agent_id[:16]}... | {u.output_file_age_minutes:.0f}m old | {'ACTIVE' if u.is_active else 'STALE'}"
+            for u in unregistered
+        )
+        parts.append(f"{len(unregistered)} UNREGISTERED agent(s) ({len(active_u)} active):\n{unreg_lines}")
+
     alert_text = (
-        f"Ghost agent alert: {len(confirmed)} GHOST_CONFIRMED agent(s) detected.\n\n"
-        f"{agent_lines}\n\n"
-        f"Run `uv run scripts/ghost-detector.py` for full report."
+        "Ghost agent alert:\n\n"
+        + "\n\n".join(parts)
+        + "\n\nRun `uv run scripts/ghost-detector.py` for full report."
     )
 
     # The MCP server is not available as a subprocess; use the lobster-inbox
@@ -398,6 +569,39 @@ def mark_failed_ghost(agent: ClassifiedAgent, db_path: Path) -> None:
     print(f"  [mark-failed] Notification queued (task_id: {result_payload['task_id']})")
 
 
+def build_unregistered_mark_failed_payload(agent: UnregisteredAgent) -> dict:
+    """Return an inbox JSON payload for a dead unregistered agent notification (pure)."""
+    short_id = agent.agent_id[:8]
+    ts = datetime.now(timezone.utc).isoformat()
+    msg_id = f"{int(time.time() * 1000)}_ghost-unregistered-{short_id}"
+    return {
+        "id": msg_id,
+        "type": "subagent_result",
+        "chat_id": RELAUNCH_CHAT_ID,
+        "text": (
+            f"Unregistered dead agent {agent.agent_id} detected by ghost-detector.py. "
+            f"Output file last modified {agent.output_file_age_minutes:.0f}m ago: {agent.output_file}. "
+            f"This agent was never registered in agent_sessions.db — likely a registration failure."
+        ),
+        "forward": True,
+        "task_id": f"ghost-unregistered-{short_id}",
+        "timestamp": ts,
+        "source": "telegram",
+    }
+
+
+def mark_failed_unregistered(agent: UnregisteredAgent) -> None:
+    """Queue a dispatcher notification for an unregistered dead agent.
+
+    Since the agent has no DB row, we cannot update agent_sessions.db.
+    Instead we drop an inbox notification so the dispatcher is aware of
+    the registration gap.
+    """
+    payload = build_unregistered_mark_failed_payload(agent)
+    drop_inbox_message(payload)
+    print(f"  [mark-failed] Notification queued for unregistered agent {agent.agent_id[:16]}...")
+
+
 def mark_failed_all_ghosts(confirmed: list[ClassifiedAgent], db_path: Path) -> None:
     """Iterate confirmed ghosts and mark each one failed, reporting outcomes."""
     if not confirmed:
@@ -411,6 +615,25 @@ def mark_failed_all_ghosts(confirmed: list[ClassifiedAgent], db_path: Path) -> N
         mark_failed_ghost(agent, db_path)
 
     print(f"\nDone. {len(confirmed)} agent(s) marked failed; alerts queued for dispatcher.")
+
+
+def mark_failed_unregistered_dead(unregistered: list[UnregisteredAgent]) -> None:
+    """Queue inbox notifications for dead unregistered agents (used with --relaunch).
+
+    Only acts on stale (non-active) unregistered agents. Active ones may still
+    be running — notifying the dispatcher about them would create false positives.
+    """
+    dead = [u for u in unregistered if not u.is_active]
+    if not dead:
+        print("\nNo dead unregistered agents to notify about.")
+        return
+
+    print(f"\nNotifying dispatcher of {len(dead)} dead unregistered agent(s)...")
+    for agent in dead:
+        print(f"\n  Unregistered dead: {agent.agent_id[:16]}... | {agent.output_file_age_minutes:.0f}m stale")
+        mark_failed_unregistered(agent)
+
+    print(f"\nDone. {len(dead)} notification(s) queued for dispatcher.")
 
 
 # ---------------------------------------------------------------------------
@@ -455,9 +678,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "For each GHOST_CONFIRMED agent: send a Telegram alert, mark the agent "
             "as failed in agent_sessions.db, and queue a notification for the "
-            "dispatcher. The detector does not spawn a new Claude process directly — "
+            "dispatcher. For dead UNREGISTERED agents: queue a dispatcher notification. "
+            "The detector does not spawn a new Claude process directly — "
             "it alerts the dispatcher who can decide whether to re-spawn."
         ),
+    )
+    parser.add_argument(
+        "--no-fs-scan",
+        action="store_true",
+        help="Disable filesystem scan; only use agent_sessions.db (legacy behavior)",
     )
     return parser.parse_args()
 
@@ -480,17 +709,30 @@ def main() -> int:
         for row in running_agents
     ]
 
-    report = build_report(classified, now, args.threshold_minutes, args.output_file_threshold_minutes)
+    # Filesystem scan — discover unregistered agents unless opted out
+    unregistered: list[UnregisteredAgent] = []
+    if not args.no_fs_scan:
+        all_known_ids = load_all_known_agent_ids(db_path)
+        unregistered = discover_filesystem_agents(now, all_known_ids)
+
+    report = build_report(
+        classified,
+        unregistered,
+        now,
+        args.threshold_minutes,
+        args.output_file_threshold_minutes,
+    )
     print(report)
 
     confirmed = [a for a in classified if a.classification == "GHOST_CONFIRMED"]
 
     if args.mark_failed:
         mark_failed_all_ghosts(confirmed, db_path)
-    elif args.alert and confirmed:
-        send_alert(confirmed, report)
+        mark_failed_unregistered_dead(unregistered)
+    elif args.alert and (confirmed or unregistered):
+        send_alert(confirmed, unregistered, report)
 
-    return 1 if confirmed else 0
+    return 1 if (confirmed or unregistered) else 0
 
 
 if __name__ == "__main__":
