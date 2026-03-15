@@ -11,8 +11,8 @@ failures and would otherwise be invisible to monitoring.
 
 It also detects COMPLETED_NOT_UPDATED agents: DB entries still showing
 status=running even though the agent's transcript confirms write_result was
-called. These are auto-corrected to status=completed on every run (no flag
-needed — transcript evidence makes it safe).
+called. These are reported but NOT corrected — if they appear, it means the
+SubagentStop hook (PR #418) isn't working. Auto-correcting would hide the bug.
 
 Usage:
     uv run scripts/ghost-detector.py
@@ -102,8 +102,8 @@ class CompletedNotUpdatedAgent:
     """A DB entry still showing status=running whose transcript confirms write_result was called.
 
     These are type-2 divergences: the agent completed normally but the DB was
-    never updated from 'running' to 'completed'. Auto-corrected unconditionally
-    because the transcript provides hard evidence of completion.
+    never updated from 'running' to 'completed'. Reported for observability but
+    NOT auto-corrected — their presence signals a SubagentStop hook failure.
     """
 
     agent_id: str
@@ -439,7 +439,7 @@ def build_report(
         lines.append(
             f"COMPLETED_NOT_UPDATED ({len(completed_not_updated)}) — DB=running but transcript confirms write_result:"
         )
-        lines.append("  (auto-correcting to status=completed)")
+        lines.append("  (diagnostic only — SubagentStop hook may not be working)")
         for c in completed_not_updated:
             lines.append(format_completed_not_updated_line(c))
         lines.append("")
@@ -473,7 +473,7 @@ def build_report(
     )
     if completed_not_updated:
         lines.append(
-            f"         {len(completed_not_updated)} completed-not-updated (auto-corrected to completed)"
+            f"         {len(completed_not_updated)} completed-not-updated (DB divergence — SubagentStop hook may be broken)"
         )
     if unregistered:
         active_u = sum(1 for u in unregistered if u.is_active)
@@ -847,9 +847,6 @@ def main() -> int:
         completed_not_updated=completed_not_updated,
     )
     print(report)
-
-    # Auto-correct COMPLETED_NOT_UPDATED — always safe, no flag required
-    auto_correct_completed_not_updated(completed_not_updated, db_path)
 
     confirmed = [a for a in classified if a.classification == "GHOST_CONFIRMED"]
 
