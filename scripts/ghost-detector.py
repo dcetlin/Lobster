@@ -10,7 +10,7 @@ Usage:
     uv run scripts/ghost-detector.py --threshold-minutes 60
     uv run scripts/ghost-detector.py --output-file-threshold-minutes 5
     uv run scripts/ghost-detector.py --alert
-    uv run scripts/ghost-detector.py --relaunch
+    uv run scripts/ghost-detector.py --mark-failed
 
 Exit codes:
     0 — no GHOST_CONFIRMED agents found
@@ -297,7 +297,7 @@ def send_alert(confirmed: list[ClassifiedAgent], report: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Relaunch (isolated side effects — DB write + inbox drop)
+# Mark-failed remediation (isolated side effects — DB write + inbox drop)
 # ---------------------------------------------------------------------------
 
 RELAUNCH_CHAT_ID = 8305714125
@@ -309,15 +309,15 @@ def mark_agent_failed(db_path: Path, agent_id: str) -> None:
     try:
         conn.execute(
             "UPDATE agent_sessions SET status='failed', result_summary=? WHERE id=?",
-            ("replaced by ghost-detector auto-relaunch", agent_id),
+            ("marked failed by ghost-detector --mark-failed", agent_id),
         )
         conn.commit()
     finally:
         conn.close()
 
 
-def build_relaunch_alert_text(agent: ClassifiedAgent) -> str:
-    """Return the Telegram alert string for a single ghost agent relaunch (pure)."""
+def build_mark_failed_alert_text(agent: ClassifiedAgent) -> str:
+    """Return the Telegram alert string for a single ghost agent being marked failed (pure)."""
     desc = agent.row.description
     age = f"{agent.age_minutes:.0f}"
     file_age = (
@@ -326,31 +326,31 @@ def build_relaunch_alert_text(agent: ClassifiedAgent) -> str:
         else "unknown"
     )
     return (
-        f"\u26a0\ufe0f Ghost agent detected \u2014 re-launching:\n"
+        f"\u26a0\ufe0f Ghost agent detected \u2014 marking failed:\n"
         f"Agent: {desc}\n"
         f"Age: {age}m | Last output: {file_age}m ago\n\n"
-        f"Spawning replacement now..."
+        f"Agent has been marked failed. Dispatcher will be notified."
     )
 
 
-def build_relaunch_inbox_message(agent: ClassifiedAgent) -> dict:
-    """Return the inbox JSON payload for a ghost relaunch notification (pure)."""
+def build_mark_failed_inbox_message(agent: ClassifiedAgent) -> dict:
+    """Return the inbox JSON payload for a ghost mark-failed notification (pure)."""
     agent_id = agent.row.agent_id
     desc = agent.row.description
     short_id = agent_id[:8]
     ts = datetime.now(timezone.utc).isoformat()
-    msg_id = f"{int(time.time() * 1000)}_ghost-relaunch-{short_id}"
+    msg_id = f"{int(time.time() * 1000)}_ghost-mark-failed-{short_id}"
     return {
         "id": msg_id,
         "type": "subagent_result",
         "chat_id": RELAUNCH_CHAT_ID,
         "text": (
-            f"Ghost agent '{desc}' was detected and auto-relaunched by ghost-detector.py. "
-            f"Original agent {agent_id} has been marked failed. "
-            f"The replacement agent has been spawned \u2014 please monitor for results."
+            f"Ghost agent '{desc}' was detected by ghost-detector.py. "
+            f"Agent {agent_id} has been marked failed in the DB. "
+            f"The dispatcher has been notified \u2014 manual re-spawn may be needed."
         ),
         "forward": True,
-        "task_id": f"ghost-relaunch-{short_id}",
+        "task_id": f"ghost-mark-failed-{short_id}",
         "timestamp": ts,
         "source": "telegram",
     }
@@ -364,18 +364,18 @@ def drop_inbox_message(payload: dict) -> None:
     dest.write_text(json.dumps(payload, indent=2))
 
 
-def relaunch_ghost(agent: ClassifiedAgent, db_path: Path) -> None:
-    """Execute all relaunch side effects for one confirmed ghost agent.
+def mark_failed_ghost(agent: ClassifiedAgent, db_path: Path) -> None:
+    """Execute all mark-failed side effects for one confirmed ghost agent.
 
     Side-effect sequence (isolated at this boundary):
       1. Write Telegram alert to inbox — dispatcher forwards to user
       2. Mark agent failed in DB
-      3. Write relaunch notification to inbox — dispatcher forwards result
+      3. Write mark-failed notification to inbox — dispatcher forwards result
     """
     agent_id = agent.row.agent_id
 
     # 1. Immediate Telegram alert
-    alert_text = build_relaunch_alert_text(agent)
+    alert_text = build_mark_failed_alert_text(agent)
     alert_msg_id = f"{int(time.time() * 1000)}_ghost-alert-{agent_id[:8]}"
     alert_payload = {
         "id": alert_msg_id,
@@ -386,29 +386,29 @@ def relaunch_ghost(agent: ClassifiedAgent, db_path: Path) -> None:
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     drop_inbox_message(alert_payload)
-    print(f"  [relaunch] Alert dropped to inbox for agent {agent_id[:16]}...")
+    print(f"  [mark-failed] Alert dropped to inbox for agent {agent_id[:16]}...")
 
     # 2. Mark failed in DB
     mark_agent_failed(db_path, agent_id)
-    print(f"  [relaunch] Marked agent {agent_id[:16]}... as failed in DB")
+    print(f"  [mark-failed] Marked agent {agent_id[:16]}... as failed in DB")
 
     # 3. Drop subagent_result notification (dispatcher forwards to user)
-    result_payload = build_relaunch_inbox_message(agent)
+    result_payload = build_mark_failed_inbox_message(agent)
     drop_inbox_message(result_payload)
-    print(f"  [relaunch] Relaunch notification queued (task_id: {result_payload['task_id']})")
+    print(f"  [mark-failed] Notification queued (task_id: {result_payload['task_id']})")
 
 
-def relaunch_all_ghosts(confirmed: list[ClassifiedAgent], db_path: Path) -> None:
-    """Iterate confirmed ghosts and relaunch each one, reporting outcomes."""
+def mark_failed_all_ghosts(confirmed: list[ClassifiedAgent], db_path: Path) -> None:
+    """Iterate confirmed ghosts and mark each one failed, reporting outcomes."""
     if not confirmed:
-        print("\nNo GHOST_CONFIRMED agents to relaunch.")
+        print("\nNo GHOST_CONFIRMED agents to mark failed.")
         return
 
-    print(f"\nRelaunching {len(confirmed)} ghost agent(s)...")
+    print(f"\nMarking {len(confirmed)} ghost agent(s) as failed...")
     for agent in confirmed:
         label = agent.row.task_id or agent.row.description[:50]
         print(f"\n  Ghost: {agent.row.agent_id[:16]}... | {label}")
-        relaunch_ghost(agent, db_path)
+        mark_failed_ghost(agent, db_path)
 
     print(f"\nDone. {len(confirmed)} agent(s) marked failed; alerts queued for dispatcher.")
 
@@ -450,13 +450,13 @@ def parse_args() -> argparse.Namespace:
         help="Send Telegram alert if GHOST_CONFIRMED count > 0",
     )
     parser.add_argument(
-        "--relaunch",
+        "--mark-failed",
         action="store_true",
         help=(
             "For each GHOST_CONFIRMED agent: send a Telegram alert, mark the agent "
-            "as failed in agent_sessions.db, and queue a relaunch notification for "
-            "the dispatcher. Implies --alert behavior. The detector does not spawn a "
-            "new Claude process directly — it alerts the dispatcher who can re-spawn."
+            "as failed in agent_sessions.db, and queue a notification for the "
+            "dispatcher. The detector does not spawn a new Claude process directly — "
+            "it alerts the dispatcher who can decide whether to re-spawn."
         ),
     )
     return parser.parse_args()
@@ -485,8 +485,8 @@ def main() -> int:
 
     confirmed = [a for a in classified if a.classification == "GHOST_CONFIRMED"]
 
-    if args.relaunch:
-        relaunch_all_ghosts(confirmed, db_path)
+    if args.mark_failed:
+        mark_failed_all_ghosts(confirmed, db_path)
     elif args.alert and confirmed:
         send_alert(confirmed, report)
 
