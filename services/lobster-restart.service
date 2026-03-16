@@ -21,7 +21,3 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=lobster-restart
 
-[Install]
-# Not enabled as a persistent service — triggered on demand via:
-#   sudo systemctl start lobster-restart
-WantedBy=multi-user.target

@@ -978,6 +978,10 @@ main() {
             local stopped_epoch
             stopped_epoch=$(date -d "$stopped_at" +%s 2>/dev/null || echo 0)
             flag_age=$(( $(date +%s) - stopped_epoch ))
+        else
+            log_warn "Maintenance flag has no stopped_at field — treating as expired and removing."
+            rm -f "$MAINTENANCE_FLAG"
+            flag_age=$MAINTENANCE_EXPIRY_SECONDS
         fi
 
         if [[ $flag_age -lt $MAINTENANCE_EXPIRY_SECONDS ]]; then
