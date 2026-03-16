@@ -47,6 +47,5 @@ if reason is None:
 
 print(
     f"Warning: {tool} called inline by the dispatcher. {reason}",
-    file=sys.stderr,
 )
 sys.exit(1)

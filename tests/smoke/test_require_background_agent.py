@@ -7,8 +7,8 @@ for the full duration of the agent — potentially minutes.
 
 Test cases:
   A1. Agent with run_in_background: true  → exit 0, no output
-  A2. Agent with run_in_background: false → exit 1, warning on stderr
-  A3. Agent with run_in_background absent → exit 1, warning on stderr
+  A2. Agent with run_in_background: false → exit 1, warning on stdout
+  A3. Agent with run_in_background absent → exit 1, warning on stdout
   A4. Non-Agent tool call                 → exit 0, no output
 
 Failure modes by case:
@@ -49,7 +49,7 @@ def _run_hook(tool_name: str, tool_input: dict) -> subprocess.CompletedProcess:
 
 
 def test_background_agent_exits_zero():
-    """A1: Agent called with run_in_background=True → exit 0, no stderr warning.
+    """A1: Agent called with run_in_background=True → exit 0, no warning output.
 
     Failure mode: if the hook warns on correct usage, Claude gets pushed toward
     foreground calls, which is the opposite of what we want.
@@ -58,10 +58,10 @@ def test_background_agent_exits_zero():
 
     assert result.returncode == 0, (
         f"Expected exit 0 for background Agent, got {result.returncode}.\n"
-        f"stderr: {result.stderr!r}"
+        f"stdout: {result.stdout!r}"
     )
-    assert result.stderr.strip() == "", (
-        f"Expected no stderr for background Agent, got: {result.stderr!r}"
+    assert result.stdout.strip() == "", (
+        f"Expected no stdout for background Agent, got: {result.stdout!r}"
     )
 
 
@@ -71,7 +71,7 @@ def test_background_agent_exits_zero():
 
 
 def test_foreground_agent_explicit_false_warns():
-    """A2: Agent called with run_in_background=False → exit 1 with warning.
+    """A2: Agent called with run_in_background=False → exit 1 with warning on stdout.
 
     Failure mode: a silent hook here means Claude never sees that it is about
     to block the dispatcher's message-processing loop.
@@ -81,9 +81,9 @@ def test_foreground_agent_explicit_false_warns():
     assert result.returncode == 1, (
         f"Expected exit 1 (soft warning) for foreground Agent, got {result.returncode}."
     )
-    assert WARNING_FRAGMENT in result.stderr, (
+    assert WARNING_FRAGMENT in result.stdout, (
         f"Warning must mention '{WARNING_FRAGMENT}' so Claude knows what to fix.\n"
-        f"Got stderr: {result.stderr!r}"
+        f"Got stdout: {result.stdout!r}"
     )
 
 
@@ -93,7 +93,7 @@ def test_foreground_agent_explicit_false_warns():
 
 
 def test_foreground_agent_field_absent_warns():
-    """A3: Agent called without run_in_background field → exit 1 with warning.
+    """A3: Agent called without run_in_background field → exit 1 with warning on stdout.
 
     Omitting the field is the most common mistake; it must be treated the same
     as run_in_background: false.
@@ -105,8 +105,8 @@ def test_foreground_agent_field_absent_warns():
     assert result.returncode == 1, (
         f"Expected exit 1 when run_in_background is absent, got {result.returncode}."
     )
-    assert WARNING_FRAGMENT in result.stderr, (
-        f"Warning must mention '{WARNING_FRAGMENT}'.\nGot stderr: {result.stderr!r}"
+    assert WARNING_FRAGMENT in result.stdout, (
+        f"Warning must mention '{WARNING_FRAGMENT}'.\nGot stdout: {result.stdout!r}"
     )
 
 
@@ -126,9 +126,9 @@ def test_non_agent_tool_exits_zero():
 
         assert result.returncode == 0, (
             f"Expected exit 0 for non-Agent tool '{tool_name}', "
-            f"got {result.returncode}.\nstderr: {result.stderr!r}"
+            f"got {result.returncode}.\nstdout: {result.stdout!r}"
         )
-        assert result.stderr.strip() == "", (
-            f"Expected no stderr for non-Agent tool '{tool_name}', "
-            f"got: {result.stderr!r}"
+        assert result.stdout.strip() == "", (
+            f"Expected no stdout for non-Agent tool '{tool_name}', "
+            f"got: {result.stdout!r}"
         )

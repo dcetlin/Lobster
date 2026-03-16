@@ -6,8 +6,8 @@ WebSearch) that block the message-processing loop for the full duration of
 the request.
 
 Test cases:
-  B1. WebFetch called inline   → exit 1, warning on stderr mentioning WebFetch
-  B2. WebSearch called inline  → exit 1, warning on stderr mentioning WebSearch
+  B1. WebFetch called inline   → exit 1, warning on stdout mentioning WebFetch
+  B2. WebSearch called inline  → exit 1, warning on stdout mentioning WebSearch
   B3. Non-guarded tool call    → exit 0, no output
 
 Failure modes by case:
@@ -44,7 +44,7 @@ def _run_hook(tool_name: str, tool_input: dict | None = None) -> subprocess.Comp
 
 
 def test_webfetch_inline_warns():
-    """B1: WebFetch called inline → exit 1 with warning mentioning WebFetch.
+    """B1: WebFetch called inline → exit 1 with warning on stdout mentioning WebFetch.
 
     Failure mode: a silent hook here means the dispatcher can issue multi-second
     network requests inline, stalling the message loop with no indication to Claude.
@@ -54,11 +54,11 @@ def test_webfetch_inline_warns():
     assert result.returncode == 1, (
         f"Expected exit 1 (soft warning) for inline WebFetch, got {result.returncode}."
     )
-    assert "WebFetch" in result.stderr, (
-        f"Warning must mention 'WebFetch'.\nGot stderr: {result.stderr!r}"
+    assert "WebFetch" in result.stdout, (
+        f"Warning must mention 'WebFetch'.\nGot stdout: {result.stdout!r}"
     )
-    assert "background" in result.stderr.lower(), (
-        f"Warning should suggest using a background subagent.\nGot stderr: {result.stderr!r}"
+    assert "background" in result.stdout.lower(), (
+        f"Warning should suggest using a background subagent.\nGot stdout: {result.stdout!r}"
     )
 
 
@@ -68,7 +68,7 @@ def test_webfetch_inline_warns():
 
 
 def test_websearch_inline_warns():
-    """B2: WebSearch called inline → exit 1 with warning mentioning WebSearch.
+    """B2: WebSearch called inline → exit 1 with warning on stdout mentioning WebSearch.
 
     Failure mode: same as B1, but for search queries that can also take several
     seconds and block the dispatcher loop.
@@ -78,11 +78,11 @@ def test_websearch_inline_warns():
     assert result.returncode == 1, (
         f"Expected exit 1 (soft warning) for inline WebSearch, got {result.returncode}."
     )
-    assert "WebSearch" in result.stderr, (
-        f"Warning must mention 'WebSearch'.\nGot stderr: {result.stderr!r}"
+    assert "WebSearch" in result.stdout, (
+        f"Warning must mention 'WebSearch'.\nGot stdout: {result.stdout!r}"
     )
-    assert "background" in result.stderr.lower(), (
-        f"Warning should suggest using a background subagent.\nGot stderr: {result.stderr!r}"
+    assert "background" in result.stdout.lower(), (
+        f"Warning should suggest using a background subagent.\nGot stdout: {result.stdout!r}"
     )
 
 
@@ -110,9 +110,9 @@ def test_non_guarded_tool_exits_zero(tool_name: str):
 
     assert result.returncode == 0, (
         f"Expected exit 0 for non-guarded tool '{tool_name}', "
-        f"got {result.returncode}.\nstderr: {result.stderr!r}"
+        f"got {result.returncode}.\nstdout: {result.stdout!r}"
     )
-    assert result.stderr.strip() == "", (
-        f"Expected no stderr for non-guarded tool '{tool_name}', "
-        f"got: {result.stderr!r}"
+    assert result.stdout.strip() == "", (
+        f"Expected no stdout for non-guarded tool '{tool_name}', "
+        f"got: {result.stdout!r}"
     )

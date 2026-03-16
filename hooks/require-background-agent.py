@@ -33,6 +33,5 @@ print(
     "This blocks message processing for the duration of the agent. "
     "Pass run_in_background: true unless you genuinely need the result "
     "synchronously to decide your next step.",
-    file=sys.stderr,
 )
 sys.exit(1)
