@@ -37,7 +37,7 @@ TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%S.%6N)
 EPOCH_MS=$(date +%s%3N)
 MSG_ID="${EPOCH_MS}_cron_${JOB_NAME}"
 
-python3 - \
+uv run - \
     "${INBOX_DIR}/${MSG_ID}.json" \
     "${MSG_ID}" \
     "${TIMESTAMP}" \
