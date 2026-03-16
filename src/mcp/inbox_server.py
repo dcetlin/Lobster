@@ -2637,6 +2637,268 @@ async def handle_wait_for_messages(args: dict) -> list[TextContent]:
         observer.join(timeout=1)
 
 
+# ---------------------------------------------------------------------------
+# Follow-up compaction
+# ---------------------------------------------------------------------------
+
+NEGATION_MARKERS: list[str] = [
+    "actually",
+    "wait",
+    "no,",
+    "scratch that",
+    "instead",
+    "forget that",
+    "cancel",
+    "never mind",
+    "nevermind",
+    "disregard",
+    "ignore that",
+]
+
+# Maximum age gap between two messages for time-window compaction (seconds).
+_COMPACTION_WINDOW_S: int = 8
+
+
+def _find_original_message(message_id: int | str, chat_id: int | str) -> dict | None:
+    """Look up a message by Telegram message_id in inbox and processing directories.
+
+    Searches inbox/ then processing/ (not processed/) — we only compact when the
+    original message is still in queue, matching the Option 1 design decision.
+
+    Returns the message dict if found, None otherwise.
+    """
+    target_id = int(message_id) if str(message_id).isdigit() else None
+    if target_id is None:
+        return None
+
+    for search_dir in (INBOX_DIR, PROCESSING_DIR):
+        for f in search_dir.glob("*.json"):
+            try:
+                with open(f) as fp:
+                    candidate = json.load(fp)
+                # Match on Telegram message_id and same chat
+                if (
+                    candidate.get("telegram_message_id") == target_id
+                    and str(candidate.get("chat_id")) == str(chat_id)
+                ):
+                    candidate["_filename"] = f.name
+                    candidate["_filepath"] = str(f)
+                    return candidate
+            except Exception:
+                continue
+    return None
+
+
+def _has_negation_marker(text: str) -> bool:
+    """Return True if text begins with or contains a recognized negation marker."""
+    lowered = text.lower().strip()
+    return any(lowered.startswith(marker) or f" {marker}" in lowered for marker in NEGATION_MARKERS)
+
+
+def _seconds_between(ts1: str, ts2: str) -> float | None:
+    """Return absolute seconds between two ISO 8601 timestamps, or None on parse failure."""
+    try:
+        from datetime import timezone as _tz
+
+        def _parse(ts: str) -> datetime:
+            # Handle both aware and naive timestamps
+            try:
+                return datetime.fromisoformat(ts)
+            except ValueError:
+                # Strip trailing Z and treat as UTC
+                return datetime.fromisoformat(ts.rstrip("Z")).replace(tzinfo=_tz.utc)
+
+        t1 = _parse(ts1)
+        t2 = _parse(ts2)
+        # Make both timezone-aware if needed
+        if t1.tzinfo is None:
+            t1 = t1.replace(tzinfo=_tz.utc)
+        if t2.tzinfo is None:
+            t2 = t2.replace(tzinfo=_tz.utc)
+        return abs((t2 - t1).total_seconds())
+    except Exception:
+        return None
+
+
+def _build_compact_group(
+    original: dict,
+    follow_up: dict,
+    compact_reason: str,
+) -> dict:
+    """Merge two messages into a single compact_group message.
+
+    The compact_group message:
+    - carries type="compact_group"
+    - preserves both constituent messages verbatim under "messages"
+    - uses the follow-up's id, chat_id, source, timestamp as the envelope
+    - sets a plain-text "text" summary so callers that only read "text" see something useful
+    """
+    constituent_original = {
+        "id": original.get("id", ""),
+        "text": original.get("text", ""),
+        "timestamp": original.get("timestamp", ""),
+        "telegram_message_id": original.get("telegram_message_id"),
+    }
+    constituent_follow_up = {
+        "id": follow_up.get("id", ""),
+        "text": follow_up.get("text", ""),
+        "timestamp": follow_up.get("timestamp", ""),
+        "telegram_message_id": follow_up.get("telegram_message_id"),
+    }
+    return {
+        "id": f"compact_{int(time.time() * 1000)}",
+        "source": follow_up.get("source", "telegram"),
+        "type": "compact_group",
+        "chat_id": follow_up.get("chat_id"),
+        "user_id": follow_up.get("user_id"),
+        "username": follow_up.get("username"),
+        "user_name": follow_up.get("user_name"),
+        "messages": [constituent_original, constituent_follow_up],
+        "compact_reason": compact_reason,
+        "text": f"[Compact group: 2 messages merged]",
+        "timestamp": follow_up.get("timestamp", datetime.now(timezone.utc).isoformat()),
+        # Preserve telegram_message_id from the follow-up for reply threading
+        "telegram_message_id": follow_up.get("telegram_message_id"),
+        # Carry forward any reply_to context from the follow-up
+        "reply_to": follow_up.get("reply_to"),
+        # Internal bookkeeping: track which inbox files were consumed
+        "_filename": follow_up.get("_filename"),
+        "_original_filename": original.get("_filename"),
+        "_original_filepath": original.get("_filepath"),
+    }
+
+
+def _maybe_compact_follow_ups(messages: list[dict]) -> list[dict]:
+    """Merge follow-up correction messages with their originals into compact_group messages.
+
+    Two compaction signals are checked, in priority order:
+
+    1. Reply threading (primary): the follow-up has a reply_to.message_id pointing
+       to another message still in inbox/ or processing/.  When found, the two are
+       merged and the original is removed from the returned list.
+
+    2. Time window + negation marker (secondary): consecutive messages from the
+       same chat within _COMPACTION_WINDOW_S seconds where the later one starts
+       with a negation marker.
+
+    Only messages whose type is "text" participate in compaction.  System messages,
+    subagent results, voice notes, photos, etc. are passed through unchanged.
+
+    The original message is NOT written back — it remains on disk for the dispatcher
+    to mark_processed along with the compact_group.  The compact_group carries
+    _original_filepath so the dispatcher can clean up both files.
+
+    Returns a new list (same length or shorter) with compact_group messages
+    substituted where compaction occurred.
+    """
+    if len(messages) < 2:
+        return messages
+
+    # Build an index from telegram_message_id → position in messages list
+    # so we can quickly find the original when a reply arrives.
+    tg_id_to_index: dict[int, int] = {}
+    for i, msg in enumerate(messages):
+        tg_mid = msg.get("telegram_message_id")
+        if tg_mid is not None:
+            tg_id_to_index[int(tg_mid)] = i
+
+    # consumed: indices replaced by a compact_group (must be excluded from output).
+    # replacements: maps follow-up index → compact_group message to insert at that position.
+    consumed: set[int] = set()
+    replacements: dict[int, dict] = {}
+
+    for i, msg in enumerate(messages):
+        if i in consumed:
+            continue
+
+        msg_type = msg.get("type", "text")
+
+        # Only plain text messages participate in compaction
+        if msg_type != "text":
+            continue
+
+        # --- Signal 1: Reply threading ---
+        reply_to = msg.get("reply_to")
+        if reply_to:
+            orig_tg_id = reply_to.get("message_id") or reply_to.get("reply_to_message_id")
+            if orig_tg_id is not None:
+                orig_tg_id = int(orig_tg_id)
+                # Check if the original is already in the messages list
+                if orig_tg_id in tg_id_to_index:
+                    orig_idx = tg_id_to_index[orig_tg_id]
+                    if orig_idx not in consumed:
+                        original = messages[orig_idx]
+                        if original.get("type", "text") == "text":
+                            compact = _build_compact_group(original, msg, "reply_thread")
+                            consumed.add(orig_idx)
+                            consumed.add(i)
+                            replacements[i] = compact
+                            log.info(
+                                f"follow-up compaction: merged msg {original.get('id')} "
+                                f"+ {msg.get('id')} via reply_thread"
+                            )
+                            continue
+                else:
+                    # Original not in inbox — look it up on disk (inbox/ and processing/)
+                    original = _find_original_message(orig_tg_id, msg.get("chat_id", ""))
+                    if original and original.get("type", "text") == "text":
+                        compact = _build_compact_group(original, msg, "reply_thread")
+                        consumed.add(i)
+                        replacements[i] = compact
+                        log.info(
+                            f"follow-up compaction: merged on-disk msg {original.get('id')} "
+                            f"+ {msg.get('id')} via reply_thread"
+                        )
+                        continue
+
+        # --- Signal 2: Time window + negation marker ---
+        msg_text = msg.get("text", "")
+        if _has_negation_marker(msg_text):
+            # Find the most recent preceding message in the same chat
+            msg_chat = msg.get("chat_id")
+            msg_ts = msg.get("timestamp", "")
+            predecessor: dict | None = None
+            pred_idx: int | None = None
+            for j in range(i - 1, -1, -1):
+                if j in consumed:
+                    continue
+                cand = messages[j]
+                if cand.get("chat_id") != msg_chat:
+                    continue
+                if cand.get("type", "text") != "text":
+                    continue
+                gap = _seconds_between(cand.get("timestamp", ""), msg_ts)
+                if gap is not None and gap <= _COMPACTION_WINDOW_S:
+                    predecessor = cand
+                    pred_idx = j
+                break  # Only look at the nearest preceding message
+
+            if predecessor is not None and pred_idx is not None:
+                compact = _build_compact_group(predecessor, msg, "negation_marker")
+                consumed.add(pred_idx)
+                consumed.add(i)
+                replacements[i] = compact
+                log.info(
+                    f"follow-up compaction: merged msg {predecessor.get('id')} "
+                    f"+ {msg.get('id')} via negation_marker"
+                )
+                continue
+
+    # Second pass: build output, skipping consumed indices and inserting compact_groups
+    # at the position of the follow-up (higher index of each merged pair).
+    compacted: list[dict] = []
+    for i, msg in enumerate(messages):
+        if i in consumed and i not in replacements:
+            # This index was the original — absorbed into a compact_group at the follow-up's position
+            continue
+        if i in replacements:
+            compacted.append(replacements[i])
+        else:
+            compacted.append(msg)
+
+    return compacted
+
+
 async def handle_check_inbox(args: dict) -> list[TextContent]:
     """Check for new messages in inbox."""
     source_filter = args.get("source", "").lower()
@@ -2658,6 +2920,9 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
 
     if not messages:
         return [TextContent(type="text", text="📭 No new messages in inbox.")]
+
+    # Apply follow-up compaction before returning to the dispatcher
+    messages = _maybe_compact_follow_ups(messages)
 
     log.info(f"check_inbox returning {len(messages)} message(s)")
 
@@ -2688,6 +2953,11 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
         elif msg_type == "document":
             file_name = msg.get("file_name", "file")
             output += f"**[{source}]** 📎 from **{user}** ({file_name})\n"
+        elif msg_type == "compact_group":
+            reason = msg.get("compact_reason", "unknown")
+            constituent_msgs = msg.get("messages", [])
+            output += f"**[{source}]** [COMPACT GROUP ({reason})] from **{user}** — {len(constituent_msgs)} messages merged\n"
+            output += "dispatcher_hint: COMPACT_GROUP — read all constituent messages below and resolve what the user wants. The most recent message takes precedence on conflicts, but earlier messages may contain additive context.\n"
         elif msg_type in ("subagent_result", "subagent_error"):
             status_icon = "✅" if msg_type == "subagent_result" else "❌"
             label = "RESULT" if msg_type == "subagent_result" else "ERROR"
@@ -2740,27 +3010,41 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
                 output += f"Original name: {doc_file_name}\n\n"
             else:
                 output += f"**Attached file**: {doc_file_name} (file not downloaded)\n\n"
-        # Show full reply-to context if present
-        reply_to = msg.get("reply_to")
-        if reply_to:
-            reply_text = reply_to.get("reply_to_text") or reply_to.get("text")
-            reply_type = reply_to.get("reply_to_type", "text")
-            reply_msg_id = reply_to.get("reply_to_message_id") or reply_to.get("message_id")
-            reply_from = reply_to.get("reply_to_from_user") or reply_to.get("from_user")
-
-            # Build the reply header line
-            type_label = f" [{reply_type}]" if reply_type and reply_type != "text" else ""
-            from_label = f" from @{reply_from}" if reply_from else ""
-            id_label = f" (msg_id={reply_msg_id})" if reply_msg_id else ""
-            output += f"↩️ Replying to{type_label}{from_label}{id_label}:\n"
-
-            if reply_text:
-                # Display the full text, indented for visual clarity
-                indented = "\n".join(f"  {line}" for line in reply_text.splitlines())
+        # For compact_group messages: display constituent messages in order
+        if msg_type == "compact_group":
+            constituent_msgs = msg.get("messages", [])
+            for idx, cm in enumerate(constituent_msgs):
+                cm_text = cm.get("text", "(no text)")
+                cm_ts = cm.get("timestamp", "")
+                label = "Original" if idx == 0 else f"Follow-up {idx}"
+                output += f"**[{label}]** ({cm_ts})\n"
+                indented = "\n".join(f"  {line}" for line in cm_text.splitlines())
                 output += f"{indented}\n\n"
-            else:
-                output += f"  (no text content)\n\n"
-        output += f"> {text}\n\n"
+            orig_fp = msg.get("_original_filepath")
+            if orig_fp:
+                output += f"_original_filepath: `{orig_fp}` (mark_processed this file after handling)\n\n"
+        else:
+            # Show full reply-to context if present
+            reply_to = msg.get("reply_to")
+            if reply_to:
+                reply_text = reply_to.get("reply_to_text") or reply_to.get("text")
+                reply_type = reply_to.get("reply_to_type", "text")
+                reply_msg_id = reply_to.get("reply_to_message_id") or reply_to.get("message_id")
+                reply_from = reply_to.get("reply_to_from_user") or reply_to.get("from_user")
+
+                # Build the reply header line
+                type_label = f" [{reply_type}]" if reply_type and reply_type != "text" else ""
+                from_label = f" from @{reply_from}" if reply_from else ""
+                id_label = f" (msg_id={reply_msg_id})" if reply_msg_id else ""
+                output += f"↩️ Replying to{type_label}{from_label}{id_label}:\n"
+
+                if reply_text:
+                    # Display the full text, indented for visual clarity
+                    indented = "\n".join(f"  {line}" for line in reply_text.splitlines())
+                    output += f"{indented}\n\n"
+                else:
+                    output += f"  (no text content)\n\n"
+            output += f"> {text}\n\n"
 
     output += "---\n"
     output += "Use `send_reply` to respond, `mark_processed` when done."

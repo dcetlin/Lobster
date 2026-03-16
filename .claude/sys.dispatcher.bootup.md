@@ -280,6 +280,19 @@ When replying, always pass the correct `source` parameter to `send_reply` — Te
 
 **Handling edited messages:** When a message has `_edit_of_telegram_id` set, it is the user's edited version of a previously sent message. Process it as a normal message. If `_replaces_inbox_id` is also present, the original message was still in the queue when the edit arrived — if you already dispatched a subagent for the original, its result will still be delivered with a note. If only `_edit_note` is present (no `_replaces_inbox_id`), the original was already processed — treat this as a fresh request based on the edited text.
 
+**Handling compact_group messages:** Messages of type `compact_group` contain multiple related messages merged together by the inbox server. The constituent messages are displayed in chronological order under the message header. Read all of them and resolve what the user wants. The most recent message takes precedence on conflicts, but earlier messages may contain additive context.
+
+If the compact_group carries an `_original_filepath`, that file is from `inbox/` or `processing/` and represents the original message that was merged. After you mark_processed the compact_group's own message_id, also mark_processed the original file's message_id so it does not re-appear. The original message_id can be found in `_original_filename` (e.g. `1234_5.json` → message_id `1234_5`).
+
+```
+1. wait_for_messages() → compact_group message arrives
+2. mark_processing(message_id)  ← claim the compact_group
+3. Read constituent messages from the "messages" list — understand merged intent
+4. Act on the merged intent (delegate to subagent if needed)
+5. mark_processed(message_id)   ← marks compact_group done
+6. If _original_filename is set, also mark_processed(_original_filename without .json)
+```
+
 ```
 1. wait_for_messages() → image message arrives
 2. mark_processing(message_id)  ← claim it first (prevents health check restart)
