@@ -1286,6 +1286,16 @@ CONSOLIDATION_MARKER="# LOBSTER-NIGHTLY-CONSOLIDATION"
 success "Nightly consolidation configured (runs at 03:00 nightly)"
 
 #===============================================================================
+# Cron-to-Inbox Reminder System (post-reminder.sh)
+#===============================================================================
+
+step "Installing post-reminder.sh..."
+
+chmod +x "$INSTALL_DIR/scripts/post-reminder.sh" || true
+
+success "post-reminder.sh installed"
+
+#===============================================================================
 # OOM Kill Monitor
 #===============================================================================
 
@@ -1293,12 +1303,31 @@ step "Setting up OOM kill monitor..."
 
 chmod +x "$INSTALL_DIR/scripts/oom-monitor.py" || true
 
-# Add OOM monitor to crontab (runs every 10 minutes, debug-gated via LOBSTER_DEBUG=true)
+# Add OOM monitor to crontab (runs every 10 minutes via cron-to-inbox pattern).
+# post-reminder.sh drops a scheduled_reminder message into the dispatcher inbox;
+# the dispatcher spawns a lobster-generalist subagent to run oom-monitor.py.
 OOM_MARKER="# LOBSTER-OOM"
 (crontab -l 2>/dev/null | grep -v "$OOM_MARKER" | grep -v "oom-monitor" || true; \
- echo "*/10 * * * * LOBSTER_DEBUG=true uv run \$HOME/lobster/scripts/oom-monitor.py --since-minutes 10 $OOM_MARKER") | crontab -
+ echo "*/10 * * * * $INSTALL_DIR/scripts/post-reminder.sh oom_check $OOM_MARKER") | crontab -
 
-success "OOM kill monitor configured (runs every 10 minutes, active only when LOBSTER_DEBUG=true)"
+success "OOM kill monitor configured (runs every 10 minutes via cron-to-inbox)"
+
+#===============================================================================
+# Ghost Detector
+#===============================================================================
+
+step "Setting up ghost detector..."
+
+chmod +x "$INSTALL_DIR/scripts/ghost-detector.py" || true
+
+# Add ghost detector to crontab (runs every 15 minutes via cron-to-inbox pattern).
+# post-reminder.sh drops a scheduled_reminder message into the dispatcher inbox;
+# the dispatcher spawns a lobster-generalist subagent to run ghost-detector.py.
+GHOST_MARKER="# LOBSTER-GHOST-DETECTOR"
+(crontab -l 2>/dev/null | grep -v "$GHOST_MARKER" | grep -v "ghost-detector" || true; \
+ echo "*/15 * * * * $INSTALL_DIR/scripts/post-reminder.sh ghost_detector $GHOST_MARKER") | crontab -
+
+success "Ghost detector configured (runs every 15 minutes via cron-to-inbox)"
 
 #===============================================================================
 # Self-Check Reminder System
