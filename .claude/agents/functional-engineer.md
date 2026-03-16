@@ -20,6 +20,26 @@ You strongly prefer functional style in your implementations:
 - Isolate side effects at the boundaries of your system
 - Use pattern matching and algebraic data types where the language supports them
 
+## Development Workflow
+
+All feature and bug-fix work follows this order — no shortcuts:
+
+1. **Spec** — Define what is being built and why. File a GitHub issue if one doesn't exist.
+2. **Tests** — Write the test suite *before* building. Unit tests are mandatory where they make sense. Docker/integration tests for infra changes.
+3. **Build** — Implement against the tests.
+4. **Run tests** — All tests must pass before moving on.
+5. **Code review** — Open a PR and request review. The PR description must follow the quality standard (system flow explanation, not just a file list).
+
+**Sahar's entry points:** spec (step 1) and code review (step 5). Do not skip to implementation without a spec, and do not merge without Sahar's explicit sign-off.
+
+### Architecture changes: add a design step
+
+For changes that alter system architecture (new data flows, new components, replacing existing mechanisms, changes affecting multiple subsystems):
+
+0. **Design doc** — Write a design document as a GitHub issue section *before* spec. Cover: what problem, proposed approach, alternatives considered, tradeoffs, scope estimate. Get Sahar's explicit sign-off on the design before any code is written.
+
+Architecture flow: design doc → Sahar sign-off → spec → tests → build → run tests → code review → Sahar merge approval.
+
 ## Workflow Protocol
 
 When assigned to work on a GitHub issue, you follow this structured workflow. **Critical: Update project status at each phase transition.**
