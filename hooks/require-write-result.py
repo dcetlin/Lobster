@@ -54,21 +54,48 @@ def main():
 
     transcript = data.get("transcript", [])
 
-    tool_calls = []
+    # Collect all tool call items so we can inspect both name and input.
+    all_tool_use_items = []
     for msg in transcript:
         if isinstance(msg, dict):
             content = msg.get("content", [])
             if isinstance(content, list):
                 for item in content:
                     if isinstance(item, dict) and item.get("type") == "tool_use":
-                        tool_calls.append(item.get("name", ""))
+                        all_tool_use_items.append(item)
 
-    # If this session called write_result, mark it completed in the DB and allow exit.
-    if "mcp__lobster-inbox__write_result" in tool_calls:
-        session_id = get_session_id(data)
-        if session_id:
-            _mark_session_completed(session_id)
-        sys.exit(0)
+    tool_call_names = [item.get("name", "") for item in all_tool_use_items]
+
+    if "mcp__lobster-inbox__write_result" in tool_call_names:
+        # write_result was called — verify it was called with a non-null chat_id.
+        # chat_id=0 is explicitly allowed: it is the dispatcher system route for
+        # background agents that were spawned without a user chat_id.
+        write_result_items = [
+            item for item in all_tool_use_items
+            if item.get("name") == "mcp__lobster-inbox__write_result"
+        ]
+        valid_calls = [
+            item for item in write_result_items
+            if item.get("input", {}).get("chat_id") is not None
+        ]
+        if valid_calls:
+            # At least one valid call found — mark session and allow exit.
+            session_id = get_session_id(data)
+            if session_id:
+                _mark_session_completed(session_id)
+            sys.exit(0)
+        else:
+            # write_result was called but chat_id was None in every call —
+            # the MCP server rejected the call and the result was not stored.
+            print(
+                "STOP: write_result was called but chat_id was None in every call. "
+                "The MCP server rejects write_result without a chat_id, so your result "
+                "was not delivered. "
+                "Call write_result again with a valid chat_id. "
+                "If you were not given a user chat_id, use chat_id=0 — that is the "
+                "dispatcher system route for background agents with no user context."
+            )
+            sys.exit(2)
 
     # Subagent finished without calling write_result — block exit
     print(

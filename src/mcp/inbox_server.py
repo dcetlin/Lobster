@@ -4340,6 +4340,12 @@ async def handle_write_result(args: dict) -> list[TextContent]:
         return [TextContent(type="text", text="Error: task_id is required")]
     if chat_id is None:
         return [TextContent(type="text", text="Error: chat_id is required")]
+    # chat_id=0 is accepted as a dispatcher system route for background agents that
+    # were spawned without a user chat_id.  The message is written to the inbox with
+    # chat_id=0 and type="subagent_result" so wait_for_messages returns it to the
+    # dispatcher, which can log or store it rather than silently dropping it.
+    # This is intentionally distinct from real Telegram/Slack chat IDs (which are
+    # always positive integers or non-empty strings).
     if not text:
         return [TextContent(type="text", text="Error: text is required")]
 

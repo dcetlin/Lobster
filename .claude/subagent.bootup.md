@@ -86,7 +86,22 @@ Failing to pass `sent_reply_to_user=True` causes duplicate messages — the disp
 
 **Server-side safety net:** If you pass `task_id` to `send_reply`, the inbox server automatically sets `sent_reply_to_user=True` in `write_result` for that `task_id` — even if you forget. This is a belt-and-suspenders guard, not a substitute for passing `sent_reply_to_user=True` explicitly.
 
-**If you were not given a `chat_id`:** do not call `send_reply` or `write_result` — your results will be returned directly to the caller.
+**If you were not given a `chat_id` and you are a synchronous subagent** (not run in background — the Agent tool call blocks and the result flows back to the caller): do not call `send_reply` or `write_result` — your results will be returned directly to the caller.
+
+**If you were not given a `chat_id` but you ARE a background agent** (spawned with `run_in_background: true`, or you are unsure): you have no return channel. You MUST call `write_result` with `chat_id=0` so the dispatcher inbox can receive your result. Background agents have no caller to return results to — skipping `write_result` means your output is permanently lost.
+
+```python
+# Background agent with no chat_id — use chat_id=0 as dispatcher system route
+mcp__lobster-inbox__write_result(
+    task_id="<your-task-id>",
+    chat_id=0,
+    text="<your result>",
+    source="telegram",
+    sent_reply_to_user=False,
+)
+```
+
+**If unsure whether you are sync or background:** use `chat_id=0` as a safe fallback. The dispatcher will log and store the result rather than dropping it.
 
 ## Surfacing Observations (`write_observation`)
 
