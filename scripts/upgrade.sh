@@ -1144,23 +1144,6 @@ run_migrations() {
         fi
     fi
 
-    # Migration 13: Remove OOM monitor and ghost detector cron entries from existing installs.
-    # These were personal/temporary jobs that were never intended for general installs.
-    # They may have been installed by earlier versions of install.sh on this machine.
-    local crontab_changed=false
-    if crontab -l 2>/dev/null | grep -q "LOBSTER-OOM\|oom-monitor\|LOBSTER-GHOST-DETECTOR\|ghost-detector"; then
-        substep "Removing OOM monitor and ghost detector cron entries..."
-        (crontab -l 2>/dev/null \
-            | grep -v "# LOBSTER-OOM" \
-            | grep -v "oom-monitor" \
-            | grep -v "# LOBSTER-GHOST-DETECTOR" \
-            | grep -v "ghost-detector" \
-            || true) | crontab -
-        success "Removed OOM/ghost-detector cron entries"
-        crontab_changed=true
-        migrated=$((migrated + 1))
-    fi
-
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
