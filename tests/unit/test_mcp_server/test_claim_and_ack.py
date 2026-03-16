@@ -229,6 +229,43 @@ class TestClaimAndAck:
 
             assert raised, "Expected ValidationError when message_id is missing"
 
+    def test_partial_failure_when_ack_send_fails(self, dirs):
+        """When mark_processing succeeds but send_reply raises, returns Warning: prefix.
+
+        The message must remain in processing/ (no rollback — documented behaviour).
+        """
+        inbox, processing, outbox, sent = dirs
+        msg_id = self._write_inbox_message(inbox)
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+
+            with patch("src.mcp.inbox_server.handle_send_reply", side_effect=RuntimeError("network timeout")):
+                result = asyncio.run(handle_claim_and_ack({
+                    "message_id": msg_id,
+                    "ack_text": "On it.",
+                    "chat_id": 123456,
+                    "source": "telegram",
+                }))
+
+        # Partial-failure response starts with Warning:
+        assert result[0].text.startswith("Warning:"), (
+            f"Expected result text to start with 'Warning:', got: {result[0].text!r}"
+        )
+        assert "network timeout" in result[0].text, "Error detail should appear in Warning text"
+
+        # Message must remain in processing/ — no rollback
+        assert not (inbox / f"{msg_id}.json").exists(), "Message should not be back in inbox/"
+        assert (processing / f"{msg_id}.json").exists(), (
+            "Message must stay in processing/ when ack fails (no rollback)"
+        )
+
     def test_reply_to_message_id_forwarded_to_ack(self, dirs):
         """reply_to_message_id is passed through to the ack reply for Telegram threading."""
         inbox, processing, outbox, sent = dirs

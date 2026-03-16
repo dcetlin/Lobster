@@ -3719,8 +3719,8 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
         return [TextContent(
             type="text",
             text=(
-                f"Message claimed: {message_id} — but ack send failed: {e}\n"
-                "Message remains in processing/. Stale recovery will handle it."
+                f"Warning: message claimed but ack send failed: {e}\n"
+                f"Message {message_id} remains in processing/. Stale recovery will handle it."
             ),
         )]
 
