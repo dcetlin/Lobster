@@ -27,11 +27,20 @@ To close both rows we call session_end() with up to three identifiers:
      when the dispatcher set task_id in register_agent, or when the subagent uses
      a stable task_id that both parties know).
   b. The session_id from hook data (matches the auto-register stub by `id`).
+  c. The agentId extracted from transcript message entries (matches the `id`
+     column of the "proper" hex-agentId row registered by the dispatcher via
+     register_agent). This is the primary fix for background Tasks where
+     task_id is not set and session_id only matches the stub row.
 
-The proper hex-ID row is the primary target but is only reachable when
-task_id matches. When it is not reachable via this hook, the reconciler in
-inbox_server.py will close it when it detects stop_reason=end_turn in the
-output file.
+The proper hex-ID row is the primary target. Strategy (c) — extracting
+agentId from the transcript — is the most direct path to it. When it is
+also not reachable via this hook, the reconciler in inbox_server.py will
+close it when it detects stop_reason=end_turn in the output file.
+
+Defense-in-depth note: the dispatcher could also set task_id=<hex-agentId>
+in register_agent() calls so strategy (a) would also reach the proper row
+without needing the transcript extraction. That remains a recommended
+future improvement but is not required for this fix.
 """
 import json
 import sys
@@ -40,6 +49,24 @@ from pathlib import Path
 # Import shared session role utility.
 sys.path.insert(0, str(Path(__file__).parent))
 from session_role import is_dispatcher, get_session_id
+
+
+def _extract_agent_id_from_transcript(transcript: list) -> str | None:
+    """Extract the subagent's hex agentId from transcript message entries.
+
+    Every transcript message contains an "agentId" field — the hex identifier
+    that the dispatcher uses when it calls register_agent() and that becomes
+    the `id` column in agent_sessions.db. Extracting it here lets us close the
+    "proper" DB row even when task_id was not set by the dispatcher.
+
+    Returns the first valid agentId found (>= 8 hex chars), or None.
+    """
+    for msg in transcript:
+        if isinstance(msg, dict):
+            agent_id = msg.get("agentId")
+            if agent_id and isinstance(agent_id, str) and len(agent_id) >= 8:
+                return agent_id
+    return None
 
 
 def _extract_write_result_task_ids(all_tool_use_items: list) -> list[str]:
@@ -138,15 +165,22 @@ def main():
             #      hex-agentId row when task_id matches (id OR task_id column).
             #   2. session_id from hook data — reaches the auto-register stub
             #      row (id = session UUID).
+            #   3. agentId from transcript messages — directly reaches the
+            #      "proper" hex-agentId row by id, even when task_id was not
+            #      set by the dispatcher. This is the fix for the ghost agent
+            #      bug where background Tasks were never closed.
             #
             # All calls are idempotent, so calling the same id twice is safe.
             write_result_task_ids = _extract_write_result_task_ids(all_tool_use_items)
             session_id = get_session_id(data)
+            agent_id = _extract_agent_id_from_transcript(transcript)
 
             for tid in write_result_task_ids:
                 _mark_session_completed(tid)
             if session_id:
                 _mark_session_completed(session_id)
+            if agent_id:
+                _mark_session_completed(agent_id)
 
             sys.exit(0)
         else:
