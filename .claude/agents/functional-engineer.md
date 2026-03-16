@@ -90,6 +90,22 @@ git branch -d feature/issue-42-my-feature
 - Reference the issue in the PR description using keywords (Closes #XX, Fixes #XX, or Relates to #XX)
 - **Set "Main Board" project status to "In Review"** after PR is opened
 
+> **HARD RULE — REVIEW BEFORE NOTIFY**
+>
+> **YOU MUST POST A REVIEW TO THE PR BEFORE YOU CALL `send_reply` TO NOTIFY THE USER.**
+>
+> The rule: **open PR → post review → surface both together, never notify without review.**
+>
+> After opening the PR, run `gh pr review` to post an inline review comment:
+>
+> ```bash
+> gh pr review <PR_NUMBER> --repo <owner/repo> \
+>   --comment \
+>   --body "Automated self-review: [summary of approach, tradeoffs, anything the human reviewer should focus on]"
+> ```
+>
+> Only then call `send_reply`. If you skip the review and call `send_reply` first, you are violating this rule. There are no exceptions — even for trivial changes.
+
 **Writing the PR description:**
 
 A PR description is a communication artifact, not a changelog. Its audience is a maintainer reviewing on mobile who needs to answer one question: "Is this safe to merge?" Write for that person.
@@ -253,26 +269,35 @@ gh api repos/<owner>/<repo>/issues/<number>   # raw API if gh subcommand insuffi
 
 ## Reporting Results Back to the User
 
-**Always deliver results in two steps: call `send_reply` directly first, then call `write_result` with `sent_reply_to_user=True`.** This is crash-safe — the user gets the reply even if the dispatcher session has restarted.
+**HARD RULE: NEVER call `send_reply` before posting a review to the PR.** The required order is: **(1) open PR → (2) post review via `gh pr review` → (3) send_reply → (4) write_result)**. Skipping the review step is not allowed under any circumstances.
+
+Delivery is crash-safe: call `send_reply` first, then `write_result` with `sent_reply_to_user=True`, so the user gets the reply even if the dispatcher session has restarted.
 
 ```python
-# On success — after PR is opened (or work is done):
+# On success — REQUIRED ORDER: open PR → post review → THEN send_reply
+# DO NOT call send_reply before the review is posted to GitHub.
 
-# Step 1: deliver directly to the user
+# Step 1: post a self-review to the PR (REQUIRED before notifying user)
+# Use gh CLI:
+#   gh pr review <pr_number> --repo <owner/repo> --comment \
+#     --body "Self-review: <summary of approach, tradeoffs, areas to focus on>"
+# This must complete successfully before proceeding to Step 2.
+
+# Step 2: deliver directly to the user (ONLY after review is posted)
 mcp__lobster-inbox__send_reply(
     chat_id=chat_id,          # passed in the Task prompt
     text=(
-        f"Done! PR #{pr_number} is open for issue #{issue_number}.\n"
+        f"Done! PR #{pr_number} is open for issue #{issue_number} and has a self-review posted.\n"
         f"{pr_url}"
     ),
     source=source,            # passed in the Task prompt, default "telegram"
 )
 
-# Step 2: signal dispatcher to mark processed without re-delivering
+# Step 3: signal dispatcher to mark processed without re-delivering
 mcp__lobster-inbox__write_result(
     task_id=f"issue-{issue_number}",
     chat_id=chat_id,
-    text=f"Done! PR #{pr_number} open for issue #{issue_number}. {pr_url}",
+    text=f"Done! PR #{pr_number} open for issue #{issue_number}, self-review posted. {pr_url}",
     source=source,
     status="success",
     sent_reply_to_user=True,  # already delivered via send_reply above
