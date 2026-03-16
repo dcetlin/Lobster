@@ -959,10 +959,32 @@ Status: Restarted successfully"
 main() {
     acquire_lock
 
-    # Maintenance mode: lobster stop sets this flag to prevent auto-restart
+    # Maintenance mode: lobster stop sets this flag to prevent auto-restart.
+    # The flag expires after 1 hour so an unrecoverable crash (e.g. a failed
+    # `lobster restart`) doesn't permanently suppress alerting.  The flag file
+    # written by cmd_stop always contains "stopped_at=<ISO8601>", which we use
+    # to compute the age.  If the timestamp is absent or unreadable we treat the
+    # flag as fresh (safe default: respect maintenance windows of unknown age
+    # rather than breaking intentional stops, but log a warning).
     if [[ -f "$MAINTENANCE_FLAG" ]]; then
-        log_info "=== Maintenance mode active, skipping all checks ==="
-        exit 0
+        local stopped_at
+        stopped_at=$(grep -oP 'stopped_at=\K\S+' "$MAINTENANCE_FLAG" 2>/dev/null || true)
+        if [[ -n "$stopped_at" ]]; then
+            local flag_epoch now_epoch flag_age
+            flag_epoch=$(date -d "$stopped_at" +%s 2>/dev/null || echo 0)
+            now_epoch=$(date +%s)
+            flag_age=$(( now_epoch - flag_epoch ))
+            if [[ $flag_age -lt 3600 ]]; then
+                log_info "=== Maintenance mode active (flag age ${flag_age}s, expires in $(( 3600 - flag_age ))s), skipping all checks ==="
+                exit 0
+            else
+                log_warn "Maintenance flag is stale (age ${flag_age}s > 3600s limit) — treating as expired, resuming health checks"
+                rm -f "$MAINTENANCE_FLAG"
+            fi
+        else
+            log_warn "Maintenance flag present but has no stopped_at timestamp — respecting flag, skipping checks"
+            exit 0
+        fi
     fi
 
     log_info "=== Health check v3 starting ==="

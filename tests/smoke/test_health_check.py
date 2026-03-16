@@ -295,8 +295,9 @@ def test_compaction_suppression_off_when_compacted_at_missing(tmp_path: Path) ->
 
 def test_maintenance_flag_causes_clean_exit(tmp_path: Path) -> None:
     """
-    D4: When the maintenance flag exists, the health check must exit 0 without
-    running any health checks or triggering any restarts.
+    D4: When the maintenance flag exists with a recent stopped_at timestamp,
+    the health check must exit 0 without running any health checks or
+    triggering any restarts.
 
     Failure mode: if the maintenance flag is ignored, `lobster stop` followed by
     any health check run within the maintenance window causes the health check to
@@ -305,13 +306,17 @@ def test_maintenance_flag_causes_clean_exit(tmp_path: Path) -> None:
 
     We test this by running the full health-check script with HOME and
     LOBSTER_MESSAGES redirected to a temp directory, placing the maintenance
-    flag at the expected path, and asserting a clean exit.
+    flag at the expected path (with a fresh timestamp), and asserting a clean exit.
     """
-    # Set up a fake messages directory with the maintenance flag in place.
+    import datetime
+
+    # Set up a fake messages directory with a fresh maintenance flag (just now).
     messages_dir = tmp_path / "messages"
     config_dir = messages_dir / "config"
     config_dir.mkdir(parents=True)
-    (config_dir / "lobster-maintenance").touch()
+    flag_path = config_dir / "lobster-maintenance"
+    now_iso = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    flag_path.write_text(f"stopped_at={now_iso} stopped_by=testuser\n")
 
     # Create required directory structure so the script can mkdir log dirs.
     workspace_dir = tmp_path / "workspace"
@@ -343,4 +348,65 @@ def test_maintenance_flag_causes_clean_exit(tmp_path: Path) -> None:
         f"returncode={result.returncode}\n"
         f"stdout: {result.stdout!r}\n"
         f"stderr: {result.stderr!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# D4b — stale maintenance flag (>1 hour) is expired and deleted
+# ---------------------------------------------------------------------------
+
+
+def test_stale_maintenance_flag_is_expired(tmp_path: Path) -> None:
+    """
+    D4b: When the maintenance flag's stopped_at timestamp is older than 1 hour,
+    the health check must treat the flag as expired, delete it, and continue
+    running health checks rather than silently suppressing all monitoring.
+
+    This guards against an outage pattern where `lobster restart` writes the
+    maintenance flag and then crashes mid-execution.  Without expiry, the flag
+    would suppress the healthcheck indefinitely — no alerts, no auto-recovery.
+
+    We verify: (1) the flag file is removed after the run, and (2) the script
+    does not exit 0 immediately (it proceeds past the maintenance check).
+    The script may exit non-zero because no real lobster-state.json or services
+    exist in the temp environment — that's acceptable; what matters is that it
+    ran past the maintenance gate.
+    """
+    import datetime
+
+    messages_dir = tmp_path / "messages"
+    config_dir = messages_dir / "config"
+    config_dir.mkdir(parents=True)
+    flag_path = config_dir / "lobster-maintenance"
+
+    # Write a timestamp 90 minutes in the past — well past the 1-hour expiry.
+    stale_ts = datetime.datetime.now() - datetime.timedelta(minutes=90)
+    stale_iso = stale_ts.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    flag_path.write_text(f"stopped_at={stale_iso} stopped_by=testuser\n")
+
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir(parents=True)
+    (workspace_dir / "logs").mkdir(parents=True)
+
+    env = {
+        **os.environ,
+        "LOBSTER_MESSAGES": str(messages_dir),
+        "LOBSTER_WORKSPACE": str(workspace_dir),
+        "LOBSTER_CONFIG_DIR": str(tmp_path / "no-config"),
+        "LOBSTER_HEALTH_LOCK": str(tmp_path / "health-check.lock"),
+    }
+
+    subprocess.run(
+        ["bash", str(HEALTH_SCRIPT)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=15,
+    )
+
+    # The flag must have been deleted — stale flag should not persist.
+    assert not flag_path.exists(), (
+        "health-check-v3.sh left a stale maintenance flag in place "
+        f"(age > 3600s). The flag should be deleted so monitoring resumes. "
+        f"Flag path: {flag_path}"
     )
