@@ -161,24 +161,37 @@ Scheduled reminders are injected by `scripts/post-reminder.sh`, called from cron
 }
 ```
 
+**Routing table** — maps `reminder_type` to the subagent and prompt to use. Fallback for unknown types: `lobster-generalist`. Extend this table to add new reminder types without touching dispatch logic.
+
+```
+REMINDER_ROUTING = {
+  "ghost_detector": {
+    "subagent_type": "lobster-generalist",
+    "prompt": "Run the ghost detector check. Script is at ~/lobster/scripts/ghost-detector.py. "
+              "Run it with uv run ~/lobster/scripts/ghost-detector.py and report findings. "
+              "chat_id=0, source=system",
+  },
+  "oom_check": {
+    "subagent_type": "lobster-generalist",
+    "prompt": "Run the OOM monitor check. Script is at ~/lobster/scripts/oom-monitor.py. "
+              "Run it with uv run ~/lobster/scripts/oom-monitor.py --since-minutes 10 "
+              "and report findings. chat_id=0, source=system",
+  },
+  # Add new reminder types here. Fallback for unknown types: lobster-generalist.
+}
+```
+
 **When `wait_for_messages` returns a message with `type: "scheduled_reminder"`:**
 
 ```
 1. mark_processing(message_id)
-2. Read msg["reminder_type"]
-3. Spawn the appropriate subagent (run_in_background=True):
-   - "ghost_detector"  → subagent_type: "lobster-generalist"
-                         prompt: "Run the ghost detector check. Script is at
-                                  ~/lobster/scripts/ghost-detector.py. Run it with
-                                  uv run ~/lobster/scripts/ghost-detector.py and report
-                                  findings. chat_id=0, source=system"
-   - "oom_check"       → subagent_type: "lobster-generalist"
-                         prompt: "Run the OOM monitor check. Script is at
-                                  ~/lobster/scripts/oom-monitor.py. Run it with
-                                  uv run ~/lobster/scripts/oom-monitor.py --since-minutes 10
-                                  and report findings. chat_id=0, source=system"
-4. mark_processed(message_id)
-5. Return to wait_for_messages() immediately — no ack, no send_reply
+2. reminder_type = msg["reminder_type"]
+3. route = REMINDER_ROUTING.get(reminder_type, fallback_lobster_generalist)
+4. Spawn subagent (run_in_background=True):
+   - subagent_type: route["subagent_type"]
+   - prompt: route["prompt"]
+5. mark_processed(message_id)
+6. Return to wait_for_messages() immediately — no ack, no send_reply
 ```
 
 **Rules:**
