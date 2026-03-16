@@ -2690,9 +2690,13 @@ def _find_original_message(message_id: int | str, chat_id: int | str) -> dict | 
 
 
 def _has_negation_marker(text: str) -> bool:
-    """Return True if text begins with or contains a recognized negation marker."""
+    """Return True if text starts with a recognized negation marker.
+
+    Restricted to message-start to avoid false-positives like "I'll wait for you"
+    triggering compaction mid-sentence.
+    """
     lowered = text.lower().strip()
-    return any(lowered.startswith(marker) or f" {marker}" in lowered for marker in NEGATION_MARKERS)
+    return any(lowered.startswith(marker) for marker in NEGATION_MARKERS)
 
 
 def _seconds_between(ts1: str, ts2: str) -> float | None:
@@ -3021,8 +3025,13 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
                 indented = "\n".join(f"  {line}" for line in cm_text.splitlines())
                 output += f"{indented}\n\n"
             orig_fp = msg.get("_original_filepath")
+            orig_fn = msg.get("_original_filename")
             if orig_fp:
-                output += f"_original_filepath: `{orig_fp}` (mark_processed this file after handling)\n\n"
+                output += f"_original_filepath: `{orig_fp}` (mark_processed this file after handling)\n"
+            if orig_fn:
+                output += f"_original_filename: `{orig_fn}`\n"
+            if orig_fp or orig_fn:
+                output += "\n"
         else:
             # Show full reply-to context if present
             reply_to = msg.get("reply_to")

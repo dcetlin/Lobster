@@ -78,8 +78,16 @@ class TestHasNegationMarker:
     def test_leading_marker(self):
         assert _has_negation_marker("actually, forget it") is True
 
-    def test_embedded_marker(self):
+    def test_leading_wait_marker(self):
+        # "wait" appears at the start — should fire
         assert _has_negation_marker("wait, I meant something else") is True
+
+    def test_mid_sentence_wait_does_not_fire(self):
+        # "wait" buried mid-sentence should NOT trigger compaction (false-positive guard)
+        assert _has_negation_marker("I'll wait for you") is False
+
+    def test_mid_sentence_actually_does_not_fire(self):
+        assert _has_negation_marker("that's actually fine") is False
 
     def test_no_marker(self):
         assert _has_negation_marker("please do the task") is False
@@ -420,3 +428,21 @@ class TestCheckInboxCompactGroupDisplay:
 
         assert "2 new message" in text
         assert "compact_group" not in text.lower().replace("COMPACT_GROUP", "")
+
+    def test_compact_group_original_filename_present(self, inbox_dir: Path):
+        """check_inbox output for a compact_group must include _original_filename
+        so the dispatcher can extract message_id without parsing a filepath."""
+        now = datetime.now(timezone.utc)
+        orig = _text_msg("404_1", "Do the thing", timestamp=now.isoformat())
+        follow = _text_msg(
+            "404_2",
+            "actually cancel that",
+            timestamp=(now + timedelta(seconds=3)).isoformat(),
+        )
+        (inbox_dir / "404_1.json").write_text(json.dumps(orig))
+        (inbox_dir / "404_2.json").write_text(json.dumps(follow))
+
+        text = self._check_inbox(inbox_dir)
+
+        assert "_original_filename" in text
+        assert "404_1.json" in text
