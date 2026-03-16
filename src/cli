@@ -126,47 +126,63 @@ cmd_stop() {
 cmd_restart() {
     print_header "Restarting Lobster"
 
-    # Schedule the start as a detached systemd transient unit BEFORE stopping.
-    # This is necessary because lobster-claude runs inside the very tmux session
-    # that `systemctl stop lobster-claude` will kill — so cmd_stop would destroy
-    # this process before cmd_start ever ran.
+    # lobster restart must NOT call cmd_stop + cmd_start directly.
     #
-    # systemd-run schedules a oneshot unit that fires 2 seconds after now,
-    # completely independent of the calling process. The delay gives the stop
-    # time to complete cleanly before the start fires.
+    # lobster-claude runs inside the tmux session that IS the service. When Claude
+    # calls `lobster restart`, cmd_stop would execute `systemctl stop lobster-claude`
+    # which kills the tmux session — and this shell with it. cmd_start never runs.
     #
-    # Note: we do NOT write the maintenance flag here. cmd_stop writes it to
-    # tell the health check "don't auto-restart, I intentionally stopped this".
-    # During a restart that flag is wrong — we WANT the services back up.
-    # cmd_start already removes the flag, but only if it runs; by scheduling
-    # start before stop we guarantee it runs even if this process dies.
-    echo "Scheduling start via systemd-run in 2s..."
-    if ! sudo systemd-run --on-active=2s --unit=lobster-restart-oneshot \
-            /bin/bash -c "rm -f '${MAINTENANCE_FLAG}'; systemctl start lobster-router lobster-claude" \
-            2>/dev/null; then
-        echo -e "${RED}systemd-run failed — falling back to stop+start${NC}"
-        echo -e "${YELLOW}Warning: if running inside lobster-claude, the start may not execute.${NC}"
-        cmd_stop
-        sleep 1
-        cmd_start
+    # Additionally, cmd_stop writes the maintenance flag, which tells the healthcheck
+    # "don't auto-restart, this was intentional." During a restart that flag is
+    # wrong: we want the services back up. If the restart itself fails, a live
+    # maintenance flag will suppress healthcheck recovery indefinitely.
+    #
+    # Fix: delegate to lobster-restart.service, a systemd oneshot unit that runs
+    # as root outside the lobster-claude session. It performs the full stop+start
+    # sequence without writing the maintenance flag. Its execution is visible in
+    # journald under SyslogIdentifier=lobster-restart.
+    #
+    # Fallback: if the service isn't installed, use systemd-run --on-active=2s to
+    # schedule a transient oneshot that fires after this process dies.
+
+    # Primary: delegate to persistent lobster-restart.service
+    if systemctl list-unit-files lobster-restart.service &>/dev/null && \
+       sudo systemctl start lobster-restart 2>/dev/null; then
+        echo -e "${GREEN}Restart delegated to lobster-restart.service (out-of-process).${NC}"
+        echo "Services will stop and restart within ~5s."
+        echo "Check status with: lobster status"
         return
     fi
 
-    # Stop services without writing the maintenance flag.
-    # (We stop directly rather than calling cmd_stop so the flag is not set.)
-    echo "Stopping services..."
-    for service in "${SERVICES[@]}"; do
-        echo -n "Stopping $service... "
-        if sudo systemctl stop "$service" 2>/dev/null; then
-            echo -e "${GREEN}OK${NC}"
-        else
-            echo -e "${YELLOW}not running${NC}"
-        fi
-    done
+    # Fallback: schedule via systemd-run transient timer (fires 2s from now,
+    # independent of this process's lifetime).
+    echo "lobster-restart.service not available — scheduling via systemd-run..."
+    if sudo systemd-run --on-active=2s --unit=lobster-restart-oneshot \
+            /bin/bash -c "rm -f '${MAINTENANCE_FLAG}'; systemctl start lobster-router lobster-claude" \
+            2>/dev/null; then
+        echo "Stopping services (start will fire in ~2s)..."
+        for service in "${SERVICES[@]}"; do
+            echo -n "Stopping $service... "
+            if sudo systemctl stop "$service" 2>/dev/null; then
+                echo -e "${GREEN}OK${NC}"
+            else
+                echo -e "${YELLOW}not running${NC}"
+            fi
+        done
+        echo ""
+        echo -e "${GREEN}Services stopped. Start scheduled in ~2s (lobster-restart-oneshot).${NC}"
+        echo "Check status with: lobster status"
+        return
+    fi
 
-    echo ""
-    echo -e "${GREEN}Services stopped. Start scheduled in ~2s (lobster-restart-oneshot).${NC}"
-    echo "Check status with: lobster status"
+    # Last resort: synchronous stop+start. If running inside lobster-claude this
+    # will self-kill and cmd_start will not run. The healthcheck will recover after
+    # the maintenance flag expires (1 hour).
+    echo -e "${YELLOW}Warning: falling back to synchronous stop+start.${NC}"
+    echo -e "${YELLOW}If running inside lobster-claude, start may not execute.${NC}"
+    cmd_stop
+    sleep 1
+    cmd_start
 }
 
 cmd_status() {

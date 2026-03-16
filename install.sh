@@ -2417,6 +2417,15 @@ step "Installing systemd services..."
 sudo cp "$INSTALL_DIR/services/lobster-router.service" /etc/systemd/system/
 sudo cp "$INSTALL_DIR/services/lobster-claude.service" /etc/systemd/system/
 
+# Install the out-of-process restart helper service.
+# lobster-restart.service is a oneshot unit triggered by `lobster restart` when
+# lobster-claude is active. It performs stop+start outside the Claude tmux session
+# so that systemctl stop lobster-claude doesn't kill the process that issued the
+# restart command. This service is not enabled (no WantedBy persistent activation)
+# — it is triggered on demand via: sudo systemctl start lobster-restart
+sudo cp "$INSTALL_DIR/services/lobster-restart.service" /etc/systemd/system/
+info "Restart helper service installed (triggered by: lobster restart)"
+
 # Install Slack router service if generated
 if [ -f "$INSTALL_DIR/services/lobster-slack-router.service" ]; then
     sudo cp "$INSTALL_DIR/services/lobster-slack-router.service" /etc/systemd/system/

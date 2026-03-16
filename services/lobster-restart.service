@@ -1,0 +1,27 @@
+[Unit]
+Description=Lobster one-shot out-of-process restart
+# This service performs a full stop+start of lobster-claude and lobster-router
+# from outside those services, so that lobster restart can be safely called
+# even from within the lobster-claude tmux session (which systemctl stop would
+# otherwise kill before the start phase runs).
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+# Stop in reverse dependency order, start in forward order.
+# The sleep gives systemd time to fully tear down the tmux session before
+# the start command recreates it.
+ExecStart=/bin/bash -c "systemctl stop lobster-claude lobster-router; sleep 2; systemctl start lobster-router lobster-claude"
+RemainAfterExit=no
+# No automatic restart — if this oneshot fails, the healthcheck will recover.
+Restart=no
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lobster-restart
+
+[Install]
+# Not enabled as a persistent service — triggered on demand via:
+#   sudo systemctl start lobster-restart
+WantedBy=multi-user.target

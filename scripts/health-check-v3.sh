@@ -959,10 +959,34 @@ Status: Restarted successfully"
 main() {
     acquire_lock
 
-    # Maintenance mode: lobster stop sets this flag to prevent auto-restart
+    # Maintenance mode: lobster stop sets this flag to prevent auto-restart.
+    #
+    # The flag expires after MAINTENANCE_EXPIRY_SECONDS (default: 3600 = 1 hour).
+    # This ensures that a failed restart (which also sets the flag via cmd_stop)
+    # doesn't suppress recovery indefinitely. A human-initiated lobster stop is
+    # respected for up to one hour; after that the healthcheck resumes normal
+    # recovery so an accidental or failed stop doesn't cause an indefinite outage.
+    #
+    # The flag file contains "stopped_at=<ISO8601> stopped_by=<user>" — we parse
+    # stopped_at to compute the flag's age.
+    MAINTENANCE_EXPIRY_SECONDS="${MAINTENANCE_EXPIRY_SECONDS:-3600}"
     if [[ -f "$MAINTENANCE_FLAG" ]]; then
-        log_info "=== Maintenance mode active, skipping all checks ==="
-        exit 0
+        local stopped_at
+        stopped_at=$(grep -oP 'stopped_at=\K[^ ]+' "$MAINTENANCE_FLAG" 2>/dev/null || true)
+        local flag_age=0
+        if [[ -n "$stopped_at" ]]; then
+            local stopped_epoch
+            stopped_epoch=$(date -d "$stopped_at" +%s 2>/dev/null || echo 0)
+            flag_age=$(( $(date +%s) - stopped_epoch ))
+        fi
+
+        if [[ $flag_age -lt $MAINTENANCE_EXPIRY_SECONDS ]]; then
+            log_info "=== Maintenance mode active (flag age: ${flag_age}s / expiry: ${MAINTENANCE_EXPIRY_SECONDS}s), skipping all checks ==="
+            exit 0
+        else
+            log_warn "Maintenance flag is stale (age: ${flag_age}s, expiry: ${MAINTENANCE_EXPIRY_SECONDS}s) — treating as expired and resuming normal checks"
+            rm -f "$MAINTENANCE_FLAG"
+        fi
     fi
 
     log_info "=== Health check v3 starting ==="
