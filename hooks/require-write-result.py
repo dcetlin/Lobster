@@ -55,13 +55,17 @@ def main():
     transcript = data.get("transcript", [])
 
     tool_calls = []
+    text_content_parts = []
     for msg in transcript:
         if isinstance(msg, dict):
             content = msg.get("content", [])
             if isinstance(content, list):
                 for item in content:
-                    if isinstance(item, dict) and item.get("type") == "tool_use":
-                        tool_calls.append(item.get("name", ""))
+                    if isinstance(item, dict):
+                        if item.get("type") == "tool_use":
+                            tool_calls.append(item.get("name", ""))
+                        elif item.get("type") == "text":
+                            text_content_parts.append(item.get("text", ""))
 
     # If this session called write_result, mark it completed in the DB and allow exit.
     if "mcp__lobster-inbox__write_result" in tool_calls:
@@ -70,13 +74,26 @@ def main():
             _mark_session_completed(session_id)
         sys.exit(0)
 
-    # Subagent finished without calling write_result — block exit
-    print(
-        "STOP: You must call mcp__lobster-inbox__write_result before finishing. "
-        "The dispatcher is waiting for your result. "
-        "If the task failed, report the failure — but you must call write_result. "
-        "Call it now with your findings, then you may exit."
-    )
+    # Subagent finished without calling write_result — block exit.
+    # Check whether write_result appeared as text output (pseudocode failure mode)
+    # to give a more actionable error message.
+    combined_text = "\n".join(text_content_parts)
+    if "mcp__lobster-inbox__write_result" in combined_text:
+        print(
+            "STOP: write_result was described as text but not called as a tool.\n\n"
+            "The tool call appeared in your text output as Python code — this is a "
+            "description, not an invocation. You must call write_result using the tool "
+            "invocation mechanism (the same way you call Read, Edit, Bash, etc.) — not "
+            "by writing it as code output.\n\n"
+            "Call write_result now using the tool mechanism."
+        )
+    else:
+        print(
+            "STOP: You must call mcp__lobster-inbox__write_result before finishing. "
+            "The dispatcher is waiting for your result. "
+            "If the task failed, report the failure — but you must call write_result. "
+            "Call it now with your findings, then you may exit."
+        )
     sys.exit(2)  # Exit 2 to hard-block the session from terminating
 
 

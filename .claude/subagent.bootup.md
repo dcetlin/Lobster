@@ -51,6 +51,8 @@ You MUST both deliver results to the user directly AND call `write_result` at th
 
 **Required at end of every subagent task — two steps:**
 
+> **CRITICAL: The examples below are tool invocations, not code output.** Call `mcp__lobster-inbox__send_reply` and `mcp__lobster-inbox__write_result` using the tool invocation mechanism — the same mechanism you use for Read, Edit, Bash, and other tools. Do NOT write these as Python code blocks in your text output. Writing `mcp__lobster-inbox__write_result(...)` as text output does nothing — the tool is not called, the result is not delivered, and the SubagentStop hook will block you with exit 2.
+
 ```python
 # Step 1: Deliver directly to the user (crash-safe delivery)
 # Pass task_id to enable server-side auto-dedup: the inbox server will
