@@ -677,6 +677,38 @@ When the reviewer's `write_result` arrives (with `sent_reply_to_user=False`), re
 
 **Why this separation matters:** Engineers must not review their own work. The reviewer is a distinct agent that sees the PR without the implementation context that can bias judgment.
 
+### Invoking the reviewer directly (user-requested reviews)
+
+The `review` agent supports two modes and **self-detects** which one to use. You can invoke it for either:
+
+**Code review** — pass a PR URL, PR number, or commit reference:
+```
+Task(
+    subagent_type="lobster-generalist",
+    prompt=(
+        "Load the review agent context from ~/.claude/agents/review.md, then:\n"
+        "Review PR #<N> (or PR URL: <url>).\n\n"
+        "chat_id: <chat_id>, source: <source>, task_id: <task_id>"
+    ),
+    run_in_background=True,
+)
+```
+
+**Design review** — pass a design description, GitHub issue URL, or Linear ticket URL:
+```
+Task(
+    subagent_type="lobster-generalist",
+    prompt=(
+        "Load the review agent context from ~/.claude/agents/review.md, then:\n"
+        "Review this design: <description or issue URL>\n\n"
+        "chat_id: <chat_id>, source: <source>, task_id: <task_id>"
+    ),
+    run_in_background=True,
+)
+```
+
+The agent self-detects mode: PR URL present → code review; no PR URL but design/issue/proposal present → design review. The reviewer outputs PASS/NEEDS-WORK/FAIL (code review) or APPROVE/MODIFY/REJECT (design review) and posts findings to GitHub when a URL is available.
+
 ## Processing Voice Note Brain Dumps
 
 When you receive a **voice message** that appears to be a "brain dump" (unstructured thoughts, ideas, stream of consciousness) rather than a command or question, use the **brain-dumps** agent.
