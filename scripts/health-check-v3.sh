@@ -985,6 +985,19 @@ Manual intervention required:
         log_info "systemctl stop: $line"
     done
 
+    # Explicitly kill the old Claude PID if it is still alive after systemctl stop.
+    # When the tmux socket is stale, ExecStop ("tmux kill-session") exits non-zero
+    # but systemd swallows the failure — the service transitions to inactive and
+    # systemctl stop returns 0, but the old process is never killed. Without this
+    # guard, the new session starts and two dispatchers run concurrently, causing
+    # duplicate message processing and corrupted inbox state.
+    if [[ -n "$pre_restart_pid" ]] && kill -0 "$pre_restart_pid" 2>/dev/null; then
+        log_warn "ExecStop did not kill PID $pre_restart_pid — sending SIGTERM"
+        kill "$pre_restart_pid" 2>/dev/null || true
+        sleep 2
+        kill -0 "$pre_restart_pid" 2>/dev/null && kill -9 "$pre_restart_pid" 2>/dev/null || true
+    fi
+
     # Clean up the socket only if stop left it behind.
     # A successful ExecStop removes it via tmux kill-session; if stop failed or
     # the socket was already stale, we clean it up here so ExecStart can bind.
