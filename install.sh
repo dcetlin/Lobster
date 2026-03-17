@@ -1655,6 +1655,27 @@ else
     info "Skipping post-compact-gate hook (settings.json not yet created)"
 fi
 
+# Set up Claude Code PreToolUse hook to warn when outgoing messages contain secrets
+chmod +x "$INSTALL_DIR/hooks/secret-scanner.py" || true
+if [ -f "$CLAUDE_SETTINGS" ]; then
+    if ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("secret-scanner"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
+        TMP_SETTINGS=$(mktemp)
+        jq '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
+            "matcher": "mcp__lobster-inbox__send_reply|mcp__github__|Bash",
+            "hooks": [{
+                "type": "command",
+                "command": "python3 '"$INSTALL_DIR"'/hooks/secret-scanner.py",
+                "timeout": 5
+            }]
+        }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+        success "secret-scanner hook installed (warn mode)"
+    else
+        info "secret-scanner hook already configured in Claude Code settings"
+    fi
+else
+    info "Skipping secret-scanner hook (settings.json not yet created)"
+fi
+
 # Set up Claude Code SessionStart hook to write the dispatcher session ID
 # This enables hooks to reliably distinguish dispatcher from subagent sessions.
 chmod +x "$INSTALL_DIR/hooks/write-dispatcher-session-id.py" || true
