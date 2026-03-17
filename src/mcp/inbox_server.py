@@ -2896,43 +2896,72 @@ async def _handle_report_slash_command(msg: dict, msg_file: Path) -> None:
 def _get_owner_chat_id_and_source() -> tuple[int | str | None, str]:
     """Return (owner_chat_id, source) for delivering recovery notifications.
 
-    Reads from config.env using the same logic as _resolve_debug_config().
-    Prefers Slack when LOBSTER_ENABLE_SLACK=true, otherwise falls back to
-    the first entry in TELEGRAM_ALLOWED_USERS.
+    Resolution order:
+      1. config.env — LOBSTER_ENABLE_SLACK / LOBSTER_SLACK_ALLOWED_CHANNELS
+         and TELEGRAM_ALLOWED_USERS (same logic as _resolve_debug_config())
+      2. Environment variables — TELEGRAM_ALLOWED_USERS and
+         LOBSTER_SLACK_ALLOWED_CHANNELS as a fallback for environments where
+         config.env is absent or incomplete (e.g. CI, test runners).
 
-    Returns (None, "telegram") when the owner's chat_id cannot be resolved.
+    Returns (None, "telegram") with a logged warning when the owner's
+    chat_id cannot be resolved from either source.
     """
     try:
-        config_file = _CONFIG_DIR / "config.env"
-        if not config_file.exists():
-            return None, "telegram"
-
         slack_enabled = False
         slack_channel: str | None = None
         telegram_chat_id: int | None = None
 
-        for line in config_file.read_text().splitlines():
-            stripped = line.strip()
-            if stripped.startswith("TELEGRAM_ALLOWED_USERS="):
-                val = stripped.split("=", 1)[1].strip().strip('"').strip("'")
-                first = val.split(",")[0].strip()
-                if first.lstrip("-").isdigit():
-                    telegram_chat_id = int(first)
-            elif stripped.startswith("LOBSTER_ENABLE_SLACK="):
-                val = stripped.split("=", 1)[1].strip().strip('"').strip("'").lower()
-                slack_enabled = val == "true"
-            elif stripped.startswith("LOBSTER_SLACK_ALLOWED_CHANNELS="):
-                val = stripped.split("=", 1)[1].strip().strip('"').strip("'")
-                first_chan = val.split(",")[0].strip()
-                if first_chan:
-                    slack_channel = first_chan
+        config_file = _CONFIG_DIR / "config.env"
+        if config_file.exists():
+            for line in config_file.read_text().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("TELEGRAM_ALLOWED_USERS="):
+                    val = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+                    first = val.split(",")[0].strip()
+                    if first.lstrip("-").isdigit():
+                        telegram_chat_id = int(first)
+                elif stripped.startswith("LOBSTER_ENABLE_SLACK="):
+                    val = stripped.split("=", 1)[1].strip().strip('"').strip("'").lower()
+                    slack_enabled = val == "true"
+                elif stripped.startswith("LOBSTER_SLACK_ALLOWED_CHANNELS="):
+                    val = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+                    first_chan = val.split(",")[0].strip()
+                    if first_chan:
+                        slack_channel = first_chan
+
+        # Env var fallback: used when config.env is absent or the relevant
+        # vars were not set there (e.g. CI / test environments).
+        if telegram_chat_id is None:
+            env_users = os.environ.get("TELEGRAM_ALLOWED_USERS", "").strip().strip('"').strip("'")
+            first = env_users.split(",")[0].strip() if env_users else ""
+            if first.lstrip("-").isdigit():
+                telegram_chat_id = int(first)
+
+        if not slack_channel:
+            env_chans = os.environ.get("LOBSTER_SLACK_ALLOWED_CHANNELS", "").strip().strip('"').strip("'")
+            first_chan = env_chans.split(",")[0].strip() if env_chans else ""
+            if first_chan:
+                slack_channel = first_chan
+
+        if not slack_enabled:
+            env_slack = os.environ.get("LOBSTER_ENABLE_SLACK", "").strip().lower()
+            slack_enabled = env_slack == "true"
 
         if slack_enabled and slack_channel:
             return slack_channel, "slack"
         if telegram_chat_id is not None:
             return telegram_chat_id, "telegram"
+
+        log.warning(
+            "_get_owner_chat_id_and_source: owner chat_id not resolvable from "
+            "config.env or environment variables"
+        )
         return None, "telegram"
     except Exception:
+        log.warning(
+            "_get_owner_chat_id_and_source: unexpected error resolving owner chat_id",
+            exc_info=True,
+        )
         return None, "telegram"
 
 
