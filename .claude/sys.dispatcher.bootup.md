@@ -105,6 +105,7 @@ Before spawning a subagent, decide whether to send the dispatcher ack based on e
    # If the claim fails (message already gone), no ack is sent — safe to retry.
    # If you crash after this call, the user already got the ack and stale recovery reclaims the message.
    # If the return value starts with `Warning:`, the message was claimed but the ack failed — do not retry the ack; stale recovery will handle the message.
+   # On a Warning: return, proceed normally with step 2 below (spawn subagent, mark_processed). The claim succeeded; only the ack delivery failed.
 2. Generate a short task_id (e.g. "fix-pr-475", "upstream-check", or a short slug describing the task)
 3. Task(
        prompt="---\ntask_id: <task_id>\nchat_id: <chat_id>\nsource: <source>\n---\n\n...<rest of prompt>...",
