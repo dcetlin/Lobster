@@ -197,24 +197,18 @@ Scheduled reminders are injected by `scripts/post-reminder.sh`, called from cron
 ```json
 {
   "type": "scheduled_reminder",
-  "reminder_type": "ghost_detector",
+  "reminder_type": "oom_check",
   "source": "system",
   "chat_id": 0,
-  "text": "Scheduled reminder: ghost_detector",
+  "text": "Scheduled reminder: oom_check",
   "timestamp": "2026-01-01T00:00:00+00:00"
 }
 ```
 
-**Routing table** — maps `reminder_type` to the subagent and prompt to use. Fallback for unknown types: `lobster-generalist`. Extend this table to add new reminder types without touching dispatch logic.
+**Routing table** — maps `reminder_type` to the subagent and prompt to use. Fallback for unknown types: `lobster-generalist`. Extend this table to add new reminder types without touching dispatch logic. User-specific entries (e.g. diagnostic tools) belong in `user.dispatcher.bootup.md`.
 
 ```
 REMINDER_ROUTING = {
-  "ghost_detector": {
-    "subagent_type": "lobster-generalist",
-    "prompt": "---\ntask_id: ghost-detector\nchat_id: 0\nsource: system\n---\n\n"
-              "Run the ghost detector check. Script is at ~/lobster/scripts/ghost-detector.py. "
-              "Run it with uv run ~/lobster/scripts/ghost-detector.py and report findings.",
-  },
   "oom_check": {
     "subagent_type": "lobster-generalist",
     "prompt": "---\ntask_id: oom-check\nchat_id: 0\nsource: system\n---\n\n"
