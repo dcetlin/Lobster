@@ -162,8 +162,17 @@ def _ensure_observation_worker() -> None:
 
 
 def _queue_observation(msg_text: str, msg_id: str, source: str | None = None, ts: str | None = None) -> None:
-    """Non-blocking: enqueue a message for background observation. Drops if full."""
+    """Non-blocking: enqueue a message for background observation. Drops if full.
+
+    Guard: skip debug/system messages so tier 1 signal extraction never fires on
+    its own output (which would create an infinite debug-observation loop).
+    """
     if _user_model is None:
+        return
+    # Skip messages that are system/debug output — not real user content.
+    # The [debug|...] prefix is written by _emit_debug_observation; source="system"
+    # and chat_id=0 are markers used by internal synthetic messages.
+    if msg_text.startswith("[debug|"):
         return
     try:
         _observation_queue.put_nowait((msg_text, msg_id, source, ts))
@@ -3105,7 +3114,8 @@ async def handle_mark_processing(args: dict) -> list[TextContent]:
     msg_text = msg_data.get("text", "") or msg_data.get("transcription", "")
     msg_type = msg_data.get("type", "")
     _SKIP_OBSERVATION_TYPES = (
-        "subagent_result", "subagent_error", "self_check", "subagent_observation"
+        "subagent_result", "subagent_error", "self_check", "subagent_observation",
+        "debug_observation",  # never run tier 1 on our own debug output (would loop)
     )
     if msg_text and msg_type not in _SKIP_OBSERVATION_TYPES:
         _queue_observation(
