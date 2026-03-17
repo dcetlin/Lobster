@@ -666,6 +666,12 @@ setup_syncthing() {
         fi
     fi
 
+    # Skip prompt if not running interactively (cron, unattended upgrades, etc.)
+    if ! [ -t 0 ]; then
+        info "Non-interactive environment detected — skipping Syncthing setup (run with --skip-syncthing to suppress this message, or install manually)"
+        return 0
+    fi
+
     # Prompt - this is the only interactive part
     echo ""
     echo -e "${YELLOW}${BOLD}LobsterDrop${NC} uses Syncthing to sync files between your phone/laptop and this server."
