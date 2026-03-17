@@ -1304,6 +1304,25 @@ with open(path, 'w') as f:
         fi
     fi
 
+    # Migration 18: Fix sqlite-vec aarch64 ELFCLASS32 bug (0.1.6 ships a 32-bit ARM .so)
+    # sqlite-vec 0.1.6 manylinux_aarch64 wheel incorrectly bundles a 32-bit ARM binary.
+    # Installs that ran `uv sync` before this fix will have the broken wheel. Detect the
+    # failure and reinstall to >=0.1.7a1 which ships a proper 64-bit aarch64 binary.
+    if ! "$VENV_DIR/bin/python" -c \
+        "import sqlite3, sqlite_vec; c=sqlite3.connect(':memory:'); c.enable_load_extension(True); sqlite_vec.load(c)" \
+        2>/dev/null; then
+        substep "sqlite-vec fails to load — reinstalling (fixes aarch64 ELFCLASS32 regression in 0.1.6)..."
+        uv pip install --quiet "sqlite-vec>=0.1.7a1" 2>/dev/null || true
+        if "$VENV_DIR/bin/python" -c \
+            "import sqlite3, sqlite_vec; c=sqlite3.connect(':memory:'); c.enable_load_extension(True); sqlite_vec.load(c)" \
+            2>/dev/null; then
+            success "sqlite-vec reinstalled and loads correctly (semantic memory restored)"
+            migrated=$((migrated + 1))
+        else
+            warn "sqlite-vec reinstall failed — semantic memory search will be unavailable"
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
