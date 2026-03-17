@@ -1280,6 +1280,7 @@ with open(path, 'w') as f:
     # registered under Stop (which hit the dispatcher) as well as SubagentStop.
     # The is_dispatcher() guard in the hook was a band-aid for this misregistration.
     # Fix: remove the entry from Stop[], leave it only under SubagentStop.
+    local CLAUDE_SETTINGS="$HOME/.claude/settings.json"
     if [ -f "$CLAUDE_SETTINGS" ] && command -v jq >/dev/null 2>&1; then
         local stop_has_write_result
         stop_has_write_result=$(jq -r '
