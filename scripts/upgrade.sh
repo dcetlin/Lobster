@@ -1070,7 +1070,7 @@ run_migrations() {
         fi
     fi
 
-    # Migration 10: Rename bootup files to sys.*/user.* naming convention
+    # Migration 10: Rename bootup files to sys.*/user.* naming convention (phase 1)
     # Must run BEFORE Migration 11 (stub creation) so that existing populated files are
     # renamed into place before Migration 11 would create empty stubs at the new names.
     # System files (.claude/ in workspace): dispatcher.bootup.md -> sys.dispatcher.bootup.md, subagent.bootup.md -> sys.subagent.bootup.md
@@ -1110,6 +1110,8 @@ run_migrations() {
 
     # Migration 11: Create stub agent files in lobster-user-config if missing
     # Runs after Migration 10 so that files renamed into place are not clobbered by empty stubs.
+    # NOTE: stub names here still use the intermediate user.*.bootup.md form intentionally —
+    # Migration 15 (below) will rename them to the final user.*.md form on existing installs.
     mkdir -p "$USER_CONFIG_DIR/agents/subagents"
     for stub_file in "user.base.bootup.md" "user.base.context.md" "user.dispatcher.bootup.md" "user.subagent.bootup.md"; do
         stub_dest="$USER_CONFIG_DIR/agents/$stub_file"
@@ -1169,6 +1171,48 @@ run_migrations() {
         substep "Removed orphan agents.db from $WORKSPACE_DIR/data/ (empty file, not used by any code)"
         migrated=$((migrated + 1))
     fi
+
+    # Migration 15: Complete sys.*/user.* rename — drop .bootup. from filenames (phase 2)
+    # Phase 1 (Migration 10) added the sys./user. prefix; phase 2 removes the .bootup. infix.
+    # System files in workspace .claude/ (symlinked from repo): rename via the symlink target.
+    # These are controlled by the repo, so git mv handles them on fresh pulls, but the
+    # workspace symlink may still point to the old filename on existing installs.
+    if [ -f "$ws_claude_dir/sys.dispatcher.bootup.md" ] && [ ! -s "$ws_claude_dir/sys.dispatcher.md" ]; then
+        mv "$ws_claude_dir/sys.dispatcher.bootup.md" "$ws_claude_dir/sys.dispatcher.md"
+        substep "Renamed .claude/sys.dispatcher.bootup.md -> .claude/sys.dispatcher.md"
+        migrated=$((migrated + 1))
+    fi
+    if [ -f "$ws_claude_dir/sys.subagent.bootup.md" ] && [ ! -s "$ws_claude_dir/sys.subagent.md" ]; then
+        mv "$ws_claude_dir/sys.subagent.bootup.md" "$ws_claude_dir/sys.subagent.md"
+        substep "Renamed .claude/sys.subagent.bootup.md -> .claude/sys.subagent.md"
+        migrated=$((migrated + 1))
+    fi
+    # User-config files: rename user.*.bootup.md -> user.*.md
+    local agents_dir15="$USER_CONFIG_DIR/agents"
+    if [ -f "$agents_dir15/user.base.bootup.md" ] && [ ! -s "$agents_dir15/user.base.md" ]; then
+        mv "$agents_dir15/user.base.bootup.md" "$agents_dir15/user.base.md"
+        substep "Renamed agents/user.base.bootup.md -> agents/user.base.md"
+        migrated=$((migrated + 1))
+    fi
+    if [ -f "$agents_dir15/user.dispatcher.bootup.md" ] && [ ! -s "$agents_dir15/user.dispatcher.md" ]; then
+        mv "$agents_dir15/user.dispatcher.bootup.md" "$agents_dir15/user.dispatcher.md"
+        substep "Renamed agents/user.dispatcher.bootup.md -> agents/user.dispatcher.md"
+        migrated=$((migrated + 1))
+    fi
+    if [ -f "$agents_dir15/user.subagent.bootup.md" ] && [ ! -s "$agents_dir15/user.subagent.md" ]; then
+        mv "$agents_dir15/user.subagent.bootup.md" "$agents_dir15/user.subagent.md"
+        substep "Renamed agents/user.subagent.bootup.md -> agents/user.subagent.md"
+        migrated=$((migrated + 1))
+    fi
+    # Ensure stubs exist at the new names (for fresh installs where Mig 11 created old-name stubs)
+    for stub_file in "user.base.md" "user.base.context.md" "user.dispatcher.md" "user.subagent.md"; do
+        stub_dest="$agents_dir15/$stub_file"
+        if [ ! -f "$stub_dest" ]; then
+            touch "$stub_dest"
+            substep "Created stub: agents/$stub_file"
+            migrated=$((migrated + 1))
+        fi
+    done
 
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"

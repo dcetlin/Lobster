@@ -93,14 +93,14 @@ Lobster's behavior is configured through a few key files:
 
 | File | What it controls |
 |------|-----------------|
-| `~/lobster-user-config/agents/user.base.bootup.md` | Behavioral preferences (response style, tone, rules) — applies to all roles |
+| `~/lobster-user-config/agents/user.base.md` | Behavioral preferences (response style, tone, rules) — applies to all roles |
 | `~/lobster-user-config/agents/user.base.context.md` | Personal facts and context (projects, people, preferences) |
-| `~/lobster-user-config/agents/user.dispatcher.bootup.md` | Dispatcher-specific behavior overrides |
-| `~/lobster-user-config/agents/user.subagent.bootup.md` | Subagent-specific behavior overrides |
+| `~/lobster-user-config/agents/user.dispatcher.md` | Dispatcher-specific behavior overrides |
+| `~/lobster-user-config/agents/user.subagent.md` | Subagent-specific behavior overrides |
 | `config/lobster.conf` | Feature flags (brain dumps on/off, repo names) |
 | `config/config.env` | Credentials (Telegram token, GitHub PAT) |
 
-These bootup files live in `~/lobster-user-config/` (private, not committed to git) and are read by both the dispatcher and subagents at startup. They extend the system defaults without replacing them.
+These context files live in `~/lobster-user-config/` (private, not committed to git) and are read by both the dispatcher and subagents at startup. They extend the system defaults without replacing them.
 
 **Private config directory:**
 The `~/lobster-user-config/` directory is set up by the installer and holds all user-specific customizations that survive upgrades:

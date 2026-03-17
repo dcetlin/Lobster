@@ -53,7 +53,7 @@ echo '{"phase":"STOPPED","started_at":null,"session_id":null}' > "$MESSAGES_DIR/
 #
 # This runs the subset of install.sh that is safe and necessary in a container:
 #   - Creates runtime directories and canonical memory templates
-#   - Creates stub user-config agent files (base.bootup.md etc.)
+#   - Creates stub user-config agent files (user.base.md etc.)
 #   - Verifies sqlite-vec loads correctly; fixes ELFCLASS32 on aarch64 (#368)
 #   - Creates CLAUDE.md and .claude/ symlinks in $WORKSPACE_DIR (#366, #367)
 #
