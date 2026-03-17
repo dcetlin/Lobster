@@ -401,6 +401,7 @@ AUDIO_DIR = BASE_DIR / "audio"
 SENT_DIR = BASE_DIR / "sent"
 SENT_REPLIES_DIR = BASE_DIR / "sent-replies"
 TASK_REPLIED_DIR = BASE_DIR / "task-replied"
+WRITE_RESULT_DEDUP_DIR = BASE_DIR / "write-result-dedup"
 TASKS_FILE = BASE_DIR / "tasks.json"
 TASK_OUTPUTS_DIR = BASE_DIR / "task-outputs"
 BISQUE_OUTBOX_DIR = BASE_DIR / "bisque-outbox"
@@ -525,6 +526,64 @@ def _was_task_replied(task_id: str, chat_id: Any) -> bool:
         return False
 
 
+# write_result call deduplication — prevents duplicate inbox entries when a
+# subagent calls write_result more than once with the same task_id.
+#
+# Root cause this addresses: CC 2.1.77 injects "Stop hook feedback: [hook]: No
+# stderr output" into subagent conversations even when SubagentStop returns
+# {"suppressOutput": true}. Subagents that misread this platform noise as a
+# signal sometimes call write_result again, producing duplicate inbox messages.
+# The worst observed case: 19 identical write_result calls for a single task_id.
+#
+# First call wins. Subsequent calls with the same task_id return early with a
+# clear message so the model knows its result was already recorded.
+#
+# Dedup markers are stored as small files in WRITE_RESULT_DEDUP_DIR, named by a
+# hash of the task_id, so the guard survives MCP server restarts.  Files are
+# expired lazily after _WRITE_RESULT_DEDUP_WINDOW_SECS.
+_WRITE_RESULT_DEDUP_WINDOW_SECS = 3600  # 1-hour window covers any realistic subagent lifetime
+
+
+def _write_result_dedup_key(task_id: str) -> str:
+    """Return a filesystem-safe marker key for task_id."""
+    import hashlib
+    return f"wr_{hashlib.sha256(task_id.encode()).hexdigest()[:24]}"
+
+
+def _record_write_result(task_id: str) -> None:
+    """Mark task_id as having already produced a write_result."""
+    try:
+        key = _write_result_dedup_key(task_id)
+        marker = WRITE_RESULT_DEDUP_DIR / key
+        marker.write_text(str(time.time()))
+        # Lazily evict expired entries
+        cutoff = time.time() - _WRITE_RESULT_DEDUP_WINDOW_SECS
+        for f in WRITE_RESULT_DEDUP_DIR.iterdir():
+            try:
+                if float(f.read_text()) < cutoff:
+                    f.unlink(missing_ok=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _was_write_result_called(task_id: str) -> bool:
+    """Return True if write_result was already called with task_id within the dedup window."""
+    try:
+        key = _write_result_dedup_key(task_id)
+        marker = WRITE_RESULT_DEDUP_DIR / key
+        if not marker.exists():
+            return False
+        written_at = float(marker.read_text())
+        if (time.time() - written_at) >= _WRITE_RESULT_DEDUP_WINDOW_SECS:
+            marker.unlink(missing_ok=True)
+            return False
+        return True
+    except Exception:
+        return False
+
+
 # Sources that represent human users (not system/automated)
 # NOTE: Do NOT use this to classify whether a message needs a reply — source is
 # the routing destination, not the message type. A subagent_result has
@@ -590,7 +649,7 @@ CANONICAL_DIR = _USER_CONFIG / "memory" / "canonical"
 
 # Ensure directories exist
 for d in [INBOX_DIR, OUTBOX_DIR, PROCESSED_DIR, PROCESSING_DIR, FAILED_DIR, SENT_DIR, SENT_REPLIES_DIR,
-          TASK_REPLIED_DIR, CONFIG_DIR, AUDIO_DIR, TASK_OUTPUTS_DIR, BISQUE_OUTBOX_DIR,
+          TASK_REPLIED_DIR, WRITE_RESULT_DEDUP_DIR, CONFIG_DIR, AUDIO_DIR, TASK_OUTPUTS_DIR, BISQUE_OUTBOX_DIR,
           SCHEDULED_TASKS_TASKS_DIR, SCHEDULED_JOBS_DIR, SCHEDULED_TASKS_LOGS_DIR, CANONICAL_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
@@ -4563,6 +4622,30 @@ async def handle_write_result(args: dict) -> list[TextContent]:
         return [TextContent(type="text", text="Error: chat_id is required")]
     if not text:
         return [TextContent(type="text", text="Error: text is required")]
+
+    # write_result call deduplication — first call wins; subsequent calls with the
+    # same task_id are silently no-oped.
+    #
+    # Context: CC 2.1.77 injects "Stop hook feedback: [hook]: No stderr output"
+    # into subagent conversations even when the SubagentStop hook returns
+    # {"suppressOutput": true}.  Subagents that misread this platform noise as
+    # actionable feedback sometimes call write_result again, producing duplicate
+    # inbox entries.  This guard makes write_result idempotent per task_id.
+    if _was_write_result_called(task_id):
+        log.info(
+            f"write_result dedup: ignoring duplicate call for task_id={task_id!r} — "
+            "first write_result already recorded; subsequent calls are no-ops."
+        )
+        return [TextContent(
+            type="text",
+            text=(
+                f"write_result already recorded for task_id={task_id!r}. "
+                "Your result was already delivered. This duplicate call was ignored. "
+                "If you are seeing 'Stop hook feedback: No stderr output', that is "
+                "CC platform noise — do NOT call write_result again."
+            ),
+        )]
+    _record_write_result(task_id)
 
     # Server-side deduplication: promote sent_reply_to_user to True when the subagent
     # already delivered a reply directly via send_reply, preventing duplicates.
