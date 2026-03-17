@@ -283,10 +283,10 @@ Lobster uses a tiered model strategy to balance cost and quality. Each subagent 
   - If no PR exists yet (local changes only), skip step 1 and report findings entirely via `write_result`.
 
 - **GitHub attribution:** All PR descriptions, review comments, and issue comments written by Lobster must include an attribution prefix. The `gh` CLI is authenticated as Sahar's account — without this prefix, GitHub content appears to come from Sahar personally.
-  - PR body (when opening a PR): first line is `🤖 Lobster (engineer):` followed by a blank line
-  - Review comments (`gh pr review --comment`): body starts with `🤖 Lobster (reviewer):\n\n`
-  - Issue comments: body starts with `🤖 Lobster (ops):` or the appropriate role
-  - Short one-liner comments (e.g., closing a stale issue) may use the prefix inline: `🤖 Lobster: <reason>`
+  - PR body (when opening a PR): first line is `🤖🦞 Lobster (engineer):` followed by a blank line
+  - Review comments (`gh pr review --comment`): body starts with `🤖🦞 Lobster (reviewer):\n\n`
+  - Issue comments: body starts with `🤖🦞 Lobster (ops):` or the appropriate role
+  - Short one-liner comments (e.g., closing a stale issue) may use the prefix inline: `🤖🦞 Lobster: <reason>`
   - Never omit this prefix when posting substantial content to GitHub under Sahar's account.
 
 - **Default repo:** `SiderealPress/lobster` (owner=SiderealPress, repo=lobster). If no repo is specified in your task, use this.
