@@ -560,6 +560,35 @@ from message_types import (  # noqa: E402 — placed after path-setup at top of 
     USER_FACING_TYPES,
 )
 
+# ---------------------------------------------------------------------------
+# Message type normalization (issue #635)
+# Aliases are resolved at ingest so the rest of the system only sees canonical
+# names. Adding a new alias here is the only change needed to support a new
+# producer that uses a legacy or non-standard type string.
+# ---------------------------------------------------------------------------
+TYPE_ALIASES: dict[str, str] = {
+    "message": "text",
+    "audio": "voice",
+    "image": "photo",
+    "cron_reminder": "scheduled_reminder",
+    "task-output": "health_check",
+    "system": "health_check",  # when type="system" from health check scripts
+}
+
+
+def normalize_message_type(msg: dict) -> dict:
+    """Return msg with the type field normalized to its canonical name.
+
+    Pure function: returns a new dict (immutable input contract); logs alias
+    resolution at DEBUG level so normalization is traceable without being noisy.
+    """
+    t = msg.get("type", "text")
+    if t in TYPE_ALIASES:
+        log.debug("normalizing type %r -> %r", t, TYPE_ALIASES[t])
+        msg = {**msg, "type": TYPE_ALIASES[t]}
+    return msg
+
+
 # Heartbeat file for health monitoring
 HEARTBEAT_FILE = _WORKSPACE / "logs" / "claude-heartbeat"
 
@@ -2626,7 +2655,7 @@ def _stale_timeout_for_message(msg: dict) -> int:
     Text messages are expected to complete quickly; media types (voice, audio,
     photo, document) may take longer due to transcription or download time.
     """
-    slow_types = {"voice", "audio", "photo", "document"}
+    slow_types = {"voice", "photo", "document"}  # "audio" removed: normalized to "voice" at ingest
     msg_type = msg.get("type", "text")
     return 300 if msg_type in slow_types else 90
 
@@ -3460,6 +3489,10 @@ async def handle_mark_processing(args: dict) -> list[TextContent]:
     except Exception:
         msg_data = {}
 
+    # Normalize type aliases to canonical names before any routing logic sees
+    # the message (issue #635). This is the single ingest normalization point.
+    msg_data = normalize_message_type(msg_data)
+
     # Atomic move to processing
     dest = PROCESSING_DIR / found.name
     found.rename(dest)
@@ -3485,12 +3518,7 @@ async def handle_mark_processing(args: dict) -> list[TextContent]:
 
     # Queue background observation (non-blocking, best-effort)
     msg_text = msg_data.get("text", "") or msg_data.get("transcription", "")
-    _SKIP_OBSERVATION_TYPES = (
-        "subagent_result", "subagent_error", "self_check", "subagent_observation",
-        "subagent_recovered",  # recovery events are system-internal; salvaged text is not user content
-        "debug_observation",  # never run tier 1 on our own debug output (would loop)
-    )
-    if msg_text and msg_type not in _SKIP_OBSERVATION_TYPES:
+    if msg_text and msg_type in USER_FACING_TYPES:
         _queue_observation(
             msg_text, message_id,
             source=msg_data.get("source"),
@@ -3500,11 +3528,7 @@ async def handle_mark_processing(args: dict) -> list[TextContent]:
     # Conditionally inject user model context for messages that would benefit
     context_block = ""
     short_msg_id = message_id[:20] if len(message_id) > 20 else message_id
-    _SKIP_CONTEXT_TYPES = (
-        "subagent_result", "subagent_error", "self_check", "callback", "system",
-        "subagent_observation", "subagent_recovered", "debug_observation",  # internal messages — not real user content
-    )
-    if _user_model is not None and msg_text and msg_type not in _SKIP_CONTEXT_TYPES:
+    if _user_model is not None and msg_text and msg_type in USER_FACING_TYPES:
         if _should_inject_user_context(msg_text):
             try:
                 ctx = _user_model.get_context()
