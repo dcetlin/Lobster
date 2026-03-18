@@ -1044,6 +1044,16 @@ async def _emit_reaction_signal(
     atomic_write_json(inbox_file, msg_data)
     log.info(f"Wrote reaction to inbox: {msg_id} emoji={emoji}")
 
+    # Send acknowledgment (same pattern as text/image messages)
+    if bot_app:
+        try:
+            await bot_app.bot.send_message(
+                chat_id=chat_id,
+                text="📨 Message received. Processing...",
+            )
+        except Exception as e:
+            log.warning(f"Failed to send reaction ack: {e}")
+
     # Clean up the pending entry
     _pending_reactions.pop((chat_id, tg_msg_id), None)
 
