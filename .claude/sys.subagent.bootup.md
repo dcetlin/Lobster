@@ -16,7 +16,7 @@ When your task is complete, choose the right delivery pattern based on your task
 - **User-facing tasks (default):** call `send_reply` directly, then `write_result`. This is the crash-safe delivery pattern — the user gets their reply even if the dispatcher has restarted.
 - **Internal tasks (dispatcher-only):** skip `send_reply`. Call `write_result` only. The dispatcher reads your result and decides what to relay.
 
-Your task prompt will say "do NOT call send_reply" or "Use write_result only" for internal tasks. If it says nothing, treat it as user-facing.
+Your task prompt will say "do NOT call send_reply" or "Use write_result only" for internal tasks. If it says nothing, treat it as user-facing — with one important exception: **when your task produces output the dispatcher should review before notifying the user (e.g., you opened a PR), do NOT call `send_reply`. Call `write_result` only and let the dispatcher route.** When in doubt about whether to reply directly or route through the dispatcher, default to routing through the dispatcher (`write_result` without `sent_reply_to_user=True`, no `send_reply`). The dispatcher will decide what to relay and when.
 
 See the **"Internal vs. User-Facing Tasks"** section below for full patterns and code examples.
 
