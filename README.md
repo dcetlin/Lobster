@@ -213,6 +213,14 @@ lobster test       # Create test message
 lobster help       # Show help
 ```
 
+## Telegram Slash Commands
+
+Commands you can send directly in the Telegram chat:
+
+| Command | Description |
+|---------|-------------|
+| `/report <description>` | File a bug report or feedback. Creates a record in Lobster's report store that can be reviewed with `list_reports`. |
+
 ## Directory Structure
 
 ```
@@ -388,6 +396,27 @@ make -j$(nproc)
 # Download the small model (~465MB)
 bash models/download-ggml-model.sh small
 ```
+
+## Telegram Reactions
+
+React to any Lobster message with an emoji to send a structured signal. Reactions are buffered for 5 seconds — removing the reaction within that window cancels it.
+
+| Emoji | Signal | Meaning |
+|-------|--------|---------|
+| 👍 | `yes` | Confirm / approve |
+| ✅ | `yes` | Confirm / approve |
+| 👌 | `yes` | Confirm / approve |
+| 👎 | `no` | Reject / decline |
+| ❌ | `no` | Reject / decline |
+| 🚫 | `cancel` | Cancel the pending action |
+
+Reactions arrive as inbox messages with `type: "reaction"` and include:
+- `emoji` — the raw emoji the user reacted with
+- `signal` — `"yes"`, `"no"`, or `"cancel"`
+- `reacted_to_text` — text of the Lobster message that was reacted to
+- `telegram_message_id` — the message that received the reaction
+
+Unknown emojis (not in the table above) are silently ignored.
 
 ## Services
 

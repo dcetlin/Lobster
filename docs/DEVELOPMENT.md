@@ -105,6 +105,38 @@ After pulling updates on the VPS (`git pull` + `uv pip install -e .`):
 
 ---
 
+---
+
+## YAML Frontmatter in Subagent Prompts
+
+The `auto-register-agent.py` PostToolUse hook reads YAML frontmatter from the top of subagent prompts to auto-populate `register_agent` fields. This means you can declare agent metadata without the agent calling `register_agent` manually.
+
+**Format** (must be at the very top of the prompt, before any other content):
+
+```
+---
+task_id: my-task-42
+chat_id: 123456789
+source: telegram
+reply_to_message_id: 99
+---
+
+Your subagent instructions go here...
+```
+
+**Fields recognized:**
+
+| Field | Description |
+|-------|-------------|
+| `task_id` | Used to correlate `write_result` calls back to the originating message |
+| `chat_id` | Chat to deliver results to |
+| `source` | Messaging source (`telegram`, `slack`) — defaults to `telegram` |
+| `reply_to_message_id` | Telegram message ID to thread replies against |
+
+The hook uses simple scalar parsing — no nested structures or lists. If no frontmatter block is found, it falls back to the legacy `task_id is: X` text pattern.
+
+All subagents spawned by the dispatcher should use YAML frontmatter rather than the legacy text pattern. The dispatcher injects these fields automatically when spawning via `Task(...)`.
+
 ## Related documentation
 
 - `.claude/sys.dispatcher.bootup.md` — runtime behavior and the worktree constraint from the dispatcher's perspective
