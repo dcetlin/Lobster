@@ -105,8 +105,6 @@ After pulling updates on the VPS (`git pull` + `uv pip install -e .`):
 
 ---
 
----
-
 ## YAML Frontmatter in Subagent Prompts
 
 The `auto-register-agent.py` PostToolUse hook reads YAML frontmatter from the top of subagent prompts to auto-populate `register_agent` fields. This means you can declare agent metadata without the agent calling `register_agent` manually.
