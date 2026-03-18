@@ -34,7 +34,7 @@ INBOX_USER_TYPES: frozenset[str] = frozenset({
 # System-generated types  (source = system)
 # ---------------------------------------------------------------------------
 INBOX_SYSTEM_TYPES: frozenset[str] = frozenset({
-    "self_check",             # periodic health/reminder injection
+    "self_check",             # DEPRECATED: periodic inbox injection retired; type kept for backward compat with stale messages
     "subagent_result",        # subagent completed work (fields: task_id, payload, artifacts?)
     "subagent_error",         # subagent failed (fields: task_id, error, retry_count)
     "subagent_ack",           # subagent already sent reply via send_reply (no re-delivery); canonical name

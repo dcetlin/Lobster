@@ -1324,6 +1324,18 @@ with open(path, 'w') as f:
         fi
     fi
 
+    # Migration 21: Remove periodic-self-check.sh cron entry
+    # The self-check system injected ~20 no-op messages per hour that the
+    # dispatcher silently discarded. Subagent completion is handled by the
+    # reconciler (structured subagent_result messages). Remove the cron entry
+    # and leave the script as a no-op stub so stale entries are harmless.
+    local SELFCHECK_MARKER="# LOBSTER-SELF-CHECK"
+    if crontab -l 2>/dev/null | grep -q "$SELFCHECK_MARKER\|periodic-self-check"; then
+        ({ crontab -l 2>/dev/null | grep -v "$SELFCHECK_MARKER" | grep -v "periodic-self-check" || true; }) | crontab -
+        substep "Removed periodic-self-check.sh from crontab (self-check injection retired)"
+        migrated=$((migrated + 1))
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

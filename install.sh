@@ -1406,26 +1406,13 @@ chmod +x "$INSTALL_DIR/scripts/post-reminder.sh" || true
 success "post-reminder.sh installed"
 
 #===============================================================================
-# Self-Check Reminder System
+# Self-Check Reminder System (REMOVED)
+#
+# The periodic self-check cron job has been retired. It injected ~20 no-op
+# messages per hour that the dispatcher silently discarded. Subagent completion
+# is handled by the reconciler via structured subagent_result messages.
+# Migration 21 in upgrade.sh removes the cron entry on existing installs.
 #===============================================================================
-
-step "Setting up self-check reminder system..."
-
-# The self-check system ensures Lobster checks on background agent completion.
-# Uses cron-based periodic-self-check.sh (runs every 3 min).
-# The PostToolUse hook (schedule-self-check.sh) has been retired; subagent
-# results are now delivered directly to the inbox via write_result.
-
-# Make self-check scripts executable
-chmod +x "$INSTALL_DIR/scripts/periodic-self-check.sh" || true
-
-# Create state directory for rate limiting
-mkdir -p "$INSTALL_DIR/.state"
-
-# Add periodic self-check to crontab (runs every 3 minutes)
-SELFCHECK_MARKER="# LOBSTER-SELF-CHECK"
-({ crontab -l 2>/dev/null | grep -v "$SELFCHECK_MARKER" | grep -v "periodic-self-check" || true; }; \
- echo "*/3 * * * * $INSTALL_DIR/scripts/periodic-self-check.sh $SELFCHECK_MARKER") | crontab -
 
 CLAUDE_SETTINGS_DIR="$HOME/.claude"
 CLAUDE_SETTINGS="$CLAUDE_SETTINGS_DIR/settings.json"
