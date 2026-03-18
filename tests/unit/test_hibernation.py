@@ -20,6 +20,14 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
+# Ensure inbox_server is importable. Must happen before any test class references
+# the module so that patch.multiple("inbox_server", ...) always targets the cached
+# module object rather than a freshly-imported one (which would not yet be patched).
+_MCP_SRC = str(Path(__file__).parent.parent.parent / "src" / "mcp")
+if _MCP_SRC not in sys.path:
+    sys.path.insert(0, _MCP_SRC)
+import inbox_server  # noqa: E402 — intentional late import after path setup
+
 
 # ---------------------------------------------------------------------------
 # Helpers shared between test classes
@@ -71,28 +79,21 @@ class TestStateFile:
 
     def test_missing_state_file_defaults_active(self, state_dir: Path):
         """Missing state file should default to 'active'."""
-        # Import the helper from the MCP server
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src" / "mcp"))
-        from inbox_server import _read_lobster_state
-        result = _read_lobster_state(state_dir / "lobster-state.json")
+        result = inbox_server._read_lobster_state(state_dir / "lobster-state.json")
         assert result == "active"
 
     def test_corrupt_state_file_defaults_active(self, state_dir: Path):
         """Corrupt state file JSON should default to 'active'."""
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src" / "mcp"))
-        from inbox_server import _read_lobster_state
         state_file = state_dir / "lobster-state.json"
         state_file.write_text("NOT_VALID_JSON{{{{")
-        result = _read_lobster_state(state_file)
+        result = inbox_server._read_lobster_state(state_file)
         assert result == "active"
 
     def test_empty_json_object_defaults_active(self, state_dir: Path):
         """State file with no 'mode' key should default to 'active'."""
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src" / "mcp"))
-        from inbox_server import _read_lobster_state
         state_file = state_dir / "lobster-state.json"
         state_file.write_text("{}")
-        result = _read_lobster_state(state_file)
+        result = inbox_server._read_lobster_state(state_file)
         assert result == "active"
 
     def test_atomic_write_no_tmp_files_remain(self, state_dir: Path):
@@ -103,19 +104,14 @@ class TestStateFile:
 
     def test_write_state_via_server_function(self, state_dir: Path):
         """_write_lobster_state helper in inbox_server writes correctly."""
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src" / "mcp"))
-        from inbox_server import _write_lobster_state
         state_file = state_dir / "lobster-state.json"
-        _write_lobster_state(state_file, "hibernate")
+        inbox_server._write_lobster_state(state_file, "hibernate")
         data = json.loads(state_file.read_text())
         assert data["mode"] == "hibernate"
         assert "updated_at" in data
 
     def test_reset_state_on_startup(self, state_dir: Path):
         """_reset_state_on_startup resets 'hibernate' to 'active' and adds woke_at."""
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src" / "mcp"))
-        from inbox_server import _reset_state_on_startup, LOBSTER_STATE_FILE
-
         # Write hibernate state
         state_file = state_dir / "lobster-state.json"
         _write_state(state_dir, "hibernate")
@@ -123,7 +119,7 @@ class TestStateFile:
 
         # Patch the global and call the function
         with patch("inbox_server.LOBSTER_STATE_FILE", state_file):
-            _reset_state_on_startup()
+            inbox_server._reset_state_on_startup()
 
         # Verify state was reset
         data = json.loads(state_file.read_text())
@@ -132,15 +128,12 @@ class TestStateFile:
 
     def test_reset_state_on_startup_noop_when_active(self, state_dir: Path):
         """_reset_state_on_startup does nothing when state is already 'active'."""
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src" / "mcp"))
-        from inbox_server import _reset_state_on_startup
-
         state_file = state_dir / "lobster-state.json"
         _write_state(state_dir, "active")
         original = state_file.read_text()
 
         with patch("inbox_server.LOBSTER_STATE_FILE", state_file):
-            _reset_state_on_startup()
+            inbox_server._reset_state_on_startup()
 
         # File should be unchanged (no unnecessary write)
         assert state_file.read_text() == original
@@ -171,8 +164,8 @@ class TestWaitForMessagesHibernation:
 
     def test_timeout_writes_hibernate_state(self, dirs):
         """When wait_for_messages times out, state file is written as 'hibernate'."""
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src" / "mcp"))
-
+        # inbox_server is imported at module level above; patch targets the cached object.
+        # _is_main_session is patched to True so the session guard allows the state write.
         with patch.multiple(
             "inbox_server",
             INBOX_DIR=dirs["inbox"],
@@ -183,12 +176,12 @@ class TestWaitForMessagesHibernation:
             with patch("inbox_server.touch_heartbeat"):
                 with patch("inbox_server._recover_stale_processing"):
                     with patch("inbox_server._recover_retryable_messages"):
-                        import inbox_server
-                        result = asyncio.run(
-                            inbox_server.handle_wait_for_messages(
-                                {"timeout": 1, "hibernate_on_timeout": True}
+                        with patch("inbox_server._is_main_session", return_value=True):
+                            result = asyncio.run(
+                                inbox_server.handle_wait_for_messages(
+                                    {"timeout": 1, "hibernate_on_timeout": True}
+                                )
                             )
-                        )
 
         # State file must exist and be "hibernate"
         assert dirs["state_file"].exists(), "State file not created on timeout"
@@ -203,8 +196,6 @@ class TestWaitForMessagesHibernation:
 
     def test_timeout_without_hibernate_flag_does_not_write_state(self, dirs):
         """When hibernate_on_timeout=False, no state file is written on timeout."""
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src" / "mcp"))
-
         with patch.multiple(
             "inbox_server",
             INBOX_DIR=dirs["inbox"],
@@ -214,7 +205,6 @@ class TestWaitForMessagesHibernation:
             with patch("inbox_server.touch_heartbeat"):
                 with patch("inbox_server._recover_stale_processing"):
                     with patch("inbox_server._recover_retryable_messages"):
-                        import inbox_server
                         asyncio.run(
                             inbox_server.handle_wait_for_messages(
                                 {"timeout": 1, "hibernate_on_timeout": False}
@@ -227,8 +217,6 @@ class TestWaitForMessagesHibernation:
 
     def test_message_arrival_does_not_trigger_hibernate(self, dirs, tmp_path):
         """When a message arrives, state must NOT be set to hibernate."""
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src" / "mcp"))
-
         # Pre-populate inbox with one message
         msg = {"id": "test_001", "text": "hello", "source": "telegram",
                "chat_id": 1, "timestamp": "2026-01-01T00:00:00"}
@@ -246,12 +234,12 @@ class TestWaitForMessagesHibernation:
             with patch("inbox_server.touch_heartbeat"):
                 with patch("inbox_server._recover_stale_processing"):
                     with patch("inbox_server._recover_retryable_messages"):
-                        import inbox_server
-                        asyncio.run(
-                            inbox_server.handle_wait_for_messages(
-                                {"timeout": 5, "hibernate_on_timeout": True}
+                        with patch("inbox_server._is_main_session", return_value=True):
+                            asyncio.run(
+                                inbox_server.handle_wait_for_messages(
+                                    {"timeout": 5, "hibernate_on_timeout": True}
+                                )
                             )
-                        )
 
         # State should still be "active" (message was processed, not timeout)
         if dirs["state_file"].exists():

@@ -623,14 +623,23 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 log = logging.getLogger("lobster-mcp")
 log.setLevel(logging.INFO)
-_file_handler = RotatingFileHandler(
-    LOG_DIR / "mcp-server.log",
-    maxBytes=5 * 1024 * 1024,  # 5MB
-    backupCount=3,
-)
-_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-log.addHandler(_file_handler)
-log.addHandler(logging.StreamHandler())
+
+
+def setup_logging() -> None:
+    """Attach file and stream handlers to the module logger.
+
+    Called only when running as a server (from the __main__ block), not when
+    imported as a library by tests or other modules. This prevents test runs
+    from writing to the production mcp-server.log file.
+    """
+    _file_handler = RotatingFileHandler(
+        LOG_DIR / "mcp-server.log",
+        maxBytes=5 * 1024 * 1024,  # 5MB
+        backupCount=3,
+    )
+    _file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(_file_handler)
+    log.addHandler(logging.StreamHandler())
 
 # Seed canonical templates on startup (idempotent — only copies missing files)
 def _seed_canonical_templates():
@@ -2773,9 +2782,15 @@ async def handle_wait_for_messages(args: dict) -> list[TextContent]:
             log.info(f"wait_for_messages timed out after {timeout}s")
 
             if hibernate_on_timeout:
-                # Write hibernate state so the bot knows to wake us on next message
-                _write_lobster_state(LOBSTER_STATE_FILE, "hibernate")
-                log.info("Hibernating: wrote state=hibernate, signalling graceful exit")
+                # Write hibernate state so the bot knows to wake us on next message.
+                # Only write when running in the main session — tests that import this
+                # module and call handle_wait_for_messages directly must not corrupt
+                # the production state file.
+                if _is_main_session():
+                    _write_lobster_state(LOBSTER_STATE_FILE, "hibernate")
+                    log.info("Hibernating: wrote state=hibernate, signalling graceful exit")
+                else:
+                    log.info("Hibernating: skipping state write (not main session)")
                 return [TextContent(
                     type="text",
                     text=(
@@ -6899,4 +6914,5 @@ async def main():
 
 if __name__ == "__main__":
     import asyncio
+    setup_logging()
     asyncio.run(main())
