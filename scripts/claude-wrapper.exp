@@ -53,6 +53,8 @@ if {[file readable $config_file]} {
     set bot_token [string trim $bot_token]
     set chat_id   [string trim $chat_id]
     if {$bot_token ne "" && $chat_id ne ""} {
+        # Ensure emoji in the message text is encoded correctly on non-UTF-8 locales.
+        encoding system utf-8
         catch {
             exec curl -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
                 --data-urlencode "chat_id=${chat_id}" \
