@@ -399,24 +399,9 @@ bash models/download-ggml-model.sh small
 
 ## Telegram Reactions
 
-React to any Lobster message with an emoji to send a structured signal. Reactions are buffered for 5 seconds — removing the reaction within that window cancels it.
+React to any Lobster message with an emoji to send a signal. Reactions are buffered for 5 seconds — removing the reaction within that window cancels it.
 
-| Emoji | Signal | Meaning |
-|-------|--------|---------|
-| 👍 | `yes` | Confirm / approve |
-| ✅ | `yes` | Confirm / approve |
-| 👌 | `yes` | Confirm / approve |
-| 👎 | `no` | Reject / decline |
-| ❌ | `no` | Reject / decline |
-| 🚫 | `cancel` | Cancel the pending action |
-
-Reactions arrive as inbox messages with `type: "reaction"` and include:
-- `emoji` — the raw emoji the user reacted with
-- `signal` — `"yes"`, `"no"`, or `"cancel"`
-- `reacted_to_text` — text of the Lobster message that was reacted to
-- `telegram_message_id` — the message that received the reaction
-
-Unknown emojis (not in the table above) are silently ignored.
+Reactions arrive as inbox messages with `type: "reaction"` and include the raw emoji. The dispatcher decides what to do with it.
 
 ## Services
 
