@@ -52,6 +52,12 @@ Fire count is tracked in /tmp/lobster-auditor-hook-fires-{agent_key} as JSON:
 
 The file is cleaned up after a successful exit (either condition met) or after
 the circuit breaker trips.
+
+## suppressOutput
+
+On all exit-0 paths the hook prints {"suppressOutput": true} so CC does not
+inject a "Stop hook feedback: No stderr output" system message that would
+trigger a spurious extra agent turn.
 """
 import json
 import os
@@ -59,6 +65,17 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+# JSON to emit on every successful (allow) exit — suppresses the
+# "Stop hook feedback: No stderr output" injection that CC 2.1.76+ produces
+# even when the hook exits 0 with no output.
+_SILENT_OK = json.dumps({"suppressOutput": True})
+
+
+def _exit_ok() -> None:
+    """Exit 0 with JSON that suppresses CC feedback injection."""
+    print(_SILENT_OK)
+    sys.exit(0)
 
 CONTEXT_FILE = Path(os.path.expanduser(
     "~/lobster-user-config/agents/system-audit.context.md"
@@ -326,7 +343,7 @@ def main() -> None:
     try:
         hook_input = json.load(sys.stdin)
     except Exception:
-        sys.exit(0)  # Unreadable input — never block
+        _exit_ok()  # Unreadable input — never block
 
     # CC 2.1.76+: SubagentStop passes the transcript as a JSONL file at
     # agent_transcript_path rather than inline. Load from the file path,
@@ -341,7 +358,7 @@ def main() -> None:
 
     # Fast path: not an auditor session — pass through.
     if not _is_auditor_session(tool_calls):
-        sys.exit(0)
+        _exit_ok()
 
     # --- Auditor session detected ---
 
@@ -351,14 +368,14 @@ def main() -> None:
         # Success path — clean up any fire-count state and allow exit.
         key = _agent_key(hook_input)
         _cleanup_fire_state(_fire_count_path(key))
-        sys.exit(0)
+        _exit_ok()
 
     # Condition 2: transcript contains the explicit safe word.
     if _safe_word_in_transcript(tool_calls):
         # Success path — clean up any fire-count state and allow exit.
         key = _agent_key(hook_input)
         _cleanup_fire_state(_fire_count_path(key))
-        sys.exit(0)
+        _exit_ok()
 
     # Neither condition met — increment fire count and check circuit breaker.
     fire_count, _first_fire_ts = _increment_fire_count(hook_input)
@@ -369,7 +386,7 @@ def main() -> None:
         _write_circuit_breaker_error(hook_input)
         key = _agent_key(hook_input)
         _cleanup_fire_state(_fire_count_path(key))
-        sys.exit(0)
+        _exit_ok()
 
     # Still within the retry window — block exit with a reminder.
     fires_remaining = MAX_HOOK_FIRES - fire_count
