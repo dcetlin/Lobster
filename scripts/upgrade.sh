@@ -1444,7 +1444,7 @@ with open(path, 'w') as f:
             TMP_SETTINGS=$(mktemp)
             jq --arg cmd "python3 $INSTALL_DIR/hooks/secret-scanner.py" \
                '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
-                "matcher": "mcp__lobster-inbox__send_reply|mcp__github__|Bash",
+                "matcher": "mcp__lobster-inbox__send_reply|mcp__github__add_issue_comment|mcp__github__issue_write|mcp__github__create_pull_request|mcp__github__update_pull_request|mcp__github__pull_request_review_write|mcp__github__add_reply_to_pull_request_comment|mcp__github__create_or_update_file|mcp__github__push_files|mcp__github__merge_pull_request|Bash",
                 "hooks": [{
                     "type": "command",
                     "command": $cmd,

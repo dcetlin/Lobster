@@ -277,8 +277,8 @@ class TestMain:
         assert code == 0  # warn mode — must not block
         assert "WARNING" in stderr
         assert "TELEGRAM_BOT_TOKEN" in stderr
-        # The raw value must NOT appear in stderr (only the key name)
-        assert "8570975517" not in stderr
+        # The raw value must NOT appear in stderr (only the key name should be logged)
+        assert "FAKE_TELEGRAM_BOT_TOKEN_FOR_TESTING_AAABBBCCC1234567890" not in stderr
 
     def test_secret_in_github_body_warns_and_exits_0(self, tmp_path):
         cfg = self._make_config(tmp_path)

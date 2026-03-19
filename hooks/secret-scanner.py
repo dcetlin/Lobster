@@ -123,9 +123,19 @@ def _extract_strings_to_scan(tool_name: str, tool_input: dict) -> list[str]:
 def _scan_for_secrets(
     texts: list[str], secrets: dict[str, str]
 ) -> list[str]:
-    """Return a list of key names whose values appear in any of the texts."""
+    """Return a list of key names whose values appear in any of the texts.
+
+    Only key names are returned — never values — so callers can log which
+    secrets were detected without revealing the secret values themselves.
+    """
     combined = "\n".join(texts)
-    return [key for key, value in secrets.items() if value in combined]
+    # Separate key/value iteration so static analysis can verify that only
+    # keys (not values) are collected into the return list.
+    matched_keys: list[str] = []
+    for key, value in secrets.items():
+        if value in combined:
+            matched_keys.append(key)  # key only — value is never stored here
+    return matched_keys
 
 
 def main() -> None:
