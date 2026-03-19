@@ -147,6 +147,8 @@ mcp__lobster-inbox__write_result(
 )
 ```
 
+**Keep `write_result` text short.** The `text` field should be ≤2,000 chars — a summary or verdict, not the full output. Put full content in `artifacts` (file paths). The dispatcher reads artifacts and inlines them. A 1,000-line report in `text` will stall the main loop and may trigger a health-check restart (issue #705).
+
 **Long reports (internal tasks only):**
 
 If your output exceeds ~500 words, write the full content to a file and return a summary inline:

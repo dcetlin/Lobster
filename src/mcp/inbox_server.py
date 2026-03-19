@@ -1594,7 +1594,15 @@ async def list_tools() -> list[Tool]:
                     },
                     "text": {
                         "type": "string",
-                        "description": "The result text to deliver to the user.",
+                        "description": (
+                            "The result text to deliver to the user. "
+                            "Keep this ≤2,000 chars — a summary, verdict, or key findings. "
+                            "Put full content (reports, diffs, long output) in `artifacts` as file paths; "
+                            "the dispatcher reads and inlines them. "
+                            "Text exceeding 2,000 chars is automatically truncated by the server, "
+                            "which can drop critical information. A 1,000-line report in `text` will "
+                            "stall the dispatcher main loop and may trigger a health-check restart."
+                        ),
                     },
                     "source": {
                         "type": "string",
@@ -5102,6 +5110,17 @@ async def handle_write_result(args: dict) -> list[TextContent]:
         return [TextContent(type="text", text="Error: chat_id is required")]
     if not text:
         return [TextContent(type="text", text="Error: text is required")]
+
+    # Safety net: truncate oversized result text to prevent the dispatcher from stalling
+    # on the main thread while composing a reply to a 1,000+ line result (issue #705).
+    # Subagents should keep text ≤2,000 chars and put full content in `artifacts` instead.
+    _WRITE_RESULT_TEXT_LIMIT = 2000
+    if len(text) > _WRITE_RESULT_TEXT_LIMIT:
+        log.warning(
+            f"write_result text too long for task {task_id!r}: {len(text)} chars — "
+            f"truncating to {_WRITE_RESULT_TEXT_LIMIT}. Use artifacts for full content."
+        )
+        text = text[:_WRITE_RESULT_TEXT_LIMIT] + "\n[Result truncated at 2,000 chars. Use artifacts for full content.]"
 
     # Server-side deduplication: promote sent_reply_to_user to True when the subagent
     # already delivered a reply directly via send_reply, preventing duplicates.

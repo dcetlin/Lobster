@@ -332,14 +332,36 @@ Check the `sent_reply_to_user` field first, then check for engineer → reviewer
                        reply_text += f"\n\n---\n{content}"
                    except:
                        pass  # skip unreadable files silently
-           send_reply(
-               chat_id=msg["chat_id"],
-               text=reply_text,
-               source=msg.get("source", "telegram"),
-               thread_ts=msg.get("thread_ts"),            # Slack thread
-               reply_to_message_id=msg.get("telegram_message_id")  # Telegram threading
-           )
-           mark_processed(message_id)
+
+           # Large result text (>~800 chars): composing and relaying a long result inline
+           # can exceed the 7-second rule and stall the main loop (issue #705).
+           # Offload to a reply-writer subagent; return to the loop immediately.
+           if len(reply_text) > 800:
+               Task(
+                   subagent_type="lobster-generalist",
+                   run_in_background=True,
+                   prompt=(
+                       f"---\n"
+                       f"task_id: relay-{msg.get('task_id', 'unknown')}\n"
+                       f"chat_id: {msg['chat_id']}\n"
+                       f"source: {msg.get('source', 'telegram')}\n"
+                       f"---\n\n"
+                       f"Relay the following subagent result to the user. "
+                       f"Send the full content via send_reply, then call write_result with sent_reply_to_user=True.\n\n"
+                       f"{reply_text}"
+                   ),
+               )
+               mark_processed(message_id)
+               # Return to wait_for_messages() immediately — reply-writer delivers async
+           else:
+               send_reply(
+                   chat_id=msg["chat_id"],
+                   text=reply_text,
+                   source=msg.get("source", "telegram"),
+                   thread_ts=msg.get("thread_ts"),            # Slack thread
+                   reply_to_message_id=msg.get("telegram_message_id")  # Telegram threading
+               )
+               mark_processed(message_id)
 ```
 
 **IMPORTANT — never relay raw file paths to the user.** File paths like `~/lobster-workspace/reports/foo.md` are server-side references that are useless on mobile. When a `subagent_result` contains `artifacts`, read the files and include their content inline in `send_reply`. Do not mention the path in the reply.
