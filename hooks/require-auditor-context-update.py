@@ -39,6 +39,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 CONTEXT_FILE = Path(os.path.expanduser(
@@ -145,6 +146,31 @@ def _safe_word_in_transcript(tool_calls: list[dict]) -> bool:
     return False
 
 
+def _parse_timestamp(t) -> float | None:
+    """Parse a timestamp value to a Unix float.
+
+    Accepts:
+      - int/float: returned as float directly
+      - str: tried as ISO-8601 first (CC 2.1.76+ format), then as a numeric string
+
+    Returns None if the value cannot be parsed.
+    """
+    if isinstance(t, (int, float)):
+        return float(t)
+    if isinstance(t, str):
+        # ISO-8601 (CC 2.1.76+): e.g. "2026-03-19T16:52:01.657Z"
+        try:
+            return datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+        # Numeric string fallback (older CC versions)
+        try:
+            return float(t)
+        except ValueError:
+            pass
+    return None
+
+
 def _session_start_time(hook_input: dict, transcript: list) -> float | None:
     """Estimate session start time from the transcript's first message timestamp.
 
@@ -157,10 +183,9 @@ def _session_start_time(hook_input: dict, transcript: list) -> float | None:
     # Claude Code hook input may carry a top-level timestamp.
     ts = hook_input.get("session_start_time") or hook_input.get("timestamp")
     if ts:
-        try:
-            return float(ts)
-        except (TypeError, ValueError):
-            pass
+        parsed = _parse_timestamp(ts)
+        if parsed is not None:
+            return parsed
 
     # Try to find the minimum timestamp inside transcript messages.
     min_ts = None
@@ -169,12 +194,10 @@ def _session_start_time(hook_input: dict, transcript: list) -> float | None:
             continue
         t = msg.get("timestamp")
         if t:
-            try:
-                t_float = float(t)
+            t_float = _parse_timestamp(t)
+            if t_float is not None:
                 if min_ts is None or t_float < min_ts:
                     min_ts = t_float
-            except (TypeError, ValueError):
-                continue
     return min_ts
 
 
@@ -238,7 +261,8 @@ def main() -> None:
         "system-audit.context.md. "
         "Either update the file with your findings, or include "
         f"{SAFE_WORD!r} as the first line of your write_result call "
-        "if nothing new was found."
+        "if nothing new was found.",
+        file=sys.stderr,
     )
     sys.exit(2)
 
