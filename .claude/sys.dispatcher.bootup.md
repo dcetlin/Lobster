@@ -323,12 +323,14 @@ Check the `sent_reply_to_user` field first, then check for engineer → reviewer
                mark_processed(message_id)
                # Return to wait_for_messages() — reviewer's write_result arrives separately
        else:
-           # Large result text (>~4,000 chars): the dispatcher would need significant
-           # LLM time to compose and relay inline, risking the 7-second rule (issue #705).
+           # Large result text: the dispatcher would need significant LLM time to compose
+           # and relay inline, risking the 7-second rule (issue #705).
            # Check size BEFORE inlining artifacts so the relay subagent receives only
            # msg["text"] (already bounded at 2,000 chars by inbox_server truncation)
            # and handles artifact inlining itself.
-           if len(msg["text"]) > 4000:
+           # Note: write_result text is server-truncated at 2,000 chars; this threshold
+           # must stay below that cap to be reachable.
+           if len(msg["text"]) > 1200:
                Task(
                    subagent_type="lobster-generalist",
                    run_in_background=True,
