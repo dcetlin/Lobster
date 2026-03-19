@@ -157,15 +157,17 @@ def _safe_word_in_transcript(tool_calls: list[dict]) -> bool:
     return False
 
 
-def _parse_timestamp(t) -> float | None:
+def _parse_timestamp(t: str | int | float | None) -> float | None:
     """Parse a timestamp value to a Unix float.
 
     Accepts:
       - int/float: returned as float directly
       - str: tried as ISO-8601 first (CC 2.1.76+ format), then as a numeric string
 
-    Returns None if the value cannot be parsed.
+    Returns None if the value cannot be parsed or if t is None.
     """
+    if t is None:
+        return None
     if isinstance(t, (int, float)):
         return float(t)
     if isinstance(t, str):
