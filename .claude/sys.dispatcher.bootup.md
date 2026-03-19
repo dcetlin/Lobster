@@ -323,20 +323,12 @@ Check the `sent_reply_to_user` field first, then check for engineer → reviewer
                mark_processed(message_id)
                # Return to wait_for_messages() — reviewer's write_result arrives separately
        else:
-           # Build reply text: inline artifact content when present
-           reply_text = msg["text"]
-           if msg.get("artifacts"):
-               for artifact_path in msg["artifacts"]:
-                   try:
-                       content = Read(artifact_path)   # read the file
-                       reply_text += f"\n\n---\n{content}"
-                   except:
-                       pass  # skip unreadable files silently
-
-           # Large result text (>~800 chars): composing and relaying a long result inline
-           # can exceed the 7-second rule and stall the main loop (issue #705).
-           # Offload to a reply-writer subagent; return to the loop immediately.
-           if len(reply_text) > 800:
+           # Large result text (>~4,000 chars): the dispatcher would need significant
+           # LLM time to compose and relay inline, risking the 7-second rule (issue #705).
+           # Check size BEFORE inlining artifacts so the relay subagent receives only
+           # msg["text"] (already bounded at 2,000 chars by inbox_server truncation)
+           # and handles artifact inlining itself.
+           if len(msg["text"]) > 4000:
                Task(
                    subagent_type="lobster-generalist",
                    run_in_background=True,
@@ -348,12 +340,22 @@ Check the `sent_reply_to_user` field first, then check for engineer → reviewer
                        f"---\n\n"
                        f"Relay the following subagent result to the user. "
                        f"Send the full content via send_reply, then call write_result with sent_reply_to_user=True.\n\n"
-                       f"{reply_text}"
+                       f"Result text:\n{msg['text']}\n\n"
+                       f"Artifact paths (inline content if present): {msg.get('artifacts', [])}"
                    ),
                )
                mark_processed(message_id)
                # Return to wait_for_messages() immediately — reply-writer delivers async
            else:
+               # Build reply text: inline artifact content when present
+               reply_text = msg["text"]
+               if msg.get("artifacts"):
+                   for artifact_path in msg["artifacts"]:
+                       try:
+                           content = Read(artifact_path)   # read the file
+                           reply_text += f"\n\n---\n{content}"
+                       except:
+                           pass  # skip unreadable files silently
                send_reply(
                    chat_id=msg["chat_id"],
                    text=reply_text,
