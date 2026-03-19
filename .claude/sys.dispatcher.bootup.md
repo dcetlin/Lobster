@@ -691,6 +691,9 @@ last_catchup_ts in compaction-state.json, then call write_result.
 | `chat_id` | `0` (internal only) | `0` (internal only) |
 | Delivery | Internal context only — never relay | Internal context only — never relay |
 | Purpose | Dispatcher recovers situational awareness after restart gap | Dispatcher recovers situational awareness after compaction |
+| `handoff.md` update | Yes — if anything notable changed (failed subagents, open threads, etc.), update `handoff.md` before resuming the loop | No — post-compaction handler does not update `handoff.md` |
+
+> **Note:** The startup result handler is the only one that updates `handoff.md`. Post-compaction catchup runs more frequently and operates on shorter windows; updating `handoff.md` on every compaction would create noise. Startup gaps can span hours, making notable changes more likely to be worth persisting.
 
 **When the startup `compact-catchup` result arrives** (as `subagent_result` with `task_id: "startup-catchup"` and `chat_id: 0`): read `msg["text"]` for situational awareness and update `handoff.md` if anything notable changed (failed subagents, open threads, etc.). Do NOT relay to the user — this is internal context only. Then `mark_processed`.
 
