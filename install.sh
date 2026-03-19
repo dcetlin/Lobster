@@ -1661,7 +1661,7 @@ if [ -f "$CLAUDE_SETTINGS" ]; then
     if ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("secret-scanner"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
         TMP_SETTINGS=$(mktemp)
         jq '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
-            "matcher": "mcp__lobster-inbox__send_reply|mcp__github__add_issue_comment|mcp__github__issue_write|mcp__github__create_pull_request|mcp__github__update_pull_request|mcp__github__pull_request_review_write|mcp__github__add_reply_to_pull_request_comment|mcp__github__create_or_update_file|mcp__github__push_files|mcp__github__merge_pull_request|Bash",
+            "matcher": "mcp__lobster-inbox__send_reply|mcp__github__add_issue_comment|mcp__github__issue_write|mcp__github__create_pull_request|mcp__github__update_pull_request|mcp__github__pull_request_review_write|mcp__github__add_reply_to_pull_request_comment|mcp__github__create_or_update_file|mcp__github__push_files|mcp__github__merge_pull_request|mcp__github__add_comment_to_pending_review|mcp__github__create_pull_request_with_copilot|mcp__github__delete_file|Bash",
             "hooks": [{
                 "type": "command",
                 "command": "python3 '"$INSTALL_DIR"'/hooks/secret-scanner.py",

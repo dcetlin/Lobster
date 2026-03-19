@@ -173,6 +173,28 @@ class TestExtractStringsToScan:
         )
         assert len(result) == 1
 
+    def test_add_comment_to_pending_review_extracts_body(self):
+        result = self.mod._extract_strings_to_scan(
+            "mcp__github__add_comment_to_pending_review",
+            {"body": "LGTM — looks clean", "pull_request_number": 7}
+        )
+        assert "LGTM — looks clean" in result
+
+    def test_create_pull_request_with_copilot_extracts_body_and_title(self):
+        result = self.mod._extract_strings_to_scan(
+            "mcp__github__create_pull_request_with_copilot",
+            {"title": "Fix auth", "body": "Closes #99", "head": "my-branch"}
+        )
+        assert "Fix auth" in result
+        assert "Closes #99" in result
+
+    def test_delete_file_extracts_message(self):
+        result = self.mod._extract_strings_to_scan(
+            "mcp__github__delete_file",
+            {"message": "Remove stale config", "path": "config.env", "sha": "abc123"}
+        )
+        assert "Remove stale config" in result
+
     def test_unrelated_tool_returns_empty(self):
         result = self.mod._extract_strings_to_scan(
             "Read",
@@ -342,6 +364,23 @@ class TestMain:
         )
         assert code == 0
         assert stderr == ""
+
+    def test_secret_in_add_comment_to_pending_review_warns(self, tmp_path):
+        cfg = self._make_config(tmp_path)
+        stdin_data = {
+            "tool_name": "mcp__github__add_comment_to_pending_review",
+            "tool_input": {
+                "body": "Token: FAKE_TELEGRAM_BOT_TOKEN_FOR_TESTING_AAABBBCCC1234567890",
+                "pull_request_number": 7,
+            },
+        }
+        code, stderr = _run_main(
+            self.mod, stdin_data,
+            env_overrides={"LOBSTER_CONFIG_DIR": str(tmp_path)}
+        )
+        assert code == 0
+        assert "WARNING" in stderr
+        assert "TELEGRAM_BOT_TOKEN" in stderr
 
     def test_invalid_json_stdin_exits_0(self, tmp_path):
         """Malformed stdin should not crash the hook — silent pass."""
