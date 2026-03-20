@@ -17,7 +17,7 @@ def decrypt_credentials():
         key_b64 = f.read().strip()
     with open(ENC_FILE, 'rb') as f:
         enc_data = f.read()
-    key = base64.b64decode(key_b64 + b'==')
+    key = base64.b64decode(key_b64.rstrip(b'=') + b'==')
     nonce = enc_data[:12]
     ciphertext = enc_data[12:]
     aesgcm = AESGCM(key)
@@ -29,6 +29,10 @@ def main():
         return
 
     enc_creds = decrypt_credentials()
+
+    if not os.path.exists(PLAIN_FILE):
+        print("No credentials.json found, skipping")
+        return
 
     with open(PLAIN_FILE) as f:
         plain_creds = json.load(f)
