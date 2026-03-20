@@ -15,8 +15,6 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
-
-from log_utils import JsonFormatter, configure_file_handler
 import re
 import socket
 import sys
@@ -27,6 +25,14 @@ import httpx
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# Ensure src/mcp/ is on sys.path so log_utils (a sibling module) can be
+# imported when this script is run directly (same guard used by
+# observability_server.py and wire_server.py).
+_MCP_SRC_DIR = str(Path(__file__).resolve().parent)
+if _MCP_SRC_DIR not in sys.path:
+    sys.path.insert(0, _MCP_SRC_DIR)
+from log_utils import JsonFormatter, configure_file_handler
 
 # Ensure the parent src/ directory is on sys.path so that sibling packages
 # (e.g. integrations, utils, bot) can be imported when this script is run
