@@ -464,7 +464,7 @@ if [ "$(id -u)" = "0" ]; then
         warn "docker group not found — skipping docker group membership (install Docker first)."
     fi
     echo ""
-    success "User 'lobster' created successfully."
+    info "User 'lobster' is ready."
     echo ""
     echo -e "${BOLD}Next step: SSH in as the lobster user and run the installer again:${NC}"
     echo ""
