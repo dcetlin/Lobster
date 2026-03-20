@@ -395,7 +395,7 @@ except Exception:
 " 2>/dev/null)
     if [[ -n "$finished_at" ]]; then
         local finished_epoch
-        finished_epoch=$(date -d "$finished_at" +%s 2>/dev/null) || true
+        finished_epoch=$(date -d "$finished_at" +%s 2>/dev/null) || { log_warn "WARN: failed to parse finished_epoch from finished_at=${finished_at} — treating catchup as still in flight"; true; }
         if [[ -n "$finished_epoch" && "$finished_epoch" -ge "$started_epoch" ]]; then
             log_info "Catchup complete: finished_at=$finished_at — WFM suppression lifted"
             return 1
