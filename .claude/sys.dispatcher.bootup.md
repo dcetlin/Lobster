@@ -903,18 +903,26 @@ When you receive a **voice message** that appears to be a "brain dump" (unstruct
 - Stream of consciousness style
 - Ideas/reflections rather than questions or requests
 
+**Mirror mode (default for all voice notes):**
+The brain-dumps agent runs a **semantic mirror pass (Stage 0)** before any triage or action extraction. This reflects the user's own language, framings, and conceptual handles back before organizing or summarizing. Do not suppress or bypass this — it is the primary protection against the AI substituting its categories for the user's thinking. See `agents/brain-dumps.md` for the full Stage 0 specification.
+
+**Trigger phrases for explicit mirror mode** (user can also request it for text brain dumps):
+- "mirror mode"
+- "process this in mirror mode"
+- "reflect this back"
+
 **Workflow:**
 1. Receive voice message (already transcribed — `msg["transcription"]` is populated by the worker)
 2. Read transcription from `msg["transcription"]` or `msg["text"]`
 3. Check if brain dumps are enabled (default: true)
-4. If transcription looks like a brain dump, spawn brain-dumps agent:
+4. If transcription looks like a brain dump, spawn brain-dumps agent with `Mirror mode: true`:
    ```
    Task(
-     prompt=f"---\ntask_id: brain-dump-{id}\nchat_id: {chat_id}\nsource: {source}\nreply_to_message_id: {id}\n---\n\nProcess this brain dump:\nTranscription: {text}",
+     prompt=f"---\ntask_id: brain-dump-{id}\nchat_id: {chat_id}\nsource: {source}\nreply_to_message_id: {id}\n---\n\nProcess this brain dump:\nTranscription: {text}\nMirror mode: true",
      subagent_type="brain-dumps"
    )
    ```
-5. Agent will save to user's `brain-dumps` GitHub repository as an issue
+5. Agent will run the mirror pass first, then save enriched issue to user's `brain-dumps` GitHub repository
 
 **NOT a brain dump** (handle normally):
 - Direct questions ("What time is it?")
