@@ -1515,6 +1515,17 @@ with open(path, 'w') as f:
         migrated=$((migrated + 1))
     fi
 
+    # Migration 31: Create proprioceptive memory directory.
+    # Stores concrete semantic mirroring instances (alignment/misalignment moments)
+    # as structured markdown files. Written by record_mirroring_instance MCP tool
+    # and read by get_proprioceptive_context. The vector DB (memory.db) holds
+    # searchable copies; this directory is the human-readable, DB-rebuild-safe store.
+    if [ ! -d "$USER_CONFIG_DIR/memory/proprioceptive" ]; then
+        mkdir -p "$USER_CONFIG_DIR/memory/proprioceptive"
+        substep "Created $USER_CONFIG_DIR/memory/proprioceptive/ for proprioceptive memory (issue #3)"
+        migrated=$((migrated + 1))
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
