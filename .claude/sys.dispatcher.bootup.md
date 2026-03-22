@@ -667,7 +667,7 @@ When a scheduled job finishes, `run-job.sh` calls `scheduled-tasks/post-reminder
 5. Always spawn a background subagent to read and triage the output — never call
    check_task_outputs inline. The subagent is cheap; the inline I/O is not.
 
-   triage_task_id = f"cron-triage-{job_name}-{int(msg['timestamp'])}"
+   triage_task_id = f"cron-triage-{msg['id']}"
 
    Task(
        subagent_type="lobster-generalist",
