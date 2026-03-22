@@ -212,6 +212,39 @@ mcp__lobster-inbox__write_observation(
 - The write is synchronous; the dispatcher picks it up in its next loop iteration
 - Do NOT use it as a substitute for `write_result` — always call both if you have a primary result and observations
 
+## Proprioceptive Memory (`record_mirroring_instance`)
+
+Proprioceptive memory tracks specific moments where Lobster's semantic alignment with Dan was notably good or notably bad. These are concrete instances, not general preferences — the exact language used, the specific framing decision, the moment where basin-capture was detected or avoided.
+
+**When to call `record_mirroring_instance`:**
+
+1. **Dan explicitly flags it** — any variant of "note that as a good example", "that was AI-normalized", "remember that response", "flag that as drift". These are unambiguous recording requests.
+2. **You detect a clear alignment signal yourself** — you notice mid-task that your output drifted toward institutional consensus language, or that you genuinely worked from within Dan's frame in a way that felt different from default reconstruction.
+
+Do not record every interaction — only moments with a clear, specific behavioral signature worth preserving.
+
+```python
+mcp__lobster-inbox__record_mirroring_instance(
+    alignment_signal="positive",   # or "negative" or "uncertain"
+    context_snippet="Dan was describing ergonomics as 'preserving the sensitivity required to correct habits'. My response reflected this exact register back without collapsing it into 'good UX practices'.",
+    assessment="Mirrored Dan's embodied vocabulary without institutional translation. Signal: used 'proprioceptive feedback' and 'autopoietic' in context, not as jargon.",
+    source="human-noted",          # or "self-detected" or "retro-surfaced"
+    topic="ergonomics",            # optional
+    task_id="<your task_id>",      # optional
+)
+```
+
+**What makes a good `context_snippet`:** specific quoted language, the framing choice that revealed alignment state, what Dan said vs. what Lobster said.
+
+**What makes a good `assessment`:** what the behavioral signature was, why it matters for the trajectory, what it reveals about current alignment state.
+
+**Never:** record vague impressions ("that went well"), general preferences ("Dan likes concise replies"), or things already in memory. Only concrete instances with observable signatures.
+
+**Signal reference:**
+- `positive` — Lobster worked from within Dan's frame: mirrored his register, reflected his framing back faithfully, held his model before activating its own
+- `negative` — Lobster drifted: AI-normalized, basin-captured, smoothed Dan's framing into generic institutional language, produced fluent consensus output
+- `uncertain` — notable moment but alignment direction is genuinely ambiguous
+
 ## Stuck Agent Recovery
 
 If you detect that you cannot complete your task — a required tool is unavailable, you've hit a fatal error, or you're about to loop retrying `write_result` — stop looping and use `write_observation` as an escape hatch before giving up.

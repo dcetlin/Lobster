@@ -2290,6 +2290,102 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
+        # Proprioceptive Memory Tools
+        Tool(
+            name="record_mirroring_instance",
+            description=(
+                "Record a specific proprioceptive instance — a concrete moment where Lobster's "
+                "semantic alignment with Dan was notably good or notably bad. Use this when Dan "
+                "flags an interaction ('note that as a good mirroring example' / 'that was "
+                "AI-normalized'), or when you detect a clear alignment signal yourself. "
+                "Do not use for general notes — use memory_store for that. "
+                "Instances are stored in both the vector DB (for retro search) and "
+                "~/lobster-user-config/memory/proprioceptive/ (for human review)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "alignment_signal": {
+                        "type": "string",
+                        "enum": ["positive", "negative", "uncertain"],
+                        "description": (
+                            "positive: Lobster worked from within Dan's frame, mirrored his "
+                            "register, reflected his framing back faithfully. "
+                            "negative: Lobster drifted — AI-normalized, basin-captured, "
+                            "smoothed Dan's framing into generic language. "
+                            "uncertain: notable moment but alignment direction is unclear."
+                        ),
+                    },
+                    "context_snippet": {
+                        "type": "string",
+                        "description": (
+                            "A brief excerpt or description of the interaction moment — "
+                            "what Dan said, what Lobster said, what made this notable. "
+                            "Include specific language where possible."
+                        ),
+                    },
+                    "assessment": {
+                        "type": "string",
+                        "description": (
+                            "Why this instance matters. What it reveals about alignment "
+                            "trajectory. Specific behavioral signature (a phrase, a "
+                            "structural choice, a framing decision) that reveals alignment state."
+                        ),
+                    },
+                    "source": {
+                        "type": "string",
+                        "enum": ["human-noted", "retro-surfaced", "self-detected"],
+                        "description": (
+                            "human-noted: Dan flagged it explicitly. "
+                            "retro-surfaced: weekly audit identified it. "
+                            "self-detected: Lobster noticed it without Dan flagging it."
+                        ),
+                        "default": "human-noted",
+                    },
+                    "topic": {
+                        "type": "string",
+                        "description": "Optional: the topic or domain of the conversation (e.g. 'ergonomics', 'code review', 'system design').",
+                    },
+                    "chat_id": {
+                        "oneOf": [
+                            {"type": "integer"},
+                            {"type": "string"},
+                        ],
+                        "description": "Optional: the chat/channel ID this instance occurred in.",
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Optional subagent task identifier.",
+                    },
+                },
+                "required": ["alignment_signal", "context_snippet", "assessment"],
+            },
+        ),
+        Tool(
+            name="get_proprioceptive_context",
+            description=(
+                "Retrieve recent proprioceptive instances — concrete alignment/misalignment "
+                "moments from past conversations. Use at session start when Dan's epistemic "
+                "principles are likely to be relevant, or before a retro. Returns the N most "
+                "recent instances across all alignment signals."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of instances to return. Default: 5.",
+                        "default": 5,
+                    },
+                    "alignment_signal": {
+                        "type": "string",
+                        "enum": ["positive", "negative", "uncertain", "all"],
+                        "description": "Filter by alignment signal. Default: all.",
+                        "default": "all",
+                    },
+                },
+            },
+        ),
         Tool(
             name="get_handoff",
             description="Read the current handoff document - a complete briefing for a new Lobster session. Contains identity, architecture, current state, and pending items.",
@@ -2785,6 +2881,10 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         return await handle_memory_search(arguments)
     elif name == "memory_recent":
         return await handle_memory_recent(arguments)
+    elif name == "record_mirroring_instance":
+        return await handle_record_mirroring_instance(arguments)
+    elif name == "get_proprioceptive_context":
+        return await handle_get_proprioceptive_context(arguments)
     elif name == "get_handoff":
         return await handle_get_handoff(arguments)
     elif name == "mark_consolidated":
@@ -6521,6 +6621,268 @@ async def handle_memory_recent(arguments: dict[str, Any]) -> list[TextContent]:
     except Exception as e:
         log.error(f"memory_recent failed: {e}", exc_info=True)
         return [TextContent(type="text", text=f"Error getting recent events: {e}")]
+
+
+def _proprioceptive_dir() -> Path:
+    """Return the proprioceptive memory directory, creating it if needed."""
+    user_config = Path(os.environ.get("LOBSTER_USER_CONFIG", Path.home() / "lobster-user-config"))
+    d = user_config / "memory" / "proprioceptive"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _write_proprioceptive_file(
+    timestamp: str,
+    alignment_signal: str,
+    context_snippet: str,
+    assessment: str,
+    source: str,
+    topic: str | None,
+    chat_id: str | None,
+) -> Path:
+    """Write a structured markdown file for a proprioceptive instance.
+
+    Format: YAML frontmatter + markdown body, stored at
+    ~/lobster-user-config/memory/proprioceptive/<timestamp>-<signal>.md
+
+    Returns the path written.
+    """
+    # Slug the timestamp for a safe filename: 2026-03-22T14:05:00+00:00 -> 2026-03-22T140500
+    ts_slug = timestamp[:19].replace(":", "").replace("-", "").replace("T", "T")
+    filename = f"{ts_slug[:15]}-{alignment_signal}.md"
+    path = _proprioceptive_dir() / filename
+
+    frontmatter_lines = [
+        "---",
+        f"timestamp: {timestamp}",
+        f"alignment_signal: {alignment_signal}",
+        f"source: {source}",
+    ]
+    if topic:
+        frontmatter_lines.append(f"topic: {topic}")
+    if chat_id:
+        frontmatter_lines.append(f"chat_id: {chat_id}")
+    frontmatter_lines.append("---")
+
+    body_lines = [
+        "",
+        "## Context",
+        "",
+        context_snippet.strip(),
+        "",
+        "## Assessment",
+        "",
+        assessment.strip(),
+    ]
+
+    content = "\n".join(frontmatter_lines + body_lines) + "\n"
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+async def handle_record_mirroring_instance(arguments: dict[str, Any]) -> list[TextContent]:
+    """Record a proprioceptive instance — a concrete semantic mirroring moment.
+
+    Dual-writes to:
+    1. The vector DB via memory_store (type=proprioceptive, project=proprioceptive)
+       for hybrid search and retro retrieval.
+    2. A structured markdown file at ~/lobster-user-config/memory/proprioceptive/
+       for human review and durability across DB rebuilds.
+    """
+    alignment_signal = arguments.get("alignment_signal", "").strip()
+    context_snippet = arguments.get("context_snippet", "").strip()
+    assessment = arguments.get("assessment", "").strip()
+    source = arguments.get("source", "human-noted").strip()
+    topic = arguments.get("topic", "").strip() or None
+    chat_id_raw = arguments.get("chat_id")
+    task_id = arguments.get("task_id", "").strip() or None
+
+    if not alignment_signal:
+        return [TextContent(type="text", text="Error: alignment_signal is required")]
+    if alignment_signal not in ("positive", "negative", "uncertain"):
+        return [TextContent(type="text", text="Error: alignment_signal must be positive, negative, or uncertain")]
+    if not context_snippet:
+        return [TextContent(type="text", text="Error: context_snippet is required")]
+    if not assessment:
+        return [TextContent(type="text", text="Error: assessment is required")]
+
+    now = datetime.now(timezone.utc)
+    timestamp = now.isoformat()
+    chat_id_str = str(chat_id_raw) if chat_id_raw is not None else None
+
+    # Compose rich content for the vector DB — include all fields so
+    # semantic search can find instances by any angle.
+    topic_line = f"\ntopic: {topic}" if topic else ""
+    memory_content = (
+        f"proprioceptive instance | signal: {alignment_signal} | source: {source}{topic_line}\n\n"
+        f"context: {context_snippet}\n\n"
+        f"assessment: {assessment}"
+    )
+
+    errors: list[str] = []
+    memory_event_id: int | None = None
+    file_path: Path | None = None
+
+    # 1. Store to vector DB
+    if _memory_provider is not None:
+        try:
+            event = MemoryEvent(
+                id=None,
+                timestamp=now,
+                type="proprioceptive",
+                source="internal",
+                project="proprioceptive",
+                content=memory_content,
+                metadata={
+                    "tags": ["proprioceptive", alignment_signal, source],
+                    "alignment_signal": alignment_signal,
+                    "source": source,
+                    **({"topic": topic} if topic else {}),
+                    **({"chat_id": chat_id_str} if chat_id_str else {}),
+                },
+            )
+            memory_event_id = _memory_provider.store(event)
+        except Exception as e:
+            log.error(f"record_mirroring_instance: vector DB write failed: {e}", exc_info=True)
+            errors.append(f"vector DB write failed: {e}")
+    else:
+        errors.append("memory system unavailable — vector DB write skipped")
+
+    # 2. Write to file-based proprioceptive log
+    try:
+        file_path = _write_proprioceptive_file(
+            timestamp=timestamp,
+            alignment_signal=alignment_signal,
+            context_snippet=context_snippet,
+            assessment=assessment,
+            source=source,
+            topic=topic,
+            chat_id=chat_id_str,
+        )
+    except Exception as e:
+        log.error(f"record_mirroring_instance: file write failed: {e}", exc_info=True)
+        errors.append(f"file write failed: {e}")
+
+    if errors and memory_event_id is None and file_path is None:
+        return [TextContent(type="text", text="Error: both storage paths failed: " + "; ".join(errors))]
+
+    parts: list[str] = []
+    if memory_event_id is not None:
+        parts.append(f"vector DB event #{memory_event_id}")
+    if file_path is not None:
+        parts.append(f"file: {file_path.name}")
+    if errors:
+        parts.append(f"warnings: {'; '.join(errors)}")
+
+    result_text = (
+        f"Recorded proprioceptive instance ({alignment_signal}): {', '.join(parts)}. "
+        f"Retrievable via memory_search(query='proprioceptive') or get_proprioceptive_context()."
+    )
+
+    log.info(
+        f"Proprioceptive instance recorded: signal={alignment_signal} source={source}"
+        + (f" event_id={memory_event_id}" if memory_event_id else "")
+        + (f" file={file_path.name}" if file_path else "")
+        + (f" task_id={task_id}" if task_id else "")
+    )
+    return [TextContent(type="text", text=result_text)]
+
+
+async def handle_get_proprioceptive_context(arguments: dict[str, Any]) -> list[TextContent]:
+    """Return recent proprioceptive instances for session context injection.
+
+    Reads from the file-based log (~/lobster-user-config/memory/proprioceptive/)
+    rather than the vector DB, so it works even when the DB is unavailable and
+    returns instances in strict recency order without semantic scoring.
+    """
+    limit = int(arguments.get("limit", 5))
+    filter_signal = arguments.get("alignment_signal", "all")
+
+    prop_dir = _proprioceptive_dir()
+    try:
+        files = sorted(prop_dir.glob("*.md"), key=lambda p: p.name, reverse=True)
+    except Exception as e:
+        return [TextContent(type="text", text=f"Error reading proprioceptive directory: {e}")]
+
+    if not files:
+        return [TextContent(type="text", text="No proprioceptive instances recorded yet.")]
+
+    selected: list[tuple[Path, dict]] = []
+    for f in files:
+        if len(selected) >= limit:
+            break
+        try:
+            raw = f.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        # Parse minimal YAML frontmatter (simple line-by-line, no external dep)
+        meta: dict = {}
+        in_front = False
+        body_lines: list[str] = []
+        front_done = False
+        for line in raw.splitlines():
+            if line.strip() == "---":
+                if not in_front and not front_done:
+                    in_front = True
+                    continue
+                elif in_front:
+                    in_front = False
+                    front_done = True
+                    continue
+            if in_front:
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    meta[k.strip()] = v.strip()
+            elif front_done:
+                body_lines.append(line)
+        if filter_signal != "all" and meta.get("alignment_signal") != filter_signal:
+            continue
+        selected.append((f, meta))
+
+    if not selected:
+        signal_note = f" (signal={filter_signal})" if filter_signal != "all" else ""
+        return [TextContent(type="text", text=f"No proprioceptive instances found{signal_note}.")]
+
+    lines = [f"**Proprioceptive Context** ({len(selected)} recent instance(s)):"]
+    for f, meta in selected:
+        signal = meta.get("alignment_signal", "?")
+        ts = meta.get("timestamp", "?")[:10]  # date only
+        src = meta.get("source", "?")
+        topic = meta.get("topic", "")
+        topic_note = f" [{topic}]" if topic else ""
+
+        # Extract context and assessment from body
+        raw = f.read_text(encoding="utf-8")
+        context_text = ""
+        assessment_text = ""
+        current_section = None
+        for line in raw.splitlines():
+            if line.startswith("## Context"):
+                current_section = "context"
+                continue
+            elif line.startswith("## Assessment"):
+                current_section = "assessment"
+                continue
+            elif line.startswith("---"):
+                continue
+            elif line.startswith("## "):
+                current_section = None
+                continue
+            if current_section == "context" and line.strip():
+                context_text = line.strip()[:200]
+                current_section = None  # take first non-empty line only
+            elif current_section == "assessment" and line.strip():
+                assessment_text = line.strip()[:200]
+                current_section = None
+
+        signal_marker = "+" if signal == "positive" else ("-" if signal == "negative" else "~")
+        lines.append(
+            f"\n[{signal_marker}] {ts} ({src}){topic_note}"
+            f"\n  context: {context_text}"
+            f"\n  assessment: {assessment_text}"
+        )
+
+    return [TextContent(type="text", text="\n".join(lines))]
 
 
 async def handle_get_handoff(arguments: dict[str, Any]) -> list[TextContent]:

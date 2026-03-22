@@ -668,3 +668,258 @@ class TestMemoryMCPHandlers:
             assert r.project == "lobster"
 
         provider.close()
+
+
+# ============================================================================
+# Proprioceptive Memory Handler Tests
+# ============================================================================
+
+
+class TestProprioceptiveHandlers:
+    """Tests for record_mirroring_instance and get_proprioceptive_context.
+
+    These test the handler functions directly via the same patterns used by
+    TestMemoryMCPHandlers — importing the helper functions from inbox_server.
+    """
+
+    @pytest.fixture
+    def prop_dir(self, tmp_path):
+        d = tmp_path / "proprioceptive"
+        d.mkdir()
+        return d
+
+    def test_write_proprioceptive_file_creates_md(self, tmp_path):
+        """_write_proprioceptive_file creates a markdown file with YAML frontmatter."""
+        import importlib, sys
+        # isolate import — patch LOBSTER_USER_CONFIG so dir creation is in tmp
+        import os
+        old_env = os.environ.get("LOBSTER_USER_CONFIG")
+        os.environ["LOBSTER_USER_CONFIG"] = str(tmp_path)
+        try:
+            # Force re-import of the helper if already cached
+            if "src.mcp.inbox_server" in sys.modules:
+                mod = sys.modules["src.mcp.inbox_server"]
+            else:
+                import src.mcp.inbox_server as mod
+
+            path = mod._write_proprioceptive_file(
+                timestamp="2026-03-22T14:05:00+00:00",
+                alignment_signal="positive",
+                context_snippet="Dan used 'proprioceptive feedback' to describe ergonomics.",
+                assessment="Mirrored Dan's register without institutional translation.",
+                source="human-noted",
+                topic="ergonomics",
+                chat_id="8075091586",
+            )
+        finally:
+            if old_env is None:
+                del os.environ["LOBSTER_USER_CONFIG"]
+            else:
+                os.environ["LOBSTER_USER_CONFIG"] = old_env
+
+        assert path.exists()
+        content = path.read_text()
+        assert "alignment_signal: positive" in content
+        assert "source: human-noted" in content
+        assert "topic: ergonomics" in content
+        assert "proprioceptive feedback" in content
+        assert "Mirrored Dan's register" in content
+        assert "## Context" in content
+        assert "## Assessment" in content
+
+    def test_write_proprioceptive_file_slug(self, tmp_path):
+        """File is named with timestamp slug and signal."""
+        import os, sys
+        old_env = os.environ.get("LOBSTER_USER_CONFIG")
+        os.environ["LOBSTER_USER_CONFIG"] = str(tmp_path)
+        try:
+            if "src.mcp.inbox_server" in sys.modules:
+                mod = sys.modules["src.mcp.inbox_server"]
+            else:
+                import src.mcp.inbox_server as mod
+
+            path = mod._write_proprioceptive_file(
+                timestamp="2026-03-22T14:05:00+00:00",
+                alignment_signal="negative",
+                context_snippet="Drift detected.",
+                assessment="AI-normalized.",
+                source="self-detected",
+                topic=None,
+                chat_id=None,
+            )
+        finally:
+            if old_env is None:
+                del os.environ["LOBSTER_USER_CONFIG"]
+            else:
+                os.environ["LOBSTER_USER_CONFIG"] = old_env
+
+        assert "negative" in path.name
+        # Should not have topic or chat_id in frontmatter
+        content = path.read_text()
+        assert "topic:" not in content
+        assert "chat_id:" not in content
+
+    @pytest.mark.asyncio
+    async def test_record_mirroring_instance_validation(self):
+        """record_mirroring_instance rejects invalid alignment_signal."""
+        if "src.mcp.inbox_server" in __import__("sys").modules:
+            mod = __import__("sys").modules["src.mcp.inbox_server"]
+        else:
+            import src.mcp.inbox_server as mod
+
+        result = await mod.handle_record_mirroring_instance({
+            "alignment_signal": "invalid",
+            "context_snippet": "something",
+            "assessment": "something",
+        })
+        assert len(result) == 1
+        assert "must be positive, negative, or uncertain" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_record_mirroring_instance_missing_fields(self):
+        """record_mirroring_instance requires all three core fields."""
+        import sys
+        if "src.mcp.inbox_server" in sys.modules:
+            mod = sys.modules["src.mcp.inbox_server"]
+        else:
+            import src.mcp.inbox_server as mod
+
+        # Missing context_snippet
+        result = await mod.handle_record_mirroring_instance({
+            "alignment_signal": "positive",
+            "assessment": "good",
+        })
+        assert "required" in result[0].text.lower() or "context_snippet" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_record_mirroring_instance_file_write(self, tmp_path):
+        """record_mirroring_instance creates a file in the proprioceptive dir."""
+        import os, sys
+        old_env = os.environ.get("LOBSTER_USER_CONFIG")
+        os.environ["LOBSTER_USER_CONFIG"] = str(tmp_path)
+        try:
+            if "src.mcp.inbox_server" in sys.modules:
+                mod = sys.modules["src.mcp.inbox_server"]
+            else:
+                import src.mcp.inbox_server as mod
+
+            result = await mod.handle_record_mirroring_instance({
+                "alignment_signal": "positive",
+                "context_snippet": "Dan described the keel metaphor clearly.",
+                "assessment": "Reflected Dan's navigation vocabulary back faithfully.",
+                "source": "human-noted",
+                "topic": "system-design",
+            })
+        finally:
+            if old_env is None:
+                del os.environ["LOBSTER_USER_CONFIG"]
+            else:
+                os.environ["LOBSTER_USER_CONFIG"] = old_env
+
+        # Should succeed
+        assert len(result) == 1
+        # File should exist in the proprioceptive dir
+        prop_files = list((tmp_path / "memory" / "proprioceptive").glob("*.md"))
+        assert len(prop_files) == 1
+        assert "positive" in prop_files[0].name
+
+    @pytest.mark.asyncio
+    async def test_get_proprioceptive_context_empty(self, tmp_path):
+        """get_proprioceptive_context returns informative message when no instances."""
+        import os, sys
+        old_env = os.environ.get("LOBSTER_USER_CONFIG")
+        os.environ["LOBSTER_USER_CONFIG"] = str(tmp_path)
+        try:
+            if "src.mcp.inbox_server" in sys.modules:
+                mod = sys.modules["src.mcp.inbox_server"]
+            else:
+                import src.mcp.inbox_server as mod
+
+            result = await mod.handle_get_proprioceptive_context({})
+        finally:
+            if old_env is None:
+                del os.environ["LOBSTER_USER_CONFIG"]
+            else:
+                os.environ["LOBSTER_USER_CONFIG"] = old_env
+
+        assert "No proprioceptive instances" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_get_proprioceptive_context_returns_instances(self, tmp_path):
+        """get_proprioceptive_context reads and returns written instances."""
+        import os, sys
+        old_env = os.environ.get("LOBSTER_USER_CONFIG")
+        os.environ["LOBSTER_USER_CONFIG"] = str(tmp_path)
+        try:
+            if "src.mcp.inbox_server" in sys.modules:
+                mod = sys.modules["src.mcp.inbox_server"]
+            else:
+                import src.mcp.inbox_server as mod
+
+            # Write two instances
+            await mod.handle_record_mirroring_instance({
+                "alignment_signal": "positive",
+                "context_snippet": "Dan said 'fundamental frequency'.",
+                "assessment": "Held his frame without translating.",
+                "source": "human-noted",
+            })
+            await mod.handle_record_mirroring_instance({
+                "alignment_signal": "negative",
+                "context_snippet": "I wrote 'best practices'.",
+                "assessment": "AI-normalized into generic language.",
+                "source": "self-detected",
+            })
+
+            result = await mod.handle_get_proprioceptive_context({"limit": 5})
+        finally:
+            if old_env is None:
+                del os.environ["LOBSTER_USER_CONFIG"]
+            else:
+                os.environ["LOBSTER_USER_CONFIG"] = old_env
+
+        text = result[0].text
+        assert "Proprioceptive Context" in text
+        # Both instances should appear
+        assert "fundamental frequency" in text or "best practices" in text
+        # Signal markers
+        assert "[+]" in text or "[-]" in text
+
+    @pytest.mark.asyncio
+    async def test_get_proprioceptive_context_signal_filter(self, tmp_path):
+        """get_proprioceptive_context filters by alignment_signal when specified."""
+        import os, sys
+        old_env = os.environ.get("LOBSTER_USER_CONFIG")
+        os.environ["LOBSTER_USER_CONFIG"] = str(tmp_path)
+        try:
+            if "src.mcp.inbox_server" in sys.modules:
+                mod = sys.modules["src.mcp.inbox_server"]
+            else:
+                import src.mcp.inbox_server as mod
+
+            await mod.handle_record_mirroring_instance({
+                "alignment_signal": "positive",
+                "context_snippet": "Positive example here.",
+                "assessment": "Good alignment.",
+                "source": "human-noted",
+            })
+            await mod.handle_record_mirroring_instance({
+                "alignment_signal": "negative",
+                "context_snippet": "Negative drift here.",
+                "assessment": "Bad alignment.",
+                "source": "self-detected",
+            })
+
+            result = await mod.handle_get_proprioceptive_context({
+                "limit": 10,
+                "alignment_signal": "positive",
+            })
+        finally:
+            if old_env is None:
+                del os.environ["LOBSTER_USER_CONFIG"]
+            else:
+                os.environ["LOBSTER_USER_CONFIG"] = old_env
+
+        text = result[0].text
+        # Only positive instance should appear
+        assert "Positive example" in text
+        assert "Negative drift" not in text
