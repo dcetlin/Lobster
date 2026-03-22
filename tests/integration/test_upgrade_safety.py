@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import time
 import pytest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -399,7 +400,7 @@ class TestInFlightMessageSafety:
         ):
             from src.mcp.inbox_server import _recover_stale_processing
 
-            _recover_stale_processing(max_age_seconds=300)
+            _recover_stale_processing()
 
         assert not (processing / f"{msg['id']}.json").exists()
         assert (inbox / f"{msg['id']}.json").exists()
@@ -455,6 +456,8 @@ class TestInFlightMessageSafety:
         processing = temp_messages_dir / "processing"
 
         msg = message_generator.generate_text_message()
+        # Stamp _processing_started_at as "just now" so pre-restart path doesn't fire
+        msg["_processing_started_at"] = datetime.now(timezone.utc).isoformat()
         (processing / f"{msg['id']}.json").write_text(json.dumps(msg))
         # File was just created, so mtime is now
 
@@ -466,7 +469,7 @@ class TestInFlightMessageSafety:
         ):
             from src.mcp.inbox_server import _recover_stale_processing
 
-            _recover_stale_processing(max_age_seconds=300)
+            _recover_stale_processing()
 
         assert (processing / f"{msg['id']}.json").exists()
         assert not (inbox / f"{msg['id']}.json").exists()
@@ -482,8 +485,10 @@ class TestInFlightMessageSafety:
         inbox_msg = message_generator.generate_text_message(text="inbox msg")
         (inbox / f"{inbox_msg['id']}.json").write_text(json.dumps(inbox_msg))
 
-        # Recently claimed message (should stay)
+        # Recently claimed message (should stay) — stamp _processing_started_at
+        # so the pre-restart path does not fire (started_at is after server start)
         recent_msg = message_generator.generate_text_message(text="recent processing")
+        recent_msg["_processing_started_at"] = datetime.now(timezone.utc).isoformat()
         (processing / f"{recent_msg['id']}.json").write_text(json.dumps(recent_msg))
 
         # Stale processing message (should recover)
@@ -518,7 +523,7 @@ class TestInFlightMessageSafety:
         ):
             from src.mcp.inbox_server import _recover_stale_processing, _recover_retryable_messages
 
-            _recover_stale_processing(max_age_seconds=300)
+            _recover_stale_processing()
             _recover_retryable_messages()
 
         # inbox: original + stale recovered + retry recovered = 3
@@ -538,3 +543,93 @@ class TestInFlightMessageSafety:
         # processed: unchanged
         processed_files = list(processed.glob("*.json"))
         assert len(processed_files) == 1
+
+    def test_pre_restart_processing_recovered_immediately(self, temp_messages_dir, message_generator):
+        """Messages claimed before the server started are recovered immediately,
+        regardless of age, because the previous server instance is gone and can
+        never complete them.  This is the MCP-drop scenario: a voice or text
+        message enters processing/ right before the MCP connection drops; when
+        the server restarts it must surface that message without waiting for the
+        full stale timeout (90–300s).
+        """
+        inbox = temp_messages_dir / "inbox"
+        processing = temp_messages_dir / "processing"
+
+        # Simulate a message that was claimed 5 seconds ago by the PREVIOUS server.
+        # _processing_started_at is in the past relative to _SERVER_START_TIME.
+        pre_restart_time = datetime.now(timezone.utc).replace(microsecond=0)
+        five_seconds_ago = pre_restart_time.timestamp() - 5
+
+        msg = message_generator.generate_text_message()
+        # Stamp _processing_started_at to 5s before "now" (will be before the
+        # fake _SERVER_START_TIME we inject, which is 1s in the future)
+        msg["_processing_started_at"] = datetime.fromtimestamp(
+            five_seconds_ago, tz=timezone.utc
+        ).isoformat()
+        (processing / f"{msg['id']}.json").write_text(json.dumps(msg))
+
+        # Inject a fake _SERVER_START_TIME that is 1 second in the future relative
+        # to _processing_started_at — i.e. the server "started" after the message
+        # was claimed, meaning the claim was made by the previous server instance.
+        fake_server_start = datetime.fromtimestamp(
+            five_seconds_ago + 1, tz=timezone.utc
+        )
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            FAILED_DIR=temp_messages_dir / "failed",
+            _SERVER_START_TIME=fake_server_start,
+        ):
+            from src.mcp.inbox_server import _recover_stale_processing
+
+            _recover_stale_processing()
+
+        # Message should be back in inbox/ immediately — no timeout wait needed.
+        assert not (processing / f"{msg['id']}.json").exists(), (
+            "Pre-restart message should have been moved out of processing/"
+        )
+        assert (inbox / f"{msg['id']}.json").exists(), (
+            "Pre-restart message should be back in inbox/"
+        )
+
+    def test_voice_message_pre_restart_recovered_immediately(self, temp_messages_dir, message_generator):
+        """Voice messages are the most vulnerable to being stuck (300s stale timeout).
+        If a voice message was claimed before the server restarted it must be
+        recovered immediately, not after 300 seconds.
+        """
+        inbox = temp_messages_dir / "inbox"
+        processing = temp_messages_dir / "processing"
+
+        # Voice message claimed 10 seconds ago, well within the 300s stale window.
+        ten_seconds_ago = datetime.now(timezone.utc).timestamp() - 10
+
+        msg = message_generator.generate_text_message()
+        msg["type"] = "voice"
+        msg["_processing_started_at"] = datetime.fromtimestamp(
+            ten_seconds_ago, tz=timezone.utc
+        ).isoformat()
+        (processing / f"{msg['id']}.json").write_text(json.dumps(msg))
+
+        # Server started 5 seconds ago — after the voice message was claimed.
+        fake_server_start = datetime.fromtimestamp(
+            ten_seconds_ago + 5, tz=timezone.utc
+        )
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            FAILED_DIR=temp_messages_dir / "failed",
+            _SERVER_START_TIME=fake_server_start,
+        ):
+            from src.mcp.inbox_server import _recover_stale_processing
+
+            _recover_stale_processing()
+
+        # Should be recovered immediately — not stuck for 300s.
+        assert not (processing / f"{msg['id']}.json").exists(), (
+            "Pre-restart voice message should be recovered immediately, not stuck for 300s"
+        )
+        assert (inbox / f"{msg['id']}.json").exists()
