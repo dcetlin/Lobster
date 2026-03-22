@@ -667,12 +667,14 @@ When a scheduled job finishes, `run-job.sh` calls `scheduled-tasks/post-reminder
 5. Always spawn a background subagent to read and triage the output — never call
    check_task_outputs inline. The subagent is cheap; the inline I/O is not.
 
+   triage_task_id = f"cron-triage-{job_name}-{int(msg['timestamp'])}"
+
    Task(
        subagent_type="lobster-generalist",
        run_in_background=True,
        prompt=(
            f"---\n"
-           f"task_id: cron-triage-{job_name}\n"
+           f"task_id: {triage_task_id}\n"
            f"chat_id: 0\n"
            f"source: system\n"
            f"---\n\n"
@@ -683,18 +685,19 @@ When a scheduled job finishes, `run-job.sh` calls `scheduled-tasks/post-reminder
            f"Steps:\n"
            f"1. Call check_task_outputs(job_name='{job_name}', limit=1) to read the latest output.\n"
            f"2. Apply the triage heuristic below.\n"
-           f"3. Call write_result(task_id='cron-triage-{job_name}', chat_id=0, "
+           f"3. Call write_result(task_id='{triage_task_id}', chat_id=0, "
            f"text=<summary>, source='system', "
            f"sent_reply_to_user=<True if you called send_reply, else False>).\n\n"
            f"Triage heuristic:\n"
            f"- FAILURES: always relay — send_reply(chat_id=ADMIN_CHAT_ID, ...) with a concise summary\n"
            f"- SUCCESSES with findings, alerts, or actionable content: relay via send_reply\n"
-           f"- SUCCESSES with 'nothing to report' / no-op output: silent — write_result only, "
-           f"no send_reply\n"
-           f"- If the job already self-reports via write_result (produces a subagent_result or "
-           f"subagent_notification), a duplicate cron_reminder will arrive — check_task_outputs\n"
-           f"  will return the same output the subagent already sent. In that case do NOT relay "
-           f"again. Call write_result silently."
+           f"- SUCCESSES where the output says 'nothing to report', 'no action taken', 'no new', "
+           f"'no findings', or any equivalent no-op phrase: silent — write_result only, no send_reply\n"
+           f"- If the output is empty or missing: treat as no-op — write_result only, no send_reply\n"
+           f"Do NOT attempt to detect whether a prior subagent already relayed this output. "
+           f"Judge solely on the content of the output: if it has actionable information, relay it; "
+           f"if it is a no-op, drop it. The dispatcher's dedup logic handles any duplicate "
+           f"subagent_result messages structurally."
        ),
    )
 
@@ -716,7 +719,7 @@ When a scheduled job finishes, `run-job.sh` calls `scheduled-tasks/post-reminder
 - For successes, relay if the output contains findings, alerts, or explicit user-relevant content
 - Routine "nothing to report" outputs → silent (write_result with chat_id=0, no send_reply)
 
-**Note:** Jobs that already call `send_reply` + `write_result` directly produce a `subagent_result`/`subagent_notification` in addition to the `cron_reminder`. The triage subagent handles this correctly — it will detect the duplicate and call write_result silently without re-relaying to the user.
+**Note:** Jobs that already call `send_reply` + `write_result` directly produce a `subagent_result`/`subagent_notification` in addition to the `cron_reminder`. The triage subagent handles this correctly — it reads the output content and drops no-op or already-empty results silently. Any genuine duplicate relay is caught structurally by the dispatcher's `subagent_result` dedup logic (the `sent_reply_to_user` field).
 
 ## Message Flow
 
