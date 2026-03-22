@@ -2872,24 +2872,82 @@ def _stale_timeout_for_message(msg: dict) -> int:
     return 300 if msg_type in slow_types else 90
 
 
+def _processing_age(f: Path, msg: dict) -> tuple[float, str]:
+    """Return (age_seconds, age_source) for a message in processing/.
+
+    Prefers the _processing_started_at field written at claim time over file
+    mtime, because mtime is refreshed by atomic_write_json when the timestamp
+    is stamped.  Falls back to mtime when the field is absent or unparseable.
+
+    Returns a 2-tuple so callers can include the source in log messages.
+    """
+    started_at_str = msg.get("_processing_started_at")
+    if started_at_str:
+        try:
+            started_at = datetime.fromisoformat(started_at_str)
+            # Ensure timezone-aware for comparison
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - started_at).total_seconds()
+            return age, "_processing_started_at"
+        except Exception:
+            pass
+    # Fall back to file mtime
+    age = time.time() - f.stat().st_mtime
+    return age, "mtime"
+
+
 def _recover_stale_processing():
     """Move stale messages from processing/ back to inbox/.
 
-    Uses a type-aware timeout: 90s for text messages, 300s for media
-    (voice/audio/photo/document) where transcription or download can be slow.
+    Two recovery paths:
+
+    1. Pre-restart abandonment (immediate): any message whose _processing_started_at
+       predates _SERVER_START_TIME was being processed by a previous server instance
+       that is now gone. It is definitively abandoned regardless of age, so it is
+       returned to inbox/ immediately without waiting for the stale timeout.
+
+    2. Timeout-based recovery: messages still being processed by the current server
+       instance use a type-aware timeout — 90s for text, 300s for media (voice/photo/
+       document) where transcription or download can be slow. Age is measured from
+       _processing_started_at when available, falling back to file mtime.
     """
     now = time.time()
+    server_start_ts = _SERVER_START_TIME.timestamp()
     for f in PROCESSING_DIR.glob("*.json"):
         try:
-            age = now - f.stat().st_mtime
             msg = json.loads(f.read_text())
+
+            # Path 1: message was claimed before this server started — definitively abandoned.
+            started_at_str = msg.get("_processing_started_at")
+            if started_at_str:
+                try:
+                    started_at = datetime.fromisoformat(started_at_str)
+                    if started_at.tzinfo is None:
+                        started_at = started_at.replace(tzinfo=timezone.utc)
+                    if started_at.timestamp() < server_start_ts:
+                        dest = INBOX_DIR / f.name
+                        f.rename(dest)
+                        log.warning(
+                            f"Recovered pre-restart message from processing: {f.name} "
+                            f"(type: {msg.get('type', 'text')}, "
+                            f"started_at: {started_at_str}, "
+                            f"server_start: {_SERVER_START_TIME.isoformat()})"
+                        )
+                        continue
+                except Exception:
+                    pass
+
+            # Path 2: timeout-based recovery using _processing_started_at or mtime.
+            age, age_source = _processing_age(f, msg)
             max_age = _stale_timeout_for_message(msg)
             if age > max_age:
                 dest = INBOX_DIR / f.name
                 f.rename(dest)
                 log.warning(
                     f"Recovered stale message from processing: {f.name} "
-                    f"(type: {msg.get('type', 'text')}, age: {int(age)}s, timeout: {max_age}s)"
+                    f"(type: {msg.get('type', 'text')}, age: {int(age)}s, "
+                    f"timeout: {max_age}s, age_source: {age_source})"
                 )
         except Exception:
             continue
@@ -7802,6 +7860,21 @@ async def main():
             log.info("[startup] No stale 'running' sessions found at startup")
     except Exception as _cleanup_err:
         log.warning(f"[startup] Stale session cleanup failed (non-fatal): {_cleanup_err}")
+
+    # Startup recovery: move any messages abandoned in processing/ back to inbox/
+    # immediately on server start, before the dispatcher calls wait_for_messages.
+    # This complements the per-call recovery in handle_wait_for_messages: messages
+    # that entered processing/ before _SERVER_START_TIME are returned immediately
+    # (path 1 in _recover_stale_processing); timeout-based recovery runs later as
+    # the dispatcher loops. Running this at startup ensures the first
+    # wait_for_messages call sees a clean inbox/ with any pre-restart messages
+    # already surfaced, rather than waiting for them to age out in processing/.
+    try:
+        _recover_stale_processing()
+        _recover_retryable_messages()
+        log.info("[startup] Ran pre-restart message recovery (processing/ and failed/)")
+    except Exception as _recovery_err:
+        log.warning(f"[startup] Pre-restart message recovery failed (non-fatal): {_recovery_err}")
 
     asyncio.create_task(reconcile_agent_sessions())
     async with stdio_server() as (read_stream, write_stream):
