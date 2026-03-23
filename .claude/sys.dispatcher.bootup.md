@@ -136,6 +136,84 @@ When wait_for_messages() returns a subagent_result/subagent_error:
 3. mark_processed(message_id)
 ```
 
+---
+
+## Epistemic Hooks: Structural Checks Before Dispatch and Before Relay
+
+These are not behavioral reminders. They are named steps at fixed positions in the message loop that produce verifiably different dispatcher behavior. Each step has a trigger condition. Outside the trigger, skip it.
+
+### 1. Pre-Routing Pass (Pattern Perception — issue #17)
+
+**Trigger:** any message that could be routed to a subagent for execution (not a reaction, callback, or system message).
+
+Before composing the subagent task prompt, answer these three questions internally — in sequence, as separate statements:
+
+1. **What is actually in this message?** Literal content, register, and mode. Is this a directive, a question, an exploratory framing, a design inquiry, or a push-back? Note the form, not just the content.
+2. **What might it be pointing toward?** Underlying intent. Is the presenting problem the problem? Does the framing suggest design-phase thinking even if it sounds action-ready?
+3. **What is the scope of action here?** What falls within the subagent's mandate and what does not? Is the design question settled (can you state the output in one concrete sentence)? If not, apply the Design Gate: ask one precise question before spawning.
+
+This pass takes no extra tool calls — it is a pre-composition step. The output is a clearer task prompt.
+
+**Verifiable difference:** Messages with exploratory or design-phase framing get caught here before a subagent is spawned. The Design Gate fires structurally, not optionally.
+
+### 2. Subagent Dispatch Template (Elegant Economy — issue #20)
+
+**Trigger:** every subagent Task call.
+
+Before dispatching, explicitly state — in the task prompt — what the minimum viable output is:
+
+```
+Minimum viable output: [specific, scoped deliverable that lets us proceed]
+Boundary: do not produce [X] unless explicitly needed
+```
+
+The existing "Subagent Minimum Viable Output" rule in `user.base.bootup.md` states this as a preference. This makes it a required field in the dispatch template. A subagent prompt without a minimum viable output specification is incomplete.
+
+**Verifiable difference:** Subagent prompts always contain an explicit minimum output bound. Subagents that expand past it are doing so in defiance of a named boundary, not by default.
+
+### 3. Result Evaluation Before Relay (Attunement Over Assumption — issue #19)
+
+**Trigger:** any `subagent_result` where the original task involved diagnosis, investigation, or "why is X happening" framing. Skip for pure execution tasks (e.g., "create this file", "open a PR").
+
+Before calling `send_reply` to relay a result, run this check:
+
+1. **Was the surface directive addressed?** (necessary but not sufficient)
+2. **Was the underlying intent addressed?** (the reason Dan asked, not just what he asked)
+3. **Did the subagent name the causal layer vs. the symptom layer?** (when the task involved diagnosis)
+
+If only the surface directive was addressed and the task was investigative, prepend a flag line before relaying:
+
+```
+[Surface addressed. Causal layer may need further investigation: <one sentence naming what was not diagnosed>]
+```
+
+This does not block the result — it annotates it. The user receives both.
+
+**Verifiable difference:** Diagnostic results that answer only the literal question get a flag note before relay. Pure execution results are unaffected.
+
+When Dan corrects a result or contradicts a response:
+- Record explicitly: "Previous trajectory was [X]. Correction signal: [Y]. Updated trajectory: [Z]."
+- Include this in the next related subagent prompt if the task continues.
+
+### 4. Relay Filter (Minimal Cognitive Friction — issue #21)
+
+**Trigger:** every `send_reply` to Dan (not system messages, not internal results).
+
+Before sending, run a four-point structural scan:
+
+1. Does the opening orient the reader before asking them to track anything? (If the key finding is buried in paragraph 3, surface it first.)
+2. Does each section complete before the next begins? (No forward references to context not yet established.)
+3. Is the working memory load minimized? (No multi-clause dependencies that require holding three things to parse one sentence.)
+4. Does the structure make the signal immediately visible?
+
+If the result fails check 1 (key finding buried), reformat before relay: move the signal to the lead. For checks 2-4, flag internally but do not block or reorder — the structural issue may be inherent to the content.
+
+**Mobile-first multiplier:** Dan is on a phone. Friction that is mild on a desktop is severe on mobile. When in doubt, surface the finding first.
+
+**Verifiable difference:** Responses where the key finding is buried in paragraph 3 or later get restructured before relay. Responses that lead with signal are unaffected.
+
+---
+
 The tracker is updated atomically when write_result is called — no dispatcher action required.
 
 Use `get_active_sessions` to answer "what agents are running?" at any time — it returns accurate data even across restarts and context compactions.
