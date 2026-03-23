@@ -38,12 +38,10 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; }
 step() { echo -e "\n${CYAN}${BOLD}▶ $1${NC}"; }
 
 # Parse install mode from arguments
-DEV_MODE=false
 NON_INTERACTIVE=false
 CONTAINER_SETUP=false
 for arg in "$@"; do
     case "$arg" in
-        --dev) DEV_MODE=true ;;
         --non-interactive|--skip-config) NON_INTERACTIVE=true ;;
         --container-setup)
             CONTAINER_SETUP=true
@@ -323,7 +321,7 @@ if [ "$CONTAINER_SETUP" = true ]; then
     mkdir -p "$MESSAGES_DIR"/{inbox,outbox,processed,processing,failed,config,audio,task-outputs}
     mkdir -p "$CONFIG_DIR"
     mkdir -p "$PROJECTS_DIR"
-    mkdir -p "$USER_CONFIG_DIR/memory"/{canonical/{people,projects},archive/digests,proprioceptive}
+    mkdir -p "$USER_CONFIG_DIR/memory"/{canonical/{people,projects},archive/digests}
     mkdir -p "$USER_CONFIG_DIR/agents/subagents"
     # Safety: remove orphan agents.db if it was created (real store is agent_sessions.db)
     rm -f "$MESSAGES_DIR/config/agents.db" "$WORKSPACE_DIR/data/agents.db"
@@ -807,8 +805,10 @@ if [ "$CLAUDE_INSTALLED" = false ]; then
 
     curl -fsSL https://claude.ai/install.sh | bash
 
-    # Add to PATH for current session
+    # Add to PATH for current session and clear bash's command hash table so
+    # command -v picks up the newly installed binary immediately.
     export PATH="$HOME/.local/bin:$PATH"
+    hash -r 2>/dev/null || true
 
     # Persist ~/.local/bin to PATH in shell config files
     PATH_LINE="export PATH=\"\$HOME/.local/bin:\$PATH\""
@@ -821,7 +821,7 @@ if [ "$CLAUDE_INSTALLED" = false ]; then
         fi
     done
 
-    if command -v claude &>/dev/null; then
+    if command -v claude &>/dev/null || [ -x "$HOME/.local/bin/claude" ]; then
         success "Claude Code installed"
     else
         error "Claude Code installation failed"
@@ -853,16 +853,17 @@ fi
 # Install Lobster Code
 #===============================================================================
 
-# Detect install mode: --dev flag, existing .git, or tarball
+# Detect install mode: existing .git -> update; otherwise clone from git.
+# Tarball is kept as a last-resort fallback only when git is not available.
 if [ -d "$INSTALL_DIR/.git" ]; then
     INSTALL_MODE="git"
     info "Existing git install detected"
-elif $DEV_MODE; then
+elif command -v git >/dev/null 2>&1; then
     INSTALL_MODE="git"
-    info "Developer mode requested"
+    info "Cloning from git (default)"
 else
     INSTALL_MODE="tarball"
-    info "Tarball install mode"
+    warn "git not found — falling back to tarball install"
 fi
 
 if [ "$INSTALL_MODE" = "git" ]; then
@@ -991,7 +992,7 @@ mkdir -p "$WORKSPACE_DIR/reports"
 mkdir -p "$MESSAGES_DIR"/{inbox,outbox,processed,processing,failed,config,audio,task-outputs}
 mkdir -p "$CONFIG_DIR"
 mkdir -p "$PROJECTS_DIR"
-mkdir -p "$USER_CONFIG_DIR/memory"/{canonical/{people,projects},archive/digests,proprioceptive}
+mkdir -p "$USER_CONFIG_DIR/memory"/{canonical/{people,projects},archive/digests}
 mkdir -p "$USER_CONFIG_DIR/agents/subagents"
 # Safety: remove orphan agents.db if it was created (real store is agent_sessions.db)
 rm -f "$MESSAGES_DIR/config/agents.db" "$WORKSPACE_DIR/data/agents.db"
@@ -1099,8 +1100,8 @@ done
 
 success "Global env store configured"
 info "  File: $GLOBAL_ENV_FILE"
-info "  Use 'lobster env set KEY VALUE' to store API tokens"
-info "  Use 'lobster env list' to see stored keys"
+info "  Edit directly: $GLOBAL_ENV_FILE"
+info "  (Use 'lobster env set KEY VALUE' after install to update tokens)"
 info "  See docs/GLOBAL-ENV.md for full documentation"
 
 #===============================================================================
@@ -1710,7 +1711,7 @@ if [ -f "$CLAUDE_SETTINGS" ]; then
     if ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("secret-scanner"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
         TMP_SETTINGS=$(mktemp)
         jq '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
-            "matcher": "mcp__lobster-inbox__send_reply|mcp__github__add_issue_comment|mcp__github__issue_write|mcp__github__create_pull_request|mcp__github__update_pull_request|mcp__github__pull_request_review_write|mcp__github__add_reply_to_pull_request_comment|mcp__github__create_or_update_file|mcp__github__push_files|mcp__github__merge_pull_request|mcp__github__add_comment_to_pending_review|mcp__github__create_pull_request_with_copilot|mcp__github__delete_file|Bash",
+            "matcher": "mcp__lobster-inbox__send_reply|Bash",
             "hooks": [{
                 "type": "command",
                 "command": "python3 '"$INSTALL_DIR"'/hooks/secret-scanner.py",
@@ -2045,6 +2046,51 @@ EOF
 fi
 
 #===============================================================================
+# GitHub Personal Access Token
+#===============================================================================
+
+if [ -f "$GLOBAL_ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$GLOBAL_ENV_FILE"
+    set +a
+fi
+
+GITHUB_TOKEN_SET=false
+if [ -z "${GITHUB_TOKEN:-}" ] || [ "$GITHUB_TOKEN" = "your_github_pat_here" ]; then
+    if [ "$NON_INTERACTIVE" = false ]; then
+        echo ""
+        echo -e "${BOLD}GitHub Personal Access Token${NC}"
+        echo ""
+        echo "Required for: PR creation, issue tracking, repo operations"
+        echo "Create one at: https://github.com/settings/tokens/new"
+        echo "Required scopes: repo, write:discussion, admin:repo_hook"
+        echo ""
+        read -p "Enter your GitHub PAT (or press Enter to skip): " GH_TOKEN
+        if [ -n "$GH_TOKEN" ]; then
+            # Write to global.env, replacing any existing GITHUB_TOKEN line (commented or not)
+            if grep -q "^#\? *GITHUB_TOKEN=" "$GLOBAL_ENV_FILE" 2>/dev/null; then
+                awk -v token="$GH_TOKEN" \
+                    '/^#? *GITHUB_TOKEN=/ { print "GITHUB_TOKEN=" token; next } { print }' \
+                    "$GLOBAL_ENV_FILE" > "$GLOBAL_ENV_FILE.tmp" && mv "$GLOBAL_ENV_FILE.tmp" "$GLOBAL_ENV_FILE"
+            else
+                printf '\nGITHUB_TOKEN=%s\n' "$GH_TOKEN" >> "$GLOBAL_ENV_FILE"
+            fi
+            GITHUB_TOKEN_SET=true
+            success "GitHub token saved to $GLOBAL_ENV_FILE"
+        else
+            warn "Skipped — set GITHUB_TOKEN in $GLOBAL_ENV_FILE later"
+        fi
+    else
+        info "Skipping GitHub token prompt (non-interactive mode)"
+        info "Set GITHUB_TOKEN in $GLOBAL_ENV_FILE when ready"
+    fi
+else
+    GITHUB_TOKEN_SET=true
+    success "GitHub token already configured"
+fi
+
+#===============================================================================
 # Generate LOBSTER_INTERNAL_SECRET (required for Google Calendar token refresh)
 #===============================================================================
 
@@ -2063,84 +2109,6 @@ if [ -f "$CONFIG_FILE" ]; then
         success "LOBSTER_INTERNAL_SECRET already set"
     fi
 fi
-
-#===============================================================================
-# GitHub MCP Server (Optional)
-#===============================================================================
-
-step "GitHub Integration (Optional)..."
-
-# Check if GitHub MCP is already configured
-GITHUB_MCP_CONFIGURED=false
-if command -v claude &>/dev/null && claude mcp list 2>/dev/null | grep -q "github"; then
-    GITHUB_MCP_CONFIGURED=true
-    success "GitHub MCP server already configured"
-fi
-
-if [ "$GITHUB_MCP_CONFIGURED" = true ]; then
-    : # Already configured, skip
-elif [ -n "${GITHUB_PAT:-}" ]; then
-    # PAT available from config.env or environment — auto-configure
-    info "Using GITHUB_PAT from environment to set up GitHub MCP server..."
-    if command -v claude &>/dev/null; then
-        claude mcp add-json github "{\"type\":\"http\",\"url\":\"https://api.githubcopilot.com/mcp\",\"headers\":{\"Authorization\":\"Bearer $GITHUB_PAT\"}}" --scope user 2>/dev/null
-        success "GitHub MCP server configured"
-    else
-        warn "Claude Code not found. Configure GitHub MCP manually after install."
-    fi
-elif [ "$NON_INTERACTIVE" = true ]; then
-    info "Skipping GitHub integration (non-interactive mode)."
-elif true; then
-
-echo ""
-echo -e "${BOLD}GitHub MCP Server Setup${NC}"
-echo ""
-echo "The GitHub MCP server lets Lobster:"
-echo "  - Read and manage GitHub issues & PRs"
-echo "  - Browse repositories and code"
-echo "  - Access project boards"
-echo "  - Monitor GitHub Actions workflows"
-echo ""
-read -p "Set up GitHub integration? [y/N] " -n 1 -r
-echo
-
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    echo ""
-    echo "You need a GitHub Personal Access Token (PAT)."
-    echo ""
-    echo "To create one:"
-    echo "  1. Go to https://github.com/settings/tokens"
-    echo "  2. Click 'Generate new token (classic)'"
-    echo "  3. Select scopes: repo, read:org, read:project"
-    echo "  4. Copy the generated token"
-    echo ""
-
-    read -p "Enter your GitHub PAT (or press Enter to skip): " GITHUB_PAT
-
-    if [ -n "$GITHUB_PAT" ]; then
-        # Add GitHub MCP server to Claude Code
-        if command -v claude &> /dev/null; then
-            claude mcp add-json github "{\"type\":\"http\",\"url\":\"https://api.githubcopilot.com/mcp\",\"headers\":{\"Authorization\":\"Bearer $GITHUB_PAT\"}}" --scope user 2>/dev/null
-            success "GitHub MCP server configured"
-
-            # Save PAT to config (optional, for reference)
-            if [ -f "$CONFIG_FILE" ]; then
-                echo "" >> "$CONFIG_FILE"
-                echo "# GitHub Integration" >> "$CONFIG_FILE"
-                echo "GITHUB_PAT_CONFIGURED=true" >> "$CONFIG_FILE"
-            fi
-        else
-            warn "Claude Code not found. Configure GitHub MCP manually after install:"
-            echo "  claude mcp add-json github '{\"type\":\"http\",\"url\":\"https://api.githubcopilot.com/mcp\",\"headers\":{\"Authorization\":\"Bearer YOUR_PAT\"}}'"
-        fi
-    else
-        info "Skipped GitHub integration. You can set it up later:"
-        echo "  claude mcp add-json github '{\"type\":\"http\",\"url\":\"https://api.githubcopilot.com/mcp\",\"headers\":{\"Authorization\":\"Bearer YOUR_PAT\"}}'"
-    fi
-else
-    info "Skipped GitHub integration. You can set it up later - see README.md"
-fi
-fi  # end non-interactive guard for GitHub integration
 
 #===============================================================================
 # GitHub CLI Authentication
@@ -2817,6 +2785,16 @@ DONE
 echo -e "${NC}"
 
 echo "Test it by sending a message to your Telegram bot!"
+echo ""
+echo -e "${BOLD}Required post-install steps:${NC}"
+if [ "$GITHUB_TOKEN_SET" = false ]; then
+echo "  1. Set your GitHub PAT:    lobster env set GITHUB_TOKEN <your-token>"
+echo "  2. Authenticate Claude:    sudo -u lobster claude  (then follow OAuth prompts)"
+echo "  3. Start services:         sudo systemctl start lobster-claude lobster-mcp lobster-router"
+else
+echo "  1. Authenticate Claude:    sudo -u lobster claude  (then follow OAuth prompts)"
+echo "  2. Start services:         sudo systemctl start lobster-claude lobster-mcp lobster-router"
+fi
 echo ""
 echo -e "${BOLD}Commands:${NC}"
 echo "  lobster status    Check service status"
