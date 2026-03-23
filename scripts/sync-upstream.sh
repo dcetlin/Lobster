@@ -79,8 +79,32 @@ log() {
 
 die() {
     log ERROR "$1"
+    write_observations_error "$1"
     cleanup_lock
     exit "${2:-2}"
+}
+
+# ---------------------------------------------------------------------------
+# observations.log writer — surfaces system_error to the dispatcher
+#
+# Mirrors the format written by inbox_server.py's write_observation handler
+# so the dispatcher can surface upstream-sync failures in the same way as
+# other system errors (e.g. transcription worker failures).
+# ---------------------------------------------------------------------------
+
+write_observations_error() {
+    local msg="$1"
+    local obs_log="$WORKSPACE_DIR/logs/observations.log"
+    local ts
+    ts=$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())')
+
+    local json_msg
+    json_msg=$(printf '%s' "upstream-sync failure: $msg" \
+        | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+
+    mkdir -p "$(dirname "$obs_log")"
+    printf '{"ts":"%s","category":"system_error","content":%s,"source":"upstream-sync","task_id":"upstream-sync"}\n' \
+        "$ts" "$json_msg" >> "$obs_log"
 }
 
 # ---------------------------------------------------------------------------
