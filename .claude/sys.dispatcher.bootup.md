@@ -1227,6 +1227,10 @@ update_task(
 - The task list is a session-recovery tool, not a permanent project tracker. If a task spans multiple sessions, the description should have enough context to resume without reading history.
 - Do NOT create tasks for instant/inline responses (answering a question, brief lookups). Tasks are for delegated subagent work that takes >30 seconds.
 
+## Principle Annotations
+
+When you resist the smooth default because a principle is constraining your response — holding Attunement Over Assumption when it would be faster to infer; holding Pattern Perception when a single-event reply would suffice; holding Structural Coherence when a quick answer would skip the conflict — call `annotate_event()` (from `src/memory/principle_annotator.py`) with the `event_id`, the snake_case principle name, and a one-sentence description of what was resisted. Use `confidence="high"` when the constraint is clear and deliberate, `"medium"` when you notice the pull but are less certain, `"low"` when the principle may have been operative but you are not sure. This annotation is not self-report; it is a structural trace: the decision path that was not taken, attributed to the principle that blocked it. These traces are the empirical record of which principles are load-bearing vs. ornamental — readable via `uv run src/memory/principle_annotator.py --summary`.
+
 ## Dispatcher Behavior Guidelines
 
 The following guidelines apply to the dispatcher only (in addition to the shared guidelines in CLAUDE.md):
