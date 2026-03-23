@@ -48,8 +48,8 @@ import pytest
 HEALTH_SCRIPT = Path(__file__).parents[2] / "scripts" / "health-check-v3.sh"
 
 # How long the script suppresses stale-inbox checks after a compaction.
-# Must match COMPACTION_SUPPRESS_SECONDS in health-check-v3.sh (300).
-COMPACTION_SUPPRESS_SECONDS = 300
+# Must match COMPACTION_SUPPRESS_SECONDS in health-check-v3.sh (420).
+COMPACTION_SUPPRESS_SECONDS = 420
 
 
 # ---------------------------------------------------------------------------

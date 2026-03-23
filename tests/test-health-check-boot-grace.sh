@@ -104,7 +104,7 @@ source_health_check_functions() {
     # Assign directly from test paths rather than re-evaluating the config block,
     # so that overrides are always in effect regardless of script structure.
     BOOT_GRACE_SECONDS=90
-    COMPACTION_SUPPRESS_SECONDS=300
+    COMPACTION_SUPPRESS_SECONDS=420
     LOBSTER_STATE_FILE="${LOBSTER_STATE_FILE_OVERRIDE:-$TEST_STATE_FILE}"
     LOG_FILE="$TEST_LOG"
 
