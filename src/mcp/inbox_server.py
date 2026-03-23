@@ -8023,6 +8023,7 @@ def _build_reconciler_message(
         # The dispatcher sees type='agent_failed' and decides whether to re-queue,
         # escalate to the user, or drop silently. Never relay raw failure noise to
         # the user's Telegram.
+        original_chat_id = session.get("chat_id", "")
         last_output = _read_last_output(output_file)
         return {
             "id": message_id,
@@ -8035,7 +8036,7 @@ def _build_reconciler_message(
             ),
             "task_id": task_id,
             "agent_id": agent_id,
-            "original_chat_id": session.get("chat_id", ""),
+            "original_chat_id": original_chat_id,
             "original_prompt": input_summary,
             "last_output": last_output,
             "status": "error",
@@ -8062,6 +8063,21 @@ def _enqueue_reconciler_notification(session: dict, outcome: str) -> None:
         session: Session dict from get_active_sessions() or get_unnotified_completed().
         outcome: 'completed' or 'dead'.
     """
+    # Dead sessions with no real user don't need dispatcher action — route to
+    # debug log only, not the inbox. The dispatcher cannot notify a user
+    # (no chat_id) or take any meaningful action. Logging preserves observability.
+    if outcome == "dead":
+        _chat_id = session.get("chat_id")
+        _chat_id_str = str(_chat_id).strip() if _chat_id is not None else ""
+        if _chat_id_str in ("0", "", "None"):
+            _agent_id = session.get("id", "")
+            log.debug(
+                "[reconciler] Dead session %r has no real user (chat_id=%r) — "
+                "skipping inbox notification (logged to debug only)",
+                _agent_id, _chat_id,
+            )
+            return
+
     # Idempotency guard — if already notified, skip
     if session.get("notified_at"):
         return
@@ -8169,6 +8185,18 @@ async def reconcile_agent_sessions() -> None:
             for session in active_sessions:
                 agent_id = session.get("id", "")
                 output_file = session.get("output_file") or ""
+
+                # Issue #781 Fix 2: Skip dispatcher-type sessions entirely.
+                # The SessionStart hook may register the dispatcher itself in
+                # agent_sessions.db with agent_type='dispatcher' (on crash-restart
+                # before the marker file is cleared).  The dispatcher is never a
+                # "dead agent" — never emit agent_failed for it.
+                if (session.get("agent_type") or "") == "dispatcher":
+                    log.debug(
+                        f"[reconciler] Skipping dispatcher session {agent_id!r} "
+                        "(agent_type='dispatcher' — not a subagent)"
+                    )
+                    continue
 
                 # Fix: guard elapsed against None before any numeric comparison
                 elapsed_raw = session.get("elapsed_seconds")
