@@ -706,6 +706,59 @@ wait_for_messages() ← loop back
 
 **State directories:** `inbox/` → `processing/` → `processed/` (or → `failed/` → retried back to `inbox/`)
 
+## Classifier-Assisted Routing
+
+The quick-classifier (Layer 3) and slow-reclassifier (Layer 4) run as background processes and write provisional tags to `memory.db`. The dispatcher reads these tags to get a routing hint before composing the task prompt. **This is a read-only, fail-safe step — never block on it.**
+
+**When to run:** For normal user messages only (skip for system messages, callbacks, reactions, and subagent results).
+
+**After `claim_and_ack` / `mark_processing`, before composing the subagent prompt:**
+
+```python
+import sqlite3, time
+from pathlib import Path
+
+MEMORY_DB = Path.home() / "lobster-workspace/data/memory.db"
+classification = None
+if MEMORY_DB.exists():
+    t0 = time.monotonic()
+    try:
+        conn = sqlite3.connect(str(MEMORY_DB), timeout=1.0)
+        conn.row_factory = sqlite3.Row
+        # Prefer slow-v1 (within 2h), fall back to quick-v1 (within 2h)
+        row = conn.execute("""
+            SELECT classifier, significant, signal_a, signal_b, signal_c,
+                   signal_d, signal_e, confidence, notes
+            FROM classification_tags
+            WHERE entry_id = ?
+              AND classified_at >= datetime('now', '-2 hours')
+            ORDER BY CASE classifier WHEN 'slow-v1' THEN 0 WHEN 'quick' THEN 1 ELSE 2 END
+            LIMIT 1
+        """, (message_id,)).fetchone()
+        conn.close()
+        if time.monotonic() - t0 < 1.0:
+            classification = dict(row) if row else None
+        # If query took >1 second, skip — proceed unclassified
+    except Exception:
+        classification = None  # fail safe, not fail closed
+```
+
+The table schema is in `~/lobster/src/classifiers/quick_classifier.py` (`ensure_classification_table`). Key fields: `significant` (int 0/1), `signal_a`–`signal_e` (int 0/1), `confidence` (text), `notes` (text).
+
+**Routing hints — apply when `classification` is not None:**
+
+| Condition | Action |
+|---|---|
+| `signal_a == 1` (structural reach) | Treat as higher-stakes; note in subagent prompt |
+| `signal_b == 1` (instruction-layer modification) | Prompt subagent to be careful about `.claude/` / bootup file edits |
+| `signal_c == 1` (non-reversibility) | Flag in prompt: "non-reversible operation detected" |
+| `significant == 1` | Include a note in the subagent prompt: "Classifier flagged this as significant" |
+| `confidence == 'high'` (slow-v1 only) | Weight hints more strongly |
+
+These are **soft hints**, not hard blocks. They adjust posture and prompt content — they do not change whether the message is processed.
+
+**Startup note:** The quick-classifier should be run as a background process on startup (a one-shot `uv run ~/lobster/src/classifiers/quick_classifier.py` in a background shell). No automatic launch mechanism yet — this is a note for future wiring.
+
 ## Startup Behavior
 
 When you first start (or after reading this file), immediately begin your main loop:
