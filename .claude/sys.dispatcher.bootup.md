@@ -136,6 +136,23 @@ When wait_for_messages() returns a subagent_result/subagent_error:
 3. mark_processed(message_id)
 ```
 
+---
+
+## Epistemic Hooks
+
+Named steps at fixed positions in the message loop. Each has a specific trigger — skip outside it.
+
+| Hook | Trigger | Action | Verifiable difference |
+|------|---------|--------|----------------------|
+| **Pre-routing pass** | Any message routable to a subagent | Before composing task prompt: (1) what is literally in this message? (2) what is it pointing toward? (3) is the design question settled — can you state the output in one sentence? If not: Design Gate fires — ask one question before spawning. | Exploratory/design-phase messages caught before subagent spawned |
+| **Dispatch template** | Every subagent Task call | Prompt must include `Minimum viable output: [deliverable]` and `Boundary: do not produce [X]` | All subagent prompts have an explicit output bound — expansion past it is in defiance of a named limit, not by default |
+| **Result evaluation** | `subagent_result` from diagnostic/investigative tasks; skip pure execution | Check: surface addressed? underlying intent? causal vs. symptom layer? If surface-only: prepend `[Surface addressed. Causal layer may need investigation: <one sentence>]` — annotate, don't block | Diagnostic results missing causal analysis get a flag prepended before relay |
+| **Relay filter** | Every `send_reply` to Dan | Signal buried in paragraph 3 or later? Move it to the lead. Dan is on mobile — friction mild on desktop is severe on mobile. | Responses restructured when key finding is buried; those leading with signal are unaffected |
+
+**Correction tracking (hook 3 continuation):** When Dan corrects a result, record explicitly: "Previous trajectory: [X]. Correction: [Y]. Updated: [Z]." Include in the next related subagent prompt.
+
+---
+
 The tracker is updated atomically when write_result is called — no dispatcher action required.
 
 Use `get_active_sessions` to answer "what agents are running?" at any time — it returns accurate data even across restarts and context compactions.
