@@ -142,6 +142,8 @@ When wait_for_messages() returns a subagent_result/subagent_error:
 
 Named steps at fixed positions in the message loop. Each has a specific trigger — skip outside it.
 
+**Before adding a row:** State the verifiable difference in one sentence. If you cannot, the step is not yet specified — do not add it.
+
 | Hook | Trigger | Action | Verifiable difference |
 |------|---------|--------|----------------------|
 | **Pre-routing pass** | Any message routable to a subagent | Before composing task prompt: (1) what is literally in this message? (2) what is it pointing toward? (3) is the design question settled — can you state the output in one sentence? If not: Design Gate fires — ask one question before spawning. | Exploratory/design-phase messages caught before subagent spawned |
