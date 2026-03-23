@@ -1526,6 +1526,21 @@ with open(path, 'w') as f:
         migrated=$((migrated + 1))
     fi
 
+    # Migration 32: Create category and meta-thread storage directories.
+    # categories/ holds Category JSON files (one per category, keyed by UUID).
+    # meta-threads/ holds MetaThread JSON files (one per thread, keyed by UUID).
+    # Both are written by scripts/categorization.py and scripts/meta_threads.py.
+    if [ ! -d "$USER_CONFIG_DIR/memory/categories" ]; then
+        mkdir -p "$USER_CONFIG_DIR/memory/categories"
+        substep "Created $USER_CONFIG_DIR/memory/categories/ for categorization foundation"
+        migrated=$((migrated + 1))
+    fi
+    if [ ! -d "$USER_CONFIG_DIR/memory/meta-threads" ]; then
+        mkdir -p "$USER_CONFIG_DIR/memory/meta-threads"
+        substep "Created $USER_CONFIG_DIR/memory/meta-threads/ for meta-thread system"
+        migrated=$((migrated + 1))
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

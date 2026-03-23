@@ -2516,6 +2516,32 @@ async def list_tools() -> list[Tool]:
                 "required": ["email"],
             },
         ),
+        # Meta-Thread Tools
+        Tool(
+            name="get_meta_thread_context",
+            description=(
+                "Search active meta-threads for context relevant to the given message text. "
+                "Returns a formatted block suitable for prepending to the dispatcher's context "
+                "before processing the message. Returns an empty string if no threads match or "
+                "the meta-threads directory does not exist. Call this at message processing start "
+                "for any non-trivial text message. Completes in <100ms for typical thread counts."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "message_text": {
+                        "type": "string",
+                        "description": "The incoming message text to match against active meta-threads.",
+                    },
+                    "threshold": {
+                        "type": "number",
+                        "description": "Minimum cosine similarity to include a thread (0–1). Default: 0.7.",
+                        "default": 0.7,
+                    },
+                },
+                "required": ["message_text"],
+            },
+        ),
         # Skill Management Tools
         Tool(
             name="get_skill_context",
@@ -2913,6 +2939,9 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         return await handle_get_bisque_connection_url(arguments)
     elif name == "generate_bisque_login_token":
         return await handle_generate_bisque_login_token(arguments)
+    # Meta-Thread Tools
+    elif name == "get_meta_thread_context":
+        return await handle_get_meta_thread_context(arguments)
     # Skill Management Tools
     elif name == "get_skill_context":
         return await handle_get_skill_context(arguments)
@@ -7487,6 +7516,58 @@ async def handle_generate_bisque_login_token(arguments: dict[str, Any]) -> list[
         "Paste this token into the bisque-chat login screen."
     )
     return [TextContent(type="text", text=instructions)]
+
+
+# =============================================================================
+# Meta-Thread Handler
+# =============================================================================
+
+async def handle_get_meta_thread_context(args: dict) -> list[TextContent]:
+    """Search active meta-threads and return formatted context for the dispatcher.
+
+    Calls meta_threads.search() + inject_context() from scripts/meta_threads.py.
+    Returns an empty string when no threads match or the storage directory does
+    not exist — the dispatcher proceeds normally with zero overhead in that case.
+
+    The handler imports meta_threads lazily so the MCP server starts without
+    requiring fastembed to be installed (fastembed is only needed at call time).
+    """
+    message_text = args.get("message_text", "").strip()
+    if not message_text:
+        return [TextContent(type="text", text="")]
+
+    threshold = float(args.get("threshold", 0.7))
+
+    try:
+        import sys as _sys
+        import importlib
+        # LOBSTER_SCRIPTS_DIR overrides the default install path for non-standard installs
+        _meta_threads_script = os.environ.get(
+            "LOBSTER_SCRIPTS_DIR",
+            str(Path.home() / "lobster" / "scripts"),
+        )
+        if _meta_threads_script not in _sys.path:
+            _sys.path.insert(0, _meta_threads_script)
+        meta_threads = importlib.import_module("meta_threads")
+
+        threads = meta_threads.search(message_text, threshold=threshold)
+        if not threads:
+            return [TextContent(type="text", text="")]
+
+        context = meta_threads.inject_context(threads)
+        # Include thread IDs so the dispatcher can reference them for async updates
+        thread_ids = ",".join(t["id"] for t in threads)
+        header = f"<!-- meta-thread-ids: {thread_ids} -->\n"
+        return [TextContent(type="text", text=header + context)]
+
+    except ModuleNotFoundError:
+        # fastembed or meta_threads.py not available — graceful no-op
+        log.debug("meta_threads not available; skipping meta-thread context")
+        return [TextContent(type="text", text="")]
+    except Exception as e:
+        # Any other failure is a silent no-op — meta-threads must never block the dispatcher
+        log.warning(f"get_meta_thread_context failed (non-fatal): {e}")
+        return [TextContent(type="text", text="")]
 
 
 # =============================================================================
