@@ -450,303 +450,6 @@ def bootstrap_from_history(
     return threads
 
 
-
-# ---------------------------------------------------------------------------
-# Incremental accumulator — continuous observation-first clustering
-# ---------------------------------------------------------------------------
-
-_DEFAULT_CANDIDATES_DIR = Path.home() / "lobster-user-config" / "memory" / "meta-threads" / "candidates"
-_DEFAULT_INCREMENTAL_STATE_FILE = Path.home() / "lobster-user-config" / "memory" / "meta-threads" / "incremental-state.json"
-
-# Similarity threshold for merging a new cluster into an existing thread/candidate
-_MERGE_THRESHOLD = 0.72
-
-
-def load_incremental_state(state_file: Path | None = None) -> dict:
-    """
-    Load the incremental accumulator state file.
-
-    Returns a dict with at minimum a ``last_run`` key (ISO timestamp string,
-    or None if the accumulator has never run).
-    """
-    p = state_file or _DEFAULT_INCREMENTAL_STATE_FILE
-    if not p.exists():
-        return {"last_run": None}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {"last_run": None}
-
-
-def save_incremental_state(state: dict, state_file: Path | None = None) -> None:
-    """Write the incremental state atomically."""
-    p = state_file or _DEFAULT_INCREMENTAL_STATE_FILE
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    tmp.replace(p)
-
-
-def load_candidates(candidates_dir: Path | None = None) -> list[MetaThread]:
-    """Load all candidate threads from the candidates directory."""
-    d = candidates_dir or _DEFAULT_CANDIDATES_DIR
-    if not d.exists():
-        return []
-    candidates = []
-    for p in sorted(d.glob("*.json")):
-        try:
-            candidates.append(json.loads(p.read_text(encoding="utf-8")))
-        except (json.JSONDecodeError, OSError):
-            pass
-    return candidates
-
-
-def save_candidate(
-    candidate: MetaThread,
-    candidates_dir: Path | None = None,
-) -> None:
-    """Write a candidate thread atomically to {candidates_dir}/{id}.json."""
-    d = candidates_dir or _DEFAULT_CANDIDATES_DIR
-    d.mkdir(parents=True, exist_ok=True)
-    target = d / f"{candidate['id']}.json"
-    tmp = target.with_suffix(".tmp")
-    tmp.write_text(json.dumps(candidate, indent=2), encoding="utf-8")
-    tmp.replace(target)
-
-
-def _merge_observations_into_thread(
-    thread: MetaThread,
-    new_observations: list[str],
-) -> MetaThread:
-    """
-    Return a copy of *thread* with *new_observations* prepended.
-
-    Trims observations to the most recent 10 (same policy as ``update()``).
-    Updates ``last_updated`` but does NOT recompute ``inquiry_embedding`` — the
-    open question is not changed by adding observations.
-    """
-    merged = dict(thread)
-    combined = new_observations + merged.get("key_observations", [])
-    merged["key_observations"] = combined[:10]
-    merged["last_updated"] = _iso_now()
-    return merged
-
-
-def accumulate_incremental(
-    memory_db_path: Path | None = None,
-    threads_dir: Path | None = None,
-    candidates_dir: Path | None = None,
-    state_file: Path | None = None,
-    dry_run: bool = False,
-    min_cluster_size: int = 2,
-    merge_threshold: float = _MERGE_THRESHOLD,
-) -> dict:
-    """
-    Incremental observation accumulator.
-
-    Runs since the last recorded ``last_run`` timestamp (or since 30 days ago
-    on first run).  Loads new events from ``memory.db``, clusters them, and
-    for each viable cluster either:
-
-    - Merges new observations into an existing active thread (if the cluster
-      centroid is close enough to the thread's inquiry embedding), or
-    - Merges new observations into an existing candidate (same criterion), or
-    - Creates a new candidate in ``memory/meta-threads/candidates/``.
-
-    Candidates are NOT loaded by the dispatcher automatically.  They surface
-    to Dan via the ``list-candidates`` CLI subcommand for manual
-    promotion/discard.
-
-    Args:
-        memory_db_path:  Override for memory.db path.
-        threads_dir:     Override for active threads directory.
-        candidates_dir:  Override for candidates directory.
-        state_file:      Override for state file path.
-        dry_run:         If True, compute and print results without writing.
-        min_cluster_size: Minimum cluster size to act on (default 2 for
-                          incremental runs — smaller windows mean fewer repeats).
-        merge_threshold: Cosine similarity required to merge into an existing
-                         thread or candidate.
-
-    Returns:
-        Dict with keys:
-          ``merged_into_threads`` — list of thread IDs that received new observations
-          ``merged_into_candidates`` — list of candidate IDs that received new observations
-          ``new_candidates`` — list of new candidate threads created
-          ``events_processed`` — count of events processed
-          ``last_run`` — the timestamp recorded for this run
-    """
-    try:
-        import sqlite3
-        import sqlite_vec  # noqa: F401 — validates extension availability
-    except ImportError:
-        print("sqlite_vec not available — cannot run incremental accumulator", file=sys.stderr)
-        return {
-            "merged_into_threads": [],
-            "merged_into_candidates": [],
-            "new_candidates": [],
-            "events_processed": 0,
-            "last_run": None,
-        }
-
-    db_path = memory_db_path or _DEFAULT_MEMORY_DB
-    if not db_path.exists():
-        print(f"memory.db not found at {db_path}", file=sys.stderr)
-        return {
-            "merged_into_threads": [],
-            "merged_into_candidates": [],
-            "new_candidates": [],
-            "events_processed": 0,
-            "last_run": None,
-        }
-
-    state = load_incremental_state(state_file)
-    # On first run, look back 30 days (shorter than full bootstrap's 90)
-    if state.get("last_run"):
-        cutoff = state["last_run"]
-    else:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-
-    run_timestamp = _iso_now()
-
-    conn = sqlite3.connect(str(db_path))
-    conn.enable_load_extension(True)
-    import sqlite_vec
-    sqlite_vec.load(conn)
-
-    rows = conn.execute(
-        "SELECT id, content, type FROM events "
-        "WHERE timestamp >= ? AND content != '' ORDER BY timestamp",
-        (cutoff,),
-    ).fetchall()
-    conn.close()
-
-    if not rows:
-        print(f"No new events since {cutoff}")
-        if not dry_run:
-            save_incremental_state({"last_run": run_timestamp}, state_file)
-        return {
-            "merged_into_threads": [],
-            "merged_into_candidates": [],
-            "new_candidates": [],
-            "events_processed": 0,
-            "last_run": run_timestamp,
-        }
-
-    print(f"Loaded {len(rows)} events since {cutoff}")
-
-    contents = [r[1] for r in rows]
-    event_ids = [str(r[0]) for r in rows]
-
-    from fastembed import TextEmbedding
-    model = TextEmbedding()
-    embeddings = [list(map(float, emb)) for emb in model.embed(contents)]
-    print(f"Embedded {len(embeddings)} events")
-
-    clusters = _agglomerate(event_ids, embeddings, threshold=0.72)
-    viable = [
-        (members, embs)
-        for members, embs in clusters
-        if len(members) >= min_cluster_size
-    ]
-    print(f"{len(viable)} viable clusters from {len(clusters)} total")
-
-    active_threads = load_threads(threads_dir)
-    existing_candidates = load_candidates(candidates_dir)
-
-    # Pre-compute centroids for active threads and candidates
-    # Use inquiry_embedding for matching (what the thread is trying to understand)
-    thread_inquiry_embs = [
-        (t, t.get("inquiry_embedding", []))
-        for t in active_threads
-        if t.get("inquiry_embedding")
-    ]
-    candidate_inquiry_embs = [
-        (c, c.get("inquiry_embedding", []))
-        for c in existing_candidates
-        if c.get("inquiry_embedding")
-    ]
-
-    merged_into_threads: list[str] = []
-    merged_into_candidates: list[str] = []
-    new_candidates: list[MetaThread] = []
-
-    for members, embs in viable:
-        cluster_centroid = _centroid(embs)
-        sample_contents = [contents[event_ids.index(m)] for m in members[:3] if m in event_ids]
-        new_obs = sample_contents[:3]
-
-        # 1. Check active threads first
-        best_thread, best_sim = _best_match(cluster_centroid, thread_inquiry_embs)
-        if best_thread is not None and best_sim >= merge_threshold:
-            updated = _merge_observations_into_thread(best_thread, new_obs)
-            if not dry_run:
-                save_thread(updated, threads_dir)
-            merged_into_threads.append(updated["id"])
-            print(f"  Merged {len(new_obs)} obs into active thread: {best_thread['name']} (sim={best_sim:.3f})")
-            continue
-
-        # 2. Check existing candidates
-        best_candidate, best_sim = _best_match(cluster_centroid, candidate_inquiry_embs)
-        if best_candidate is not None and best_sim >= merge_threshold:
-            updated = _merge_observations_into_thread(best_candidate, new_obs)
-            if not dry_run:
-                save_candidate(updated, candidates_dir)
-            merged_into_candidates.append(updated["id"])
-            print(f"  Merged {len(new_obs)} obs into candidate: {best_candidate['name']} (sim={best_sim:.3f})")
-            continue
-
-        # 3. New candidate
-        name, question = _name_cluster(sample_contents)
-        candidate = make_meta_thread(
-            name=name,
-            current_open_question=question,
-            key_observations=sample_contents[:5],
-            active=False,  # candidates are inactive until promoted
-        )
-        candidate["_candidate"] = True
-        candidate["_source"] = "incremental"
-        candidate["_created"] = run_timestamp
-
-        if not dry_run:
-            save_candidate(candidate, candidates_dir)
-        new_candidates.append(candidate)
-        print(f"  New candidate: {name} — {question}")
-
-    if not dry_run:
-        save_incremental_state({"last_run": run_timestamp}, state_file)
-
-    return {
-        "merged_into_threads": merged_into_threads,
-        "merged_into_candidates": merged_into_candidates,
-        "new_candidates": new_candidates,
-        "events_processed": len(rows),
-        "last_run": run_timestamp,
-    }
-
-
-def _best_match(
-    centroid: list[float],
-    candidates: list[tuple[MetaThread, list[float]]],
-) -> tuple[MetaThread | None, float]:
-    """
-    Return the best-matching (thread, similarity) pair from *candidates*,
-    or (None, 0.0) if the list is empty.
-
-    Pure function: does not read or write any state.
-    """
-    best: MetaThread | None = None
-    best_sim = 0.0
-    for thread, emb in candidates:
-        if not emb or len(emb) != len(centroid):
-            continue
-        sim = _cosine(centroid, emb)
-        if sim > best_sim:
-            best_sim = sim
-            best = thread
-    return best, best_sim
-
-
 def _agglomerate(
     ids: list[str],
     embeddings: list[list[float]],
@@ -871,19 +574,8 @@ def main(argv: list[str] | None = None) -> None:
     p_bootstrap.add_argument("--since-days", type=int, default=90)
     p_bootstrap.add_argument("--dry-run", action="store_true")
     p_bootstrap.add_argument("--min-cluster-size", type=int, default=3)
-    p_bootstrap.add_argument(
-        "--incremental",
-        action="store_true",
-        help=(
-            "Run as incremental accumulator: process only events since last run, "
-            "merge into existing threads/candidates, write new candidates to "
-            "memory/meta-threads/candidates/ for manual review."
-        ),
-    )
 
     p_list = sub.add_parser("list", help="List all meta-threads")
-
-    sub.add_parser("list-candidates", help="List candidate threads awaiting promotion")
 
     p_test = sub.add_parser("test", help="Run a self-test")
     # Keep --test for backward-compat with the spec
@@ -922,26 +614,14 @@ def main(argv: list[str] | None = None) -> None:
             print(f"Thread {args.thread_id} not found")
 
     elif args.command == "bootstrap":
-        if getattr(args, "incremental", False):
-            result = accumulate_incremental(
-                dry_run=args.dry_run,
-                min_cluster_size=args.min_cluster_size,
-            )
-            print(f"Incremental run processed {result['events_processed']} events.")
-            print(f"  Merged into active threads: {len(result['merged_into_threads'])}")
-            print(f"  Merged into candidates:     {len(result['merged_into_candidates'])}")
-            print(f"  New candidates:             {len(result['new_candidates'])}")
-            for c in result["new_candidates"]:
-                print(f"    + {c['name']}: {c['current_open_question']}")
-        else:
-            threads = bootstrap_from_history(
-                since_days=args.since_days,
-                dry_run=args.dry_run,
-                min_cluster_size=args.min_cluster_size,
-            )
-            print(f"Bootstrap {'would create' if args.dry_run else 'created'} {len(threads)} thread(s):")
-            for t in threads:
-                print(f"  {t['name']}: {t['current_open_question']}")
+        threads = bootstrap_from_history(
+            since_days=args.since_days,
+            dry_run=args.dry_run,
+            min_cluster_size=args.min_cluster_size,
+        )
+        print(f"Bootstrap {'would create' if args.dry_run else 'created'} {len(threads)} thread(s):")
+        for t in threads:
+            print(f"  {t['name']}: {t['current_open_question']}")
 
     elif args.command == "list":
         threads = load_threads()
@@ -953,18 +633,6 @@ def main(argv: list[str] | None = None) -> None:
             print(f"[{t['id'][:8]}] {t['name']} ({status})")
             print(f"  Q: {t['current_open_question']}")
             print(f"  Observations: {len(t.get('key_observations', []))}")
-
-    elif args.command == "list-candidates":
-        candidates = load_candidates()
-        if not candidates:
-            print("No candidates found. Run: uv run scripts/meta_threads.py bootstrap --incremental")
-            return
-        print(f"{len(candidates)} candidate thread(s) awaiting promotion:")
-        for c in candidates:
-            created = c.get("_created", "unknown")[:10]
-            print(f"  [{c['id'][:8]}] {c['name']} (created {created})")
-            print(f"    Q: {c['current_open_question']}")
-            print(f"    Observations: {len(c.get('key_observations', []))}")
 
     elif args.command == "test":
         _run_test()

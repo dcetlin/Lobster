@@ -13,13 +13,3 @@
 
 ## Items Needing Follow-up
 <!-- Populated automatically -->
-
-## Structural Coherence
-<!-- Required section. Populated by nightly consolidation coherence check.
-     Four checks run at each consolidation:
-     A. Tasks vs. priorities alignment
-     B. Recent observations vs. canonical memory drift
-     C. Stale meta-threads (open question resolved by activity, not by update)
-     D. Compensating machinery identified
-     If no conflicts: write "Coherence check: no conflicts detected."
-     This section must always be present. -->
