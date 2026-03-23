@@ -4122,13 +4122,14 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
     except Exception:
         pass  # non-fatal; stale recovery falls back to mtime
 
-    # Queue background observation (non-blocking, best-effort)
+    # Queue background observation (non-blocking, best-effort).
+    # Only queue for user-facing message types — system-generated types
+    # (cron_reminder, consolidation, subagent_result, etc.) must not
+    # feed the user model. Use USER_FACING_TYPES as the single source of
+    # truth (issue #660).
     msg_text = msg_data.get("text", "") or msg_data.get("transcription", "")
     msg_type = msg_data.get("type", "")
-    _SKIP_OBSERVATION_TYPES = (
-        "subagent_result", "subagent_error", "self_check", "subagent_observation"
-    )
-    if msg_text and msg_type not in _SKIP_OBSERVATION_TYPES:
+    if msg_text and msg_type in USER_FACING_TYPES:
         _queue_observation(
             msg_text, message_id,
             source=msg_data.get("source"),
