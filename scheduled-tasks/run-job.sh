@@ -71,13 +71,13 @@ claude -p "$TASK_CONTENT
 
 IMPORTANT: You are running as a scheduled task. When you complete your task:
 1. Call send_reply(chat_id=${LOBSTER_ADMIN_CHAT_ID}, text=<your digest>, source=\"telegram\") to deliver results directly to the user
-2. Call write_result(task_id=\"scheduled-job-$JOB_NAME\", chat_id=${LOBSTER_ADMIN_CHAT_ID}, text=<same text>, forward=False) to notify the dispatcher that the job completed
+2. Call write_result(task_id=\"scheduled-job-$JOB_NAME\", chat_id=${LOBSTER_ADMIN_CHAT_ID}, text=<same text>, sent_reply_to_user=True) to notify the dispatcher that the job completed
 3. Keep output concise - the user is on mobile
 4. Exit after writing output - do not start a loop
 
-Both calls are required. send_reply delivers the digest immediately to Telegram; write_result(forward=False) signals the dispatcher that the job is done without double-sending." \
+Both calls are required. send_reply delivers the digest immediately to Telegram; write_result(sent_reply_to_user=True) signals the dispatcher that the job is done without double-sending." \
     --dangerously-skip-permissions \
-    --max-turns 25 \
+    --max-turns 40 \
     2>&1 | tee -a "$LOG_FILE"
 
 EXIT_CODE=$?
