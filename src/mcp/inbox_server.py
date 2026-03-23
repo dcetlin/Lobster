@@ -3936,12 +3936,13 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
         pass  # non-fatal; stale recovery falls back to mtime
 
     # Queue background observation (non-blocking, best-effort)
+    # Use the USER_FACING_TYPES allowlist (same pattern as mark_processing) so that
+    # system-generated types (cron_reminder, scheduled_reminder, subagent_*, etc.)
+    # never feed tier-1 signal extraction. Closed-world: new system types are blocked
+    # by default rather than requiring manual denylist updates. Closes #660.
     msg_text = msg_data.get("text", "") or msg_data.get("transcription", "")
     msg_type = msg_data.get("type", "")
-    _SKIP_OBSERVATION_TYPES = (
-        "subagent_result", "subagent_error", "self_check", "subagent_observation"
-    )
-    if msg_text and msg_type not in _SKIP_OBSERVATION_TYPES:
+    if msg_text and msg_type in USER_FACING_TYPES:
         _queue_observation(
             msg_text, message_id,
             source=msg_data.get("source"),
