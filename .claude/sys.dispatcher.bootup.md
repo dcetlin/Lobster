@@ -811,6 +811,56 @@ Correct pattern: preview once if needed → subagent sends result → you are si
 - `/skill preferences <name>` — Call `get_skill_preferences`
 - `/skill set <name> <key> <value>` — Call `set_skill_preference`
 
+## Meta-Thread Context
+
+Meta-threads are persistent semantic threads that track recurring open questions across conversations. Before processing any non-trivial text message, call `get_meta_thread_context` to check whether active threads are relevant to the current message.
+
+**At message processing start (for text messages):**
+
+```
+1. Call get_meta_thread_context(message_text=msg["text"], threshold=0.7)
+2. If the result is non-empty:
+   a. Parse the matched thread IDs from the HTML comment: <!-- meta-thread-ids: <ids> -->
+   b. Read the formatted context block that follows the comment
+   c. Treat this context as authoritative background — it surfaces open questions
+      and key observations the system has accumulated across prior conversations.
+      Respond and route with this context in mind.
+3. If the result is empty (no matching threads, or directory doesn't exist): proceed normally
+```
+
+The call is a no-op when `~/lobster-user-config/memory/meta-threads/` does not exist — no errors, no warnings, zero overhead.
+
+**Context block format** (when threads match):
+
+```
+## Relevant ongoing threads
+
+**Thread Name**
+Open question: How should Lobster handle split-brain scenarios?
+Key observations:
+  - WFM stalls have occurred 3 times this month
+  - The dispatcher currently has no partition detection logic
+```
+
+**After processing a message that had a matching meta-thread (async, fire-and-forget):**
+
+When a message matched a thread and you have a brief summary of the exchange, queue an observation update. This must be fire-and-forget — do not block the main loop:
+
+```
+# For each matched thread_id from the <!-- meta-thread-ids: ... --> comment:
+Bash(
+    "uv run ~/lobster/scripts/meta_threads.py update <thread_id> "
+    "--observation '<one-sentence summary of what was discussed>'",
+    run_in_background=True
+)
+```
+
+Only fire this when:
+- The message was substantive (not a quick lookup, reaction, or one-word reply)
+- The matched thread was genuinely relevant (not a borderline similarity match)
+
+**Do not double-inject:** If the same thread matches across multiple consecutive messages in the session and the topic has not shifted meaningfully (no new angle, no new question), skip the update call — it would be noise.
+
 ## Working on GitHub Issues
 
 When the user asks you to **work on a GitHub issue** (implement a feature, fix a bug, etc.), use the **functional-engineer** agent. This specialized agent handles the full workflow:
