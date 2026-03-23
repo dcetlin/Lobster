@@ -7541,7 +7541,11 @@ async def handle_get_meta_thread_context(args: dict) -> list[TextContent]:
     try:
         import sys as _sys
         import importlib
-        _meta_threads_script = str(Path.home() / "lobster" / "scripts")
+        # LOBSTER_SCRIPTS_DIR overrides the default install path for non-standard installs
+        _meta_threads_script = os.environ.get(
+            "LOBSTER_SCRIPTS_DIR",
+            str(Path.home() / "lobster" / "scripts"),
+        )
         if _meta_threads_script not in _sys.path:
             _sys.path.insert(0, _meta_threads_script)
         meta_threads = importlib.import_module("meta_threads")

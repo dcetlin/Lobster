@@ -820,11 +820,20 @@ Meta-threads are persistent semantic threads that track recurring open questions
 ```
 1. Call get_meta_thread_context(message_text=msg["text"], threshold=0.7)
 2. If the result is non-empty:
-   a. Parse the matched thread IDs from the HTML comment: <!-- meta-thread-ids: <ids> -->
-   b. Read the formatted context block that follows the comment
-   c. Treat this context as authoritative background — it surfaces open questions
+   a. Parse the matched thread IDs from the HTML comment at the top of the result:
+      <!-- meta-thread-ids: id1,id2 -->
+      Exact parsing: split the result on the first newline; the first line is the
+      comment. Extract IDs with:
+          import re
+          m = re.match(r'<!-- meta-thread-ids: (.+?) -->', first_line)
+          thread_ids = m.group(1).split(',') if m else []
+      If the comment is absent or malformed, skip the async update — do not error.
+   b. Read the formatted context block that follows the comment (everything after
+      the first newline)
+   c. Treat this as relevant background, held lightly — it surfaces open questions
       and key observations the system has accumulated across prior conversations.
-      Respond and route with this context in mind.
+      Respond and route with this context in mind, but stay open to the message
+      reframing the topic.
 3. If the result is empty (no matching threads, or directory doesn't exist): proceed normally
 ```
 

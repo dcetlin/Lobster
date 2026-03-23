@@ -697,6 +697,30 @@ def _run_test() -> None:
         similarity = _cosine(old_emb, new_emb)
         print(f"Old vs new inquiry similarity: {similarity:.3f} (should be < 1.0)")
 
+        # Verify the HTML comment side-channel produced by get_meta_thread_context
+        # This exercises the full round-trip: search -> inject -> comment -> parse
+        print("\nHTML comment round-trip test:")
+        import re as _re
+        test_results = search(test_message, threshold=0.4, threads_dir=d)
+        if test_results:
+            thread_ids_out = ",".join(t["id"] for t in test_results)
+            ctx_block = inject_context(test_results)
+            header = f"<!-- meta-thread-ids: {thread_ids_out} -->\n"
+            full_output = header + ctx_block
+
+            # Simulate the exact dispatcher parsing step
+            first_line, _, body = full_output.partition("\n")
+            m = _re.match(r"<!-- meta-thread-ids: (.+?) -->", first_line)
+            parsed_ids = [i.strip() for i in m.group(1).split(",")] if m else []
+            assert parsed_ids, "Failed to parse thread IDs from HTML comment"
+            assert parsed_ids[0] == test_results[0]["id"], "Parsed ID mismatch"
+            assert body.startswith("## Relevant ongoing threads"), "Context block missing after comment"
+            print(f"  Comment parses to IDs: {[i[:8] for i in parsed_ids]}")
+            print("  Context block present after comment line: OK")
+            print("  Round-trip: OK")
+        else:
+            print("  (skipped — no results from search)")
+
         print("\n--- self-test passed ---")
 
 
