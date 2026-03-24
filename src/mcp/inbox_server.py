@@ -40,6 +40,12 @@ from log_utils import JsonFormatter, configure_file_handler
 _SRC_DIR = str(Path(__file__).resolve().parent.parent)
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
+# Re-insert _MCP_SRC_DIR at front so src/mcp/memory wins over src/memory.
+# src/memory/__init__.py is empty (added in ea623f8); the real memory module
+# is src/mcp/memory/. Without this, the import at line ~117 silently fails
+# and _memory_provider stays None forever.
+if sys.path[0] != _MCP_SRC_DIR:
+    sys.path.insert(0, _MCP_SRC_DIR)
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
