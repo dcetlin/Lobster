@@ -616,7 +616,7 @@ def build_passthrough_tag(event_id: int, quick_tag: dict | None) -> Classificati
         signal_c=sig_c,
         signal_d=sig_d,
         signal_e=sig_e,
-        confidence="medium",
+        confidence="low",
         signal_type=quick_tag.get("signal_type", "system_observation") if quick_tag else "system_observation",
         urgency=quick_tag.get("urgency", "normal") if quick_tag else "normal",
         posture_hint=quick_tag.get("posture_hint", "minimal_cognitive_friction") if quick_tag else "minimal_cognitive_friction",
