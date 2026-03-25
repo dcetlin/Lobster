@@ -66,6 +66,41 @@ if [ -x "$VENV_PYTHON" ]; then
     check "psutil (python)"       "$VENV_PYTHON -c 'import psutil'"
     check "fastembed (python)"    "$VENV_PYTHON -c 'import fastembed'"
     check "sqlite_vec (python)"   "$VENV_PYTHON -c 'import sqlite_vec'"
+
+    # Memory capability probe: verify memory_store actually works end-to-end,
+    # not just that the packages are importable. This catches the 2026-03-23
+    # failure mode where a sys.path collision caused a silent ImportError at
+    # server startup, leaving _memory_provider=None for the entire session.
+    # The probe attempts a live write and confirms a positive integer ID is returned.
+    check "memory_store (live write)" "
+        timeout 15 '$VENV_PYTHON' - <<'PYEOF'
+import sys, os
+install_dir = os.environ.get('LOBSTER_INSTALL_DIR', os.path.expanduser('~/lobster'))
+src_mcp = os.path.join(install_dir, 'src', 'mcp')
+src_dir = os.path.join(install_dir, 'src')
+for p in [src_mcp, src_dir]:
+    if p in sys.path:
+        sys.path.remove(p)
+sys.path.insert(0, src_dir)
+sys.path.insert(0, src_mcp)
+workspace_dir = os.environ.get('LOBSTER_WORKSPACE', os.path.expanduser('~/lobster-workspace'))
+os.environ.setdefault('LOBSTER_DB_PATH', os.path.join(workspace_dir, 'data', 'memory.db'))
+from memory import create_memory_provider, MemoryEvent
+from datetime import datetime, timezone
+provider = create_memory_provider(use_vector=True)
+event = MemoryEvent(
+    id=None,
+    timestamp=datetime.now(timezone.utc),
+    type='health_check',
+    source='daily-health-check',
+    project=None,
+    content='probe',
+    metadata={'tags': ['health_probe']},
+)
+event_id = provider.store(event)
+assert isinstance(event_id, int) and event_id > 0, f'bad event_id: {event_id}'
+PYEOF
+    "
 else
     log "FAIL: venv not found at $VENV_PYTHON"
     FAILURES+=("python-venv")

@@ -996,6 +996,141 @@ check_messages_db() {
     return 0
 }
 
+# Check 12: Memory capability probe — verify memory_store actually works
+#
+# The 2026-03-23 outage showed that a silent ImportError at startup leaves
+# _memory_provider=None for the lifetime of the server. Every memory_store
+# call returns "Memory system is not available." without any alert. Process
+# liveness checks can't detect this; only a live write probe can.
+#
+# Design:
+#   - Import the memory module directly via the venv Python (same path the
+#     MCP server uses) and attempt to write a test event.
+#   - A returned integer event ID means the write landed.
+#   - Advisory only (never RED): a broken memory system is not a restart
+#     condition, but it does warrant an immediate Telegram alert.
+#
+# Throttle: alert at most once per MEMORY_PROBE_ALERT_INTERVAL_SECONDS so
+# a persistent failure doesn't flood the user. State is tracked in a small
+# counter file that resets when the probe passes.
+#
+# Returns: 0=OK, 1=degraded (Telegram alert sent on first failure)
+MEMORY_PROBE_ALERT_INTERVAL_SECONDS=3600   # Re-alert at most once per hour
+MEMORY_PROBE_FAILURE_FILE="$WORKSPACE_DIR/logs/memory-probe-failures"
+
+check_memory_capability() {
+    local install_dir="${LOBSTER_INSTALL_DIR:-$HOME/lobster}"
+    local venv_python="$install_dir/.venv/bin/python"
+
+    # Skip if venv is not available — daily-health-check.sh will catch that gap
+    if [[ ! -x "$venv_python" ]]; then
+        log_info "Memory capability probe skipped: venv not found at $venv_python"
+        return 0
+    fi
+
+    local src_dir="$install_dir/src/mcp"
+    local workspace_dir="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}"
+    local db_path="$workspace_dir/data/memory.db"
+
+    # Run the probe in a subprocess with a tight timeout so a hung DB never
+    # blocks the health check. The probe writes a single event and confirms the
+    # returned event ID is a positive integer.
+    local probe_result
+    probe_result=$(timeout 10 "$venv_python" - <<'PYEOF' 2>&1
+import sys, os
+
+# Mirror the sys.path fix from inbox_server.py (ea623f8 / PR #80):
+# src/mcp must precede src/ so "from memory import ..." resolves to
+# src/mcp/memory/ rather than the empty src/memory/__init__.py.
+# Insert src_dir first, then src_mcp at the front, so src_mcp wins.
+install_dir = os.environ.get("LOBSTER_INSTALL_DIR", os.path.expanduser("~/lobster"))
+src_mcp = os.path.join(install_dir, "src", "mcp")
+src_dir = os.path.join(install_dir, "src")
+for p in [src_mcp, src_dir]:
+    if p in sys.path:
+        sys.path.remove(p)
+sys.path.insert(0, src_dir)
+sys.path.insert(0, src_mcp)
+
+workspace_dir = os.environ.get("LOBSTER_WORKSPACE", os.path.expanduser("~/lobster-workspace"))
+os.environ.setdefault("LOBSTER_DB_PATH", os.path.join(workspace_dir, "data", "memory.db"))
+
+try:
+    from memory import create_memory_provider, MemoryEvent
+except ImportError as e:
+    print(f"IMPORT_ERROR:{e}")
+    sys.exit(1)
+
+try:
+    provider = create_memory_provider(use_vector=True)
+except Exception as e:
+    print(f"INIT_ERROR:{e}")
+    sys.exit(1)
+
+from datetime import datetime, timezone
+event = MemoryEvent(
+    id=None,
+    timestamp=datetime.now(timezone.utc),
+    type="health_check",
+    source="health-check-v3",
+    project=None,
+    content="probe",
+    metadata={"tags": ["health_probe"]},
+)
+try:
+    event_id = provider.store(event)
+    if isinstance(event_id, int) and event_id > 0:
+        print(f"OK:{event_id}")
+    else:
+        print(f"BAD_ID:{event_id}")
+        sys.exit(1)
+except Exception as e:
+    print(f"STORE_ERROR:{e}")
+    sys.exit(1)
+PYEOF
+    )
+    local probe_rc=$?
+
+    if [[ $probe_rc -eq 0 && "$probe_result" == OK:* ]]; then
+        # Probe passed — clear failure counter
+        rm -f "$MEMORY_PROBE_FAILURE_FILE"
+        local event_id="${probe_result#OK:}"
+        log_info "Memory capability probe OK (event_id=$event_id)"
+        return 0
+    fi
+
+    # Probe failed — record failure and decide whether to alert
+    local failure_count=0
+    local last_alert_epoch=0
+    if [[ -f "$MEMORY_PROBE_FAILURE_FILE" ]]; then
+        read -r failure_count last_alert_epoch _ < "$MEMORY_PROBE_FAILURE_FILE" 2>/dev/null || true
+    fi
+    failure_count=$(( ${failure_count:-0} + 1 ))
+
+    local now
+    now=$(date +%s)
+    local elapsed_since_alert=$(( now - ${last_alert_epoch:-0} ))
+
+    log_error "Memory capability probe FAILED (attempt=$failure_count, result=$probe_result)"
+
+    if [[ $elapsed_since_alert -ge $MEMORY_PROBE_ALERT_INTERVAL_SECONDS ]]; then
+        echo "$failure_count $now" > "$MEMORY_PROBE_FAILURE_FILE"
+        send_telegram_alert "Memory system capability probe failed (attempt $failure_count).
+
+The memory_store capability is not working. Every memory write is silently returning 'not available'. This is the same failure mode as the 2026-03-23 outage.
+
+Probe result: $probe_result
+
+A server restart may be needed: \`lobster restart\`"
+        log_warn "Memory probe failure alert sent (failure_count=$failure_count)"
+    else
+        echo "$failure_count $last_alert_epoch" > "$MEMORY_PROBE_FAILURE_FILE"
+        log_info "Memory probe failure suppressed: last alert was ${elapsed_since_alert}s ago (interval: ${MEMORY_PROBE_ALERT_INTERVAL_SECONDS}s)"
+    fi
+
+    return 1
+}
+
 # Check 10: Required cron entries - auto-restore LOBSTER-SELF-CHECK if missing
 check_cron_entries() {
     local install_dir="${LOBSTER_INSTALL_DIR:-$HOME/lobster}"
@@ -1783,6 +1918,19 @@ main() {
     # --- messages.db liveness (advisory, BIS-167 Slice 6, never RED) ---
 
     check_messages_db
+
+    # --- Memory capability probe (advisory — never RED, but Telegram-alerts) ---
+    # Verifies memory_store actually works by attempting a live write.
+    # Skipped during boot grace: the MCP server may not be initialized yet.
+    if [[ "$boot_grace" == "true" ]]; then
+        log_info "Memory capability probe suppressed (boot grace period)"
+    else
+        if ! check_memory_capability; then
+            # Degraded but not RED: a broken memory system doesn't block
+            # message processing. The function sends its own Telegram alert.
+            [[ "$level" == "GREEN" ]] && level="YELLOW"
+        fi
+    fi
 
     # --- Resource checks (RED if critical) ---
 
