@@ -683,6 +683,7 @@ def get_active_sessions(path: Path | None = None) -> list[dict]:
         """
         SELECT * FROM agent_sessions
         WHERE status IN ('running', 'starting')
+          AND (agent_type IS NULL OR agent_type NOT IN ('dispatcher', 'hook'))
         ORDER BY spawned_at ASC
         """
     )

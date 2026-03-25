@@ -8197,10 +8197,18 @@ async def reconcile_agent_sessions() -> None:
                 # agent_sessions.db with agent_type='dispatcher' (on crash-restart
                 # before the marker file is cleared).  The dispatcher is never a
                 # "dead agent" — never emit agent_failed for it.
-                if (session.get("agent_type") or "") == "dispatcher":
+                #
+                # Issue #56: Also skip agent_type='hook' sessions. These are stub
+                # entries written by write-dispatcher-session-id.py at SessionStart
+                # for every subagent/scheduled-job session. The session UUID used at
+                # SessionStart never matches the real agent hex ID from PostToolUse,
+                # so these stubs are always orphans with no output_file. They are
+                # never user-facing agents and should never generate reconciler noise.
+                agent_type = (session.get("agent_type") or "")
+                if agent_type in ("dispatcher", "hook"):
                     log.debug(
-                        f"[reconciler] Skipping dispatcher session {agent_id!r} "
-                        "(agent_type='dispatcher' — not a subagent)"
+                        f"[reconciler] Skipping {agent_type!r} session {agent_id!r} "
+                        f"(agent_type={agent_type!r} — infrastructure, not a subagent)"
                     )
                     continue
 

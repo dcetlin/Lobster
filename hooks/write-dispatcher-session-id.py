@@ -169,6 +169,16 @@ def _auto_register_subagent(session_id: str) -> None:
     row first is left untouched. init_db() ensures the schema exists; the
     INSERT then uses the module's connection pool without duplicating DDL.
     Failures are logged and silently swallowed.
+
+    ## agent_type='hook'
+
+    Stubs written here use agent_type='hook' (not 'subagent') so the
+    reconciler and active-sessions query can filter them out. The session_id
+    at SessionStart (UUID format) never matches the real agent hex ID from the
+    PostToolUse auto-register-agent.py hook, so these stubs are always orphans
+    — the PostToolUse hook writes the canonical entry with the correct ID and
+    output_file path. Tagging them 'hook' keeps them out of the dispatcher's
+    active-sessions view and prevents 30-minute "dead agent" churn (issue #56).
     """
     from datetime import datetime, timezone
 
@@ -181,7 +191,7 @@ def _auto_register_subagent(session_id: str) -> None:
             INSERT OR IGNORE INTO agent_sessions
                 (id, description, chat_id, status, agent_type, spawned_at)
             VALUES
-                (?, 'auto-registered by SessionStart hook', '0', 'running', 'subagent', ?)
+                (?, 'auto-registered by SessionStart hook', '0', 'running', 'hook', ?)
             """,
             (session_id, now),
         )
