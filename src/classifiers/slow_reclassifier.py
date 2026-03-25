@@ -195,7 +195,14 @@ def ensure_classification_table(conn: sqlite3.Connection) -> None:
 
 def read_recent_events(conn: sqlite3.Connection, hours: int = LOOK_BACK_HOURS) -> list[EventRow]:
     """
-    Read events from the last `hours` hours that have a quick-v1 classification tag.
+    Read events from the last `hours` hours that have a quick-v1 classification tag
+    but do NOT yet have a slow-v1 tag (i.e. not yet reclassified this cycle).
+
+    Excludes pattern_observation events — those are synthetic outputs written by this
+    classifier itself and must never be re-classified, or they create a feedback loop
+    where pattern_observation events get tagged meta_reflection by the quick classifier,
+    which then triggers more meta_thread detections and more pattern_observation writes.
+
     Returns them sorted by timestamp ascending (oldest first).
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
@@ -204,7 +211,11 @@ def read_recent_events(conn: sqlite3.Connection, hours: int = LOOK_BACK_HOURS) -
         FROM events e
         INNER JOIN classification_tags ct ON ct.entry_id = CAST(e.id AS TEXT)
             AND ct.classifier = 'quick-v1'
+        LEFT JOIN classification_tags slow ON slow.entry_id = CAST(e.id AS TEXT)
+            AND slow.classifier = 'slow-v1'
         WHERE e.timestamp >= ?
+          AND e.type != 'pattern_observation'
+          AND slow.entry_id IS NULL
         ORDER BY e.timestamp ASC
     """, (cutoff,))
     rows = []
