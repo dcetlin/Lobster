@@ -1632,14 +1632,54 @@ EOF
     # Migration 36: Register daily-metrics scheduled job (issue #122)
     # Delivers a daily 24-hour snapshot of artifact output to Telegram at 07:00 UTC:
     # GitHub issues opened/closed, agent session counts, git activity on ~/lobster/.
-    # The Python script collects all metrics from existing sources (gh CLI, agent_sessions.db,
-    # git log) — no new instrumentation required. The task .md file wraps the script for
-    # Claude-based execution via run-job.sh.
+    # The Python script (scheduled-tasks/daily-metrics.py) collects metrics from
+    # existing sources (gh CLI, agent_sessions.db, git log) — no new instrumentation.
+    # The task .md file is created here in the workspace (task definitions are
+    # workspace runtime data, not committed to the repo per .githooks/pre-commit).
     local daily_metrics_task="$WORKSPACE_DIR/scheduled-jobs/tasks/daily-metrics.md"
-    local daily_metrics_src="$LOBSTER_DIR/scheduled-tasks/tasks/daily-metrics.md"
-    if [ ! -f "$daily_metrics_task" ] && [ -f "$daily_metrics_src" ]; then
-        cp "$daily_metrics_src" "$daily_metrics_task"
-        substep "Copied daily-metrics task file to scheduled-jobs/tasks/"
+    if [ ! -f "$daily_metrics_task" ]; then
+        mkdir -p "$WORKSPACE_DIR/scheduled-jobs/tasks"
+        cat > "$daily_metrics_task" << 'DAILY_METRICS_TASK'
+# Daily Metrics Report
+
+**Job**: daily-metrics
+**Schedule**: Daily at 7:00 AM UTC (`0 7 * * *`)
+**GitHub issue**: https://github.com/dcetlin/Lobster/issues/122
+
+## Context
+
+You are running as a scheduled task. Your job is to collect a 24-hour snapshot of
+Lobster's artifact output and deliver it to Dan via Telegram.
+
+## Instructions
+
+Run the daily metrics script:
+
+```bash
+uv run ~/lobster/scheduled-tasks/daily-metrics.py
+```
+
+The script collects:
+- GitHub issues opened/closed in the past 24h, plus current open count
+- Agent sessions launched, completed, and still running (from agent_sessions.db)
+- Git activity on ~/lobster/ — commits, files changed, lines added/removed
+
+It delivers the formatted report to Telegram via a Claude subagent and writes
+task output. No further action is needed after running the script.
+
+If the script fails (non-zero exit), note the error in write_task_output with
+status="failed" and include the stderr output.
+
+## Output
+
+When you complete your task, call `write_task_output` with:
+- job_name: "daily-metrics"
+- output: Your results/summary
+- status: "success" or "failed"
+
+Keep output concise. The main Lobster instance will review this later.
+DAILY_METRICS_TASK
+        substep "Created daily-metrics task file in scheduled-jobs/tasks/"
         migrated=$((migrated + 1))
     fi
     if [ -f "$JOBS_FILE" ] && command -v jq >/dev/null 2>&1; then
