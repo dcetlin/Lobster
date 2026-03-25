@@ -297,13 +297,18 @@ REMINDER_ROUTING = {
 
 ```
 1. mark_processing(message_id)
-2. reminder_type = msg["reminder_type"]
-3. route = REMINDER_ROUTING.get(reminder_type, fallback_lobster_generalist)
-4. Spawn subagent (run_in_background=True):
+2. reminder_type = msg.get("reminder_type")
+3. If reminder_type is None or empty:
+   # Defensive drop — cron job completions use type "cron_reminder" (not "scheduled_reminder").
+   # A "scheduled_reminder" without a reminder_type field is malformed; drop it silently.
+   mark_processed(message_id)
+   continue  # Return to wait_for_messages()
+4. route = REMINDER_ROUTING.get(reminder_type, fallback_lobster_generalist)
+5. Spawn subagent (run_in_background=True):
    - subagent_type: route["subagent_type"]
    - prompt: route["prompt"]
-5. mark_processed(message_id)
-6. Return to wait_for_messages() immediately — no ack, no send_reply
+6. mark_processed(message_id)
+7. Return to wait_for_messages() immediately — no ack, no send_reply
 ```
 
 **Rules:**
@@ -325,6 +330,14 @@ Check the `sent_reply_to_user` field first, then check for engineer → reviewer
        # Subagent already called send_reply — nothing to deliver
        mark_processed(message_id)
    else:
+       # --- SILENT DROP: chat_id=0 sentinel ---
+       # A subagent_result with chat_id=0 is the no-op sentinel used by cron triage subagents
+       # and other system subagents to signal "nothing actionable happened — drop silently."
+       # Never relay these; they have no valid Telegram/Slack destination.
+       if str(msg.get("chat_id", "")).strip() in ("0", "", "None"):
+           mark_processed(message_id)
+           continue  # Return to wait_for_messages()
+       # --- END SILENT DROP: chat_id=0 ---
        # --- SILENT DROP: scheduled job no-op results ---
        # If task_id starts with "scheduled-job-" AND text signals nothing happened,
        # drop immediately without relaying. Do not deliberate — if in doubt, drop it.
