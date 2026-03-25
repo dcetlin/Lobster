@@ -1629,6 +1629,43 @@ EOF
         fi
     fi
 
+    # Migration 36: Register daily-metrics scheduled job (issue #122)
+    # Delivers a daily 24-hour snapshot of artifact output to Telegram at 07:00 UTC:
+    # GitHub issues opened/closed, agent session counts, git activity on ~/lobster/.
+    # The Python script collects all metrics from existing sources (gh CLI, agent_sessions.db,
+    # git log) — no new instrumentation required. The task .md file wraps the script for
+    # Claude-based execution via run-job.sh.
+    local daily_metrics_task="$WORKSPACE_DIR/scheduled-jobs/tasks/daily-metrics.md"
+    local daily_metrics_src="$LOBSTER_DIR/scheduled-tasks/tasks/daily-metrics.md"
+    if [ ! -f "$daily_metrics_task" ] && [ -f "$daily_metrics_src" ]; then
+        cp "$daily_metrics_src" "$daily_metrics_task"
+        substep "Copied daily-metrics task file to scheduled-jobs/tasks/"
+        migrated=$((migrated + 1))
+    fi
+    if [ -f "$JOBS_FILE" ] && command -v jq >/dev/null 2>&1; then
+        if ! jq -e '.jobs["daily-metrics"]' "$JOBS_FILE" > /dev/null 2>&1; then
+            local now_iso
+            now_iso=$(date -u +"%Y-%m-%dT%H:%M:%S.%6N+00:00")
+            TMP_JOBS=$(mktemp)
+            jq --arg now "$now_iso" '.jobs["daily-metrics"] = {
+                "name": "daily-metrics",
+                "schedule": "0 7 * * *",
+                "schedule_human": "Daily at 7:00",
+                "task_file": "tasks/daily-metrics.md",
+                "created_at": $now,
+                "updated_at": $now,
+                "enabled": true
+            }' "$JOBS_FILE" > "$TMP_JOBS" && mv "$TMP_JOBS" "$JOBS_FILE"
+            substep "Registered daily-metrics job in jobs.json (daily at 07:00 UTC)"
+            # Sync crontab so the new cron entry is installed immediately
+            if [ -x "$LOBSTER_DIR/scheduled-tasks/sync-crontab.sh" ]; then
+                bash "$LOBSTER_DIR/scheduled-tasks/sync-crontab.sh" 2>/dev/null || true
+                substep "Crontab synchronized (daily-metrics added)"
+            fi
+            migrated=$((migrated + 1))
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
