@@ -49,6 +49,7 @@ PENDING_DIR = _MESSAGES / "pending-transcription"
 INBOX_DIR = _MESSAGES / "inbox"
 AUDIO_DIR = _MESSAGES / "audio"
 DEAD_LETTER_DIR = _MESSAGES / "dead-letter"
+OUTBOX_DIR = _MESSAGES / "outbox"
 
 FFMPEG_PATH = Path.home() / ".local" / "bin" / "ffmpeg"
 WHISPER_CPP_PATH = _WORKSPACE / "whisper.cpp" / "build" / "bin" / "whisper-cli"
@@ -315,6 +316,46 @@ def notify_dispatcher_dead_letter(msg_data: dict, reason: str) -> None:
         log.warning(f"notify_dispatcher_dead_letter failed (non-fatal): {e}")
 
 
+def notify_transcription_complete(msg_data: dict) -> None:
+    """Write an outbox reply signalling that transcription is done and processing is starting.
+
+    Drops a reply JSON into ~/messages/outbox/ so lobster_bot.py picks it up
+    and sends it to the user via Telegram. This gives the user a visible ping
+    between the "Transcribing..." ack and the actual substantive reply, which
+    may arrive seconds later after Claude processes the transcript.
+
+    Silent on any failure — this feedback ping must never block the main
+    transcription pipeline.
+    """
+    try:
+        chat_id = msg_data.get("chat_id")
+        if not chat_id:
+            log.warning("notify_transcription_complete: no chat_id in msg_data, skipping ping")
+            return
+
+        reply_to_message_id = msg_data.get("telegram_message_id")
+        now = datetime.now(timezone.utc)
+        ts_ms = int(now.timestamp() * 1000)
+        reply_id = f"{ts_ms}_transcription_done_{uuid.uuid4().hex[:8]}"
+
+        reply: dict = {
+            "id": reply_id,
+            "source": msg_data.get("source", "telegram"),
+            "chat_id": chat_id,
+            "text": "✅ Transcription done — processing your message",
+            "timestamp": now.isoformat(),
+        }
+        if reply_to_message_id:
+            reply["reply_to_message_id"] = reply_to_message_id
+
+        OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
+        dest = OUTBOX_DIR / f"{reply_id}.json"
+        atomic_write_json(dest, reply)
+        log.info(f"Transcription-complete ping queued for chat_id={chat_id}: {reply_id}")
+    except Exception as e:
+        log.warning(f"notify_transcription_complete failed (non-fatal): {e}")
+
+
 def move_to_dead_letter(pending_file: Path, msg_data: dict, reason: str) -> None:
     """Move a failed file to dead-letter, annotating with failure reason."""
     DEAD_LETTER_DIR.mkdir(parents=True, exist_ok=True)
@@ -420,6 +461,11 @@ async def transcribe_pending_file(pending_file: Path) -> None:
                 atomic_write_json(inbox_file, msg_data)
                 pending_file.unlink(missing_ok=True)
                 log.info(f"  Transcription done → inbox/{pending_file.name}")
+
+                # Ping the user so they know transcription finished and
+                # Claude is now processing — visible feedback before the
+                # substantive reply arrives.
+                notify_transcription_complete(msg_data)
                 return
 
             elif success and not result:

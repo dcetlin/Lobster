@@ -1179,7 +1179,22 @@ async def handle_audio_message(
         atomic_write_json(pending_file, msg_data)
 
         log.info(f"Wrote {msg_type} message to pending-transcription: {msg_id}")
-        ack = "🎤 Voice message received. Transcribing..." if is_voice else "🎵 Audio file received. Transcribing..."
+        if is_voice:
+            duration_s = audio_obj.duration or 0
+            if duration_s > 0:
+                # Whisper typically runs ~1.5–2x real-time on this hardware;
+                # add a few seconds for ffmpeg conversion and startup overhead.
+                estimated_s = max(10, int(duration_s * 2 + 5))
+                if estimated_s < 60:
+                    time_estimate = f"~{estimated_s}s"
+                else:
+                    estimated_m = round(estimated_s / 60)
+                    time_estimate = f"~{estimated_m}m"
+                ack = f"🎤 Transcribing... ({time_estimate})"
+            else:
+                ack = "🎤 Transcribing... (~30s)"
+        else:
+            ack = "🎵 Audio file received. Transcribing..."
         await message.reply_text(ack)
         log.info(f"Ack sent to chat_id={message.chat_id} for {msg_type} message: {msg_id}")
 
