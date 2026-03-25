@@ -38,10 +38,21 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; }
 step() { echo -e "\n${CYAN}${BOLD}▶ $1${NC}"; }
 
 # Parse install mode from arguments
+#
+# Flags:
+#   (default)         git clone from main — always current
+#   --stable          download latest GitHub release tarball (pinned, reproducible)
+#   --dev             git clone from main + write LOBSTER_DEBUG=true to config.env
+#   --non-interactive skip interactive prompts (CI / Docker)
+#   --container-setup implies --non-interactive; for container-specific setup
+DEV_MODE=false
+STABLE_MODE=false
 NON_INTERACTIVE=false
 CONTAINER_SETUP=false
 for arg in "$@"; do
     case "$arg" in
+        --dev) DEV_MODE=true ;;
+        --stable) STABLE_MODE=true ;;
         --non-interactive|--skip-config) NON_INTERACTIVE=true ;;
         --container-setup)
             CONTAINER_SETUP=true
@@ -330,7 +341,7 @@ if [ "$CONTAINER_SETUP" = true ]; then
     # applies immediately on first start. Without this, is_boot_grace_period() returns
     # false (missing field) and the health check fires within seconds of first launch,
     # triggering a restart loop before Claude has had time to initialize.
-    local state_file="$MESSAGES_DIR/config/lobster-state.json"
+    state_file="$MESSAGES_DIR/config/lobster-state.json"
     if [ ! -f "$state_file" ]; then
         echo '{"mode": "active", "booted_at": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' > "$state_file"
         info "  Seeded lobster-state.json with initial booted_at timestamp"
@@ -459,8 +470,12 @@ if [ "$(id -u)" = "0" ]; then
     if getent group docker &>/dev/null; then
         usermod -aG docker lobster
         success "Added 'lobster' to the docker group."
+    elif command -v docker &>/dev/null; then
+        # Docker is installed but the group doesn't exist — that's unusual and worth flagging
+        warn "Docker is installed but the 'docker' group doesn't exist — run 'sudo groupadd docker && sudo usermod -aG docker lobster' to fix."
     else
-        warn "docker group not found — skipping docker group membership (install Docker first)."
+        # Docker not installed — this is the normal case on a fresh machine, not a warning
+        info "Docker not installed — skipping docker group setup. Install Docker later to enable Docker features."
     fi
     # Copy script to /tmp so lobster user can read it regardless of working directory
     INSTALL_SCRIPT="$(readlink -f "$0")"
@@ -498,12 +513,16 @@ if ! sudo true 2>/dev/null; then
 fi
 success "Sudo access confirmed"
 
-# Check internet
-if ! curl -s --connect-timeout 5 https://api.github.com >/dev/null; then
-    error "No internet connection"
+# Check internet (skip when source is already present — existing install, or
+# pre-copied source in non-interactive mode, matching the git clone skip condition).
+if [ -d "$INSTALL_DIR/.git" ] || { [ -f "$INSTALL_DIR/install.sh" ] && [ "$NON_INTERACTIVE" = true ]; }; then
+    info "Skipping internet check (source already present)"
+elif ! curl -s --connect-timeout 5 https://api.github.com >/dev/null; then
+    error "No internet connection (required for fresh install)"
     exit 1
+else
+    success "Internet connectivity confirmed"
 fi
-success "Internet connectivity confirmed"
 
 # Check Python
 if ! command -v python3 &>/dev/null; then
@@ -801,31 +820,36 @@ fi
 #===============================================================================
 
 if [ "$CLAUDE_INSTALLED" = false ]; then
-    step "Installing Claude Code..."
-
-    curl -fsSL https://claude.ai/install.sh | bash
-
-    # Add to PATH for current session and clear bash's command hash table so
-    # command -v picks up the newly installed binary immediately.
-    export PATH="$HOME/.local/bin:$PATH"
-    hash -r 2>/dev/null || true
-
-    # Persist ~/.local/bin to PATH in shell config files
-    PATH_LINE="export PATH=\"\$HOME/.local/bin:\$PATH\""
-    for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
-        if [ -f "$rc" ] && ! grep -q '\.local/bin' "$rc"; then
-            echo "" >> "$rc"
-            echo "# Added by Lobster installer" >> "$rc"
-            echo "$PATH_LINE" >> "$rc"
-            info "Added ~/.local/bin to PATH in $rc"
-        fi
-    done
-
-    if command -v claude &>/dev/null || [ -x "$HOME/.local/bin/claude" ]; then
-        success "Claude Code installed"
+    if [ "$NON_INTERACTIVE" = true ]; then
+        warn "Claude Code not found — skipping installation (non-interactive mode)."
+        info "Run the installer interactively or install Claude Code manually: curl -fsSL https://claude.ai/install.sh | bash"
     else
-        error "Claude Code installation failed"
-        exit 1
+        step "Installing Claude Code..."
+
+        curl -fsSL https://claude.ai/install.sh | bash
+
+        # Add to PATH for current session and clear bash's command hash table so
+        # command -v picks up the newly installed binary immediately.
+        export PATH="$HOME/.local/bin:$PATH"
+        hash -r 2>/dev/null || true
+
+        # Persist ~/.local/bin to PATH in shell config files
+        PATH_LINE="export PATH=\"\$HOME/.local/bin:\$PATH\""
+        for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+            if [ -f "$rc" ] && ! grep -q '\.local/bin' "$rc"; then
+                echo "" >> "$rc"
+                echo "# Added by Lobster installer" >> "$rc"
+                echo "$PATH_LINE" >> "$rc"
+                info "Added ~/.local/bin to PATH in $rc"
+            fi
+        done
+
+        if command -v claude &>/dev/null || [ -x "$HOME/.local/bin/claude" ]; then
+            success "Claude Code installed"
+        else
+            error "Claude Code installation failed"
+            exit 1
+        fi
     fi
 fi
 
@@ -853,17 +877,34 @@ fi
 # Install Lobster Code
 #===============================================================================
 
-# Detect install mode: existing .git -> update; otherwise clone from git.
-# Tarball is kept as a last-resort fallback only when git is not available.
+# Detect install mode.
+#
+# Priority:
+#   1. Existing .git dir       → git update (always wins; no flag can override an existing repo)
+#   2. --stable flag           → tarball of the latest GitHub release (opt-in, pinned)
+#   3. default / --dev flag    → git clone from main (always current)
+#   4. git not available       → tarball fallback (last resort)
+#
+# See: https://github.com/SiderealPress/lobster/issues/787
 if [ -d "$INSTALL_DIR/.git" ]; then
     INSTALL_MODE="git"
     info "Existing git install detected"
-elif command -v git >/dev/null 2>&1; then
-    INSTALL_MODE="git"
-    info "Cloning from git (default)"
-else
+elif $STABLE_MODE; then
     INSTALL_MODE="tarball"
-    warn "git not found — falling back to tarball install"
+    info "Stable mode: using latest release tarball"
+else
+    # Default and --dev: git clone when available
+    if command -v git >/dev/null 2>&1; then
+        INSTALL_MODE="git"
+        if $DEV_MODE; then
+            info "Developer mode: using git clone (LOBSTER_DEBUG will be enabled)"
+        else
+            info "Fresh install: using git clone from main (always current)"
+        fi
+    else
+        INSTALL_MODE="tarball"
+        warn "git not found — falling back to tarball install"
+    fi
 fi
 
 if [ "$INSTALL_MODE" = "git" ]; then
@@ -875,6 +916,11 @@ if [ "$INSTALL_MODE" = "git" ]; then
         git fetch --quiet
         git checkout --quiet "$REPO_BRANCH"
         git pull --quiet origin "$REPO_BRANCH"
+    elif [ -f "$INSTALL_DIR/install.sh" ] && [ "$NON_INTERACTIVE" = true ]; then
+        # Source is already present (e.g. Docker test environment with COPY'd source).
+        # In non-interactive mode, trust the pre-populated directory and skip the clone.
+        info "Source already present at $INSTALL_DIR — skipping git clone (non-interactive mode)"
+        cd "$INSTALL_DIR"
     else
         info "Cloning repository from $REPO_URL (branch: $REPO_BRANCH)..."
         git clone --quiet --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR"
@@ -883,11 +929,13 @@ if [ "$INSTALL_MODE" = "git" ]; then
 
     success "Repository ready at $INSTALL_DIR (branch: $REPO_BRANCH)"
 
-    step "Configuring distributed git hooks..."
-    cd "$INSTALL_DIR"
-    git config --local core.hooksPath .githooks
-    chmod +x .githooks/pre-push .githooks/post-checkout .githooks/pre-commit .githooks/post-merge .githooks/post-rewrite 2>/dev/null || true
-    success "Git hooks configured (core.hooksPath -> .githooks)"
+    if [ -d "$INSTALL_DIR/.git" ]; then
+        step "Configuring distributed git hooks..."
+        cd "$INSTALL_DIR"
+        git config --local core.hooksPath .githooks
+        chmod +x .githooks/pre-push .githooks/post-checkout .githooks/pre-commit .githooks/post-merge .githooks/post-rewrite 2>/dev/null || true
+        success "Git hooks configured (core.hooksPath -> .githooks)"
+    fi
 
 else
     step "Downloading latest Lobster release..."
@@ -901,6 +949,10 @@ else
     LATEST_TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name // empty' 2>/dev/null || true)
 
     if [ -z "$LATEST_TAG" ]; then
+        if ! command -v git >/dev/null 2>&1; then
+            error "No release tag found and git is not available. Cannot install."
+            exit 1
+        fi
         info "No release found, falling back to git clone..."
         git clone --quiet --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR"
         cd "$INSTALL_DIR"
@@ -916,6 +968,10 @@ else
         fi
 
         if [ -z "$TARBALL_URL" ]; then
+            if ! command -v git >/dev/null 2>&1; then
+                error "No release tag found and git is not available. Cannot install."
+                exit 1
+            fi
             error "No tarball found in release. Falling back to git clone..."
             git clone --quiet --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR"
             cd "$INSTALL_DIR"
@@ -1790,6 +1846,31 @@ else
     info "Skipping inject-debug-bootup hook (settings.json not yet created)"
 fi
 
+# Set up Claude Code Stop hook to enforce wait_for_messages in dispatcher sessions.
+# Stop fires when the dispatcher's main Claude Code session considers stopping.
+# The hook detects the dispatcher via session_role.is_dispatcher() and injects a
+# reminder if wait_for_messages was not called — preventing the 12-minute stall
+# window that the health check otherwise needs to catch.
+chmod +x "$INSTALL_DIR/hooks/require-wait-for-messages.py" || true
+if [ -f "$CLAUDE_SETTINGS" ]; then
+    if ! jq -e '.hooks.Stop[]? | select(.hooks[]?.command | contains("require-wait-for-messages"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
+        TMP_SETTINGS=$(mktemp)
+        jq '.hooks.Stop = (.hooks.Stop // []) + [{
+            "matcher": "",
+            "hooks": [{
+                "type": "command",
+                "command": "python3 '"$INSTALL_DIR"'/hooks/require-wait-for-messages.py",
+                "timeout": 10
+            }]
+        }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+        success "require-wait-for-messages Stop hook installed"
+    else
+        info "require-wait-for-messages Stop hook already configured in Claude Code settings"
+    fi
+else
+    info "Skipping require-wait-for-messages Stop hook (settings.json not yet created)"
+fi
+
 # Set up Claude Code SubagentStop hook to enforce write_result in subagent sessions
 # SubagentStop fires when a background sidechain session considers stopping — this is
 # the hook that actually catches subagents, whereas Stop only fires for the main session.
@@ -1981,6 +2062,11 @@ TELEGRAM_ALLOWED_USERS=
 # Admin chat ID (Telegram numeric user ID for the primary admin user).
 # Used by run-job.sh (scheduled tasks) and alert.sh to deliver messages.
 LOBSTER_ADMIN_CHAT_ID=
+
+# Environment mode: production | dev | test
+# Set to "dev" to make the persistent session and health check inert while doing
+# interactive SSH work. Revert to "production" (or remove this line) to resume.
+LOBSTER_ENV=production
 EOF
     fi
     NEED_CONFIG=false
@@ -2040,6 +2126,11 @@ TELEGRAM_ALLOWED_USERS=$USER_ID
 # Admin chat ID (Telegram numeric user ID for the primary admin user).
 # Used by run-job.sh (scheduled tasks) and alert.sh to deliver messages.
 LOBSTER_ADMIN_CHAT_ID=$USER_ID
+
+# Environment mode: production | dev | test
+# Set to "dev" to make the persistent session and health check inert while doing
+# interactive SSH work. Revert to "production" (or remove this line) to resume.
+LOBSTER_ENV=production
 EOF
 
     success "Telegram configuration saved"
@@ -2049,6 +2140,9 @@ fi
 # GitHub Personal Access Token
 #===============================================================================
 
+step "Checking GitHub Personal Access Token..."
+
+# Load global.env if not already done so we can check for an existing token
 if [ -f "$GLOBAL_ENV_FILE" ]; then
     set -a
     # shellcheck disable=SC1090
@@ -2069,9 +2163,11 @@ if [ -z "${GITHUB_TOKEN:-}" ] || [ "$GITHUB_TOKEN" = "your_github_pat_here" ]; t
         read -p "Enter your GitHub PAT (or press Enter to skip): " GH_TOKEN
         if [ -n "$GH_TOKEN" ]; then
             # Write to global.env, replacing any existing GITHUB_TOKEN line (commented or not)
-            if grep -q "^#\? *GITHUB_TOKEN=" "$GLOBAL_ENV_FILE" 2>/dev/null; then
-                awk -v token="$GH_TOKEN" \
-                    '/^#? *GITHUB_TOKEN=/ { print "GITHUB_TOKEN=" token; next } { print }' \
+            if grep -q "^#\{0,1\} *GITHUB_TOKEN=" "$GLOBAL_ENV_FILE" 2>/dev/null; then
+                # Use ENVIRON to avoid backslash mangling that -v causes with tokens
+                # containing backslash sequences (e.g. \n, \t in a PAT value).
+                GH_TOKEN="$GH_TOKEN" awk \
+                    '/^#? *GITHUB_TOKEN=/ { print "GITHUB_TOKEN=" ENVIRON["GH_TOKEN"]; next } { print }' \
                     "$GLOBAL_ENV_FILE" > "$GLOBAL_ENV_FILE.tmp" && mv "$GLOBAL_ENV_FILE.tmp" "$GLOBAL_ENV_FILE"
             else
                 printf '\nGITHUB_TOKEN=%s\n' "$GH_TOKEN" >> "$GLOBAL_ENV_FILE"
@@ -2111,6 +2207,26 @@ if [ -f "$CONFIG_FILE" ]; then
 fi
 
 #===============================================================================
+# Developer Mode: Enable LOBSTER_DEBUG
+#===============================================================================
+
+if $DEV_MODE && [ -f "$CONFIG_FILE" ]; then
+    step "Developer mode: enabling LOBSTER_DEBUG..."
+    # Remove any existing LOBSTER_DEBUG line (set or commented), then append the live value.
+    # This is idempotent — safe to run on reinstall.
+    if grep -q "^#\{0,1\}LOBSTER_DEBUG=" "$CONFIG_FILE" 2>/dev/null; then
+        # Replace in-place using a temp file (sed -i is not portable across macOS/Linux)
+        TMP_CONFIG=$(mktemp)
+        grep -v "^#\{0,1\}LOBSTER_DEBUG=" "$CONFIG_FILE" > "$TMP_CONFIG"
+        mv "$TMP_CONFIG" "$CONFIG_FILE"
+    fi
+    echo "" >> "$CONFIG_FILE"
+    echo "# Enabled by --dev flag at install time" >> "$CONFIG_FILE"
+    echo "LOBSTER_DEBUG=true" >> "$CONFIG_FILE"
+    success "LOBSTER_DEBUG=true written to $CONFIG_FILE"
+fi
+
+#===============================================================================
 # GitHub CLI Authentication
 #===============================================================================
 
@@ -2123,6 +2239,8 @@ elif [ -n "${GITHUB_PAT:-}" ]; then
     echo "$GITHUB_PAT" | gh auth login --with-token 2>/dev/null && \
         success "GitHub CLI authenticated via PAT" || \
         warn "GitHub CLI auth via PAT failed. Authenticate later with: gh auth login"
+elif [ "$NON_INTERACTIVE" = true ]; then
+    info "GitHub CLI not authenticated — skipping (non-interactive mode). Authenticate later with: gh auth login"
 else
     echo ""
     echo "GitHub CLI (gh) is not authenticated."
@@ -2555,30 +2673,35 @@ fi
 
 step "Installing systemd services..."
 
-sudo cp "$INSTALL_DIR/services/lobster-router.service" /etc/systemd/system/
-sudo cp "$INSTALL_DIR/services/lobster-claude.service" /etc/systemd/system/
+# Check whether systemd is running (skip service install in containers/Docker where systemd is absent)
+if ! pidof systemd >/dev/null 2>&1 && ! systemctl is-system-running >/dev/null 2>&1; then
+    warn "systemd not running — skipping service installation (container environment?)"
+    info "Service files have been generated in $INSTALL_DIR/services/ — install them manually when running on a systemd host."
+else
+    sudo cp "$INSTALL_DIR/services/lobster-router.service" /etc/systemd/system/
+    sudo cp "$INSTALL_DIR/services/lobster-claude.service" /etc/systemd/system/
 
-# Install Slack router service if generated
-if [ -f "$INSTALL_DIR/services/lobster-slack-router.service" ]; then
-    sudo cp "$INSTALL_DIR/services/lobster-slack-router.service" /etc/systemd/system/
-    info "Slack router service installed (enable manually with: sudo systemctl enable lobster-slack-router)"
+    # Install Slack router service if generated
+    if [ -f "$INSTALL_DIR/services/lobster-slack-router.service" ]; then
+        sudo cp "$INSTALL_DIR/services/lobster-slack-router.service" /etc/systemd/system/
+        info "Slack router service installed (enable manually with: sudo systemctl enable lobster-slack-router)"
+    fi
+
+    # Install MCP HTTP bridge service if generated
+    if [ -f "$INSTALL_DIR/services/lobster-mcp.service" ]; then
+        sudo cp "$INSTALL_DIR/services/lobster-mcp.service" /etc/systemd/system/
+        info "MCP HTTP bridge service installed (enable manually with: sudo systemctl enable lobster-mcp)"
+    fi
+
+    # Install observability service if generated
+    if [ -f "$INSTALL_DIR/services/lobster-observability.service" ]; then
+        sudo cp "$INSTALL_DIR/services/lobster-observability.service" /etc/systemd/system/
+        info "Observability server service installed (enable manually with: sudo systemctl enable lobster-observability)"
+    fi
+
+    sudo systemctl daemon-reload
+    success "Services installed"
 fi
-
-# Install MCP HTTP bridge service if generated
-if [ -f "$INSTALL_DIR/services/lobster-mcp.service" ]; then
-    sudo cp "$INSTALL_DIR/services/lobster-mcp.service" /etc/systemd/system/
-    info "MCP HTTP bridge service installed (enable manually with: sudo systemctl enable lobster-mcp)"
-fi
-
-# Install observability service if generated
-if [ -f "$INSTALL_DIR/services/lobster-observability.service" ]; then
-    sudo cp "$INSTALL_DIR/services/lobster-observability.service" /etc/systemd/system/
-    info "Observability server service installed (enable manually with: sudo systemctl enable lobster-observability)"
-fi
-
-sudo systemctl daemon-reload
-
-success "Services installed"
 
 #===============================================================================
 # Pre-seed ~/.claude.json
@@ -2639,7 +2762,7 @@ sudo chmod +x /usr/local/bin/lobster
 success "CLI installed"
 
 # Install git pre-commit hook (enforces execute bits on scripts/ and hooks/)
-if [ -f "$INSTALL_DIR/hooks/pre-commit" ]; then
+if [ -f "$INSTALL_DIR/hooks/pre-commit" ] && [ -d "$INSTALL_DIR/.git" ]; then
     cp "$INSTALL_DIR/hooks/pre-commit" "$INSTALL_DIR/.git/hooks/pre-commit"
     chmod +x "$INSTALL_DIR/.git/hooks/pre-commit"
     success "Pre-commit hook installed (.git/hooks/pre-commit)"
