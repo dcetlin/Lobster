@@ -50,7 +50,8 @@ if sys.path[0] != _MCP_SRC_DIR:
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-# Reliability utilities (atomic writes, validation, audit logging, circuit breaker)
+# Reliability utilities (atomic writes, validation, audit logging, circuit breaker,
+# capability failure alerting)
 from reliability import (
     atomic_write_json,
     validate_send_reply_args,
@@ -60,6 +61,8 @@ from reliability import (
     audit_log,
     IdempotencyTracker,
     CircuitBreaker,
+    CapabilityFailureTracker,
+    _response_is_failure,
 )
 
 # Self-update system
@@ -415,6 +418,63 @@ def _emit_debug_observation(
         atomic_write_json(outbox_file, message)
     except Exception:
         pass  # never block on debug instrumentation
+
+
+# ---------------------------------------------------------------------------
+# Capability failure alert delivery
+# ---------------------------------------------------------------------------
+
+def _deliver_capability_alert(alert_message: str, tool: str) -> None:
+    """Write a capability failure alert directly to the outbox.
+
+    This bypasses the dispatcher inbox entirely — no dispatcher tokens are
+    burned, and the alert is unconditional (not gated on LOBSTER_DEBUG).
+    The bot watchdog delivers it to Telegram in the same way as a normal
+    send_reply response.
+
+    Resolves the owner chat_id from config using _get_owner_chat_id_and_source().
+    If the chat_id cannot be resolved, logs a warning and drops the alert
+    rather than crashing the MCP server.
+
+    Never raises — must be safe to call from any context.
+    """
+    try:
+        owner_chat_id, owner_source = _get_owner_chat_id_and_source()
+        if owner_chat_id is None:
+            log.warning(
+                "_deliver_capability_alert: owner chat_id not resolvable — "
+                "dropping alert for tool=%s", tool
+            )
+            return
+
+        from datetime import datetime, timezone as _timezone
+        now = datetime.now(_timezone.utc)
+        ts_ms = int(now.timestamp() * 1000)
+        safe_tool = "".join(c if c.isalnum() or c in "-_" else "_" for c in tool)[:40]
+        message_id = f"{ts_ms}_capability_alert_{safe_tool}"
+        message = {
+            "id": message_id,
+            "type": "capability_alert",
+            "source": owner_source,
+            "chat_id": owner_chat_id,
+            "text": alert_message,
+            "timestamp": now.isoformat(),
+        }
+        if owner_source == "bisque":
+            outbox_file = BISQUE_OUTBOX_DIR / f"{message_id}.json"
+        else:
+            outbox_file = OUTBOX_DIR / f"{message_id}.json"
+        atomic_write_json(outbox_file, message)
+        log.warning(
+            "Capability alert delivered for tool=%s (chat_id=%s, source=%s)",
+            tool, owner_chat_id, owner_source,
+        )
+    except Exception:
+        log.warning(
+            "_deliver_capability_alert: unexpected error delivering alert for tool=%s",
+            tool,
+            exc_info=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -825,6 +885,15 @@ _reply_idempotency = IdempotencyTracker(ttl_seconds=300)
 # Circuit breaker for outbox delivery (Telegram/Slack API)
 # TODO: Wire into lobster_bot.py outbox delivery to short-circuit when Telegram is down
 _outbox_breaker = CircuitBreaker("outbox_delivery", failure_threshold=5, cooldown_seconds=120)
+
+# Capability failure tracker — alerts Dan when a core tool fails N consecutive times.
+# Threshold: 3 consecutive failures → immediate Telegram alert.
+# Cooldown: 30 minutes between repeat alerts for a tool that stays degraded.
+# Alert delivery: direct OUTBOX_DIR write (bypasses dispatcher, no token burn).
+_capability_tracker = CapabilityFailureTracker(
+    failure_threshold=3,
+    alert_cooldown_seconds=1800,
+)
 
 # OpenAI configuration for Whisper transcription
 # Try environment first, then fall back to config file
@@ -2794,9 +2863,33 @@ async def list_tools() -> list[Tool]:
     )
 
 
+def _track_tool_outcome(name: str, result: list[TextContent]) -> None:
+    """Update capability failure tracker based on a tool's response.
+
+    Records a success or failure for monitored tools by inspecting the first
+    TextContent text in the result. If a failure threshold is crossed, delivers
+    a direct Telegram alert via _deliver_capability_alert.
+
+    Pure side-effect isolation: all I/O (alert delivery) happens here, keeping
+    CapabilityFailureTracker itself free of I/O.
+
+    Never raises — must not interfere with normal tool response delivery.
+    """
+    try:
+        response_text = result[0].text if result else ""
+        if _response_is_failure(response_text):
+            decision = _capability_tracker.record_failure(name, response_text)
+            if decision.should_alert:
+                _deliver_capability_alert(decision.alert_message, name)
+        else:
+            _capability_tracker.record_success(name)
+    except Exception:
+        pass  # tracking must never crash tool dispatch
+
+
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    """Handle tool calls with structured audit logging."""
+    """Handle tool calls with structured audit logging and capability failure tracking."""
     log.info(f"Tool called: {name}")
     start_time = time.time()
     try:
@@ -2805,6 +2898,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         # Audit log all tool calls (except wait_for_messages which is too noisy)
         if name != "wait_for_messages":
             audit_log(tool=name, args=arguments, result="ok", duration_ms=elapsed_ms)
+        # Track capability health — alert on consecutive failures for monitored tools
+        _track_tool_outcome(name, result)
         return result
     except ValidationError as e:
         elapsed_ms = int((time.time() - start_time) * 1000)
@@ -2814,6 +2909,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         elapsed_ms = int((time.time() - start_time) * 1000)
         audit_log(tool=name, args=arguments, error=str(e), duration_ms=elapsed_ms)
         log.error(f"Tool {name} failed: {e}", exc_info=True)
+        # Unhandled exceptions in monitored tools also count as failures
+        _track_tool_outcome(name, [TextContent(type="text", text=f"Error in {name}: {str(e)}")])
         return [TextContent(type="text", text=f"Error in {name}: {str(e)}")]
 
 

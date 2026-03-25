@@ -28,6 +28,9 @@ from reliability import (
     audit_log,
     IdempotencyTracker,
     CircuitBreaker,
+    CapabilityFailureTracker,
+    _response_is_failure,
+    DEFAULT_MONITORED_TOOLS,
 )
 
 
@@ -332,3 +335,178 @@ class TestCircuitBreaker:
         assert status["name"] == "telegram"
         assert status["state"] == "closed"
         assert status["failure_threshold"] == 5
+
+
+# =============================================================================
+# Response Failure Detection Tests
+# =============================================================================
+
+
+class TestResponseIsFailure:
+    def test_memory_not_available(self):
+        """'Memory system is not available.' is a failure."""
+        assert _response_is_failure("Memory system is not available.") is True
+
+    def test_error_storing_memory(self):
+        """'Error storing memory: ...' is a failure."""
+        assert _response_is_failure("Error storing memory: connection refused") is True
+
+    def test_error_in_memory_store(self):
+        """'Error in memory_store: ...' is a failure."""
+        assert _response_is_failure("Error in memory_store: disk full") is True
+
+    def test_stored_memory_event_is_success(self):
+        """Normal memory_store success response is not a failure."""
+        assert _response_is_failure("Stored memory event #42 (type=note, source=internal)") is False
+
+    def test_empty_response_is_not_failure(self):
+        """Empty string is not a failure."""
+        assert _response_is_failure("") is False
+
+    def test_validation_error_is_not_capability_failure(self):
+        """Validation errors (bad input) are not capability failures."""
+        assert _response_is_failure("Validation error: chat_id is required") is False
+
+    def test_no_new_messages_is_not_failure(self):
+        """'No new messages' is healthy inbox behavior, not a failure."""
+        assert _response_is_failure("No new messages") is False
+
+    def test_zero_messages_is_not_failure(self):
+        """'0 messages' variants are healthy inbox behavior."""
+        assert _response_is_failure("0 messages in inbox") is False
+        assert _response_is_failure("0 new messages") is False
+
+    def test_case_insensitive(self):
+        """Failure detection is case-insensitive."""
+        assert _response_is_failure("MEMORY SYSTEM IS NOT AVAILABLE") is True
+        assert _response_is_failure("memory system is not available") is True
+
+    def test_failed_fragment(self):
+        """'failed:' fragment triggers failure detection."""
+        assert _response_is_failure("memory_store failed: vector DB unreachable") is True
+
+    def test_not_available_fragment_does_not_trigger(self):
+        """Bare 'not available' does NOT trigger failure detection.
+
+        The phrase is too broad — tool responses that mention unavailability
+        of optional features (e.g. "Slack integration not available") would
+        false-positive. Tool-specific patterns already cover real failures.
+        """
+        assert _response_is_failure("Feature X is not available in this version") is False
+        assert _response_is_failure("Slack integration not available") is False
+
+    def test_non_failure_takes_precedence(self):
+        """Non-failure patterns take precedence over failure patterns."""
+        # "no new messages" overrides any failure pattern even if both match
+        assert _response_is_failure("No new messages (memory_store failed: unreachable)") is False
+
+
+# =============================================================================
+# Capability Failure Tracker Tests
+# =============================================================================
+
+
+class TestCapabilityFailureTracker:
+    def test_no_alert_below_threshold(self):
+        """Failures below threshold produce no alert."""
+        tracker = CapabilityFailureTracker(failure_threshold=3)
+        d1 = tracker.record_failure("memory_store", "Memory system is not available.")
+        d2 = tracker.record_failure("memory_store", "Memory system is not available.")
+        assert d1.should_alert is False
+        assert d2.should_alert is False
+
+    def test_alert_at_threshold(self):
+        """Alert fires exactly when consecutive failures reach threshold."""
+        tracker = CapabilityFailureTracker(failure_threshold=3)
+        tracker.record_failure("memory_store", "Memory system is not available.")
+        tracker.record_failure("memory_store", "Memory system is not available.")
+        d3 = tracker.record_failure("memory_store", "Memory system is not available.")
+        assert d3.should_alert is True
+        assert "memory_store" in d3.alert_message
+        assert d3.consecutive_failures == 3
+
+    def test_alert_message_contains_response_snippet(self):
+        """Alert message includes a snippet of the failure response."""
+        tracker = CapabilityFailureTracker(failure_threshold=1)
+        decision = tracker.record_failure("memory_store", "Memory system is not available.")
+        assert "Memory system is not available" in decision.alert_message
+
+    def test_success_resets_counter(self):
+        """A success resets the failure counter; subsequent failures start fresh."""
+        tracker = CapabilityFailureTracker(failure_threshold=3)
+        tracker.record_failure("memory_store", "err")
+        tracker.record_failure("memory_store", "err")
+        tracker.record_success("memory_store")  # reset
+        # One more failure should not trigger alert (counter reset to 0 then +1 = 1)
+        d = tracker.record_failure("memory_store", "err")
+        assert d.should_alert is False
+        assert d.consecutive_failures == 1
+
+    def test_no_alert_for_unmonitored_tool(self):
+        """Failures on unmonitored tools are silently ignored."""
+        monitored = frozenset({"memory_store"})
+        tracker = CapabilityFailureTracker(monitored_tools=monitored, failure_threshold=1)
+        decision = tracker.record_failure("some_other_tool", "err")
+        assert decision.should_alert is False
+        assert decision.consecutive_failures == 0
+
+    def test_tools_tracked_independently(self):
+        """Failures on different tools are tracked independently."""
+        tracker = CapabilityFailureTracker(failure_threshold=3)
+        tracker.record_failure("memory_store", "err")
+        tracker.record_failure("memory_store", "err")
+        # send_reply hasn't failed yet — should not trigger
+        d = tracker.record_failure("send_reply", "err")
+        assert d.should_alert is False
+        assert d.consecutive_failures == 1
+
+    def test_no_repeat_alert_within_cooldown(self):
+        """A 4th consecutive failure within cooldown does NOT re-alert."""
+        tracker = CapabilityFailureTracker(failure_threshold=3, alert_cooldown_seconds=3600)
+        for _ in range(3):
+            tracker.record_failure("memory_store", "err")
+        # 4th failure — within cooldown, no re-alert
+        d4 = tracker.record_failure("memory_store", "err")
+        assert d4.should_alert is False
+        assert d4.consecutive_failures == 4
+
+    def test_repeat_alert_after_cooldown(self):
+        """Re-alert fires after cooldown period elapses."""
+        tracker = CapabilityFailureTracker(failure_threshold=3, alert_cooldown_seconds=0)
+        for _ in range(3):
+            tracker.record_failure("memory_store", "err")
+        # With cooldown=0, next failure should re-alert immediately
+        d4 = tracker.record_failure("memory_store", "err")
+        assert d4.should_alert is True
+
+    def test_success_returns_no_alert(self):
+        """record_success always returns should_alert=False."""
+        tracker = CapabilityFailureTracker(failure_threshold=3)
+        decision = tracker.record_success("memory_store")
+        assert decision.should_alert is False
+        assert decision.consecutive_failures == 0
+
+    def test_status_returns_all_monitored_tools(self):
+        """status() includes all monitored tools with their failure counts."""
+        tracker = CapabilityFailureTracker(failure_threshold=3)
+        tracker.record_failure("memory_store", "err")
+        status = tracker.status()
+        assert "memory_store" in status
+        assert status["memory_store"]["consecutive_failures"] == 1
+
+    def test_default_monitored_tools(self):
+        """Default monitored tools include the critical-path tools."""
+        assert "memory_store" in DEFAULT_MONITORED_TOOLS
+        assert "send_reply" in DEFAULT_MONITORED_TOOLS
+        assert "check_inbox" in DEFAULT_MONITORED_TOOLS
+        assert "wait_for_messages" in DEFAULT_MONITORED_TOOLS
+
+    def test_alert_message_truncates_long_response(self):
+        """Alert message truncates response texts longer than 200 chars."""
+        tracker = CapabilityFailureTracker(failure_threshold=1)
+        long_response = "X" * 300
+        decision = tracker.record_failure("memory_store", long_response)
+        assert decision.should_alert is True
+        # The snippet in the alert should be capped at 200 + "..."
+        assert "X" * 200 in decision.alert_message
+        assert "..." in decision.alert_message

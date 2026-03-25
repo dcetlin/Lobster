@@ -6,6 +6,7 @@ Addresses common agent failure patterns:
 - Input validation (prevents silent bad data)
 - Structured audit logging (observability)
 - Idempotency helpers (prevents duplicate processing)
+- Capability failure alerting (detects silent tool degradation)
 
 Design principles:
 - Each function is pure or has a single side effect
@@ -305,4 +306,206 @@ class CircuitBreaker:
             "failure_count": self._failure_count,
             "failure_threshold": self.failure_threshold,
             "cooldown_seconds": self.cooldown_seconds,
+        }
+
+
+# =============================================================================
+# Capability Failure Tracker
+# =============================================================================
+# Problem: When a core MCP tool (memory_store, send_reply, check_inbox) starts
+# returning failure responses, the degradation goes undetected for hours because
+# the dispatcher never surfaces it to the user (see 26-hour memory outage,
+# 2026-03-23).
+#
+# Solution: Track consecutive failures per tool. When a monitored tool fails
+# N consecutive times, emit a direct Telegram alert via the outbox (bypassing
+# the dispatcher inbox so no tokens are burned and the alert is unconditional).
+# Reset the counter on the first success. Re-alert on a cooldown interval to
+# prevent spam while the tool remains degraded.
+#
+# Design:
+# - Pure state transitions: record_success / record_failure return an
+#   AlertDecision dataclass describing what action to take; the caller
+#   performs the side effect (outbox write). This keeps the tracker testable
+#   without mocking I/O.
+# - No I/O inside the tracker — callers are responsible for alert delivery.
+# =============================================================================
+
+from dataclasses import dataclass
+
+
+# Tools monitored by default — the critical path for Lobster's core operation.
+DEFAULT_MONITORED_TOOLS: frozenset[str] = frozenset({
+    "memory_store",
+    "send_reply",
+    "check_inbox",
+    "wait_for_messages",
+})
+
+# Text fragments in tool responses that indicate a capability failure.
+# These are matched as substrings (case-insensitive) of the first TextContent
+# text returned by the tool handler.
+FAILURE_RESPONSE_PATTERNS: tuple[str, ...] = (
+    "memory system is not available",
+    "error storing memory",
+    "error in memory_store",
+    "error in send_reply",
+    "error in check_inbox",
+    "error in wait_for_messages",
+    "failed:",
+)
+
+# Patterns that look like failures but aren't — validation errors, empty inbox,
+# etc. These short-circuit the failure-detection path.
+NON_FAILURE_PATTERNS: tuple[str, ...] = (
+    "validation error",          # tool input was bad, not the tool itself
+    "no new messages",           # empty inbox is healthy
+    "0 message",                 # empty inbox variants
+    "0 new message",
+)
+
+
+def _response_is_failure(response_text: str) -> bool:
+    """Return True if a tool response text indicates a capability failure.
+
+    Pure function — no side effects, fully testable.
+
+    Args:
+        response_text: The text content returned by a tool handler.
+    """
+    lower = response_text.lower()
+
+    # Non-failure patterns take precedence — check first.
+    for non_failure in NON_FAILURE_PATTERNS:
+        if non_failure in lower:
+            return False
+
+    for pattern in FAILURE_RESPONSE_PATTERNS:
+        if pattern in lower:
+            return True
+
+    return False
+
+
+@dataclass(frozen=True)
+class AlertDecision:
+    """Immutable result of a failure-tracking state transition.
+
+    Returned by CapabilityFailureTracker.record_success/record_failure.
+    The caller reads should_alert and, if True, delivers the alert message.
+    """
+    should_alert: bool
+    alert_message: str
+    consecutive_failures: int
+    tool: str
+
+
+class CapabilityFailureTracker:
+    """Tracks consecutive failures per tool and signals when to alert.
+
+    State transitions are pure — record_success/record_failure return an
+    AlertDecision with the recommended action. I/O (outbox write) is the
+    caller's responsibility, keeping this class fully unit-testable.
+
+    Args:
+        monitored_tools: Set of tool names to track.
+        failure_threshold: Consecutive failures before first alert (default 3).
+        alert_cooldown_seconds: Minimum seconds between repeat alerts for a
+            tool that remains degraded (default 1800 = 30 min).
+    """
+
+    def __init__(
+        self,
+        monitored_tools: frozenset[str] = DEFAULT_MONITORED_TOOLS,
+        failure_threshold: int = 3,
+        alert_cooldown_seconds: int = 1800,
+    ) -> None:
+        self._monitored = monitored_tools
+        self._threshold = failure_threshold
+        self._cooldown = alert_cooldown_seconds
+        # Per-tool state: consecutive failure count and last-alerted timestamp
+        self._consecutive: dict[str, int] = {}
+        self._last_alerted: dict[str, float] = {}
+
+    def record_success(self, tool: str) -> AlertDecision:
+        """Record a successful tool call, resetting its failure counter.
+
+        Returns an AlertDecision with should_alert=False (success clears state).
+        """
+        if tool in self._monitored:
+            self._consecutive[tool] = 0
+        return AlertDecision(
+            should_alert=False,
+            alert_message="",
+            consecutive_failures=0,
+            tool=tool,
+        )
+
+    def record_failure(self, tool: str, response_text: str = "") -> AlertDecision:
+        """Record a failed tool call and decide whether to alert.
+
+        Returns an AlertDecision. The caller must deliver the alert if
+        should_alert is True.
+
+        Args:
+            tool: The tool name that failed.
+            response_text: The response text from the tool (used in alert body).
+        """
+        if tool not in self._monitored:
+            return AlertDecision(
+                should_alert=False,
+                alert_message="",
+                consecutive_failures=0,
+                tool=tool,
+            )
+
+        count = self._consecutive.get(tool, 0) + 1
+        self._consecutive[tool] = count
+
+        if count < self._threshold:
+            return AlertDecision(
+                should_alert=False,
+                alert_message="",
+                consecutive_failures=count,
+                tool=tool,
+            )
+
+        # At or above threshold — decide whether to alert based on cooldown.
+        now = time.time()
+        last = self._last_alerted.get(tool, 0.0)
+        is_first_alert = count == self._threshold
+        cooldown_elapsed = (now - last) >= self._cooldown
+
+        if not (is_first_alert or cooldown_elapsed):
+            return AlertDecision(
+                should_alert=False,
+                alert_message="",
+                consecutive_failures=count,
+                tool=tool,
+            )
+
+        self._last_alerted[tool] = now
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        snippet = (response_text[:200] + "...") if len(response_text) > 200 else response_text
+        message = (
+            f"CAPABILITY ALERT [{ts}]\n"
+            f"Tool '{tool}' has failed {count} consecutive time(s).\n"
+            f"Last response: {snippet or '(no response text)'}\n"
+            "This may indicate silent degradation. Check logs."
+        )
+        return AlertDecision(
+            should_alert=True,
+            alert_message=message,
+            consecutive_failures=count,
+            tool=tool,
+        )
+
+    def status(self) -> dict:
+        """Return current per-tool failure counts for observability."""
+        return {
+            tool: {
+                "consecutive_failures": self._consecutive.get(tool, 0),
+                "last_alerted": self._last_alerted.get(tool, 0.0),
+            }
+            for tool in self._monitored
         }
