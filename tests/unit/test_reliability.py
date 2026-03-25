@@ -385,14 +385,20 @@ class TestResponseIsFailure:
         """'failed:' fragment triggers failure detection."""
         assert _response_is_failure("memory_store failed: vector DB unreachable") is True
 
-    def test_not_available_fragment(self):
-        """'not available' as a substring triggers failure detection."""
-        assert _response_is_failure("Feature X is not available in this version") is True
+    def test_not_available_fragment_does_not_trigger(self):
+        """Bare 'not available' does NOT trigger failure detection.
+
+        The phrase is too broad — tool responses that mention unavailability
+        of optional features (e.g. "Slack integration not available") would
+        false-positive. Tool-specific patterns already cover real failures.
+        """
+        assert _response_is_failure("Feature X is not available in this version") is False
+        assert _response_is_failure("Slack integration not available") is False
 
     def test_non_failure_takes_precedence(self):
         """Non-failure patterns take precedence over failure patterns."""
-        # "no new messages" overrides "not available" even if both match
-        assert _response_is_failure("No new messages (feature not available)") is False
+        # "no new messages" overrides any failure pattern even if both match
+        assert _response_is_failure("No new messages (memory_store failed: unreachable)") is False
 
 
 # =============================================================================

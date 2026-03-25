@@ -352,7 +352,6 @@ FAILURE_RESPONSE_PATTERNS: tuple[str, ...] = (
     "error in send_reply",
     "error in check_inbox",
     "error in wait_for_messages",
-    "not available",
     "failed:",
 )
 
