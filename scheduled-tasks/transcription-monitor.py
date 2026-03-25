@@ -10,11 +10,6 @@ feedback during long transcriptions.
 Self-silencing: exits immediately (no outbox write) when whisper-cli is
 not running. Safe to call from cron every 5 minutes.
 
-Progress tracking:
-  If worker.py has already written a <id>.progress file (a plain float
-  representing audio-seconds transcribed so far), that is used for a real
-  completion percentage.  Otherwise falls back to the 3x-realtime heuristic.
-
 Usage:
     uv run scheduled-tasks/transcription-monitor.py
 
@@ -52,7 +47,7 @@ PENDING_DIR = _MESSAGES / "pending-transcription"
 OUTBOX_DIR = _MESSAGES / "outbox"
 
 # Heuristic: whisper-cli processes audio at ~3x realtime on this hardware.
-# Used as a fallback when no .progress file exists yet.
+# This means a 10-minute audio file takes ~3.3 minutes of CPU time.
 REALTIME_MULTIPLIER = 3.0
 
 
@@ -99,8 +94,12 @@ def get_process_start_time(pid: int) -> float | None:
         return None
 
 
-def find_pending_voice_file() -> tuple[dict, Path] | None:
-    """Return (msg_data, json_path) for the first pending voice message, or None."""
+def find_pending_voice_json() -> dict | None:
+    """Return the first voice message JSON from pending-transcription/, or None.
+
+    Reads all .json files and returns the first with type == "voice".
+    Pure modulo filesystem I/O.
+    """
     try:
         for json_file in sorted(PENDING_DIR.glob("*.json")):
             if json_file.name.endswith(".tmp"):
@@ -108,21 +107,12 @@ def find_pending_voice_file() -> tuple[dict, Path] | None:
             try:
                 data = json.loads(json_file.read_text())
                 if data.get("type") == "voice":
-                    return data, json_file
+                    return data
             except Exception:
                 continue
     except Exception:
         pass
     return None
-
-
-def read_progress_seconds(pending_stem: str) -> float | None:
-    """Read audio-seconds-processed from the .progress file, or None if absent."""
-    progress_file = PENDING_DIR / f"{pending_stem}.progress"
-    try:
-        return float(progress_file.read_text().strip())
-    except Exception:
-        return None
 
 
 def read_admin_chat_id() -> int | None:
@@ -143,45 +133,52 @@ def read_admin_chat_id() -> int | None:
     return None
 
 
-def format_ping_message(
+def compute_progress_stats(
     audio_duration_s: float,
     elapsed_s: float,
-    audio_processed_s: float | None,
-) -> str:
-    """Format a human-readable progress ping.
+    realtime_multiplier: float,
+) -> dict:
+    """Compute transcription progress statistics from timing inputs.
 
-    When audio_processed_s is provided (real progress from whisper-cli), uses
-    the actual transcription rate to compute percentage and remaining time.
-    Otherwise falls back to the 3x-realtime heuristic.
+    Returns a dict with:
+        elapsed_min: float
+        estimated_total_min: float
+        remaining_min: float
+        realtime_factor: float  (elapsed / audio_duration)
+        audio_min: float
+
+    All pure math — no I/O.
     """
-    audio_min = audio_duration_s / 60.0
-    elapsed_min = elapsed_s / 60.0
+    estimated_total_s = audio_duration_s * realtime_multiplier
+    remaining_s = max(0.0, estimated_total_s - elapsed_s)
+    realtime_factor = elapsed_s / audio_duration_s if audio_duration_s > 0 else 0.0
 
-    if audio_processed_s is not None and audio_processed_s > 0 and audio_duration_s > 0:
-        # Real progress path
-        pct = min(audio_processed_s / audio_duration_s, 1.0)
-        pct_int = int(pct * 100)
-        # Estimate remaining using the actual transcription rate so far
-        rate = elapsed_s / audio_processed_s  # wall-clock seconds per audio-second
-        remaining_audio_s = audio_duration_s - audio_processed_s
-        remaining_min = (remaining_audio_s * rate) / 60.0
-        return (
-            f"\U0001f3a4 Transcribing: {audio_min:.1f} min audio \u2014 "
-            f"{pct_int}% done, ~{remaining_min:.1f} min remaining"
-        )
-    else:
-        # Heuristic fallback (no .progress file yet)
-        estimated_total_s = audio_duration_s * REALTIME_MULTIPLIER
-        remaining_s = max(0.0, estimated_total_s - elapsed_s)
-        remaining_min = remaining_s / 60.0
-        factor = elapsed_s / audio_duration_s if audio_duration_s > 0 else 0.0
-        return (
-            f"\U0001f3a4 Still transcribing: "
-            f"{audio_min:.1f} min audio, "
-            f"{elapsed_min:.1f} min elapsed, "
-            f"~{remaining_min:.1f} min est. remaining "
-            f"({factor:.1f}x realtime)"
-        )
+    return {
+        "audio_min": audio_duration_s / 60.0,
+        "elapsed_min": elapsed_s / 60.0,
+        "estimated_total_min": estimated_total_s / 60.0,
+        "remaining_min": remaining_s / 60.0,
+        "realtime_factor": realtime_factor,
+    }
+
+
+def format_ping_message(stats: dict) -> str:
+    """Format a human-readable progress ping from computed stats.
+
+    Pure string formatting — no I/O.
+    """
+    audio_min = stats["audio_min"]
+    elapsed_min = stats["elapsed_min"]
+    remaining_min = stats["remaining_min"]
+    factor = stats["realtime_factor"]
+
+    return (
+        f"\U0001f3a4 Still transcribing: "
+        f"{audio_min:.1f} min audio, "
+        f"{elapsed_min:.1f} min elapsed, "
+        f"~{remaining_min:.1f} min est. remaining "
+        f"({factor:.1f}x realtime)"
+    )
 
 
 def build_outbox_reply(
@@ -231,19 +228,22 @@ def main() -> int:
         return 0
 
     # Step 2: Find the pending voice message JSON.
-    result = find_pending_voice_file()
-    if result is None:
+    msg_data = find_pending_voice_json()
+    if msg_data is None:
         # whisper is running but no pending JSON found — could be finishing up.
         # Exit silently; the completion ping from worker.py will fire shortly.
         return 0
-    msg_data, pending_file = result
 
     # Step 3: Compute elapsed time.
     # Prefer process start time from /proc; fall back to file mtime of the JSON.
     start_time: float | None = get_process_start_time(pid)
     if start_time is None:
+        # Fall back: use mtime of the pending JSON file as a proxy for when
+        # transcription started (close enough for a progress heuristic).
         try:
-            start_time = pending_file.stat().st_mtime
+            json_files = sorted(PENDING_DIR.glob("*.json"))
+            if json_files:
+                start_time = json_files[0].stat().st_mtime
         except Exception:
             pass
 
@@ -253,24 +253,23 @@ def main() -> int:
 
     elapsed_s = time.time() - start_time
 
-    # Step 4: Get audio duration.
+    # Step 4: Compute stats.
     audio_duration_s = float(msg_data.get("audio_duration", 0) or 0)
     if audio_duration_s <= 0:
         # No duration metadata — can't estimate, skip ping.
         return 0
 
-    # Step 5: Try to read real progress from the .progress file.
-    audio_processed_s = read_progress_seconds(pending_file.stem)
+    stats = compute_progress_stats(audio_duration_s, elapsed_s, REALTIME_MULTIPLIER)
 
-    # Step 6: Determine chat_id.
+    # Step 5: Determine chat_id.
     chat_id = msg_data.get("chat_id")
     if chat_id is None:
         chat_id = read_admin_chat_id()
     if chat_id is None:
         return 1
 
-    # Step 7: Build and write the ping.
-    text = format_ping_message(audio_duration_s, elapsed_s, audio_processed_s)
+    # Step 6: Build and write the ping.
+    text = format_ping_message(stats)
     reply_to_message_id = msg_data.get("telegram_message_id")
     reply = build_outbox_reply(int(chat_id), text, reply_to_message_id)
 
