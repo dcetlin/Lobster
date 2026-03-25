@@ -120,16 +120,14 @@ def count_new_events(conn: sqlite3.Connection, since_id: int) -> int:
     `since_id` of -1 means "no prior checkpoint" — returns total event count,
     so the classifier always runs on first invocation.
 
-    Returns 0 on OperationalError (events table may not yet exist on a fresh install).
+    Raises sqlite3.OperationalError if the events table is unreadable (e.g. on a
+    fresh install). The caller (should_run) catches this and fails open, returning
+    True so the classifier runs rather than silently skipping a pass.
     """
-    try:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM events WHERE id > ?", (since_id,)
-        ).fetchone()
-        return row[0] if row else 0
-    except sqlite3.OperationalError as exc:
-        log.debug("count_new_events: events table not readable (%s)", exc)
-        return 0
+    row = conn.execute(
+        "SELECT COUNT(*) FROM events WHERE id > ?", (since_id,)
+    ).fetchone()
+    return row[0] if row else 0
 
 
 def max_event_id(conn: sqlite3.Connection) -> int:
