@@ -266,8 +266,8 @@ def _resolve_debug_config() -> None:
                         val = line.split("=", 1)[1].strip().strip('"').strip("'").lower()
                         debug = val == "true"
                         break
-        except Exception:
-            pass
+        except Exception as _debug_cfg_err:
+            log.warning("Failed to read LOBSTER_DEBUG from config.env: %s", _debug_cfg_err)
     _DEBUG_MODE = debug
 
     # Determine owner chat_id and messaging source.
@@ -329,8 +329,12 @@ def _resolve_debug_config() -> None:
             elif _DEBUG_OWNER_SOURCE != "slack" and telegram_chat_id is not None and telegram_bot_token:
                 _DEBUG_OWNER_CHAT_ID = telegram_chat_id
                 _DEBUG_ALERTS_ENABLED = True
-        except Exception:
-            pass
+        except Exception as _debug_resolve_err:
+            log.warning(
+                "Failed to resolve debug alert destination from config.env — "
+                "debug alerts will be disabled: %s",
+                _debug_resolve_err,
+            )
 
     _DEBUG_RESOLVED = True
 
@@ -983,8 +987,8 @@ def _check_tmux_ancestry() -> bool:
             if ppid <= 1:
                 break
             pid = ppid
-    except Exception:
-        pass
+    except Exception as _tmux_err:
+        log.warning("_check_tmux_ancestry: unexpected error checking tmux ancestry — defaulting to False: %s", _tmux_err)
     return False  # Fail closed — not the main session
 
 
@@ -3070,8 +3074,12 @@ def _recover_stale_processing():
                             f"server_start: {_SERVER_START_TIME.isoformat()})"
                         )
                         continue
-                except Exception:
-                    pass
+                except Exception as _parse_err:
+                    log.warning(
+                        "_recover_stale_processing: could not parse _processing_started_at "
+                        "for %s — skipping pre-restart check, falling through to timeout: %s",
+                        f.name, _parse_err,
+                    )
 
             # Path 2: timeout-based recovery using _processing_started_at or mtime.
             age, age_source = _processing_age(f, msg)
@@ -3084,7 +3092,11 @@ def _recover_stale_processing():
                     f"(type: {msg.get('type', 'text')}, age: {int(age)}s, "
                     f"timeout: {max_age}s, age_source: {age_source})"
                 )
-        except Exception:
+        except Exception as _stale_err:
+            log.warning(
+                "_recover_stale_processing: error processing file %s — skipping: %s",
+                f.name, _stale_err,
+            )
             continue
 
 
@@ -3289,8 +3301,8 @@ async def _handle_report_slash_command(msg: dict, msg_file: Path) -> None:
     try:
         active = _session_store.get_active_sessions()
         active_session_ids = [s.get("id", "") for s in active if s.get("id")]
-    except Exception:
-        pass
+    except Exception as _sessions_err:
+        log.warning("Failed to fetch active sessions for report snapshot: %s", _sessions_err)
 
     snapshot_state = {
         "active_session_count": len(active_session_ids),
