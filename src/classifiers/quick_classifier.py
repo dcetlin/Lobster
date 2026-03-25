@@ -66,6 +66,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.classifiers.checkpoint import max_event_id, save_checkpoint, should_run
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [quick-classifier] %(message)s")
 log = logging.getLogger(__name__)
 
@@ -78,6 +80,7 @@ CLASSIFIER_VERSION = "quick-v1"
 LOBSTER_WORKSPACE = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
 MEMORY_DB_PATH = LOBSTER_WORKSPACE / "data" / "memory.db"
 LOG_PATH = LOBSTER_WORKSPACE / "logs" / "classifier.log"
+CHECKPOINT_PATH = LOBSTER_WORKSPACE / "data" / "quick-classifier.checkpoint.json"
 
 # How many recent events to pull per classification pass
 RECENT_EVENTS_LIMIT = 50
@@ -477,13 +480,20 @@ def write_run_log(
 # Main classification pass
 # ---------------------------------------------------------------------------
 
-def run_pass(db_path: Path = MEMORY_DB_PATH) -> tuple[int, int]:
+def run_pass(
+    db_path: Path = MEMORY_DB_PATH,
+    checkpoint_path: Path = CHECKPOINT_PATH,
+) -> tuple[int, int]:
     """
-    Open memory.db, classify unclassified events, write tags.
+    Open memory.db, classify unclassified events, write tags, save checkpoint.
 
     Returns (processed, skipped) where:
     - processed: entries classified in this pass
     - skipped: entries already tagged by this classifier version (not re-processed)
+
+    After a successful pass, saves a checkpoint recording the current maximum
+    event id. The next invocation uses this to skip the pass entirely if no new
+    events have been written since then.
     """
     if not db_path.exists():
         log.warning("memory.db not found at %s — skipping pass.", db_path)
@@ -498,6 +508,9 @@ def run_pass(db_path: Path = MEMORY_DB_PATH) -> tuple[int, int]:
 
         if not events:
             log.info("No unclassified events found (already tagged: %d).", already_done)
+            # Advance checkpoint even when there is nothing to classify, so that
+            # subsequent invocations skip immediately rather than re-entering here.
+            save_checkpoint(checkpoint_path, max_event_id(conn))
             return 0, already_done
 
         processed = 0
@@ -517,6 +530,8 @@ def run_pass(db_path: Path = MEMORY_DB_PATH) -> tuple[int, int]:
             "Pass complete: %d classified, %d already tagged.",
             processed, already_done,
         )
+        # Save checkpoint so next invocation can skip if no new events arrive.
+        save_checkpoint(checkpoint_path, max_event_id(conn))
         return processed, already_done
 
     finally:
@@ -571,6 +586,8 @@ def main() -> None:
     parser = _build_arg_parser()
     args = parser.parse_args()
 
+    checkpoint_path = CHECKPOINT_PATH
+
     # Default to --once when neither flag is given
     run_loop = args.loop
 
@@ -580,15 +597,23 @@ def main() -> None:
             args.interval, args.db,
         )
         while True:
+            if not should_run(checkpoint_path, args.db):
+                time.sleep(args.interval)
+                continue
             t0 = time.monotonic()
-            processed, skipped = run_pass(args.db)
+            processed, skipped = run_pass(args.db, checkpoint_path)
             elapsed_ms = (time.monotonic() - t0) * 1000
             write_run_log(processed, skipped, elapsed_ms, args.db)
             time.sleep(args.interval)
     else:
+        # --once mode: exit immediately (code 0) if nothing new to classify.
+        # This is the normal path for the scheduled job invocation.
+        if not should_run(checkpoint_path, args.db):
+            log.info("No new events since last checkpoint — exiting without classification.")
+            return
         log.info("Running single classification pass (db: %s).", args.db)
         t0 = time.monotonic()
-        processed, skipped = run_pass(args.db)
+        processed, skipped = run_pass(args.db, checkpoint_path)
         elapsed_ms = (time.monotonic() - t0) * 1000
         write_run_log(processed, skipped, elapsed_ms, args.db)
         log.info("Done. elapsed_ms=%.1f", elapsed_ms)

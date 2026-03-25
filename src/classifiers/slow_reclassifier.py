@@ -62,6 +62,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
+from src.classifiers.checkpoint import max_event_id, save_checkpoint, should_run
+
 # ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
@@ -79,6 +81,7 @@ log = logging.getLogger(__name__)
 LOBSTER_WORKSPACE = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
 MEMORY_DB_PATH = LOBSTER_WORKSPACE / "data" / "memory.db"
 LOG_PATH = LOBSTER_WORKSPACE / "logs" / "classifier.log"
+CHECKPOINT_PATH = LOBSTER_WORKSPACE / "data" / "slow-reclassifier.checkpoint.json"
 
 DEFAULT_INTERVAL_SECONDS = 600      # 10 minutes
 CLUSTER_WINDOW_MINUTES = 30         # group events within 30 minutes by same source
@@ -684,8 +687,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_once(db_path: Path) -> None:
-    """Run one classification pass and exit."""
+def run_once(
+    db_path: Path,
+    checkpoint_path: Path = CHECKPOINT_PATH,
+) -> None:
+    """Run one classification pass and exit, saving a checkpoint on success."""
     if not db_path.exists():
         log.warning("memory.db not found at %s — skipping.", db_path)
         return
@@ -701,25 +707,40 @@ def run_once(db_path: Path) -> None:
             "Pass complete: %d events processed, %d tags revised, %d patterns found (%.1f ms)",
             processed, revised, patterns, elapsed_ms,
         )
+        # Save checkpoint so next invocation skips if no new events arrive.
+        save_checkpoint(checkpoint_path, max_event_id(conn))
     finally:
         conn.close()
 
 
-def run_loop(db_path: Path, interval: int) -> None:
+def run_loop(
+    db_path: Path,
+    interval: int,
+    checkpoint_path: Path = CHECKPOINT_PATH,
+) -> None:
     """Run continuously, sleeping `interval` seconds between passes."""
     log.info("Starting slow-reclassifier loop (interval=%ds).", interval)
     while True:
-        run_once(db_path)
+        if not should_run(checkpoint_path, db_path):
+            log.info("Sleeping %d seconds (no new events).", interval)
+            time.sleep(interval)
+            continue
+        run_once(db_path, checkpoint_path)
         log.info("Sleeping %d seconds.", interval)
         time.sleep(interval)
 
 
 def main() -> None:
     args = parse_args()
+    checkpoint_path = CHECKPOINT_PATH
     if args.once:
-        run_once(args.db)
+        # --once mode: exit immediately (code 0) if nothing new to classify.
+        if not should_run(checkpoint_path, args.db):
+            log.info("No new events since last checkpoint — exiting without classification.")
+            return
+        run_once(args.db, checkpoint_path)
     else:
-        run_loop(args.db, args.interval)
+        run_loop(args.db, args.interval, checkpoint_path)
 
 
 if __name__ == "__main__":
