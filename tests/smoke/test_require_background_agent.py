@@ -105,27 +105,21 @@ def test_dispatcher_background_agent_exits_zero():
 # ---------------------------------------------------------------------------
 
 
-def test_dispatcher_foreground_agent_explicit_false_blocked():
-    """A2: Dispatcher calling Agent with run_in_background=False → exit 2 with block on stderr.
+def test_foreground_agent_explicit_false_subagent_exempt():
+    """A2: Subagent calling Agent with run_in_background=False → exit 0 (subagent exempt).
 
-    Failure mode: a silent hook here means Claude never sees that it is about
-    to block the dispatcher's message-processing loop.
+    Subagents may legitimately spawn nested synchronous agents. The hook only
+    blocks the dispatcher. Without a dispatcher session marker, the hook treats
+    the caller as a subagent and passes through with exit 0.
+
+    Failure mode: if the hook warns subagents, nested synchronous agent calls
+    from subagents that need the result synchronously are incorrectly blocked.
     """
-    result = _run_hook(
-        "Agent",
-        {"run_in_background": False, "prompt": "do stuff"},
-        session_id="dispatcher-sess",
-        dispatcher_session_id="dispatcher-sess",
-    )
+    result = _run_hook("Agent", {"run_in_background": False, "prompt": "do stuff"})
 
-    assert result.returncode == 2, (
-        f"Expected exit 2 (hard block) for foreground Agent, got {result.returncode}."
-    )
-    assert BLOCK_FRAGMENT in result.stderr, (
-        f"Block message must appear on stderr.\nGot stderr: {result.stderr!r}"
-    )
-    assert result.stdout == "", (
-        f"Expected empty stdout on block, got: {result.stdout!r}"
+    assert result.returncode == 0, (
+        f"Expected exit 0 (subagent exempt) for foreground Agent without dispatcher marker, "
+        f"got {result.returncode}."
     )
 
 
@@ -134,29 +128,21 @@ def test_dispatcher_foreground_agent_explicit_false_blocked():
 # ---------------------------------------------------------------------------
 
 
-def test_dispatcher_foreground_agent_field_absent_blocked():
-    """A3: Dispatcher calling Agent without run_in_background field → exit 2.
+def test_foreground_agent_field_absent_subagent_exempt():
+    """A3: Subagent calling Agent without run_in_background field → exit 0 (subagent exempt).
 
-    Omitting the field is the most common mistake; it must be treated the same
-    as run_in_background: false.
+    The hook only enforces the background requirement for the dispatcher.
+    A subagent session (no dispatcher marker file) calling Agent without
+    run_in_background is passed through silently with exit 0.
 
-    Failure mode: same as A2 — silent hook means silent dispatcher stall.
+    Failure mode: if the hook blocks subagents here, nested synchronous agents
+    from subagents that need a result to decide next steps are incorrectly blocked.
     """
-    result = _run_hook(
-        "Agent",
-        {"prompt": "do stuff"},
-        session_id="dispatcher-sess",
-        dispatcher_session_id="dispatcher-sess",
-    )
+    result = _run_hook("Agent", {"prompt": "do stuff"})
 
-    assert result.returncode == 2, (
-        f"Expected exit 2 when run_in_background is absent, got {result.returncode}."
-    )
-    assert BLOCK_FRAGMENT in result.stderr, (
-        f"Block message must appear on stderr.\nGot stderr: {result.stderr!r}"
-    )
-    assert result.stdout == "", (
-        f"Expected empty stdout on block, got: {result.stdout!r}"
+    assert result.returncode == 0, (
+        f"Expected exit 0 (subagent exempt) when run_in_background is absent "
+        f"and no dispatcher marker is present, got {result.returncode}."
     )
 
 

@@ -260,7 +260,7 @@ class TestHookAgentWithAgentId:
         """A pre-existing row (from register_agent) is NOT overwritten."""
         # Pre-populate with a richer row
         db_dir = tmp_path / "messages" / "config"
-        db_dir.mkdir(parents=True)
+        db_dir.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(db_dir / "agent_sessions.db"))
         conn.execute("""
             CREATE TABLE IF NOT EXISTS agent_sessions (

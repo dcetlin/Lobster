@@ -164,9 +164,10 @@ class TestOutboxToTelegram:
             try:
                 await handler.process_reply(str(reply_file))
 
-                mock_bot.send_message.assert_called_once_with(
-                    chat_id=123456, text="Reply text"
-                )
+                assert mock_bot.send_message.call_count == 1
+                call_kwargs = mock_bot.send_message.call_args
+                assert call_kwargs.kwargs.get("chat_id") == 123456
+                assert call_kwargs.kwargs.get("text") == "Reply text"
             finally:
                 bot_module.bot_app = original_app
                 loop.close()

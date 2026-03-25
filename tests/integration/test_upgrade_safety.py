@@ -317,11 +317,11 @@ class TestMCPServerDirectoryInit:
 
         # Pre-create some dirs with data (simulating existing install)
         inbox = messages / "inbox"
-        inbox.mkdir(parents=True)
+        inbox.mkdir(parents=True, exist_ok=True)
         (inbox / "existing_msg.json").write_text('{"id": "keep_me"}')
 
         processed = messages / "processed"
-        processed.mkdir(parents=True)
+        processed.mkdir(parents=True, exist_ok=True)
         (processed / "old_msg.json").write_text('{"id": "archived"}')
 
         # Patch the constants and run the directory creation loop
