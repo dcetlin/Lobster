@@ -41,3 +41,11 @@ action_seeds:
     - text: "Phase alignment requires two distinct operations: (1) subtractive — removing interference to allow the fundamental frequency to emerge; (2) perceptual — recognizing resonance when it appears, as a felt quality rather than an inference. Dan's framework is well-developed on the subtractive dimension but the perceptual dimension — training the ear for one's own fundamental frequency, distinguishing in-phase from out-of-phase as phenomenological recognition — is implied but unnamed as a developmental discipline. The live-signal-decoding capability points toward perceptual extension as a distinct mode of cybernetic self-extension: not more tasks but a sharper ear. Semantic mirroring is an instrument for this when used as practice rather than output."
       type: "pattern_observation"
 ```
+
+---
+
+## Related Threads (added 2026-03-25)
+
+**dcetlin/riffs: frameworks/2026-03-25-principal-philosophy-lens.md** — Companion piece. That riff names aesthetic proprioception as the real-time phase-alignment detector for Lobster — the continuous felt-sense signal at the output layer. This explore names the complementary question: how is that perceptual capacity itself developed? The riff answers "what the instrument is"; this explore asks "what trains the ear."
+
+**dcetlin/riffs: voice-notes/2026-03-25-theory-of-learning.md** — Structural source. The Discernment → Attunement → Coherence arc in that learning theory is the formal account of what this explore calls "training the violinist's ear," applied to external skills. The explore extends the same arc inward: the capacity to perceive resonance in one's own fundamental frequency develops through the same stages — discernment that a gradient exists, attunement toward it, access to momentary coherence, then sustained coherence. The explore names the inward application that the learning theory leaves implicit.
