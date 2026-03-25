@@ -1445,7 +1445,7 @@ with open(path, 'w') as f:
             TMP_SETTINGS=$(mktemp)
             jq --arg cmd "python3 $INSTALL_DIR/hooks/secret-scanner.py" \
                '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
-                "matcher": "mcp__lobster-inbox__send_reply|mcp__github__add_issue_comment|mcp__github__issue_write|mcp__github__create_pull_request|mcp__github__update_pull_request|mcp__github__pull_request_review_write|mcp__github__add_reply_to_pull_request_comment|mcp__github__create_or_update_file|mcp__github__push_files|mcp__github__merge_pull_request|mcp__github__add_comment_to_pending_review|mcp__github__create_pull_request_with_copilot|mcp__github__delete_file|Bash",
+                "matcher": "mcp__lobster-inbox__send_reply|Bash",
                 "hooks": [{
                     "type": "command",
                     "command": $cmd,
@@ -1540,6 +1540,67 @@ with open(path, 'w') as f:
         substep "Created $USER_CONFIG_DIR/memory/meta-threads/ for meta-thread system"
         migrated=$((migrated + 1))
     fi
+    # Migration 33: Remove GitHub MCP server from Claude Code settings.
+    # The GitHub MCP caused subagents to reach for mcp__github__* tools instead
+    # of the gh CLI, which is already authenticated and the canonical tool.
+    # Removing the MCP entry eliminates the confusion source at the tool-list level.
+    # This migration removes the "github" MCP entry from both settings files so the
+    # MCP no longer appears in the available tool list on next Claude Code startup.
+    for _settings_file in "$HOME/.claude/settings.json" "$HOME/.claude/settings.local.json"; do
+        if [ -f "$_settings_file" ] && jq -e '.mcpServers.github' "$_settings_file" >/dev/null 2>&1; then
+            TMP_SETTINGS=$(mktemp)
+            jq 'del(.mcpServers.github)' "$_settings_file" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$_settings_file"
+            substep "Removed GitHub MCP entry from $_settings_file"
+            migrated=$((migrated + 1))
+        fi
+    done
+    # Also remove via claude CLI in case the MCP was registered at user scope
+    if command -v claude &>/dev/null && claude mcp list 2>/dev/null | grep -q "^github"; then
+        claude mcp remove github --scope user 2>/dev/null || true
+        substep "Removed GitHub MCP server from Claude Code user config"
+        migrated=$((migrated + 1))
+    fi
+
+    # Migration 34: Add LOBSTER_ENV=production to existing config.env files
+    # New installs write LOBSTER_ENV=production into config.env during setup.
+    # Existing installs that predate this change will not have the variable, which
+    # is safe (both scripts default to "production" when the variable is absent),
+    # but the explicit entry makes the knob discoverable and easy to flip for dev work.
+    # We only append if LOBSTER_ENV is completely absent — no existing line is modified.
+    if [ -f "$CONFIG_FILE" ] && ! grep -q '^LOBSTER_ENV=' "$CONFIG_FILE"; then
+        cat >> "$CONFIG_FILE" << 'EOF'
+
+# Environment mode: production | dev | test
+# Set to "dev" to make the persistent session and health check inert while doing
+# interactive SSH work. Revert to "production" (or remove this line) to resume.
+LOBSTER_ENV=production
+EOF
+        substep "Added LOBSTER_ENV=production to $CONFIG_FILE (existing install backfill)"
+        migrated=$((migrated + 1))
+    fi
+
+    # Migration 35: Register require-wait-for-messages Stop hook in settings.json
+    # This hook fires on every Stop event and nudges the dispatcher to call
+    # wait_for_messages when it stalls without doing so, cutting the recovery window
+    # from ~12 minutes (health check) to one turn. Subagent sessions are exempted
+    # via is_dispatcher() — the hook is a no-op for anything that is not the dispatcher.
+    if [ -f "$CLAUDE_SETTINGS" ]; then
+        if ! jq -e '.hooks.Stop[]? | select(.hooks[]?.command | contains("require-wait-for-messages"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
+            chmod +x "$INSTALL_DIR/hooks/require-wait-for-messages.py" 2>/dev/null || true
+            TMP_SETTINGS=$(mktemp)
+            jq '.hooks.Stop = (.hooks.Stop // []) + [{
+                "matcher": "",
+                "hooks": [{
+                    "type": "command",
+                    "command": "python3 '"$INSTALL_DIR"'/hooks/require-wait-for-messages.py",
+                    "timeout": 10
+                }]
+            }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+            substep "Registered require-wait-for-messages Stop hook in settings.json"
+            migrated=$((migrated + 1))
+        fi
+    fi
+
 
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
