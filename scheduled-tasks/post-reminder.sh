@@ -58,7 +58,7 @@ status = sys.argv[7]
 msg = {
     "id": msg_id,
     "source": "system",
-    "type": "scheduled_reminder",
+    "type": "cron_reminder",
     "chat_id": 0,
     "user_id": 0,
     "username": "lobster-cron",

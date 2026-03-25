@@ -678,7 +678,7 @@ TYPE_ALIASES: dict[str, str] = {
     "message": "text",
     "audio": "voice",
     "image": "photo",
-    "cron_reminder": "scheduled_reminder",
+    # "cron_reminder" is no longer aliased — it is its own canonical type handled separately from "scheduled_reminder"
     "task-output": "health_check",
     "system": "health_check",  # when type="system" from health check scripts
 }
