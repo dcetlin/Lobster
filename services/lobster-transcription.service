@@ -23,9 +23,10 @@ EnvironmentFile=-/home/lobster/lobster-config/global.env
 
 ExecStart=/home/lobster/lobster/.venv/bin/python /home/lobster/lobster/src/transcription/worker.py
 
-# Restart on any failure; voice messages accumulate safely in pending-transcription/
-Restart=always
-RestartSec=10
+# Restart on failure (SIGTERM, crash); voice messages accumulate safely in pending-transcription/
+# RestartSec=5 matches the incident on 2026-03-23 where worker died on SIGTERM with no supervisor
+Restart=on-failure
+RestartSec=5
 
 # Limit whisper.cpp memory in case a corrupt audio file causes a runaway
 MemoryMax=2G

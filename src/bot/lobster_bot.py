@@ -1181,6 +1181,7 @@ async def handle_audio_message(
         log.info(f"Wrote {msg_type} message to pending-transcription: {msg_id}")
         ack = "🎤 Voice message received. Transcribing..." if is_voice else "🎵 Audio file received. Transcribing..."
         await message.reply_text(ack)
+        log.info(f"Ack sent to chat_id={message.chat_id} for {msg_type} message: {msg_id}")
 
     except Exception as e:
         log.error(f"Error handling {msg_type} message: {e}", exc_info=True)

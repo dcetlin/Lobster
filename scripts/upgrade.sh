@@ -1541,6 +1541,33 @@ with open(path, 'w') as f:
         migrated=$((migrated + 1))
     fi
 
+    # Migration 33: Install, enable, and start lobster-transcription systemd service.
+    # The transcription worker was previously started ad-hoc (nohup). A SIGTERM on
+    # 2026-03-23 killed it with no supervisor, silently stalling all subsequent voice
+    # notes. This migration installs the service file and starts the worker under
+    # systemd supervision so it auto-restarts on failure (Restart=on-failure, RestartSec=5).
+    local transcription_svc="/etc/systemd/system/lobster-transcription.service"
+    local transcription_svc_src="$LOBSTER_DIR/services/lobster-transcription.service"
+    if [ -f "$transcription_svc_src" ] && [ ! -f "$transcription_svc" ]; then
+        substep "Installing lobster-transcription systemd service..."
+        sudo cp "$transcription_svc_src" "$transcription_svc"
+        sudo systemctl daemon-reload 2>/dev/null || warn "systemctl daemon-reload failed"
+        sudo systemctl enable lobster-transcription 2>/dev/null || warn "systemctl enable lobster-transcription failed"
+        sudo systemctl start lobster-transcription 2>/dev/null || warn "systemctl start lobster-transcription failed"
+        success "lobster-transcription service installed and started (supervised restart on failure)"
+        migrated=$((migrated + 1))
+    elif [ -f "$transcription_svc_src" ] && [ -f "$transcription_svc" ]; then
+        # Service already installed — update file in case Restart= settings changed
+        if ! diff -q "$transcription_svc_src" "$transcription_svc" >/dev/null 2>&1; then
+            substep "Updating lobster-transcription service file (Restart policy changed)..."
+            sudo cp "$transcription_svc_src" "$transcription_svc"
+            sudo systemctl daemon-reload 2>/dev/null || warn "systemctl daemon-reload failed"
+            sudo systemctl try-restart lobster-transcription 2>/dev/null || true
+            substep "lobster-transcription service file updated"
+            migrated=$((migrated + 1))
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
