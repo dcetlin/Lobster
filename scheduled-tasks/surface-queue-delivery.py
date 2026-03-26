@@ -21,7 +21,6 @@ Run standalone:
 
 import json
 import os
-import subprocess
 import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -235,82 +234,88 @@ def format_summary(delivered_count: int, archived_count: int, remaining_count: i
 
 
 # ---------------------------------------------------------------------------
-# Delivery via Claude subagent
+# Delivery via inbox routing
 # ---------------------------------------------------------------------------
 
-def build_delivery_prompt(
-    chat_id: int,
-    messages: list[str],
-    job_summary: str,
-    delivered_count: int,
-    archived_count: int,
-) -> str:
-    """
-    Build the Claude prompt for delivery. Returns a prompt string.
-    Pure function: no side effects.
-    """
-    calls = []
-    for i, msg_text in enumerate(messages, start=1):
-        calls.append(
-            f"{i}. Call send_reply with:\n"
-            f"   - chat_id: {chat_id}\n"
-            f"   - source: \"telegram\"\n"
-            f"   - text: {json.dumps(msg_text)}"
-        )
+def _inbox_dir() -> Path:
+    """Return the inbox directory path, creating it if needed."""
+    messages_base = os.environ.get("LOBSTER_MESSAGES", str(Path.home() / "messages"))
+    inbox = Path(messages_base) / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    return inbox
 
-    next_call = len(messages) + 1
-    calls.append(
-        f"{next_call}. Call write_task_output with:\n"
-        f"   - job_name: \"surface-queue-delivery\"\n"
-        f"   - output: {json.dumps(job_summary)}\n"
-        f"   - status: \"success\""
-    )
 
-    instructions = "\n\n".join(calls)
-    return (
-        f"You are delivering reflective surface queue items. "
-        f"Make exactly these {len(messages) + 1} calls in order, then stop:\n\n"
-        f"{instructions}\n\n"
-        f"Make all calls, then stop. No commentary."
-    )
+def _task_outputs_dir() -> Path:
+    """Return the task-outputs directory path, creating it if needed."""
+    messages_base = os.environ.get("LOBSTER_MESSAGES", str(Path.home() / "messages"))
+    task_outputs = Path(messages_base) / "task-outputs"
+    task_outputs.mkdir(parents=True, exist_ok=True)
+    return task_outputs
+
+
+def write_inbox_message(chat_id: int, text: str, timestamp: str) -> None:
+    """
+    Write a single scheduled_job_result message to the inbox.
+    The dispatcher picks it up and routes it via send_reply.
+    Pure side-effect boundary: all I/O is isolated here.
+    """
+    inbox = _inbox_dir()
+    epoch_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    msg_id = f"{epoch_ms}_surface_queue_delivery"
+    msg = {
+        "id": msg_id,
+        "type": "scheduled_job_result",
+        "job_name": "surface-queue-delivery",
+        "chat_id": chat_id,
+        "source": "telegram",
+        "text": text,
+        "timestamp": timestamp,
+    }
+    out_path = inbox / f"{msg_id}.json"
+    tmp_path = Path(str(out_path) + ".tmp")
+    tmp_path.write_text(json.dumps(msg, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(out_path)
+
+
+def write_task_output(output: str, status: str, timestamp: str) -> None:
+    """
+    Write a task output record directly to the task-outputs directory.
+    Mirrors the format expected by check_task_outputs.
+    """
+    task_outputs = _task_outputs_dir()
+    # Use a timestamp-based filename consistent with existing task output files
+    date_prefix = timestamp[:19].replace(":", "").replace("-", "").replace("T", "-")
+    filename = f"{date_prefix}-surface-queue-delivery.json"
+    record = {
+        "job_name": "surface-queue-delivery",
+        "timestamp": timestamp,
+        "status": status,
+        "output": output,
+    }
+    out_path = task_outputs / filename
+    tmp_path = Path(str(out_path) + ".tmp")
+    tmp_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(out_path)
 
 
 def deliver(messages: list[str], job_summary: str, delivered_count: int, archived_count: int) -> None:
     """
-    Spawn a Claude subagent to deliver messages to Telegram and write task output.
+    Deliver messages to the Lobster inbox and write task output.
+    Each message is written as a scheduled_job_result inbox file; the dispatcher
+    picks them up and routes them via send_reply. No Claude subprocess is spawned.
     Side effects are isolated to this function.
     """
     chat_id = int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586"))
-    prompt = build_delivery_prompt(chat_id, messages, job_summary, delivered_count, archived_count)
-
-    subprocess.run(
-        [
-            "claude", "-p", prompt,
-            "--dangerously-skip-permissions",
-            "--max-turns", "10",
-        ],
-        timeout=180,
-    )
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for msg_text in messages:
+        write_inbox_message(chat_id, msg_text, timestamp)
+    write_task_output(job_summary, "success", timestamp)
 
 
 def deliver_no_items(reason: str) -> None:
-    """Write a task output when there is nothing to deliver."""
-    chat_id = int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586"))
-    prompt = (
-        f"Call write_task_output with:\n"
-        f"- job_name: \"surface-queue-delivery\"\n"
-        f"- output: {json.dumps(reason)}\n"
-        f"- status: \"success\"\n\n"
-        f"Make this one call, then stop."
-    )
-    subprocess.run(
-        [
-            "claude", "-p", prompt,
-            "--dangerously-skip-permissions",
-            "--max-turns", "3",
-        ],
-        timeout=60,
-    )
+    """Write a task output record when there is nothing to deliver."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    write_task_output(reason, "success", timestamp)
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +327,7 @@ def run() -> int:
     Execute the surface queue delivery pipeline.
 
     Reads queue -> scores undelivered items -> selects top N -> formats messages
-    -> delivers via subagent -> marks delivered -> saves queue.
+    -> writes inbox files for dispatcher delivery -> marks delivered -> saves queue.
 
     Returns exit code: 0 for success, 1 for failure.
     """
@@ -359,7 +364,7 @@ def run() -> int:
 
     # Deliver
     if messages:
-        print("  Delivering to Telegram via subagent...")
+        print("  Writing messages to inbox for dispatcher delivery...")
         deliver(messages, job_summary, len(to_deliver), len(to_archive))
     else:
         # Only archiving, no messages to send — still write task output
