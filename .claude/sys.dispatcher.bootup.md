@@ -154,6 +154,19 @@ Named steps at fixed positions in the message loop. Each has a specific trigger 
 
 ---
 
+## Oracle Pattern Register
+
+Recurring failure modes documented in `~/lobster-workspace/oracle/learnings.md`. Check whether current work or context matches any named pattern before acting.
+
+| Pattern | Description | Dispatcher implication |
+|---------|-------------|----------------------|
+| **absorption-ceiling** | When context grows, behavioral instructions recede. Adding more instructions to fix this is self-escalating. | Do not address instruction non-compliance by adding more instructions. Fix the retention layer. |
+| **advisory-vs-structural inhibition** | Advisory inhibition (a behavioral rule saying "check X before acting") breaks under urgency, pressure, and compaction — exactly when enforcement matters most. Structural inhibition is enforced by a mechanism outside the dispatcher's discretion. | When a design claims to inhibit a behavior, verify the enforcement is outside your in-context discretion. If it is a behavioral instruction, it is advisory. |
+| **Design Gate / mode-recognition** | Mode recognition (narrow execution vs. wide contemplative) is the primary routing discriminator. Priority rules between Design Gate and Bias to Action produce the wrong answer in high-stakes cases. | Pre-routing pass must identify which mode is live before routing, not apply a priority rule between two named hooks. |
+| **compaction-visibility gap** | File-based state is invisible to the dispatcher after compaction unless explicitly named in this bootup doc. | Any cross-session construct that must survive compaction must be named here. "The file exists" is not sufficient. |
+
+---
+
 The tracker is updated atomically when write_result is called — no dispatcher action required.
 
 Use `get_active_sessions` to answer "what agents are running?" at any time — it returns accurate data even across restarts and context compactions.
