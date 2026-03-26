@@ -1821,6 +1821,84 @@ DECAY_DETECTOR_TASK
         fi
     fi
 
+    # Migration 43: Register surface-queue-delivery scheduled job (issue #140)
+    # Reads meta/reflective-surface-queue.json, scores undelivered items by source
+    # weight + verdict + age, delivers the top 3 via Telegram, marks them delivered,
+    # and archives items older than 14 days. Runs daily at 08:00 UTC so items surface
+    # in the morning rather than overnight.
+    local surface_queue_task="$WORKSPACE_DIR/scheduled-jobs/tasks/surface-queue-delivery.md"
+    if [ ! -f "$surface_queue_task" ]; then
+        mkdir -p "$WORKSPACE_DIR/scheduled-jobs/tasks"
+        cat > "$surface_queue_task" << 'SURFACE_QUEUE_TASK'
+# Reflective Surface Queue Delivery
+
+**Job**: surface-queue-delivery
+**Schedule**: Daily at 8:00 AM UTC (`0 8 * * *`)
+**GitHub issue**: https://github.com/dcetlin/Lobster/issues/140
+
+## Context
+
+You are running as a scheduled task. The reflective-surface-queue accumulates
+observations from premise-review, hygiene-review, and oracle agents. Nothing has
+ever read it and routed items to Dan. This job does that.
+
+## Instructions
+
+Run the surface queue delivery script:
+
+```bash
+uv run ~/lobster/scheduled-tasks/surface-queue-delivery.py
+```
+
+The script:
+- Reads `~/lobster-workspace/meta/reflective-surface-queue.json`
+- Scores undelivered items by source weight, alignment verdict, and age
+- Delivers the top 3 items to Dan via Telegram
+- Marks delivered items with `delivered: true` and `delivered_at` timestamp
+- Archives items older than 14 days (too stale to be actionable)
+- Writes a summary to task output
+
+No further action is needed after running the script.
+
+If the script fails (non-zero exit), include the error output in write_task_output
+with status="failed".
+
+## Output
+
+When you complete your task, call `write_task_output` with:
+- job_name: "surface-queue-delivery"
+- output: The script's stdout/stderr output (or summary if clean)
+- status: "success" or "failed"
+
+Keep output concise. The main Lobster instance will review this later.
+SURFACE_QUEUE_TASK
+        substep "Created surface-queue-delivery task file in scheduled-jobs/tasks/"
+        migrated=$((migrated + 1))
+    fi
+    if [ -f "$JOBS_FILE" ] && command -v jq >/dev/null 2>&1; then
+        if ! jq -e '.jobs["surface-queue-delivery"]' "$JOBS_FILE" > /dev/null 2>&1; then
+            local now_iso
+            now_iso=$(date -u +"%Y-%m-%dT%H:%M:%S.%6N+00:00")
+            TMP_JOBS=$(mktemp)
+            jq --arg now "$now_iso" '.jobs["surface-queue-delivery"] = {
+                "name": "surface-queue-delivery",
+                "schedule": "0 8 * * *",
+                "schedule_human": "Daily at 8:00",
+                "task_file": "tasks/surface-queue-delivery.md",
+                "created_at": $now,
+                "updated_at": $now,
+                "enabled": true
+            }' "$JOBS_FILE" > "$TMP_JOBS" && mv "$TMP_JOBS" "$JOBS_FILE"
+            substep "Registered surface-queue-delivery job in jobs.json (daily at 08:00 UTC)"
+            # Sync crontab so the new cron entry is installed immediately
+            if [ -x "$LOBSTER_DIR/scheduled-tasks/sync-crontab.sh" ]; then
+                bash "$LOBSTER_DIR/scheduled-tasks/sync-crontab.sh" 2>/dev/null || true
+                substep "Crontab synchronized (surface-queue-delivery added)"
+            fi
+            migrated=$((migrated + 1))
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
