@@ -1,5 +1,5 @@
 # Work Orchestration System
-*Design doc — first version: 2026-03-26 (as "Issue Sweeper"). Substantially rewritten: 2026-03-26.*
+*Design doc — first version: 2026-03-26 (as "Issue Sweeper"). Substantially rewritten: 2026-03-26. Audit-required changes applied: 2026-03-26.*
 
 ---
 
@@ -52,23 +52,38 @@ The sweeper starts in propose-only mode. Each increase in autonomy level (sweepe
 **Schema (per record):**
 ```json
 {
-  "id":            "uow_20260326_abc123",
-  "type":          "executable | design | research | operational | seed",
-  "source":        "github:issue/142 | telegram:msg/1774 | cron:issue-sweeper",
-  "status":        "pending | active | blocked | done | failed",
-  "posture":       "solo | fan-out | sequential | review-loop | human-gate",
-  "agent":         "subagent-id or null",
-  "children":      ["uow_...", "..."],
-  "parent":        "uow_... or null",
-  "created_at":    "ISO8601",
-  "started_at":    "ISO8601 or null",
-  "completed_at":  "ISO8601 or null",
-  "summary":       "one-line description",
-  "output_ref":    "path or URL to output artifact",
-  "hooks_applied": ["hook_id_1", "..."],
-  "route_reason":  "classifier output: which rule fired and why"
+  "id":             "uow_20260326_abc123",
+  "type":           "executable | design | research | operational | seed",
+  "source":         "github:issue/142 | telegram:msg/1774 | cron:issue-sweeper",
+  "status":         "proposed | pending | active | blocked | done | failed | expired",
+  "posture":        "solo | fan-out | sequential | review-loop | human-gate",
+  "agent":          "subagent-id or null",
+  "children":       ["uow_...", "..."],
+  "parent":         "uow_... or null",
+  "created_at":     "ISO8601",
+  "started_at":     "ISO8601 or null",
+  "completed_at":   "ISO8601 or null",
+  "summary":        "one-line description",
+  "output_ref":     "path or URL to output artifact",
+  "hooks_applied":  ["hook_id_1", "..."],
+  "route_reason":   "classifier output: which rule fired and why (human-readable)",
+  "route_evidence": {"rules_fired": ["..."], "scores": {}, "winning_rule": "..."},
+  "trigger":        {"type": "immediate | time | condition", "fire_at": "ISO8601 or null", "condition": {}}
 }
 ```
+
+<!-- Added: audit synthesis 2026-03-26 -->
+**Status vocabulary:**
+- `proposed` — sweeper created this record; awaiting confirmation. Default status in Phase 1.
+- `pending` — confirmed for execution; awaiting an agent to claim it.
+- `active` — an agent is currently executing this UoW.
+- `blocked` — execution paused, awaiting an external condition or human decision.
+- `done` — execution complete; output written to `output_ref`.
+- `failed` — execution failed; `retry-on-failure` hook may re-queue.
+- `expired` — proposed record older than 14 days with no action; excluded from "what's pending?" queries but retained in audit.
+
+The `proposed` / `pending` distinction is load-bearing: the Registry must not mix unconfirmed sweeper proposals with confirmed work queued for execution. "What's pending?" queries filter on `status=pending` only, not `status=proposed`. This prevents the Registry from accumulating phantom pending work that makes "what's running?" unreliable.
+<!-- End added: audit synthesis 2026-03-26 -->
 
 **Dispatcher queries (Phase 1 minimum):**
 - `"what's running?"` → `status=active`
@@ -79,7 +94,17 @@ The sweeper starts in propose-only mode. Each increase in autonomy level (sweepe
 
 **Failure mode:** Registry drift — a UoW is `active` but no agent is alive for it and no recent audit entry exists. Detection: a sweep hook that checks for `active` records older than 2× the expected task duration and emits a stale-active warning. Without this sweep, orphaned active records accumulate and "what's running?" returns ghost entries.
 
-**Phase 1 implementation:** Flat JSON file at `~/lobster-workspace/orchestration/registry.json`. Written by any agent via direct file append or a thin write helper. No database dependency. Read by dispatcher via file read + JSON parse. Phase 1 does not require query performance — the registry will be small.
+**Phase 1 implementation:** Flat JSON file at `~/lobster-workspace/orchestration/registry.json`. Written via `src/orchestration/registry_cli.py`, invocable by scheduled subagents via `uv run`. No direct file append — the CLI is the canonical write path for all agents. No database dependency. Read by dispatcher via file read + JSON parse. Phase 1 does not require query performance — the registry will be small.
+
+<!-- Added: audit synthesis 2026-03-26 -->
+**Write protocol (required — not optional):** Every Registry state change is a two-phase write: (1) append to `audit.jsonl` first; (2) update the Registry record. On startup or health check, if `audit.jsonl` contains entries with no corresponding Registry update, replay the updates. This enforces Principle 1 (no silent transitions) structurally rather than by convention. The `registry_cli.py` CLI enforces this protocol so no agent can bypass it.
+
+**Concurrent write safety (required — not optional):** `registry_cli.py` uses `fcntl.flock` for advisory locking on all writes. Writes are atomic: write to `registry.json.tmp`, then `os.rename()` to `registry.json` (atomic on Linux). Before every write, copy `registry.json` to `registry.json.bak`. Recovery path for corruption: detect empty/unparseable file on startup, restore from `.bak`, alert Dan via Telegram.
+
+**UoW deduplication (required — not optional):** Before creating a UoW for a GitHub issue, the Registry CLI checks for existing records with `source=github:issue/N` and `status NOT IN (done, failed, expired)`. If found, skip creation and log the skip. This prevents daily duplicate UoWs for issues that remain in `proposed` state between sweep runs.
+
+**Directory initialization:** `~/lobster-workspace/orchestration/` is created by `scripts/upgrade.sh` migration step. The `registry_cli.py` also performs `mkdir -p` on startup to handle manual installs.
+<!-- End added: audit synthesis 2026-03-26 -->
 
 ---
 
@@ -227,7 +252,11 @@ root UoW: "Refactor scheduler to support per-job timeouts"
        → synthesis agent: verify consistency, write summary, update PR description
 ```
 
-**Failure mode:** Orphaned children — root UoW transitions to `done` before all children complete (agent crash, timeout). Detection: post-completion sweep that checks for children with `status=active or pending` when parent is `done`. If found: alert, pause root closure, re-queue orphaned children.
+**Failure mode:** Orphaned children — root UoW fails to converge because a child never transitions from `active` or `pending` (agent crash, timeout). Detection: a temporal check (not a post-completion event — the completion event may never fire) that runs on each sweep cycle: any fan-out parent with `status=active` where all children have `status IN (done, failed)` for >1 hour triggers a reconciliation alert to Dan via Telegram and transitions the parent to `done` with a note. If children are still `active` or `pending` after 2× the typical task window, escalate separately.
+
+<!-- Added: audit synthesis 2026-03-26 -->
+Note on the detection trigger: the original design specified "post-completion sweep" — this is a design hole. The failure mode being detected is precisely that the `all_children_done` hook never fires (and thus the parent never reaches `done`). A detection that runs post-completion will never trigger if completion is the thing that never happens. The temporal scan above closes this gap.
+<!-- End added: audit synthesis 2026-03-26 -->
 
 **Phase 1 implementation:** Fan-out is not dispatched in Phase 1. All UoWs use solo posture. The Registry schema supports `parent/children` fields from day one so Phase 2 can add fan-out without a migration.
 
@@ -269,6 +298,36 @@ One JSON object per line:
 
 ---
 
+### 3.6 Trigger Substrate
+
+<!-- Added: audit synthesis 2026-03-26 -->
+
+**What it is:** A unified evaluation substrate for lifecycle activation triggers. A Trigger is the mechanism by which a sleeping UoW becomes active. The WOS Conditional Hook System (#168) and the Deferred Trigger system (#172) are both implementations of this single abstraction.
+
+**Core insight:** A UoW in `status='proposed'` or `status='pending'` is sleeping until its trigger fires. The trigger can be time-based (fire at a wall-clock time) or condition-based (fire when a Registry or GitHub state condition is met). Both trigger types are evaluated by the same substrate.
+
+**Trigger types:**
+
+| `trigger_type` | Description | Example |
+|---|---|---|
+| `immediate` | No delay; UoW becomes active on confirmation | Default for most Phase 1 UoWs |
+| `time` | Fire at a specified wall-clock time | `fire_at: "2026-04-01T09:00:00Z"` |
+| `condition` | Fire when a Registry state condition is met | `{all_children_done: true, parent_id: "uow_..."}` |
+
+**Relationship to Hook System (#168) and Deferred Triggers (#172):**
+
+The Conditional Hook System's temporal hooks (e.g., `escalate-stalled-high-priority`) are time triggers. Its state-transition hooks (e.g., `all_children_done`, `status_changed_to_failed`) are condition triggers. The Deferred Trigger system (#172) is the mechanism for scheduling UoWs to activate at a future time — also a time trigger.
+
+These are not two separate systems. They are the same Trigger evaluation engine with two trigger types. Building #172 first gives #168's temporal and condition hooks a substrate to build on, rather than reimplementing scheduling logic independently.
+
+**Phase 2 implementation:** The Trigger evaluator is a lightweight component of the sweeper or a separate scheduled process. On each run, it checks all sleeping UoWs (`status IN (proposed, pending)` with a `trigger` field) and fires any whose conditions are met. Fired triggers transition the UoW to the next status (typically `active`) and write an audit entry.
+
+**Why this matters for Phase 1:** The `trigger` field is added to the schema from day one (see §3.1 schema). Phase 1 UoWs carry `trigger: {type: immediate}` as the default. No trigger evaluation happens in Phase 1 — but the field's presence means Phase 2 can add trigger evaluation without a schema migration.
+
+<!-- End added: audit synthesis 2026-03-26 -->
+
+---
+
 ## 4. The Issue Sweeper (Governance Layer)
 
 The sweeper is not a general orchestration component — it is one specific agent: the scanner that watches the GitHub issue backlog and creates new UoWs for the orchestration engine.
@@ -292,6 +351,10 @@ The sweeper is not a general orchestration component — it is one specific agen
 3. Escalations — high-priority stalled items (Telegram ping)
 4. Dan-blocked items — waiting on his action
 5. UoWs created (Phase 1: proposed only)
+
+<!-- Added: audit synthesis 2026-03-26 -->
+**Deduplication requirement:** Before creating a UoW for any GitHub issue, the sweeper checks the Registry for existing records with `source=github:issue/N` and `status NOT IN (done, failed, expired)`. If found, the sweep logs a skip entry in its output (e.g., "Issue #142: UoW uow_20260326_abc123 already exists in proposed status — skipping") and no new record is created. This prevents daily duplicate UoWs for issues that remain in `proposed` state across sweep runs.
+<!-- End added: audit synthesis 2026-03-26 -->
 
 **Consumption gate for Phase 1:** The sweeper output is delivered; Dan acts on it. Healthy state: ready queue in sweep output contains ≤5 items per run, and items from prior sweeps appear as closed or in-progress within 5 days. Degradation state: sweep outputs accumulate unread or ready queue grows run-over-run without drain. If the output isn't being consumed, the sweeper is producing noise.
 
@@ -320,9 +383,14 @@ The sweeper enforces typing via labels. The ready queue contains only executable
 - Operations: stale detection, ready-queue surfacing, Dan-blocked identification, Telegram escalation for high-priority stalled items
 - UoW Registry: flat JSON at `~/lobster-workspace/orchestration/registry.json`
 - Audit log: `~/lobster-workspace/orchestration/audit.jsonl`
-- Sweeper creates UoW records for identified items (no autonomy yet — records reflect proposals, status starts at `pending` until Dan confirms)
+- Sweeper creates UoW records for identified items (no autonomy yet — records reflect proposals, `status=proposed` until Dan confirms)
+- Confirmed records transition to `status=pending`; `proposed` records older than 14 days transition to `status=expired` via a lightweight cron
 - No classifier — all postures default to `solo`, `route_reason = "phase1-default"`
 - No hooks — sweeper proposes, Dan confirms
+<!-- Added: audit synthesis 2026-03-26 -->
+- Registry write path: `registry_cli.py` CLI with `fcntl.flock`, atomic writes, and write-ahead-log protocol
+- `~/lobster-workspace/orchestration/` directory initialized via `upgrade.sh` migration
+<!-- End added: audit synthesis 2026-03-26 -->
 
 **Phase 1 is done when:**
 - The sweeper runs on its nightly schedule without errors
@@ -408,7 +476,7 @@ These are load-bearing. Flag when evidence contradicts them.
 - Sweeper runs on schedule: `hygiene/YYYY-MM-DD-issue-sweep.md` files appear dated to the current day. No gap >2 nights.
 - Registry reflects reality: UoW count in Registry roughly tracks the `ready-to-execute` issue count. Systematic divergence (Registry near-empty, GitHub has 10+ ready) means the sweeper is not creating UoWs.
 - Stale issues resolve: issues flagged `stale` either close, get `on-hold` with a reason, or re-enter ready queue within ~2 weeks.
-- Audit log is active: `audit.jsonl` accrues new entries each week. Silence means the pipeline has stopped.
+- Audit log has transition events: `audit.jsonl` contains entries with `event != 'created'` at least weekly. A log containing only `created` events means the sweeper is running but no work is transitioning — this is a stalled pipeline signal, not a healthy one. Creation-only entries are necessary but not sufficient. <!-- Added: audit synthesis 2026-03-26 -->
 - Failed UoW proportion is low: failed/total ratio below ~20% sustained over a week.
 - "What's running?" is answerable in one query. If the dispatcher falls back to GitHub scanning, the Registry is not being maintained.
 
