@@ -1706,6 +1706,25 @@ DAILY_METRICS_TASK
         fi
     fi
 
+    # Migration 37: Register block-claude-p PreToolUse hook (warn mode).
+    # Catches agents that write `claude -p` in Bash commands — the root cause of the
+    # 2026-03-25 dispatcher MCP connection drop. Deployed in soft warn mode first.
+    # See: https://github.com/SiderealPress/lobster/issues/889
+    local claude_settings="$HOME/.claude/settings.json"
+    if [ -f "$claude_settings" ] && command -v jq >/dev/null 2>&1; then
+        if ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("block-claude-p"))' "$claude_settings" > /dev/null 2>&1; then
+            chmod +x "$LOBSTER_DIR/hooks/block-claude-p.py" 2>/dev/null || true
+            TMP_SETTINGS=$(mktemp)
+            jq --arg cmd "LOBSTER_BLOCK_CLAUDE_P_MODE=warn python3 $LOBSTER_DIR/hooks/block-claude-p.py" \
+                '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": $cmd, "timeout": 5}]
+            }]' "$claude_settings" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$claude_settings"
+            substep "Registered block-claude-p hook in Claude Code settings (warn mode)"
+            migrated=$((migrated + 1))
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

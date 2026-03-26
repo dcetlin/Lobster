@@ -1677,6 +1677,29 @@ else
     info "Skipping dispatcher-inline-tool-guard hook (settings.json not yet created)"
 fi
 
+# Set up Claude Code PreToolUse hook to warn/block agents from spawning `claude -p` sessions
+# Deployed in warn mode (LOBSTER_BLOCK_CLAUDE_P_MODE=warn) to validate before hard-blocking.
+# See: https://github.com/SiderealPress/lobster/issues/889
+chmod +x "$INSTALL_DIR/hooks/block-claude-p.py" || true
+if [ -f "$CLAUDE_SETTINGS" ]; then
+    if ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("block-claude-p"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
+        TMP_SETTINGS=$(mktemp)
+        jq '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
+            "matcher": "Bash",
+            "hooks": [{
+                "type": "command",
+                "command": "LOBSTER_BLOCK_CLAUDE_P_MODE=warn python3 '"$INSTALL_DIR"'/hooks/block-claude-p.py",
+                "timeout": 5
+            }]
+        }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+        success "block-claude-p hook installed (warn mode)"
+    else
+        info "block-claude-p hook already configured in Claude Code settings"
+    fi
+else
+    info "Skipping block-claude-p hook (settings.json not yet created)"
+fi
+
 # Set up Claude Code PreToolUse hook to block edits to system files unless LOBSTER_DEBUG=true
 chmod +x "$INSTALL_DIR/hooks/system-file-protect.py" || true
 if [ -f "$CLAUDE_SETTINGS" ]; then
