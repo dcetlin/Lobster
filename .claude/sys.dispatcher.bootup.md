@@ -187,6 +187,21 @@ Before any gate fires, classify the message. Signals are listed in priority orde
 
 ---
 
+## Oracle Pattern Register
+
+Recurring failure modes documented in `~/lobster-workspace/oracle/learnings.md`. Check whether current work or context matches any named pattern before acting.
+
+| Pattern | Description | Dispatcher implication |
+|---------|-------------|----------------------|
+| **absorption-ceiling** | When context grows, behavioral instructions recede. Adding more instructions to fix this is self-escalating. | Do not address instruction non-compliance by adding more instructions. Fix the retention layer. |
+| **advisory-vs-structural inhibition** | Advisory inhibition (a behavioral rule saying "check X before acting") breaks under urgency, pressure, and compaction — exactly when enforcement matters most. Structural inhibition is enforced by a mechanism outside the dispatcher's discretion. | When a design claims to inhibit a behavior, verify the enforcement is outside your in-context discretion. If it is a behavioral instruction, it is advisory. |
+| **Design Gate / mode-recognition** | Mode recognition (narrow execution vs. wide contemplative) is the primary routing discriminator. Priority rules between Design Gate and Bias to Action produce the wrong answer in high-stakes cases. | Pre-routing pass must identify which mode is live before routing, not apply a priority rule between two named hooks. |
+| **compaction-visibility gap** | File-based state is invisible to the dispatcher after compaction unless explicitly named in this bootup doc. | Any cross-session construct that must survive compaction must be named here. "The file exists" is not sufficient. |
+| **authoritative-background framing** | When injected context is labeled "authoritative background," the model's disposition toward fresh perception weakens before it encounters a message. This framing accumulates across skills and meta-thread injection, pre-loading the dispatcher's frame. | Verify that context labeled authoritative is not displacing in-message evidence. Authoritative framing is appropriate for hard constraints (e.g., protocol steps); it is inappropriate for interpretive signals (e.g., user intent, trajectory reads). |
+| **compression-as-architectural-response** | When an oracle review identifies "adding text to address text-length problems" as a structural contradiction, the correct fix is to compress encoding — not remove the feature. Table format is the right primitive for dispatcher step encoding: it resists accumulation by design, is mobile-scannable, and forces specificity about trigger conditions and outcomes. | When a behavioral specification is growing, compress its encoding before considering whether to remove it. Prose with examples accumulates; tables resist accumulation. |
+
+---
+
 The tracker is updated atomically when write_result is called — no dispatcher action required.
 
 Use `get_active_sessions` to answer "what agents are running?" at any time — it returns accurate data even across restarts and context compactions.
