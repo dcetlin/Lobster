@@ -94,7 +94,7 @@ The `proposed` / `pending` distinction is load-bearing: the Registry must not mi
 
 **Failure mode:** Registry drift — a UoW is `active` but no agent is alive for it and no recent audit entry exists. Detection: a sweep hook that checks for `active` records older than 2× the expected task duration and emits a stale-active warning. Without this sweep, orphaned active records accumulate and "what's running?" returns ghost entries.
 
-**Phase 1 implementation:** SQLite database at `~/lobster-workspace/orchestration/registry.db`. Written via `src/orchestration/registry_cli.py`, invocable by scheduled subagents via `uv run`. No direct database access — the CLI is the canonical write path for all agents. Read by dispatcher via CLI query commands or direct SQLite read.
+**Phase 1 implementation:** SQLite database at `~/lobster-workspace/orchestration/registry.db`. Written via `src/orchestration/registry_cli.py`, invocable by scheduled subagents via `uv run`. The CLI is the canonical path for all Registry access — reads and writes. Direct SQLite reads are not permitted; they bypass schema evolution handling and will silently break when the schema changes.
 
 <!-- Added: audit synthesis 2026-03-26 -->
 **Schema — SQLite table definition:**
@@ -133,17 +133,61 @@ uv run registry_cli.py get --id <uow-id>
 uv run registry_cli.py list --status proposed
 uv run registry_cli.py confirm --id <uow-id>        # transitions proposed → pending
 uv run registry_cli.py check-stale                  # reports active UoWs whose source issue is closed
+uv run registry_cli.py expire-proposals             # transitions proposed records older than 14 days to expired
 ```
+
+**CLI output contract:** All commands output JSON to stdout. `list` returns a JSON array of UoW objects. `get` returns a single UoW object or `{"error": "not found"}`. `confirm` returns `{"id": "...", "status": "pending", "previous_status": "proposed"}` on success, or an error object. `upsert` returns `{"id": "...", "action": "inserted|skipped", "reason": "..."}`. `check-stale` returns a JSON array of stale UoW summaries. `expire-proposals` returns `{"expired_count": N, "ids": [...]}`. This output contract is stable — callers may parse it. Free-form text output is not part of the interface.
 
 All operations use `BEGIN IMMEDIATE` SQLite transactions. Audit log entries are written in the same transaction as the status change. If either the audit write or the registry update fails, both roll back — this enforces Principle 1 structurally at the transaction boundary.
 
-**Write protocol (required — not optional):** Every Registry state change is executed inside a `BEGIN IMMEDIATE` transaction: (1) INSERT into `audit_log` table first; (2) INSERT or UPDATE the `uow_registry` record. If either step fails, the transaction rolls back and no partial state is written. On startup, if the database is absent or corrupt, `registry_cli.py` recreates the schema and alerts Dan via Telegram.
+**`audit_log` table definition:**
+```sql
+CREATE TABLE audit_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT NOT NULL,
+    uow_id      TEXT NOT NULL,
+    event       TEXT NOT NULL,    -- created | status_change | hook_fired | child_spawned | completed | failed | expired | skipped
+    from_status TEXT,
+    to_status   TEXT,
+    agent       TEXT,
+    note        TEXT
+);
+```
+The `audit_log` table is append-only. It is never truncated, never schema-migrated destructively, and must be backed up separately before any schema migration to `uow_registry`. It is the write-ahead record; if `uow_registry` and `audit_log` diverge, `audit_log` is the source of record for reconstruction.
+
+**Write protocol (required — not optional):** Every Registry state change is executed inside a `BEGIN IMMEDIATE` transaction: (1) INSERT into `audit_log` first; (2) INSERT or UPDATE the `uow_registry` record. If either step fails, the transaction rolls back and no partial state is written.
+
+**Startup recovery:** On startup, if the database file is absent, `registry_cli.py` creates the schema and alerts Dan via Telegram. If the database file is present but `uow_registry` is corrupt, `registry_cli.py` recreates only `uow_registry` — it must not recreate or truncate `audit_log`, because the audit log is the recovery source. If the database file itself is irrecoverable (file corrupt beyond SQLite repair), Dan is alerted and must restore from backup before the CLI will write.
 
 **Concurrent write safety (required — not optional):** SQLite's `BEGIN IMMEDIATE` serializes writers. No additional file locking required. The `registry.db` file is never written to directly — all writes go through the CLI. WAL mode is enabled (`PRAGMA journal_mode=WAL`) for read/write concurrency.
 
-**UoW deduplication (required — not optional):** The `UNIQUE(source_issue_number, sweep_date)` constraint prevents duplicate UoWs at the database level. The `upsert` CLI command uses `INSERT OR IGNORE` for records not in `proposed` state and `INSERT OR REPLACE` only when the existing record is `proposed`. Before inserting, the CLI also checks for any existing record with the same `source_issue_number` and `status NOT IN (done, failed, expired)` — if found, it logs the skip in the audit entry and returns without writing.
+**UoW deduplication (required — not optional):** The `UNIQUE(source_issue_number, sweep_date)` constraint prevents duplicate UoWs at the database level. The `upsert` CLI command applies the following decision table before any write:
 
-**Stale-active detection (required — Phase 1):** `uv run registry_cli.py check-stale` queries for UoWs in `active` status whose source GitHub issue is closed (verified via `gh issue view`). Output: list of UoW IDs with their source issue numbers. Run by the sweeper on each pass. Any stale-active UoWs are included in the sweep output report for Dan's review.
+| Existing record state (any sweep_date) | Action |
+|---|---|
+| None | INSERT new `proposed` record |
+| `proposed` (any sweep_date) | SKIP — already proposed; log skip in audit entry |
+| `pending`, `active`, or `blocked` (any sweep_date) | SKIP — work in flight; log skip in audit entry |
+| `done`, `failed`, or `expired` (any sweep_date) | INSERT new `proposed` record — prior work is terminal |
+
+The cross-sweep-date check for non-terminal records is explicit: the pre-check queries `WHERE source_issue_number = ? AND status NOT IN ('done', 'failed', 'expired')` across all sweep dates. This prevents re-proposal for issues with in-flight work from prior sweeps.
+
+On UNIQUE constraint conflict (same `source_issue_number` + `sweep_date`), the `ON CONFLICT` clause uses a conditional update — never `INSERT OR REPLACE` (which would silently reset execution state for non-proposed records):
+
+```sql
+INSERT INTO uow_registry (...) VALUES (...)
+ON CONFLICT(source_issue_number, sweep_date) DO UPDATE SET
+    status      = CASE WHEN uow_registry.status = 'proposed' THEN excluded.status ELSE uow_registry.status END,
+    updated_at  = CASE WHEN uow_registry.status = 'proposed' THEN excluded.updated_at ELSE uow_registry.updated_at END;
+```
+
+Using `INSERT OR REPLACE` is a correctness bug — it would delete and re-insert the row, silently discarding `agent`, `started_at`, `hooks_applied`, and all execution state for any UoW not in `proposed` state.
+
+**Stale-active detection (required — Phase 1):** `uv run registry_cli.py check-stale` queries for UoWs in `active` status whose source GitHub issue is closed (verified via `gh issue view`). Output: JSON array of stale UoW summaries (see CLI output contract above). Run by the sweeper on each pass. Any stale-active UoWs are included in the sweep output report for Dan's review.
+
+**Phase 2 implementation note — check-stale composability:** The current `check-stale` definition embeds a GitHub API dependency inside the Registry CLI layer and is scoped to GitHub-issue-sourced UoWs only. In Phase 2, when UoWs from non-GitHub sources appear (classifier-created UoWs, agent-created UoWs), `check-stale` will require modification. The Phase 2 design should consider (a) moving the GitHub closed-issue check to the sweeper layer (which already scans GitHub) and having the sweeper write a `source_closed: true` flag to the UoW record, after which `check-stale` queries only Registry state with no external calls, and (b) a general staleness model that is not GitHub-specific.
+
+**Phase 2 implementation note — SQLite concurrent writers:** At Phase 2+ operation rates (sweeper + classifier + hook evaluators writing concurrently), set `PRAGMA busy_timeout = 5000` in the CLI connection setup. The default `busy_timeout=0` causes concurrent writers to fail immediately with `SQLITE_BUSY` rather than waiting, which produces an undetected write failure for the losing writer.
 
 **Directory initialization:** `~/lobster-workspace/orchestration/` is created by `scripts/upgrade.sh` migration step. The `registry_cli.py` also performs `mkdir -p` on startup to handle manual installs.
 <!-- End added: audit synthesis 2026-03-26 -->
@@ -358,9 +402,9 @@ One JSON object per line:
 
 **Relationship to Hook System (#168) and Deferred Triggers (#172):**
 
-The Conditional Hook System's temporal hooks (e.g., `escalate-stalled-high-priority`) are time triggers. Its state-transition hooks (e.g., `all_children_done`, `status_changed_to_failed`) are condition triggers. The Deferred Trigger system (#172) is the mechanism for scheduling UoWs to activate at a future time — also a time trigger.
+The Conditional Hook System's temporal hooks (e.g., `escalate-stalled-high-priority`) are time triggers. The Deferred Trigger system (#172) is the mechanism for scheduling UoWs to activate at a future time — also a time trigger. The Trigger Substrate unifies these two: building #172 first gives #168's temporal hooks a substrate to build on, rather than reimplementing scheduling logic independently.
 
-These are not two separate systems. They are the same Trigger evaluation engine with two trigger types. Building #172 first gives #168's temporal and condition hooks a substrate to build on, rather than reimplementing scheduling logic independently.
+**Scope clarification (Phase 2 design decision required):** The Trigger Substrate unification applies cleanly to `time` triggers. For `condition` triggers — specifically state-transition hooks like `all_children_done` and `status_changed_to_failed` — there is an unresolved design decision about evaluation mode: polling (evaluator checks conditions on each scheduled run, up to N minutes of latency) vs. event-driven (hook fires in the same transaction as the state transition, zero latency). These are not equivalent: event-driven semantics for `retry-on-failure` mean the retry is queued atomically when the failure is written; polling semantics mean the retry is queued up to N minutes later, during which the UoW appears failed. This decision must be made before Phase 2 hook implementation begins. Until resolved, the `condition` trigger type in the schema should be treated as a reserved field. Additionally, the storage model for hooks is not yet unified: `hooks.yaml` applies hooks to all matching UoWs, while the `trigger` field in the UoW record applies to that specific UoW. These are different storage patterns for what may be the same evaluation concept; Phase 2 must resolve which pattern is canonical or whether both are maintained for different use cases.
 
 **Phase 2 implementation:** The Trigger evaluator is a lightweight component of the sweeper or a separate scheduled process. On each run, it checks all sleeping UoWs (`status IN (proposed, pending)` with a `trigger` field) and fires any whose conditions are met. Fired triggers transition the UoW to the next status (typically `active`) and write an audit entry.
 
@@ -398,7 +442,7 @@ The sweeper is not a general orchestration component — it is one specific agen
 **Deduplication requirement:** Before creating a UoW for any GitHub issue, the sweeper checks the Registry for existing records with `source=github:issue/N` and `status NOT IN (done, failed, expired)`. If found, the sweep logs a skip entry in its output (e.g., "Issue #142: UoW uow_20260326_abc123 already exists in proposed status — skipping") and no new record is created. This prevents daily duplicate UoWs for issues that remain in `proposed` state across sweep runs.
 <!-- End added: audit synthesis 2026-03-26 -->
 
-**Consumption gate for Phase 1:** The sweeper output is delivered; Dan acts on it. Healthy state: ready queue in sweep output contains ≤5 items per run, and items from prior sweeps appear as closed or in-progress within 5 days. Degradation state: sweep outputs accumulate unread or ready queue grows run-over-run without drain. If the output isn't being consumed, the sweeper is producing noise.
+**Consumption gate for Phase 1:** The sweeper output is delivered; Dan acts on it. Healthy state: ready queue in sweep output contains ≤5 items per run, and items from prior sweeps appear as closed or in-progress within 5 days. The sweep output explicitly labels unconfirmed `proposed` items with "awaiting /confirm" distinct from confirmed-but-pending items, so the `proposed`/`pending` distinction is salient at a glance without requiring a separate Registry query. The sweep output also flags any `proposed` records approaching the 14-day expiry window (≥12 days old) with an "expiring soon — confirm or this proposal will expire in N days" notice. Degradation state: sweep outputs accumulate unread, ready queue grows run-over-run without drain, or `proposed` records accumulate in the Registry while sweep outputs show ≤5 items (the consumption gate must monitor the Registry `proposed` count directly, not only the current sweep file).
 
 ---
 
@@ -426,23 +470,31 @@ The sweeper enforces typing via labels. The ready queue contains only executable
 - UoW Registry: SQLite at `~/lobster-workspace/orchestration/registry.db`
 - Audit log: `audit_log` table within the same SQLite database (also exported to `audit.jsonl` for external inspection)
 - Sweeper creates UoW records for identified items (no autonomy yet — records reflect proposals, `status=proposed` until Dan confirms)
-- Confirmed records transition to `status=pending`; `proposed` records older than 14 days transition to `status=expired` via a lightweight cron
+- Confirmed records transition to `status=pending`; `proposed` records older than 14 days transition to `status=expired` — the sweeper calls `uv run registry_cli.py expire-proposals` on each nightly pass (no separate cron job required)
 - No classifier — all postures default to `solo`, `route_reason = "phase1-default"`
 - No hooks — sweeper proposes, Dan confirms
 <!-- Added: audit synthesis 2026-03-26 -->
 - Registry write path: `registry_cli.py` CLI with `BEGIN IMMEDIATE` SQLite transactions and audit-in-transaction protocol
 - `~/lobster-workspace/orchestration/` directory initialized via `upgrade.sh` migration
-- Confirmation interface: dispatcher recognizes `/confirm <uow-id>` Telegram command, calls `uv run registry_cli.py confirm --id <uow-id>`, and replies with the updated UoW status. This is the explicit gate from `proposed` to `pending`.
+- Confirmation interface: dispatcher recognizes `/confirm <uow-id>` Telegram command, calls `uv run registry_cli.py confirm --id <uow-id>`, and replies with the updated UoW status. This is the explicit gate from `proposed` to `pending`. **Phase 1 uses manual `/confirm <uow-id>` for UoW confirmation. Auto-confirm-with-rejection is a named gate crossing to Phase 3+, not a Phase 1 option.** The cost asymmetry is intentional: a missed confirmation (item stays `proposed`, pipeline pauses) is recoverable at low cost; a missed rejection (item advances to `pending` unreviewed) is not, especially as Phase 2 adds autonomy.
+  - Implementation note — `/confirm` error handling: (a) UoW not found → reply "UoW `<id>` not found. Run `/wos status proposed` to see current proposals."; (b) already in non-proposed state → reply "UoW `<id>` is already `<status>` — no action taken."; (c) expired → reply "UoW `<id>` has expired. Wait for the next sweep to re-propose, or run a manual sweep."; (d) success → reply "UoW `<id>` confirmed. Status: `proposed → pending`."; (e) duplicate send → same as (b); idempotent.
+- Status query interface: dispatcher recognizes `/wos status` command, calls `uv run registry_cli.py list --status active` (and optionally `--status pending`), and formats the result as a Telegram message with one line per UoW: `<id> | <summary> | source: <source> | created: <date>`. Natural language recognition of "what's running?" queries is Phase 2 work — Phase 1 scope is the `/wos status` command only.
 - Stale-active check: sweeper calls `uv run registry_cli.py check-stale` on each run; results included in sweep output report
+- Sweeper calls `uv run registry_cli.py expire-proposals` on each run; expired records are logged in the sweep output
 <!-- End added: audit synthesis 2026-03-26 -->
+<!-- Added: R2 synthesis 2026-03-26 -->
+- **Phase 2 note — `/confirm` vs. human-gate approvals:** `/confirm <uow-id>` is the sweeper-proposal gate (`proposed → pending`). It must not be reused as the signal for mid-execution human-gate UoWs in Phase 2, because the two interactions have different audit semantics (a sweeper confirmation and a mid-execution approve/reject/defer look identical in the audit log). Phase 2 should introduce a distinct command for human-gate mid-execution responses, e.g. `/decide <uow-id> approve|reject|defer [notes]`.
+- **Phase 2 note — trigger evaluator idempotency:** The trigger evaluator must check `WHERE status = 'pending'` atomically inside the `BEGIN IMMEDIATE` transaction before transitioning a UoW to `active`. This prevents double-activation if two evaluator instances overlap (e.g., slow evaluator run + new cron fire). The transition must be a no-op if the record is already `active`.
+<!-- End added: R2 synthesis 2026-03-26 -->
 
 **Phase 1 is done when:**
 - The sweeper runs on its nightly schedule without errors
 - `registry.db` contains at least one UoW record created by the sweeper
 - The `audit_log` table contains the corresponding creation event
-- Dan can ask "what's running?" and get an answer from a single Registry query
+- Dan can send `/wos status` and get an answer from a single Registry query (no GitHub fallback)
 - The ready queue in the sweep output is ordered and actionable (not just a dump of all open issues)
 - Dan has used `/confirm <uow-id>` at least once and the record transitioned from `proposed` to `pending`
+- The sweeper's output explicitly distinguishes "awaiting /confirm" (`proposed`) items from "confirmed, awaiting execution" (`pending`) items
 
 **Phase 1 → Phase 2 autonomy gate (computable):**
 Phase 2 prerequisites are met when ALL of the following are true:
