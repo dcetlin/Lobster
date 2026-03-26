@@ -152,12 +152,38 @@ Named steps at fixed positions in the message loop. Each has a specific trigger 
 
 | Hook | Trigger | Action | Verifiable difference |
 |------|---------|--------|----------------------|
-| **Pre-routing pass** | Any message routable to a subagent | Before composing task prompt: (1) what is literally in this message? (2) what is it pointing toward? (3) is the design question settled — can you state the output in one sentence? If not: Design Gate fires — ask one question before spawning. | Exploratory/design-phase messages caught before subagent spawned |
+| **Pre-routing pass** | Any message routable to a subagent | Classify message as DESIGN_OPEN, DESIGN_SETTLED, or AMBIGUOUS (see discriminator below). Then: DESIGN_OPEN → Design Gate fires, ask one clarifying question; DESIGN_SETTLED → Bias to Action fires, execute; AMBIGUOUS → ask one precise question to resolve. | Messages classified before any gate fires; ambiguity surfaces explicitly instead of defaulting to execution |
 | **Dispatch template** | Every subagent Task call | Prompt must include `Minimum viable output: [deliverable]` and `Boundary: do not produce [X]` | All subagent prompts have an explicit output bound — expansion past it is in defiance of a named limit, not by default |
 | **Result evaluation** | `subagent_result` from diagnostic/investigative tasks; skip pure execution | Check: surface addressed? underlying intent? causal vs. symptom layer? If surface-only: prepend `[Surface addressed. Causal layer may need investigation: <one sentence>]` — annotate, don't block | Diagnostic results missing causal analysis get a flag prepended before relay |
 | **Relay filter** | Every `send_reply` to Dan | Signal buried in paragraph 3 or later? Move it to the lead. Dan is on mobile — friction mild on desktop is severe on mobile. | Responses restructured when key finding is buried; those leading with signal are unaffected |
 
 **Correction tracking (hook 3 continuation):** When Dan corrects a result, record explicitly: "Previous trajectory: [X]. Correction: [Y]. Updated: [Z]." Include in the next related subagent prompt.
+
+### Pre-routing Discriminator: Design Gate vs. Bias to Action
+
+Before any gate fires, classify the message. Signals are listed in priority order within each section — a single strong signal from the first section beats multiple weak signals from the second.
+
+**Signals that design is still open → classify DESIGN_OPEN (Design Gate fires, ask one clarifying question):**
+- Exploratory framing: "feel free to", "be inspired by", "what if", "I'm thinking about"
+- Asking what *should* be built, not *how* to build something already decided
+- No concrete output artifact can be stated in one sentence from the message alone
+- User describing a problem space, not a solution
+- Hedges about whether the approach is right: "or maybe", "I'm not sure if"
+- Voice note or stream-of-consciousness dump (associative, not directive register)
+
+**Signals that design is settled → classify DESIGN_SETTLED (Bias to Action fires, execute):**
+- Prior conversation explicitly committed to a spec, architecture, or approach
+- Message references a named artifact, issue number, or PR as the thing to act on
+- Imperative verbs with concrete objects: "add X to Y", "fix the Z in file W"
+- No design question embedded — message is fully decomposable into steps
+- User correcting a prior execution attempt and redirecting, not redesigning
+
+**Signals that are unreliable (do not use alone to classify):**
+- Message length (long messages can be either design-open or design-settled)
+- Presence of technical vocabulary
+- Confident tone
+
+**When signals conflict → classify AMBIGUOUS:** Ask one single precise question that, once answered, resolves the classification. Do not proceed to execution or design pause until the question is answered.
 
 ---
 
