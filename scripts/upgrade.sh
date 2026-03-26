@@ -2046,6 +2046,89 @@ PROPOSALS_DIGEST_TASK
         fi
     fi
 
+    # Migration 46: Register auto-router scheduled job (nightly gate judgment for reflective-surface-queue)
+    # Reads meta/reflective-surface-queue.json, applies gate judgment (implementation vs design-open)
+    # to each unrouted item, writes subagent_result inbox messages, and marks items with routed_at.
+    # Runs at 03:00 UTC — before decay-detector (04:00) and delivery (08:00).
+    local auto_router_task="$WORKSPACE_DIR/scheduled-jobs/tasks/auto-router.md"
+    if [ ! -f "$auto_router_task" ]; then
+        mkdir -p "$WORKSPACE_DIR/scheduled-jobs/tasks"
+        cat > "$auto_router_task" << 'AUTO_ROUTER_TASK'
+# Reflective Surface Queue Auto-Router
+
+**Job**: auto-router
+**Schedule**: Nightly at 3:00 AM UTC (`0 3 * * *`)
+
+## Context
+
+You are running as a scheduled task. The reflective-surface-queue accumulates
+observations from premise-review, hygiene-review, and other agents. This job
+applies a gate judgment to each unrouted item:
+
+- **implementation-ready**: item describes a concrete, scoped change → dispatches
+  a functional-engineer via subagent_result inbox message
+- **design-open**: item has unresolved premises or requires directional input →
+  surfaces to Dan via subagent_result inbox message asking for go/nogo
+
+Gate criterion: can you state in one concrete sentence what the output should be?
+If yes → implementation-ready. If no → design-open.
+
+## Instructions
+
+Run the auto-router script:
+
+```bash
+uv run ~/lobster/scheduled-tasks/auto-router.py
+```
+
+The script:
+- Reads the reflective-surface-queue.json (hygiene/meta or meta location)
+- Applies gate judgment to each unrouted item
+- Writes subagent_result inbox messages for the dispatcher to route
+- Marks each item with routed_at and route_decision
+- Writes a summary to task output
+
+No further action is needed after running the script.
+
+If the script fails (non-zero exit), include the error output in write_task_output
+with status="failed".
+
+## Output
+
+When you complete your task, call `write_task_output` with:
+- job_name: "auto-router"
+- output: The script's stdout/stderr output (or summary if clean)
+- status: "success" or "failed"
+
+Keep output concise. The main Lobster instance will review this later.
+AUTO_ROUTER_TASK
+        substep "Created auto-router task file in scheduled-jobs/tasks/"
+        migrated=$((migrated + 1))
+    fi
+    if [ -f "$JOBS_FILE" ] && command -v jq >/dev/null 2>&1; then
+        if ! jq -e '.jobs["auto-router"]' "$JOBS_FILE" > /dev/null 2>&1; then
+            local now_iso
+            now_iso=$(date -u +"%Y-%m-%dT%H:%M:%S.%6N+00:00")
+            TMP_JOBS=$(mktemp)
+            jq --arg now "$now_iso" '.jobs["auto-router"] = {
+                "name": "auto-router",
+                "schedule": "0 3 * * *",
+                "schedule_human": "Nightly at 3:00 UTC",
+                "task_file": "tasks/auto-router.md",
+                "created_at": $now,
+                "updated_at": $now,
+                "enabled": true
+            }' "$JOBS_FILE" > "$TMP_JOBS" && mv "$TMP_JOBS" "$JOBS_FILE"
+            substep "Registered auto-router job in jobs.json (nightly at 03:00 UTC)"
+            # Sync crontab so the new cron entry is installed immediately
+            if [ -x "$LOBSTER_DIR/scheduled-tasks/sync-crontab.sh" ]; then
+                bash "$LOBSTER_DIR/scheduled-tasks/sync-crontab.sh" 2>/dev/null || true
+                substep "Crontab synchronized (auto-router added)"
+            fi
+            migrated=$((migrated + 1))
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
