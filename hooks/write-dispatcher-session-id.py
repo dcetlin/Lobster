@@ -34,16 +34,6 @@ misclassify a restart as a subagent, the reconciler's dispatcher-type skip
 guard (added in the same issue) will still prevent agent_failed from being
 emitted for any session tagged 'dispatcher'.
 
-
-## Dispatcher DB registration (issue #781)
-
-When the hook determines the current session IS the dispatcher, it also writes
-a row to agent_sessions.db with agent_type='dispatcher'. This row is permanent
-insurance: even if a future crash causes _is_dispatcher_session() to
-misclassify a restart as a subagent, the reconciler's dispatcher-type skip
-guard (added in the same issue) will still prevent agent_failed from being
-emitted for any session tagged 'dispatcher'.
-
 ## Stale marker recovery
 
 If the dispatcher crashes or is killed without a clean `lobster stop`, the
@@ -137,7 +127,6 @@ def _is_dispatcher_session(session_id: str) -> bool:
 
 def _register_dispatcher_session(session_id: str) -> None:
     """Write a 'running' row to agent_sessions.db tagged as agent_type='dispatcher'.
-
 
     The reconciler skips sessions with agent_type='dispatcher', so this row
     prevents any future ghost-session cascade even if the marker-file check
