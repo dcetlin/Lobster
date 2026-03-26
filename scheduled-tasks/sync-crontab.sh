@@ -7,7 +7,7 @@ set -e
 WORKSPACE="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}"
 REPO_DIR="${LOBSTER_INSTALL_DIR:-$HOME/lobster}"
 JOBS_FILE="$WORKSPACE/scheduled-jobs/jobs.json"
-RUNNER="$REPO_DIR/scheduled-tasks/run-job.sh"
+RUNNER="$REPO_DIR/scheduled-tasks/post-job-trigger.sh"
 
 # Check if crontab is available
 if ! command -v crontab &> /dev/null; then
@@ -26,7 +26,8 @@ fi
 MARKER="# LOBSTER-SCHEDULED"
 
 # Get existing crontab entries (excluding lobster ones)
-EXISTING=$(crontab -l 2>/dev/null | grep -v "$MARKER" | grep -v "$RUNNER" || true)
+OLD_RUNNER="$REPO_DIR/scheduled-tasks/run-job.sh"
+EXISTING=$(crontab -l 2>/dev/null | grep -v "$MARKER" | grep -v "$RUNNER" | grep -v "$OLD_RUNNER" || true)
 
 # Generate new crontab entries from jobs.json
 if command -v jq &> /dev/null; then

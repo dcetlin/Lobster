@@ -1725,6 +1725,20 @@ DAILY_METRICS_TASK
         fi
     fi
 
+
+    # Migration 38: Update existing crontab entries to call post-job-trigger.sh instead of run-job.sh
+    # Phase 2 of issue #138: cron now writes a trigger message to the dispatcher inbox
+    # instead of spawning claude -p directly. This avoids competing MCP stdio connections.
+    # The old run-job.sh entries must be replaced with post-job-trigger.sh entries.
+    local OLD_RUNNER="$LOBSTER_DIR/scheduled-tasks/run-job.sh"
+    local NEW_RUNNER="$LOBSTER_DIR/scheduled-tasks/post-job-trigger.sh"
+    if crontab -l 2>/dev/null | grep -q "$OLD_RUNNER"; then
+        chmod +x "$NEW_RUNNER" 2>/dev/null || true
+        { crontab -l 2>/dev/null | sed "s|$OLD_RUNNER|$NEW_RUNNER|g" || true; } | crontab -
+        substep "Updated crontab entries: run-job.sh → post-job-trigger.sh (issue #138 Phase 2)"
+        migrated=$((migrated + 1))
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

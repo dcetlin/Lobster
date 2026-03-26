@@ -383,6 +383,72 @@ REMINDER_ROUTING = {
 - Do not ack these — they are background system tasks, not user requests
 - When in doubt about a new job name, add it to REMINDER_ROUTING as `None` (fast-exit)
 
+## Handling Scheduled Job Triggers (`scheduled_job_trigger`)
+
+Cron calls `post-job-trigger.sh <job-name>` instead of running `claude -p` directly.
+That script drops a JSON file in `~/messages/inbox/` with `type: "scheduled_job_trigger"`.
+The dispatcher picks it up here and spawns a background subagent to run the job.
+
+**Message shape:**
+```json
+{
+  "type": "scheduled_job_trigger",
+  "job_name": "daily-metrics",
+  "timestamp": "2026-01-01T07:00:00+00:00",
+  "source": "cron",
+  "chat_id": 8075091586
+}
+```
+
+**When `wait_for_messages` returns a message with `type: "scheduled_job_trigger"`:**
+
+```
+1. mark_processing(message_id)
+
+2. job_name = msg["job_name"]
+   chat_id  = msg.get("chat_id") or ADMIN_CHAT_ID
+
+3. task_file = f"~/lobster-workspace/scheduled-jobs/tasks/{job_name}.md"
+   # Do NOT read the file inline — delegate to the subagent. The subagent
+   # receives the path and reads it as its first action.
+
+4. task_id = f"scheduled-job-{job_name}"
+
+5. Spawn subagent (run_in_background=True):
+   subagent_type: "lobster-generalist"
+   prompt:
+     ---
+     task_id: scheduled-job-{job_name}
+     chat_id: {chat_id}
+     source: telegram
+     ---
+
+     You are running as a scheduled job. Your task definition is in:
+       ~/lobster-workspace/scheduled-jobs/tasks/{job_name}.md
+
+     Steps:
+     1. Read that file to get the full job instructions.
+     2. Execute the job as instructed.
+     3. When done, call send_reply(chat_id={chat_id}, text=<your digest>, source="telegram")
+        to deliver results to the user.
+     4. Call write_result(task_id="scheduled-job-{job_name}", chat_id={chat_id},
+        text=<same text>, source="telegram", sent_reply_to_user=True) to signal completion.
+
+     Both calls are required. send_reply delivers immediately; write_result(sent_reply_to_user=True)
+     tells the dispatcher the job is done without double-sending.
+
+6. mark_processed(message_id)
+   # THE VERY NEXT ACTION MUST BE wait_for_messages()
+```
+
+**Rules:**
+- Do NOT read the task file on the main thread — that is a file I/O violation of the 7-second rule.
+- Do NOT send an ack to the user — this is a background system event, not a user request.
+- The subagent delivers results via `send_reply` + `write_result` (same contract as the old `run-job.sh`).
+- If the task file is missing, the subagent will fail; its `write_result` will arrive as `subagent_error` and be relayed to the user as an error.
+
+---
+
 ## Handling Subagent Results (`subagent_result` / `subagent_error`)
 
 Background subagents call `write_result(task_id, chat_id, text, ...)`, which drops a message of type `subagent_result` (or `subagent_error`) into the inbox. The main thread picks it up.
