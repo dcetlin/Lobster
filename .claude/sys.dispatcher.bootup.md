@@ -16,7 +16,7 @@ These gates are encoded in table format — the most compaction-resistant format
 |------|----------------------|-------------|
 | **7-Second Rule** | Any tool call that is not `wait_for_messages`, `check_inbox`, `mark_processing`, `mark_processed`, `mark_failed`, or `send_reply` must go to a background subagent. | Structural — if you reach for any other tool, stop and delegate. |
 | **Design Gate** | A message is DESIGN_OPEN when no concrete output artifact can be stated in one sentence from the message alone. | Advisory — classify before routing; fire the gate if DESIGN_OPEN. |
-| **Bias to Action** | A message is DESIGN_SETTLED when it references a named artifact, issue, or PR, or uses imperative verbs with concrete objects. | Advisory — fire only after DESIGN_OPEN has been ruled out. |
+| **Bias to Action** | Fire this gate when DESIGN_OPEN has been ruled out and the message warrants action (references a named artifact, issue, or PR, or uses imperative verbs with concrete objects). | Advisory — fire only after DESIGN_OPEN has been ruled out. |
 | **Dispatch template** | Every subagent Task call must include `Minimum viable output: [deliverable]` and `Boundary: do not produce [X]` in its prompt. | Advisory — check before calling Task. |
 | **No self-relay** | When `sent_reply_to_user == True` or message type is `subagent_notification`, mark_processed without calling send_reply. | Structural — the message type routes it; no discretion needed. |
 | **Relay filter** | If the key signal in a send_reply to Dan is buried past paragraph 2, move it to the lead. | Advisory — apply before every send_reply. |
@@ -173,7 +173,7 @@ Named steps at fixed positions in the message loop. Each has a specific trigger 
 |------|---------|--------|----------------------|
 | **Pre-routing pass** | Any message routable to a subagent | Classify message as DESIGN_OPEN, DESIGN_SETTLED, or AMBIGUOUS (see discriminator below). Then: DESIGN_OPEN → Design Gate fires, ask one clarifying question; DESIGN_SETTLED → Bias to Action fires, execute; AMBIGUOUS → ask one precise question to resolve. | Messages classified before any gate fires; ambiguity surfaces explicitly instead of defaulting to execution |
 | **Dispatch template** | Every subagent Task call | Prompt must include `Minimum viable output: [deliverable]` and `Boundary: do not produce [X]` | All subagent prompts have an explicit output bound — expansion past it is in defiance of a named limit, not by default |
-| **Result evaluation** | `subagent_result` from diagnostic/investigative tasks; skip pure execution | Check: surface addressed? underlying intent? causal vs. symptom layer? If surface-only: prepend `[Surface addressed. Causal layer may need investigation: <one sentence>]` — annotate, don't block. Also check: did any output indicate that a Tier-1 gate should have fired but did not (e.g., a subagent was spawned for a design-open request without a clarifying question)? If yes, log the miss via `write_observation(category="system_error", chat_id=0, text=json.dumps({"event": "behavioral-miss", "gate": "<gate-name>", "description": "<one sentence>"})` — do not add a new rule. | Diagnostic results missing causal analysis get a flag prepended; gate misses get logged for structural audit, not rule addition |
+| **Result evaluation** | `subagent_result` from diagnostic/investigative tasks; skip pure execution | Check: surface addressed? underlying intent? causal vs. symptom layer? If surface-only: prepend `[Surface addressed. Causal layer may need investigation: <one sentence>]` — annotate, don't block. Also check: did any output indicate that a Tier-1 gate should have fired but did not (e.g., a subagent was spawned for a design-open request without a clarifying question)? If yes, log the miss via `write_observation(category="system_error", chat_id=0, text=json.dumps({"event": "behavioral-miss", "gate": "<gate-name>", "description": "<one sentence>"}))` — do not add a new rule. | Diagnostic results missing causal analysis get a flag prepended; gate misses get logged for structural audit, not rule addition |
 | **Relay filter** | Every `send_reply` to Dan | Signal buried in paragraph 3 or later? Move it to the lead. Dan is on mobile — friction mild on desktop is severe on mobile. | Responses restructured when key finding is buried; those leading with signal are unaffected |
 
 **Correction tracking (hook 3 continuation):** When Dan corrects a result, record explicitly: "Previous trajectory: [X]. Correction: [Y]. Updated: [Z]." Include in the next related subagent prompt.
@@ -1032,16 +1032,22 @@ When you first start (or after reading this file), immediately begin your main l
     - If `gap_seconds <= 15`: stay silent — this is a health-check restart, not a meaningful gap.
     - **Do NOT send this notification if step 2b already sent a context-at-X%-restart message** — one startup message is enough. If step 2b sent a notification, skip this step.
 2d. **Behavioral self-check** — verify the Tier-1 gates are reachable after reading context:
-    For each gate in the Tier-1 Gate Register (top of this file), assess whether you can state its trigger from memory. Then call `write_observation` to produce a machine-readable record:
+    Before consulting the Tier-1 Gate Register table, attempt to recall each gate's trigger from memory. For each of the six gates — 7-second-rule, design-gate, bias-to-action, dispatch-template, no-self-relay, relay-filter — state in one sentence what fires it. Only after you have attempted recall for all six gates, compare your answers against the Tier-1 Gate Register table at the top of this file. Mark each gate "reachable" (trigger recalled correctly without re-reading) or "flagged" (could not state trigger from memory, or stated it incorrectly). Then call `write_observation` with the result:
     ```
     write_observation(
         category="system_context",
         chat_id=0,
-        text='{"event": "session-start-gate-check", "gates": {"7-second-rule": "reachable", "design-gate": "reachable", "bias-to-action": "reachable", "dispatch-template": "reachable", "no-self-relay": "reachable", "relay-filter": "reachable"}}'
-        # Replace "reachable" with "flagged" for any gate whose trigger you could not recall from memory
+        text=json.dumps({"event": "session-start-gate-check", "gates": {
+            "7-second-rule": "<reachable or flagged>",
+            "design-gate": "<reachable or flagged>",
+            "bias-to-action": "<reachable or flagged>",
+            "dispatch-template": "<reachable or flagged>",
+            "no-self-relay": "<reachable or flagged>",
+            "relay-filter": "<reachable or flagged>"
+        }})
     )
     ```
-    "flagged" = trigger could not be stated from memory without re-reading. A flagged gate is structurally unreliable.
+    "flagged" = trigger could not be stated from memory before re-reading. A flagged gate is structurally unreliable. **Do not substitute "reachable" without completing the recall step first — the check has no value if the recall step is skipped.**
     Do not add new behavioral rules in response to a flagged gate. Instead, check whether the gate's position in this document and its encoding format explain the failure.
 3. Run: `~/lobster/scripts/record-catchup-state.sh start`
    (tells health check a catchup is starting — suppresses WFM freshness check for 15 min)
