@@ -1899,6 +1899,153 @@ SURFACE_QUEUE_TASK
         fi
     fi
 
+    # Migration 44: Register lobster-meta scheduled job (issue #141)
+    # Runs the lobster-meta drift-detection agent nightly. Reads phase-alignment
+    # signals, surfaces anomalies against vision.md, appends entries to
+    # meta/proposals.md, and queues items to reflective-surface-queue.json.
+    # Runs at 01:00 UTC — before proposals-digest (03:00) so proposals are
+    # written before the consumer reads them.
+    local lobster_meta_task="$WORKSPACE_DIR/scheduled-jobs/tasks/lobster-meta.md"
+    if [ ! -f "$lobster_meta_task" ]; then
+        mkdir -p "$WORKSPACE_DIR/scheduled-jobs/tasks"
+        cat > "$lobster_meta_task" << 'LOBSTER_META_TASK'
+# Lobster Meta — Nightly Drift Detection
+
+**Job**: lobster-meta
+**Schedule**: Daily at 1:00 AM UTC (`0 1 * * *`)
+**GitHub issue**: https://github.com/dcetlin/Lobster/issues/141
+
+## Context
+
+You are running as a scheduled task. The main Lobster instance created this job.
+
+## Instructions
+
+You are running as the lobster-meta drift-detection agent.
+
+**Start here:** Read `~/lobster/.claude/agents/lobster-meta.md` in full. That file
+contains your complete operating instructions including epistemic posture, processing
+sequence, and output format. Do not proceed until you have read it.
+
+Follow all steps in that file exactly:
+1. Read phase-alignment signals
+2. Find what doesn't fit (anomalies, silences, contradictions)
+3. Check premise-review.md
+4. Append findings to ~/lobster-workspace/meta/proposals.md
+5. Queue reflective surfaces to ~/lobster-workspace/meta/reflective-surface-queue.json
+6. Archive processed signals
+7. Exit
+
+## Output
+
+When you complete your task, call `write_task_output` with:
+- job_name: "lobster-meta"
+- output: One-line summary: signals processed, anomalies found, surfaces queued.
+- status: "success" or "failed"
+
+Keep output concise. The main Lobster instance will review this later.
+LOBSTER_META_TASK
+        substep "Created lobster-meta task file in scheduled-jobs/tasks/"
+        migrated=$((migrated + 1))
+    fi
+    if [ -f "$JOBS_FILE" ] && command -v jq >/dev/null 2>&1; then
+        if ! jq -e '.jobs["lobster-meta"]' "$JOBS_FILE" > /dev/null 2>&1; then
+            local now_iso
+            now_iso=$(date -u +"%Y-%m-%dT%H:%M:%S.%6N+00:00")
+            TMP_JOBS=$(mktemp)
+            jq --arg now "$now_iso" '.jobs["lobster-meta"] = {
+                "name": "lobster-meta",
+                "schedule": "0 1 * * *",
+                "schedule_human": "Daily at 1:00",
+                "task_file": "tasks/lobster-meta.md",
+                "created_at": $now,
+                "updated_at": $now,
+                "enabled": true
+            }' "$JOBS_FILE" > "$TMP_JOBS" && mv "$TMP_JOBS" "$JOBS_FILE"
+            substep "Registered lobster-meta job in jobs.json (daily at 01:00 UTC)"
+            if [ -x "$LOBSTER_DIR/scheduled-tasks/sync-crontab.sh" ]; then
+                bash "$LOBSTER_DIR/scheduled-tasks/sync-crontab.sh" 2>/dev/null || true
+                substep "Crontab synchronized (lobster-meta added)"
+            fi
+            migrated=$((migrated + 1))
+        fi
+    fi
+
+    # Migration 45: Register proposals-digest scheduled job (issue #141)
+    # Reads meta/proposals.md, finds undelivered entries, delivers them to Dan
+    # via the Lobster inbox (up to 2 per run), and marks them as delivered by
+    # inserting a <!-- proposals-digest-delivered: YYYY-MM-DD --> marker.
+    # Runs at 03:00 UTC — after lobster-meta (01:00) so fresh proposals are
+    # included in the same morning's digest.
+    local proposals_digest_task="$WORKSPACE_DIR/scheduled-jobs/tasks/proposals-digest.md"
+    if [ ! -f "$proposals_digest_task" ]; then
+        mkdir -p "$WORKSPACE_DIR/scheduled-jobs/tasks"
+        cat > "$proposals_digest_task" << 'PROPOSALS_DIGEST_TASK'
+# Proposals Digest
+
+**Job**: proposals-digest
+**Schedule**: Daily at 3:00 AM UTC (`0 3 * * *`)
+**GitHub issue**: https://github.com/dcetlin/Lobster/issues/141
+
+## Context
+
+You are running as a scheduled task. The main Lobster instance created this job.
+
+## Instructions
+
+Run the proposals digest script:
+
+```bash
+uv run ~/lobster/scheduled-tasks/proposals-digest.py
+```
+
+The script:
+- Reads `~/lobster-workspace/meta/proposals.md`
+- Finds entries that have not yet been delivered (no delivered marker)
+- Delivers up to 2 entries to Dan via the Lobster inbox (Telegram)
+- Marks delivered entries with `<!-- proposals-digest-delivered: YYYY-MM-DD -->` so
+  they are not re-sent on subsequent runs
+
+No further action is needed after running the script.
+
+If the script fails (non-zero exit), include the error output in write_task_output
+with status="failed".
+
+## Output
+
+When you complete your task, call `write_task_output` with:
+- job_name: "proposals-digest"
+- output: The script's stdout output (or summary if clean)
+- status: "success" or "failed"
+
+Keep output concise. The main Lobster instance will review this later.
+PROPOSALS_DIGEST_TASK
+        substep "Created proposals-digest task file in scheduled-jobs/tasks/"
+        migrated=$((migrated + 1))
+    fi
+    if [ -f "$JOBS_FILE" ] && command -v jq >/dev/null 2>&1; then
+        if ! jq -e '.jobs["proposals-digest"]' "$JOBS_FILE" > /dev/null 2>&1; then
+            local now_iso
+            now_iso=$(date -u +"%Y-%m-%dT%H:%M:%S.%6N+00:00")
+            TMP_JOBS=$(mktemp)
+            jq --arg now "$now_iso" '.jobs["proposals-digest"] = {
+                "name": "proposals-digest",
+                "schedule": "0 3 * * *",
+                "schedule_human": "Daily at 3:00",
+                "task_file": "tasks/proposals-digest.md",
+                "created_at": $now,
+                "updated_at": $now,
+                "enabled": true
+            }' "$JOBS_FILE" > "$TMP_JOBS" && mv "$TMP_JOBS" "$JOBS_FILE"
+            substep "Registered proposals-digest job in jobs.json (daily at 03:00 UTC)"
+            if [ -x "$LOBSTER_DIR/scheduled-tasks/sync-crontab.sh" ]; then
+                bash "$LOBSTER_DIR/scheduled-tasks/sync-crontab.sh" 2>/dev/null || true
+                substep "Crontab synchronized (proposals-digest added)"
+            fi
+            migrated=$((migrated + 1))
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
