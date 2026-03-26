@@ -22,6 +22,7 @@ Run standalone:
 import json
 import os
 import sys
+import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -234,7 +235,7 @@ def format_summary(delivered_count: int, archived_count: int, remaining_count: i
 
 
 # ---------------------------------------------------------------------------
-# Delivery via inbox routing
+# Inbox / task-output I/O helpers
 # ---------------------------------------------------------------------------
 
 def _inbox_dir() -> Path:
@@ -255,20 +256,21 @@ def _task_outputs_dir() -> Path:
 
 def write_inbox_message(chat_id: int, text: str, timestamp: str) -> None:
     """
-    Write a single scheduled_job_result message to the inbox.
+    Write a single subagent_result message to the inbox.
     The dispatcher picks it up and routes it via send_reply.
     Pure side-effect boundary: all I/O is isolated here.
     """
     inbox = _inbox_dir()
-    epoch_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    msg_id = f"{epoch_ms}_surface_queue_delivery"
+    msg_id = f"surface_queue_delivery_{uuid.uuid4().hex}"
     msg = {
         "id": msg_id,
-        "type": "scheduled_job_result",
-        "job_name": "surface-queue-delivery",
+        "type": "subagent_result",
+        "task_id": msg_id,
         "chat_id": chat_id,
         "source": "telegram",
         "text": text,
+        "status": "success",
+        "sent_reply_to_user": False,
         "timestamp": timestamp,
     }
     out_path = inbox / f"{msg_id}.json"
@@ -298,10 +300,14 @@ def write_task_output(output: str, status: str, timestamp: str) -> None:
     tmp_path.replace(out_path)
 
 
+# ---------------------------------------------------------------------------
+# Delivery via direct inbox writes
+# ---------------------------------------------------------------------------
+
 def deliver(messages: list[str], job_summary: str, delivered_count: int, archived_count: int) -> None:
     """
     Deliver messages to the Lobster inbox and write task output.
-    Each message is written as a scheduled_job_result inbox file; the dispatcher
+    Each message is written as a subagent_result inbox file; the dispatcher
     picks them up and routes them via send_reply. No Claude subprocess is spawned.
     Side effects are isolated to this function.
     """
