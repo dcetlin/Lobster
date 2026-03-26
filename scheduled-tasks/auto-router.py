@@ -21,6 +21,7 @@ Run standalone:
 """
 
 import json
+import logging
 import os
 import sys
 import uuid
@@ -250,6 +251,11 @@ def _resolve_queue_path() -> Path:
     if QUEUE_PATH.exists():
         return QUEUE_PATH
     if _OLD_QUEUE_PATH.exists():
+        logging.warning(
+            "Using legacy queue path %s — migrate to %s",
+            _OLD_QUEUE_PATH,
+            QUEUE_PATH,
+        )
         return _OLD_QUEUE_PATH
     # Return the canonical new path even if it doesn't exist yet — callers handle missing
     return QUEUE_PATH
@@ -279,6 +285,30 @@ def mark_routed(item: dict, decision: str, timestamp: str) -> dict:
     return {**item, "routed_at": timestamp, "route_decision": decision}
 
 
+def _routing_key(item: dict) -> str:
+    """
+    Return a stable, collision-resistant routing key for an item.
+
+    Prefers source_id (stable, human-readable). Falls back to a pre-assigned
+    _routing_key uuid if present (set by the pipeline for items that lack source_id).
+    This two-level fallback avoids the silent collision risk of timestamp+text truncation
+    while keeping the key deterministic within a single pipeline run.
+    """
+    return item.get("source_id") or item.get("_routing_key") or ""
+
+
+def assign_routing_keys(items: list[dict]) -> list[dict]:
+    """
+    For any item that lacks source_id, stamp a uuid4 _routing_key onto the dict
+    so that apply_routing can correlate across the routed_pairs and items lists.
+    Returns the same list (items are mutated in place — call before building routed_pairs).
+    """
+    for item in items:
+        if not item.get("source_id") and not item.get("_routing_key"):
+            item["_routing_key"] = uuid.uuid4().hex
+    return items
+
+
 def apply_routing(
     items: list[dict],
     routed: list[tuple[dict, str]],  # (original_item, decision)
@@ -286,17 +316,18 @@ def apply_routing(
 ) -> list[dict]:
     """
     Return a new items list with routed items updated.
-    Identifies items by source_id (falling back to queued_at+observation hash).
-    Pure: does not mutate input.
+    Identifies items by source_id, falling back to _routing_key (uuid) pre-assigned
+    by assign_routing_keys() for items without source_id.
     """
-    routed_map: dict[str, str] = {}
-    for item, decision in routed:
-        key = item.get("source_id") or f"{item.get('queued_at','')}:{item.get('observation','')[:40]}"
-        routed_map[key] = decision
+    routed_map: dict[str, str] = {
+        _routing_key(item): decision
+        for item, decision in routed
+        if _routing_key(item)
+    }
 
     def update(item: dict) -> dict:
-        key = item.get("source_id") or f"{item.get('queued_at','')}:{item.get('observation','')[:40]}"
-        if key in routed_map:
+        key = _routing_key(item)
+        if key and key in routed_map:
             return mark_routed(item, routed_map[key], timestamp)
         return item
 
@@ -335,7 +366,7 @@ def write_inbox_message(chat_id: int, text: str, timestamp: str) -> str:
         "type": "subagent_result",
         "task_id": msg_id,
         "chat_id": chat_id,
-        "source": "telegram",
+        "source": os.environ.get("LOBSTER_DEFAULT_SOURCE", "telegram"),
         "text": text,
         "status": "success",
         "sent_reply_to_user": False,
@@ -396,6 +427,10 @@ def run() -> int:
         print("  Nothing to route.")
         write_task_output("No unrouted items in the reflective surface queue.", "success", timestamp_iso)
         return 0
+
+    # Stamp routing keys on items that lack source_id before building routed_pairs,
+    # so apply_routing can correlate them without timestamp+text collision risk.
+    assign_routing_keys(unrouted)
 
     # Apply gate judgment to each unrouted item
     routed_pairs: list[tuple[dict, str]] = []
