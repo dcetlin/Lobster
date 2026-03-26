@@ -62,6 +62,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
+import struct
+
 from src.classifiers.checkpoint import max_event_id, save_checkpoint, should_run
 
 # ---------------------------------------------------------------------------
@@ -158,7 +160,43 @@ class PatternObservation:
 def open_db(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
+    # Load sqlite-vec so events_vec INSERT works in write_pattern_event().
+    conn.enable_load_extension(True)
+    try:
+        import sqlite_vec
+        sqlite_vec.load(conn)
+    except Exception as exc:
+        log.warning("sqlite_vec unavailable — pattern_observation embeddings will be skipped: %s", exc)
+    conn.enable_load_extension(False)
     return conn
+
+
+# ---------------------------------------------------------------------------
+# Embedding helpers (same model as VectorMemory — all-MiniLM-L6-v2)
+# ---------------------------------------------------------------------------
+
+_EMBEDDING_DIM = 384
+_embed_model = None
+
+
+def _get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        from fastembed import TextEmbedding
+        _embed_model = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
+    return _embed_model
+
+
+def _embed_content(text: str) -> bytes | None:
+    """Return a 384-dim float32 blob for *text*, or None if embedding is unavailable."""
+    try:
+        model = _get_embed_model()
+        vec = list(model.embed([text]))[0]
+        floats = vec.tolist() if hasattr(vec, "tolist") else list(vec)
+        return struct.pack(f"{len(floats)}f", *floats)
+    except Exception as exc:
+        log.warning("Embedding failed for pattern_observation content: %s", exc)
+        return None
 
 
 def ensure_classification_table(conn: sqlite3.Connection) -> None:
@@ -294,7 +332,7 @@ def write_tag(conn: sqlite3.Connection, tag: ClassificationTag) -> None:
 
 def write_pattern_event(conn: sqlite3.Connection, obs: PatternObservation) -> int:
     """
-    Write a pattern_observation event to the events table.
+    Write a pattern_observation event to the events table and events_vec.
     Returns the new event id.
     """
     metadata = json.dumps({
@@ -313,8 +351,21 @@ def write_pattern_event(conn: sqlite3.Connection, obs: PatternObservation) -> in
         INSERT INTO events (timestamp, type, source, content, metadata)
         VALUES (?, 'pattern_observation', ?, ?, ?)
     """, (obs.detected_at.isoformat(), obs.source, content, metadata))
+    event_id = cursor.lastrowid
+
+    # Store embedding so this event is reachable via vector search.
+    vec_blob = _embed_content(content)
+    if vec_blob is not None:
+        try:
+            conn.execute(
+                "INSERT INTO events_vec(rowid, embedding) VALUES (?, ?)",
+                (event_id, vec_blob),
+            )
+        except Exception as exc:
+            log.warning("Could not insert embedding for event %d: %s", event_id, exc)
+
     conn.commit()
-    return cursor.lastrowid
+    return event_id
 
 
 def write_run_log(
