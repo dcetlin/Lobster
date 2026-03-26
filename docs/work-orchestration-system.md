@@ -41,7 +41,7 @@ The sweeper starts in propose-only mode. Each increase in autonomy level (sweepe
 
 ### 3.1 UoW Registry
 
-**What it is:** A structured store (flat JSON in Phase 1, SQLite in Phase 2) holding one record per Unit of Work. It is the authoritative live state of all work: pending, active, blocked, done, failed.
+**What it is:** A structured store (SQLite from Phase 1) holding one record per Unit of Work. It is the authoritative live state of all work: pending, active, blocked, done, failed.
 
 **What it does:** Receives writes from all agents on state transitions. Answers dispatcher queries without requiring any other lookup. Maintains parent/child tree structure for fan-out UoWs.
 
@@ -94,14 +94,56 @@ The `proposed` / `pending` distinction is load-bearing: the Registry must not mi
 
 **Failure mode:** Registry drift — a UoW is `active` but no agent is alive for it and no recent audit entry exists. Detection: a sweep hook that checks for `active` records older than 2× the expected task duration and emits a stale-active warning. Without this sweep, orphaned active records accumulate and "what's running?" returns ghost entries.
 
-**Phase 1 implementation:** Flat JSON file at `~/lobster-workspace/orchestration/registry.json`. Written via `src/orchestration/registry_cli.py`, invocable by scheduled subagents via `uv run`. No direct file append — the CLI is the canonical write path for all agents. No database dependency. Read by dispatcher via file read + JSON parse. Phase 1 does not require query performance — the registry will be small.
+**Phase 1 implementation:** SQLite database at `~/lobster-workspace/orchestration/registry.db`. Written via `src/orchestration/registry_cli.py`, invocable by scheduled subagents via `uv run`. No direct database access — the CLI is the canonical write path for all agents. Read by dispatcher via CLI query commands or direct SQLite read.
 
 <!-- Added: audit synthesis 2026-03-26 -->
-**Write protocol (required — not optional):** Every Registry state change is a two-phase write: (1) append to `audit.jsonl` first; (2) update the Registry record. On startup or health check, if `audit.jsonl` contains entries with no corresponding Registry update, replay the updates. This enforces Principle 1 (no silent transitions) structurally rather than by convention. The `registry_cli.py` CLI enforces this protocol so no agent can bypass it.
+**Schema — SQLite table definition:**
+```sql
+CREATE TABLE uow_registry (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_issue_number INTEGER,
+    sweep_date TEXT,
+    status TEXT NOT NULL DEFAULT 'proposed',
+    posture TEXT NOT NULL DEFAULT 'solo',
+    agent TEXT,
+    children TEXT DEFAULT '[]',
+    parent TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    summary TEXT NOT NULL,
+    output_ref TEXT,
+    hooks_applied TEXT DEFAULT '[]',
+    route_reason TEXT,
+    route_evidence TEXT DEFAULT '{}',
+    trigger TEXT DEFAULT '{"type": "immediate"}',
+    UNIQUE(source_issue_number, sweep_date)
+);
+```
 
-**Concurrent write safety (required — not optional):** `registry_cli.py` uses `fcntl.flock` for advisory locking on all writes. Writes are atomic: write to `registry.json.tmp`, then `os.rename()` to `registry.json` (atomic on Linux). Before every write, copy `registry.json` to `registry.json.bak`. Recovery path for corruption: detect empty/unparseable file on startup, restore from `.bak`, alert Dan via Telegram.
+The `UNIQUE(source_issue_number, sweep_date)` constraint enforces deduplication at the database level. On conflict: `UPDATE SET status = excluded.status, updated_at = excluded.updated_at` — but only if the existing record is in `proposed` state. Records in `pending`, `active`, `blocked`, `done`, `failed`, or `expired` are never overwritten by a new sweep.
 
-**UoW deduplication (required — not optional):** Before creating a UoW for a GitHub issue, the Registry CLI checks for existing records with `source=github:issue/N` and `status NOT IN (done, failed, expired)`. If found, skip creation and log the skip. This prevents daily duplicate UoWs for issues that remain in `proposed` state between sweep runs.
+**Registry CLI interface (`src/orchestration/registry_cli.py`):**
+```
+uv run registry_cli.py upsert --issue <N> --title <T> --status proposed
+uv run registry_cli.py get --id <uow-id>
+uv run registry_cli.py list --status proposed
+uv run registry_cli.py confirm --id <uow-id>        # transitions proposed → pending
+uv run registry_cli.py check-stale                  # reports active UoWs whose source issue is closed
+```
+
+All operations use `BEGIN IMMEDIATE` SQLite transactions. Audit log entries are written in the same transaction as the status change. If either the audit write or the registry update fails, both roll back — this enforces Principle 1 structurally at the transaction boundary.
+
+**Write protocol (required — not optional):** Every Registry state change is executed inside a `BEGIN IMMEDIATE` transaction: (1) INSERT into `audit_log` table first; (2) INSERT or UPDATE the `uow_registry` record. If either step fails, the transaction rolls back and no partial state is written. On startup, if the database is absent or corrupt, `registry_cli.py` recreates the schema and alerts Dan via Telegram.
+
+**Concurrent write safety (required — not optional):** SQLite's `BEGIN IMMEDIATE` serializes writers. No additional file locking required. The `registry.db` file is never written to directly — all writes go through the CLI. WAL mode is enabled (`PRAGMA journal_mode=WAL`) for read/write concurrency.
+
+**UoW deduplication (required — not optional):** The `UNIQUE(source_issue_number, sweep_date)` constraint prevents duplicate UoWs at the database level. The `upsert` CLI command uses `INSERT OR IGNORE` for records not in `proposed` state and `INSERT OR REPLACE` only when the existing record is `proposed`. Before inserting, the CLI also checks for any existing record with the same `source_issue_number` and `status NOT IN (done, failed, expired)` — if found, it logs the skip in the audit entry and returns without writing.
+
+**Stale-active detection (required — Phase 1):** `uv run registry_cli.py check-stale` queries for UoWs in `active` status whose source GitHub issue is closed (verified via `gh issue view`). Output: list of UoW IDs with their source issue numbers. Run by the sweeper on each pass. Any stale-active UoWs are included in the sweep output report for Dan's review.
 
 **Directory initialization:** `~/lobster-workspace/orchestration/` is created by `scripts/upgrade.sh` migration step. The `registry_cli.py` also performs `mkdir -p` on startup to handle manual installs.
 <!-- End added: audit synthesis 2026-03-26 -->
@@ -381,29 +423,41 @@ The sweeper enforces typing via labels. The ready queue contains only executable
 **What gets built:**
 - Scheduled job: `issue-sweeper`, nightly at 3am
 - Operations: stale detection, ready-queue surfacing, Dan-blocked identification, Telegram escalation for high-priority stalled items
-- UoW Registry: flat JSON at `~/lobster-workspace/orchestration/registry.json`
-- Audit log: `~/lobster-workspace/orchestration/audit.jsonl`
+- UoW Registry: SQLite at `~/lobster-workspace/orchestration/registry.db`
+- Audit log: `audit_log` table within the same SQLite database (also exported to `audit.jsonl` for external inspection)
 - Sweeper creates UoW records for identified items (no autonomy yet — records reflect proposals, `status=proposed` until Dan confirms)
 - Confirmed records transition to `status=pending`; `proposed` records older than 14 days transition to `status=expired` via a lightweight cron
 - No classifier — all postures default to `solo`, `route_reason = "phase1-default"`
 - No hooks — sweeper proposes, Dan confirms
 <!-- Added: audit synthesis 2026-03-26 -->
-- Registry write path: `registry_cli.py` CLI with `fcntl.flock`, atomic writes, and write-ahead-log protocol
+- Registry write path: `registry_cli.py` CLI with `BEGIN IMMEDIATE` SQLite transactions and audit-in-transaction protocol
 - `~/lobster-workspace/orchestration/` directory initialized via `upgrade.sh` migration
+- Confirmation interface: dispatcher recognizes `/confirm <uow-id>` Telegram command, calls `uv run registry_cli.py confirm --id <uow-id>`, and replies with the updated UoW status. This is the explicit gate from `proposed` to `pending`.
+- Stale-active check: sweeper calls `uv run registry_cli.py check-stale` on each run; results included in sweep output report
 <!-- End added: audit synthesis 2026-03-26 -->
 
 **Phase 1 is done when:**
 - The sweeper runs on its nightly schedule without errors
-- `registry.json` contains at least one UoW record created by the sweeper
-- `audit.jsonl` contains the corresponding creation event
+- `registry.db` contains at least one UoW record created by the sweeper
+- The `audit_log` table contains the corresponding creation event
 - Dan can ask "what's running?" and get an answer from a single Registry query
 - The ready queue in the sweep output is ordered and actionable (not just a dump of all open issues)
+- Dan has used `/confirm <uow-id>` at least once and the record transitioned from `proposed` to `pending`
+
+**Phase 1 → Phase 2 autonomy gate (computable):**
+Phase 2 prerequisites are met when ALL of the following are true:
+1. Phase 1 has been running for ≥14 days
+2. Sweeper proposed-to-confirmed ratio ≥80% over the last 7 days (i.e., of UoWs the sweeper proposed, Dan confirmed ≥80%)
+
+Both conditions must be true simultaneously. The sweeper evaluates this metric on each run and writes a `gate_readiness` field to its output. When the gate condition is met, a human-gate UoW is surfaced to Dan with the explicit question: "Phase 2 prerequisites met — advance to autonomous label writes?"
 
 **Estimated scope:** One subagent session to write the task definition + sweeper agent context.
 
 ---
 
 ### Phase 2 — Routing classifier + conditional hooks + autonomous label writes
+
+**Phase 2 prerequisite (autonomy gate):** Phase 1 has run for ≥14 days AND sweeper proposed-to-confirmed ratio ≥80% over the last 7 days. Gate must be explicitly confirmed via human-gate UoW before Phase 2 work begins.
 
 **What gets built:**
 - Sweeper writes labels autonomously (after explicit gate crossing — see Principle 6)
@@ -525,8 +579,8 @@ These are load-bearing. Flag when evidence contradicts them.
 
 *Only genuine open questions — design decisions that cannot be resolved without more information or observation. Each includes what would resolve it.*
 
-**Q1: Registry persistence — when to migrate to SQLite?**
-JSON is sufficient for Phase 1. At what UoW volume does query performance degrade enough to warrant SQLite? Unresolved because we don't yet know Phase 1 throughput. *Resolves when:* Phase 1 has been running for 30 days and we can measure actual UoW volume per week.
+**Q1: Registry persistence — RESOLVED.**
+SQLite from Phase 1. Decision confirmed 2026-03-26. The `UNIQUE(source_issue_number, sweep_date)` deduplication constraint and `BEGIN IMMEDIATE` transaction atomicity require SQLite semantics. Flat JSON cannot provide these guarantees without substantial re-implementation of the same guarantees SQLite provides natively.
 
 **Q2: Hook storage location — user-config vs. system repo?**
 Behavioral hooks (escalation thresholds, notification preferences) belong in user-config; structural hooks (retry logic, loop guards) belong in system repo. The split makes sense in principle, but the boundary case — convergence-trigger hook — is structural behavior with a user-tunable parameter (what synthesis agent to use). *Resolves when:* Phase 2 hook implementation specifies which hooks it needs, and each is classified by the proposed split rule.
