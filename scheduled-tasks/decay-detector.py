@@ -199,10 +199,10 @@ def remove_stale_label(issue_number: int) -> None:
 
 def send_telegram(chat_id: str, text: str) -> None:
     """Send a Telegram message via the lobster-inbox MCP or outbox."""
-    outbox = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-    outbox = outbox.parent / "messages" / "outbox"
-    if outbox.exists():
-        msg_file = outbox / f"decay-detector-{today_str()}.json"
+    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+    outbox_dir = workspace.parent / "messages" / "outbox"
+    if outbox_dir.exists():
+        msg_file = outbox_dir / f"decay-detector-{today_str()}.json"
         msg_file.write_text(json.dumps({
             "chat_id": chat_id,
             "text": text,
