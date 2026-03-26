@@ -1744,7 +1744,82 @@ DAILY_METRICS_TASK
         migrated=$((migrated + 1))
     fi
 
+    # Migration 42: Register decay-detector scheduled job (issue #137)
+    # Pipeline Layer — Mode A: detects frozen intentions in the issue backlog.
+    # Runs nightly at 04:00 UTC (after the 02:00 negentropic sweep), checks
+    # rotation-state.json, and only executes on Night 4 of the sweep cycle.
+    # Applies/removes 'stale' labels autonomously; never closes issues.
+    local decay_task="$WORKSPACE_DIR/scheduled-jobs/tasks/decay-detector.md"
+    if [ ! -f "$decay_task" ]; then
+        mkdir -p "$WORKSPACE_DIR/scheduled-jobs/tasks"
+        cat > "$decay_task" << 'DECAY_DETECTOR_TASK'
+# Decay Detector
 
+**Job**: decay-detector
+**Schedule**: Daily at 4:00 AM UTC (`0 4 * * *`)
+**GitHub issue**: https://github.com/dcetlin/Lobster/issues/137
+
+## Context
+
+You are running as a scheduled task. This is the Pipeline Layer — Mode A: Decay Detection.
+
+This script runs every night at 4:00 AM (after the negentropic sweep at 2:00 AM). It is a no-LLM, pure-data pass — your only job is to run the Python script below and report the result.
+
+## Instructions
+
+Run the decay detector script:
+
+```bash
+uv run ~/lobster/scheduled-tasks/decay-detector.py
+```
+
+The script:
+- Checks if today's sweep was a Night 4 (Issues + Memory) sweep — exits silently if not
+- Fetches open issues from `dcetlin/Lobster`
+- Applies/removes `stale` labels autonomously based on inactivity thresholds
+- Detects near-duplicate titles and empty-body issues
+- Appends a decay report section to today's sweep file
+- Sends a Telegram ping to Dan (chat_id: 8075091586) summarizing findings
+
+No further action is needed after running the script. If the script exits with code 0, all work is done.
+
+If the script fails (non-zero exit), include the error output in write_task_output with status="failed".
+
+## Output
+
+When you complete your task, call `write_task_output` with:
+- job_name: "decay-detector"
+- output: The script's stdout/stderr output (or "completed successfully" if clean)
+- status: "success" or "failed"
+
+Keep output concise. The main Lobster instance will review this later.
+DECAY_DETECTOR_TASK
+        substep "Created decay-detector task file in scheduled-jobs/tasks/"
+        migrated=$((migrated + 1))
+    fi
+    if [ -f "$JOBS_FILE" ] && command -v jq >/dev/null 2>&1; then
+        if ! jq -e '.jobs["decay-detector"]' "$JOBS_FILE" > /dev/null 2>&1; then
+            local now_iso
+            now_iso=$(date -u +"%Y-%m-%dT%H:%M:%S.%6N+00:00")
+            TMP_JOBS=$(mktemp)
+            jq --arg now "$now_iso" '.jobs["decay-detector"] = {
+                "name": "decay-detector",
+                "schedule": "0 4 * * *",
+                "schedule_human": "Daily at 4:00",
+                "task_file": "tasks/decay-detector.md",
+                "created_at": $now,
+                "updated_at": $now,
+                "enabled": true
+            }' "$JOBS_FILE" > "$TMP_JOBS" && mv "$TMP_JOBS" "$JOBS_FILE"
+            substep "Registered decay-detector job in jobs.json (daily at 04:00 UTC)"
+            # Sync crontab so the new cron entry is installed immediately
+            if [ -x "$LOBSTER_DIR/scheduled-tasks/sync-crontab.sh" ]; then
+                bash "$LOBSTER_DIR/scheduled-tasks/sync-crontab.sh" 2>/dev/null || true
+                substep "Crontab synchronized (decay-detector added)"
+            fi
+            migrated=$((migrated + 1))
+        fi
+    fi
 
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
