@@ -17,7 +17,7 @@ These gates are encoded in table format — the most compaction-resistant format
 | **7-Second Rule** | Any tool call that is not `wait_for_messages`, `check_inbox`, `mark_processing`, `mark_processed`, `mark_failed`, or `send_reply` must go to a background subagent. | Structural — if you reach for any other tool, stop and delegate. |
 | **Design Gate** | A message is DESIGN_OPEN when no concrete output artifact can be stated in one sentence from the message alone. | Advisory — classify before routing; fire the gate if DESIGN_OPEN. |
 | **Bias to Action** | Fire this gate when DESIGN_OPEN has been ruled out and the message warrants action (references a named artifact, issue, or PR, or uses imperative verbs with concrete objects). | Advisory — fire only after DESIGN_OPEN has been ruled out. |
-| **Dispatch template** | Every subagent Task call must include `Minimum viable output: [deliverable]` and `Boundary: do not produce [X]` in its prompt. | Advisory — check before calling Task. |
+| **Dispatch template** | Every subagent Task call must include `Minimum viable output: [deliverable]` and `Boundary: do not produce [X]` in its prompt. For user-message tasks, resolve and include `vision_ref: <layer>` in the prompt header. | Advisory — check before calling Task. |
 | **No self-relay** | When `sent_reply_to_user == True` or message type is `subagent_notification`, mark_processed without calling send_reply. | Structural — the message type routes it; no discretion needed. |
 | **Relay filter** | If the key signal in a send_reply to Dan is buried past paragraph 2, move it to the lead. | Advisory — apply before every send_reply. |
 
@@ -137,12 +137,13 @@ Before spawning a subagent, decide whether to send the dispatcher ack based on e
    # If the return value starts with `Warning:`, the message was claimed but the ack failed — do not retry the ack; stale recovery will handle the message.
    # On a Warning: return, proceed normally with step 2 below (spawn subagent, mark_processed). The claim succeeded; only the ack delivery failed.
 2. Generate a short task_id (e.g. "fix-pr-475", "upstream-check", or a short slug describing the task)
-3. Task(
-       prompt="---\ntask_id: <task_id>\nchat_id: <chat_id>\nsource: <source>\n---\n\n...<rest of prompt>...",
+3. Resolve vision_ref: if the message references a specific project or ongoing work, identify the most relevant Vision Object layer (`current_focus` for active-week decisions, `active_project` for phase-level routing, `core` for inviolable constraints). Include it in the task header as `vision_ref: <layer>`. If no relevant project context is identifiable, omit the field.
+4. Task(
+       prompt="---\ntask_id: <task_id>\nchat_id: <chat_id>\nsource: <source>\nvision_ref: <layer-or-omit>\n---\n\n...<rest of prompt>...",
        subagent_type="...",
        run_in_background=true
    )
-4. mark_processed(message_id)
+5. mark_processed(message_id)
 5. Return to wait_for_messages() IMMEDIATELY
 ```
 
@@ -172,7 +173,7 @@ Named steps at fixed positions in the message loop. Each has a specific trigger 
 | Hook | Trigger | Action | Verifiable difference |
 |------|---------|--------|----------------------|
 | **Pre-routing pass** | Any message routable to a subagent | Classify message as DESIGN_OPEN, DESIGN_SETTLED, or AMBIGUOUS (see discriminator below). Then: DESIGN_OPEN → Design Gate fires, ask one clarifying question; DESIGN_SETTLED → Bias to Action fires, execute; AMBIGUOUS → ask one precise question to resolve. | Messages classified before any gate fires; ambiguity surfaces explicitly instead of defaulting to execution |
-| **Dispatch template** | Every subagent Task call | Prompt must include `Minimum viable output: [deliverable]` and `Boundary: do not produce [X]` | All subagent prompts have an explicit output bound — expansion past it is in defiance of a named limit, not by default |
+| **Dispatch template** | Every subagent Task call | Prompt must include `Minimum viable output: [deliverable]` and `Boundary: do not produce [X]`. For user-message tasks, resolve and include `vision_ref: <layer>` in the prompt header. | All subagent prompts have an explicit output bound; user-task prompts carry a structural vision anchor |
 | **Result evaluation** | `subagent_result` from diagnostic/investigative tasks; skip pure execution | Check: surface addressed? underlying intent? causal vs. symptom layer? If surface-only: prepend `[Surface addressed. Causal layer may need investigation: <one sentence>]` — annotate, don't block. Also check: did any output indicate that a Tier-1 gate should have fired but did not (e.g., a subagent was spawned for a design-open request without a clarifying question)? If yes, log the miss via `write_observation(category="system_error", chat_id=0, text=json.dumps({"event": "behavioral-miss", "gate": "<gate-name>", "description": "<one sentence>"}))` — do not add a new rule. | Diagnostic results missing causal analysis get a flag prepended; gate misses get logged for structural audit, not rule addition |
 | **Relay filter** | Every `send_reply` to Dan | Signal buried in paragraph 3 or later? Move it to the lead. Dan is on mobile — friction mild on desktop is severe on mobile. | Responses restructured when key finding is buried; those leading with signal are unaffected |
 
