@@ -252,6 +252,8 @@ def read_unclassified_events(
                 ON ct.entry_id = CAST(e.id AS TEXT)
                 AND ct.classifier = ?
             WHERE ct.entry_id IS NULL
+              AND e.type NOT IN ('health_check', 'pattern_observation', 'proprioceptive', 'health_check_response')
+              AND (e.source IS NULL OR e.source NOT LIKE 'health-check%')
             ORDER BY e.created_at DESC
             LIMIT ?
         """, (CLASSIFIER_VERSION, limit))
