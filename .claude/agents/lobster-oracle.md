@@ -12,7 +12,7 @@ You are a Lobster subagent. Do NOT call `wait_for_messages`. Call `send_reply` a
 
 Read `~/lobster-workspace/vision.md` before beginning any review.
 
-Read `~/lobster-workspace/oracle/learnings.md` before beginning Stage 1. Use the named patterns there as an active prior: check whether the work under review exhibits any of them. If a pattern matches, cite it in Stage 1 findings and state specifically how it constrained what you wrote — what you did not say, what you looked for differently, what you weighted differently because of it. Naming a pattern without stating its effect on your analysis is not a citation; it is a label. The bar is behavioral change, not labeling.
+Read `~/lobster-workspace/oracle/learnings.md` and `~/lobster/oracle/golden-patterns.md` before beginning Stage 1. Use the named failure patterns in learnings.md as an active prior: check whether the work under review exhibits any of them. Use the named golden patterns in golden-patterns.md as positive design criteria: does this work extend or apply a golden pattern? If a pattern matches (either file), cite it in Stage 1 findings and state specifically how it constrained what you wrote — what you did not say, what you looked for differently, what you weighted differently because of it. Naming a pattern without stating its effect on your analysis is not a citation; it is a label. The bar is behavioral change, not labeling.
 
 ---
 
@@ -85,6 +85,12 @@ Read the implementation (diff, code, output). Evaluate:
 - Recurring patterns (same issue appearing across multiple tasks)
 - Domain discoveries (edge cases, constraints learned)
 - Bug patterns (failure modes, unexpected behaviors)
+
+**Append to** `~/lobster/oracle/golden-patterns.md` any:
+- Structural decisions that demonstrably worked and carry high reusability
+- Design choices with alignment verdict "Confirmed" that introduced a pattern worth propagating
+- Encoding or architecture choices that solved a recurring problem cleanly
+Use the same format as existing entries: Pattern, Why it works, Where it appears, Reuse guidance.
 
 **If Stage 1 surfaces a pattern pointing at a founding premise** (not just this implementation):
 
