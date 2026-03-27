@@ -46,6 +46,7 @@ class BootupCandidate:
 class MemoryObservation:
     text: str
     type: str = "pattern_observation"
+    valence: str = "neutral"   # 'golden' | 'smell' | 'neutral'
 
 
 @dataclass(frozen=True)
@@ -118,10 +119,12 @@ def parse_action_seeds(yaml_text: str) -> ActionSeeds:
         for item in (raw.get("bootup_candidates") or [])
     )
 
+    _valid_valences = {"golden", "smell", "neutral"}
     memory_observations = tuple(
         MemoryObservation(
             text=item["text"],
             type=item.get("type", "pattern_observation"),
+            valence=item.get("valence", "neutral") if item.get("valence") in _valid_valences else "neutral",
         )
         for item in (raw.get("memory_observations") or [])
     )
@@ -234,6 +237,7 @@ def store_memory_observation(obs: MemoryObservation, dry_run: bool) -> bool:
     mcp_cmd = ["uv", "run", "-m", "mcp", "call", "lobster-inbox", "memory_store",
                json.dumps({"content": obs.text, "type": "note",
                            "tags": [obs.type], "source": "internal",
+                           "valence": obs.valence,
                            "task_id": "philosophy-harvester"})]
 
     result = subprocess.run(mcp_cmd, capture_output=True, text=True, timeout=15)
@@ -250,6 +254,7 @@ def store_memory_observation(obs: MemoryObservation, dry_run: bool) -> bool:
         "type": "note",
         "tags": [obs.type],
         "source": "philosophy-harvester",
+        "valence": obs.valence,
     }
     with pending_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")

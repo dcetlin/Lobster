@@ -2194,6 +2194,27 @@ AUTO_ROUTER_TASK
         fi
     fi
 
+    # Migration 50: Add valence column to memory.db events table.
+    # Classifies observations as golden (reinforce), smell (address), or neutral.
+    # The Python code handles this via ALTER TABLE on startup for existing DBs,
+    # but this migration catches cases where the MCP server hasn't restarted yet
+    # and ensures the column exists before the next search or store call.
+    local MEMORY_DB="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/data/memory.db"
+    if [ -f "$MEMORY_DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+        if ! sqlite3 "$MEMORY_DB" "PRAGMA table_info(events);" 2>/dev/null | grep -q "valence"; then
+            substep "Adding valence column to memory.db events table..."
+            sqlite3 "$MEMORY_DB" \
+                "ALTER TABLE events ADD COLUMN valence TEXT DEFAULT 'neutral' CHECK(valence IN ('golden', 'smell', 'neutral'));" \
+                2>/dev/null && \
+                sqlite3 "$MEMORY_DB" \
+                    "CREATE INDEX IF NOT EXISTS idx_events_valence ON events(valence);" \
+                    2>/dev/null && \
+                success "valence column added to memory.db (golden/smell/neutral register enabled)" || \
+                warn "Failed to add valence column to memory.db (may already exist or DB locked)"
+            migrated=$((migrated + 1))
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

@@ -11,6 +11,9 @@ from typing import Protocol, Optional
 from datetime import datetime
 
 
+VALENCE_VALUES = frozenset({"golden", "smell", "neutral"})
+
+
 @dataclass
 class MemoryEvent:
     """A single event stored in memory.
@@ -18,6 +21,11 @@ class MemoryEvent:
     Events represent messages, tasks, decisions, notes, or links
     that Lobster should remember. Each event is stored with its
     embedding for vector search and indexed for keyword search.
+
+    The ``valence`` field classifies an observation as a golden pattern
+    (something that works well and should be reinforced), a smell (something
+    problematic that should be addressed), or neutral (no strong signal).
+    Valid values: 'golden' | 'smell' | 'neutral' (default).
     """
     id: Optional[int]
     timestamp: datetime
@@ -27,6 +35,7 @@ class MemoryEvent:
     content: str
     metadata: dict = field(default_factory=dict)
     consolidated: bool = False
+    valence: str = "neutral"   # 'golden' | 'smell' | 'neutral'
 
     def to_dict(self) -> dict:
         """Serialize to a dictionary."""
@@ -39,6 +48,7 @@ class MemoryEvent:
             "content": self.content,
             "metadata": self.metadata,
             "consolidated": self.consolidated,
+            "valence": self.valence,
         }
 
     @classmethod
@@ -58,6 +68,7 @@ class MemoryEvent:
             content=data.get("content", ""),
             metadata=data.get("metadata", {}),
             consolidated=data.get("consolidated", False),
+            valence=data.get("valence", "neutral"),
         )
 
 
@@ -73,11 +84,20 @@ class MemoryProvider(Protocol):
         """Store an event and return its ID."""
         ...
 
-    def search(self, query: str, limit: int = 10, project: str = None) -> list[MemoryEvent]:
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        project: str = None,
+        valence: str = None,
+    ) -> list[MemoryEvent]:
         """Search memory for events matching the query.
 
         Uses hybrid search (vector + keyword) when available,
         falls back to keyword-only search otherwise.
+
+        Pass ``valence='golden'`` or ``valence='smell'`` to restrict results
+        to observations with that classification.
         """
         ...
 
