@@ -2211,6 +2211,166 @@ AUTO_ROUTER_TASK
                     2>/dev/null && \
                 success "valence column added to memory.db (golden/smell/neutral register enabled)" || \
                 warn "Failed to add valence column to memory.db (may already exist or DB locked)"
+        fi
+    fi
+
+    # Migration 51: Create ~/lobster-workspace/orchestration/ and register issue-sweeper (WOS Phase 1, issue #167)
+    # Creates the orchestration directory, registers the issue-sweeper nightly job (03:30 UTC),
+    # and creates the audit.jsonl export location.
+    local orchestration_dir="$WORKSPACE_DIR/orchestration"
+    local sweeper_task="$WORKSPACE_DIR/scheduled-jobs/tasks/issue-sweeper.md"
+    if [ ! -d "$orchestration_dir" ]; then
+        mkdir -p "$orchestration_dir"
+        substep "Created $orchestration_dir for WOS registry"
+        migrated=$((migrated + 1))
+    fi
+    if [ ! -f "$sweeper_task" ]; then
+        mkdir -p "$WORKSPACE_DIR/scheduled-jobs/tasks"
+        cat > "$sweeper_task" << 'ISSUE_SWEEPER_TASK'
+# Issue Sweeper — WOS Phase 1
+
+**Job**: issue-sweeper
+**Schedule**: Nightly at 3:30 AM UTC (`30 3 * * *`)
+**Created**: WOS Phase 1 — issue #167
+
+## Context
+
+You are the WOS Issue Sweeper running as a scheduled task. Your job is to scan
+the dcetlin/Lobster GitHub issue backlog and create proposed Units of Work (UoWs)
+in the Registry for issues that are ready-to-execute or need attention.
+
+The Registry CLI is at `~/lobster/src/orchestration/registry_cli.py`.
+The database lives at `~/lobster-workspace/orchestration/registry.db`.
+
+## Instructions
+
+### 1. Expire stale proposals
+
+First, expire any proposals older than 14 days that have not been confirmed:
+
+```bash
+uv run ~/lobster/src/orchestration/registry_cli.py expire-proposals
+```
+
+Include the result in your sweep output.
+
+### 2. Check for stale-active UoWs
+
+Check whether any active UoWs have their source issue closed:
+
+```bash
+uv run ~/lobster/src/orchestration/registry_cli.py check-stale
+```
+
+If any stale UoWs are found, include them in the sweep output and flag for Dan's review.
+
+### 3. Scan the GitHub issue backlog
+
+Fetch open issues from dcetlin/Lobster:
+
+```bash
+gh issue list --repo dcetlin/Lobster --state open --json number,title,labels,createdAt,updatedAt,comments --limit 100
+```
+
+For each issue, apply the following criteria:
+
+**Propose as UoW if ANY of the following are true:**
+- Has `ready-to-execute` label AND no linked PR AND age > 3 days
+- Has `high-priority` label AND no recent comment (>7 days) AND no linked PR
+- Open > 14 days AND no `on-hold` label AND no `needs-design` label AND no `stale` label AND no linked PR
+
+**Skip if:**
+- Has `on-hold` label (note in "Dan-blocked" section)
+- Has `needs-design` label (not ready for execution)
+- Has `stale` label already
+- Has an open linked PR (work in progress)
+
+### 4. Create UoWs for qualifying issues
+
+For each qualifying issue, upsert a proposed UoW:
+
+```bash
+uv run ~/lobster/src/orchestration/registry_cli.py upsert \
+  --issue <N> \
+  --title "<issue title>" \
+  --sweep-date "$(date +%Y-%m-%d)"
+```
+
+Record the result (inserted vs skipped with reason) in your sweep output.
+
+### 5. Compute gate readiness
+
+Check Phase 1 → Phase 2 autonomy gate status:
+
+```bash
+uv run ~/lobster/src/orchestration/registry_cli.py gate-readiness
+```
+
+Include the output in your sweep report.
+
+### 6. Build the ready queue
+
+Query pending and proposed UoWs from the registry:
+
+```bash
+uv run ~/lobster/src/orchestration/registry_cli.py list --status proposed
+uv run ~/lobster/src/orchestration/registry_cli.py list --status pending
+```
+
+Order by created_at (oldest first). Distinguish:
+- `proposed` items: labeled "awaiting /confirm" — Dan must run `/confirm <uow-id>` to activate
+- `pending` items: labeled "confirmed, awaiting execution"
+
+Flag any `proposed` records approaching 14-day expiry (>= 12 days old) with:
+"expiring soon — confirm or this proposal will expire in N days"
+
+### 7. Write sweep output
+
+Call `write_task_output` with a structured report containing:
+
+1. **Expired proposals**: count and ids
+2. **Stale-active UoWs**: list (id, issue, summary) — if any
+3. **Issues scanned**: count
+4. **UoWs created**: list (id, issue number, title, action: inserted/skipped)
+5. **Ready queue** (proposed — awaiting /confirm):
+   - One line per UoW: `<id> | #<issue> | <title> | created: <date> [EXPIRING SOON]`
+6. **Confirmed queue** (pending — awaiting execution):
+   - One line per UoW: `<id> | #<issue> | <title>`
+7. **Dan-blocked items**: issues with `on-hold` label
+8. **Gate readiness**: gate_met, days_running, ratio
+
+Keep it concise — Dan reads this on mobile.
+
+## Output
+
+When you complete your task, call `write_task_output` with:
+- job_name: "issue-sweeper"
+- output: Your structured sweep report
+- status: "success" or "failed"
+ISSUE_SWEEPER_TASK
+        substep "Created issue-sweeper task file in scheduled-jobs/tasks/"
+        migrated=$((migrated + 1))
+    fi
+    if [ -f "$JOBS_FILE" ] && command -v jq >/dev/null 2>&1; then
+        if ! jq -e '.jobs["issue-sweeper"]' "$JOBS_FILE" > /dev/null 2>&1; then
+            local now_iso
+            now_iso=$(date -u +"%Y-%m-%dT%H:%M:%S.%6N+00:00")
+            TMP_JOBS=$(mktemp)
+            jq --arg now "$now_iso" '.jobs["issue-sweeper"] = {
+                "name": "issue-sweeper",
+                "schedule": "30 3 * * *",
+                "schedule_human": "Nightly at 3:30 UTC",
+                "task_file": "tasks/issue-sweeper.md",
+                "created_at": $now,
+                "updated_at": $now,
+                "enabled": true
+            }' "$JOBS_FILE" > "$TMP_JOBS" && mv "$TMP_JOBS" "$JOBS_FILE"
+            substep "Registered issue-sweeper job in jobs.json (nightly at 03:30 UTC)"
+            if [ -x "$LOBSTER_DIR/scheduled-tasks/sync-crontab.sh" ]; then
+                bash "$LOBSTER_DIR/scheduled-tasks/sync-crontab.sh" 2>/dev/null || true
+                substep "Crontab synchronized (issue-sweeper added)"
+            fi
+
             migrated=$((migrated + 1))
         fi
     fi

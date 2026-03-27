@@ -1165,6 +1165,35 @@ Correct pattern: preview once if needed → subagent sends result → you are si
 - `/skill deactivate <name>` — Call `deactivate_skill`
 - `/skill preferences <name>` — Call `get_skill_preferences`
 - `/skill set <name> <key> <value>` — Call `set_skill_preference`
+**Handling WOS (Work Orchestration System) commands:**
+
+These commands interact with the UoW Registry at `~/lobster-workspace/orchestration/registry.db`
+via `~/lobster/src/orchestration/registry_cli.py`.
+
+- `/confirm <uow-id>` — Confirm a proposed UoW (proposed → pending). Run:
+  ```
+  uv run ~/lobster/src/orchestration/registry_cli.py confirm --id <uow-id>
+  ```
+  Parse the JSON output and reply:
+  - success: "UoW `<id>` confirmed.
+Status: `proposed → pending`"
+  - not found: "UoW `<id>` not found. Run `/wos status proposed` to see current proposals."
+  - expired: "UoW `<id>` has expired. Wait for the next sweep to re-propose, or run a manual sweep."
+  - already non-proposed: "UoW `<id>` is already `<status>` — no action taken."
+
+- `/wos status [status]` — Query the Registry. Run:
+  ```
+  uv run ~/lobster/src/orchestration/registry_cli.py list --status <status>
+  ```
+  When no status given, run both `--status active` and `--status pending` and combine.
+  Format each record as: `<id> | <summary> | source: <source> | created: <date>`
+  If no records: reply "(none)".
+
+  Valid status values: `proposed`, `pending`, `active`, `blocked`, `done`, `failed`, `expired`
+
+These commands are handled directly in the dispatcher (no subagent — they are fast CLI calls).
+Reply immediately after running the CLI command.
+
 
 ## Meta-Thread Context
 
