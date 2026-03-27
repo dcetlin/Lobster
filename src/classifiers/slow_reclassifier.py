@@ -141,6 +141,25 @@ class ClassificationTag:
     )
 
 
+_GOLDEN_KEYWORDS = frozenset({"golden", "win", "strength"})
+_SMELL_KEYWORDS = frozenset({"smell", "drift", "failure", "error"})
+
+
+def classify_valence(pattern_type: str, description: str) -> str:
+    """
+    Classify a pattern observation as 'golden', 'smell', or 'neutral'.
+
+    Applies keyword heuristics to pattern_type and description text.
+    Pure function — no I/O.
+    """
+    combined = (pattern_type + " " + description).lower()
+    if any(kw in combined for kw in _GOLDEN_KEYWORDS):
+        return "golden"
+    if any(kw in combined for kw in _SMELL_KEYWORDS):
+        return "smell"
+    return "neutral"
+
+
 @dataclass
 class PatternObservation:
     """A cross-event pattern detected across a cluster."""
@@ -151,6 +170,7 @@ class PatternObservation:
     urgency: str
     posture_hint: str
     detected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    valence: str = "neutral"    # golden | smell | neutral
 
 
 # ---------------------------------------------------------------------------
@@ -341,16 +361,27 @@ def write_pattern_event(conn: sqlite3.Connection, obs: PatternObservation) -> in
         "signal_type": obs.signal_type,
         "urgency": obs.urgency,
         "posture_hint": obs.posture_hint,
+        "valence": obs.valence,
     })
     content = (
         f"pattern_observation | {obs.pattern_type} | source: {obs.source}\n"
         f"contributing events: {obs.event_ids}\n"
         f"signal_type: {obs.signal_type} | posture_hint: {obs.posture_hint}"
     )
-    cursor = conn.execute("""
-        INSERT INTO events (timestamp, type, source, content, metadata)
-        VALUES (?, 'pattern_observation', ?, ?, ?)
-    """, (obs.detected_at.isoformat(), obs.source, content, metadata))
+    # Write valence to the events table column added by PR #181.
+    # Fall back to INSERT without the column for databases that pre-date the migration
+    # (the column has a DEFAULT 'neutral' so the value is still correct either way).
+    try:
+        cursor = conn.execute("""
+            INSERT INTO events (timestamp, type, source, content, metadata, valence)
+            VALUES (?, 'pattern_observation', ?, ?, ?, ?)
+        """, (obs.detected_at.isoformat(), obs.source, content, metadata, obs.valence))
+    except sqlite3.OperationalError:
+        # valence column not yet present (pre-migration DB)
+        cursor = conn.execute("""
+            INSERT INTO events (timestamp, type, source, content, metadata)
+            VALUES (?, 'pattern_observation', ?, ?, ?)
+        """, (obs.detected_at.isoformat(), obs.source, content, metadata))
     event_id = cursor.lastrowid
 
     # Store embedding so this event is reachable via vector search.
@@ -487,6 +518,7 @@ def detect_design_session(
                     signal_type="design_session",
                     urgency="normal",
                     posture_hint="structural_coherence",
+                    valence=classify_valence("design_session", ""),
                 ))
 
     return observations
@@ -520,6 +552,7 @@ def detect_brainstorm_mode(
                     signal_type="brainstorm",
                     urgency="normal",
                     posture_hint="pattern_perception",
+                    valence=classify_valence("brainstorm_mode", ""),
                 ))
 
     return observations
@@ -551,6 +584,7 @@ def detect_complex_request(
                     signal_type="task_request",
                     urgency="high",
                     posture_hint="minimal_cognitive_friction",
+                    valence=classify_valence("complex_request", ""),
                 ))
 
     return observations
@@ -584,6 +618,7 @@ def detect_meta_thread(
                     signal_type="meta_thread",
                     urgency="normal",
                     posture_hint="structural_coherence",
+                    valence=classify_valence("meta_thread", ""),
                 ))
 
     return observations
