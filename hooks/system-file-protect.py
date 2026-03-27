@@ -7,7 +7,9 @@ System files are anything under ~/lobster/ (the installed repo):
 
 NOT blocked: ~/lobster-workspace/, ~/lobster-user-config/, ~/messages/
 
-Override: set LOBSTER_DEBUG=true to allow edits during development.
+Override: create the file ~/.lobster-debug to allow edits during development.
+This uses a file flag instead of an env var to prevent subprocess injection attacks
+(a subprocess cannot inject a file flag into the parent process filesystem state).
 """
 
 import json
@@ -19,13 +21,13 @@ from pathlib import Path
 DENY_REASON = (
     "Blocked: {path!r} is a Lobster system file. "
     "Editing system files during normal operation is not allowed. "
-    "To make intentional changes, set LOBSTER_DEBUG=true and re-run."
+    "To make intentional changes, create ~/.lobster-debug and re-run."
 )
 
 DENY_REASON_BASH = (
     "Blocked: Bash command appears to write to a Lobster system file under ~/lobster/. "
     "Editing system files during normal operation is not allowed. "
-    "To make intentional changes, set LOBSTER_DEBUG=true and re-run."
+    "To make intentional changes, create ~/.lobster-debug and re-run."
 )
 
 # Resolved once at module load
@@ -63,7 +65,13 @@ _BASH_WRITE_OPS = re.compile(
 
 
 def is_debug_mode() -> bool:
-    return os.environ.get("LOBSTER_DEBUG", "").lower() == "true"
+    """Return True if the file-based debug flag exists.
+
+    Using a file flag (~/.lobster-debug) instead of an env var (LOBSTER_DEBUG)
+    prevents subprocess injection: a subprocess can set env vars in its own
+    environment but cannot create files visible to the hook process.
+    """
+    return os.path.exists(os.path.join(str(Path.home()), ".lobster-debug"))
 
 
 def is_system_file(file_path: str) -> bool:
