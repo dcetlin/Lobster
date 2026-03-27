@@ -23,47 +23,10 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
-# Schema DDL
+# Schema — loaded from schema.sql (the authoritative source of truth)
 # ---------------------------------------------------------------------------
 
-_DDL_UOW_REGISTRY = """
-CREATE TABLE IF NOT EXISTS uow_registry (
-    id TEXT PRIMARY KEY,
-    type TEXT NOT NULL DEFAULT 'executable',
-    source TEXT NOT NULL,
-    source_issue_number INTEGER,
-    sweep_date TEXT,
-    status TEXT NOT NULL DEFAULT 'proposed',
-    posture TEXT NOT NULL DEFAULT 'solo',
-    agent TEXT,
-    children TEXT DEFAULT '[]',
-    parent TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    started_at TEXT,
-    completed_at TEXT,
-    summary TEXT NOT NULL,
-    output_ref TEXT,
-    hooks_applied TEXT DEFAULT '[]',
-    route_reason TEXT,
-    route_evidence TEXT DEFAULT '{}',
-    trigger TEXT DEFAULT '{"type": "immediate"}',
-    UNIQUE(source_issue_number, sweep_date)
-);
-"""
-
-_DDL_AUDIT_LOG = """
-CREATE TABLE IF NOT EXISTS audit_log (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts          TEXT NOT NULL,
-    uow_id      TEXT NOT NULL,
-    event       TEXT NOT NULL,
-    from_status TEXT,
-    to_status   TEXT,
-    agent       TEXT,
-    note        TEXT
-);
-"""
+_SCHEMA_SQL = (Path(__file__).parent / "schema.sql").read_text()
 
 # Statuses that indicate in-flight work (block re-proposal)
 _NON_TERMINAL_STATUSES = frozenset({"proposed", "pending", "active", "blocked"})
@@ -113,9 +76,7 @@ class Registry:
     def _init_schema(self) -> None:
         conn = self._connect()
         try:
-            conn.execute(_DDL_UOW_REGISTRY)
-            conn.execute(_DDL_AUDIT_LOG)
-            conn.commit()
+            conn.executescript(_SCHEMA_SQL)
         finally:
             conn.close()
 
