@@ -198,40 +198,79 @@ def apply_updates(
 # Message formatting
 # ---------------------------------------------------------------------------
 
-def format_item(item: dict, index: int, total: int) -> str:
+_SOURCE_LABELS: dict[str, str] = {
+    "meta/premise-review.md": "Premise Review",
+    "meta/hygiene-review.md": "Hygiene Review",
+    "meta/oracle/learnings.md": "Oracle Learnings",
+}
+
+_GROUP_ORDER = ["Premise Review", "Hygiene Review", "Oracle Learnings"]
+
+
+def _queued_label(item: dict) -> str:
+    """Return a formatted date string for the item's queued_at field."""
+    raw = item.get("queued_at", "")
+    if not raw:
+        return "unknown date"
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d")
+    except ValueError:
+        return raw
+
+
+def _source_label(item: dict) -> str:
+    return _SOURCE_LABELS.get(item.get("source_file", ""), item.get("source_file", "unknown source"))
+
+
+def format_item_block(item: dict) -> str:
     """
-    Format a single queue item as a Telegram message.
-
-    Uses plain text (no markdown) for Telegram compatibility.
+    Format a single item as a block of plain text for inclusion in a digest.
+    Pure function — no I/O.
     """
-    source_file = item.get("source_file", "unknown source")
-    source_label = {
-        "meta/premise-review.md": "Premise Review",
-        "meta/hygiene-review.md": "Hygiene Review",
-        "meta/oracle/learnings.md": "Oracle Learnings",
-    }.get(source_file, source_file)
-
-    queued = item.get("queued_at", "")
-    if queued:
-        try:
-            dt = datetime.fromisoformat(queued.replace("Z", "+00:00"))
-            queued_label = dt.strftime("%Y-%m-%d")
-        except ValueError:
-            queued_label = queued
-    else:
-        queued_label = "unknown date"
-
     observation = item.get("observation", "").strip()
     surface_reason = item.get("surface_reason", "").strip()
+    date_label = _queued_label(item)
 
-    lines = [
-        f"Reflective surface item {index}/{total} — {source_label} ({queued_label})",
-        "",
-        observation,
-    ]
-
+    lines = [f"({date_label}) {observation}"]
     if surface_reason:
-        lines += ["", f"Why surfaced: {surface_reason}"]
+        lines += [f"  Why surfaced: {surface_reason}"]
+    return "\n".join(lines)
+
+
+def format_digest(items: list[dict]) -> str:
+    """
+    Format all items as a single digest message, grouped by type.
+
+    Groups: Premise Review / Hygiene Review / Oracle Learnings (then others).
+    Pure function — no I/O.
+    """
+    if not items:
+        return ""
+
+    # Group items by their source label, preserving relative order within each group
+    groups: dict[str, list[dict]] = {}
+    for item in items:
+        label = _source_label(item)
+        groups.setdefault(label, []).append(item)
+
+    # Ordered: known groups first, then any unknown source labels alphabetically
+    known = [g for g in _GROUP_ORDER if g in groups]
+    unknown = sorted(g for g in groups if g not in _GROUP_ORDER)
+    ordered_groups = known + unknown
+
+    lines = ["Reflective Surface Digest"]
+    lines.append("")
+
+    for group_label in ordered_groups:
+        lines.append(f"-- {group_label} --")
+        for item in groups[group_label]:
+            lines.append(format_item_block(item))
+            lines.append("")
+
+    # Strip trailing blank line
+    while lines and lines[-1] == "":
+        lines.pop()
 
     return "\n".join(lines)
 
@@ -318,17 +357,14 @@ def write_task_output(output: str, status: str, timestamp: str) -> None:
 # Delivery via direct inbox writes
 # ---------------------------------------------------------------------------
 
-def deliver(messages: list[str], job_summary: str, delivered_count: int, archived_count: int) -> None:
+def deliver(digest_text: str, job_summary: str) -> None:
     """
-    Deliver messages to the Lobster inbox and write task output.
-    Each message is written as a subagent_result inbox file; the dispatcher
-    picks them up and routes them via send_reply. No Claude subprocess is spawned.
-    Side effects are isolated to this function.
+    Deliver the digest as a single inbox message and write task output.
+    One write_inbox_message call — not per-item. Side effects isolated here.
     """
     chat_id = int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586"))
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    for msg_text in messages:
-        write_inbox_message(chat_id, msg_text, timestamp)
+    write_inbox_message(chat_id, digest_text, timestamp)
     write_task_output(job_summary, "success", timestamp)
 
 
@@ -346,8 +382,10 @@ def run() -> int:
     """
     Execute the surface queue delivery pipeline.
 
-    Reads queue -> scores undelivered items -> selects top N -> formats messages
-    -> writes inbox files for dispatcher delivery -> marks delivered -> saves queue.
+    Reads queue -> scores undelivered items -> selects all candidates -> formats
+    as a single digest -> writes ONE inbox file -> marks all delivered -> saves queue.
+
+    If the queue has 0 undelivered items, nothing is sent (guardrail #5: no firehose).
 
     Returns exit code: 0 for success, 1 for failure.
     """
@@ -365,29 +403,24 @@ def run() -> int:
     print(f"  Items to archive (age > {ARCHIVE_AGE_DAYS} days): {len(to_archive)}")
 
     if not to_deliver and not to_archive:
-        print("  Nothing to do.")
+        print("  Nothing to do — queue is empty.")
         deliver_no_items("No undelivered items in the reflective surface queue.")
         return 0
 
-    # Format messages
-    messages = [
-        format_item(item, i + 1, len(to_deliver))
-        for i, item in enumerate(to_deliver)
-    ]
-
-    # Count remaining after this run
+    # Count remaining after this run (items not in to_deliver or to_archive)
     all_undelivered = [i for i in items if not is_delivered(i) and not is_archived(i)]
     remaining_after = max(0, len(all_undelivered) - len(to_deliver) - len(to_archive))
 
     job_summary = format_summary(len(to_deliver), len(to_archive), remaining_after)
     print(f"  Summary: {job_summary}")
 
-    # Deliver
-    if messages:
-        print("  Writing messages to inbox for dispatcher delivery...")
-        deliver(messages, job_summary, len(to_deliver), len(to_archive))
+    # Format and deliver as a single digest (not per-item)
+    if to_deliver:
+        digest_text = format_digest(to_deliver)
+        print("  Writing digest to inbox for dispatcher delivery...")
+        deliver(digest_text, job_summary)
     else:
-        # Only archiving, no messages to send — still write task output
+        # Only archiving — no items to show, just write task output
         deliver_no_items(job_summary)
 
     # Mark items in queue and save

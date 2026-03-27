@@ -155,3 +155,84 @@ class TestSelectItems:
         ]
         to_deliver, to_archive = sqd.select_items(items, now)
         assert len(to_deliver) == 0
+
+
+# ---------------------------------------------------------------------------
+# format_digest: single digest message from multiple items
+# ---------------------------------------------------------------------------
+
+class TestFormatDigest:
+    def _item(self, source_file: str, observation: str, surface_reason: str = "",
+              queued_at: str = "2026-03-25T12:00:00Z") -> dict:
+        return {
+            "source_file": source_file,
+            "observation": observation,
+            "surface_reason": surface_reason,
+            "queued_at": queued_at,
+        }
+
+    def test_empty_list_returns_empty_string(self):
+        assert sqd.format_digest([]) == ""
+
+    def test_single_item_contains_header_and_observation(self):
+        item = self._item("meta/premise-review.md", "Core premise is off")
+        result = sqd.format_digest([item])
+        assert "Reflective Surface Digest" in result
+        assert "Premise Review" in result
+        assert "Core premise is off" in result
+
+    def test_groups_by_source_type(self):
+        items = [
+            self._item("meta/premise-review.md", "Premise obs"),
+            self._item("meta/hygiene-review.md", "Hygiene obs"),
+        ]
+        result = sqd.format_digest(items)
+        assert "Premise Review" in result
+        assert "Hygiene Review" in result
+        assert "Premise obs" in result
+        assert "Hygiene obs" in result
+
+    def test_premise_review_before_hygiene_review(self):
+        items = [
+            self._item("meta/hygiene-review.md", "Hygiene obs"),
+            self._item("meta/premise-review.md", "Premise obs"),
+        ]
+        result = sqd.format_digest(items)
+        premise_pos = result.index("Premise Review")
+        hygiene_pos = result.index("Hygiene Review")
+        assert premise_pos < hygiene_pos
+
+    def test_surface_reason_included_when_present(self):
+        item = self._item("meta/hygiene-review.md", "The queue grew", surface_reason="Misaligned priority")
+        result = sqd.format_digest([item])
+        assert "Why surfaced: Misaligned priority" in result
+
+    def test_surface_reason_absent_when_empty(self):
+        item = self._item("meta/hygiene-review.md", "Routine check", surface_reason="")
+        result = sqd.format_digest([item])
+        assert "Why surfaced" not in result
+
+    def test_queued_date_formatted(self):
+        item = self._item("meta/premise-review.md", "obs", queued_at="2026-01-15T08:00:00Z")
+        result = sqd.format_digest([item])
+        assert "2026-01-15" in result
+
+    def test_result_is_single_string(self):
+        items = [
+            self._item("meta/premise-review.md", "obs 1"),
+            self._item("meta/premise-review.md", "obs 2"),
+        ]
+        result = sqd.format_digest(items)
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_multiple_items_same_group(self):
+        items = [
+            self._item("meta/premise-review.md", "first obs"),
+            self._item("meta/premise-review.md", "second obs"),
+        ]
+        result = sqd.format_digest(items)
+        # Group header should appear once
+        assert result.count("Premise Review") == 1
+        assert "first obs" in result
+        assert "second obs" in result
