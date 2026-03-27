@@ -2129,6 +2129,71 @@ AUTO_ROUTER_TASK
         fi
     fi
 
+    # Migration 47: Remove run-job.sh cron entries and make dispatch-job.sh executable.
+    # run-job.sh (which invoked claude -p directly) has been replaced by dispatch-job.sh
+    # (which posts a scheduled_reminder to the inbox for the dispatcher to handle).
+    # Remove any lingering LOBSTER-SCHEDULED cron entries that still reference run-job.sh.
+    if crontab -l 2>/dev/null | grep -q 'run-job.sh.*# LOBSTER-SCHEDULED'; then
+        { crontab -l 2>/dev/null | grep -v 'run-job.sh.*# LOBSTER-SCHEDULED' || true; } | crontab -
+        substep "Removed run-job.sh cron entries (superseded by dispatch-job.sh inbox dispatch)"
+        migrated=$((migrated + 1))
+    fi
+    # Make dispatch-job.sh executable if present
+    local dispatch_script="$LOBSTER_DIR/scheduled-tasks/dispatch-job.sh"
+    if [ -f "$dispatch_script" ] && [ ! -x "$dispatch_script" ]; then
+        chmod +x "$dispatch_script"
+        substep "Made dispatch-job.sh executable"
+        migrated=$((migrated + 1))
+    fi
+
+    # Migration 48: Update bot-talk poller task files to mirror both sides of conversation
+    # The poller previously only forwarded AlbertLobster messages to the owner. The updated
+    # task files instruct the poller to collect both SaharLobster and AlbertLobster
+    # messages, sort them chronologically, and send a single conversation block to the owner.
+    local bt_poller_src="$LOBSTER_DIR/scheduled-tasks/tasks/bot-talk-poller.md"
+    local bt_fast_src="$LOBSTER_DIR/scheduled-tasks/tasks/bot-talk-poller-fast.md"
+    local bt_tasks_dir="$WORKSPACE_DIR/scheduled-jobs/tasks"
+    if [ -f "$bt_poller_src" ] && [ -d "$bt_tasks_dir" ]; then
+        cp "$bt_poller_src" "$bt_tasks_dir/bot-talk-poller.md"
+        substep "Updated bot-talk-poller.md to mirror both conversation sides"
+        migrated=$((migrated + 1))
+    fi
+    if [ -f "$bt_fast_src" ] && [ -d "$bt_tasks_dir" ]; then
+        cp "$bt_fast_src" "$bt_tasks_dir/bot-talk-poller-fast.md"
+        substep "Updated bot-talk-poller-fast.md to mirror both conversation sides"
+        migrated=$((migrated + 1))
+    fi
+
+    # Migration 49: Register block-claude-p.py PreToolUse hook in Claude Code settings
+    # This hook detects and logs (warn mode) or blocks (block mode) `claude -p` /
+    # `claude --print` invocations in Bash tool calls. Deploying in warn mode first
+    # validates zero false positives before switching to hard-block. Mode is
+    # controlled by LOBSTER_BLOCK_CLAUDE_P_MODE env var (default: warn).
+    # Note: Migration 41 already does this for our naming; this migration is for
+    # installations that came from upstream and need the updated hook path/format.
+    if [ -f "$CLAUDE_SETTINGS" ] && command -v jq >/dev/null 2>&1; then
+        local has_block_claude_p_updated
+        has_block_claude_p_updated=$(jq -r '
+            [.hooks.PreToolUse[]?.hooks[]?.command // empty]
+            | map(select(contains("block-claude-p")))
+            | length
+        ' "$CLAUDE_SETTINGS" 2>/dev/null || echo "0")
+        if [ "${has_block_claude_p_updated:-0}" = "0" ] || [ "${has_block_claude_p_updated:-0}" = "" ]; then
+            chmod +x "$LOBSTER_DIR/hooks/block-claude-p.py" 2>/dev/null || true
+            TMP_SETTINGS=$(mktemp)
+            jq --arg cmd "python3 $LOBSTER_DIR/hooks/block-claude-p.py"                '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": $cmd,
+                    "timeout": 5
+                }]
+            }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+            substep "Registered block-claude-p hook in Claude Code settings (warn mode, Bash-only)"
+            migrated=$((migrated + 1))
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

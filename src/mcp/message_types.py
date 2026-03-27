@@ -45,8 +45,8 @@ INBOX_SYSTEM_TYPES: frozenset[str] = frozenset({
     "agent_failed",           # reconciler/agent-monitor detected dead agent (chat_id=0; dispatcher decides re-queue vs escalate vs drop)
     "compact_group",          # grouped compact messages (internal, produced by check_inbox)
     "compact_reminder",       # on-compact hook reminder (hooks/on-compact.py)
-    "cron_reminder",          # cron job completion (scheduled-tasks/post-reminder.sh; fields: job_name, status, duration_seconds)
-    "scheduled_reminder",     # system-level scheduled reminder (scripts/post-reminder.sh; fields: reminder_type)
+    "cron_reminder",          # DEPRECATED alias — normalizes to "scheduled_reminder" on ingest
+    "scheduled_reminder",     # scheduled reminder (scripts/post-reminder.sh, scheduled-tasks/dispatch-job.sh)
     "update_notification",    # system update available (scripts/check-updates.sh)
     "consolidation",          # nightly consolidation result
     "observation",            # OOM-monitor or similar system observation
