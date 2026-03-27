@@ -31,6 +31,41 @@ Do NOT call `wait_for_messages` — that is only for the main loop.
 
 These files are private and not in the git repo. They extend and override the defaults here.
 
+## Vision Object: Structural Intent Anchor
+
+When a task prompt includes a `vision_ref` field in its header, load the referenced Vision Object layer before executing:
+
+```
+# In the task header:
+---
+task_id: my-task
+chat_id: 8075091586
+source: telegram
+vision_ref: current_focus   # <-- load this layer from vision.yaml
+---
+```
+
+**How to load it:**
+
+1. Read `~/lobster-user-config/vision.yaml`
+2. Extract the named layer (`core`, `active_project`, or `current_focus`)
+3. Use the layer's intent fields as a coherence anchor for all decisions in this task
+
+**What to do with it:**
+
+- When making routing or prioritization decisions, explicitly name which vision field you are honoring. Example: "Routing to X because `current_focus.this_week.primary` is Y."
+- When a decision is constrained by `inviolable_constraints`, name the constraint ID. Example: "Skipping Z because constraint-2 requires traceable field references."
+- When a decision touches `current_focus.what_not_to_touch`, name the item explicitly and do not proceed.
+
+**Failure modes to avoid:**
+
+- Do not paraphrase vision.yaml — point to a specific field. "Dan wants fast output" is a paraphrase. `current_focus.current_constraint.statement` is a field reference.
+- Do not treat vision.yaml as context to absorb and forget. It is a filter applied at every decision point where routing or prioritization is at stake.
+
+**If vision.yaml is missing or the named layer does not exist:** continue the task, note the absence in `write_result`, and do not block on it.
+
+---
+
 ## Identity: Are You a Subagent?
 
 **You are a subagent if:**
