@@ -163,17 +163,31 @@ def apply_updates(
     timestamp: str,
 ) -> list[dict]:
     """
-    Return a new items list with delivered and archived items updated in-place by source_id.
+    Return a new items list with delivered and archived items updated.
+
+    Matching strategy:
+    - Items with a source_id are matched by source_id value (fast, reliable).
+    - Items without a source_id are matched by object identity (id()), using
+      the same list references passed in from select_items. This handles
+      queue entries written before source_id was a required field.
+
     Pure: does not mutate the input list.
     """
-    delivered_ids = {i["source_id"] for i in delivered if "source_id" in i}
-    archived_ids = {i["source_id"] for i in archived if "source_id" in i}
+    delivered_ids = {i["source_id"] for i in delivered if i.get("source_id")}
+    archived_ids = {i["source_id"] for i in archived if i.get("source_id")}
+    # Object-identity fallback for items that lack source_id
+    delivered_objs = {id(i) for i in delivered if not i.get("source_id")}
+    archived_objs = {id(i) for i in archived if not i.get("source_id")}
 
     def update(item: dict) -> dict:
         sid = item.get("source_id")
-        if sid in delivered_ids:
+        if sid and sid in delivered_ids:
             return mark_delivered(item, timestamp)
-        if sid in archived_ids:
+        if sid and sid in archived_ids:
+            return mark_archived(item, timestamp)
+        if id(item) in delivered_objs:
+            return mark_delivered(item, timestamp)
+        if id(item) in archived_objs:
             return mark_archived(item, timestamp)
         return item
 
