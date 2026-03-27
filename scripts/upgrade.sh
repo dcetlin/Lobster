@@ -2244,6 +2244,16 @@ The database lives at `~/lobster-workspace/orchestration/registry.db`.
 
 ## Instructions
 
+### 0. Load Vision Object
+
+Read `~/lobster-user-config/vision.yaml` at the start of each sweep. Extract:
+- `current_focus.this_week.primary` — the primary focus for this week
+- `current_focus.what_not_to_touch` — list of domains to exclude from UoW proposals
+- `active_project.phase_intent` — the current phase intent (one paragraph)
+
+Use these to populate `vision_ref` when upserting UoWs (see step 4). If the file
+does not exist, log a warning in sweep output and continue without vision anchoring.
+
 ### 1. Expire stale proposals
 
 First, expire any proposals older than 14 days that have not been confirmed:
@@ -2284,6 +2294,8 @@ For each issue, apply the following criteria:
 - Has `needs-design` label (not ready for execution)
 - Has `stale` label already
 - Has an open linked PR (work in progress)
+- Issue title/domain matches an entry in `vision.current_focus.what_not_to_touch`
+  (note as "excluded by vision.what_not_to_touch" in sweep output)
 
 ### 4. Create UoWs for qualifying issues
 
@@ -2296,7 +2308,20 @@ uv run ~/lobster/src/orchestration/registry_cli.py upsert \
   --sweep-date "$(date +%Y-%m-%d)"
 ```
 
-Record the result (inserted vs skipped with reason) in your sweep output.
+After upserting, write the `vision_ref` field using the Registry CLI or direct
+SQLite update. Determine the vision anchor by checking:
+
+1. If the issue title or content matches `current_focus.this_week.primary`:
+   vision_ref = {"layer": "current_focus", "field": "this_week.primary",
+                 "statement": "<verbatim primary text>", "anchored_at": "<now ISO>"}
+
+2. If the issue is structural/registry/substrate work (relates to WOS, routing,
+   or Vision Object itself): vision_ref references `active_project.phase_intent`.
+
+3. Otherwise: vision_ref = null (issue has no explicit vision anchor yet).
+
+Record the result (inserted vs skipped with reason, and vision_ref assigned) in
+your sweep output.
 
 ### 5. Compute gate readiness
 
@@ -2328,16 +2353,19 @@ Flag any `proposed` records approaching 14-day expiry (>= 12 days old) with:
 
 Call `write_task_output` with a structured report containing:
 
-1. **Expired proposals**: count and ids
-2. **Stale-active UoWs**: list (id, issue, summary) — if any
-3. **Issues scanned**: count
-4. **UoWs created**: list (id, issue number, title, action: inserted/skipped)
-5. **Ready queue** (proposed — awaiting /confirm):
+1. **Vision Object loaded**: yes/no (if no, reason)
+2. **Current focus**: one-line summary from vision.current_focus.this_week.primary
+3. **Expired proposals**: count and ids
+4. **Stale-active UoWs**: list (id, issue, summary) — if any
+5. **Issues scanned**: count
+6. **UoWs created**: list (id, issue number, title, action: inserted/skipped, vision_ref: layer or null)
+7. **Vision-excluded issues**: issues skipped due to what_not_to_touch
+8. **Ready queue** (proposed — awaiting /confirm):
    - One line per UoW: `<id> | #<issue> | <title> | created: <date> [EXPIRING SOON]`
-6. **Confirmed queue** (pending — awaiting execution):
+9. **Confirmed queue** (pending — awaiting execution):
    - One line per UoW: `<id> | #<issue> | <title>`
-7. **Dan-blocked items**: issues with `on-hold` label
-8. **Gate readiness**: gate_met, days_running, ratio
+10. **Dan-blocked items**: issues with `on-hold` label
+11. **Gate readiness**: gate_met, days_running, ratio
 
 Keep it concise — Dan reads this on mobile.
 
@@ -2371,6 +2399,25 @@ ISSUE_SWEEPER_TASK
                 substep "Crontab synchronized (issue-sweeper added)"
             fi
 
+            migrated=$((migrated + 1))
+        fi
+    fi
+
+    # Migration 48: Add vision_ref column to uow_registry (Vision Object Phase 1)
+    # Adds the intent-anchor field that connects each UoW back to a specific
+    # Vision Object layer. NULL is correct for pre-existing rows.
+    local registry_db="$WORKSPACE_DIR/orchestration/registry.db"
+    if [ -f "$registry_db" ]; then
+        if ! python3 -c "
+import sqlite3, sys
+conn = sqlite3.connect('$registry_db')
+cols = [row[1] for row in conn.execute('PRAGMA table_info(uow_registry)').fetchall()]
+conn.close()
+sys.exit(0 if 'vision_ref' in cols else 1)
+" 2>/dev/null; then
+            sqlite3 "$registry_db" "ALTER TABLE uow_registry ADD COLUMN vision_ref TEXT DEFAULT NULL;" 2>/dev/null && \
+                substep "Added vision_ref column to uow_registry" || \
+                warn "Could not add vision_ref column to uow_registry (non-fatal: column added at schema init for new installs)"
             migrated=$((migrated + 1))
         fi
     fi
