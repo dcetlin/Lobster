@@ -42,8 +42,14 @@ CREATE TABLE IF NOT EXISTS uow_registry (
     route_reason        TEXT,
     route_evidence      TEXT    DEFAULT '{}',
     trigger             TEXT    DEFAULT '{"type": "immediate"}',
+    vision_ref          TEXT    DEFAULT NULL,
     UNIQUE(source_issue_number, sweep_date)
 );
+-- vision_ref: JSON {layer, field, statement, anchored_at}
+-- NULL = created before Vision Object existed or no vision anchor found.
+-- Example: {"layer": "current_focus", "field": "primary",
+--           "statement": "Design and commit Vision Object...",
+--           "anchored_at": "2026-03-27T00:00:00+00:00"}
 
 CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -83,7 +83,7 @@ class Registry:
     def _row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         d = dict(row)
         # Deserialize JSON-stored fields
-        for field in ("children", "hooks_applied", "route_evidence", "trigger"):
+        for field in ("children", "hooks_applied", "route_evidence", "trigger", "vision_ref"):
             if d.get(field) and isinstance(d[field], str):
                 try:
                     d[field] = json.loads(d[field])
