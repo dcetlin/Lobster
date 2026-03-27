@@ -142,9 +142,22 @@ class VectorMemory:
                 content TEXT NOT NULL,
                 metadata TEXT DEFAULT '{}',
                 consolidated INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT (datetime('now'))
+                created_at TEXT DEFAULT (datetime('now')),
+                valence TEXT DEFAULT 'neutral' CHECK(valence IN ('golden', 'smell', 'neutral'))
             )
         """)
+
+        # Add valence column to existing databases that pre-date this schema change.
+        # ALTER TABLE is a no-op on new databases (the column is in CREATE TABLE above).
+        try:
+            conn.execute(
+                "ALTER TABLE events ADD COLUMN valence TEXT DEFAULT 'neutral' "
+                "CHECK(valence IN ('golden', 'smell', 'neutral'))"
+            )
+            conn.commit()
+        except Exception:
+            # Column already exists — expected on new installs after CREATE TABLE
+            pass
 
         # Create FTS5 virtual table for keyword search
         conn.execute("""
@@ -200,6 +213,10 @@ class VectorMemory:
             CREATE INDEX IF NOT EXISTS idx_events_project
             ON events(project)
         """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_events_valence
+            ON events(valence)
+        """)
 
         conn.commit()
         return conn
@@ -212,10 +229,13 @@ class VectorMemory:
         # Generate embedding
         embedding = self._embedder.embed_one(event.content)
 
+        from .provider import VALENCE_VALUES
+        valence = event.valence if event.valence in VALENCE_VALUES else "neutral"
+
         cursor = self._conn.execute(
             """
-            INSERT INTO events (timestamp, type, source, project, content, metadata, consolidated)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO events (timestamp, type, source, project, content, metadata, consolidated, valence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.timestamp.isoformat(),
@@ -225,6 +245,7 @@ class VectorMemory:
                 event.content,
                 json.dumps(event.metadata),
                 1 if event.consolidated else 0,
+                valence,
             ),
         )
         event_id = cursor.lastrowid
@@ -240,18 +261,29 @@ class VectorMemory:
         event.id = event_id
         return event_id
 
-    def search(self, query: str, limit: int = 10, project: str = None) -> list[MemoryEvent]:
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        project: str = None,
+        valence: str = None,
+    ) -> list[MemoryEvent]:
         """Hybrid search: 70% cosine similarity + 30% BM25 keyword.
 
         Falls back to keyword-only if vector search fails.
+
+        Pass ``valence='golden'`` or ``valence='smell'`` to restrict results
+        to observations with that classification.
         """
+        from .provider import VALENCE_VALUES
+        effective_valence = valence if valence in VALENCE_VALUES else None
         try:
-            return self._hybrid_search(query, limit, project)
+            return self._hybrid_search(query, limit, project, effective_valence)
         except Exception as e:
             log.warning(f"Hybrid search failed, falling back to keyword: {e}")
-            return self._keyword_search(query, limit, project)
+            return self._keyword_search(query, limit, project, effective_valence)
 
-    def _hybrid_search(self, query: str, limit: int, project: str = None) -> list[MemoryEvent]:
+    def _hybrid_search(self, query: str, limit: int, project: str = None, valence: str = None) -> list[MemoryEvent]:
         """Combine vector similarity and BM25 keyword scores."""
         # Vector search
         query_embedding = self._embedder.embed_one(query)
@@ -332,19 +364,28 @@ class VectorMemory:
         if project:
             ranked_ids = [eid for eid in ranked_ids if self._event_matches_project(eid, project)]
 
+        # Apply valence filter if specified (post-rank, preserves score ordering)
+        if valence:
+            ranked_ids = [eid for eid in ranked_ids if self._event_matches_valence(eid, valence)]
+
         # Fetch full events for top results
         return self._fetch_events(ranked_ids[:limit])
 
-    def _keyword_search(self, query: str, limit: int, project: str = None) -> list[MemoryEvent]:
+    def _keyword_search(self, query: str, limit: int, project: str = None, valence: str = None) -> list[MemoryEvent]:
         """Keyword-only search using FTS5."""
         fts_query = query.replace('"', '""')
 
-        where_clause = ""
+        where_parts = []
         params = []
 
         if project:
-            where_clause = "AND e.project = ?"
+            where_parts.append("e.project = ?")
             params.append(project)
+        if valence:
+            where_parts.append("e.valence = ?")
+            params.append(valence)
+
+        where_clause = ("AND " + " AND ".join(where_parts)) if where_parts else ""
 
         try:
             rows = self._conn.execute(
@@ -385,6 +426,13 @@ class VectorMemory:
             "SELECT project FROM events WHERE id = ?", (event_id,)
         ).fetchone()
         return row is not None and row["project"] == project
+
+    def _event_matches_valence(self, event_id: int, valence: str) -> bool:
+        """Check if an event has the specified valence."""
+        row = self._conn.execute(
+            "SELECT valence FROM events WHERE id = ?", (event_id,)
+        ).fetchone()
+        return row is not None and row["valence"] == valence
 
     def _fetch_events(self, event_ids: list[int]) -> list[MemoryEvent]:
         """Fetch full event objects by ID, preserving order."""
@@ -472,6 +520,12 @@ class VectorMemory:
         if isinstance(ts, str):
             ts = datetime.fromisoformat(ts)
 
+        # valence column may be absent on DBs not yet migrated; default to 'neutral'
+        try:
+            valence = row["valence"] or "neutral"
+        except (IndexError, KeyError):
+            valence = "neutral"
+
         return MemoryEvent(
             id=row["id"],
             timestamp=ts,
@@ -481,4 +535,5 @@ class VectorMemory:
             content=row["content"],
             metadata=metadata,
             consolidated=bool(row["consolidated"]),
+            valence=valence,
         )

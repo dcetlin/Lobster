@@ -2322,6 +2322,16 @@ async def list_tools() -> list[Tool]:
                         "items": {"type": "string"},
                         "description": "Optional tags for categorization.",
                     },
+                    "valence": {
+                        "type": "string",
+                        "enum": ["golden", "smell", "neutral"],
+                        "description": (
+                            "Observation valence: 'golden' for patterns that work well and should be reinforced, "
+                            "'smell' for problematic patterns that should be addressed, "
+                            "'neutral' for observations with no strong directional signal (default)."
+                        ),
+                        "default": "neutral",
+                    },
                     "task_id": {
                         "type": "string",
                         "description": "Optional subagent task identifier. Included in debug alerts when LOBSTER_DEBUG=true so the caller is visible in the memory write notification.",
@@ -2348,6 +2358,14 @@ async def list_tools() -> list[Tool]:
                     "project": {
                         "type": "string",
                         "description": "Optional project filter.",
+                    },
+                    "valence": {
+                        "type": "string",
+                        "enum": ["golden", "smell", "neutral"],
+                        "description": (
+                            "Optional valence filter. Pass 'golden' to retrieve only golden patterns, "
+                            "'smell' to retrieve only smell patterns, or omit to search all observations."
+                        ),
                     },
                     "task_id": {
                         "type": "string",
@@ -6722,6 +6740,10 @@ async def handle_memory_store(arguments: dict[str, Any]) -> list[TextContent]:
     if not content:
         return [TextContent(type="text", text="Error: content is required.")]
 
+    from .memory.provider import VALENCE_VALUES
+    raw_valence = arguments.get("valence", "neutral")
+    valence = raw_valence if raw_valence in VALENCE_VALUES else "neutral"
+
     event = MemoryEvent(
         id=None,
         timestamp=datetime.now(timezone.utc),
@@ -6730,11 +6752,12 @@ async def handle_memory_store(arguments: dict[str, Any]) -> list[TextContent]:
         project=arguments.get("project"),
         content=content,
         metadata={"tags": arguments.get("tags", [])},
+        valence=valence,
     )
 
     try:
         event_id = _memory_provider.store(event)
-        result_text = f"Stored memory event #{event_id} (type={event.type}, source={event.source})"
+        result_text = f"Stored memory event #{event_id} (type={event.type}, source={event.source}, valence={event.valence})"
     except Exception as e:
         log.error(f"memory_store failed: {e}", exc_info=True)
         return [TextContent(type="text", text=f"Error storing memory: {e}")]
@@ -6770,8 +6793,12 @@ async def handle_memory_search(arguments: dict[str, Any]) -> list[TextContent]:
     limit = arguments.get("limit", 10)
     project = arguments.get("project")
 
+    from .memory.provider import VALENCE_VALUES
+    raw_valence = arguments.get("valence")
+    valence = raw_valence if raw_valence in VALENCE_VALUES else None
+
     try:
-        results = _memory_provider.search(query, limit=limit, project=project)
+        results = _memory_provider.search(query, limit=limit, project=project, valence=valence)
     except Exception as e:
         log.error(f"memory_search failed: {e}", exc_info=True)
         return [TextContent(type="text", text=f"Error searching memory: {e}")]
@@ -6793,16 +6820,19 @@ async def handle_memory_search(arguments: dict[str, Any]) -> list[TextContent]:
         pass
 
     if not results:
-        return [TextContent(type="text", text=f"No memory events found for: {query}")]
+        valence_note = f" with valence={valence}" if valence else ""
+        return [TextContent(type="text", text=f"No memory events found for: {query}{valence_note}")]
 
-    lines = [f"**Memory Search Results** ({len(results)} found for \"{query}\"):"]
+    valence_label = f", valence={valence}" if valence else ""
+    lines = [f"**Memory Search Results** ({len(results)} found for \"{query}\"{valence_label}):"]
     for i, event in enumerate(results, 1):
         ts = _format_display_ts(event.timestamp, "%Y-%m-%d %I:%M %p %Z") if event.timestamp else "?"
         proj = f" [{event.project}]" if event.project else ""
         eid = f"#{event.id}" if event.id else ""
+        valence_tag = f" [{event.valence}]" if event.valence != "neutral" else ""
         # Truncate content for display
         content_preview = event.content[:200] + "..." if len(event.content) > 200 else event.content
-        lines.append(f"\n{i}. {eid} ({event.type}/{event.source}{proj}) {ts}")
+        lines.append(f"\n{i}. {eid} ({event.type}/{event.source}{proj}{valence_tag}) {ts}")
         lines.append(f"   {content_preview}")
 
     return [TextContent(type="text", text="\n".join(lines))]
