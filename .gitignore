@@ -70,3 +70,6 @@ PLAN-*.md
 # Listed here as a safety net in case someone clones into the wrong place
 .claude/user.md
 .claude/user/
+
+# Runtime output (written by async-deep-work job)
+deep-work/
