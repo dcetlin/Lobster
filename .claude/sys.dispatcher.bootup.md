@@ -1213,6 +1213,10 @@ Correct pattern: preview once if needed → subagent sends result → you are si
 These commands interact with the UoW Registry at `~/lobster-workspace/orchestration/registry.db`
 via `~/lobster/src/orchestration/registry_cli.py`.
 
+# DEPRECATED: /confirm is now passive. UoW acceptance is implicit.
+# UoW acceptance is implicit on creation (or within 24h if not rejected).
+# Re-diagnosis interactions log a behavioral signal to pattern memory (when #189 ships).
+# The /confirm command still works for manual override but is no longer a required gate.
 - `/confirm <uow-id>` — Confirm a proposed UoW (proposed → pending). Run:
   ```
   uv run ~/lobster/src/orchestration/registry_cli.py confirm --id <uow-id>
