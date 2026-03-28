@@ -22,6 +22,7 @@ import time
 import threading
 import uuid
 import httpx
+import yaml
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -2553,6 +2554,30 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="get_vision_context",
+            description=(
+                "Fetch the Vision Object — Dan's intent at three temporal scales "
+                "(core, active_project, current_focus). Returns structured YAML parsed "
+                "from ~/lobster-user-config/vision.yaml. Use this to make routing and "
+                "prioritization decisions traceable to a specific vision field rather "
+                "than inferred from prose. Accepts an optional 'section' argument to "
+                "return only one top-level key (e.g. 'core', 'active_project', "
+                "'current_focus', 'life_domains')."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "section": {
+                        "type": "string",
+                        "description": (
+                            "Optional. One of: core, active_project, current_focus, "
+                            "life_domains. If omitted, all sections are returned."
+                        ),
+                    },
+                },
+            },
+        ),
+        Tool(
             name="get_project_context",
             description="Fetch status and context for a specific project. Returns project status, recent decisions, pending items, and blockers from the canonical project file.",
             inputSchema={
@@ -3056,6 +3081,8 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
     # Convenience Tools (canonical memory readers)
     elif name == "get_priorities":
         return await handle_get_priorities(arguments)
+    elif name == "get_vision_context":
+        return await handle_get_vision_context(arguments)
     elif name == "get_project_context":
         return await handle_get_project_context(arguments)
     elif name == "get_daily_digest":
@@ -7290,6 +7317,50 @@ async def handle_get_priorities(arguments: dict[str, Any]) -> list[TextContent]:
     except Exception as e:
         log.error(f"get_priorities failed: {e}", exc_info=True)
         return [TextContent(type="text", text=f"Error reading priorities: {e}")]
+
+
+async def handle_get_vision_context(arguments: dict[str, Any]) -> list[TextContent]:
+    """Return the Vision Object (vision.yaml) as structured data.
+
+    Reads ~/lobster-user-config/vision.yaml and returns the full document or
+    a single top-level section. Returns a JSON-serialised dict so callers can
+    reference specific fields programmatically (e.g. current_focus.primary).
+    """
+    vision_path = _USER_CONFIG / "vision.yaml"
+    if not vision_path.exists():
+        # Fallback: try vision.yml
+        vision_path = _USER_CONFIG / "vision.yml"
+    if not vision_path.exists():
+        return [TextContent(
+            type="text",
+            text=json.dumps({"error": "vision.yaml not found", "looked_in": str(_USER_CONFIG)}),
+        )]
+
+    try:
+        raw = vision_path.read_text(encoding="utf-8")
+        data = yaml.safe_load(raw)
+        if not isinstance(data, dict):
+            return [TextContent(type="text", text=json.dumps({"error": "vision.yaml did not parse to a dict"}))]
+
+        section = arguments.get("section", "").strip()
+        if section:
+            if section not in data:
+                available = list(data.keys())
+                return [TextContent(
+                    type="text",
+                    text=json.dumps({"error": f"section '{section}' not found", "available_sections": available}),
+                )]
+            result = {section: data[section]}
+        else:
+            result = data
+
+        return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+    except yaml.YAMLError as e:
+        log.error(f"get_vision_context: YAML parse error: {e}", exc_info=True)
+        return [TextContent(type="text", text=json.dumps({"error": f"YAML parse error: {e}"}))]
+    except Exception as e:
+        log.error(f"get_vision_context failed: {e}", exc_info=True)
+        return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 
 
 async def handle_get_project_context(arguments: dict[str, Any]) -> list[TextContent]:
