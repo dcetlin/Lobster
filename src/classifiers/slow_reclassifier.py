@@ -565,8 +565,15 @@ def detect_complex_request(
     """
     Detect complex requests: 2+ short events (content len < 50) from same source
     within 5 minutes.
+
+    Health-check events are excluded from the clustering window — their short,
+    frequent payloads would otherwise trigger spurious complex_request detections.
     """
-    short_events = [ev for ev in cluster if len(ev.content.strip()) < COMPLEX_REQUEST_CHAR_LIMIT]
+    short_events = [
+        ev for ev in cluster
+        if len(ev.content.strip()) < COMPLEX_REQUEST_CHAR_LIMIT
+        and not ev.source.startswith("health-check")
+    ]
     short_events.sort(key=lambda e: e.timestamp)
 
     observations: list[PatternObservation] = []
