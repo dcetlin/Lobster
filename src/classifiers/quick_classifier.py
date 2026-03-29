@@ -317,6 +317,31 @@ _SIGNAL_TYPE_PATTERNS: list[tuple[str, list[str]]] = [
         "status", "how is", "what's happening", "progress", "update on",
         "any news", "where are we", "running?", "working?",
     ]),
+    # philosophy must appear before meta_reflection: philosophy messages are a
+    # strict subset of the reflective register, but require dedicated routing.
+    # A message matching philosophy keywords should not fall through to meta_reflection.
+    ("philosophy", [
+        # Conceptual / phenomenological exploration
+        "phenomenolog", "phenomenal", "qualia", "embodiment", "embodied",
+        "cognition", "enactive", "perception as", "experience of",
+        # Epistemic frameworks and theory
+        "epistemic", "ontolog", "epistemolog", "metaphysic",
+        "propositional", "propositionally",
+        # ToL arc references
+        "tree of life", "tol arc", "tol ", "arc of meaning",
+        # Philosophy-register vocabulary
+        "philosophy of", "philosophic", "philosophical",
+        "what is consciousness", "what is mind",
+        "what is experience", "nature of experience",
+        "hard problem", "explanatory gap",
+        # Conceptual exploration register
+        "conceptual exploration", "orient toward", "let's explore",
+        "what does it mean", "what would it mean",
+        "wondering about the nature", "genuinely curious about",
+        # System design philosophy (distinct from impl design)
+        "design philosophy", "architectural philosophy",
+        "first principles", "what grounds",
+    ]),
     ("meta_reflection", [
         "meta", "retrospective", "reflection", "premise", "oracle", "principle",
         "alignment", "drift", "pattern we keep", "notice that", "keep doing",
@@ -436,6 +461,10 @@ def classify_event(event: dict) -> ClassificationTag:
     signal_type = detect_signal_type(combined_text)
     urgency = detect_urgency(combined_text)
     posture_hint = detect_posture_hint(combined_text, signals)
+    # Philosophy messages always warrant attunement posture — override keyword
+    # detection which might otherwise return structural_coherence or the default.
+    if signal_type == "philosophy":
+        posture_hint = "attunement"
 
     active = signals.active_names()
     notes_parts = ["quick-pass; pending slow-reclassifier revision"]

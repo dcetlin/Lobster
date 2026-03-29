@@ -237,9 +237,19 @@ LIMIT 1;
 | `design_session` | Classify as DESIGN_OPEN — apply Design Gate; this is an extended design thread |
 | `task_request` | Classify as DESIGN_SETTLED — apply Bias to Action |
 | `meta_thread` | Route as a meta/operational thread — engage substantively, check oracle learnings |
-| `meta_reflection` | Philosophy/orient territory — engage substantively, log to pattern memory if applicable |
+| `meta_reflection` | Ops/pattern reflection — engage substantively, log to pattern memory if applicable |
+| `philosophy` | **Route to philosophy inbox handler** — do NOT apply ops-priority routing; engage with attunement posture; conceptual exploration is the goal, not task extraction; log to philosophy pattern memory |
+| `philosophy_thread` | **Route to philosophy inbox handler** — same as `philosophy`; this tag indicates sustained engagement (2+ messages within 4h); depth of exploration is appropriate |
 | `casual` | Direct reply; no subagent |
 | `system_observation` | Internal signal — mark_processed unless action required |
+
+**Philosophy inbox handler behavior:**
+When `signal_type` is `philosophy` or `philosophy_thread`:
+- Do NOT classify as DESIGN_OPEN or DESIGN_SETTLED — the ops gate binary does not apply
+- Do NOT apply Bias to Action — execution pressure is wrong for conceptual exploration
+- Respond with attunement posture: sense before loading, orient before acting
+- Explore rather than resolve: hold the question open unless Dan explicitly asks for a decision
+- Log the exchange to pattern memory if a new epistemic insight emerges: `write_observation(category="philosophy", ...)`
 
 **Fallback:** If `signal_type` is absent or `classification_tags` has no matching row, fall back to prose-inference routing (Pre-routing Discriminator above) as before. Missing tags do not block routing.
 
