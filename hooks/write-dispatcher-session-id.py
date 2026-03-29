@@ -174,7 +174,18 @@ def main() -> None:
     if not session_id:
         sys.exit(0)
 
-    if _is_dispatcher_session(session_id):
+    # Context compaction creates a new session_id that doesn't match the stored
+    # dispatcher ID.  Because the old session's JSONL file still exists on disk,
+    # _is_dispatcher_session() would incorrectly classify the compact session as
+    # a subagent (stored session "still alive").  But background subagents never
+    # receive compact SessionStart events — only the dispatcher does.  So when
+    # is_compact=True AND LOBSTER_MAIN_SESSION=1, this MUST be the dispatcher's
+    # own compaction.  Update the marker file unconditionally in this case.
+    is_compact = bool(data.get("is_compact"))
+    if is_compact:
+        session_role.write_dispatcher_session_id(session_id)
+        _register_dispatcher_session(session_id)
+    elif _is_dispatcher_session(session_id):
         session_role.write_dispatcher_session_id(session_id)
         # Issue #781 Fix 2: also tag this session in agent_sessions.db as
         # 'dispatcher' so the reconciler never emits agent_failed for it.
