@@ -498,10 +498,12 @@ The sweeper enforces typing via labels. The ready queue contains only executable
 
 **Phase 1 → Phase 2 autonomy gate (computable):**
 Phase 2 prerequisites are met when ALL of the following are true:
-1. Phase 1 has been running for ≥14 days
+1. Phase 1 has been running for ≥14 **calendar days** (measured as days elapsed since the oldest UoW record was created — not sweep run count; the sweeper runs 16×/night but this counter advances at most once per calendar day)
 2. Sweeper proposed-to-confirmed ratio ≥80% over the last 7 days (i.e., of UoWs the sweeper proposed, Dan confirmed ≥80%)
 
 Both conditions must be true simultaneously. The sweeper evaluates this metric on each run and writes a `gate_readiness` field to its output. When the gate condition is met, a human-gate UoW is surfaced to Dan with the explicit question: "Phase 2 prerequisites met — advance to autonomous label writes?"
+
+<!-- Clarified 2026-03-29: "days running" is a calendar-day count (age of oldest registry record), not a sweep-run count. With 16 runs/night the distinction is material — see issue #251. Implementation in registry.py gate_readiness() already uses calendar days correctly. -->
 
 **Estimated scope:** One subagent session to write the task definition + sweeper agent context.
 
@@ -509,7 +511,7 @@ Both conditions must be true simultaneously. The sweeper evaluates this metric o
 
 ### Phase 2 — Routing classifier + conditional hooks + autonomous label writes
 
-**Phase 2 prerequisite (autonomy gate):** Phase 1 has run for ≥14 days AND sweeper proposed-to-confirmed ratio ≥80% over the last 7 days. Gate must be explicitly confirmed via human-gate UoW before Phase 2 work begins.
+**Phase 2 prerequisite (autonomy gate):** Phase 1 has run for ≥14 **calendar days** AND sweeper proposed-to-confirmed ratio ≥80% over the last 7 days. Gate must be explicitly confirmed via human-gate UoW before Phase 2 work begins.
 
 **What gets built:**
 - Sweeper writes labels autonomously (after explicit gate crossing — see Principle 6)
