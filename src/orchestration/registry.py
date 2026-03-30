@@ -135,6 +135,7 @@ class UoW:
     route_reason: str | None = None
     steward_notes: str = ""
     success_criteria: str = ""
+    output_ref: str | None = None
     # trigger: deserialized from JSON. dict for structured triggers, str if malformed JSON,
     # None for NULL rows. evaluate_condition handles all three cases.
     trigger: dict | str | None = None
@@ -255,6 +256,7 @@ class Registry:
             route_reason=d.get("route_reason"),
             steward_notes=d.get("steward_notes") or "",
             success_criteria=d.get("success_criteria") or "",
+            output_ref=d.get("output_ref"),
             trigger=trigger,
             workflow_artifact=d.get("workflow_artifact"),
             prescribed_skills=prescribed_skills,

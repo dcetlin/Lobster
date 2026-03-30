@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from src.orchestration.registry import UoW
+
 log = logging.getLogger("steward")
 
 
@@ -164,13 +166,13 @@ def _classify_return_reason(return_reason: str | None) -> str:
     return _RETURN_REASON_CLASSIFICATIONS.get(return_reason, _CLASSIFICATION_ERROR)
 
 
-def _parse_audit_log(uow: dict[str, Any]) -> list[dict[str, Any]]:
+def _parse_audit_log(audit_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     Extract structured entries from the audit_log rows passed in.
     Returns a list of audit entries (from the `note` field, JSON-parsed).
     """
     # Audit entries are passed as a list from the registry queries
-    return uow.get("_audit_entries", [])
+    return audit_entries
 
 
 def _most_recent_return_reason(audit_entries: list[dict]) -> str | None:
@@ -303,7 +305,7 @@ def _determine_reentry_posture(
 
 
 def _assess_completion(
-    uow: dict[str, Any],
+    uow: UoW,
     output_content: str,
     reentry_posture: str,
 ) -> tuple[bool, str]:
@@ -318,11 +320,11 @@ def _assess_completion(
     - Output content confirms original intent is addressed
     - steward_cycles < HARD_CAP_CYCLES
     """
-    cycles = uow.get("steward_cycles", 0)
+    cycles = uow.steward_cycles
     if cycles >= _HARD_CAP_CYCLES:
         return False, f"hard_cap: steward_cycles={cycles} >= {_HARD_CAP_CYCLES}"
 
-    output_ref = uow.get("output_ref")
+    output_ref = uow.output_ref
     if not _output_ref_is_valid(output_ref):
         return False, "output_ref is null or file does not exist or is empty"
 
@@ -335,7 +337,7 @@ def _assess_completion(
     # Deterministic completion check: look for a structured result file.
     # The Executor is expected to write `{output_ref}.result.json` with a
     # `success: true/false` field. This is a structural proxy, not a heuristic.
-    output_ref = uow.get("output_ref")
+    output_ref = uow.output_ref
     if output_ref:
         result_file = Path(output_ref).with_suffix(".result.json")
         if not result_file.exists():
@@ -356,7 +358,7 @@ def _assess_completion(
                 log.warning("Could not parse result file %s: %s", result_file, e)
 
     # No structured result file found.
-    success_criteria = uow.get("success_criteria")
+    success_criteria = uow.success_criteria
     if success_criteria:
         # Conservative fallback: without a structured result file we cannot
         # deterministically verify completion against success_criteria.
@@ -368,11 +370,10 @@ def _assess_completion(
     else:
         # Phase 1 / legacy fallback: no success_criteria and no result file.
         # Trust the output_ref + execution_complete posture.
-        summary = uow.get("summary", "")
-        return True, f"success_criteria is NULL — output_ref present with execution_complete posture: {summary[:80]}"
+        return True, f"success_criteria is NULL — output_ref present with execution_complete posture: {uow.summary[:80]}"
 
 
-def _build_initial_agenda(uow: dict[str, Any], issue_body: str) -> list[dict[str, Any]]:
+def _build_initial_agenda(uow: "UoW", issue_body: str) -> list[dict[str, Any]]:
     """
     Build the initial steward_agenda for a new UoW (steward_cycles == 0).
 
@@ -380,8 +381,8 @@ def _build_initial_agenda(uow: dict[str, Any], issue_body: str) -> list[dict[str
     - Well-defined (concrete deliverable): full agenda upfront
     - Open-ended (exploratory): 1-2 steps + 'pending evaluation' marker
     """
-    summary = uow.get("summary", "")
-    success_criteria = uow.get("success_criteria")
+    summary = uow.summary
+    success_criteria = uow.success_criteria or None
 
     # Heuristic: well-defined if success_criteria is present and summary is specific
     is_well_defined = bool(success_criteria and len(summary) > 20)
@@ -418,13 +419,13 @@ def _build_initial_agenda(uow: dict[str, Any], issue_body: str) -> list[dict[str
         ]
 
 
-def _select_prescribed_skills(uow: dict[str, Any], reentry_posture: str) -> list[str]:
+def _select_prescribed_skills(uow: "UoW", reentry_posture: str) -> list[str]:
     """
     Select prescribed skills appropriate to the UoW type and posture.
 
     Returns a list of skill IDs.
     """
-    summary = uow.get("summary", "").lower()
+    summary = uow.summary.lower()
     skills = []
 
     if "bug" in summary or "fix" in summary or "error" in summary:
@@ -439,7 +440,7 @@ def _select_prescribed_skills(uow: dict[str, Any], reentry_posture: str) -> list
 
 
 def _build_prescription_instructions(
-    uow: dict[str, Any],
+    uow: UoW,
     reentry_posture: str,
     completion_gap: str,
 ) -> str:
@@ -448,9 +449,9 @@ def _build_prescription_instructions(
 
     The instruction is targeted at the specific gap identified.
     """
-    summary = uow.get("summary", "")
-    success_criteria = uow.get("success_criteria", "")
-    cycles = uow.get("steward_cycles", 0)
+    summary = uow.summary
+    success_criteria = uow.success_criteria
+    cycles = uow.steward_cycles
 
     if cycles == 0:
         return (
@@ -629,7 +630,7 @@ def _mark_current_agenda_node_prescribed(
 # ---------------------------------------------------------------------------
 
 def _detect_stuck_condition(
-    uow: dict[str, Any],
+    uow: UoW,
     reentry_posture: str,
     return_reason: str | None,
 ) -> str | None:
@@ -638,7 +639,7 @@ def _detect_stuck_condition(
 
     Returns the condition name string if stuck, or None if not stuck.
     """
-    cycles = uow.get("steward_cycles", 0)
+    cycles = uow.steward_cycles
 
     if cycles >= _HARD_CAP_CYCLES:
         return "hard_cap"
@@ -655,7 +656,7 @@ def _detect_stuck_condition(
 # ---------------------------------------------------------------------------
 
 def _diagnose_uow(
-    uow: dict[str, Any],
+    uow: UoW,
     audit_entries: list[dict],
     issue_info: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -677,11 +678,11 @@ def _diagnose_uow(
     reentry_posture = _determine_reentry_posture(audit_entries, return_reason)
     classification = _classify_return_reason(return_reason)
 
-    output_ref = uow.get("output_ref")
+    output_ref = uow.output_ref
     output_valid = _output_ref_is_valid(output_ref)
     output_content = _read_output_ref(output_ref) if output_valid else ""
 
-    success_criteria_missing = not uow.get("success_criteria")
+    success_criteria_missing = not uow.success_criteria
 
     is_complete, completion_rationale = _assess_completion(
         uow, output_content, reentry_posture
@@ -804,7 +805,7 @@ _DAN_CHAT_ID = "8075091586"
 
 
 def _default_notify_dan(
-    uow: dict[str, Any],
+    uow: UoW,
     condition: str,
     surface_log: str | None = None,
 ) -> None:
@@ -815,8 +816,8 @@ def _default_notify_dan(
     dispatcher surfaces it to Dan via Telegram. In tests this is replaced
     by a capturing mock via the `notify_dan` parameter.
     """
-    uow_id = uow.get("id", "unknown")
-    cycles = uow.get("steward_cycles", 0)
+    uow_id = uow.id
+    cycles = uow.steward_cycles
     log.warning(
         "SURFACE TO DAN: UoW %s — condition=%s cycles=%s",
         uow_id, condition, cycles,
@@ -871,7 +872,7 @@ def _fetch_audit_entries(registry, uow_id: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def _process_uow(
-    uow: dict[str, Any],
+    uow: UoW,
     registry,
     audit_entries: list[dict[str, Any]],
     issue_info: dict[str, Any] | None,
@@ -884,8 +885,8 @@ def _process_uow(
 
     Returns a StewardOutcome: Prescribed | Done | Surfaced | RaceSkipped.
     """
-    uow_id = uow["id"]
-    cycles = uow.get("steward_cycles", 0)
+    uow_id = uow.id
+    cycles = uow.steward_cycles
 
     # Step 1: Claim (optimistic lock) — only if not in dry-run mode
     if not dry_run:
@@ -895,8 +896,8 @@ def _process_uow(
             return RaceSkipped(uow_id=uow_id)
 
     # Step 2: Initialization ritual — write steward_agenda on first contact
-    current_agenda_str = uow.get("steward_agenda")
-    current_log_str = uow.get("steward_log")
+    current_agenda_str = uow.steward_agenda
+    current_log_str = uow.steward_log
 
     agenda: list[dict[str, Any]] = []
     if current_agenda_str:
@@ -1196,8 +1197,8 @@ def run_steward_cycle(
     considered_ids = []
 
     for uow in uows:
-        uow_id = uow["id"]
-        source_issue_number = uow.get("source_issue_number")
+        uow_id = uow.id
+        source_issue_number = uow.source_issue_number
         considered_ids.append(uow_id)
 
         # BOOTUP_CANDIDATE_GATE: skip if label present and gate is True

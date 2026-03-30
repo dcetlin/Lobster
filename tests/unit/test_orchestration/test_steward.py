@@ -662,7 +662,8 @@ class TestHardCap:
         notifications = []
 
         def capture_notification(uow, condition, surface_log=None):
-            notifications.append({"uow_id": uow["id"], "condition": condition})
+            uow_id = uow.id if hasattr(uow, "id") else uow["id"]
+            notifications.append({"uow_id": uow_id, "condition": condition})
 
         conn = _open_db(db_path)
         uow_id = _make_uow_row(
