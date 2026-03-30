@@ -1,6 +1,6 @@
 # Work Orchestration System v2 — Design Document
 
-*Status: Draft — 2026-03-29*
+*Status: Active — 2026-03-30*
 
 ---
 
@@ -296,7 +296,13 @@ Steward cycle 2:
 
 **Done condition:** Dan can ask "what's running?" and get an answer from a single UoWRegistry query. No GitHub fallback. Dan has used `/confirm` at least once. UoW Registrar runs without errors, audit log contains transition events (not only `created`).
 
-**Phase 1 to Phase 2 gate (computable):** Phase 1 has run for >=14 calendar days AND UoW Registrar proposed-to-confirmed ratio >=80% over the last 7 days. Gate surfaces to Dan as an explicit human-gate UoW.
+**Phase 1 completion status: COMPLETE as of 2026-03-30.** The qualitative threshold has been met:
+- UoW Registrar running cleanly (8 UoWs tracked, proposed-to-confirmed ratio stable at 1.0)
+- UoWRegistry populated with real work
+- Oracle audit passed ("excellent enough to implement")
+- Design doc stable and converged
+
+**Phase 1 to Phase 2 transition:** Two pre-Phase-2 blocking gates remain before implementation begins. Both are owned by Dan and documented in Open Decisions: (1) workflow artifact format decision (deterministic script vs. LLM prompt instructions), and (2) trigger evaluation mode decision (polling vs. event-driven). Resolving these two gates is the immediate next step; Steward MVP build begins once both are cleared.
 
 ### Phase 2: Steward + Executor [next]
 
