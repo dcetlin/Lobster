@@ -308,11 +308,16 @@ def _assess_completion(
     uow: UoW,
     output_content: str,
     reentry_posture: str,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str | None]:
     """
     Assess whether the UoW output satisfies the original intent (Seed).
 
-    Returns (is_complete: bool, rationale: str).
+    Returns (is_complete: bool, rationale: str, executor_outcome: str | None).
+
+    executor_outcome is the `outcome` field from the result file when found
+    (e.g. "complete", "partial", "failed", "blocked"), or None when no valid
+    result file was found. Callers must check executor_outcome == "blocked"
+    to route immediately to Dan — the is_complete flag does not encode this.
 
     Completion requires ALL of:
     - output_ref is not NULL and file exists and is non-empty
@@ -322,55 +327,92 @@ def _assess_completion(
     """
     cycles = uow.steward_cycles
     if cycles >= _HARD_CAP_CYCLES:
-        return False, f"hard_cap: steward_cycles={cycles} >= {_HARD_CAP_CYCLES}"
+        return False, f"hard_cap: steward_cycles={cycles} >= {_HARD_CAP_CYCLES}", None
 
     output_ref = uow.output_ref
     if not _output_ref_is_valid(output_ref):
-        return False, "output_ref is null or file does not exist or is empty"
+        return False, "output_ref is null or file does not exist or is empty", None
 
     if reentry_posture not in ("execution_complete", "startup_sweep_possibly_complete"):
-        return False, f"re-entry posture is {reentry_posture!r} — not a normal completion"
+        return False, f"re-entry posture is {reentry_posture!r} — not a normal completion", None
 
     if not output_content.strip():
-        return False, "output file is empty"
+        return False, "output file is empty", None
 
     # Deterministic completion check: look for a structured result file.
-    # The Executor is expected to write `{output_ref}.result.json` with a
-    # `success: true/false` field. This is a structural proxy, not a heuristic.
+    # The Executor is expected to write `{output_ref}.result.json` with the
+    # `outcome` field as the primary routing signal (executor-contract.md §Schema).
+    # `success` is a backward-compat convenience field; `outcome` is always read first.
     output_ref = uow.output_ref
     if output_ref:
         result_file = Path(output_ref).with_suffix(".result.json")
         if not result_file.exists():
-            # Also check the alternate naming convention: {stem}.result.json
+            # Also check the alternate naming convention: append .result.json suffix
             result_file_alt = Path(str(output_ref) + ".result.json")
             if result_file_alt.exists():
                 result_file = result_file_alt
         if result_file.exists():
             try:
                 result_data = json.loads(result_file.read_text(encoding="utf-8"))
-                if result_data.get("success") is True:
-                    return True, f"structured result file confirms success: {result_file.name}"
-                elif result_data.get("success") is False:
+
+                # Gap 2 (executor-contract.md): validate uow_id BEFORE reading any
+                # other field. A misrouted result file must be treated as absence.
+                result_uow_id = result_data.get("uow_id")
+                if result_uow_id is not None and result_uow_id != uow.id:
+                    log.warning(
+                        "Result file %s has uow_id=%r but expected %r — "
+                        "treating as absent (misrouted result file)",
+                        result_file, result_uow_id, uow.id,
+                    )
+                    # Fall through to the no-result-file path below
+                else:
+                    # Gap 1 (executor-contract.md): `outcome` is the primary routing
+                    # signal. Read it first; `success` is a backward-compat fallback.
+                    outcome = result_data.get("outcome")
                     reason = result_data.get("reason", "no reason provided")
-                    return False, f"structured result file reports failure: {reason}"
-                # If 'success' key is absent, fall through to conservative check
+
+                    if outcome == "complete":
+                        return True, f"outcome=complete: {result_file.name}", "complete"
+                    elif outcome == "blocked":
+                        # Gap 3: `blocked` always routes to Dan — the Executor has
+                        # determined that external resolution is required.
+                        # Return is_complete=False so the normal prescription path
+                        # is skipped; the caller must check executor_outcome for routing.
+                        return False, f"outcome=blocked: {reason}", "blocked"
+                    elif outcome in ("partial", "failed"):
+                        return False, f"outcome={outcome}: {reason}", outcome
+                    elif outcome is not None:
+                        # Unknown outcome value — conservative non-completion
+                        log.warning(
+                            "Result file %s has unknown outcome=%r — treating as non-completion",
+                            result_file, outcome,
+                        )
+                        return False, f"unknown outcome={outcome!r} in result file", outcome
+                    else:
+                        # No `outcome` field — fall back to `success` for backward
+                        # compatibility with result files written before contract v1.
+                        if result_data.get("success") is True:
+                            return True, f"structured result file confirms success (legacy): {result_file.name}", None
+                        elif result_data.get("success") is False:
+                            return False, f"structured result file reports failure (legacy): {reason}", None
+                        # If neither field is present, fall through to conservative check
             except (json.JSONDecodeError, OSError) as e:
                 log.warning("Could not parse result file %s: %s", result_file, e)
 
-    # No structured result file found.
+    # No structured result file found (or result file was invalid/misrouted).
     success_criteria = uow.success_criteria
     if success_criteria:
-        # Conservative fallback: without a structured result file we cannot
+        # Conservative fallback: without a valid result file we cannot
         # deterministically verify completion against success_criteria.
         # Do not declare done — require the Executor to write a result file.
         return False, (
             f"no structured result file ({output_ref}.result.json) found — "
             f"cannot verify success_criteria without Executor confirmation: {success_criteria[:80]}"
-        )
+        ), None
     else:
         # Phase 1 / legacy fallback: no success_criteria and no result file.
         # Trust the output_ref + execution_complete posture.
-        return True, f"success_criteria is NULL — output_ref present with execution_complete posture: {uow.summary[:80]}"
+        return True, f"success_criteria is NULL — output_ref present with execution_complete posture: {uow.summary[:80]}", None
 
 
 def _build_initial_agenda(uow: "UoW", issue_body: str) -> list[dict[str, Any]]:
@@ -684,11 +726,16 @@ def _diagnose_uow(
 
     success_criteria_missing = not uow.success_criteria
 
-    is_complete, completion_rationale = _assess_completion(
+    is_complete, completion_rationale, executor_outcome = _assess_completion(
         uow, output_content, reentry_posture
     )
 
     stuck_condition = _detect_stuck_condition(uow, reentry_posture, return_reason)
+
+    # Gap 3 (executor-contract.md): `blocked` outcome always routes to Dan.
+    # Override stuck_condition here so _process_uow uses the existing surface path.
+    if executor_outcome == "blocked" and stuck_condition is None:
+        stuck_condition = "executor_blocked"
 
     # Hard cap overrides completion
     if stuck_condition == "hard_cap":
@@ -703,6 +750,7 @@ def _diagnose_uow(
         "is_complete": is_complete,
         "completion_rationale": completion_rationale,
         "stuck_condition": stuck_condition,
+        "executor_outcome": executor_outcome,
         "success_criteria_missing": success_criteria_missing,
     }
 

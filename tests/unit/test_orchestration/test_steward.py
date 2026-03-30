@@ -498,9 +498,6 @@ class TestCompletionPath:
 
         output_file = tmp_path / "output.txt"
         output_file.write_text("Task completed successfully. All acceptance criteria met.")
-        # Write structured result file so the Steward can deterministically assess completion
-        result_file = tmp_path / "output.result.json"
-        result_file.write_text(json.dumps({"success": True, "reason": "all criteria met"}))
 
         audit_entries = [
             {"event": "execution_complete", "actor": "executor",
@@ -517,6 +514,15 @@ class TestCompletionPath:
             success_criteria="Task completed successfully.",
         )
         conn.close()
+
+        # Write structured result file with uow_id and outcome (executor-contract.md §Schema)
+        result_file = tmp_path / "output.result.json"
+        result_file.write_text(json.dumps({
+            "uow_id": uow_id,
+            "outcome": "complete",
+            "success": True,
+            "reason": "all criteria met",
+        }))
 
         steward.run_steward_cycle(
             registry=registry,
@@ -541,9 +547,6 @@ class TestCompletionPath:
 
         output_file = tmp_path / "output.txt"
         output_file.write_text("Task completed successfully.")
-        # Write structured result file for deterministic completion assessment
-        result_file = tmp_path / "output.result.json"
-        result_file.write_text(json.dumps({"success": True, "reason": "task done"}))
 
         agenda = json.dumps([
             {"posture": "solo", "context": "initial", "constraints": [], "status": "prescribed"},
@@ -564,6 +567,15 @@ class TestCompletionPath:
             success_criteria="Task completed successfully.",
         )
         conn.close()
+
+        # Write structured result file with uow_id and outcome (executor-contract.md §Schema)
+        result_file = tmp_path / "output.result.json"
+        result_file.write_text(json.dumps({
+            "uow_id": uow_id,
+            "outcome": "complete",
+            "success": True,
+            "reason": "task done",
+        }))
 
         steward.run_steward_cycle(
             registry=registry,
