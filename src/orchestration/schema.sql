@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS uow_registry (
 
     -- Phase 2 fields — Executor-accessible (included in executor_uow_view)
     workflow_artifact   TEXT    NULL,
-    success_criteria    TEXT    NULL,
+    success_criteria    TEXT    NOT NULL DEFAULT '',
     prescribed_skills   TEXT    NULL,
     steward_cycles      INTEGER NOT NULL DEFAULT 0,
     timeout_at          TEXT    NULL,

@@ -181,7 +181,9 @@ class TestPhase2FieldsPresent:
 
     def test_nullable_fields_default_null(self, migrated_db):
         """workflow_artifact, prescribed_skills, timeout_at, estimated_runtime,
-        steward_agenda, steward_log, success_criteria all default to NULL."""
+        steward_agenda, steward_log all default to NULL.
+        success_criteria defaults to '' (NOT NULL DEFAULT '') — excluded from
+        the nullable_fields list and checked separately."""
         conn = _open_db(migrated_db)
         try:
             import uuid
@@ -204,10 +206,14 @@ class TestPhase2FieldsPresent:
             ).fetchone()
             nullable_fields = [
                 "workflow_artifact", "prescribed_skills", "timeout_at",
-                "estimated_runtime", "steward_agenda", "steward_log", "success_criteria",
+                "estimated_runtime", "steward_agenda", "steward_log",
             ]
             for field in nullable_fields:
                 assert row[field] is None, f"Expected NULL for {field}, got {row[field]}"
+            # success_criteria is NOT NULL DEFAULT '' — defaults to empty string, not NULL
+            assert row["success_criteria"] == "", (
+                f"Expected '' for success_criteria, got {row['success_criteria']!r}"
+            )
         finally:
             conn.close()
 
@@ -312,7 +318,7 @@ class TestPartialMigrationResumability:
         conn = _open_db(db_path)
         try:
             conn.execute("ALTER TABLE uow_registry ADD COLUMN workflow_artifact TEXT NULL")
-            conn.execute("ALTER TABLE uow_registry ADD COLUMN success_criteria TEXT NULL")
+            conn.execute("ALTER TABLE uow_registry ADD COLUMN success_criteria TEXT NOT NULL DEFAULT ''")
             conn.execute("ALTER TABLE uow_registry ADD COLUMN prescribed_skills TEXT NULL")
             conn.commit()
         finally:
@@ -356,7 +362,8 @@ class TestPreMigrationUoWSurvival:
         assert "error" not in record, f"get() returned error: {record}"
         assert record["id"] == uow_id
         assert record["workflow_artifact"] is None
-        assert record["success_criteria"] is None
+        # success_criteria is NOT NULL DEFAULT '' — pre-migration rows get '' after migration
+        assert record["success_criteria"] == ""
         assert record["prescribed_skills"] is None
         assert record["steward_cycles"] == 0
         assert record["timeout_at"] is None
@@ -375,7 +382,9 @@ class TestPreMigrationUoWSurvival:
         record = reg.get(uow_id)
         assert "error" not in record
         assert record["workflow_artifact"] is None
-        assert record["success_criteria"] is None
+        # success_criteria is NOT NULL DEFAULT '' — new UoWs default to ''
+        # (Application layer: UoW Registrar must reject empty success_criteria at germination)
+        assert record["success_criteria"] == ""
         assert record["prescribed_skills"] is None
         assert record["steward_cycles"] == 0
         assert record["timeout_at"] is None
@@ -549,11 +558,12 @@ class TestValidatePhase2Schema:
             # Add all Phase 2 fields except steward_agenda and steward_log
             for field in PHASE2_FIELDS:
                 if field not in ("steward_agenda", "steward_log"):
-                    col_type = (
-                        "INTEGER NOT NULL DEFAULT 0"
-                        if field == "steward_cycles"
-                        else "TEXT NULL"
-                    )
+                    if field == "steward_cycles":
+                        col_type = "INTEGER NOT NULL DEFAULT 0"
+                    elif field == "success_criteria":
+                        col_type = "TEXT NOT NULL DEFAULT ''"
+                    else:
+                        col_type = "TEXT NULL"
                     conn.execute(
                         f"ALTER TABLE uow_registry ADD COLUMN {field} {col_type}"
                     )

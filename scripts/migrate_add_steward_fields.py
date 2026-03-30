@@ -56,7 +56,11 @@ _PHASE2_COLUMNS: list[tuple[str, str, bool]] = [
 
     # Prose statement of what completion looks like. Written at germination;
     # immutable thereafter. Executor-accessible (used in evaluate_condition).
-    ("success_criteria", "TEXT NULL", True),
+    # NOT NULL DEFAULT '': SQLite requires a DEFAULT for NOT NULL columns in
+    # ALTER TABLE ADD COLUMN. The effective non-empty constraint is enforced at
+    # the application layer (UoW Registrar rejects germination with empty
+    # success_criteria). The DEFAULT '' is a schema-layer safety net only.
+    ("success_criteria", "TEXT NOT NULL DEFAULT ''", True),
 
     # Skill IDs to load at Executor task start. JSON array string (same
     # pattern as hooks_applied). NULL = not yet prescribed. Executor-accessible.
