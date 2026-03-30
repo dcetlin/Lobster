@@ -125,6 +125,34 @@ Every transition is written to the audit log before it is considered to have hap
 
 ---
 
+## UoW Record Schema
+
+Each UoW entry in the UoWRegistry has the following fields. Fields are written at creation unless noted.
+
+| Field | Type | Written at | Description |
+|-------|------|-----------|-------------|
+| `id` | `TEXT` (UUID) | creation | Primary key. Unique per UoW. |
+| `issue_id` | `TEXT` | creation | GitHub issue ID (e.g. `"SiderealPress/lobster#142"`). Idempotency key — duplicate proposals for the same issue are a no-op (see Crash Recovery and Idempotency). |
+| `issue_url` | `TEXT` | creation | Full GitHub issue URL. |
+| `title` | `TEXT` | creation | Issue title at proposal time. |
+| `status` | `TEXT` | every transition | Current state (see State Machine above). |
+| `proposed_at` | `TEXT` (ISO-8601) | creation | When the UoW Registrar created this record. |
+| `confirmed_at` | `TEXT` (ISO-8601) \| `NULL` | Dan `/confirm` | When Dan confirmed. `NULL` until confirmed. |
+| `claimed_at` | `TEXT` (ISO-8601) \| `NULL` | Executor claim | When an Executor claimed this UoW and set status to `active`. |
+| `estimated_runtime` | `INTEGER` (seconds) \| `NULL` | creation or Steward prescription | Optional. Set by the proposer or Steward when scope is estimable. Used to compute `timeout_at`. |
+| `timeout_at` | `TEXT` (ISO-8601) \| `NULL` | Executor claim | Computed as `claimed_at + estimated_runtime` if `estimated_runtime` is set; otherwise `claimed_at + 1800` (30 min default). The Observation Loop compares `NOW()` against `timeout_at` for any `active` record to detect silent stalls. |
+| `output_file` | `TEXT` \| `NULL` | Executor claim | Written by the Executor when it claims the UoW. Full path to the Executor's output artifact. Enables crash recovery: if the Executor crashes, `output_file` is the last known artifact. The startup sweep checks `output_file` existence to classify stale-active records as potentially-complete vs. crashed. |
+| `workflow_artifact` | `TEXT` \| `NULL` | Steward prescription | Path to the workflow artifact written by the Steward. |
+| `prescribed_skills` | `TEXT` (JSON array) \| `NULL` | Steward prescription | Skill IDs to be loaded by the Executor at task start. |
+| `steward_cycles` | `INTEGER` | Steward re-entry | Count of Steward diagnosis/prescription cycles completed on this UoW. |
+| `audit_log` | JSON array \| external table | every event | Ordered audit entries. Each entry: `{event, actor, timestamp, note}`. Every state transition is appended here before the transition is considered complete. |
+| `route_reason` | `TEXT` \| `NULL` | Classifier | Human-readable rationale for the posture assigned by the Routing Classifier. |
+| `hooks_applied` | `TEXT` (JSON array) \| `NULL` | hook execution | Hook IDs that fired on this UoW. |
+| `closed_at` | `TEXT` (ISO-8601) \| `NULL` | Steward closure | When the Steward declared `done`. |
+| `parent_id` | `TEXT` \| `NULL` | creation | Parent UoW ID for sub-UoWs spawned by spec-breakdown. `NULL` for root UoWs. |
+
+---
+
 ## Composable Primitives
 
 The Steward selects from a library of named workflow primitives. Each primitive is a well-specified unit — not a vague instruction. The Executor runs whichever primitive the Steward prescribes.
@@ -166,14 +194,31 @@ Runs nightly at 3am. Scans the GitHub issue backlog for issues meeting defined c
 
 The UoW Registrar is the bridge between the pre-Registry layer (GitHub issues as seed substrate) and the execution substrate (UoWRegistry). It performs four functions: (1) reads GitHub issues, (2) identifies qualifying ones (gate criteria met), (3) creates UoW entries in the UoWRegistry, (4) manages lifecycle (expired proposals, stale-active detection).
 
+**Nightly sweep algorithm:**
+```
+for each GitHub issue meeting gate criteria:
+    if UoWRegistry.exists(issue_id=issue.id):
+        continue  # idempotent — no duplicate UoWs
+    create proposed UoW record with issue_id, issue_url, title, proposed_at
+    write to audit_log: {event: "proposed", actor: "registrar", ...}
+
+for each UoW where status == "proposed" and proposed_at < NOW() - 14d:
+    transition to "expired"
+    write to audit_log: {event: "expired", actor: "registrar", ...}
+
+for each UoW where status == "active":
+    if timeout_at IS NOT NULL and NOW() > timeout_at:
+        surface to Steward: stall detected, timeout_at exceeded
+```
+
 ### Steward Heartbeat
 
 Runs on a cron heartbeat (initially ~3 minutes). Queries for UoWs in `ready-for-steward` state. For each, the Steward:
 
-1. **Diagnoses** — reads the UoW trail (original intent, prior prescriptions, execution logs, current UoWRegistry state, Vision Object context). Writes the diagnosis to the audit trail before prescribing.
-2. **Prescribes** — selects a workflow primitive with a written rationale. Writes the prescription (named workflow + artifact path) to the audit trail. Transitions UoW to `ready-for-executor`.
-3. **Evaluates** (on re-entry after execution) — reads execution results, re-diagnoses fresh, decides: loop again or declare closure.
-4. **Closes** — writes a closing diagnosis when convergence conditions are met. Transitions to `done`.
+1. **Diagnoses** — reads the UoW trail (original intent, prior prescriptions, execution logs, current UoWRegistry state, Vision Object context). Writes the diagnosis to the audit trail before prescribing. **Diagnosis inputs:** `{uow_record, audit_log, output_file contents if exists, steward_cycles count, Dan's current register from context}`. **Diagnosis output:** a written assessment logged to `audit_log` before any prescription is written.
+2. **Prescribes** — selects a workflow primitive with a written rationale. Writes the prescription (named workflow + artifact path) to the audit trail. Transitions UoW to `ready-for-executor`. **Prescription output written to UoW record:** `{workflow_artifact: <path>, prescribed_skills: [...], route_reason: <rationale>}`.
+3. **Evaluates** (on re-entry after execution) — reads execution results (from `output_file` and `audit_log`), re-diagnoses fresh, decides: loop again or declare closure. Increments `steward_cycles`.
+4. **Closes** — writes a closing diagnosis when convergence conditions are met. Transitions to `done`. Sets `closed_at`.
 
 The Steward surfaces to Dan under three conditions: (1) something is severely wrong and outside confident operating range; (2) Dan's perspective would materially change the prescription; (3) the Steward has prescribed the same primitive twice with no new input in the audit trail (convergence-velocity proxy for orientation distortion — the Steward cannot reliably detect its own distortion from inside it, so this is measured externally).
 
@@ -190,6 +235,14 @@ The Steward's diagnostic function has a developmental dimension distinct from th
 
 Picks up UoWs in `ready-for-executor` state. Carries out the prescribed workflow as specified in the workflow artifact. Writes execution results to an output artifact. Transitions the UoW back to `ready-for-steward` with the execution log. The Executor does not diagnose or decide — it executes and reports.
 
+**Executor claim sequence (atomic):**
+1. Transition UoW status from `ready-for-executor` to `active`.
+2. Write `claimed_at = NOW()` to UoW record.
+3. Write `output_file = <path to output artifact>` to UoW record. This is the ground-truth re-entry point: if the Executor crashes mid-execution, `output_file` is the last known artifact and the startup sweep uses it to classify the record.
+4. Compute and write `timeout_at = claimed_at + estimated_runtime` (or default 30 min if `estimated_runtime` is NULL).
+5. Append `{event: "claimed", actor: "executor", claimed_at, output_file, timeout_at}` to audit_log.
+6. Begin executing the prescribed workflow.
+
 The Steward/Executor loop continues until the Steward declares convergence:
 
 ```
@@ -199,6 +252,41 @@ Steward → Executor → Steward → Executor → ... → Steward declares done
 ### Observation Loop
 
 META monitors the UoWRegistry and audit log for degradation signals: dark pipeline (no audit entries for >3 days), orphaned active records, ready-queue growth without drain, stale count accumulation, issue-open rate exceeding close rate for >2 consecutive weeks. When a signal fires, META surfaces it to Dan with evidence, not guesswork.
+
+**Stall detection:** On each Observation Loop pass, for every UoW where `status = 'active'` and `timeout_at IS NOT NULL`: if `NOW() > timeout_at`, the record is a stall candidate. Surface to Steward: `{uow_id, claimed_at, timeout_at, output_file, elapsed}`. The Steward classifies and decides — the Observation Loop only detects and surfaces, never acts unilaterally.
+
+### Crash Recovery and Idempotency
+
+These four properties are required for the system to be safe to operate continuously. They are sourced from battle-tested patterns in Lobster's `register_agent` / session_store system (`~/lobster/src/agents/tracker.py`, `~/lobster/src/mcp/inbox_server.py`) — the same durability properties that make Lobster's background agent lifecycle reliable.
+
+**1. Timeout and estimated_runtime**
+
+Every UoW in `active` state has a `timeout_at` timestamp computed at claim time. `estimated_runtime` (optional, set at proposal time or by the Steward) drives the computation; the default is 1800 seconds (30 min). The Observation Loop checks `timeout_at` on each pass. A UoW that exceeds `timeout_at` without transitioning is a silent stall — it is surfaced to the Steward for classification (crashed vs. slow vs. legitimate blocking condition). This prevents `active` records from disappearing into silence.
+
+**2. Executor writes output_file at claim time**
+
+When an Executor claims a UoW, it writes the `output_file` path to the UoW record before beginning execution. This is not optional. The `output_file` field is the last known artifact pointer: if the Executor crashes mid-execution, the UoW record contains the path to whatever was written before the crash. The startup sweep (below) uses `output_file` to distinguish completed-before-crash from nothing-written.
+
+**3. Steward startup sweep for orphaned-active UoWs**
+
+At Steward startup (and on a periodic sweep, frequency: configurable, default: every 15 minutes), scan UoWRegistry for UoWs where `status = 'active'`. For each:
+```
+if output_file IS NOT NULL and os.path.exists(output_file):
+    surface to Steward as "potentially complete" — Executor may have finished before crash.
+    Steward reviews output_file, decides: accept as complete or re-queue.
+else:
+    surface to Steward as "crashed with no output" — nothing was written.
+    Steward decides: re-queue (transition back to ready-for-executor) or escalate to Dan.
+```
+This is the crash recovery path. The sweep does not act unilaterally — it classifies and presents. The Steward makes the decision and writes it to the audit log.
+
+**4. Idempotent proposal creation keyed on issue_id**
+
+Creating a UoW proposal for a GitHub issue that already has a UoW in the Registry is a no-op — the UoW Registrar checks `issue_id` before creating new records and returns the existing record without modification. This prevents duplicate UoWs from accumulating across sweep re-runs, restarts, or manual triggers. The check is the first operation in the nightly sweep loop (see UoW Registrar algorithm above).
+
+> **Golden patterns reference:** Items 1–4 above are directly sourced from Lobster's battle-tested agent lifecycle implementation in `~/lobster/src/agents/tracker.py` and `~/lobster/src/mcp/inbox_server.py`. The `register_agent` / `session_store` system implements the same four properties — liveness detection via `timeout_minutes` + mtime polling, `output_file` as ground-truth artifact pointer, startup sweep over stale active sessions, and idempotent session creation. WOS adopts these patterns at the UoW level.
+
+---
 
 ### Dan Interrupt
 
