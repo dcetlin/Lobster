@@ -916,16 +916,21 @@ def _default_notify_dan(
 def _default_notify_dan_early_warning(
     uow: UoW,
     return_reason: str | None,
+    new_cycles: int | None = None,
 ) -> None:
     """
     Send an early-warning notification to Dan when steward_cycles reaches
     _EARLY_WARNING_CYCLES (4), one cycle before the hard cap.
 
+    new_cycles is the post-prescription cycle count (uow.steward_cycles + 1).
+    Pass it explicitly so the message reflects the cycle count after prescription,
+    not the stale pre-prescription value on the UoW object.
+
     Uses the same inbox path as _default_notify_dan. In tests, override via
     the `notify_dan_early_warning` parameter on run_steward_cycle / _process_uow.
     """
     uow_id = uow.id
-    cycles = uow.steward_cycles
+    cycles = new_cycles if new_cycles is not None else uow.steward_cycles
     admin_chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", _DAN_CHAT_ID)
     log.warning(
         "WOS EARLY WARNING: UoW %s at cycle %s — approaching hard cap (%s)",
@@ -1253,7 +1258,7 @@ def _process_uow(
     # Fires regardless of dry_run so tests can capture the notification.
     if new_cycles == _EARLY_WARNING_CYCLES:
         _notify_early = notify_dan_early_warning or _default_notify_dan_early_warning
-        _notify_early(uow, return_reason)
+        _notify_early(uow, return_reason, new_cycles)
 
     return Prescribed(uow_id=uow_id, cycles=new_cycles)
 

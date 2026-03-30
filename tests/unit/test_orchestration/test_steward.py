@@ -1289,9 +1289,9 @@ class TestEarlyWarningAt4:
 
         early_warnings = []
 
-        def capture_early_warning(uow, return_reason):
+        def capture_early_warning(uow, return_reason, new_cycles=None):
             uow_id = uow.id if hasattr(uow, "id") else uow["id"]
-            early_warnings.append({"uow_id": uow_id, "return_reason": return_reason})
+            early_warnings.append({"uow_id": uow_id, "return_reason": return_reason, "new_cycles": new_cycles})
 
         audit_entries = [
             {"event": "execution_complete", "actor": "executor",
@@ -1328,6 +1328,10 @@ class TestEarlyWarningAt4:
             f"Early warning must fire exactly once when new_cycles == 4, got: {early_warnings}"
         )
         assert early_warnings[0]["uow_id"] == uow_id
+        assert early_warnings[0]["new_cycles"] == 4, (
+            f"new_cycles passed to early warning must be 4 (post-prescription), "
+            f"got: {early_warnings[0]['new_cycles']}"
+        )
 
     def test_early_warning_not_fired_at_cycle_3(self, db_path, registry, tmp_path):
         """No early warning when new steward_cycles is 3 (only fires at exactly 4)."""
@@ -1336,7 +1340,7 @@ class TestEarlyWarningAt4:
 
         early_warnings = []
 
-        def capture_early_warning(uow, return_reason):
+        def capture_early_warning(uow, return_reason, new_cycles=None):
             early_warnings.append(return_reason)
 
         audit_entries = [
@@ -1376,7 +1380,7 @@ class TestEarlyWarningAt4:
         early_warnings = []
         surface_calls = []
 
-        def capture_early_warning(uow, return_reason):
+        def capture_early_warning(uow, return_reason, new_cycles=None):
             early_warnings.append(return_reason)
 
         def capture_notification(uow, condition, surface_log=None, return_reason=None):
