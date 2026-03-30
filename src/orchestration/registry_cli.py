@@ -133,6 +133,7 @@ def cmd_gate_readiness(registry: Registry, args: argparse.Namespace) -> None:
     gs = registry.registry_health()
     _output({
         "gate_met": gs.gate_met,
+        "phase": "phase_1_complete_phase_2_active",
         "days_running": gs.days_running,
         "proposed_to_confirmed_ratio_7d": gs.approval_rate,
         "reason": gs.reason,
