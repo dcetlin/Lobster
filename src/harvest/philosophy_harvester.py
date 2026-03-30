@@ -4,10 +4,17 @@ philosophy_harvester.py — parse Action Seeds from a philosophy-explore .md fil
 and route each item to its destination: GitHub issues, bootup candidates queue,
 and memory.db observations.
 
+Also invokes the frontier classifier/router (src/harvest/frontier_classifier.py
+and src/harvest/frontier_router.py) after action-seed processing. When the session
+constitutes genuine re-engagement with one or more living frontier domains, the
+router appends a structured entry to the corresponding frontier document in
+~/lobster-user-config/memory/canonical/frontiers/.
+
 Usage:
     uv run src/harvest/philosophy_harvester.py <path_to_output_md>
     uv run src/harvest/philosophy_harvester.py --help
     uv run src/harvest/philosophy_harvester.py --dry-run <path_to_output_md>
+    uv run src/harvest/philosophy_harvester.py --no-frontier <path_to_output_md>
 """
 
 import argparse
@@ -62,6 +69,7 @@ class HarvestResult:
     queued_bootup: tuple[Path, ...]             # paths to written pending files
     stored_observations: int
     errors: tuple[str, ...]
+    frontier_domains_routed: tuple[str, ...]   # domain names updated in frontier docs
 
 
 # ---------------------------------------------------------------------------
@@ -268,10 +276,11 @@ def send_telegram_summary(
     filed: list[dict[str, Any]],
     queued_bootup: int,
     stored_obs: int,
+    frontier_domains: list[str],
     dry_run: bool,
 ) -> None:
     """Send a Telegram summary via the lobster-inbox send_reply tool."""
-    if not filed and queued_bootup == 0 and stored_obs == 0:
+    if not filed and queued_bootup == 0 and stored_obs == 0 and not frontier_domains:
         print("  No items to report — skipping Telegram notification.")
         return
 
@@ -292,6 +301,11 @@ def send_telegram_summary(
     if stored_obs:
         parts.append(
             f"\n{stored_obs} memory observation{'s' if stored_obs != 1 else ''} stored."
+        )
+    if frontier_domains:
+        domain_list = ", ".join(frontier_domains)
+        parts.append(
+            f"\nFrontier docs updated: {domain_list}."
         )
 
     message = "\n".join(parts)
@@ -322,6 +336,8 @@ def harvest(
     pending_dir: Path,
     chat_id: int,
     dry_run: bool,
+    frontier_dir: Path | None = None,
+    skip_frontier: bool = False,
 ) -> HarvestResult:
     """
     Top-level harvest function. Reads the .md file, parses action_seeds,
@@ -330,6 +346,11 @@ def harvest(
     Structured as a pipeline of pure transformation followed by bounded
     side-effectful execution. Errors per-item are collected rather than
     aborting the whole run.
+
+    After action-seed routing, also runs frontier classification and routing
+    (unless skip_frontier=True). The frontier router detects whether this
+    session constitutes genuine re-engagement with one or more frontier domains
+    and appends a structured entry to the corresponding frontier document.
     """
     seeds = load_action_seeds(md_path)
     if seeds is None:
@@ -339,6 +360,7 @@ def harvest(
             queued_bootup=(),
             stored_observations=0,
             errors=(),
+            frontier_domains_routed=(),
         )
 
     total = (
@@ -388,6 +410,56 @@ def harvest(
             print(f"  ERROR: {msg}")
             errors.append(msg)
 
+    # --- Frontier document routing ---
+    frontier_domains: list[str] = []
+    if not skip_frontier:
+        try:
+            from .frontier_classifier import classify_session
+            from .frontier_router import route_to_frontiers
+
+            effective_frontier_dir = frontier_dir or (
+                Path.home() / "lobster-user-config" / "memory" / "canonical" / "frontiers"
+            )
+            text = md_path.read_text(encoding="utf-8")
+
+            # Re-parse the raw action_seeds dict for explicit frontier_advances
+            raw_seeds_dict: dict | None = None
+            yaml_text = extract_yaml_block(text)
+            if yaml_text:
+                try:
+                    raw_seeds_dict = yaml.safe_load(yaml_text)
+                except Exception:
+                    pass
+
+            classification = classify_session(
+                text=text,
+                source_path=md_path,
+                frontier_dir=effective_frontier_dir,
+                action_seeds=raw_seeds_dict,
+            )
+
+            if classification.has_re_engagement():
+                domains_str = ", ".join(classification.re_engagement_domains)
+                print(f"  Frontier re-engagement detected: {domains_str}")
+                route_result = route_to_frontiers(
+                    classification=classification,
+                    session_text=text,
+                    source_filename=md_path.name,
+                    frontier_dir=effective_frontier_dir,
+                    dry_run=dry_run,
+                )
+                frontier_domains = list(route_result.routes[i].label
+                                        for i, r in enumerate(route_result.routes)
+                                        if route_result.routes[i].appended)
+                for err in route_result.errors:
+                    errors.append(f"Frontier routing: {err}")
+            else:
+                print("  Frontier classifier: no re-engagement detected.")
+        except Exception as exc:
+            msg = f"Frontier routing failed: {exc}"
+            print(f"  WARNING: {msg}")
+            errors.append(msg)
+
     # --- Send Telegram summary ---
     try:
         send_telegram_summary(
@@ -396,6 +468,7 @@ def harvest(
             filed=filed,
             queued_bootup=len(queued),
             stored_obs=stored,
+            frontier_domains=frontier_domains,
             dry_run=dry_run,
         )
     except Exception as exc:
@@ -406,6 +479,7 @@ def harvest(
         queued_bootup=tuple(queued),
         stored_observations=stored,
         errors=tuple(errors),
+        frontier_domains_routed=tuple(frontier_domains),
     )
 
 
@@ -419,7 +493,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Parse the action_seeds block from a philosophy-explore .md output file "
             "and route each item to its destination: GitHub issues, bootup candidates "
-            "queue, and memory.db observations."
+            "queue, memory.db observations, and living frontier documents."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -427,6 +501,7 @@ Examples:
   uv run src/harvest/philosophy_harvester.py output.md
   uv run src/harvest/philosophy_harvester.py --dry-run output.md
   uv run src/harvest/philosophy_harvester.py --repo dcetlin/Lobster output.md
+  uv run src/harvest/philosophy_harvester.py --no-frontier output.md
         """,
     )
     parser.add_argument(
@@ -457,6 +532,18 @@ Examples:
         default=8075091586,
         help="Telegram chat ID for summary notification (default: 8075091586)",
     )
+    parser.add_argument(
+        "--frontier-dir",
+        default=str(
+            Path.home() / "lobster-user-config" / "memory" / "canonical" / "frontiers"
+        ),
+        help="Directory containing living frontier documents (default: ~/lobster-user-config/memory/canonical/frontiers/)",
+    )
+    parser.add_argument(
+        "--no-frontier",
+        action="store_true",
+        help="Skip frontier document routing",
+    )
     return parser
 
 
@@ -477,6 +564,7 @@ def main() -> int:
         return 1
 
     pending_dir = Path(args.pending_dir).expanduser().resolve()
+    frontier_dir = Path(args.frontier_dir).expanduser().resolve()
 
     print(f"Harvesting: {md_path}")
     if args.dry_run:
@@ -488,12 +576,16 @@ def main() -> int:
         pending_dir=pending_dir,
         chat_id=args.chat_id,
         dry_run=args.dry_run,
+        frontier_dir=frontier_dir,
+        skip_frontier=args.no_frontier,
     )
 
     print(f"\nHarvest complete:")
     print(f"  Issues filed:          {len(result.filed_issues)}")
     print(f"  Bootup candidates:     {len(result.queued_bootup)}")
     print(f"  Memory observations:   {result.stored_observations}")
+    print(f"  Frontier docs updated: {len(result.frontier_domains_routed)}"
+          + (f" ({', '.join(result.frontier_domains_routed)})" if result.frontier_domains_routed else ""))
     if result.errors:
         print(f"  Errors ({len(result.errors)}):")
         for err in result.errors:
