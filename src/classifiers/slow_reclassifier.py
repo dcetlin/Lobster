@@ -730,6 +730,40 @@ def build_revised_tag(
     )
 
 
+def build_passthrough_tag(event_id: int, quick_tag: dict | None) -> ClassificationTag:
+    """
+    Build a slow-v1 ClassificationTag for an event that was examined but matched
+    no cross-event pattern. Carries forward the quick-v1 signal flags and dimensions
+    unchanged, marking the event as 'reviewed, no pattern' so future passes skip it.
+
+    Without this, events with no pattern match never receive a slow-v1 tag and are
+    re-fetched (and re-examined for patterns) on every subsequent cycle.
+    """
+    sig_a = bool(quick_tag.get("signal_a", 0)) if quick_tag else False
+    sig_b = bool(quick_tag.get("signal_b", 0)) if quick_tag else False
+    sig_c = bool(quick_tag.get("signal_c", 0)) if quick_tag else False
+    sig_d = bool(quick_tag.get("signal_d", 0)) if quick_tag else False
+    sig_e = bool(quick_tag.get("signal_e", 0)) if quick_tag else False
+    significant = sig_a or sig_b or sig_c or sig_d or sig_e
+
+    return ClassificationTag(
+        entry_id=str(event_id),
+        entry_type="event",
+        classifier="slow-v1",
+        significant=significant,
+        signal_a=sig_a,
+        signal_b=sig_b,
+        signal_c=sig_c,
+        signal_d=sig_d,
+        signal_e=sig_e,
+        confidence="low",
+        signal_type=quick_tag.get("signal_type", "system_observation") if quick_tag else "system_observation",
+        urgency=quick_tag.get("urgency", "normal") if quick_tag else "normal",
+        posture_hint=quick_tag.get("posture_hint", "minimal_cognitive_friction") if quick_tag else "minimal_cognitive_friction",
+        notes="reviewed by slow-v1 | no cross-event pattern detected",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main processing pass
 # ---------------------------------------------------------------------------
@@ -764,6 +798,7 @@ def run_pass(conn: sqlite3.Connection) -> tuple[int, int, int]:
     tags_revised = 0
     patterns_found = 0
     processed_event_ids: set[int] = set()
+    pattern_event_ids: set[int] = set()
 
     for cluster in clusters:
         patterns = detect_all_patterns(cluster, quick_tags)
@@ -785,8 +820,19 @@ def run_pass(conn: sqlite3.Connection) -> tuple[int, int, int]:
                 revised = build_revised_tag(event_id, pattern, quick_tag)
                 write_tag(conn, revised)
                 tags_revised += 1
+                pattern_event_ids.add(event_id)
 
         processed_event_ids.update(e.id for e in cluster)
+
+    # Write passthrough slow-v1 tags for events that were examined but matched no
+    # pattern. Without this, they have no slow-v1 tag and are re-fetched and
+    # re-examined on every subsequent cycle, producing identical "0 patterns found"
+    # output indefinitely.
+    unmatched_ids = processed_event_ids - pattern_event_ids
+    for event_id in unmatched_ids:
+        quick_tag = quick_tags.get(event_id)
+        passthrough = build_passthrough_tag(event_id, quick_tag)
+        write_tag(conn, passthrough)
 
     return len(processed_event_ids), tags_revised, patterns_found
 
