@@ -2697,6 +2697,21 @@ conn.close()
         fi
     fi
 
+    # Migration 55: Add transcription-monitor cron entry
+    # transcription-monitor.py pings the user every 5 minutes while whisper-cli
+    # is running, providing progress feedback during long transcriptions (e.g. a
+    # 16-minute audio that takes 30+ minutes to process). Self-silencing: exits
+    # immediately with no outbox write when whisper-cli is not running.
+    local TRANSCRIPTION_MONITOR_MARKER="# LOBSTER-TRANSCRIPTION-MONITOR"
+    if ! crontab -l 2>/dev/null | grep -q "$TRANSCRIPTION_MONITOR_MARKER"; then
+        local monitor_script="$LOBSTER_DIR/scheduled-tasks/transcription-monitor.py"
+        chmod +x "$monitor_script" 2>/dev/null || true
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$TRANSCRIPTION_MONITOR_MARKER" \
+            "*/5 * * * * cd $LOBSTER_DIR && uv run scheduled-tasks/transcription-monitor.py $TRANSCRIPTION_MONITOR_MARKER"
+        substep "Added transcription-monitor cron entry (every 5 minutes, self-silencing)"
+        migrated=$((migrated + 1))
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

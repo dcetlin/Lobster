@@ -1386,6 +1386,15 @@ chmod +x "$INSTALL_DIR/scheduled-tasks/export-logs.py" 2>/dev/null || true
 
 success "Log export configured (runs at 03:00 UTC daily)"
 
+# Add transcription-monitor to crontab (runs every 5 minutes, self-silencing)
+# Pings the user while whisper-cli is running so long transcriptions don't
+# appear as dead silence. Exits immediately (no outbox write) when idle.
+chmod +x "$INSTALL_DIR/scheduled-tasks/transcription-monitor.py" 2>/dev/null || true
+"$INSTALL_DIR/scripts/cron-manage.sh" add "# LOBSTER-TRANSCRIPTION-MONITOR" \
+    "*/5 * * * * cd $INSTALL_DIR && uv run scheduled-tasks/transcription-monitor.py # LOBSTER-TRANSCRIPTION-MONITOR"
+
+success "Transcription monitor configured (every 5 minutes, self-silencing)"
+
 #===============================================================================
 # Ghost Detector (agent-monitor)
 #===============================================================================
