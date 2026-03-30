@@ -103,13 +103,13 @@ PR opened
 
 **ORACLE + DEEP**
 - Oracle agent runs adversarial review.
-- Deep review agent runs: checks for architectural coherence, WOS principle compliance, cross-doc consistency.
-- Both agents post findings.
-- If either agent flags a critical finding, escalates to DAN-REQUIRED.
+- Deep review path: TBD — see issue to be filed. For Phase 2 MVP, skip deep review; route oracle-pass PRs directly to merge. DeepReviewAgent is not yet built.
+- Oracle posts findings.
+- If oracle flags a critical finding, escalates to DAN-REQUIRED.
 - Dan is not pinged unless escalation triggers.
 
 **DAN-REQUIRED**
-- Oracle and deep reviews run (their output is available when Dan looks at the PR).
+- Oracle review runs (output is available when Dan looks at the PR). Deep review is deferred to Phase 3.
 - Dan is notified via Telegram/Slack with a summary: PR title, routing reason, and oracle headline findings.
 - PR is labeled `needs-dan-review` if not already.
 
@@ -126,7 +126,7 @@ These conditions force escalation to DAN-REQUIRED regardless of initial classifi
 | `needs-dan-review` label present | Explicit human signal |
 | External contributor (not repo owner or known bots) | Human-to-human review expected |
 | `install.sh` or `deploy/` touched | Affects live system state |
-| Oracle flags `CRITICAL` severity finding | Oracle identified a likely breaking change |
+| Oracle returns `NEEDS-WORK` on any stage | Oracle identified a problem requiring human judgment; automatic escalation to Dan |
 | Schema change with no corresponding migration file | Data integrity risk |
 | PR modifies >3 file categories simultaneously | High surface area; coordination risk |
 
@@ -134,36 +134,41 @@ When any escalation trigger fires, the routing reason is appended to the Dan not
 
 ---
 
-## 5. Integration Point
+## 5. Integration Point — Sweep-Cycle Polling (Phase 2 MVP)
+
+The Phase 2 MVP fires the classifier from the periodic sweep cycle. Webhook integration is a Phase 3 enhancement (see Section 7).
 
 ### Where classification fires
 
-The classifier fires in the WOS event loop when a `pull_request.opened` or `pull_request.reopened` GitHub webhook event is received. If webhooks are not yet wired, the classifier fires from the periodic sweep cycle when it detects a PR in `open` state that has no `lobster-reviewed` label.
+The sweep cycle polls the GitHub API at its regular interval and detects any PR in `open` state that does not yet have a `lobster-reviewed` label. On detection, it spawns the classifier.
 
 ### Concrete integration sequence
 
 ```
-GitHub PR opened
+Sweep cycle runs
   │
-  ├─► Webhook or sweep cycle detects new PR
+  ├─► Poll GitHub API: list open PRs on dcetlin/Lobster without "lobster-reviewed" label
   │
-  ├─► PRClassifier.classify(pr_metadata) → ClassificationResult
-  │     - pr_metadata: title, body, files_changed, lines_added, lines_deleted,
-  │                    labels, author, base_branch
-  │     - ClassificationResult: { path: "oracle-only"|"oracle+deep"|"dan-required",
-  │                               escalation_triggers: list[str],
-  │                               escalation_score: int,
-  │                               file_categories: list[str] }
+  ├─► For each unreviewed PR:
+  │     PRClassifier.classify(pr_metadata) → ClassificationResult
+  │       - pr_metadata: title, body, files_changed, lines_added, lines_deleted,
+  │                      labels, author, base_branch
+  │       - ClassificationResult: { path: "oracle-only"|"oracle+deep"|"dan-required",
+  │                                 escalation_triggers: list[str],
+  │                                 escalation_score: int,
+  │                                 file_categories: list[str] }
   │
   ├─► Route based on ClassificationResult.path:
   │     oracle-only   → spawn OracleAgent(pr_url)
-  │     oracle+deep   → spawn OracleAgent(pr_url) + DeepReviewAgent(pr_url)
-  │     dan-required  → spawn OracleAgent + DeepReviewAgent + notify Dan
+  │     oracle+deep   → spawn OracleAgent(pr_url)  [DeepReviewAgent: TBD, Phase 3]
+  │     dan-required  → spawn OracleAgent + notify Dan  [DeepReviewAgent: TBD, Phase 3]
   │
   ├─► Label PR: add "lobster-reviewed" + path label ("oracle-reviewed", "deep-reviewed", "needs-dan-review")
   │
-  └─► Write classification report as PR comment (within 60 seconds of PR open)
+  └─► Write classification report as PR comment
 ```
+
+Polling latency is acceptable for Phase 2. The sweep cycle runs at least every few minutes, so classification comment delay is bounded by the poll interval, not sub-second.
 
 ### Module path
 
@@ -183,7 +188,7 @@ If the classifier itself fails (GitHub API unavailable, malformed PR metadata), 
 
 ## 6. Classification Report Format
 
-Every PR receives a classification comment within 60 seconds:
+Every PR receives a classification comment:
 
 ```
 **Lobster PR Review Classification**
@@ -212,14 +217,38 @@ Escalation triggers:
 - >500 lines changed
 - schema change detected (no migration file found)
 
-Oracle + deep reviews running. @dcetlin review requested.
+Oracle review running. @dcetlin review requested.
 ```
 
 ---
 
-## 7. Open Questions (not blocking Phase 2)
+## 7. Future Enhancement — Webhook Integration (Phase 3)
 
-- **Webhook vs. poll:** Webhook integration is cleaner but requires a registered GitHub webhook. The sweep-cycle polling fallback is the Phase 2 MVP. Webhook wiring is Phase 3.
+Webhook integration fires the classifier immediately on `pull_request.opened` or `pull_request.reopened` events, eliminating poll latency and reducing GitHub API calls.
+
+This is deferred to Phase 3 because it requires:
+- A registered GitHub webhook pointing at a Lobster endpoint
+- A publicly reachable inbound HTTP endpoint (not available in all deploy configurations)
+- Webhook signature validation
+
+When implemented, the integration sequence becomes:
+
+```
+GitHub PR opened
+  │
+  ├─► GitHub delivers pull_request.opened webhook to Lobster endpoint
+  │
+  ├─► Webhook handler validates signature, extracts pr_metadata
+  │
+  └─► Same classification + routing sequence as sweep-cycle path (Section 5)
+```
+
+The sweep-cycle polling path (Section 5) remains as a fallback even after webhook integration is live.
+
+---
+
+## 8. Open Questions (not blocking Phase 2)
+
 - **Known bot list:** The classifier needs a list of known bot accounts (subagents) to distinguish from external contributors. For Phase 2, the heuristic is: PR body contains "Generated with Claude Code" or "Co-Authored-By: Claude".
-- **Oracle severity levels:** The `CRITICAL` escalation trigger requires Oracle to output a structured severity field. Oracle's output schema should include `severity: "low"|"medium"|"high"|"critical"`. If Oracle does not yet produce this field, skip the oracle-critical escalation trigger in Phase 2 MVP and document the gap.
+- **Oracle severity levels:** Resolved for Phase 2. The escalation trigger no longer depends on a structured `severity` field. Oracle `NEEDS-WORK` on any stage is sufficient for automatic escalation to Dan. Structured severity (low/medium/high/critical) may be added in Phase 3 if finer-grained routing is needed.
 - **Merge blocking:** Should `needs-dan-review` PRs be blocked from merging until Dan approves? Deferred — branch protection rules are a GitHub configuration decision, not a classifier decision.

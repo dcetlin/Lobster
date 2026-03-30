@@ -59,6 +59,21 @@ def record_link(
 
 `synthesizes` is a multi-target link type. When a worker synthesizes more than one source, they record one link per source-to-target pair, all with type `synthesizes`. The rationale on each link should reference the synthesis context.
 
+### Batch synthesis links
+
+When a single synthesis act produces N links (e.g., a harvest session that synthesizes several documents at once), the worker should set a `batch_id` field on all links from that act so they can be grouped for rendering. The `batch_id` is a session-scoped timestamp string, e.g. `"2026-03-30T22:00:00Z"`.
+
+Example JSONL entries for a batch synthesis:
+
+```json
+{"link_id": "...", "batch_id": "2026-03-30T22:00:00Z", "link_type": "synthesizes", "source_path": "sessions/2026-03-30.md", "target_path": "frontier-docs/agency-architecture.md", ...}
+{"link_id": "...", "batch_id": "2026-03-30T22:00:00Z", "link_type": "synthesizes", "source_path": "sessions/2026-03-30.md", "target_path": "frontier-docs/executor-contract.md", ...}
+```
+
+The surfacing agent groups by `batch_id` when rendering synthesis clusters, so Dan sees: "Session synthesized 2 frontier docs (batch 2026-03-30T22:00:00Z)" rather than two separate link entries. Links without a `batch_id` are treated as standalone.
+
+The `record_link` interface should accept an optional `batch_id: str | None = None` parameter. Workers that do not need batch grouping omit it.
+
 ---
 
 ## 4. Storage
@@ -118,14 +133,20 @@ Public API:
 
 The linker accumulates silently. Surfacing is a scheduled job that runs on the digest cycle (or on demand).
 
-### Surfacing agent behavior
+### Surfacing Agent spec
 
-1. Read all links recorded since the last surfacing run (or last 30 days if no prior run).
-2. Group by `target_path` — documents with multiple inbound links are likely conceptually central.
-3. Identify `contradicts` links — these always surface regardless of count.
-4. Identify documents appearing in both `source_path` and `target_path` fields — these are network hubs.
-5. Generate a prose summary: "3 documents link to `frontier-docs/agency-architecture.md`. One link is a `contradicts` from a sweep report (see rationale). Two are `elaborates` from recent philosophy sessions."
-6. Send to Dan via `send_reply` with the summary and a list of high-signal links (contradicts first, then hubs sorted by inbound count).
+- **State file:** `~/lobster-workspace/data/connective-tissue-last-run.json` — stores the ISO-8601 timestamp of the last completed surfacing run. On first run (file absent), default to 30 days ago.
+- **Job name:** `connective-tissue-linker` — registered as a Lobster scheduled job via `create_scheduled_job`.
+- **Behavior on each run:**
+  1. Load `connective-tissue-last-run.json` to get `last_run` timestamp (or default to 30 days ago).
+  2. Call `load_links(since=last_run)` to retrieve all links written since that timestamp.
+  3. Group links by `source_path` to identify active writers; deduplicate by `(source_path, target_path, link_type)`.
+  4. Group by `target_path` — documents with multiple inbound links are likely conceptually central.
+  5. Identify `contradicts` links — these always surface regardless of count.
+  6. Identify documents appearing in both `source_path` and `target_path` fields — these are network hubs.
+  7. Generate a prose summary (see Format below).
+  8. Send summary to Dan via `send_reply` using `LOBSTER_ADMIN_CHAT_ID`.
+  9. Write updated timestamp to `connective-tissue-last-run.json`.
 
 ### Trigger conditions
 
