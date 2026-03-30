@@ -340,7 +340,7 @@ _SIGNAL_TYPE_PATTERNS: list[tuple[str, list[str]]] = [
         "wondering about the nature", "genuinely curious about",
         # System design philosophy (distinct from impl design)
         "design philosophy", "architectural philosophy",
-        "first principles", "what grounds",
+        "what grounds",
     ]),
     ("meta_reflection", [
         "meta", "retrospective", "reflection", "premise", "oracle", "principle",

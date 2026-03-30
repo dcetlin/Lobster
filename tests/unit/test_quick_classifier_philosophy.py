@@ -72,8 +72,13 @@ class TestPhilosophySignalTypeDetection:
     def test_hard_problem(self):
         assert detect_signal_type("the hard problem of consciousness keeps coming up") == "philosophy"
 
-    def test_first_principles(self):
-        assert detect_signal_type("let's think from first principles about this") == "philosophy"
+    def test_first_principles_no_longer_a_philosophy_keyword(self):
+        # "first principles" was removed because it collides with engineering/design
+        # discussions that should route through the Design Gate, not attunement.
+        # A message using only "first principles" without philosophy vocabulary
+        # should NOT be classified as philosophy.
+        result = detect_signal_type("let's think from first principles about this architecture decision")
+        assert result != "philosophy"
 
     def test_design_philosophy(self):
         # "design" alone triggers design_question; use "design philosophy" explicitly.
@@ -131,6 +136,17 @@ class TestNonPhilosophySignalTypes:
     def test_oracle_reference_without_philosophy(self):
         result = detect_signal_type("the oracle flagged a premise misalignment")
         assert result == "meta_reflection"
+
+    def test_first_principles_in_design_context_not_philosophy(self):
+        # "first principles" was removed from the philosophy keyword list because it
+        # collides with engineering design discussions. These should route through
+        # the Design Gate, not attunement.
+        result = detect_signal_type("let's think from first principles about this architecture decision")
+        assert result != "philosophy"
+
+    def test_first_principles_in_architecture_context_not_philosophy(self):
+        result = detect_signal_type("from first principles, how should we design the caching layer")
+        assert result != "philosophy"
 
 
 # ---------------------------------------------------------------------------
