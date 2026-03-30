@@ -31,10 +31,10 @@ from typing import Any, Protocol
 
 _SCHEMA_SQL = (Path(__file__).parent / "schema.sql").read_text()
 
-# Canonical route_reason written when no classifier is present (Phase 1).
+# Canonical route_reason written when no classifier is present (legacy default).
 # All existing DB rows use this exact string. If you change it here, add a
 # Migration to upgrade.sh to UPDATE existing rows to the new value.
-_PHASE1_ROUTE_REASON = "phase1-default: no classifier"
+_LEGACY_ROUTE_REASON = "phase1-default: no classifier"
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +363,7 @@ class Registry:
                     now,
                     now,
                     title,
-                    _PHASE1_ROUTE_REASON,
+                    _LEGACY_ROUTE_REASON,
                 ),
             )
             conn.commit()
