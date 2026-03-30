@@ -2,6 +2,8 @@
 
 *Converged from thread, March 30, 2026 — voice-note origin, meditation in the form of a life seed*
 
+> **Germinated:** [register-awareness-as-navigational-instrument](https://github.com/dcetlin/riffs/blob/main/voice-notes/2026-03-30-register-awareness-as-navigational-instrument.md) in dcetlin/riffs — this file is the seed; the riffs version is the living expansion.
+
 ---
 
 ## The Seed
