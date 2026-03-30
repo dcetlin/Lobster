@@ -23,6 +23,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+import threading
+import concurrent.futures
 from pathlib import Path
 
 import pytest
@@ -440,6 +442,54 @@ class TestOptimisticLock:
         with pytest.raises(RuntimeError, match="optimistic lock failed"):
             executor2.run(uow_id)
 
+    def test_truly_concurrent_claim_exactly_one_succeeds(
+        self, registry: Registry, db_path: Path
+    ) -> None:
+        """
+        Two Executor instances racing to claim the same UoW via real threads must
+        result in exactly one success (rowcount=1) and one race-skip (RuntimeError).
+
+        This tests the optimistic lock under genuine concurrent access — not just
+        sequential calls where order is deterministic.
+        """
+        uow_id = "uow_lock_004"
+        _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
+
+        results: list[str] = []  # "success" or exception class name
+        errors: list[Exception] = []
+        barrier = threading.Barrier(2)  # synchronize both threads to maximize contention
+
+        def try_run(executor: Executor) -> None:
+            barrier.wait()  # both threads reach this point before either proceeds
+            try:
+                executor.run(uow_id)
+                results.append("success")
+            except RuntimeError as exc:
+                results.append("RuntimeError")
+                errors.append(exc)
+            except Exception as exc:
+                results.append(type(exc).__name__)
+                errors.append(exc)
+
+        executor_a = Executor(registry)
+        executor_b = Executor(registry)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            fut_a = pool.submit(try_run, executor_a)
+            fut_b = pool.submit(try_run, executor_b)
+            fut_a.result(timeout=10)
+            fut_b.result(timeout=10)
+
+        # Exactly one must succeed and one must get the optimistic lock rejection
+        assert sorted(results) == ["RuntimeError", "success"], (
+            f"Expected exactly one success and one RuntimeError, got: {results}"
+        )
+        # The error must be the optimistic lock rejection (not some other failure)
+        assert len(errors) == 1
+        assert "optimistic lock failed" in str(errors[0]), (
+            f"Expected optimistic lock rejection, got: {errors[0]}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: skill activation
@@ -575,6 +625,41 @@ class TestCrashRecoveryProperties:
         # Status should be 'failed' after graceful handling
         status = _get_uow_status(db_path, uow_id)
         assert status == "failed"
+
+    def test_result_json_written_when_parent_dir_missing(
+        self, registry: Registry, db_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        result.json must be written successfully even when the parent directory
+        does not yet exist. The executor must create it (mkdir parents=True).
+        """
+        uow_id = "uow_crash_003"
+        _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
+
+        # Point the output dir at a deep path that doesn't exist yet
+        nonexistent_dir = tmp_path / "deep" / "nested" / "dir"
+        assert not nonexistent_dir.exists(), "precondition: dir must not exist before run"
+
+        # Monkeypatch the output dir template so output_ref lands in nonexistent_dir
+        import orchestration.executor as _executor_mod
+        original_template = _executor_mod._OUTPUT_DIR_TEMPLATE
+        monkeypatch.setattr(_executor_mod, "_OUTPUT_DIR_TEMPLATE", str(nonexistent_dir))
+
+        try:
+            executor = Executor(registry)
+            result = executor.run(uow_id)
+        finally:
+            monkeypatch.setattr(_executor_mod, "_OUTPUT_DIR_TEMPLATE", original_template)
+
+        assert result.outcome == ExecutorOutcome.COMPLETE
+        output_ref = _get_output_ref(db_path, uow_id)
+        result_path = _result_json_path(output_ref)
+        assert result_path.exists(), (
+            f"result.json must exist even when parent dir was missing: {result_path}"
+        )
+        result_data = json.loads(result_path.read_text())
+        assert result_data["outcome"] == "complete"
+        assert result_data["uow_id"] == uow_id
 
     def test_result_json_path_primary_convention(self) -> None:
         """Primary convention: foo.json → foo.result.json."""
