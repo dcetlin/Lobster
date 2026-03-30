@@ -347,6 +347,67 @@ REMINDER_ROUTING = {
 - **Background subagents** (pollers, scheduled jobs, system tasks) call `write_result` only — never `send_reply`. Use `chat_id=ADMIN_CHAT_ID, sent_reply_to_user=False` for actionable results; `chat_id=0` for no-op.
 - **User-facing subagents** (handling a user's request) call `send_reply` first to deliver directly, then `write_result(sent_reply_to_user=True)` to signal the dispatcher not to re-deliver.
 
+## Handling WOS Execute Messages (`type: "wos_execute"`)
+
+`wos_execute` messages are written by the Executor (`_dispatch_via_inbox`) when it needs to launch an LLM subagent to carry out a UoW's prescribed instructions. The Executor does not block — it writes the message and returns immediately. The dispatcher spawns the subagent.
+
+**Never call `send_reply` for these — this is a system-to-system handoff, not a user request.**
+
+**When `wait_for_messages` returns a message with `type: "wos_execute"`:**
+
+```
+1. mark_processing(message_id)
+2. uow_id = msg["uow_id"]
+3. instructions = msg["instructions"]
+4. output_ref = f"~/lobster-workspace/orchestration/outputs/{uow_id}.json"
+   result_path = f"~/lobster-workspace/orchestration/outputs/{uow_id}.result.json"
+5. task_id = f"wos-{uow_id}"
+6. Spawn lobster-generalist (run_in_background=True) with prompt:
+   ---
+   task_id: wos-{uow_id}
+   chat_id: 0
+   source: system
+   ---
+
+   You are executing a Work Order System (WOS) unit of work on behalf of the Steward.
+   UoW ID: {uow_id}
+
+   ## Instructions
+
+   {instructions}
+
+   ## Result contract (REQUIRED)
+
+   After completing the instructions (or on any error that prevents completion),
+   write the result file to: {result_path}
+
+   The file must be valid JSON:
+     {"uow_id": "{uow_id}", "outcome": "complete", "success": true}
+   or on failure:
+     {"uow_id": "{uow_id}", "outcome": "failed", "success": false, "reason": "<why>"}
+
+   Outcome values: "complete" | "partial" | "failed" | "blocked"
+   "success" must be true if and only if outcome == "complete".
+
+   Steps to write the file:
+     mkdir -p ~/lobster-workspace/orchestration/outputs/
+     write JSON to {result_path}.tmp, then rename to {result_path}
+
+   After writing the result file:
+     write_result(task_id="wos-{uow_id}", chat_id=0, source="system",
+                  text="WOS UoW {uow_id}: outcome=<outcome>")
+
+   Minimum viable output: {result_path} with uow_id, outcome, and success fields.
+   Boundary: do not modify executor.py, registry.py, or any WOS source files.
+
+7. mark_processed(message_id)
+```
+
+**Rules:**
+- The subagent writes `{uow_id}.result.json`. The Steward reads it on its next heartbeat cycle.
+- Do NOT relay the result to the user: task_id starts with `wos-`, chat_id=0 — both silent-drop conditions apply.
+- If the subagent fails to write the result file, the Observation Loop detects the stall at `timeout_at` and surfaces it to Dan.
+
 ## Handling Subagent Results (`subagent_result` / `subagent_error`)
 
 **When `wait_for_messages` returns a message with `type: "subagent_result"`:**
