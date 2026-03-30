@@ -823,20 +823,24 @@ def _default_notify_dan(
         uow_id, condition, cycles,
     )
     msg_id = str(uuid.uuid4())
+    body_lines = [
+        f"WOS SURFACE: UoW {uow_id} hit condition={condition} "
+        f"(steward_cycles={cycles}). Needs human review.",
+    ]
+    if surface_log:
+        body_lines.append(f"\nSteward log:\n{surface_log}")
     msg = {
         "id": msg_id,
         "source": "system",
         "chat_id": _DAN_CHAT_ID,
-        "text": (
-            f"WOS SURFACE: UoW {uow_id} hit condition={condition} "
-            f"(steward_cycles={cycles}). Needs human review."
-        ),
+        "text": "\n".join(body_lines),
         "timestamp": time.time(),
         "metadata": {
             "type": "wos_surface",
             "uow_id": uow_id,
             "condition": condition,
             "steward_cycles": cycles,
+            "steward_log": surface_log,
         },
     }
     inbox_dir = Path(os.path.expanduser("~/messages/inbox"))
