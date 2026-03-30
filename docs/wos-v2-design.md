@@ -10,6 +10,8 @@ The Work Orchestration System (WOS) is the pipeline that moves units of work fro
 
 The v2 model replaces the Phase 1 dispatcher-centric model with a two-actor **Steward/Executor** loop: a Steward that diagnoses and prescribes, and an Executor that carries out the prescription. The Steward owns each UoW's full lifecycle; the Executor does the work. Nothing exits via side-door.
 
+**Already-embodied pattern:** Lobster's existing dispatcher/subagent architecture IS the Steward/Executor pattern operating informally. The dispatcher already acts as a Steward — it receives a message (a unit of work), diagnoses what kind of work it is, prescribes the appropriate subagent task, dispatches it, and evaluates the result. Background subagents are already Executors — they receive a structured task prompt (the WorkflowArtifact equivalent), execute it, and return results. WOS Phase 2 formalizes this into a tracked, auditable, crash-safe pipeline. The concepts are not new to Lobster; the infrastructure to make them durable and inspectable is what Phase 2 adds.
+
 ---
 
 ## Vocabulary & Primitives
