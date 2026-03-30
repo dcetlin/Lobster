@@ -6767,7 +6767,7 @@ async def handle_memory_store(arguments: dict[str, Any]) -> list[TextContent]:
     if not content:
         return [TextContent(type="text", text="Error: content is required.")]
 
-    from .memory.provider import VALENCE_VALUES
+    from memory.provider import VALENCE_VALUES
     raw_valence = arguments.get("valence", "neutral")
     valence = raw_valence if raw_valence in VALENCE_VALUES else "neutral"
 
@@ -6820,7 +6820,7 @@ async def handle_memory_search(arguments: dict[str, Any]) -> list[TextContent]:
     limit = arguments.get("limit", 10)
     project = arguments.get("project")
 
-    from .memory.provider import VALENCE_VALUES
+    from memory.provider import VALENCE_VALUES
     raw_valence = arguments.get("valence")
     valence = raw_valence if raw_valence in VALENCE_VALUES else None
 
