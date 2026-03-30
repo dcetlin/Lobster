@@ -359,8 +359,8 @@ REMINDER_ROUTING = {
 1. mark_processing(message_id)
 2. uow_id = msg["uow_id"]
 3. instructions = msg["instructions"]
-4. output_ref = f"~/lobster-workspace/orchestration/outputs/{uow_id}.json"
-   result_path = f"~/lobster-workspace/orchestration/outputs/{uow_id}.result.json"
+4. result_path = f"~/lobster-workspace/orchestration/outputs/{uow_id}.result.json"
+   # output_ref ({uow_id}.json) is pre-written by the Python Executor before dispatch — do not write it here
 5. task_id = f"wos-{uow_id}"
 6. Spawn lobster-generalist (run_in_background=True) with prompt:
    ---
@@ -385,6 +385,10 @@ REMINDER_ROUTING = {
      {"uow_id": "{uow_id}", "outcome": "complete", "success": true}
    or on failure:
      {"uow_id": "{uow_id}", "outcome": "failed", "success": false, "reason": "<why>"}
+   or on partial completion:
+     {"uow_id": "{uow_id}", "outcome": "partial", "success": false, "reason": "<what was done and what was not>"}
+   or when blocked by an external dependency:
+     {"uow_id": "{uow_id}", "outcome": "blocked", "success": false, "reason": "<what is blocking and why>"}
 
    Outcome values: "complete" | "partial" | "failed" | "blocked"
    "success" must be true if and only if outcome == "complete".
@@ -405,7 +409,7 @@ REMINDER_ROUTING = {
 
 **Rules:**
 - The subagent writes `{uow_id}.result.json`. The Steward reads it on its next heartbeat cycle.
-- Do NOT relay the result to the user: task_id starts with `wos-`, chat_id=0 — both silent-drop conditions apply.
+- Do NOT relay the result to the user: chat_id=0 is the silent-drop sentinel — the subagent_result handler drops it without relaying.
 - If the subagent fails to write the result file, the Observation Loop detects the stall at `timeout_at` and surfaces it to Dan.
 
 ## Handling Subagent Results (`subagent_result` / `subagent_error`)
