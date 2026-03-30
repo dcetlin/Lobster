@@ -819,6 +819,27 @@ class Registry:
         """
         return self.list(status=UoWStatus.ACTIVE)
 
+    def get_started_at(self, uow_id: str) -> str | None:
+        """
+        Return the started_at timestamp string for a UoW, or None if the UoW
+        is not found or started_at is NULL.
+
+        started_at is set by the Executor at claim time and is not exposed on
+        the UoW dataclass (it is not needed by most callers). This method
+        provides public access without requiring callers to open a raw
+        connection via registry._connect().
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT started_at FROM uow_registry WHERE id = ?", (uow_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            return row["started_at"]
+        finally:
+            conn.close()
+
     def record_startup_sweep_active(
         self,
         uow_id: str,
