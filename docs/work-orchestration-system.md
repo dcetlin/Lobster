@@ -1,3 +1,5 @@
+> **Status: SUPERSEDED** — This is the v1 WOS design document. The canonical design is now [`wos-v2-design.md`](./wos-v2-design.md). This file is retained for historical reference only.
+
 # Work Orchestration System
 *Design doc — first version: 2026-03-26 (as "Issue Sweeper"). Substantially rewritten: 2026-03-26. Audit-required changes applied: 2026-03-26.*
 

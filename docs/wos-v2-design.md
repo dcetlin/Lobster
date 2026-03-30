@@ -12,13 +12,70 @@ The v2 model replaces the Phase 1 dispatcher-centric model with a two-actor **St
 
 ---
 
+## Vocabulary & Primitives
+
+### Core Terms
+
+**Unit of Work (UoW)** — The atomic unit of tracked, auditable work in the pipeline. Every piece of work that enters the execution substrate is a UoW. A UoW has a state, an audit trail, and a closure condition.
+
+**UoWRegistry** — The execution substrate. A structured store (SQLite from Phase 1) holding one record per UoW. It is the single source of truth for what is running; no other lookup is ever needed to answer "what's active?"
+
+**UoW Registrar** — The governance agent that watches the GitHub issue backlog and creates new UoWs for the orchestration engine. It performs four functions: (1) reads GitHub issues, (2) identifies qualifying ones (ready-to-execute, gate criteria met), (3) creates UoW entries in the UoWRegistry, (4) manages lifecycle (expired proposals, stale-active detection). "Sweeper" was the prior name; the actual job is registration and lifecycle management, hence the rename.
+
+### Pre-Registry Vocabulary
+
+**Seed** — Unclassified potential. An idea, observation, or open question that may or may not become executable work. Not yet in the UoWRegistry. Seeds can originate from philosophy sessions, Telegram observations, direct feature requests, or any source.
+
+**Pearl** — A philosophy session output that is a distillation rather than an action item. Pearls route to the write-path (frontier docs, bootup candidates) via the Cultivator. They do not enter the UoWRegistry. Pearl outputs circulate via re-encounter rather than via a separate execution pipeline.
+
+**Germination** — The classification event at which a seed's output type is resolved (pearl or executable work). For seeds that resolve to executable work, germination produces a GitHub issue.
+
+**Sprout moment** — When the UoW Registrar identifies a qualifying GitHub issue and creates a UoW entry in the UoWRegistry. The issue enters the UoW execution pipeline at this point.
+
+**Bootup candidate** — A pearl or seed that is not yet actionable but has been identified as relevant to future system orientation. Bootup candidates are filed as design-gate UoWs: they enter the UoWRegistry at low priority, pending an explicit design session or human-gate confirmation before proceeding.
+
+### The Cultivator
+
+The Cultivator is the philosophy pipeline's classification agent. It runs after a philosophy session and performs three operations:
+
+1. **Distinguish** — classifies session outputs as pearls or seeds.
+2. **Route pearls** — sends pearls to the appropriate write-path (frontier doc, bootup candidate). No UoWRegistry entry is created.
+3. **File seeds** — files seeds as GitHub issues. Phase 1: with human review. Phase 2: programmatically.
+
+The Cultivator's internal operations are classification (pearl or seed?) and triage (which path does this seed take?). "Classifier" and "triage agent" are names for the same role at different abstraction levels; the Cultivator is the unified name for the philosophy pipeline's sorting function.
+
+The Cultivator's trigger is an open implementation question: on-demand (after each session), scheduled, or event-triggered. This is a Phase 2 design decision.
+
+### GitHub Issues as the Universal Pre-Registry Substrate
+
+GitHub issues are the pre-Registry substrate for all executable work. Every seed — whether originating from a philosophy session, a Telegram observation, or a direct feature request — eventually becomes a GitHub issue before entering the UoWRegistry.
+
+For feature requests: the GitHub issue is the germinated seed. For specs: the spec issue is the seed; subissues are the UoW decomposition. The subissue-to-UoW mapping is implied by the parent/children fields in the Registry and will be specified in a Phase 2 design note.
+
+### Full Pipeline
+
+```
+Philosophy session
+  -> Cultivator
+    -> pearls -> write-path (frontier docs, bootup candidates)
+    -> seeds -> GitHub issues
+               -> UoW Registrar (identifies qualifying issues)
+                 -> UoWRegistry (execution substrate)
+                   -> Steward/Executor loop
+                     -> artifacts / done
+```
+
+This pipeline applies beyond philosophy sessions: any source of seeds (Telegram observations, nightly health scans, direct requests) flows through the same funnel — GitHub issue as the universal entry point, UoW Registrar as the gate into the execution substrate.
+
+---
+
 ## State Machine
 
 ### States
 
 | State | Semantics |
 |-------|-----------|
-| `proposed` | Sweeper created this record; awaiting Dan's confirmation. |
+| `proposed` | UoW Registrar created this record; awaiting Dan's confirmation. |
 | `pending` | Dan confirmed via `/confirm`; queued for an agent to claim. |
 | `ready-for-steward` | Active in the Steward/Executor loop; Steward's turn to diagnose. |
 | `ready-for-executor` | Steward has prescribed a workflow; Executor's turn to run it. |
@@ -32,10 +89,10 @@ The v2 model replaces the Phase 1 dispatcher-centric model with a two-actor **St
 
 | From | To | Actor | Trigger |
 |------|-----|-------|---------|
-| — | `proposed` | Sweeper | Nightly scan identifies a ready issue |
+| — | `proposed` | UoW Registrar | Nightly scan identifies a ready issue |
 | `proposed` | `pending` | Dan | `/confirm <uow-id>` command |
-| `proposed` | `expired` | Sweeper | Record age ≥ 14 days on nightly run |
-| `pending` | `ready-for-steward` | Sweeper / Trigger evaluator | UoW is confirmed and trigger fires (default: immediate) |
+| `proposed` | `expired` | UoW Registrar | Record age ≥ 14 days on nightly run |
+| `pending` | `ready-for-steward` | UoW Registrar / Trigger evaluator | UoW is confirmed and trigger fires (default: immediate) |
 | `ready-for-steward` | `ready-for-executor` | Steward | Diagnosis complete; workflow prescribed |
 | `ready-for-steward` | `blocked` | Steward | Observation surfaced to Dan; awaiting orientation or decision |
 | `ready-for-steward` | `done` | Steward | Convergence conditions met; closure declared |
@@ -84,9 +141,11 @@ The Steward must be able to cite a diagnosis reason for choosing complexity. A c
 
 ## Core Processes
 
-### Issue Sweeper
+### UoW Registrar
 
-Runs nightly at 3am. Scans the GitHub issue backlog for issues meeting defined conditions (ready-to-execute label, high-priority stall, stale with no activity). Creates `proposed` UoW records in the Registry via `registry_cli.py`. Checks stale-active records and runs `expire-proposals` on each pass. In Phase 1, all proposals require Dan's `/confirm` before advancing. In Phase 2+, the sweeper writes labels autonomously after an explicit autonomy gate crossing.
+Runs nightly at 3am. Scans the GitHub issue backlog for issues meeting defined conditions (ready-to-execute label, high-priority stall, stale with no activity). Creates `proposed` UoW records in the UoWRegistry via `registry_cli.py`. Checks stale-active records and runs `expire-proposals` on each pass. In Phase 1, all proposals require Dan's `/confirm` before advancing. In Phase 2+, the UoW Registrar writes labels autonomously after an explicit autonomy gate crossing.
+
+The UoW Registrar is the bridge between the pre-Registry layer (GitHub issues as seed substrate) and the execution substrate (UoWRegistry). It performs four functions: (1) reads GitHub issues, (2) identifies qualifying ones (gate criteria met), (3) creates UoW entries in the UoWRegistry, (4) manages lifecycle (expired proposals, stale-active detection).
 
 ### Steward Heartbeat
 
@@ -131,7 +190,7 @@ Dan can plug into the Steward's loop at three defined points:
 
 ```
 Issue #142: "Add per-job timeout support to scheduler"
-  -> Sweeper creates UoW (proposed)
+  -> UoW Registrar creates UoW (proposed)
   -> Dan: /confirm uow_abc123 -> status: pending -> ready-for-steward
 
 Steward cycle 1:
@@ -220,17 +279,17 @@ Steward cycle 2:
 
 ## Phase Roadmap (v2)
 
-### Phase 1: Registry + Sweeper [current]
+### Phase 1: UoWRegistry + UoW Registrar [current]
 
-**What exists:** SQLite Registry at `~/lobster-workspace/orchestration/registry.db`, `registry_cli.py` CLI, nightly Issue Sweeper, Dan-manual `/confirm` gate, `/wos status` dispatcher command.
+**What exists:** SQLite UoWRegistry at `~/lobster-workspace/orchestration/registry.db`, `registry_cli.py` CLI, nightly UoW Registrar, Dan-manual `/confirm` gate, `/wos status` dispatcher command.
 
-**Done condition:** Dan can ask "what's running?" and get an answer from a single Registry query. No GitHub fallback. Dan has used `/confirm` at least once. Sweeper runs without errors, audit log contains transition events (not only `created`).
+**Done condition:** Dan can ask "what's running?" and get an answer from a single UoWRegistry query. No GitHub fallback. Dan has used `/confirm` at least once. UoW Registrar runs without errors, audit log contains transition events (not only `created`).
 
-**Phase 1 to Phase 2 gate (computable):** Phase 1 has run for >=14 calendar days AND sweeper proposed-to-confirmed ratio >=80% over the last 7 days. Gate surfaces to Dan as an explicit human-gate UoW.
+**Phase 1 to Phase 2 gate (computable):** Phase 1 has run for >=14 calendar days AND UoW Registrar proposed-to-confirmed ratio >=80% over the last 7 days. Gate surfaces to Dan as an explicit human-gate UoW.
 
 ### Phase 2: Steward + Executor [next]
 
-**What to build:** Steward agent (cron heartbeat, diagnose/prescribe/evaluate/close loop), Executor agent (picks up `ready-for-executor` UoWs, runs prescribed workflow, returns results). Registry extended with Steward-cycle audit fields. Routing Classifier added: rule engine evaluating `classifier.yaml`, assigning postures, writing `route_reason`. Conditional Hook System wired.
+**What to build:** Steward agent (cron heartbeat, diagnose/prescribe/evaluate/close loop), Executor agent (picks up `ready-for-executor` UoWs, runs prescribed workflow, returns results). UoWRegistry extended with Steward-cycle audit fields. Routing Classifier added: rule engine evaluating `classifier.yaml`, assigning postures, writing `route_reason`. Conditional Hook System wired. Cultivator wired to file seeds from philosophy sessions programmatically (Phase 2 trigger design).
 
 **Done condition:** A UoW completes a full Steward/Executor loop — Steward diagnoses, Executor runs, Steward re-diagnoses and closes. Audit trail shows all cycle entries. Classifier assigns posture and writes `route_reason`. At least one hook fires and appears in `hooks_applied`.
 
