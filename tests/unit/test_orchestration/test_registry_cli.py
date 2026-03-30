@@ -2,7 +2,7 @@
 Unit tests for registry_cli.py subprocess interface.
 
 Tests verify the JSON output contract for every command:
-  upsert, get, list, confirm, check-stale, expire-proposals
+  upsert, get, list, approve, check-stale, expire-proposals, gate-readiness
 
 All tests invoke the CLI as a subprocess (matching how scheduled subagents use it)
 and parse stdout as JSON.
@@ -119,32 +119,45 @@ class TestListCommand:
         assert isinstance(result, list)
         assert len(result) >= 2
 
+    def test_list_records_have_typed_fields(self, db_path):
+        today = datetime.now(timezone.utc).date().isoformat()
+        run_cli(db_path, "upsert", "--issue", "32", "--title", "Issue 32", "--sweep-date", today)
+        result = run_cli(db_path, "list", "--status", "proposed")
+        assert len(result) >= 1
+        record = result[0]
+        # UoW fields must be present in JSON output
+        assert "id" in record
+        assert "status" in record
+        assert "summary" in record
+        assert "source" in record
+
 
 # ---------------------------------------------------------------------------
-# confirm command
+# approve command
 # ---------------------------------------------------------------------------
 
-class TestConfirmCommand:
-    def test_confirm_proposed_record(self, db_path):
+class TestApproveCommand:
+    def test_approve_proposed_record(self, db_path):
         today = datetime.now(timezone.utc).date().isoformat()
         inserted = run_cli(db_path, "upsert", "--issue", "40", "--title", "Issue 40", "--sweep-date", today)
         uow_id = inserted["id"]
-        result = run_cli(db_path, "confirm", "--id", uow_id)
+        result = run_cli(db_path, "approve", "--id", uow_id)
         assert result["status"] == "pending"
         assert result["previous_status"] == "proposed"
 
-    def test_confirm_idempotent_on_pending(self, db_path):
+    def test_approve_idempotent_on_pending(self, db_path):
         today = datetime.now(timezone.utc).date().isoformat()
         inserted = run_cli(db_path, "upsert", "--issue", "41", "--title", "Issue 41", "--sweep-date", today)
         uow_id = inserted["id"]
-        run_cli(db_path, "confirm", "--id", uow_id)
-        result = run_cli(db_path, "confirm", "--id", uow_id)
+        run_cli(db_path, "approve", "--id", uow_id)
+        result = run_cli(db_path, "approve", "--id", uow_id)
         assert result["status"] == "pending"
+        assert result["action"] == "noop"
 
-    def test_confirm_not_found_returns_error(self, db_path):
+    def test_approve_not_found_returns_error(self, db_path):
         # Need to init the DB first
         run_cli(db_path, "upsert", "--issue", "42", "--title", "Init", "--sweep-date", "2026-01-01")
-        result = run_cli(db_path, "confirm", "--id", "nonexistent")
+        result = run_cli(db_path, "approve", "--id", "nonexistent")
         assert "error" in result
 
 
@@ -180,3 +193,18 @@ class TestExpireProposalsCommand:
         run_cli(db_path, "upsert", "--issue", "61", "--title", "Issue 61", "--sweep-date", today)
         result = run_cli(db_path, "expire-proposals")
         assert result["expired_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# gate-readiness command
+# ---------------------------------------------------------------------------
+
+class TestGateReadinessCommand:
+    def test_gate_readiness_returns_gate_met(self, db_path):
+        run_cli(db_path, "upsert", "--issue", "70", "--title", "Issue 70", "--sweep-date", "2026-01-01")
+        result = run_cli(db_path, "gate-readiness")
+        assert "gate_met" in result
+        assert result["gate_met"] is True
+        assert "days_running" in result
+        assert "proposed_to_confirmed_ratio_7d" in result
+        assert "reason" in result

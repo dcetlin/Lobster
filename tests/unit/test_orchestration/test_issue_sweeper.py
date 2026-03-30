@@ -67,24 +67,24 @@ def _run_sweep(registry, github_client=None) -> dict[str, Any]:
 
 class TestImmediateTriggerSweep:
     def test_pending_immediate_advances_to_ready_for_steward(self, registry, db_path):
-        # Insert and confirm a UoW (proposed → pending)
+        # Insert and approve a UoW (proposed → pending)
         result = registry.upsert(issue_number=10, title="test UoW")
-        uow_id = result["id"]
-        registry.confirm(uow_id)
+        uow_id = result.id
+        registry.approve(uow_id)
 
         # Verify it's pending with immediate trigger
         uow = registry.get(uow_id)
-        assert uow["status"] == "pending"
+        assert str(uow.status) == "pending"
 
         _run_sweep(registry)
 
         uow_after = registry.get(uow_id)
-        assert uow_after["status"] == "ready-for-steward"
+        assert str(uow_after.status) == "ready-for-steward"
 
     def test_trigger_fired_audit_entry_written(self, registry, db_path):
         result = registry.upsert(issue_number=11, title="audit test")
-        uow_id = result["id"]
-        registry.confirm(uow_id)
+        uow_id = result.id
+        registry.approve(uow_id)
 
         _run_sweep(registry)
 
@@ -101,19 +101,19 @@ class TestImmediateTriggerSweep:
     def test_proposed_uow_not_swept(self, registry, db_path):
         """Proposed UoWs must not be passed to evaluate_condition."""
         result = registry.upsert(issue_number=12, title="proposed only")
-        uow_id = result["id"]
-        # Do NOT confirm — stays at "proposed"
+        uow_id = result.id
+        # Do NOT approve — stays at "proposed"
 
         _run_sweep(registry)
 
         uow_after = registry.get(uow_id)
-        assert uow_after["status"] == "proposed"
+        assert str(uow_after.status) == "proposed"
 
     def test_ready_for_steward_uow_not_swept(self, registry, db_path):
         """UoWs already at ready-for-steward must not be swept again."""
         result = registry.upsert(issue_number=13, title="already advanced")
-        uow_id = result["id"]
-        registry.confirm(uow_id)
+        uow_id = result.id
+        registry.approve(uow_id)
         registry.set_status_direct(uow_id, "ready-for-steward")
 
         eval_call_count = {"n": 0}
@@ -143,8 +143,8 @@ class TestImmediateTriggerSweep:
 class TestIssueClosedTriggerSweep:
     def test_issue_not_closed_stays_pending_no_audit(self, registry, db_path):
         result = registry.upsert(issue_number=50, title="awaiting issue close")
-        uow_id = result["id"]
-        registry.confirm(uow_id)
+        uow_id = result.id
+        registry.approve(uow_id)
 
         # Override trigger to issue_closed
         conn = sqlite3.connect(str(db_path))
@@ -161,7 +161,7 @@ class TestIssueClosedTriggerSweep:
         _run_sweep(registry, github_client=mock_github_client)
 
         uow_after = registry.get(uow_id)
-        assert uow_after["status"] == "pending"
+        assert str(uow_after.status) == "pending"
 
         # No trigger_fired audit entry
         entries = _audit_entries(db_path, uow_id)
@@ -177,15 +177,15 @@ class TestConsecutiveSweeps:
     def test_second_sweep_skips_advanced_uow(self, registry, db_path):
         """After first sweep advances a UoW, second sweep must not evaluate it."""
         result = registry.upsert(issue_number=60, title="two-sweep test")
-        uow_id = result["id"]
-        registry.confirm(uow_id)
+        uow_id = result.id
+        registry.approve(uow_id)
 
         eval_calls = []
         import src.orchestration.conditions as cond_module
         original_eval = cond_module.evaluate_condition
 
         def recording_eval(uow, **kwargs):
-            eval_calls.append(uow["id"])
+            eval_calls.append(uow.id)
             return original_eval(uow, **kwargs)
 
         cond_module.evaluate_condition = recording_eval
@@ -201,7 +201,7 @@ class TestConsecutiveSweeps:
             cond_module.evaluate_condition = original_eval
 
         uow_after = registry.get(uow_id)
-        assert uow_after["status"] == "ready-for-steward"
+        assert str(uow_after.status) == "ready-for-steward"
 
 
 # ---------------------------------------------------------------------------
@@ -215,8 +215,8 @@ class TestOptimisticLock:
         and transition. When transition returns 0, no trigger_fired entry should be written.
         """
         result = registry.upsert(issue_number=70, title="race condition test")
-        uow_id = result["id"]
-        registry.confirm(uow_id)
+        uow_id = result.id
+        registry.approve(uow_id)
 
         # Patch transition to return 0 (simulate another sweep winning the race)
         original_transition = registry.transition

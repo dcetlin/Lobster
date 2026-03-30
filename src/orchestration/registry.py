@@ -39,6 +39,7 @@ _SCHEMA_SQL = (Path(__file__).parent / "schema.sql").read_text()
 class UoWStatus(StrEnum):
     PROPOSED = "proposed"
     PENDING = "pending"
+    READY_FOR_STEWARD = "ready-for-steward"
     ACTIVE = "active"
     BLOCKED = "blocked"
     DONE = "done"
@@ -50,8 +51,8 @@ class UoWStatus(StrEnum):
         return self in {UoWStatus.DONE, UoWStatus.FAILED, UoWStatus.EXPIRED}
 
     def is_in_flight(self) -> bool:
-        """True for statuses that block re-proposal (active, pending)."""
-        return self in {UoWStatus.ACTIVE, UoWStatus.PENDING}
+        """True for statuses that block re-proposal (active, pending, ready-for-steward)."""
+        return self in {UoWStatus.ACTIVE, UoWStatus.PENDING, UoWStatus.READY_FOR_STEWARD}
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +135,17 @@ class UoW:
     route_reason: str | None = None
     steward_notes: str = ""
     success_criteria: str = ""
+    # trigger: deserialized from JSON. dict for structured triggers, str if malformed JSON,
+    # None for NULL rows. evaluate_condition handles all three cases.
+    trigger: dict | str | None = None
+    # Phase 2 fields (populated after schema migration)
+    workflow_artifact: str | None = None
+    prescribed_skills: list | None = None
+    steward_cycles: int = 0
+    timeout_at: str | None = None
+    estimated_runtime: str | None = None
+    steward_agenda: str | None = None
+    steward_log: str | None = None
 
 
 def _now_iso() -> str:
@@ -204,6 +216,31 @@ class Registry:
     def _row_to_uow(self, row: sqlite3.Row) -> UoW:
         """Convert a sqlite3.Row to a typed UoW value object."""
         d = dict(row)
+
+        def _deserialize_json(raw: Any) -> Any:
+            if raw is not None and isinstance(raw, str):
+                try:
+                    return json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            return raw
+
+        # trigger: deserialize from JSON string → dict, or keep None
+        trigger_raw = d.get("trigger")
+        trigger: dict | None = None
+        if trigger_raw is not None:
+            parsed = _deserialize_json(trigger_raw)
+            if isinstance(parsed, dict):
+                trigger = parsed
+
+        # prescribed_skills: NULL → None, '[]' → [], '["a"]' → ["a"]
+        prescribed_skills_raw = d.get("prescribed_skills")
+        prescribed_skills: list | None = None
+        if prescribed_skills_raw is not None:
+            parsed_ps = _deserialize_json(prescribed_skills_raw)
+            if isinstance(parsed_ps, list):
+                prescribed_skills = parsed_ps
+
         return UoW(
             id=d["id"],
             status=UoWStatus(d["status"]),
@@ -218,6 +255,14 @@ class Registry:
             route_reason=d.get("route_reason"),
             steward_notes=d.get("steward_notes") or "",
             success_criteria=d.get("success_criteria") or "",
+            trigger=trigger,
+            workflow_artifact=d.get("workflow_artifact"),
+            prescribed_skills=prescribed_skills,
+            steward_cycles=d.get("steward_cycles") or 0,
+            timeout_at=d.get("timeout_at"),
+            estimated_runtime=d.get("estimated_runtime"),
+            steward_agenda=d.get("steward_agenda"),
+            steward_log=d.get("steward_log"),
         )
 
     def _write_audit(
@@ -249,9 +294,13 @@ class Registry:
         title: str,
         sweep_date: str | None = None,
         uow_type: str = "executable",
-    ) -> dict[str, Any]:
+    ) -> UpsertResult:
         """
         Propose a UoW for a GitHub issue.
+
+        Returns a typed UpsertResult:
+        - UpsertInserted: new proposed UoW was created
+        - UpsertSkipped: existing non-terminal record prevents creation
 
         Decision table (evaluated before any write):
         - No existing non-terminal record → INSERT new proposed record
@@ -261,12 +310,7 @@ class Registry:
         - UNIQUE(issue, sweep_date) conflict + existing is proposed → UPDATE fields
         - UNIQUE(issue, sweep_date) conflict + existing is non-proposed → no-op update (fields unchanged)
         """
-        result = self._upsert_typed(issue_number, title, sweep_date, uow_type)
-        match result:
-            case UpsertInserted(id=uow_id):
-                return {"id": uow_id, "action": "inserted"}
-            case UpsertSkipped(id=uow_id, reason=reason):
-                return {"id": uow_id, "action": "skipped", "reason": reason}
+        return self._upsert_typed(issue_number, title, sweep_date, uow_type)
 
     def _upsert_typed(
         self,
@@ -427,57 +471,7 @@ class Registry:
         finally:
             conn.close()
 
-    def confirm(self, uow_id: str) -> dict[str, Any]:
-        """
-        Transition a UoW from proposed → pending.
-
-        Delegates to approve() and serializes the result to the legacy dict shape
-        expected by registry_cli.py and dispatcher_handlers.py callers.
-
-        Returns:
-        - success: {"id", "status": "pending", "previous_status": "proposed"}
-        - already non-proposed: {"id", "status": <current>, "action": "noop", "reason": "already <status>"}
-        - not found: {"error": "not found", "id": <id>}
-        - expired: {"error": "expired", "id": <id>}
-        """
-        result = self.approve(uow_id)
-        match result:
-            case ApproveConfirmed(id=id_):
-                return {"id": id_, "status": "pending", "previous_status": "proposed"}
-            case ApproveNotFound(id=id_):
-                return {
-                    "error": "not found",
-                    "id": id_,
-                    "message": f"UoW `{uow_id}` not found. Run `/wos status proposed` to see current proposals.",
-                }
-            case ApproveExpired(id=id_):
-                return {
-                    "error": "expired",
-                    "id": id_,
-                    "message": f"UoW `{uow_id}` has expired. Wait for the next sweep to re-propose, or run a manual sweep.",
-                }
-            case ApproveSkipped(id=id_, current_status=current_status, reason=reason):
-                return {
-                    "id": id_,
-                    "status": current_status,
-                    "action": "noop",
-                    "reason": reason,
-                }
-
-    def get(self, uow_id: str) -> dict[str, Any]:
-        """Return a UoW record by id, or {"error": "not found", "id": <id>}."""
-        conn = self._connect()
-        try:
-            row = conn.execute(
-                "SELECT * FROM uow_registry WHERE id = ?", (uow_id,)
-            ).fetchone()
-            if row is None:
-                return {"error": "not found", "id": uow_id}
-            return self._row_to_dict(row)
-        finally:
-            conn.close()
-
-    def get_uow(self, uow_id: str) -> UoW | None:
+    def get(self, uow_id: str) -> UoW | None:
         """Return a typed UoW value object by id, or None if not found."""
         conn = self._connect()
         try:
@@ -490,7 +484,7 @@ class Registry:
         finally:
             conn.close()
 
-    def list(self, status: str | None = None) -> list[dict[str, Any]]:
+    def list(self, status: str | None = None) -> list[UoW]:
         """Return all UoW records, optionally filtered by status."""
         conn = self._connect()
         try:
@@ -503,7 +497,7 @@ class Registry:
                 rows = conn.execute(
                     "SELECT * FROM uow_registry ORDER BY created_at DESC"
                 ).fetchall()
-            return [self._row_to_dict(r) for r in rows]
+            return [self._row_to_uow(r) for r in rows]
         finally:
             conn.close()
 
@@ -559,7 +553,7 @@ class Registry:
     def check_stale(
         self,
         issue_checker: IssueChecker | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[UoW]:
         """
         Return active UoWs whose source GitHub issue is closed.
 
@@ -585,14 +579,7 @@ class Registry:
         for row in active_rows:
             issue_num = row["source_issue_number"]
             if issue_checker(issue_num):
-                uow = self._row_to_uow(row)
-                stale.append({
-                    "id": uow.id,
-                    "source_issue_number": issue_num,
-                    "summary": uow.summary,
-                    "status": str(uow.status),
-                    "created_at": uow.created_at,
-                })
+                stale.append(self._row_to_uow(row))
         return stale
 
     def set_status_direct(self, uow_id: str, new_status: str) -> None:
@@ -631,7 +618,7 @@ class Registry:
         finally:
             conn.close()
 
-    def query(self, status: str) -> list[dict[str, Any]]:
+    def query(self, status: str) -> list[UoW]:
         """
         Return all UoW records with the given status.
 
@@ -773,22 +760,6 @@ class Registry:
         finally:
             conn.close()
 
-    def gate_readiness(self) -> dict[str, Any]:
-        """
-        Report Phase 1 → Phase 2 autonomy gate status.
-
-        Delegates to registry_health() and serializes to the legacy dict shape
-        expected by registry_cli.py callers.
-
-        Returns a dict with: gate_met, days_running, proposed_to_confirmed_ratio_7d, reason
-        """
-        gs = self.registry_health()
-        return {
-            "gate_met": gs.gate_met,
-            "days_running": gs.days_running,
-            "proposed_to_confirmed_ratio_7d": gs.approval_rate,
-            "reason": "phase 1 complete (2026-03-30)",
-        }
 
 
 # ---------------------------------------------------------------------------

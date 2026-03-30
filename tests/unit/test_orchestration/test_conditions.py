@@ -45,14 +45,20 @@ def _make_uow(
     trigger_json: str | None = '{"type": "immediate"}',
     source_issue_number: int = 42,
     status: str = "pending",
-) -> dict[str, Any]:
-    """Build a minimal UoW dict as returned by _row_to_dict."""
-    return {
-        "id": uow_id,
-        "status": status,
-        "source_issue_number": source_issue_number,
-        "trigger": json.loads(trigger_json) if trigger_json is not None else None,
-    }
+):
+    """Build a minimal UoW typed object for use in evaluate_condition tests."""
+    from src.orchestration.registry import UoW, UoWStatus
+    trigger = json.loads(trigger_json) if trigger_json is not None else None
+    return UoW(
+        id=uow_id,
+        status=UoWStatus(status),
+        summary="test",
+        source=f"github:issue/{source_issue_number}",
+        source_issue_number=source_issue_number,
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+        trigger=trigger,
+    )
 
 
 def _audit_entries(db_path: Path, uow_id: str) -> list[dict]:
@@ -100,14 +106,10 @@ class TestImmediateTrigger:
         uow = _make_uow(trigger_json='{"type": "immediate"}')
         assert evaluate_condition(uow) is True
 
-    def test_immediate_already_dict(self):
-        """_row_to_dict deserializes trigger JSON — ensure dict is handled."""
+    def test_immediate_trigger_dict_already_deserialized(self):
+        """UoW.trigger is a dict (deserialized) — ensure dict trigger is handled."""
         from src.orchestration.conditions import evaluate_condition
-        uow = {
-            "id": "uow_imm_2",
-            "trigger": {"type": "immediate"},
-            "source_issue_number": 1,
-        }
+        uow = _make_uow(uow_id="uow_imm_2", trigger_json='{"type": "immediate"}')
         assert evaluate_condition(uow) is True
 
 
@@ -231,8 +233,8 @@ class TestRegistryStateTrigger:
 
         # Insert a target UoW into the registry and advance it to "done"
         result = registry.upsert(issue_number=99, title="target UoW")
-        target_id = result["id"]
-        registry.confirm(target_id)
+        target_id = result.id
+        registry.approve(target_id)
         registry.set_status_direct(target_id, "done")
 
         uow_id = "uow_rs_match"
@@ -247,7 +249,7 @@ class TestRegistryStateTrigger:
         from src.orchestration.conditions import evaluate_condition
 
         result = registry.upsert(issue_number=100, title="pending target")
-        target_id = result["id"]
+        target_id = result.id
         # UoW stays in "proposed" state
 
         uow_id = "uow_rs_nomatch"
@@ -279,7 +281,7 @@ class TestRegistryStateTrigger:
         """False condition (state not matched) must not write audit entry."""
         from src.orchestration.conditions import evaluate_condition
         result = registry.upsert(issue_number=101, title="still proposed")
-        target_id = result["id"]
+        target_id = result.id
 
         uow_id = "uow_rs_silent"
         uow = _make_uow(
@@ -299,13 +301,19 @@ class TestMalformedTrigger:
     def test_malformed_json_string_returns_true_with_audit(self, registry, db_path):
         """When trigger is stored as a malformed JSON string, return True + audit."""
         from src.orchestration.conditions import evaluate_condition
+        from src.orchestration.registry import UoW, UoWStatus
         uow_id = "uow_malformed"
-        # Simulate a UoW that arrived with trigger as a raw string (pre-deserialized)
-        uow = {
-            "id": uow_id,
-            "trigger": "not-valid-json{{{",  # raw string, not dict
-            "source_issue_number": 1,
-        }
+        # Simulate a UoW that arrived with trigger as a raw malformed string (not valid JSON)
+        uow = UoW(
+            id=uow_id,
+            status=UoWStatus("pending"),
+            summary="test",
+            source="github:issue/1",
+            source_issue_number=1,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+            trigger="not-valid-json{{{",  # raw string, not valid JSON
+        )
         result = evaluate_condition(uow, registry=registry)
         assert result is True
 
@@ -318,12 +326,20 @@ class TestMalformedTrigger:
     def test_trigger_as_non_dict_non_string_returns_true_with_audit(self, registry, db_path):
         """When trigger is some unexpected type (e.g., list), treat as error → True + audit."""
         from src.orchestration.conditions import evaluate_condition
+        from src.orchestration.registry import UoW, UoWStatus
         uow_id = "uow_badtype"
-        uow = {
-            "id": uow_id,
-            "trigger": [1, 2, 3],  # unexpected type
-            "source_issue_number": 1,
-        }
+        # UoW.trigger is typed dict|str|None but Python doesn't enforce at runtime;
+        # pass a list to exercise the unexpected-type branch in evaluate_condition.
+        uow = UoW(
+            id=uow_id,
+            status=UoWStatus("pending"),
+            summary="test",
+            source="github:issue/1",
+            source_issue_number=1,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+            trigger=[1, 2, 3],  # type: ignore[arg-type]  # unexpected type
+        )
         result = evaluate_condition(uow, registry=registry)
         assert result is True
         entries = _audit_entries(db_path, uow_id)

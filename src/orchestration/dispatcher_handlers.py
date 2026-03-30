@@ -82,10 +82,9 @@ def handle_wos_status(status: str | None, *, registry: "Registry") -> str:
 
     lines = [header, ""]
     for r in records:
-        uow_id = r["id"]
-        summary = r.get("summary", "(no summary)")
-        source = r.get("source", "unknown")
-        created = (r.get("created_at") or "")[:10]  # YYYY-MM-DD
-        lines.append(f"`{uow_id}` | {summary} | source: {source} | created: {created}")
+        summary = r.summary or "(no summary)"
+        source = r.source or "unknown"
+        created = r.created_at[:10]  # YYYY-MM-DD
+        lines.append(f"`{r.id}` | {summary} | source: {source} | created: {created}")
 
     return "\n".join(lines)

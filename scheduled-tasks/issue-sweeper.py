@@ -112,7 +112,7 @@ def run_sweep(
         eval_kwargs["github_client"] = github_client
 
     for uow in pending_uows:
-        uow_id = uow["id"]
+        uow_id = uow.id
 
         try:
             condition_met = evaluate_condition(uow, **eval_kwargs)
@@ -142,7 +142,7 @@ def run_sweep(
                 "event": "trigger_fired",
                 "actor": _ACTOR_REGISTRAR,
                 "uow_id": uow_id,
-                "trigger": uow.get("trigger"),
+                "trigger": uow.trigger,
                 "timestamp": _now_iso(),
             })
             advanced += 1
