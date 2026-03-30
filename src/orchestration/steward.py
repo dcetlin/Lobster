@@ -849,7 +849,7 @@ def _write_workflow_artifact(
 # Dan notification
 # ---------------------------------------------------------------------------
 
-_DAN_CHAT_ID = "8075091586"
+_DAN_CHAT_ID = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
 
 
 def _default_notify_dan(
