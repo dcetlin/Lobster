@@ -47,16 +47,19 @@ LOG_FILE="$LOG_DIR/${JOB_NAME}-${TIMESTAMP}.log"
 # --- Check enabled flag ---
 # If the job is marked enabled=false in jobs.json, exit silently.
 if [ -f "$JOBS_FILE" ]; then
-    ENABLED=$(python3 -c "
+    ENABLED=$(uv run - "$JOBS_FILE" "$JOB_NAME" << 'PYEOF'
 import json, sys
+jobs_file = sys.argv[1]
+job_name  = sys.argv[2]
 try:
-    with open('$JOBS_FILE') as f:
+    with open(jobs_file) as f:
         data = json.load(f)
-    job = data.get('jobs', {}).get('$JOB_NAME', {})
+    job = data.get('jobs', {}).get(job_name, {})
     print(str(job.get('enabled', True)).lower())
 except Exception:
     print('true')
-" 2>/dev/null)
+PYEOF
+    2>/dev/null)
     if [ "$ENABLED" = "false" ]; then
         echo "[$START_ISO] Job '$JOB_NAME' is disabled — skipping" >> "$LOG_FILE" 2>&1 || true
         exit 0
