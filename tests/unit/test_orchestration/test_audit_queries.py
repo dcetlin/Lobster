@@ -169,29 +169,51 @@ class TestStallEvents:
 # ---------------------------------------------------------------------------
 
 class TestCyclesHistogram:
-    def test_counts_steward_cycle_events_per_uow(self, db_path):
+    def test_counts_steward_activity_events_per_uow(self, db_path):
         from src.orchestration.audit_queries import cycles_histogram
 
-        _seed_audit(db_path, uow_id="uow-1", event="steward_cycle", ts="2026-01-01T10:00:00+00:00")
-        _seed_audit(db_path, uow_id="uow-1", event="steward_cycle", ts="2026-01-01T11:00:00+00:00")
-        _seed_audit(db_path, uow_id="uow-1", event="steward_cycle", ts="2026-01-01T12:00:00+00:00")
-        _seed_audit(db_path, uow_id="uow-2", event="steward_cycle", ts="2026-01-01T10:00:00+00:00")
+        # Seed with the actual event strings the steward writes
+        _seed_audit(db_path, uow_id="uow-1", event="steward_prescription", ts="2026-01-01T10:00:00+00:00")
+        _seed_audit(db_path, uow_id="uow-1", event="steward_diagnosis", ts="2026-01-01T11:00:00+00:00")
+        _seed_audit(db_path, uow_id="uow-1", event="agenda_update", ts="2026-01-01T12:00:00+00:00")
+        _seed_audit(db_path, uow_id="uow-2", event="steward_prescription", ts="2026-01-01T10:00:00+00:00")
 
         result = cycles_histogram(registry_path=db_path)
 
         assert result == {"uow-1": 3, "uow-2": 1}
 
-    def test_excludes_non_steward_cycle_events(self, db_path):
+    def test_counts_all_steward_event_types(self, db_path):
+        from src.orchestration.audit_queries import cycles_histogram
+
+        # Each of the seven steward event strings must be counted
+        steward_events = [
+            "steward_prescription",
+            "steward_diagnosis",
+            "steward_surface",
+            "steward_closure",
+            "agenda_update",
+            "reentry_prescription",
+            "prescription",
+        ]
+        for event in steward_events:
+            _seed_audit(db_path, uow_id="uow-1", event=event, ts="2026-01-01T10:00:00+00:00")
+
+        result = cycles_histogram(registry_path=db_path)
+
+        assert result == {"uow-1": len(steward_events)}
+
+    def test_excludes_non_steward_events(self, db_path):
         from src.orchestration.audit_queries import cycles_histogram
 
         _seed_audit(db_path, uow_id="uow-1", event="status_change", ts="2026-01-01T10:00:00+00:00")
-        _seed_audit(db_path, uow_id="uow-1", event="steward_cycle", ts="2026-01-01T11:00:00+00:00")
+        _seed_audit(db_path, uow_id="uow-1", event="execution_complete", ts="2026-01-01T10:00:00+00:00")
+        _seed_audit(db_path, uow_id="uow-1", event="steward_prescription", ts="2026-01-01T11:00:00+00:00")
 
         result = cycles_histogram(registry_path=db_path)
 
         assert result == {"uow-1": 1}
 
-    def test_empty_dict_when_no_steward_cycles(self, db_path):
+    def test_empty_dict_when_no_steward_events(self, db_path):
         from src.orchestration.audit_queries import cycles_histogram
 
         result = cycles_histogram(registry_path=db_path)
@@ -200,7 +222,7 @@ class TestCyclesHistogram:
     def test_returns_plain_dict(self, db_path):
         from src.orchestration.audit_queries import cycles_histogram
 
-        _seed_audit(db_path, uow_id="uow-1", event="steward_cycle", ts="2026-01-01T10:00:00+00:00")
+        _seed_audit(db_path, uow_id="uow-1", event="steward_prescription", ts="2026-01-01T10:00:00+00:00")
 
         result = cycles_histogram(registry_path=db_path)
         assert isinstance(result, dict)
@@ -212,53 +234,50 @@ class TestCyclesHistogram:
 # ---------------------------------------------------------------------------
 
 class TestExecutionOutcomes:
-    def test_counts_outcomes_by_note_value(self, db_path):
+    def test_counts_execution_complete_and_failed_events(self, db_path):
         from src.orchestration.audit_queries import execution_outcomes
+        import json
 
         cutoff = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        # execution_complete — note is a JSON dict matching executor._complete_uow
         for _ in range(3):
-            _seed_audit(db_path, uow_id="uow-1", event="executor_outcome",
-                        ts="2026-01-02T10:00:00+00:00", note="complete")
+            _seed_audit(db_path, uow_id="uow-1", event="execution_complete",
+                        ts="2026-01-02T10:00:00+00:00",
+                        note=json.dumps({"actor": "executor", "output_ref": "/tmp/out", "timestamp": "2026-01-02T10:00:00+00:00"}))
+        # execution_failed — note is a JSON dict matching executor._fail_uow
         for _ in range(2):
-            _seed_audit(db_path, uow_id="uow-2", event="executor_outcome",
-                        ts="2026-01-02T10:00:00+00:00", note="failed")
-        _seed_audit(db_path, uow_id="uow-3", event="executor_outcome",
-                    ts="2026-01-02T10:00:00+00:00", note="blocked")
+            _seed_audit(db_path, uow_id="uow-2", event="execution_failed",
+                        ts="2026-01-02T10:00:00+00:00",
+                        note=json.dumps({"actor": "executor", "reason": "timeout", "timestamp": "2026-01-02T10:00:00+00:00"}))
 
         result = execution_outcomes(cutoff, registry_path=db_path)
 
-        assert result == {"complete": 3, "failed": 2, "blocked": 1}
-
-    def test_null_note_counted_as_unknown(self, db_path):
-        from src.orchestration.audit_queries import execution_outcomes
-
-        cutoff = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-        _seed_audit(db_path, uow_id="uow-1", event="executor_outcome",
-                    ts="2026-01-02T10:00:00+00:00", note=None)
-
-        result = execution_outcomes(cutoff, registry_path=db_path)
-
-        assert result == {"unknown": 1}
+        assert result == {"execution_complete": 3, "execution_failed": 2}
 
     def test_excludes_events_before_since(self, db_path):
         from src.orchestration.audit_queries import execution_outcomes
+        import json
 
         cutoff = datetime(2026, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
-        _seed_audit(db_path, uow_id="uow-1", event="executor_outcome",
-                    ts="2026-01-01T10:00:00+00:00", note="complete")  # before cutoff
-        _seed_audit(db_path, uow_id="uow-2", event="executor_outcome",
-                    ts="2026-07-01T10:00:00+00:00", note="failed")    # after cutoff
+        _seed_audit(db_path, uow_id="uow-1", event="execution_complete",
+                    ts="2026-01-01T10:00:00+00:00",  # before cutoff
+                    note=json.dumps({"actor": "executor", "output_ref": "/tmp/out", "timestamp": "2026-01-01T10:00:00+00:00"}))
+        _seed_audit(db_path, uow_id="uow-2", event="execution_failed",
+                    ts="2026-07-01T10:00:00+00:00",  # after cutoff
+                    note=json.dumps({"actor": "executor", "reason": "timeout", "timestamp": "2026-07-01T10:00:00+00:00"}))
 
         result = execution_outcomes(cutoff, registry_path=db_path)
 
-        assert result == {"failed": 1}
+        assert result == {"execution_failed": 1}
 
-    def test_excludes_non_executor_outcome_events(self, db_path):
+    def test_excludes_non_executor_events(self, db_path):
         from src.orchestration.audit_queries import execution_outcomes
 
         cutoff = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
         _seed_audit(db_path, uow_id="uow-1", event="status_change",
-                    ts="2026-01-02T10:00:00+00:00", note="complete")
+                    ts="2026-01-02T10:00:00+00:00")
+        _seed_audit(db_path, uow_id="uow-1", event="steward_prescription",
+                    ts="2026-01-02T10:00:00+00:00")
 
         result = execution_outcomes(cutoff, registry_path=db_path)
         assert result == {}

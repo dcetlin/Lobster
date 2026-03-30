@@ -109,10 +109,13 @@ def stall_events(
 def cycles_histogram(
     registry_path: Path | None = None,
 ) -> dict[str, int]:
-    """Return {uow_id: steward_cycle_count} for all UoWs with audit records.
+    """Return {uow_id: steward_activity_count} for all UoWs with audit records.
 
-    steward_cycle_count is the number of audit_log entries whose event is
-    'steward_cycle' for each UoW. UoWs with no such entries are omitted.
+    steward_activity_count is the number of audit_log entries written by the
+    steward for each UoW. The steward writes these event strings on each cycle:
+    'steward_prescription', 'steward_diagnosis', 'steward_surface',
+    'steward_closure', 'agenda_update', 'reentry_prescription', 'prescription'.
+    UoWs with no such entries are omitted.
     """
     path = registry_path if registry_path is not None else _default_registry_path()
     conn = _connect(path)
@@ -121,7 +124,15 @@ def cycles_histogram(
             """
             SELECT uow_id, COUNT(*) AS cycle_count
             FROM audit_log
-            WHERE event = 'steward_cycle'
+            WHERE event IN (
+                'steward_prescription',
+                'steward_diagnosis',
+                'steward_surface',
+                'steward_closure',
+                'agenda_update',
+                'reentry_prescription',
+                'prescription'
+            )
             GROUP BY uow_id
             ORDER BY uow_id ASC
             """,
@@ -137,9 +148,12 @@ def execution_outcomes(
 ) -> dict[str, int]:
     """Return {outcome: count} for all executor outcomes since the given datetime.
 
-    Executor outcomes are audit entries whose event is 'executor_outcome'.
-    The outcome value is stored in the audit_log.note column.
-    Entries with a NULL note are counted under the key 'unknown'.
+    Executor outcomes are audit entries whose event is 'execution_complete' or
+    'execution_failed' (written by executor._complete_uow and ._fail_uow).
+    The outcome key is the event value itself — 'execution_complete' or
+    'execution_failed'. The note column contains a JSON dict with actor,
+    output_ref or reason, and timestamp; the event string is the authoritative
+    outcome signal.
     """
     path = registry_path if registry_path is not None else _default_registry_path()
     since_iso = since.isoformat() if since.tzinfo is not None else since.replace(tzinfo=timezone.utc).isoformat()
@@ -147,11 +161,11 @@ def execution_outcomes(
     try:
         rows = conn.execute(
             """
-            SELECT COALESCE(note, 'unknown') AS outcome, COUNT(*) AS cnt
+            SELECT event AS outcome, COUNT(*) AS cnt
             FROM audit_log
-            WHERE event = 'executor_outcome'
+            WHERE event IN ('execution_complete', 'execution_failed')
               AND ts >= ?
-            GROUP BY COALESCE(note, 'unknown')
+            GROUP BY event
             """,
             (since_iso,),
         ).fetchall()
