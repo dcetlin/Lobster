@@ -97,6 +97,9 @@ OUTBOX_HISTORICAL_CUTOFF=3600        # Skip files > 1 hour (dead-letter candidat
 LOG_FILE="$WORKSPACE_DIR/logs/health-check.log"
 LOCK_FILE="${LOBSTER_HEALTH_LOCK:-/tmp/lobster-health-check-v3.lock}"
 
+CLAUDE_SESSION_LOG="$WORKSPACE_DIR/logs/claude-session.log"
+LIMIT_WAIT_STATE_FILE="$WORKSPACE_DIR/logs/health-limit-wait-state"
+
 MAX_RESTART_ATTEMPTS=3
 RESTART_COOLDOWN_SECONDS=600         # 10 min window for counting attempts
 RESTART_STATE_FILE="$WORKSPACE_DIR/logs/health-restart-state-v3"
@@ -1253,6 +1256,83 @@ except Exception as e:
 }
 
 #===============================================================================
+# Usage Limit Detection
+#===============================================================================
+# check_usage_limit — inspect the last 50 lines of claude-session.log for the
+# Anthropic rate-limit message ("You've hit your limit").
+#
+# Returns:
+#   0  — usage limit detected (caller should NOT escalate to BLACK/restart)
+#   1  — no limit signal found (caller should proceed with normal crash logic)
+#
+# Side effects on detection:
+#   - Writes $LIMIT_WAIT_STATE_FILE with epoch timestamp and optional reset time
+#   - Sends a deduplicated Telegram alert with the reset time if parseable
+#   - Logs at INFO level
+check_usage_limit() {
+    if [[ ! -f "$CLAUDE_SESSION_LOG" ]]; then
+        return 1
+    fi
+
+    local limit_line
+    limit_line=$(tail -50 "$CLAUDE_SESSION_LOG" 2>/dev/null | grep -i "you.ve hit your limit\|hit your limit" | tail -1)
+
+    if [[ -z "$limit_line" ]]; then
+        return 1
+    fi
+
+    log_info "USAGE LIMIT: Detected rate-limit signal in claude-session.log: $limit_line"
+
+    # Extract reset time if present — e.g. "resets 6pm (UTC)" or "resets at 6:00pm"
+    local reset_time=""
+    reset_time=$(echo "$limit_line" | grep -oiE 'resets? (at )?[0-9]{1,2}(:[0-9]{2})?(am|pm)( \([A-Z]+\))?' | head -1)
+
+    local now
+    now=$(date +%s)
+    echo "$now ${reset_time:-unknown}" > "$LIMIT_WAIT_STATE_FILE"
+    log_info "USAGE LIMIT: Wrote limit-wait state to $LIMIT_WAIT_STATE_FILE (reset: ${reset_time:-unknown})"
+
+    local alert_text
+    if [[ -n "$reset_time" ]]; then
+        alert_text="Claude usage limit hit. ${reset_time^}. Will retry automatically — no restart needed."
+    else
+        alert_text="Claude usage limit hit. Reset time unknown. Will retry automatically — no restart needed."
+    fi
+
+    send_telegram_alert_deduped "usage-limit" "$alert_text"
+    return 0
+}
+
+# is_limit_wait — returns 0 if a recent usage-limit event was recorded and
+# the limit-wait window has not yet expired.  Conservatively uses a 4-hour
+# guard since reset times are hard to parse reliably.
+LIMIT_WAIT_MAX_SECONDS=14400  # 4 hours
+
+is_limit_wait() {
+    [[ -f "$LIMIT_WAIT_STATE_FILE" ]] || return 1
+    local recorded_at
+    read -r recorded_at _ < "$LIMIT_WAIT_STATE_FILE" 2>/dev/null || return 1
+    [[ "$recorded_at" =~ ^[0-9]+$ ]] || return 1
+    local now
+    now=$(date +%s)
+    local age=$(( now - recorded_at ))
+    if [[ $age -lt $LIMIT_WAIT_MAX_SECONDS ]]; then
+        log_info "LIMIT-WAIT: Usage limit recorded ${age}s ago (guard: ${LIMIT_WAIT_MAX_SECONDS}s) — suppressing restart"
+        return 0
+    fi
+    # Guard expired — remove stale state file so normal crash logic resumes
+    rm -f "$LIMIT_WAIT_STATE_FILE"
+    return 1
+}
+
+clear_limit_wait() {
+    if [[ -f "$LIMIT_WAIT_STATE_FILE" ]]; then
+        rm -f "$LIMIT_WAIT_STATE_FILE"
+        log_info "LIMIT-WAIT: Cleared limit-wait state (system recovered)"
+    fi
+}
+
+#===============================================================================
 # Recovery - always via systemd, never manual tmux
 #===============================================================================
 # DANGER: do_restart() must ONLY be called when the system is confirmed
@@ -1971,19 +2051,34 @@ main() {
             # If system previously required manual intervention, clear the flag now
             # so auto-restarts are re-enabled after genuine recovery.
             clear_manual_intervention
+            # Clear any stale limit-wait state on genuine recovery
+            clear_limit_wait
             ;;
         YELLOW)
             log_warn "YELLOW: Non-critical issues detected (mode=$lobster_mode), monitoring"
             ;;
         RED)
             log_error "RED: Critical failure (mode=$lobster_mode) - $restart_reason"
-            # Pass compaction_recent as suppress_alert so do_restart() skips its
-            # Telegram alerts when compaction is still within the suppression
-            # window.  on-compact.py already sent exactly one notification, so
-            # the deferred-restart and recovered-successfully alerts would be
-            # duplicates.  Genuine failure alerts (restart failed, BLACK state)
-            # always fire regardless of this flag.
-            do_restart "$restart_reason" "$compaction_recent"
+
+            # Usage-limit gate: before escalating to restart/BLACK, check whether
+            # claude-session.log contains the Anthropic rate-limit message.  A usage
+            # limit produces exit_code=1 and a stale inbox — identical to a crash —
+            # but restarting is useless (Claude will just hit the limit again immediately).
+            # If we're already in a recorded limit-wait, suppress the restart silently.
+            # If this is a fresh limit event, detect it, alert, and suppress the restart.
+            if is_limit_wait; then
+                log_info "LIMIT-WAIT: Suppressing restart (active usage-limit wait) — skipping do_restart"
+            elif check_usage_limit; then
+                log_info "LIMIT-WAIT: Usage limit detected — suppressing restart, alert sent"
+            else
+                # Pass compaction_recent as suppress_alert so do_restart() skips its
+                # Telegram alerts when compaction is still within the suppression
+                # window.  on-compact.py already sent exactly one notification, so
+                # the deferred-restart and recovered-successfully alerts would be
+                # duplicates.  Genuine failure alerts (restart failed, BLACK state)
+                # always fire regardless of this flag.
+                do_restart "$restart_reason" "$compaction_recent"
+            fi
             ;;
     esac
 
