@@ -213,6 +213,19 @@ Every intentional exit — complete, partial, failed, or blocked — must produc
 
 ---
 
+## Startup Sweep Classification Labels
+
+When the startup sweep runs, it assigns classification labels to UoWs it recovers. These labels appear in the `classification` field of the audit log entry written by the sweep.
+
+| Label | Condition | Steward treatment |
+|-------|-----------|-------------------|
+| `executor_orphan` | UoW stuck in `ready-for-executor` state beyond the orphan threshold (default: 1 hour). Executor was dispatched but never wrote a result file. | Treated as clean first execution: Steward re-diagnoses and re-prescribes from the current UoW state. |
+| `diagnosing_orphan` | UoW in `diagnosing` state at sweep time — Steward crashed mid-diagnosis before completing the diagnosis cycle. | Re-diagnosed from current UoW state; steward_log may carry partial entries from the aborted cycle. |
+| `crashed_no_output_ref` | UoW was `active` (Executor running) and no `output_ref` is set — Executor crashed before writing any artifact. | Steward re-diagnoses from scratch; no artifact to evaluate. |
+| `crashed_output_ref_missing` | UoW was `active`, `output_ref` is set, but the file is absent — Executor crashed after registering the artifact path but before writing it. | Steward re-diagnoses; treats missing file as incomplete execution. |
+
+---
+
 ## Contract Version
 
 This document specifies contract v1, corresponding to WOS Phase 2. Future versions will be noted here with their effective date and the PRs that introduce changes.
