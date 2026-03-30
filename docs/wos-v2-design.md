@@ -405,11 +405,15 @@ Steward cycle 2:
 - Oracle audit passed ("excellent enough to implement")
 - Design doc stable and converged
 
-**Phase 1 to Phase 2 transition:** Two pre-Phase-2 blocking gates remain before implementation begins. Both are owned by Dan and documented in Open Decisions: (1) workflow artifact format decision (deterministic script vs. LLM prompt instructions), and (2) trigger evaluation mode decision (polling vs. event-driven). Resolving these two gates is the immediate next step; Steward MVP build begins once both are cleared.
+**Phase 1 to Phase 2 transition:** Both pre-Phase-2 blocking gates are now resolved (2026-03-30). (1) Workflow artifact format — Option C: structured envelope + instructions field. (2) Trigger evaluation mode — polling via `evaluate_condition(uow)`. See Resolved Decisions for full rationale. Steward MVP build can begin.
 
 ### Phase 2: Steward + Executor [next]
 
-**Pre-Phase-2 gates (must be cleared before implementation begins):** (1) Workflow artifact format decision (deterministic script vs. LLM prompt instructions) — see Open Decisions. (2) Trigger evaluation mode (polling vs. event-driven for condition triggers) — see Open Decisions. Both gates are blocking; neither has a costly resolution path.
+**Pre-Phase-2 gates: CLEARED as of 2026-03-30.** Both blocking gates are resolved:
+1. Workflow artifact format — Option C: structured envelope + instructions field. See Resolved Decisions.
+2. Trigger evaluation mode — polling via `evaluate_condition(uow)`. See Resolved Decisions.
+
+**Phase 2 build can begin.**
 
 **What to build:** Steward agent (cron heartbeat, diagnose/prescribe/evaluate/close loop), Executor agent (picks up `ready-for-executor` UoWs, runs prescribed workflow, returns results). UoWRegistry extended with Steward-cycle audit fields. Routing Classifier added: rule engine evaluating `classifier.yaml`, assigning postures, writing `route_reason`. Conditional Hook System wired. Cultivator wired to file seeds from philosophy sessions programmatically (Phase 2 trigger design).
 
@@ -429,30 +433,60 @@ Steward cycle 2:
 
 ---
 
+## Design Principle
+
+> **Optimize for current scale, place abstraction precisely at seams that will need to flex.** Simplest implementation that works now, with named interfaces at the points where the grain of the design indicates future change will be needed. This is not over-engineering — it is reading the grain.
+
+This principle governs every architectural decision in WOS. When a decision is between "simpler now, harder to change later" and "named interface now, swap-out later," the choice depends on whether this seam is one where the design's grain indicates future change. At seams that will need to flex, the named interface is the simpler choice in total. At seams that will not, it is premature.
+
+---
+
+## Resolved Decisions
+
+### Decision 1: Workflow artifact format — RESOLVED: Option C (structured envelope + instructions field)
+
+**Status: Resolved. Phase 2 implementation proceeds on this basis.**
+
+The `workflow_artifact` is a named struct (structured envelope) with a required `instructions` field containing natural language instructions the Executor follows. The envelope fields are load-bearing throughout Phase 2 — not ceremonial. The struct is:
+
+```
+workflow_artifact:
+  uow_id:            TEXT        # which UoW this artifact belongs to
+  executor_type:     TEXT        # which executor class should pick this up
+  constraints:       TEXT[]      # hard constraints the Executor must honor
+  prescribed_skills: TEXT[]      # skill IDs to load at task start
+  instructions:      TEXT        # natural language — the Steward's prescription
+```
+
+**Rationale for implementers:**
+
+(a) **Formalizing existing practice.** This is already how Lobster dispatches subagents today — a structured prompt with named fields and natural language instructions. Adopting this pattern at the Steward/Executor seam means no conceptual leap; the Executor is a subagent that follows a well-formed task spec.
+
+(b) **Auditability without rigidity.** The envelope fields (`uow_id`, `executor_type`, `constraints`, `prescribed_skills`) give the audit log structured data to work with — you can query which executor type ran, what constraints were imposed, which skills were loaded — without locking the instruction content into a deterministic script format that cannot handle novel situations.
+
+(c) **Abstraction at the right seam.** The envelope is the contract between Steward and Executor. The `instructions` field is the Steward's judgment, expressed in natural language. Separating these means the contract (envelope schema) can evolve independently from the instruction style. If the Steward/Executor contract needs to change in Phase 3, it is a schema change on the envelope — not a refactor of how instructions are written.
+
+---
+
+### Decision 2: Trigger evaluation mode — RESOLVED: polling via evaluate_condition(uow)
+
+**Status: Resolved. Phase 2 implementation proceeds on this basis.**
+
+For Phase 2, trigger evaluation is implemented as polling: the UoW Registrar calls `evaluate_condition(uow)` on each sweep pass. `evaluate_condition(uow)` checks the relevant external state (GitHub API, registry state, or other condition) and returns a boolean — fire or no-fire.
+
+**`evaluate_condition(uow)` is a named callable.** It is not inlined logic in the sweep loop. This is the seam.
+
+**Rationale for implementers:**
+
+(a) **Native to the Registrar's scheduling model.** The Registrar already runs on a polling sweep. Adding trigger evaluation as a function call on each pass requires no new infrastructure — it is exactly what the Registrar loop already does.
+
+(b) **At current scale, polling lag is irrelevant.** The conditions we are evaluating in Phase 2 (`all_children_done`, `retry-on-failure`, time-based triggers) have latency tolerance in the minutes range. Polling on the Registrar's sweep cadence (nightly for proposals; configurable for state checks) is accurate enough.
+
+(c) **The abstraction makes Phase 3 a backend swap, not a refactor.** By naming the callable `evaluate_condition(uow)` and calling it consistently, the switch to event-driven semantics in Phase 3 means replacing the implementation of `evaluate_condition` — not touching the Registrar's loop structure. The Registrar does not need to know whether evaluation is polling or event-driven; it calls the function and gets a result.
+
+---
+
 ## Open Decisions
-
-**Workflow artifact format: deterministic script vs. LLM prompt instructions**
-
-When the Steward prescribes a workflow, it writes a workflow artifact that the Executor follows. Two candidate forms:
-
-| Form | Description | Trade-offs |
-|------|-------------|-----------|
-| **Deterministic script** | A structured script that kicks off specific agents in a defined sequence — explicit branching, named subagents, typed outputs | More predictable, easier to audit, harder to write for novel situations |
-| **LLM prompt instructions** | A rich instruction document that an Executor-agent follows via its own judgment — natural language, composable, flexible | More adaptable, harder to audit deterministically, relies on Executor fidelity |
-
-This is the **first implementation decision to resolve** before the Executor can be built. It determines the interface contract between Steward and Executor, the structure of workflow artifacts, and the degree of determinism in the system.
-
-**Pre-Phase-2 gate.** Resolution owner: Dan. Cheapest-test path: produce a concrete example of each form applied to one real workflow type (e.g., investigation or design review), then a decision logged to the audit trail within the first week of Phase 2 design. Fallback default if gate is not cleared: LLM prompt instructions (lower implementation cost; switch to deterministic script if auditability requirements surface during Phase 2). Phase 2 implementation does not begin until this gate is cleared.
-
----
-
-**Trigger evaluation mode for condition triggers: polling vs. event-driven**
-
-For time-based triggers, polling (evaluator checks on each scheduled run) is sufficient. For state-transition hooks like `all_children_done` and `retry-on-failure`, event-driven semantics (hook fires in the same transaction as the state transition) are materially different from polling semantics.
-
-**Pre-Phase-2 gate.** Resolution owner: Dan. Cheapest-test path: test both semantics against the `retry-on-failure` hook with a real failed UoW before committing to either model. Fallback default: polling (simpler, consistent with existing cron infrastructure). Until resolved, the `condition` trigger type in the schema is a reserved field and no hook implementation depends on event-driven semantics.
-
----
 
 **Hook storage split: structural vs. behavioral**
 
