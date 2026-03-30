@@ -819,6 +819,194 @@ class Registry:
         """
         return self.list(status=UoWStatus.ACTIVE)
 
+    def record_startup_sweep_active(
+        self,
+        uow_id: str,
+        classification: str,
+        output_ref: str | None,
+        extra: dict[str, Any] | None = None,
+    ) -> int:
+        """
+        Atomically write a startup_sweep audit entry and transition an `active`
+        UoW to `ready-for-steward`.
+
+        Used for the four crash classifications that originate from `active`:
+        possibly_complete, crashed_zero_bytes, crashed_output_ref_missing,
+        crashed_no_output_ref.
+
+        Follows the optimistic-lock + audit pattern (Principle 1):
+        - UPDATE uses WHERE status = 'active'.
+        - Audit INSERT is written in the same transaction only if rows == 1.
+        - Returns 1 on success, 0 if another process already advanced this UoW.
+        """
+        now = _now_iso()
+        note: dict[str, Any] = {
+            "event": "startup_sweep",
+            "actor": "steward_startup",
+            "classification": classification,
+            "output_ref": output_ref,
+            "uow_id": uow_id,
+            "timestamp": now,
+        }
+        if extra:
+            note.update(extra)
+        note_json = json.dumps(note)
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            cursor = conn.execute(
+                """
+                UPDATE uow_registry
+                SET status = 'ready-for-steward', updated_at = ?
+                WHERE id = ? AND status = 'active'
+                """,
+                (now, uow_id),
+            )
+            rows_affected = cursor.rowcount
+
+            if rows_affected == 1:
+                conn.execute(
+                    """
+                    INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                    VALUES (?, ?, 'startup_sweep', 'active', 'ready-for-steward', 'steward_startup', ?)
+                    """,
+                    (now, uow_id, note_json),
+                )
+
+            conn.commit()
+            return rows_affected
+
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def record_startup_sweep_executor_orphan(
+        self,
+        uow_id: str,
+        proposed_at: str,
+        age_seconds: float,
+        threshold_seconds: int = 3600,
+    ) -> int:
+        """
+        Atomically write a startup_sweep audit entry and transition a
+        `ready-for-executor` UoW to `ready-for-steward`.
+
+        Used exclusively for the executor_orphan classification: UoWs stuck
+        in ready-for-executor for longer than threshold_seconds.
+
+        Follows the optimistic-lock + audit pattern (Principle 1):
+        - UPDATE uses WHERE status = 'ready-for-executor'.
+        - Audit INSERT written in same transaction only if rows == 1.
+        - Returns 1 on success, 0 if another process already advanced this UoW.
+        """
+        now = _now_iso()
+        note_json = json.dumps({
+            "event": "startup_sweep",
+            "actor": "steward_startup",
+            "classification": "executor_orphan",
+            "output_ref": None,
+            "uow_id": uow_id,
+            "timestamp": now,
+            "prior_status": "ready-for-executor",
+            "proposed_at": proposed_at,
+            "age_seconds": age_seconds,
+            "threshold_seconds": threshold_seconds,
+        })
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            cursor = conn.execute(
+                """
+                UPDATE uow_registry
+                SET status = 'ready-for-steward', updated_at = ?
+                WHERE id = ? AND status = 'ready-for-executor'
+                """,
+                (now, uow_id),
+            )
+            rows_affected = cursor.rowcount
+
+            if rows_affected == 1:
+                conn.execute(
+                    """
+                    INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                    VALUES (?, ?, 'startup_sweep', 'ready-for-executor', 'ready-for-steward',
+                            'steward_startup', ?)
+                    """,
+                    (now, uow_id, note_json),
+                )
+
+            conn.commit()
+            return rows_affected
+
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def record_startup_sweep_diagnosing(
+        self,
+        uow_id: str,
+    ) -> int:
+        """
+        Atomically write a startup_sweep audit entry and transition a
+        `diagnosing` UoW back to `ready-for-steward`.
+
+        Used when the Steward crashed mid-diagnosis. The next heartbeat
+        re-diagnoses cleanly from ready-for-steward.
+
+        Returns 1 on success, 0 if another process already advanced this UoW.
+        """
+        now = _now_iso()
+        note_json = json.dumps({
+            "event": "startup_sweep",
+            "actor": "steward_startup",
+            "classification": "diagnosing_orphan",
+            "output_ref": None,
+            "uow_id": uow_id,
+            "timestamp": now,
+            "prior_status": "diagnosing",
+        })
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            cursor = conn.execute(
+                """
+                UPDATE uow_registry
+                SET status = 'ready-for-steward', updated_at = ?
+                WHERE id = ? AND status = 'diagnosing'
+                """,
+                (now, uow_id),
+            )
+            rows_affected = cursor.rowcount
+
+            if rows_affected == 1:
+                conn.execute(
+                    """
+                    INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                    VALUES (?, ?, 'startup_sweep', 'diagnosing', 'ready-for-steward',
+                            'steward_startup', ?)
+                    """,
+                    (now, uow_id, note_json),
+                )
+
+            conn.commit()
+            return rows_affected
+
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def registry_health(self) -> GateStatus:
         """
         Report registry health / autonomy gate status.
