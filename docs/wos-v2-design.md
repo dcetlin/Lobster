@@ -32,7 +32,7 @@ The v2 model replaces the Phase 1 dispatcher-centric model with a two-actor **St
 
 **Sprout moment** — When the UoW Registrar identifies a qualifying GitHub issue and creates a UoW entry in the UoWRegistry. The issue enters the UoW execution pipeline at this point.
 
-**Bootup candidate** — A pearl or seed that is not yet actionable but has been identified as relevant to future system orientation. Bootup candidates are filed as design-gate UoWs: they enter the UoWRegistry at low priority, pending an explicit design session or human-gate confirmation before proceeding.
+**Bootup candidate** — A specific pearl type: a proposed addition to Lobster's bootup or context files, produced by a philosophy session and routed by the Cultivator to the write-path as a GitHub issue (label: `bootup-candidate`). Bootup candidates do not automatically enter the UoWRegistry. They are design-gate UoWs: the gate is Dan's review. Once Dan approves (passes the gate), the issue qualifies for the UoW Registrar to pick up and register as an executable UoW.
 
 ### The Cultivator
 
@@ -127,7 +127,7 @@ The Steward selects from a library of named workflow primitives. Each primitive 
 | **Diverge → converge (1×)** | One divergent pass (alternatives/perspectives) + one convergence pass (synthesize) | Synthesized artifact |
 | **Diverge → converge (2×)** | Two divergent passes before convergence — used when the problem space is large or stakes are high | Synthesized artifact |
 | **Multi-perspective fan-out** | Spawn N subagents with distinct postures; convergence step synthesizes all readings | Synthesized artifact |
-| **Spec breakdown** | Decomposes a design spec into executable sub-UoWs, each entering the queue | N new UoWs in Registry |
+| **Spec breakdown** | Decomposes a design spec into executable sub-UoWs, each entering the queue | N new UoWs in UoWRegistry |
 
 ### Selection Rule
 
@@ -151,7 +151,7 @@ The UoW Registrar is the bridge between the pre-Registry layer (GitHub issues as
 
 Runs on a cron heartbeat (initially ~3 minutes). Queries for UoWs in `ready-for-steward` state. For each, the Steward:
 
-1. **Diagnoses** — reads the UoW trail (original intent, prior prescriptions, execution logs, current Registry state, Vision Object context). Writes the diagnosis to the audit trail before prescribing.
+1. **Diagnoses** — reads the UoW trail (original intent, prior prescriptions, execution logs, current UoWRegistry state, Vision Object context). Writes the diagnosis to the audit trail before prescribing.
 2. **Prescribes** — selects a workflow primitive with a written rationale. Writes the prescription (named workflow + artifact path) to the audit trail. Transitions UoW to `ready-for-executor`.
 3. **Evaluates** (on re-entry after execution) — reads execution results, re-diagnoses fresh, decides: loop again or declare closure.
 4. **Closes** — writes a closing diagnosis when convergence conditions are met. Transitions to `done`.
@@ -172,7 +172,7 @@ Steward → Executor → Steward → Executor → ... → Steward declares done
 
 ### Observation Loop
 
-META monitors the Registry and audit log for degradation signals: dark pipeline (no audit entries for >3 days), orphaned active records, ready-queue growth without drain, stale count accumulation, issue-open rate exceeding close rate for >2 consecutive weeks. When a signal fires, META surfaces it to Dan with evidence, not guesswork.
+META monitors the UoWRegistry and audit log for degradation signals: dark pipeline (no audit entries for >3 days), orphaned active records, ready-queue growth without drain, stale count accumulation, issue-open rate exceeding close rate for >2 consecutive weeks. When a signal fires, META surfaces it to Dan with evidence, not guesswork.
 
 ### Dan Interrupt
 
@@ -180,7 +180,7 @@ Dan can plug into the Steward's loop at three defined points:
 
 - **Observation surfacing**: Steward sends Dan a diagnosis when one of the three surface conditions is met. Context is organized for minimum cognitive friction.
 - **Orientation input**: Dan injects nuance or alternative readings; Steward re-diagnoses before prescribing. Both the correction and re-diagnosis are written to the audit trail.
-- **Human gate (`/decide`)**: Explicit confirmation required when the decision is substantial, fundamental, load-bearing, and sufficiently complex — all four. Steward presents synthesized orientation; Dan's answer becomes the prescription constraint. (Note: `/confirm` is the sweeper-proposal gate only; mid-execution human-gate responses use `/decide <uow-id> approve|reject|defer`.)
+- **Human gate (`/decide`)**: Explicit confirmation required when the decision is substantial, fundamental, load-bearing, and sufficiently complex — all four. Steward presents synthesized orientation; Dan's answer becomes the prescription constraint. (Note: `/confirm` is the UoW Registrar proposal gate only; mid-execution human-gate responses use `/decide <uow-id> approve|reject|defer`.)
 
 ---
 
@@ -211,7 +211,7 @@ Steward cycle 2 (re-entry):
 
 ```
 Issue #228: "UoW Steward -- per-issue diagnostic orchestrator"
-  -> Sweeper creates UoW (proposed, type: design-seed)
+  -> UoW Registrar creates UoW (proposed, type: design-seed)
   -> Dan: /confirm -> ready-for-steward
 
 Steward cycle 1:
