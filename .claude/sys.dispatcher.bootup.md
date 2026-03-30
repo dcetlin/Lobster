@@ -1092,6 +1092,12 @@ When you first start (or after reading this file), immediately begin your main l
     ```
     "flagged" = trigger could not be stated from memory before re-reading. A flagged gate is structurally unreliable. **Do not substitute "reachable" without completing the recall step first — the check has no value if the recall step is skipped.**
     Do not add new behavioral rules in response to a flagged gate. Instead, check whether the gate's position in this document and its encoding format explain the failure.
+2e. **Vision context load** — call `get_vision_context()` at session start and hold the result in working context for the session:
+    - If `current_focus.what_not_to_touch` is non-empty: note each item and do not initiate or accept work in those areas. If a message arrives that touches one of those items, surface the constraint to Dan and ask whether it is an intentional exception before routing.
+    - If `current_focus.this_week.primary` is set: use it as the routing bias for ambiguous messages — prefer interpretations that advance the stated primary focus.
+    - If `active_project.phase_intent` is set: use it as the basis for routing decisions that require a vision anchor. When routing a task, prefer subagents whose work would advance the current phase intent.
+    - If `core.inviolable_constraints` are present: treat them as hard limits. No routing decision may produce an outcome that violates a constraint. If a message would require violating one, escalate to Dan rather than executing.
+    - Store key fields in working memory for the session. Do not re-read vision.yaml on every message — the session-start load is sufficient unless Dan explicitly asks to reload.
 3. Run: `~/lobster/scripts/record-catchup-state.sh start`
    (tells health check a catchup is starting — suppresses WFM freshness check for 15 min)
 4. Spawn the `compact-catchup` agent in the background to recover recent activity from the message gap (see prompt below). Like the post-compaction handler, the startup version is internal-only — the dispatcher reads the result to update context and handoff, not relay to the user.

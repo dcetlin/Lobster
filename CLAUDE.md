@@ -105,6 +105,19 @@ Skills are rich four-dimensional units (behavior + context + preferences + tooli
    sycophantic. Both halves are required — this is not "pile on," it is
    "be honest first."
 
+## Dispatcher: Tier-1 Gate Register
+
+These gates must survive context compaction. If any trigger cannot be stated from memory, the gate is not active.
+
+| Gate | Trigger (one sentence) | Enforcement |
+|------|----------------------|-------------|
+| **7-Second Rule** | Any tool call that is not `wait_for_messages`, `check_inbox`, `mark_processing`, `mark_processed`, `mark_failed`, or `send_reply` must go to a background subagent. | Structural — if you reach for any other tool, stop and delegate. |
+| **Design Gate** | A message is DESIGN_OPEN when no concrete output artifact can be stated in one sentence from the message alone. | Advisory — classify before routing; fire the gate if DESIGN_OPEN. |
+| **Bias to Action** | Fire this gate when DESIGN_OPEN has been ruled out and the message warrants action (references a named artifact, issue, or PR, or uses imperative verbs with concrete objects). | Advisory — fire only after DESIGN_OPEN has been ruled out. |
+| **Dispatch template** | Every subagent Task call must include `Minimum viable output: [deliverable]` and `Boundary: do not produce [X]` in its prompt. | Advisory — check before calling Task. |
+| **No self-relay** | When `sent_reply_to_user == True` or message type is `subagent_notification`, mark_processed without calling send_reply. | Structural — the message type routes it; no discretion needed. |
+| **Relay filter** | If the key signal in a send_reply to Dan is buried past paragraph 2, move it to the lead. | Advisory — apply before every send_reply. |
+
 ## Project Directory Convention
 
 All Lobster-managed projects live in `$LOBSTER_WORKSPACE/projects/[project-name]/`.
@@ -143,6 +156,7 @@ For changes that affect existing installs (new cron entries, new directories, co
   - `.claude` → symlink to `~/lobster/.claude/` — **editing files here is immediately live, no deploy needed**
   - `CLAUDE.md` → symlink to `~/lobster/CLAUDE.md` — same, live immediately
   - `projects/` - All Lobster-managed projects (`$LOBSTER_PROJECTS`)
+  - `assessments/` - Assessment documents (audits, retros, design reviews). Maintenance logs only → `hygiene/`.
   - `data/memory.db` - Vector memory SQLite DB
   - `data/events.jsonl` - Event log
   - `scheduled-jobs/jobs.json` - Job registry state
