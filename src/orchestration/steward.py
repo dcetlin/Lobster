@@ -26,11 +26,67 @@ import logging
 import os
 import sqlite3
 import sys
+import time
+import uuid
 from datetime import datetime, timezone
+from enum import StrEnum
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 log = logging.getLogger("steward")
+
+
+# ---------------------------------------------------------------------------
+# Status enum (golden pattern: StrEnum so values serialize as plain strings)
+# ---------------------------------------------------------------------------
+
+class UoWStatus(StrEnum):
+    PROPOSED = "proposed"
+    PENDING = "pending"
+    READY_FOR_STEWARD = "ready-for-steward"
+    DIAGNOSING = "diagnosing"
+    READY_FOR_EXECUTOR = "ready-for-executor"
+    ACTIVE = "active"
+    DONE = "done"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+    EXPIRED = "expired"
+
+    def is_terminal(self) -> bool:
+        return self in {UoWStatus.DONE, UoWStatus.FAILED, UoWStatus.EXPIRED}
+
+    def is_in_flight(self) -> bool:
+        return self in {UoWStatus.ACTIVE, UoWStatus.READY_FOR_EXECUTOR, UoWStatus.DIAGNOSING}
+
+
+# ---------------------------------------------------------------------------
+# Named outcome types (golden pattern: typed return contract for _process_uow)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Prescribed:
+    uow_id: str
+    cycles: int
+
+
+@dataclass(frozen=True)
+class Done:
+    uow_id: str
+
+
+@dataclass(frozen=True)
+class Surfaced:
+    uow_id: str
+    condition: str
+
+
+@dataclass(frozen=True)
+class RaceSkipped:
+    uow_id: str
+
+
+StewardOutcome = Prescribed | Done | Surfaced | RaceSkipped
 
 
 # ---------------------------------------------------------------------------
@@ -41,12 +97,12 @@ log = logging.getLogger("steward")
 # This gate is True by default until the Phase 2 validation sequence passes.
 BOOTUP_CANDIDATE_GATE: bool = True
 
-# Status values
-_STATUS_READY_FOR_STEWARD = "ready-for-steward"
-_STATUS_DIAGNOSING = "diagnosing"
-_STATUS_READY_FOR_EXECUTOR = "ready-for-executor"
-_STATUS_DONE = "done"
-_STATUS_BLOCKED = "blocked"
+# Status values — use UoWStatus StrEnum (kept as aliases for backward compat)
+_STATUS_READY_FOR_STEWARD = UoWStatus.READY_FOR_STEWARD
+_STATUS_DIAGNOSING = UoWStatus.DIAGNOSING
+_STATUS_READY_FOR_EXECUTOR = UoWStatus.READY_FOR_EXECUTOR
+_STATUS_DONE = UoWStatus.DONE
+_STATUS_BLOCKED = UoWStatus.BLOCKED
 
 # Actor identifier written to audit entries
 _ACTOR_STEWARD = "steward"
@@ -276,23 +332,44 @@ def _assess_completion(
     if not output_content.strip():
         return False, "output file is empty"
 
-    # Check against success_criteria or summary (fallback for Phase 1 UoWs)
+    # Deterministic completion check: look for a structured result file.
+    # The Executor is expected to write `{output_ref}.result.json` with a
+    # `success: true/false` field. This is a structural proxy, not a heuristic.
+    output_ref = uow.get("output_ref")
+    if output_ref:
+        result_file = Path(output_ref).with_suffix(".result.json")
+        if not result_file.exists():
+            # Also check the alternate naming convention: {stem}.result.json
+            result_file_alt = Path(str(output_ref) + ".result.json")
+            if result_file_alt.exists():
+                result_file = result_file_alt
+        if result_file.exists():
+            try:
+                result_data = json.loads(result_file.read_text(encoding="utf-8"))
+                if result_data.get("success") is True:
+                    return True, f"structured result file confirms success: {result_file.name}"
+                elif result_data.get("success") is False:
+                    reason = result_data.get("reason", "no reason provided")
+                    return False, f"structured result file reports failure: {reason}"
+                # If 'success' key is absent, fall through to conservative check
+            except (json.JSONDecodeError, OSError) as e:
+                log.warning("Could not parse result file %s: %s", result_file, e)
+
+    # No structured result file found.
     success_criteria = uow.get("success_criteria")
     if success_criteria:
-        # Use first few words of success_criteria as a basic content check
-        # In production, this is an LLM assessment; here we use heuristic
-        criteria_words = success_criteria.lower().split()[:5]
-        content_lower = output_content.lower()
-        # If any key criterion word appears in output, consider it addressed
-        matched = any(w in content_lower for w in criteria_words if len(w) > 3)
-        if matched:
-            return True, f"output addresses success_criteria: {success_criteria[:80]}"
-        else:
-            return False, f"output does not appear to address success_criteria: {success_criteria[:80]}"
+        # Conservative fallback: without a structured result file we cannot
+        # deterministically verify completion against success_criteria.
+        # Do not declare done — require the Executor to write a result file.
+        return False, (
+            f"no structured result file ({output_ref}.result.json) found — "
+            f"cannot verify success_criteria without Executor confirmation: {success_criteria[:80]}"
+        )
     else:
-        # Phase 1 fallback: evaluate against summary
+        # Phase 1 / legacy fallback: no success_criteria and no result file.
+        # Trust the output_ref + execution_complete posture.
         summary = uow.get("summary", "")
-        return True, f"success_criteria is NULL — evaluated against summary as fallback: {summary[:80]}"
+        return True, f"success_criteria is NULL — output_ref present with execution_complete posture: {summary[:80]}"
 
 
 def _build_initial_agenda(uow: dict[str, Any], issue_body: str) -> list[dict[str, Any]]:
@@ -723,24 +800,53 @@ def _write_workflow_artifact(
 # Dan notification
 # ---------------------------------------------------------------------------
 
+_DAN_CHAT_ID = "8075091586"
+
+
 def _default_notify_dan(
     uow: dict[str, Any],
     condition: str,
     surface_log: str | None = None,
 ) -> None:
     """
-    Surface a UoW to Dan via the Lobster messaging system.
+    Surface a UoW to Dan via the Lobster inbox.
 
-    In production this sends a Telegram/Slack message. In tests it is
-    replaced by a capturing mock via the `notify_dan` parameter.
+    Writes a structured JSON message to ~/messages/inbox/ so the Lobster
+    dispatcher surfaces it to Dan via Telegram. In tests this is replaced
+    by a capturing mock via the `notify_dan` parameter.
     """
     uow_id = uow.get("id", "unknown")
+    cycles = uow.get("steward_cycles", 0)
     log.warning(
         "SURFACE TO DAN: UoW %s — condition=%s cycles=%s",
-        uow_id, condition, uow.get("steward_cycles", 0)
+        uow_id, condition, cycles,
     )
-    # In production, emit a structured event to the inbox or send directly
-    # via the lobster-inbox MCP tool. Kept simple for Phase 2 scaffolding.
+    msg_id = str(uuid.uuid4())
+    msg = {
+        "id": msg_id,
+        "source": "system",
+        "chat_id": _DAN_CHAT_ID,
+        "text": (
+            f"WOS SURFACE: UoW {uow_id} hit condition={condition} "
+            f"(steward_cycles={cycles}). Needs human review."
+        ),
+        "timestamp": time.time(),
+        "metadata": {
+            "type": "wos_surface",
+            "uow_id": uow_id,
+            "condition": condition,
+            "steward_cycles": cycles,
+        },
+    }
+    inbox_dir = Path(os.path.expanduser("~/messages/inbox"))
+    try:
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        (inbox_dir / f"{msg_id}.json").write_text(
+            json.dumps(msg, indent=2), encoding="utf-8"
+        )
+        log.info("WOS surface message written to inbox: %s", msg_id)
+    except OSError as e:
+        log.error("Failed to write WOS surface message to inbox: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -772,11 +878,11 @@ def _process_uow(
     dry_run: bool,
     artifact_dir: Path | None,
     notify_dan: Callable | None,
-) -> dict[str, Any]:
+) -> StewardOutcome:
     """
     Process a single UoW through the full diagnosis + prescribe/close/surface cycle.
 
-    Returns a result dict with keys: outcome, uow_id, condition (if surfaced).
+    Returns a StewardOutcome: Prescribed | Done | Surfaced | RaceSkipped.
     """
     uow_id = uow["id"]
     cycles = uow.get("steward_cycles", 0)
@@ -786,7 +892,7 @@ def _process_uow(
         rows = registry.transition(uow_id, _STATUS_DIAGNOSING, _STATUS_READY_FOR_STEWARD)
         if rows == 0:
             log.debug("UoW %s already claimed by another Steward instance — skipping", uow_id)
-            return {"outcome": "race_skipped", "uow_id": uow_id}
+            return RaceSkipped(uow_id=uow_id)
 
     # Step 2: Initialization ritual — write steward_agenda on first contact
     current_agenda_str = uow.get("steward_agenda")
@@ -902,7 +1008,7 @@ def _process_uow(
         if not dry_run:
             registry.transition(uow_id, _STATUS_BLOCKED, _STATUS_DIAGNOSING)
 
-        return {"outcome": "surfaced", "uow_id": uow_id, "condition": stuck_condition}
+        return Surfaced(uow_id=uow_id, condition=stuck_condition)
 
     # 4b: Declare done
     if is_complete:
@@ -934,7 +1040,7 @@ def _process_uow(
             })
             registry.transition(uow_id, _STATUS_DONE, _STATUS_DIAGNOSING)
 
-        return {"outcome": "done", "uow_id": uow_id}
+        return Done(uow_id=uow_id)
 
     # 4c: Prescribe another Executor pass
     new_cycles = cycles + 1
@@ -992,7 +1098,7 @@ def _process_uow(
         # Transition status to ready-for-executor
         registry.transition(uow_id, _STATUS_READY_FOR_EXECUTOR, _STATUS_DIAGNOSING)
 
-    return {"outcome": "prescribed", "uow_id": uow_id, "cycles": new_cycles}
+    return Prescribed(uow_id=uow_id, cycles=new_cycles)
 
 
 # ---------------------------------------------------------------------------
@@ -1130,17 +1236,17 @@ def run_steward_cycle(
             skipped += 1
             continue
 
-        outcome = result.get("outcome", "unknown")
-        if outcome == "prescribed":
-            prescribed += 1
-        elif outcome == "done":
-            done += 1
-        elif outcome == "surfaced":
-            surfaced += 1
-        elif outcome == "race_skipped":
-            race_skipped += 1
-        else:
-            skipped += 1
+        match result:
+            case Prescribed():
+                prescribed += 1
+            case Done():
+                done += 1
+            case Surfaced():
+                surfaced += 1
+            case RaceSkipped():
+                race_skipped += 1
+            case _:
+                skipped += 1
 
     return {
         "evaluated": evaluated,

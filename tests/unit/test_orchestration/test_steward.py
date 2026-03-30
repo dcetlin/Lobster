@@ -492,12 +492,15 @@ class TestInitializationRitual:
 
 class TestCompletionPath:
     def test_uow_with_valid_output_declared_done(self, db_path, registry, tmp_path):
-        """UoW with execution_complete + valid output_ref is declared done."""
+        """UoW with execution_complete + valid output_ref + result file is declared done."""
         _ensure_registry_has_phase2_methods(registry)
         steward = _import_steward()
 
         output_file = tmp_path / "output.txt"
         output_file.write_text("Task completed successfully. All acceptance criteria met.")
+        # Write structured result file so the Steward can deterministically assess completion
+        result_file = tmp_path / "output.result.json"
+        result_file.write_text(json.dumps({"success": True, "reason": "all criteria met"}))
 
         audit_entries = [
             {"event": "execution_complete", "actor": "executor",
@@ -538,6 +541,9 @@ class TestCompletionPath:
 
         output_file = tmp_path / "output.txt"
         output_file.write_text("Task completed successfully.")
+        # Write structured result file for deterministic completion assessment
+        result_file = tmp_path / "output.result.json"
+        result_file.write_text(json.dumps({"success": True, "reason": "task done"}))
 
         agenda = json.dumps([
             {"posture": "solo", "context": "initial", "constraints": [], "status": "prescribed"},
