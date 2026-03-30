@@ -189,7 +189,21 @@ class Registry:
     def __init__(self, db_path: Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_schema()
+        self._run_migrations()
+
+    # -----------------------------------------------------------------------
+    # Migration bootstrap — called once at Registry init
+    # -----------------------------------------------------------------------
+
+    def _run_migrations(self) -> None:
+        """Apply all pending numbered migrations via migrate.run_migrations().
+
+        This replaces the old _init_schema() / executescript(schema.sql) path.
+        The initial schema is now migration 0001, so new and existing DBs are
+        both handled by the migration runner.
+        """
+        from src.orchestration.migrate import run_migrations  # local import avoids circular
+        run_migrations(self.db_path)
 
     # -----------------------------------------------------------------------
     # Internal helpers
@@ -201,13 +215,6 @@ class Registry:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
-
-    def _init_schema(self) -> None:
-        conn = self._connect()
-        try:
-            conn.executescript(_SCHEMA_SQL)
-        finally:
-            conn.close()
 
     def _row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         d = dict(row)

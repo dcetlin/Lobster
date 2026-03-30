@@ -2697,6 +2697,21 @@ conn.close()
         fi
     fi
 
+    # Migration 56: Run numbered DB migrations (WOS orchestration layer)
+    # src/orchestration/migrate.py applies all unapplied numbered .sql files
+    # from src/orchestration/migrations/ to the registry DB. It is idempotent:
+    # already-applied migrations are skipped. This call handles all future
+    # schema changes to the WOS registry without requiring new upgrade.sh entries.
+    local registry_db="$WORKSPACE_DIR/orchestration/registry.db"
+    if [ -f "$registry_db" ]; then
+        if uv run "$LOBSTER_DIR/src/orchestration/migrate.py" "$registry_db" 2>/dev/null; then
+            substep "WOS DB migrations applied (or already up to date)"
+            migrated=$((migrated + 1))
+        else
+            warn "WOS DB migration runner failed — run manually: uv run src/orchestration/migrate.py $registry_db"
+        fi
+    fi
+
     # Migration 55: Add transcription-monitor cron entry
     # transcription-monitor.py pings the user every 5 minutes while whisper-cli
     # is running, providing progress feedback during long transcriptions (e.g. a
