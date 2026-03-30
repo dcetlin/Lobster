@@ -36,6 +36,7 @@ from orchestration.executor import (
     ExecutorOutcome,
     ExecutorResult,
     _result_json_path,
+    _dispatch_via_inbox,
 )
 
 
@@ -738,3 +739,188 @@ class TestExecutorResultDataclass:
         assert "steps_total" not in d
         assert "output_artifact" not in d
         assert "executor_id" not in d
+
+
+# ---------------------------------------------------------------------------
+# Tests: _dispatch_via_inbox (production dispatcher)
+# ---------------------------------------------------------------------------
+
+class TestDispatchViaInbox:
+    """Tests for the production inbox-based dispatch function."""
+
+    def test_writes_json_file_to_inbox_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """_dispatch_via_inbox must write a JSON file to the inbox directory."""
+        import orchestration.executor as _executor_mod
+        monkeypatch.setattr(_executor_mod, "_INBOX_DIR_TEMPLATE", str(tmp_path / "inbox"))
+
+        msg_id = _dispatch_via_inbox("Do the task", "uow-abc-123")
+
+        inbox_dir = tmp_path / "inbox"
+        assert inbox_dir.exists(), "inbox dir must be created"
+        written_file = inbox_dir / f"{msg_id}.json"
+        assert written_file.exists(), f"Expected {written_file} to be written"
+
+    def test_returns_message_id_as_executor_id(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Return value must be a non-empty string (the message_id for audit correlation)."""
+        import orchestration.executor as _executor_mod
+        monkeypatch.setattr(_executor_mod, "_INBOX_DIR_TEMPLATE", str(tmp_path / "inbox"))
+
+        msg_id = _dispatch_via_inbox("instructions", "uow-xyz")
+
+        assert isinstance(msg_id, str)
+        assert len(msg_id) > 0
+
+    def test_message_has_wos_execute_type(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The inbox message must have type='wos_execute' so the dispatcher routes it."""
+        import orchestration.executor as _executor_mod
+        monkeypatch.setattr(_executor_mod, "_INBOX_DIR_TEMPLATE", str(tmp_path / "inbox"))
+
+        msg_id = _dispatch_via_inbox("Do the task", "uow-type-test")
+
+        msg_file = tmp_path / "inbox" / f"{msg_id}.json"
+        msg = json.loads(msg_file.read_text(encoding="utf-8"))
+        assert msg["type"] == "wos_execute"
+
+    def test_message_contains_uow_id(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The inbox message must carry the uow_id for the dispatcher to correlate."""
+        import orchestration.executor as _executor_mod
+        monkeypatch.setattr(_executor_mod, "_INBOX_DIR_TEMPLATE", str(tmp_path / "inbox"))
+
+        uow_id = "uow-correlation-test"
+        msg_id = _dispatch_via_inbox("instructions text", uow_id)
+
+        msg_file = tmp_path / "inbox" / f"{msg_id}.json"
+        msg = json.loads(msg_file.read_text(encoding="utf-8"))
+        assert msg["uow_id"] == uow_id
+
+    def test_message_contains_instructions(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The inbox message must carry the instructions string for the subagent."""
+        import orchestration.executor as _executor_mod
+        monkeypatch.setattr(_executor_mod, "_INBOX_DIR_TEMPLATE", str(tmp_path / "inbox"))
+
+        instructions = "Fix the bug in foo.py and write a test"
+        msg_id = _dispatch_via_inbox(instructions, "uow-instr-test")
+
+        msg_file = tmp_path / "inbox" / f"{msg_id}.json"
+        msg = json.loads(msg_file.read_text(encoding="utf-8"))
+        assert msg["instructions"] == instructions
+
+    def test_message_id_field_matches_filename(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """msg['id'] must match the filename base and the return value."""
+        import orchestration.executor as _executor_mod
+        monkeypatch.setattr(_executor_mod, "_INBOX_DIR_TEMPLATE", str(tmp_path / "inbox"))
+
+        msg_id = _dispatch_via_inbox("instructions", "uow-id-match")
+
+        msg_file = tmp_path / "inbox" / f"{msg_id}.json"
+        msg = json.loads(msg_file.read_text(encoding="utf-8"))
+        assert msg["id"] == msg_id
+
+    def test_message_has_source_system(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Message source must be 'system' (not user-sourced)."""
+        import orchestration.executor as _executor_mod
+        monkeypatch.setattr(_executor_mod, "_INBOX_DIR_TEMPLATE", str(tmp_path / "inbox"))
+
+        msg_id = _dispatch_via_inbox("instructions", "uow-source-test")
+
+        msg_file = tmp_path / "inbox" / f"{msg_id}.json"
+        msg = json.loads(msg_file.read_text(encoding="utf-8"))
+        assert msg["source"] == "system"
+
+    def test_message_has_timestamp(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Message must include a timestamp for ordering and audit."""
+        import orchestration.executor as _executor_mod
+        monkeypatch.setattr(_executor_mod, "_INBOX_DIR_TEMPLATE", str(tmp_path / "inbox"))
+
+        msg_id = _dispatch_via_inbox("instructions", "uow-ts-test")
+
+        msg_file = tmp_path / "inbox" / f"{msg_id}.json"
+        msg = json.loads(msg_file.read_text(encoding="utf-8"))
+        assert "timestamp" in msg
+        # Must be parseable as ISO-8601
+        from datetime import datetime
+        datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00"))
+
+    def test_two_dispatches_produce_unique_message_ids(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Each dispatch call must produce a unique message_id (no collision)."""
+        import orchestration.executor as _executor_mod
+        monkeypatch.setattr(_executor_mod, "_INBOX_DIR_TEMPLATE", str(tmp_path / "inbox"))
+
+        id1 = _dispatch_via_inbox("instructions A", "uow-unique-1")
+        id2 = _dispatch_via_inbox("instructions B", "uow-unique-2")
+
+        assert id1 != id2
+
+    def test_inbox_dir_created_if_missing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Inbox directory must be created automatically if it does not exist."""
+        import orchestration.executor as _executor_mod
+        deep_inbox = tmp_path / "deep" / "nested" / "inbox"
+        assert not deep_inbox.exists(), "precondition: dir must not exist"
+        monkeypatch.setattr(_executor_mod, "_INBOX_DIR_TEMPLATE", str(deep_inbox))
+
+        _dispatch_via_inbox("instructions", "uow-mkdir-test")
+
+        assert deep_inbox.exists(), "inbox dir must be created even when deeply nested"
+
+    def test_executor_run_uses_dispatch_via_inbox_by_default(
+        self, registry: Registry, db_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        When no dispatcher is injected, Executor.run() must use _dispatch_via_inbox
+        (not the no-op stub). Verified by checking that a wos_execute file appears
+        in the inbox directory after a successful run.
+        """
+        import orchestration.executor as _executor_mod
+        inbox_dir = tmp_path / "inbox"
+        monkeypatch.setattr(_executor_mod, "_INBOX_DIR_TEMPLATE", str(inbox_dir))
+
+        uow_id = "uow_default_dispatch_001"
+        _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
+
+        # No dispatcher injected — should default to _dispatch_via_inbox
+        executor = Executor(registry)
+        result = executor.run(uow_id)
+
+        assert result.outcome == ExecutorOutcome.COMPLETE
+
+        # Inbox must have exactly one wos_execute message
+        inbox_files = list(inbox_dir.glob("*.json"))
+        assert len(inbox_files) == 1, (
+            f"Expected exactly one inbox message, got {len(inbox_files)}"
+        )
+        msg = json.loads(inbox_files[0].read_text(encoding="utf-8"))
+        assert msg["type"] == "wos_execute"
+        assert msg["uow_id"] == uow_id
+
+    def test_executor_id_in_result_is_message_id(
+        self, registry: Registry, db_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The executor_id in ExecutorResult and result.json must match the
+        message_id written to the inbox (for audit trail correlation).
+        """
+        import orchestration.executor as _executor_mod
+        inbox_dir = tmp_path / "inbox"
+        monkeypatch.setattr(_executor_mod, "_INBOX_DIR_TEMPLATE", str(inbox_dir))
+
+        uow_id = "uow_exec_id_correlation_001"
+        _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
+
+        executor = Executor(registry)
+        result = executor.run(uow_id)
+
+        # Read the inbox message to get the message_id
+        inbox_files = list(inbox_dir.glob("*.json"))
+        assert len(inbox_files) == 1
+        msg = json.loads(inbox_files[0].read_text(encoding="utf-8"))
+        msg_id = msg["id"]
+
+        # executor_id in result must equal the inbox message_id
+        assert result.executor_id == msg_id, (
+            f"executor_id {result.executor_id!r} must match inbox message_id {msg_id!r}"
+        )
+
+        # Also verify it's in the result.json file
+        output_ref = _get_output_ref(db_path, uow_id)
+        result_data = _read_result_json(output_ref)
+        assert result_data.get("executor_id") == msg_id
