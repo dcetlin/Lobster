@@ -287,6 +287,18 @@ The Steward/Executor loop continues until the Steward declares convergence:
 Steward → Executor → Steward → Executor → ... → Steward declares done
 ```
 
+### Steward↔Executor Contract
+
+This contract governs the completion handshake between the Executor and the Steward. Every Executor implementation must honor it.
+
+The full specification — schema, outcome enum, Steward interpretation table, posture rationale, and failure taxonomy — is in **[`docs/executor-contract.md`](executor-contract.md)**.
+
+Summary:
+- Executor must write `{output_ref}.result.json` before transitioning to `ready-for-steward`.
+- `outcome` is the routing field: `"complete"` | `"partial"` | `"failed"` | `"blocked"`.
+- Steward evaluates `success_criteria` against `output_ref`; Executor does not self-evaluate.
+- Absence of the result file when `success_criteria` is present is a contract violation, not an ambiguous state.
+
 ### Observation Loop
 
 META monitors the UoWRegistry and audit log for degradation signals: dark pipeline (no audit entries for >3 days), orphaned active records, ready-queue growth without drain, stale count accumulation, issue-open rate exceeding close rate for >2 consecutive weeks. When a signal fires, META surfaces it to Dan with evidence, not guesswork.
