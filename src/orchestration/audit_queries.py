@@ -149,7 +149,7 @@ def execution_outcomes(
     """Return {outcome: count} for all executor outcomes since the given datetime.
 
     Executor outcomes are audit entries whose event is 'execution_complete' or
-    'execution_failed' (written by executor._complete_uow and ._fail_uow).
+    'execution_failed' (written by Registry.complete_uow and .fail_uow).
     The outcome key is the event value itself — 'execution_complete' or
     'execution_failed'. The note column contains a JSON dict with actor,
     output_ref or reason, and timestamp; the event string is the authoritative
