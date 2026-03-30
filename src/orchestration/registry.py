@@ -82,11 +82,19 @@ class Registry:
 
     def _row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         d = dict(row)
-        # Deserialize JSON-stored fields
-        for field in ("children", "hooks_applied", "route_evidence", "trigger", "vision_ref"):
-            if d.get(field) and isinstance(d[field], str):
+        # Deserialize JSON-stored fields.
+        # prescribed_skills follows the same pattern as hooks_applied:
+        #   NULL stored value → None (not [])
+        #   '[]' stored value → [] (not None) — distinct semantics
+        #   '["skill-a"]' stored value → ["skill-a"]
+        # steward_agenda and steward_log are Steward-private and are returned
+        # as raw strings (or None) — they are NOT deserialized here.
+        for field in ("children", "hooks_applied", "route_evidence", "trigger",
+                      "vision_ref", "prescribed_skills"):
+            raw = d.get(field)
+            if raw is not None and isinstance(raw, str):
                 try:
-                    d[field] = json.loads(d[field])
+                    d[field] = json.loads(raw)
                 except (json.JSONDecodeError, TypeError):
                     pass
         return d
@@ -522,6 +530,51 @@ class Registry:
             }
         finally:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 schema validation
+# ---------------------------------------------------------------------------
+
+# The seven Phase 2 fields that must be present for Steward/Executor operation.
+# If any are absent, the Steward must exit with a clear error rather than
+# silently failing mid-execution.
+_PHASE2_REQUIRED_FIELDS = frozenset({
+    "workflow_artifact",
+    "success_criteria",
+    "prescribed_skills",
+    "steward_cycles",
+    "timeout_at",
+    "estimated_runtime",
+    "steward_agenda",
+    "steward_log",
+})
+
+
+def validate_phase2_schema(conn: sqlite3.Connection) -> None:
+    """
+    Validate that all Phase 2 fields are present in uow_registry.
+
+    Raises RuntimeError with a specific message if any of the seven Phase 2
+    fields is absent from the table. Call this at Steward startup before
+    processing any UoW.
+
+    Args:
+        conn: An open SQLite connection to the registry database.
+
+    Raises:
+        RuntimeError: If any Phase 2 field is missing. Message includes
+            "schema migration not applied" and the list of missing fields.
+    """
+    rows = conn.execute("PRAGMA table_info(uow_registry)").fetchall()
+    existing_cols = {row[1] for row in rows}
+    missing = _PHASE2_REQUIRED_FIELDS - existing_cols
+    if missing:
+        missing_sorted = sorted(missing)
+        raise RuntimeError(
+            f"schema migration not applied — run scripts/migrate_add_steward_fields.py first. "
+            f"Missing fields: {missing_sorted}"
+        )
 
 
 # ---------------------------------------------------------------------------
