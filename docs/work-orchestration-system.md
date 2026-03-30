@@ -20,8 +20,8 @@ These are constraints, not descriptions. Each rules something out.
 **1. No silent transitions.**
 Every state change in a Unit of Work — creation, routing, start, completion, failure — is written to the audit log before the transition is considered to have happened. A UoW that transitions without an audit entry does not count as transitioned. This rules out: fire-and-forget spawning, status updates that live only in an agent's context, and "soft" completions that are not written back.
 
-**2. The Registry is the single source of truth for what is running.**
-The dispatcher never falls back to GitHub polling or file scanning to answer "what's running?" If the Registry does not reflect reality, the Registry is wrong — not the dispatcher's responsibility to compensate. This rules out: agent status living only in the dispatcher's in-context memory, sweeper output files as the primary self-orientation mechanism, and "check GitHub first, then the Registry."
+**2. The UoWRegistry is the single source of truth for what is running.**
+The dispatcher never falls back to GitHub polling or file scanning to answer "what's running?" If the UoWRegistry does not reflect reality, the UoWRegistry is wrong — not the dispatcher's responsibility to compensate. This rules out: agent status living only in the dispatcher's in-context memory, sweeper output files as the primary self-orientation mechanism, and "check GitHub first, then the UoWRegistry."
 
 **3. Composability without permission.**
 Any agent can create child UoWs, spawn subagents, and report completions. The orchestration system provides scaffolding (Registry, hooks, classifier), not a central coordinator that must be asked before action. This rules out: approval gates between decomposition and execution, agents that must wait for dispatcher acknowledgment before spawning children.
@@ -37,9 +37,51 @@ The sweeper starts in propose-only mode. Each increase in autonomy level (sweepe
 
 ---
 
+## 2.5 Pre-Registry Layer
+
+The UoWRegistry is the execution substrate. But work has a life before it reaches the UoWRegistry. This section defines the pre-Registry layer: where work originates and how it enters the pipeline.
+
+### GitHub Issues as the Universal Seed Substrate
+
+GitHub issues are the pre-Registry substrate for all executable work. Every seed — whether originating from a philosophy session, a Telegram observation, or a direct feature request — eventually becomes a GitHub issue before entering the UoWRegistry.
+
+**Germination vocabulary:**
+- **Seed** — unclassified potential. An idea, observation, or open question that may or may not become executable work. Not yet in the UoWRegistry.
+- **Germination** — the classification event at which a seed's output type is resolved (pearl or executable work). For seeds that resolve to executable work, germination produces a GitHub issue.
+- **Sprout moment** — when the UoW Registrar identifies a qualifying GitHub issue and creates a UoW entry in the UoWRegistry. The issue enters the UoW pipeline.
+
+For feature requests: the GitHub issue is the germinated seed. For specs: the spec issue is the seed; subissues are the UoW decomposition. The subissue-to-UoW mapping is not yet in the UoW schema — it is implied by the parent/children fields and will be specified in a Phase 2 design note.
+
+**Pearl** — a philosophy session output that is a distillation rather than an action item. Pearls route to the write-path (frontier docs, bootup candidates) via the Cultivator. They do not enter the UoWRegistry. Pearl outputs circulate via re-encounter rather than via a separate pipeline.
+
+### The Cultivator
+
+The Cultivator is the philosophy pipeline's classification agent. It runs after a philosophy session and performs three operations:
+
+1. **Distinguish** — classifies session outputs as pearls or seeds.
+2. **Route pearls** — sends pearls to the appropriate write-path (frontier doc, bootup candidate). No UoWRegistry entry is created.
+3. **File seeds** — files seeds as GitHub issues. Phase 1: with human review. Phase 2: programmatically.
+
+The Cultivator's internal operations are classification (pearl or seed?) and triage (which path does this seed take?). "Classifier" and "triage agent" are names for the same role at different abstraction levels; the Cultivator is the unified name.
+
+The Cultivator's trigger is an open implementation question: on-demand (after each session), scheduled, or event-triggered. This affects pipeline ergonomics and is a Phase 2 design decision.
+
+**Full pipeline:**
+```
+Philosophy session
+  → Cultivator
+    → pearls → write-path (frontier docs, bootup candidates)
+    → seeds → GitHub issues
+              → UoW Registrar (identifies qualifying issues)
+                → UoWRegistry (execution substrate)
+                  → artifacts / done
+```
+
+---
+
 ## 3. The Five Components
 
-### 3.1 UoW Registry
+### 3.1 UoWRegistry
 
 **What it is:** A structured store (SQLite from Phase 1) holding one record per Unit of Work. It is the authoritative live state of all work: pending, active, blocked, done, failed.
 
@@ -416,9 +458,9 @@ The Conditional Hook System's temporal hooks (e.g., `escalate-stalled-high-prior
 
 ---
 
-## 4. The Issue Sweeper (Governance Layer)
+## 4. The UoW Registrar (Governance Layer)
 
-The sweeper is not a general orchestration component — it is one specific agent: the scanner that watches the GitHub issue backlog and creates new UoWs for the orchestration engine.
+The UoW Registrar is not a general orchestration component — it is one specific agent: the scanner that watches the GitHub issue backlog and creates new UoWs for the orchestration engine. It performs four functions: (1) reads GitHub issues, (2) identifies qualifying ones (ready-to-execute, gate criteria met), (3) creates UoW entries in the UoWRegistry, (4) manages lifecycle (expired proposals, stale-active detection). The word "sweeper" — used in earlier versions of this doc — implied cleanup; the actual job is registration and lifecycle management, hence the rename.
 
 **Schedule:** Nightly at 3am (after negentropic sweep at 2am, so sweep output is available as sweeper input).
 
