@@ -97,9 +97,10 @@ This pipeline applies beyond philosophy sessions: any source of seeds (Telegram 
 | `proposed` | UoW Registrar created this record; awaiting Dan's confirmation. |
 | `pending` | Dan confirmed via `/confirm`; queued for an agent to claim. |
 | `ready-for-steward` | Active in the Steward/Executor loop; Steward's turn to diagnose. |
+| `diagnosing` | Steward has claimed this UoW for a diagnosis pass (optimistic lock). Transient: transitions to `ready-for-executor`, `blocked`, or `done` within the same heartbeat invocation. If the Steward crashes mid-diagnosis, the startup sweep reclassifies it to `ready-for-steward` on the next heartbeat. |
 | `ready-for-executor` | Steward has prescribed a workflow; Executor's turn to run it. |
 | `active` | Executor is currently running the prescribed workflow. |
-| `blocked` | Execution paused; awaiting an external condition or human decision. |
+| `blocked` | Execution paused; awaiting an external condition or human decision. Set by the Steward when a surface condition fires (stuck threshold, severe error, Dan's input needed). Cleared by Dan via `/decide`. |
 | `done` | Steward has declared closure; output artifact written. Terminal state — no re-entry. If a closed UoW requires rework, a new UoW is filed referencing the prior UoW's ID. |
 | `failed` | Execution failed; retry hook may re-queue. |
 | `expired` | Proposed record older than 14 days with no action; excluded from active queries. |
@@ -112,9 +113,11 @@ This pipeline applies beyond philosophy sessions: any source of seeds (Telegram 
 | `proposed` | `pending` | Dan | `/confirm <uow-id>` command |
 | `proposed` | `expired` | UoW Registrar | Record age ≥ 14 days on nightly run |
 | `pending` | `ready-for-steward` | UoW Registrar / Trigger evaluator | UoW is confirmed and trigger fires (default: immediate) |
-| `ready-for-steward` | `ready-for-executor` | Steward | Diagnosis complete; workflow prescribed |
-| `ready-for-steward` | `blocked` | Steward | Observation surfaced to Dan; awaiting orientation or decision |
-| `ready-for-steward` | `done` | Steward | Convergence conditions met; closure declared |
+| `ready-for-steward` | `diagnosing` | Steward | Steward claims the UoW for diagnosis (optimistic lock) |
+| `diagnosing` | `ready-for-executor` | Steward | Diagnosis complete; workflow prescribed |
+| `diagnosing` | `blocked` | Steward | Stuck condition fires; surfacing to Dan |
+| `diagnosing` | `done` | Steward | Convergence conditions met; closure declared |
+| `diagnosing` | `ready-for-steward` | Startup sweep | Steward crashed mid-diagnosis; UoW reclassified |
 | `blocked` | `ready-for-steward` | Dan | Dan provides orientation or confirms decision |
 | `ready-for-executor` | `active` | Executor | Executor claims the UoW |
 | `active` | `ready-for-steward` | Executor | Execution complete; results written |
@@ -148,7 +151,7 @@ Each UoW entry in the UoWRegistry has the following fields. Fields are written a
 | `output_file` | `TEXT` \| `NULL` | Executor claim | Written by the Executor when it claims the UoW. Full path to the Executor's output artifact. Enables crash recovery: if the Executor crashes, `output_file` is the last known artifact. The startup sweep checks `output_file` existence to classify stale-active records as potentially-complete vs. crashed. |
 | `workflow_artifact` | `TEXT` \| `NULL` | Steward prescription | Path to the workflow artifact written by the Steward. |
 | `prescribed_skills` | `TEXT` (JSON array) \| `NULL` | Steward prescription | Skill IDs to be loaded by the Executor at task start. |
-| `success_criteria` | `TEXT NOT NULL` | creation (germination) | Required. Prose description of what completion looks like for this UoW. Written at germination time; immutable thereafter. The Steward evaluates `steward_agenda` against this field at every re-entry — it is the anchor that prevents premature termination and endless refinement. A UoW without `success_criteria` is invalid and is rejected at germination time. |
+| `success_criteria` | `TEXT NOT NULL` (new UoWs) / `TEXT NULL` (Phase 2 migration) | creation (germination) | Required for new UoWs. Prose description of what completion looks like for this UoW. Written at germination time; immutable thereafter. The Steward evaluates output against this field at every re-entry — it is the anchor that prevents premature termination and endless refinement. A new UoW without `success_criteria` is invalid and is rejected at germination time. **Phase 1→2 migration note:** The #309 migration adds this as `TEXT NULL` to preserve existing Phase 1 records. For pre-existing UoWs with `success_criteria = NULL`: the Steward falls back to evaluating against the `summary` field and writes a `success_criteria_missing` audit entry to flag the gap. |
 | `steward_cycles` | `INTEGER NOT NULL DEFAULT 0` | Steward re-entry | Count of Steward diagnosis/prescription cycles completed on this UoW. Surface condition 3 (hard cap) fires at 5. |
 | `steward_agenda` | `TEXT NULL` (JSON) | Steward only | Oracle-style forward forecast written by the Steward at first contact (`steward_cycles == 0`). List/tree of anticipated prescription nodes, each: `{posture, context, constraints, status: pending\|prescribed\|complete}`. Updated on each re-entry as new information arrives. **Steward-private — never read by the Executor.** |
 | `steward_log` | `TEXT NULL` | Steward only | Append-only newline-delimited JSON log of every Steward decision point — diagnosis rationale, prescription decisions, surface-to-Dan trigger fires, agenda updates. Steward-to-future-self. **Steward-private — never read by the Executor.** |
