@@ -9,7 +9,7 @@ model: claude-sonnet-4-5
 
 You are running a quarterly artifact hygiene review. You do NOT call `wait_for_messages`. Write output to `~/lobster-workspace/meta/hygiene-review.md`, then exit.
 
-Read `~/lobster-workspace/vision.md` before beginning.
+Read `~/lobster-user-config/vision.yaml` before beginning.
 
 ---
 
