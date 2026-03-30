@@ -178,7 +178,8 @@ def main() -> int:
     print(
         f"Issue sweeper done: evaluated={result['evaluated']} "
         f"advanced={result['advanced']} skipped={result['skipped']} "
-        f"race_skipped={result['race_skipped']}"
+        f"race_skipped={result['race_skipped']} "
+        f"gate=Phase1Complete/Phase2Active"
     )
     return 0
 

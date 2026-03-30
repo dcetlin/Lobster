@@ -205,6 +205,7 @@ class TestGateReadinessCommand:
         result = run_cli(db_path, "gate-readiness")
         assert "gate_met" in result
         assert result["gate_met"] is True
+        assert result["phase"] == "phase_1_complete_phase_2_active"
         assert "days_running" in result
         assert "proposed_to_confirmed_ratio_7d" in result
         assert "reason" in result
