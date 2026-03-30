@@ -11,6 +11,16 @@ Design constraints enforced here:
 - Exception during execution still writes result.json before re-raising.
 - Executor NEVER transitions to 'done' — only the Steward declares closure.
 
+Dispatch protocol:
+- The production dispatcher (_dispatch_via_inbox) writes a structured JSON
+  message to ~/messages/inbox/ so the Lobster dispatcher (main Claude loop)
+  can read it and spawn a subagent via the Task tool.
+- The message type is 'wos_execute'. The dispatcher routes this type to a
+  subagent that runs the prescribed instructions and writes the result file.
+- The Executor does NOT block waiting for the subagent — it writes timeout_at
+  at claim time and returns. The Observation Loop (#306) detects stalls.
+- The message_id is returned as executor_id for audit correlation.
+
 Imports:
     from orchestration.executor import Executor, ExecutorOutcome, ExecutorResult
 
@@ -24,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -203,13 +214,15 @@ class Executor:
         Args:
             registry: The Registry instance (provides db_path for raw connections).
             skill_activator: Callable that activates a skill by ID. Defaults to
-                the MCP activate_skill tool in production. Injectable for tests.
-            dispatcher: Callable that dispatches the LLM subagent task. Injectable
-                for tests. Defaults to _default_dispatcher (no-op stub).
+                _noop_skill_activator. Injectable for tests.
+            dispatcher: Callable that dispatches the LLM subagent task. Defaults
+                to _dispatch_via_inbox (writes a wos_execute message to the Lobster
+                inbox so the dispatcher spawns a subagent via the Task tool).
+                Injectable for tests.
         """
         self.registry = registry
         self._skill_activator = skill_activator or _noop_skill_activator
-        self._dispatcher = dispatcher or _noop_dispatcher
+        self._dispatcher = dispatcher or _dispatch_via_inbox
 
     # -----------------------------------------------------------------------
     # Public API
@@ -575,14 +588,76 @@ class Executor:
 
 
 # ---------------------------------------------------------------------------
-# Default no-op implementations (production stubs)
+# Production dispatcher — inbox-based agent launch
+# ---------------------------------------------------------------------------
+
+#: Inbox directory — where dispatch messages are written for the Lobster
+#: dispatcher (main Claude loop) to pick up and route to a subagent.
+_INBOX_DIR_TEMPLATE = "~/messages/inbox"
+
+#: Admin chat ID injected via env — same as LOBSTER_ADMIN_CHAT_ID.
+#: Used as the chat_id for wos_execute messages so the dispatcher can
+#: route results back to Dan if needed.
+_DISPATCH_CHAT_ID: str = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
+
+
+def _dispatch_via_inbox(instructions: str, uow_id: str) -> str:
+    """
+    Production dispatcher: write a wos_execute message to the Lobster inbox.
+
+    The Lobster dispatcher (main Claude loop) reads ~/messages/inbox/ on each
+    cycle. When it sees a message with type='wos_execute', it spawns a
+    background subagent via the Task tool with the prescribed instructions.
+
+    This is fire-and-forget: the Executor does NOT block waiting for the
+    subagent. Completion is detected by the Steward on its next heartbeat
+    cycle, via the result.json file the subagent writes (executor-contract.md).
+
+    The message_id is returned as the executor_id for audit correlation.
+
+    Raises OSError if the inbox directory cannot be created or the message
+    file cannot be written — the caller's exception handler will write
+    result.json with outcome=failed.
+    """
+    msg_id = str(uuid.uuid4())
+    inbox_dir = Path(os.path.expanduser(_INBOX_DIR_TEMPLATE))
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+
+    msg: dict = {
+        "id": msg_id,
+        "source": "system",
+        "type": "wos_execute",
+        "chat_id": _DISPATCH_CHAT_ID,
+        "uow_id": uow_id,
+        "instructions": instructions,
+        "timestamp": _now_iso(),
+    }
+
+    tmp_path = inbox_dir / f"{msg_id}.json.tmp"
+    dest_path = inbox_dir / f"{msg_id}.json"
+    try:
+        tmp_path.write_text(json.dumps(msg, indent=2), encoding="utf-8")
+        tmp_path.rename(dest_path)
+    finally:
+        # Best-effort cleanup of tmp file if rename failed.
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+
+    return msg_id
+
+
+# ---------------------------------------------------------------------------
+# No-op implementations — for tests and environments without a live inbox
 # ---------------------------------------------------------------------------
 
 def _noop_skill_activator(skill_id: str) -> None:
-    """Production: replaced by MCP activate_skill call at dispatch site."""
+    """No-op skill activator. In production, activate_skill MCP is called instead."""
     pass
 
 
 def _noop_dispatcher(instructions: str, uow_id: str) -> str:
-    """Production: replaced by Task tool dispatch at the main loop level."""
+    """No-op dispatcher for tests. In production, _dispatch_via_inbox is used."""
     return f"dispatched:{uow_id}"
