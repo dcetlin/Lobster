@@ -158,6 +158,13 @@ Runs on a cron heartbeat (initially ~3 minutes). Queries for UoWs in `ready-for-
 
 The Steward surfaces to Dan under three conditions: (1) something is severely wrong and outside confident operating range; (2) Dan's perspective would materially change the prescription; (3) the Steward detects its own orientation may be distorting the read.
 
+**Prescribed skills**: Steward diagnosis MAY include a `prescribed_skills` field — a list of skill IDs to be loaded by the executor at task start. This keeps methodology context out of the always-loaded context and activates it situationally. Examples:
+- A bug-fix UoW → prescribe `systematic-debugging` (4-phase root-cause process)
+- Any PR UoW → prescribe `verification-before-completion` (prove it works before marking done)
+- A complex multi-agent UoW → prescribe `subagent-driven-development` (spec + quality review)
+
+Skill content from frameworks like [Superpowers](https://github.com/Anysphere/superpowers) (118k stars, actively maintained) can be adapted into Lobster's skill library (`~/lobster-user-config/skills/`) and prescribed by the Steward. This keeps the methodology overhead zero for simple UoWs and available for complex ones.
+
 The Steward's diagnostic function has a developmental dimension distinct from the UoW's internal requirements. The question is not only "what does this UoW need to move forward?" but "what does this UoW need relative to Dan's current orientation?" A UoW that is technically ready-for-executor may require a different prescription if Dan is in an exploratory register than if he is in an executive one. The Steward holds both dimensions simultaneously: the UoW's internal state and Dan's current developmental and attentional position. Diagnosis that ignores the second dimension produces technically correct prescriptions that land in the wrong register — which is a coupling failure, not a content failure.
 
 ### Executor
