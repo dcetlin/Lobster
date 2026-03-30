@@ -994,6 +994,7 @@ def _process_uow(
     completion_rationale = diagnosis["completion_rationale"]
     stuck_condition = diagnosis["stuck_condition"]
     success_criteria_missing = diagnosis["success_criteria_missing"]
+    executor_outcome = diagnosis.get("executor_outcome")
 
     # Append diagnosis to steward_log
     diag_log_entry = {
@@ -1096,10 +1097,48 @@ def _process_uow(
         return Done(uow_id=uow_id)
 
     # 4c: Prescribe another Executor pass
+    # executor-contract.md Steward Interpretation Table: `partial` and `failed`
+    # require distinct re-diagnosis inputs. For `partial`, include
+    # steps_completed/steps_total from the result file so the prescription
+    # reflects how far the previous execution got. For `failed`, re-diagnose
+    # with `reason` as the primary input (already in completion_rationale).
     new_cycles = cycles + 1
     prescribed_skills = _select_prescribed_skills(uow, reentry_posture)
-    instructions = _build_prescription_instructions(uow, reentry_posture, completion_rationale)
-    route_reason = f"steward: {reentry_posture} — {completion_rationale[:120]}"
+
+    partial_steps_context: str = ""
+    if executor_outcome == "partial" and uow.output_ref:
+        # Read steps_completed/steps_total from result file for partial continuation
+        output_ref_path = uow.output_ref
+        result_file = Path(output_ref_path).with_suffix(".result.json")
+        if not result_file.exists():
+            result_file_alt = Path(str(output_ref_path) + ".result.json")
+            if result_file_alt.exists():
+                result_file = result_file_alt
+        if result_file.exists():
+            try:
+                result_data = json.loads(result_file.read_text(encoding="utf-8"))
+                steps_completed = result_data.get("steps_completed")
+                steps_total = result_data.get("steps_total")
+                if steps_completed is not None or steps_total is not None:
+                    partial_steps_context = (
+                        f"steps_completed={steps_completed}, steps_total={steps_total}"
+                    )
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    if executor_outcome == "partial" and partial_steps_context:
+        completion_gap_for_prescription = (
+            f"{completion_rationale} [{partial_steps_context}]"
+        )
+        route_reason = (
+            f"steward: {reentry_posture} — partial continuation "
+            f"({partial_steps_context}) — {completion_rationale[:80]}"
+        )
+    else:
+        completion_gap_for_prescription = completion_rationale
+        route_reason = f"steward: {reentry_posture} — {completion_rationale[:120]}"
+
+    instructions = _build_prescription_instructions(uow, reentry_posture, completion_gap_for_prescription)
 
     # Update agenda: mark current pending node as prescribed
     updated_agenda = _mark_current_agenda_node_prescribed(agenda)

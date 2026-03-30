@@ -327,10 +327,23 @@ class Executor:
             conn.commit()
 
             # Deserialize workflow_artifact (after transaction commits)
+            # Post-claim validation: these are planned stops, not crashes.
+            # The atomic claim (steps 2-6) has already committed; output_ref is
+            # registered. Each branch below writes result.json before calling
+            # _fail_uow so the Steward can distinguish a planned stop from an
+            # orphan (executor-contract.md: every intentional exit must produce
+            # a result file).
             workflow_artifact_raw = row["workflow_artifact"]
             if not workflow_artifact_raw:
-                # Write audit, transition to failed, return rejected
-                self._fail_uow(uow_id, "workflow_artifact field is NULL or empty — cannot execute")
+                null_reason = "workflow_artifact field is NULL or empty — cannot execute"
+                null_result = ExecutorResult(
+                    uow_id=uow_id,
+                    outcome=ExecutorOutcome.FAILED,
+                    success=False,
+                    reason=null_reason,
+                )
+                _write_result_json(output_ref, null_result)
+                self._fail_uow(uow_id, null_reason)
                 return ClaimRejected(
                     uow_id=uow_id,
                     reason="workflow_artifact field is NULL or empty",
@@ -339,7 +352,15 @@ class Executor:
             try:
                 artifact = from_json(workflow_artifact_raw)
             except ValueError as e:
-                self._fail_uow(uow_id, f"workflow_artifact deserialization failed: {e}")
+                deser_reason = f"workflow_artifact deserialization failed: {e}"
+                deser_result = ExecutorResult(
+                    uow_id=uow_id,
+                    outcome=ExecutorOutcome.FAILED,
+                    success=False,
+                    reason=deser_reason,
+                )
+                _write_result_json(output_ref, deser_result)
+                self._fail_uow(uow_id, deser_reason)
                 return ClaimRejected(
                     uow_id=uow_id,
                     reason=f"workflow_artifact deserialization failed: {e}",
