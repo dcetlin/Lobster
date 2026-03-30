@@ -11,10 +11,14 @@ router appends a structured entry to the corresponding frontier document in
 ~/lobster-user-config/memory/canonical/frontiers/.
 
 Usage:
-    uv run src/harvest/philosophy_harvester.py <path_to_output_md>
-    uv run src/harvest/philosophy_harvester.py --help
-    uv run src/harvest/philosophy_harvester.py --dry-run <path_to_output_md>
-    uv run src/harvest/philosophy_harvester.py --no-frontier <path_to_output_md>
+    cd ~/lobster && uv run -m src.harvest.philosophy_harvester <path_to_output_md>
+    cd ~/lobster && uv run -m src.harvest.philosophy_harvester --help
+    cd ~/lobster && uv run -m src.harvest.philosophy_harvester --dry-run <path_to_output_md>
+    cd ~/lobster && uv run -m src.harvest.philosophy_harvester --no-frontier <path_to_output_md>
+
+Note: must be invoked as a module (``-m src.harvest.philosophy_harvester``), not as a
+script (``src/harvest/philosophy_harvester.py``). Script invocation breaks the relative
+imports used by the frontier routing block (lines 417-418).
 """
 
 import argparse
