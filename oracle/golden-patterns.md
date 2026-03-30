@@ -102,4 +102,44 @@ Each entry is dated, evidence-grounded, and behaviorally specific. Generic softw
 
 ---
 
+### [2026-03-29] Pattern: oracle vocabulary as detection precondition
+
+**Pattern:** Reading `learnings.md` and `golden-patterns.md` before the substantive scan is not optional — the vocabulary determines what gets named, not just labeled. The bar is behavioral change: what would I have done differently without this pattern? If the answer is "nothing," the citation is a label, not a citation.
+
+**Why it works:** Detection is vocabulary-dependent. An agent scanning for smells without named failure modes will find things but miss the pattern class they belong to. An agent scanning for golden patterns without named structural wins will produce vague descriptions instead of extending a recognized vocabulary. Reading the oracle files first locks in the detection vocabulary before the scan begins, which changes what gets flagged and how it gets encoded. The test is whether the oracle read constrained any specific decision — weighted a finding differently, caused a flag that would have been passed over, or prevented an inclusion.
+
+**Where it appears:** `hygiene/sweep-context.md` Step 1 — oracle vocabulary is read before the detection pass begins. The explicit behavioral bar ("naming a pattern without stating its effect on your analysis is not a citation") was added to enforce this distinction.
+
+**Reuse guidance:** Apply whenever an agent must detect pattern instances from a corpus. Read the pattern vocabulary first, before touching the corpus. After the scan, apply the behavioral-change test to every citation: "what did I do differently because of this pattern?" If no answer surfaces, the citation is cosmetic and should be removed or replaced with an honest description of what was found.
+
+---
+
+### [2026-03-29] Pattern: structural pre-scan before linear corpus read
+
+**Pattern:** Before reading a large corpus linearly (issues, memory entries, files), run a structural pre-scan that buckets items by type, label, or source. Use the bucket distribution to build a priority queue. Read the priority queue, not the corpus.
+
+**Why it works:** Linear reading of a large corpus (e.g., 100 issues, 3500 memory entries) has O(n) cost with no signal-to-noise improvement — every item is weighted equally. A structural pre-scan costs O(n) once but produces a sorted, filtered priority queue. Subsequent reading is O(k) where k is the number of high-signal items, which is typically much smaller. The pre-scan also surfaces flood conditions (e.g., 3500 health-check entries from one source) that would be invisible during linear reading until the reader is already buried.
+
+**Where it appears:** `hygiene/sweep-context.md` Step 1b (Memory Pre-Pass) and Step 1c (Issue Pre-Scan), both added in Night 4 methodology improvement (2026-03-29). The issue pre-scan buckets by label and surfaces `needs-decision` items older than 14 days first. The memory pre-scan counts entries by event_type and greps for consumers before treating as signal vs. noise.
+
+**Reuse guidance:** Apply whenever an agent reads more than ~20 items from a corpus. The structural pre-scan questions are: (1) what dimensions bucket this corpus? (labels, event_type, age, author, status); (2) what bucket distribution signals noise vs. signal? (single source dominating, no labels, very old); (3) what ordering within the signal bucket puts highest-value items first? Build the priority queue, then read it.
+
+---
+
+### [2026-03-30] Pattern: seam-first abstraction
+
+**Pattern:** When building at current scale, choose the simplest implementation that works, but place named abstractions precisely at the seams where future change will be needed. The seam is identifiable from the grain of the design — it's where two systems with different evolutionary rates meet, or where the implementation backend may need to swap without touching the surrounding logic.
+
+Applied in WOS Phase 2 design (2026-03-30):
+- `workflow_artifact` struct: minimal fields now, but named — the Steward/Executor contract seam
+- `evaluate_condition(uow)` callable: polling implementation now, but abstracted — the trigger evaluation backend seam
+
+**Anti-pattern:** inlining logic at a seam because "it works now" — this makes future change a refactor rather than a backend swap.
+
+**Distinction from over-engineering:** over-engineering adds abstraction layers for hypothetical futures. Seam-first adds one named interface at a point where the design's grain already indicates future flex will be needed. The test: "does the grain point here?" — not "might we ever need this?"
+
+**Reuse guidance:** Before writing an implementation, identify the seams: where do two components with different evolutionary rates meet? Where might the backend swap without changing surrounding logic? Name those boundaries explicitly — a struct, a callable, a protocol — even if the implementation behind them is trivial today. The naming is load-bearing; it is what makes future change a backend swap rather than a refactor.
+
+---
+
 *Entries should be added when: (1) an oracle decision receives an "Alignment verdict: Confirmed" with notable quality findings; (2) a negentropic sweep identifies an "undernamed gem" in the golden patterns section; (3) a reflection-systems review names a structural win specific to this codebase.*
