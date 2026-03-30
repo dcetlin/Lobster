@@ -142,6 +142,37 @@ def cycles_histogram(
         conn.close()
 
 
+def completed_uow_ids_since(
+    since: str,
+    registry_path: Path | None = None,
+) -> list[str]:
+    """Return UoW IDs that have an execution_complete audit entry since since_iso.
+
+    ``since`` is an ISO-8601 string (UTC).  Returns an empty list if the
+    audit_log table does not exist yet.
+    """
+    path = registry_path if registry_path is not None else _default_registry_path()
+    try:
+        conn = _connect(path)
+    except sqlite3.OperationalError:
+        return []
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT uow_id
+            FROM audit_log
+            WHERE event = 'execution_complete'
+              AND ts >= ?
+            """,
+            (since,),
+        ).fetchall()
+        return [row["uow_id"] for row in rows]
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+
+
 def execution_outcomes(
     since: datetime,
     registry_path: Path | None = None,

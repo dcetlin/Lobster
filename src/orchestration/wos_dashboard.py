@@ -15,7 +15,8 @@ Exits 0 on success.
 
 Design:
 - Pure functions over data; all side effects isolated at the boundary (main).
-- Uses Registry.list() and audit_queries for all data access — no raw DB connections.
+- Uses Registry.list() and audit_queries for all data access — no raw DB connections
+  opened directly in this module; all DB access goes through audit_queries._connect().
 - Composable: build_dashboard_data() returns a plain dict usable by both renderers.
 """
 
@@ -127,31 +128,13 @@ def _cycle_histogram_last_7d(registry: Any, registry_path: Path) -> dict[str, in
 
 
 def _fetch_completed_uow_ids_since(registry_path: Path, since_iso: str) -> list[str]:
-    """Return UoW IDs that have an execution_complete audit entry since since_iso."""
-    import sqlite3
+    """Return UoW IDs that have an execution_complete audit entry since since_iso.
 
-    # Fall back to read-write connection if DB doesn't exist yet (no results).
-    try:
-        conn = sqlite3.connect(f"file:{registry_path}?mode=ro", uri=True, timeout=10.0)
-    except sqlite3.OperationalError:
-        return []
-
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = conn.execute(
-            """
-            SELECT DISTINCT uow_id
-            FROM audit_log
-            WHERE event = 'execution_complete'
-              AND ts >= ?
-            """,
-            (since_iso,),
-        ).fetchall()
-        return [row["uow_id"] for row in rows]
-    except sqlite3.OperationalError:
-        return []
-    finally:
-        conn.close()
+    Delegates to audit_queries.completed_uow_ids_since() so that all DB access
+    goes through audit_queries._connect() (WAL mode, busy_timeout=5000).
+    """
+    from src.orchestration import audit_queries
+    return audit_queries.completed_uow_ids_since(since=since_iso, registry_path=registry_path)
 
 
 def _stalled_uows(registry: Any, stall_threshold_minutes: int = 30) -> list[dict]:
