@@ -305,7 +305,7 @@ def run_startup_sweep(
     # --- Population 2: ready-for-executor UoWs older than threshold ---
     for uow in rfe_uows:
         uow_id = uow.id
-        proposed_at = getattr(uow, "proposed_at", None) or uow.created_at
+        proposed_at = uow.proposed_at or uow.created_at
 
         try:
             proposed_dt = datetime.fromisoformat(

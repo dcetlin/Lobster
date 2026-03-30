@@ -160,6 +160,7 @@ class UoW:
     estimated_runtime: str | None = None
     steward_agenda: str | None = None
     steward_log: str | None = None
+    proposed_at: str | None = None
 
 
 def _now_iso() -> str:
