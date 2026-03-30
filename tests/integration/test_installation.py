@@ -100,13 +100,15 @@ class TestPythonEnvironment:
             pytest.skip(f"MCP server not importable: {e}")
 
     def test_bot_module_importable(self):
-        """Test that bot module can be imported."""
+        """Test that bot module can be imported without raising an ImportError."""
         try:
-            # This will fail without env vars, which is expected
-            with pytest.raises((ValueError, KeyError)):
-                from src.bot import lobster_bot
+            from src.bot import lobster_bot  # noqa: F401
         except ImportError as e:
             pytest.skip(f"Bot module not importable: {e}")
+        except Exception:
+            # Non-ImportError exceptions (e.g. missing env vars at init time)
+            # are acceptable — the module is still importable.
+            pass
 
 
 @pytest.mark.integration

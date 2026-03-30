@@ -310,13 +310,13 @@ def test_maintenance_flag_causes_clean_exit(tmp_path: Path) -> None:
     # Set up a fake messages directory with the maintenance flag in place.
     messages_dir = tmp_path / "messages"
     config_dir = messages_dir / "config"
-    config_dir.mkdir(parents=True)
+    config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / "lobster-maintenance").touch()
 
     # Create required directory structure so the script can mkdir log dirs.
     workspace_dir = tmp_path / "workspace"
-    workspace_dir.mkdir(parents=True)
-    (workspace_dir / "logs").mkdir(parents=True)
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    (workspace_dir / "logs").mkdir(parents=True, exist_ok=True)
 
     env = {
         **os.environ,

@@ -99,8 +99,11 @@ def test_no_reminder_when_write_result_called():
     result = _run_hook(transcript)
 
     assert result.returncode == 0
-    assert result.stdout.strip() == "", (
-        f"Expected empty stdout (no reminder), got: {result.stdout!r}\n"
+    # Hook may emit {"suppressOutput": true} to suppress CC's feedback injection.
+    # That is a control directive, not a reminder — it is not visible to the agent.
+    stdout_stripped = result.stdout.strip()
+    assert stdout_stripped == "" or stdout_stripped == '{"suppressOutput": true}', (
+        f"Expected empty stdout or suppressOutput directive (no reminder), got: {result.stdout!r}\n"
         "Hook emitted a spurious reminder despite write_result being present."
     )
 
@@ -131,13 +134,15 @@ def test_reminder_emitted_when_write_result_not_called():
         f"Hook must exit 2 (hard-block mode), got {result.returncode}. "
         "Exit 2 prevents the subagent session from terminating without calling write_result."
     )
-    assert result.stdout.strip(), (
-        "Hook must print a reminder to stdout when write_result was not called.\n"
-        f"Got empty stdout. stderr={result.stderr!r}"
+    # Reminder goes to stderr so Claude Code sees it as feedback, not as output.
+    reminder_output = result.stderr.strip() or result.stdout.strip()
+    assert reminder_output, (
+        "Hook must emit a reminder (on stderr or stdout) when write_result was not called.\n"
+        f"Got empty stderr and stdout."
     )
-    assert "write_result" in result.stdout, (
+    assert "write_result" in reminder_output, (
         "Reminder text must mention 'write_result' so the subagent knows "
-        f"which tool to call. Got: {result.stdout!r}"
+        f"which tool to call. Got: {reminder_output!r}"
     )
 
 
@@ -153,8 +158,9 @@ def test_reminder_emitted_when_transcript_is_empty():
         f"Hook must exit 2 (hard-block) even when the transcript has no tool calls at all. "
         f"Got exit {result.returncode}."
     )
-    assert result.stdout.strip(), (
-        "Hook must emit a reminder even when the transcript has no tool calls at all."
+    # Reminder goes to stderr so Claude Code sees it as feedback, not as output.
+    assert result.stderr.strip() or result.stdout.strip(), (
+        "Hook must emit a reminder (on stderr or stdout) even when the transcript has no tool calls at all."
     )
 
 
@@ -184,8 +190,11 @@ def test_dispatcher_skips_enforcement():
     assert result.returncode == 0, (
         f"Hook must exit 0 for dispatcher sessions, got {result.returncode}."
     )
-    assert result.stdout.strip() == "", (
-        "Hook must produce no output for dispatcher sessions. "
+    # Hook may emit {"suppressOutput": true} to suppress CC's feedback injection.
+    # That is a control directive, not a reminder — it is not visible to the agent.
+    stdout_stripped = result.stdout.strip()
+    assert stdout_stripped == "" or stdout_stripped == '{"suppressOutput": true}', (
+        "Hook must produce no reminder output for dispatcher sessions. "
         f"Got: {result.stdout!r}"
     )
 
@@ -269,7 +278,10 @@ def test_hook_exits_0_with_write_result_including_task_id():
         f"Hook must exit 0 when write_result was called with task_id + chat_id. "
         f"Got exit {result.returncode}. stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    assert result.stdout.strip() == "", (
-        f"Hook must produce no output when write_result was called. "
+    # Hook may emit {"suppressOutput": true} to suppress CC's feedback injection.
+    # That is a control directive, not a reminder — it is not visible to the agent.
+    stdout_stripped = result.stdout.strip()
+    assert stdout_stripped == "" or stdout_stripped == '{"suppressOutput": true}', (
+        f"Hook must produce no reminder output when write_result was called. "
         f"Got: {result.stdout!r}"
     )
