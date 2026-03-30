@@ -13,13 +13,16 @@ Design constraints enforced here:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
+from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 
 # ---------------------------------------------------------------------------
@@ -28,10 +31,109 @@ from typing import Any
 
 _SCHEMA_SQL = (Path(__file__).parent / "schema.sql").read_text()
 
-# Statuses that indicate in-flight work (block re-proposal)
-_NON_TERMINAL_STATUSES = frozenset({"proposed", "pending", "active", "blocked"})
-# Statuses that are terminal (allow re-proposal for the same issue)
-_TERMINAL_STATUSES = frozenset({"done", "failed", "expired"})
+
+# ---------------------------------------------------------------------------
+# Status enum — logic lives on the type, not scattered at call sites
+# ---------------------------------------------------------------------------
+
+class UoWStatus(StrEnum):
+    PROPOSED = "proposed"
+    PENDING = "pending"
+    ACTIVE = "active"
+    BLOCKED = "blocked"
+    DONE = "done"
+    FAILED = "failed"
+    EXPIRED = "expired"
+
+    def is_terminal(self) -> bool:
+        """True for statuses that allow re-proposal (done, failed, expired)."""
+        return self in {UoWStatus.DONE, UoWStatus.FAILED, UoWStatus.EXPIRED}
+
+    def is_in_flight(self) -> bool:
+        """True for statuses that block re-proposal (active, pending)."""
+        return self in {UoWStatus.ACTIVE, UoWStatus.PENDING}
+
+
+# ---------------------------------------------------------------------------
+# Named result types — no dict[str, Any] from decision functions
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class UpsertInserted:
+    id: str
+
+
+@dataclass(frozen=True)
+class UpsertSkipped:
+    id: str
+    reason: str
+
+
+UpsertResult = UpsertInserted | UpsertSkipped
+
+
+@dataclass(frozen=True)
+class ApproveConfirmed:
+    id: str
+
+
+@dataclass(frozen=True)
+class ApproveSkipped:
+    id: str
+    reason: str
+    current_status: str
+
+
+@dataclass(frozen=True)
+class ApproveNotFound:
+    id: str
+
+
+@dataclass(frozen=True)
+class ApproveExpired:
+    id: str
+
+
+ApproveResult = ApproveConfirmed | ApproveSkipped | ApproveNotFound | ApproveExpired
+
+
+@dataclass(frozen=True, slots=True)
+class GateStatus:
+    """Named return type for registry_health() — replaces dict[str, Any]."""
+    gate_met: bool
+    days_running: int
+    approval_rate: float
+    reason: str
+
+
+# ---------------------------------------------------------------------------
+# IssueChecker protocol — explicit structural interface for DI
+# ---------------------------------------------------------------------------
+
+class IssueChecker(Protocol):
+    def __call__(self, issue_number: int) -> bool: ...
+
+
+# ---------------------------------------------------------------------------
+# UoW value object — typed, frozen
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class UoW:
+    """Typed value object for a Unit of Work row."""
+    id: str
+    status: UoWStatus
+    summary: str
+    source: str
+    source_issue_number: int | None
+    created_at: str
+    updated_at: str
+    sweep_date: str | None = None
+    type: str = "executable"
+    posture: str = "solo"
+    route_reason: str | None = None
+    steward_notes: str = ""
+    success_criteria: str = ""
 
 
 def _now_iso() -> str:
@@ -99,6 +201,25 @@ class Registry:
                     pass
         return d
 
+    def _row_to_uow(self, row: sqlite3.Row) -> UoW:
+        """Convert a sqlite3.Row to a typed UoW value object."""
+        d = dict(row)
+        return UoW(
+            id=d["id"],
+            status=UoWStatus(d["status"]),
+            summary=d.get("summary") or "",
+            source=d.get("source") or "",
+            source_issue_number=d.get("source_issue_number"),
+            created_at=d.get("created_at") or "",
+            updated_at=d.get("updated_at") or "",
+            sweep_date=d.get("sweep_date"),
+            type=d.get("type") or "executable",
+            posture=d.get("posture") or "solo",
+            route_reason=d.get("route_reason"),
+            steward_notes=d.get("steward_notes") or "",
+            success_criteria=d.get("success_criteria") or "",
+        )
+
     def _write_audit(
         self,
         conn: sqlite3.Connection,
@@ -140,6 +261,21 @@ class Registry:
         - UNIQUE(issue, sweep_date) conflict + existing is proposed → UPDATE fields
         - UNIQUE(issue, sweep_date) conflict + existing is non-proposed → no-op update (fields unchanged)
         """
+        result = self._upsert_typed(issue_number, title, sweep_date, uow_type)
+        match result:
+            case UpsertInserted(id=uow_id):
+                return {"id": uow_id, "action": "inserted"}
+            case UpsertSkipped(id=uow_id, reason=reason):
+                return {"id": uow_id, "action": "skipped", "reason": reason}
+
+    def _upsert_typed(
+        self,
+        issue_number: int,
+        title: str,
+        sweep_date: str | None = None,
+        uow_type: str = "executable",
+    ) -> UpsertResult:
+        """Core upsert logic returning typed UpsertResult."""
         if sweep_date is None:
             sweep_date = datetime.now(timezone.utc).date().isoformat()
 
@@ -168,11 +304,7 @@ class Registry:
                     note=f"upsert skipped: {skip_reason}",
                 )
                 conn.commit()
-                return {
-                    "id": existing["id"],
-                    "action": "skipped",
-                    "reason": skip_reason,
-                }
+                return UpsertSkipped(id=existing["id"], reason=skip_reason)
 
             # Check for same-date UNIQUE conflict (terminal record from a prior run today).
             # This is rare but possible: same issue went terminal and is being re-swept on
@@ -199,11 +331,7 @@ class Registry:
                     note=f"upsert skipped: {skip_reason}",
                 )
                 conn.commit()
-                return {
-                    "id": same_date_row["id"],
-                    "action": "skipped",
-                    "reason": skip_reason,
-                }
+                return UpsertSkipped(id=same_date_row["id"], reason=skip_reason)
 
             uow_id = _generate_uow_id()
             now = _now_iso()
@@ -234,7 +362,7 @@ class Registry:
                 ),
             )
             conn.commit()
-            return {"id": uow_id, "action": "inserted"}
+            return UpsertInserted(id=uow_id)
 
         except Exception:
             conn.rollback()
@@ -242,15 +370,15 @@ class Registry:
         finally:
             conn.close()
 
-    def confirm(self, uow_id: str) -> dict[str, Any]:
+    def approve(self, uow_id: str) -> ApproveResult:
         """
         Transition a UoW from proposed → pending.
 
-        Returns:
-        - success: {"id", "status": "pending", "previous_status": "proposed"}
-        - already non-proposed: {"id", "status": <current>, "action": "noop", "reason": "already <status>"}
-        - not found: {"error": "not found", "id": <id>}
-        - expired: {"error": "expired", "id": <id>}
+        Returns a typed ApproveResult:
+        - ApproveConfirmed: transition succeeded
+        - ApproveSkipped: UoW exists but is not in a confirmable state
+        - ApproveNotFound: no UoW with that id
+        - ApproveExpired: UoW has expired
         """
         conn = self._connect()
         try:
@@ -262,51 +390,79 @@ class Registry:
 
             if row is None:
                 conn.commit()
-                return {
-                    "error": "not found",
-                    "id": uow_id,
-                    "message": f"UoW `{uow_id}` not found. Run `/wos status proposed` to see current proposals.",
-                }
+                return ApproveNotFound(id=uow_id)
 
-            current_status = row["status"]
+            current_status = UoWStatus(row["status"])
 
-            if current_status == "expired":
-                conn.commit()
-                return {
-                    "error": "expired",
-                    "id": uow_id,
-                    "message": f"UoW `{uow_id}` has expired. Wait for the next sweep to re-propose, or run a manual sweep.",
-                }
-
-            if current_status != "proposed":
-                conn.commit()
-                return {
-                    "id": uow_id,
-                    "status": current_status,
-                    "action": "noop",
-                    "reason": f"already {current_status} — no action taken.",
-                }
-
-            now = _now_iso()
-            self._write_audit(
-                conn,
-                uow_id=uow_id,
-                event="status_change",
-                from_status="proposed",
-                to_status="pending",
-            )
-            conn.execute(
-                "UPDATE uow_registry SET status = 'pending', updated_at = ? WHERE id = ?",
-                (now, uow_id),
-            )
-            conn.commit()
-            return {"id": uow_id, "status": "pending", "previous_status": "proposed"}
+            match current_status:
+                case UoWStatus.EXPIRED:
+                    conn.commit()
+                    return ApproveExpired(id=uow_id)
+                case UoWStatus.PROPOSED:
+                    now = _now_iso()
+                    self._write_audit(
+                        conn,
+                        uow_id=uow_id,
+                        event="status_change",
+                        from_status=UoWStatus.PROPOSED,
+                        to_status=UoWStatus.PENDING,
+                    )
+                    conn.execute(
+                        "UPDATE uow_registry SET status = 'pending', updated_at = ? WHERE id = ?",
+                        (now, uow_id),
+                    )
+                    conn.commit()
+                    return ApproveConfirmed(id=uow_id)
+                case _:
+                    conn.commit()
+                    return ApproveSkipped(
+                        id=uow_id,
+                        reason=f"already {current_status} — no action taken.",
+                        current_status=str(current_status),
+                    )
 
         except Exception:
             conn.rollback()
             raise
         finally:
             conn.close()
+
+    def confirm(self, uow_id: str) -> dict[str, Any]:
+        """
+        Transition a UoW from proposed → pending.
+
+        Delegates to approve() and serializes the result to the legacy dict shape
+        expected by registry_cli.py and dispatcher_handlers.py callers.
+
+        Returns:
+        - success: {"id", "status": "pending", "previous_status": "proposed"}
+        - already non-proposed: {"id", "status": <current>, "action": "noop", "reason": "already <status>"}
+        - not found: {"error": "not found", "id": <id>}
+        - expired: {"error": "expired", "id": <id>}
+        """
+        result = self.approve(uow_id)
+        match result:
+            case ApproveConfirmed(id=id_):
+                return {"id": id_, "status": "pending", "previous_status": "proposed"}
+            case ApproveNotFound(id=id_):
+                return {
+                    "error": "not found",
+                    "id": id_,
+                    "message": f"UoW `{uow_id}` not found. Run `/wos status proposed` to see current proposals.",
+                }
+            case ApproveExpired(id=id_):
+                return {
+                    "error": "expired",
+                    "id": id_,
+                    "message": f"UoW `{uow_id}` has expired. Wait for the next sweep to re-propose, or run a manual sweep.",
+                }
+            case ApproveSkipped(id=id_, current_status=current_status, reason=reason):
+                return {
+                    "id": id_,
+                    "status": current_status,
+                    "action": "noop",
+                    "reason": reason,
+                }
 
     def get(self, uow_id: str) -> dict[str, Any]:
         """Return a UoW record by id, or {"error": "not found", "id": <id>}."""
@@ -318,6 +474,19 @@ class Registry:
             if row is None:
                 return {"error": "not found", "id": uow_id}
             return self._row_to_dict(row)
+        finally:
+            conn.close()
+
+    def get_uow(self, uow_id: str) -> UoW | None:
+        """Return a typed UoW value object by id, or None if not found."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM uow_registry WHERE id = ?", (uow_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            return self._row_to_uow(row)
         finally:
             conn.close()
 
@@ -366,8 +535,8 @@ class Registry:
                     conn,
                     uow_id=uow_id,
                     event="expired",
-                    from_status="proposed",
-                    to_status="expired",
+                    from_status=UoWStatus.PROPOSED,
+                    to_status=UoWStatus.EXPIRED,
                     note="auto-expired: proposed for >14 days",
                 )
 
@@ -389,7 +558,7 @@ class Registry:
 
     def check_stale(
         self,
-        issue_checker: Callable[[int], bool] | None = None,
+        issue_checker: IssueChecker | None = None,
     ) -> list[dict[str, Any]]:
         """
         Return active UoWs whose source GitHub issue is closed.
@@ -416,13 +585,13 @@ class Registry:
         for row in active_rows:
             issue_num = row["source_issue_number"]
             if issue_checker(issue_num):
-                d = self._row_to_dict(row)
+                uow = self._row_to_uow(row)
                 stale.append({
-                    "id": d["id"],
+                    "id": uow.id,
                     "source_issue_number": issue_num,
-                    "summary": d["summary"],
-                    "status": d["status"],
-                    "created_at": d["created_at"],
+                    "summary": uow.summary,
+                    "status": str(uow.status),
+                    "created_at": uow.created_at,
                 })
         return stale
 
@@ -546,16 +715,14 @@ class Registry:
         finally:
             conn.close()
 
-    def gate_readiness(self) -> dict[str, Any]:
+    def registry_health(self) -> GateStatus:
         """
-        Report Phase 1 → Phase 2 autonomy gate status.
+        Report registry health / autonomy gate status.
 
-        The 14-day calendar gate has been removed. Phase 1 was declared complete
-        on 2026-03-30 (commit 2900900). gate_met is always True.
-
-        Returns a dict with: gate_met, days_running, proposed_to_confirmed_ratio_7d, reason
-        The days_running and proposed_to_confirmed_ratio_7d fields are retained for
-        observability; they no longer gate Phase 2 entry.
+        Returns a typed GateStatus dataclass. gate_met is always True —
+        the calendar gate was removed when the system was declared ready
+        on 2026-03-30 (commit 2900900). days_running and approval_rate are
+        retained for observability.
         """
         conn = self._connect()
         try:
@@ -564,19 +731,19 @@ class Registry:
             ).fetchone()["oldest"]
 
             if oldest is None:
-                return {
-                    "gate_met": True,
-                    "days_running": 0,
-                    "proposed_to_confirmed_ratio_7d": 0.0,
-                    "reason": "phase 1 complete (2026-03-30)",
-                }
+                return GateStatus(
+                    gate_met=True,
+                    days_running=0,
+                    approval_rate=0.0,
+                    reason="no UoWs recorded yet",
+                )
 
             oldest_dt = datetime.fromisoformat(oldest.replace("Z", "+00:00"))
-            now = datetime.now(timezone.utc)
-            days_running = (now - oldest_dt).days
+            now_dt = datetime.now(timezone.utc)
+            days_running = (now_dt - oldest_dt).days
 
             # Ratio over last 7 days — retained for observability only
-            seven_days_ago = (now - timedelta(days=7)).isoformat()
+            seven_days_ago = (now_dt - timedelta(days=7)).isoformat()
             proposed_last_7d = conn.execute(
                 """
                 SELECT COUNT(*) as c FROM uow_registry
@@ -597,14 +764,31 @@ class Registry:
 
             ratio = (confirmed_last_7d / proposed_last_7d) if proposed_last_7d > 0 else 0.0
 
-            return {
-                "gate_met": True,
-                "days_running": days_running,
-                "proposed_to_confirmed_ratio_7d": round(ratio, 4),
-                "reason": "phase 1 complete (2026-03-30)",
-            }
+            return GateStatus(
+                gate_met=True,
+                days_running=days_running,
+                approval_rate=round(ratio, 4),
+                reason="gate always met",
+            )
         finally:
             conn.close()
+
+    def gate_readiness(self) -> dict[str, Any]:
+        """
+        Report Phase 1 → Phase 2 autonomy gate status.
+
+        Delegates to registry_health() and serializes to the legacy dict shape
+        expected by registry_cli.py callers.
+
+        Returns a dict with: gate_met, days_running, proposed_to_confirmed_ratio_7d, reason
+        """
+        gs = self.registry_health()
+        return {
+            "gate_met": gs.gate_met,
+            "days_running": gs.days_running,
+            "proposed_to_confirmed_ratio_7d": gs.approval_rate,
+            "reason": "phase 1 complete (2026-03-30)",
+        }
 
 
 # ---------------------------------------------------------------------------

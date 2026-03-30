@@ -1,12 +1,12 @@
 """
-Dispatcher command handlers for WOS Phase 1.
+Dispatcher command handlers for WOS.
 
 These are pure functions: they take a UoW id (or status string) and a Registry
 instance, and return a formatted string response suitable for sending back to
 Telegram. No MCP tools, no network calls — those belong in the dispatcher.
 
 The dispatcher calls these handlers when it recognizes:
-  /confirm <uow-id>        → handle_confirm(uow_id, registry)
+  /approve <uow-id>        → handle_approve(uow_id, registry)
   /wos status [status]     → handle_wos_status(status, registry)
 """
 
@@ -17,38 +17,46 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .registry import Registry
 
+from .registry import ApproveConfirmed, ApproveExpired, ApproveNotFound, ApproveSkipped
+
+
+def handle_approve(uow_id: str, *, registry: "Registry") -> str:
+    """
+    Handle /approve <uow-id>.
+
+    Returns a human-readable Telegram message describing the outcome.
+    Uses match/case on the typed ApproveResult union — no string key checks.
+    """
+    result = registry.approve(uow_id)
+
+    match result:
+        case ApproveConfirmed():
+            return (
+                f"UoW `{uow_id}` confirmed.\n"
+                f"Status: `proposed \u2192 pending`"
+            )
+        case ApproveNotFound():
+            return (
+                f"UoW `{uow_id}` not found. "
+                "Run `/wos status proposed` to see current proposals."
+            )
+        case ApproveExpired():
+            return (
+                f"UoW `{uow_id}` has expired. "
+                "Wait for the next sweep to re-propose, or run a manual sweep."
+            )
+        case ApproveSkipped(current_status=current_status):
+            return f"UoW `{uow_id}` is already `{current_status}` — no action taken."
+
 
 def handle_confirm(uow_id: str, *, registry: "Registry") -> str:
     """
     Handle /confirm <uow-id>.
 
-    Returns a human-readable Telegram message describing the outcome.
-    Error cases follow the spec from the design doc §6 Phase 1 implementation notes.
+    Alias for handle_approve — retains the /confirm command name for backwards
+    compatibility while delegating to the renamed approve() method.
     """
-    result = registry.confirm(uow_id)
-
-    if "error" in result:
-        error = result["error"]
-        if error == "not found":
-            return (
-                f"UoW `{uow_id}` not found. "
-                "Run `/wos status proposed` to see current proposals."
-            )
-        if error == "expired":
-            return (
-                f"UoW `{uow_id}` has expired. "
-                "Wait for the next sweep to re-propose, or run a manual sweep."
-            )
-        return f"Error confirming `{uow_id}`: {result.get('message', error)}"
-
-    if result.get("action") == "noop":
-        current = result["status"]
-        return f"UoW `{uow_id}` is already `{current}` — no action taken."
-
-    return (
-        f"UoW `{uow_id}` confirmed.\n"
-        f"Status: `proposed \u2192 pending`"
-    )
+    return handle_approve(uow_id, registry=registry)
 
 
 def handle_wos_status(status: str | None, *, registry: "Registry") -> str:
