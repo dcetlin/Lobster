@@ -56,16 +56,18 @@ For feature requests: the GitHub issue is the germinated seed. For specs: the sp
 
 ```
 Philosophy session
-  -> Cultivator
+  -> Cultivator                   [ASPIRATIONAL — not yet built]
     -> pearls -> write-path (frontier docs, bootup candidates)
     -> seeds -> GitHub issues
-               -> UoW Registrar (identifies qualifying issues)
-                 -> UoWRegistry (execution substrate)
-                   -> Steward/Executor loop
+               -> UoW Registrar   [Phase 1 — operational]
+                 -> UoWRegistry   [Phase 1 — operational]
+                   -> Steward/Executor loop  [Phase 2 — not yet built]
                      -> artifacts / done
 ```
 
 This pipeline applies beyond philosophy sessions: any source of seeds (Telegram observations, nightly health scans, direct requests) flows through the same funnel — GitHub issue as the universal entry point, UoW Registrar as the gate into the execution substrate.
+
+**Operational status note:** The Cultivator is not yet built. Until it is, philosophy session outputs (bootup candidates, seeds) reach GitHub via manual filing — the Cultivator stage is bypassed entirely. The pipeline diagram above is the design target; the `ASPIRATIONAL` label marks stages that are not yet operational. Do not read the diagram as a description of current system behavior.
 
 ---
 
@@ -81,7 +83,7 @@ This pipeline applies beyond philosophy sessions: any source of seeds (Telegram 
 | `ready-for-executor` | Steward has prescribed a workflow; Executor's turn to run it. |
 | `active` | Executor is currently running the prescribed workflow. |
 | `blocked` | Execution paused; awaiting an external condition or human decision. |
-| `done` | Steward has declared closure; output artifact written. |
+| `done` | Steward has declared closure; output artifact written. Terminal state — no re-entry. If a closed UoW requires rework, a new UoW is filed referencing the prior UoW's ID. |
 | `failed` | Execution failed; retry hook may re-queue. |
 | `expired` | Proposed record older than 14 days with no action; excluded from active queries. |
 
@@ -103,6 +105,8 @@ This pipeline applies beyond philosophy sessions: any source of seeds (Telegram 
 | `failed` | `ready-for-steward` | Hook (retry) | Retry hook re-queues after backoff |
 
 Every transition is written to the audit log before it is considered to have happened (**Principle 1: No silent transitions**).
+
+**Rework after closure:** `done` has no re-entry path. If a closed UoW's output proves wrong or requires follow-on work, a new UoW is filed that references the original UoW's ID in its description. This preserves the audit integrity of the closed record while creating a fresh execution chain.
 
 ---
 
@@ -156,7 +160,7 @@ Runs on a cron heartbeat (initially ~3 minutes). Queries for UoWs in `ready-for-
 3. **Evaluates** (on re-entry after execution) — reads execution results, re-diagnoses fresh, decides: loop again or declare closure.
 4. **Closes** — writes a closing diagnosis when convergence conditions are met. Transitions to `done`.
 
-The Steward surfaces to Dan under three conditions: (1) something is severely wrong and outside confident operating range; (2) Dan's perspective would materially change the prescription; (3) the Steward detects its own orientation may be distorting the read.
+The Steward surfaces to Dan under three conditions: (1) something is severely wrong and outside confident operating range; (2) Dan's perspective would materially change the prescription; (3) the Steward has prescribed the same primitive twice with no new input in the audit trail (convergence-velocity proxy for orientation distortion — the Steward cannot reliably detect its own distortion from inside it, so this is measured externally).
 
 **Prescribed skills**: Steward diagnosis MAY include a `prescribed_skills` field — a list of skill IDs to be loaded by the executor at task start. This keeps methodology context out of the always-loaded context and activates it situationally. Examples:
 - A bug-fix UoW → prescribe `systematic-debugging` (4-phase root-cause process)
@@ -260,7 +264,7 @@ UoW: "Migrate registry schema to add steward_cycles table"
 Steward cycle 1:
   Diagnosis: "Schema migration touches shared infrastructure; Steward's biases feel strong
               toward minimal change but Dan's intuition on schema evolution may differ"
-  Surface condition 3 (Steward detects own orientation may distort read)
+  Surface condition 2 (Dan's perspective would materially change the prescription)
   -> Surfaces to Dan: "Here's what the migration involves. My read: minimal change is right.
     Is there context I'm missing?"
 
@@ -296,6 +300,8 @@ Steward cycle 2:
 
 ### Phase 2: Steward + Executor [next]
 
+**Pre-Phase-2 gates (must be cleared before implementation begins):** (1) Workflow artifact format decision (deterministic script vs. LLM prompt instructions) — see Open Decisions. (2) Trigger evaluation mode (polling vs. event-driven for condition triggers) — see Open Decisions. Both gates are blocking; neither has a costly resolution path.
+
 **What to build:** Steward agent (cron heartbeat, diagnose/prescribe/evaluate/close loop), Executor agent (picks up `ready-for-executor` UoWs, runs prescribed workflow, returns results). UoWRegistry extended with Steward-cycle audit fields. Routing Classifier added: rule engine evaluating `classifier.yaml`, assigning postures, writing `route_reason`. Conditional Hook System wired. Cultivator wired to file seeds from philosophy sessions programmatically (Phase 2 trigger design).
 
 **Done condition:** A UoW completes a full Steward/Executor loop — Steward diagnoses, Executor runs, Steward re-diagnoses and closes. Audit trail shows all cycle entries. Classifier assigns posture and writes `route_reason`. At least one hook fires and appears in `hooks_applied`.
@@ -327,13 +333,15 @@ When the Steward prescribes a workflow, it writes a workflow artifact that the E
 
 This is the **first implementation decision to resolve** before the Executor can be built. It determines the interface contract between Steward and Executor, the structure of workflow artifacts, and the degree of determinism in the system.
 
-Resolution requires: a concrete example of each form applied to one real workflow type (e.g., investigation or design review), then a decision logged to the audit trail.
+**Pre-Phase-2 gate.** Resolution owner: Dan. Cheapest-test path: produce a concrete example of each form applied to one real workflow type (e.g., investigation or design review), then a decision logged to the audit trail within the first week of Phase 2 design. Fallback default if gate is not cleared: LLM prompt instructions (lower implementation cost; switch to deterministic script if auditability requirements surface during Phase 2). Phase 2 implementation does not begin until this gate is cleared.
 
 ---
 
 **Trigger evaluation mode for condition triggers: polling vs. event-driven**
 
-For time-based triggers, polling (evaluator checks on each scheduled run) is sufficient. For state-transition hooks like `all_children_done` and `retry-on-failure`, event-driven semantics (hook fires in the same transaction as the state transition) are materially different from polling semantics. This must be resolved before Phase 2 hook implementation begins. Until resolved, the `condition` trigger type in the schema is a reserved field.
+For time-based triggers, polling (evaluator checks on each scheduled run) is sufficient. For state-transition hooks like `all_children_done` and `retry-on-failure`, event-driven semantics (hook fires in the same transaction as the state transition) are materially different from polling semantics.
+
+**Pre-Phase-2 gate.** Resolution owner: Dan. Cheapest-test path: test both semantics against the `retry-on-failure` hook with a real failed UoW before committing to either model. Fallback default: polling (simpler, consistent with existing cron infrastructure). Until resolved, the `condition` trigger type in the schema is a reserved field and no hook implementation depends on event-driven semantics.
 
 ---
 
