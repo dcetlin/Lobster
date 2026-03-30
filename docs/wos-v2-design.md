@@ -46,6 +46,19 @@ The Cultivator's internal operations are classification (pearl or seed?) and tri
 
 The Cultivator's trigger is an open implementation question: on-demand (after each session), scheduled, or event-triggered. This is a Phase 2 design decision.
 
+### GitHub Issue Types
+
+GitHub issues are the pre-UoWRegistry substrate for all seeds. Issues are typed by what they ARE at any moment — types are not permanent, they transition:
+
+- **Type A — Ungerminated seed**: Unresolved output type or timing. Default state for new issues. Queued for the UoW Registrar.
+- **Type B — UoW tracking issue**: Germinated; has a corresponding UoWRegistry entry. The issue is the handle for an active execution chain. No longer a seed.
+- **Type C — Umbrella/epic**: Organizing structure with no direct execution intent. Children may be Type A or B. Never enters UoWRegistry as a single unit.
+- **Type D — Historical record**: Closed, done. Lineage preserved only.
+
+Transitions: A → B (on germination), B → D (on UoW completion), C stays C.
+
+"When is an issue not a seed?" Two cases: (1) it germinated (now Type B tracker), (2) it was always Type C umbrella.
+
 ### GitHub Issues as the Universal Pre-Registry Substrate
 
 GitHub issues are the pre-Registry substrate for all executable work. Every seed — whether originating from a philosophy session, a Telegram observation, or a direct feature request — eventually becomes a GitHub issue before entering the UoWRegistry.
@@ -107,6 +120,8 @@ This pipeline applies beyond philosophy sessions: any source of seeds (Telegram 
 Every transition is written to the audit log before it is considered to have happened (**Principle 1: No silent transitions**).
 
 **Rework after closure:** `done` has no re-entry path. If a closed UoW's output proves wrong or requires follow-on work, a new UoW is filed that references the original UoW's ID in its description. This preserves the audit integrity of the closed record while creating a fresh execution chain.
+
+> Rework convention: any rework, regardless of size, starts a fresh Type A seed (new GitHub issue) referencing the prior UoW ID in its description. The prior UoW stays done. No re-opening. This preserves audit integrity and eliminates re-open ambiguity.
 
 ---
 
