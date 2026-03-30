@@ -10,6 +10,18 @@ feedback during long transcriptions.
 Self-silencing: exits immediately (no outbox write) when whisper-cli is
 not running. Safe to call from cron every 5 minutes.
 
+Delivery convention note
+------------------------
+This script is a documented exception to the standard Lobster delivery path.
+Most jobs route output through the inbox (dispatch-job.sh → dispatcher →
+subagent → send_reply). This script writes directly to outbox/ instead,
+bypassing the inbox entirely.
+
+The deviation is intentional: inbox polling can add several seconds of latency,
+which is noticeable when the user is actively waiting on a long transcription.
+Direct outbox writes are delivered by the connector on its next cycle with no
+queuing delay. See scheduled-tasks/README.md § Delivery Convention Exception.
+
 Usage:
     uv run scheduled-tasks/transcription-monitor.py
 
@@ -273,6 +285,19 @@ def main() -> int:
     reply_to_message_id = msg_data.get("telegram_message_id")
     reply = build_outbox_reply(int(chat_id), text, reply_to_message_id)
 
+    # Intentional exception to the standard delivery convention:
+    # Most jobs route output through the inbox (dispatch-job.sh → dispatcher →
+    # subagent → send_reply). This script bypasses the inbox and writes directly
+    # to outbox/ so the connector delivers the ping immediately.
+    #
+    # Reason: transcription is time-sensitive. The inbox polling interval can
+    # introduce several seconds of lag, which is noticeable when the user is
+    # waiting on a long transcription. Direct outbox writes are picked up by the
+    # connector on its next cycle (sub-second on this hardware) with no queuing.
+    #
+    # This is the only local-code script that writes to outbox/. All other
+    # outbox-direct writes come from worker.py (the transcription worker itself),
+    # which has the same real-time delivery requirement.
     OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
     dest = OUTBOX_DIR / f"{reply['id']}.json"
     atomic_write_json(dest, reply)
