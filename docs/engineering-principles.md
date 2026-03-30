@@ -1,5 +1,7 @@
 # Engineering Principles
 
+*Last updated: 2026-03-30*
+
 This document is a PR review checklist, not a philosophy statement. Use it to evaluate whether a change is consistent with how Lobster is built and why.
 
 When a PR fails a check, the question is not "is this forgivable" but "does the architecture hold."
@@ -16,27 +18,31 @@ When a PR fails a check, the question is not "is this forgivable" but "does the 
 
 ---
 
-### 2. Isolation boundaries are enforced at the DB/view layer, not the application layer
+### 2. Invariants are enforced structurally, not by convention
 
-**One sentence:** Access control and data scoping belong in schema design and query construction, not in conditional logic scattered through application code.
+**One sentence:** System boundaries and access constraints belong in the architecture itself, not in conditional logic that depends on every future developer knowing the convention exists.
 
-**Passing looks like:** Removing a single application-layer guard does not expose data it should not. The architecture itself — foreign keys, row ownership, view filters — enforces the boundary. If you must trust the programmer to call the right check, the boundary is wrong.
+**Passing looks like:** Removing a single application-layer guard does not expose data or violate an invariant. The architecture itself — schema design, type constraints, message boundaries, query construction — enforces the boundary. If you must trust the programmer to call the right check, the boundary is wrong.
 
----
-
-### 3. Audit-before-transition is a non-negotiable invariant
-
-**One sentence:** Every state transition writes an audit record before the transition completes, in the same transaction.
-
-**Passing looks like:** A reader can reconstruct exactly what happened, by whom, and when, solely from the `audit_log` — including transitions that were attempted and rolled back. There is no valid exception to this rule: if a transition is too cheap to audit, it is probably not a transition.
+> **Example (WOS pipeline):** `executor_uow_view` enforces job-scoped isolation at the DB layer. A future developer can't break the cross-tenant boundary even without knowing it exists, because the view never exposes rows they shouldn't see.
 
 ---
 
-### 4. Cognitive clarity: can a future reader reconstruct intent from the audit log alone?
+### 3. State transitions are auditable before they complete
 
-**One sentence:** The audit trail is the canonical record of what the system did and why.
+**One sentence:** Every meaningful state transition produces an audit record in the same atomic operation as the transition itself.
 
-**Passing looks like:** A developer unfamiliar with the change can open `audit_log`, read the entries produced by a workflow, and correctly answer: what was the user trying to do, what did the system decide, and what changed? If the answer requires reading source code to interpret the log, the log entries lack sufficient context.
+**Passing looks like:** A reader can reconstruct what happened, by whom, and when, from the audit trail alone — including transitions that were attempted and rolled back. There is no valid exception to this rule: if a transition is too cheap to audit, it is probably not a transition.
+
+---
+
+### 4. Cognitive clarity: intent survives without the author
+
+**One sentence:** A developer unfamiliar with a change should be able to reconstruct what the system did and why, without reading the source code.
+
+**Passing looks like:** Given only the observable outputs of a workflow — audit records, log entries, variable names, commit messages — a developer can correctly answer: what was the user trying to do, what did the system decide, and what changed? If reconstructing intent requires reading the implementation, the signal is missing from where it needs to be.
+
+> **Example (WOS pipeline):** `audit_log` entries include intent fields alongside state fields. A reader opening `audit_log` after a workflow runs can answer all three questions without opening source.
 
 ---
 
