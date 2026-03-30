@@ -45,3 +45,5 @@ The arc's unresolved open question (from 2026-03-26-synthesis): what would a pro
 ---
 
 *Living document. Updated as the inquiry moves.*
+
+**Telos grounding**: The Embodiment Paradox (more fully expressed skill requires more context) is the mechanism that makes the specification→embodiment arc non-linear: as attunement deepens, the system requires less rule-specification and more field-specification. See also: [Theory of Learning (voice note, 2026-03-25)](https://github.com/dcetlin/riffs/blob/main/voice-notes/2026-03-25-theory-of-learning.md).

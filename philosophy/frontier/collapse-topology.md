@@ -46,3 +46,5 @@ The current frontier: the distinction between productive and premature collapse 
 ---
 
 *Living document. Updated as the inquiry moves.*
+
+**Telos grounding**: The encoding irony (sessions achieving coherence encode propositions while dropping attentional configuration) is what makes the specification→embodiment arc hard: the medium that transmits content cannot easily transmit the capacity that generated it.

@@ -99,6 +99,8 @@ Runs on a cron heartbeat (initially ~3 minutes). Queries for UoWs in `ready-for-
 
 The Steward surfaces to Dan under three conditions: (1) something is severely wrong and outside confident operating range; (2) Dan's perspective would materially change the prescription; (3) the Steward detects its own orientation may be distorting the read.
 
+The Steward's diagnostic function has a developmental dimension distinct from the UoW's internal requirements. The question is not only "what does this UoW need to move forward?" but "what does this UoW need relative to Dan's current orientation?" A UoW that is technically ready-for-executor may require a different prescription if Dan is in an exploratory register than if he is in an executive one. The Steward holds both dimensions simultaneously: the UoW's internal state and Dan's current developmental and attentional position. Diagnosis that ignores the second dimension produces technically correct prescriptions that land in the wrong register — which is a coupling failure, not a content failure.
+
 ### Executor
 
 Picks up UoWs in `ready-for-executor` state. Carries out the prescribed workflow as specified in the workflow artifact. Writes execution results to an output artifact. Transitions the UoW back to `ready-for-steward` with the execution log. The Executor does not diagnose or decide — it executes and reports.

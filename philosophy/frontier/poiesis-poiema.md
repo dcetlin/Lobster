@@ -50,3 +50,5 @@ The poiesis/poiema distinction is also the frame for the encoding irony. The phi
 ---
 
 *Living document. Updated as the inquiry moves.*
+
+**Telos grounding**: The production/poiesis distinction maps directly onto the specification/embodiment arc. A fully embodied system would operate from poietic orientation — attending to what is live — rather than executing a specification.

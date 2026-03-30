@@ -214,6 +214,8 @@ Using `INSERT OR REPLACE` is a correctness bug — it would delete and re-insert
 | `review-loop` | High risk or output needs validation | Subagent produces draft; review agent validates; either done or re-queued |
 | `human-gate` | Requires Dan's decision before proceeding | UoW pauses; Telegram ping sent; resumes on Dan's reply |
 
+**Note on posture ontology**: The five execution postures are field-attractor regions, not system modes — the system does not "switch" to a posture so much as converge toward one based on the gradient of the current UoW and the shaped field. Posture temperature (how far a given UoW's behavior drifts from its assigned posture) is a diagnostic relative to the telos, not a performance metric: a UoW running hotter than solo but cooler than fan-out is not failing, it is signaling something about the UoW's actual shape. The right response is re-diagnosis, not enforcement.
+
 **Rule configuration (YAML at `~/lobster-user-config/orchestration/classifier.yaml`):**
 ```yaml
 rules:
