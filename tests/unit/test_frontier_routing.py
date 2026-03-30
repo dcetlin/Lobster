@@ -264,7 +264,8 @@ class TestClassifyDomain:
             time_prior=-0.04,
         )
         # The combination of low content orientation and unknown event type should suppress
-        assert signal.confidence < RE_ENGAGEMENT_THRESHOLD or signal.engagement_hit_count <= 1
+        assert signal.confidence < RE_ENGAGEMENT_THRESHOLD
+        assert signal.engagement_hit_count <= 1
 
     def test_zero_engagement_hits_yields_zero_confidence(self) -> None:
         domain = DOMAINS["poiesis"]

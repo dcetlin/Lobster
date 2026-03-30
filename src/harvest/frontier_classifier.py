@@ -46,6 +46,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
 
@@ -191,7 +192,7 @@ DOMAINS = {
 # Event type classification — Signal 1
 # ---------------------------------------------------------------------------
 
-class EventType(str):
+class EventType(StrEnum):
     """Enumeration of session event types inferred from file naming."""
     PHILOSOPHY_EXPLORE = "philosophy_explore"
     SYNTHESIS = "synthesis"
@@ -213,7 +214,7 @@ EVENT_TYPE_WEIGHTS: dict[str, float] = {
 }
 
 
-def classify_event_type(source_path: Path) -> str:
+def classify_event_type(source_path: Path) -> EventType:
     """Classify the event type from the source file's name. Pure function."""
     name = source_path.name.lower()
     if "philosophy-explore" in name or "philosophy_explore" in name:
@@ -342,7 +343,7 @@ class DomainSignal:
     engagement_hit_count: int         # number of engagement patterns matched
     status_review_hit_count: int      # number of domain-specific status patterns matched
     content_orientation_score: float  # 0.0–1.0 from score_content_orientation
-    event_type: str
+    event_type: EventType
     event_weight: float
     time_prior: float
     confidence: float                 # combined score in [0.0, 1.0]
@@ -404,7 +405,7 @@ RE_ENGAGEMENT_THRESHOLD = 0.45
 def classify_domain(
     text: str,
     domain: DomainSpec,
-    event_type: str,
+    event_type: EventType,
     content_orientation: float,
     time_prior: float,
 ) -> DomainSignal:
@@ -481,7 +482,7 @@ def extract_explicit_advances(action_seeds: dict | None) -> frozenset[str]:
 class SessionClassification:
     """Complete classification result for one session output."""
     source_path: Path
-    event_type: str
+    event_type: EventType
     content_orientation_score: float
     domain_signals: dict[str, DomainSignal]
     explicit_advances: frozenset[str]
