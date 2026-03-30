@@ -64,25 +64,26 @@ if command -v jq &> /dev/null; then
         "\(.value.schedule) \($resolved_runner) \(.key) \($marker)"
     ' "$JOBS_FILE" 2>/dev/null || echo "")
 else
-    CRON_ENTRIES=$(python3 -c "
-import json
-import sys
-import os
+    CRON_ENTRIES=$(uv run - "$JOBS_FILE" "$REPO_DIR" "$RUNNER" "$MARKER" << 'PYEOF'
+import json, sys
+jobs_file      = sys.argv[1]
+repo_dir       = sys.argv[2]
+default_runner = sys.argv[3]
+marker         = sys.argv[4]
 try:
-    with open('$JOBS_FILE', 'r') as f:
+    with open(jobs_file, 'r') as f:
         data = json.load(f)
-    repo_dir = '$REPO_DIR'
-    default_runner = '$RUNNER'
     for name, job in data.get('jobs', {}).items():
         if job.get('enabled', True):
             schedule = job.get('schedule', '')
             if schedule:
                 runner = job.get('runner', default_runner)
-                runner = runner.replace('\$REPO_DIR', repo_dir)
-                print(f\"{schedule} {runner} {name} $MARKER\")
+                runner = runner.replace('$REPO_DIR', repo_dir)
+                print(f"{schedule} {runner} {name} {marker}")
 except Exception as e:
     sys.stderr.write(f'Error: {e}\n')
-" 2>/dev/null || echo "")
+PYEOF
+    2>/dev/null || echo "")
 fi
 
 # Build the new crontab content
