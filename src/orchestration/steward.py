@@ -112,6 +112,9 @@ _ACTOR_STEWARD = "steward"
 # Hard cap: surface to Dan unconditionally if steward_cycles >= this value
 _HARD_CAP_CYCLES = 5
 
+# Early warning threshold: notify Dan when steward_cycles reaches this value
+_EARLY_WARNING_CYCLES = 4
+
 # Crash surface threshold: surface if crashed_no_output and cycles >= this value
 _CRASH_SURFACE_CYCLES = 2
 
@@ -856,6 +859,7 @@ def _default_notify_dan(
     uow: UoW,
     condition: str,
     surface_log: str | None = None,
+    return_reason: str | None = None,
 ) -> None:
     """
     Surface a UoW to Dan via the Lobster inbox.
@@ -871,10 +875,16 @@ def _default_notify_dan(
         uow_id, condition, cycles,
     )
     msg_id = str(uuid.uuid4())
-    body_lines = [
-        f"WOS SURFACE: UoW {uow_id} hit condition={condition} "
-        f"(steward_cycles={cycles}). Needs human review.",
-    ]
+    if condition == "hard_cap":
+        body_lines = [
+            f"🚨 WOS: UoW `{uow_id}` hit cycle cap ({_HARD_CAP_CYCLES}). "
+            f"return_reason: {return_reason}. Surfacing for Dan review.",
+        ]
+    else:
+        body_lines = [
+            f"WOS SURFACE: UoW {uow_id} hit condition={condition} "
+            f"(steward_cycles={cycles}). Needs human review.",
+        ]
     if surface_log:
         body_lines.append(f"\nSteward log:\n{surface_log}")
     msg = {
@@ -888,6 +898,7 @@ def _default_notify_dan(
             "uow_id": uow_id,
             "condition": condition,
             "steward_cycles": cycles,
+            "return_reason": return_reason,
             "steward_log": surface_log,
         },
     }
@@ -900,6 +911,58 @@ def _default_notify_dan(
         log.info("WOS surface message written to inbox: %s", msg_id)
     except OSError as e:
         log.error("Failed to write WOS surface message to inbox: %s", e)
+
+
+def _default_notify_dan_early_warning(
+    uow: UoW,
+    return_reason: str | None,
+    new_cycles: int | None = None,
+) -> None:
+    """
+    Send an early-warning notification to Dan when steward_cycles reaches
+    _EARLY_WARNING_CYCLES (4), one cycle before the hard cap.
+
+    new_cycles is the post-prescription cycle count (uow.steward_cycles + 1).
+    Pass it explicitly so the message reflects the cycle count after prescription,
+    not the stale pre-prescription value on the UoW object.
+
+    Uses the same inbox path as _default_notify_dan. In tests, override via
+    the `notify_dan_early_warning` parameter on run_steward_cycle / _process_uow.
+    """
+    uow_id = uow.id
+    cycles = new_cycles if new_cycles is not None else uow.steward_cycles
+    admin_chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", _DAN_CHAT_ID)
+    log.warning(
+        "WOS EARLY WARNING: UoW %s at cycle %s — approaching hard cap (%s)",
+        uow_id, cycles, _HARD_CAP_CYCLES,
+    )
+    msg_id = str(uuid.uuid4())
+    msg = {
+        "id": msg_id,
+        "source": "system",
+        "chat_id": admin_chat_id,
+        "text": (
+            f"⚠️ WOS: UoW `{uow_id}` at cycle {cycles} — "
+            f"approaching hard cap ({_HARD_CAP_CYCLES}). "
+            f"Last return_reason: {return_reason}"
+        ),
+        "timestamp": time.time(),
+        "metadata": {
+            "type": "wos_early_warning",
+            "uow_id": uow_id,
+            "steward_cycles": cycles,
+            "return_reason": return_reason,
+        },
+    }
+    inbox_dir = Path(os.path.expanduser("~/messages/inbox"))
+    try:
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        (inbox_dir / f"{msg_id}.json").write_text(
+            json.dumps(msg, indent=2), encoding="utf-8"
+        )
+        log.info("WOS early-warning message written to inbox: %s", msg_id)
+    except OSError as e:
+        log.error("Failed to write WOS early-warning message to inbox: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -931,6 +994,7 @@ def _process_uow(
     dry_run: bool,
     artifact_dir: Path | None,
     notify_dan: Callable | None,
+    notify_dan_early_warning: Callable | None = None,
 ) -> StewardOutcome:
     """
     Process a single UoW through the full diagnosis + prescribe/close/surface cycle.
@@ -1057,7 +1121,7 @@ def _process_uow(
 
         # Surface to Dan (injectable for tests)
         _notify = notify_dan or _default_notify_dan
-        _notify(uow, stuck_condition, surface_log=current_log_str)
+        _notify(uow, stuck_condition, surface_log=current_log_str, return_reason=return_reason)
 
         if not dry_run:
             registry.transition(uow_id, _STATUS_BLOCKED, _STATUS_DIAGNOSING)
@@ -1190,6 +1254,12 @@ def _process_uow(
         # Transition status to ready-for-executor
         registry.transition(uow_id, _STATUS_READY_FOR_EXECUTOR, _STATUS_DIAGNOSING)
 
+    # Early warning: fire when new_cycles reaches the early-warning threshold.
+    # Fires regardless of dry_run so tests can capture the notification.
+    if new_cycles == _EARLY_WARNING_CYCLES:
+        _notify_early = notify_dan_early_warning or _default_notify_dan_early_warning
+        _notify_early(uow, return_reason, new_cycles)
+
     return Prescribed(uow_id=uow_id, cycles=new_cycles)
 
 
@@ -1203,6 +1273,7 @@ def run_steward_cycle(
     github_client: Callable[[int], dict[str, Any]] | None = None,
     artifact_dir: Path | None = None,
     notify_dan: Callable | None = None,
+    notify_dan_early_warning: Callable | None = None,
     bootup_candidate_gate: bool | None = None,
     db_path: Path | None = None,
 ) -> dict[str, Any]:
@@ -1223,8 +1294,12 @@ def run_steward_cycle(
     artifact_dir:
         Override for the artifact directory path. Used in tests.
     notify_dan:
-        Callable(uow, condition, surface_log) for surface-to-Dan notifications.
-        Defaults to the production notification path.
+        Callable(uow, condition, surface_log, return_reason) for surface-to-Dan
+        notifications. Defaults to the production notification path.
+    notify_dan_early_warning:
+        Callable(uow, return_reason) for early-warning notifications when
+        steward_cycles reaches _EARLY_WARNING_CYCLES (4). Defaults to the
+        production notification path.
     bootup_candidate_gate:
         Override for BOOTUP_CANDIDATE_GATE. If None, uses the module constant.
     db_path:
@@ -1322,6 +1397,7 @@ def run_steward_cycle(
                 dry_run=dry_run,
                 artifact_dir=artifact_dir,
                 notify_dan=notify_dan,
+                notify_dan_early_warning=notify_dan_early_warning,
             )
         except Exception:
             log.exception("Steward: unhandled error processing UoW %s — skipping", uow_id)

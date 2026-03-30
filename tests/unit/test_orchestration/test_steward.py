@@ -673,7 +673,7 @@ class TestHardCap:
 
         notifications = []
 
-        def capture_notification(uow, condition, surface_log=None):
+        def capture_notification(uow, condition, surface_log=None, return_reason=None):
             uow_id = uow.id if hasattr(uow, "id") else uow["id"]
             notifications.append({"uow_id": uow_id, "condition": condition})
 
@@ -705,7 +705,7 @@ class TestHardCap:
         steward = _import_steward()
         notifications = []
 
-        def capture_notification(uow, condition, surface_log=None):
+        def capture_notification(uow, condition, surface_log=None, return_reason=None):
             notifications.append(condition)
 
         conn = _open_db(db_path)
@@ -728,7 +728,7 @@ class TestHardCap:
         steward = _import_steward()
         notifications = []
 
-        def capture_notification(uow, condition, surface_log=None):
+        def capture_notification(uow, condition, surface_log=None, return_reason=None):
             notifications.append(condition)
 
         conn = _open_db(db_path)
@@ -764,7 +764,7 @@ class TestCrashedSurface:
         steward = _import_steward()
         notifications = []
 
-        def capture_notification(uow, condition, surface_log=None):
+        def capture_notification(uow, condition, surface_log=None, return_reason=None):
             notifications.append(condition)
 
         audit_entries = [
@@ -808,7 +808,7 @@ class TestExecutorOrphan:
         steward = _import_steward()
         notifications = []
 
-        def capture_notification(uow, condition, surface_log=None):
+        def capture_notification(uow, condition, surface_log=None, return_reason=None):
             notifications.append(condition)
 
         audit_entries = [
@@ -1275,6 +1275,217 @@ class TestModuleConstants:
         assert steward.BOOTUP_CANDIDATE_GATE is True, (
             "BOOTUP_CANDIDATE_GATE must default to True"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test: Early warning at cycle 4 (item 12)
+# ---------------------------------------------------------------------------
+
+class TestEarlyWarningAt4:
+    def test_early_warning_fires_when_prescription_reaches_cycle_4(self, db_path, registry, tmp_path):
+        """When a prescription results in new steward_cycles == 4, an early warning is sent."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        early_warnings = []
+
+        def capture_early_warning(uow, return_reason, new_cycles=None):
+            uow_id = uow.id if hasattr(uow, "id") else uow["id"]
+            early_warnings.append({"uow_id": uow_id, "return_reason": return_reason, "new_cycles": new_cycles})
+
+        audit_entries = [
+            {"event": "execution_complete", "actor": "executor",
+             "return_reason": "needs_steward_review", "timestamp": _now_iso()},
+        ]
+
+        conn = _open_db(db_path)
+        # steward_cycles=3: after prescription it becomes 4 → early warning
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=3,
+            output_ref=None,
+            audit_log_entries=audit_entries,
+            success_criteria="Must produce artifact",
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan_early_warning=capture_early_warning,
+        )
+
+        uow = _get_uow(db_path, uow_id)
+        # Must have been prescribed (status ready-for-executor, cycles=4)
+        assert uow["status"] == "ready-for-executor", (
+            "UoW at cycle 3 with no output should be prescribed (status=ready-for-executor)"
+        )
+        assert uow["steward_cycles"] == 4, "steward_cycles must be 4 after prescription"
+        assert len(early_warnings) == 1, (
+            f"Early warning must fire exactly once when new_cycles == 4, got: {early_warnings}"
+        )
+        assert early_warnings[0]["uow_id"] == uow_id
+        assert early_warnings[0]["new_cycles"] == 4, (
+            f"new_cycles passed to early warning must be 4 (post-prescription), "
+            f"got: {early_warnings[0]['new_cycles']}"
+        )
+
+    def test_early_warning_not_fired_at_cycle_3(self, db_path, registry, tmp_path):
+        """No early warning when new steward_cycles is 3 (only fires at exactly 4)."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        early_warnings = []
+
+        def capture_early_warning(uow, return_reason, new_cycles=None):
+            early_warnings.append(return_reason)
+
+        audit_entries = [
+            {"event": "execution_complete", "actor": "executor",
+             "return_reason": "needs_steward_review", "timestamp": _now_iso()},
+        ]
+
+        conn = _open_db(db_path)
+        # steward_cycles=2: after prescription it becomes 3 → no early warning
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=2,
+            output_ref=None,
+            audit_log_entries=audit_entries,
+            success_criteria="Must produce artifact",
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan_early_warning=capture_early_warning,
+        )
+
+        assert len(early_warnings) == 0, (
+            f"Early warning must not fire at new_cycles=3, got: {early_warnings}"
+        )
+
+    def test_early_warning_not_fired_at_hard_cap(self, db_path, registry, tmp_path):
+        """When steward_cycles == 5 (hard cap), early warning must not fire — surface fires instead."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        early_warnings = []
+        surface_calls = []
+
+        def capture_early_warning(uow, return_reason, new_cycles=None):
+            early_warnings.append(return_reason)
+
+        def capture_notification(uow, condition, surface_log=None, return_reason=None):
+            surface_calls.append(condition)
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=5,
+            output_ref=None,
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan=capture_notification,
+            notify_dan_early_warning=capture_early_warning,
+        )
+
+        assert len(early_warnings) == 0, (
+            "Early warning must not fire at hard cap — surface fires instead"
+        )
+        assert "hard_cap" in surface_calls, "Hard cap surface must fire at cycles=5"
+
+
+# ---------------------------------------------------------------------------
+# Test: Hard cap surface message includes return_reason (item 12)
+# ---------------------------------------------------------------------------
+
+class TestHardCapSurfaceIncludesReturnReason:
+    def test_hard_cap_notification_includes_return_reason(self, db_path, registry, tmp_path):
+        """At hard cap (cycles >= 5), the surface notification carries return_reason."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        notifications = []
+
+        def capture_notification(uow, condition, surface_log=None, return_reason=None):
+            notifications.append({"condition": condition, "return_reason": return_reason})
+
+        audit_entries = [
+            {"event": "execution_complete", "actor": "executor",
+             "return_reason": "execution_failed", "timestamp": _now_iso()},
+        ]
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=5,
+            output_ref=None,
+            audit_log_entries=audit_entries,
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan=capture_notification,
+        )
+
+        assert len(notifications) == 1, "Hard cap must surface exactly once"
+        n = notifications[0]
+        assert n["condition"] == "hard_cap"
+        assert n["return_reason"] == "execution_failed", (
+            f"Hard cap surface must include return_reason='execution_failed', got: {n['return_reason']!r}"
+        )
+
+    def test_hard_cap_surface_return_reason_none_when_no_audit(self, db_path, registry, tmp_path):
+        """Hard cap surface with no prior audit entries sends return_reason=None (not a crash)."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        notifications = []
+
+        def capture_notification(uow, condition, surface_log=None, return_reason=None):
+            notifications.append({"condition": condition, "return_reason": return_reason})
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=5,
+            output_ref=None,
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan=capture_notification,
+        )
+
+        assert len(notifications) == 1
+        assert notifications[0]["condition"] == "hard_cap"
+        # return_reason is None when there are no audit entries recording a return_reason
+        assert notifications[0]["return_reason"] is None
 
 
 # ---------------------------------------------------------------------------
