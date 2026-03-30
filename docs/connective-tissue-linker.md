@@ -94,7 +94,8 @@ One JSON object per line. Schema:
   "target_path": "frontier-docs/agency-architecture.md",
   "link_type": "elaborates",
   "rationale": "The session's discussion of distributed cognition directly elaborates the agency-architecture doc's open question about multi-agent epistemics.",
-  "worker_id": "cultivator"
+  "worker_id": "cultivator",
+  "batch_id": null
 }
 ```
 
