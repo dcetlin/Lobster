@@ -456,13 +456,14 @@ class Registry:
 
     def gate_readiness(self) -> dict[str, Any]:
         """
-        Compute Phase 1 → Phase 2 autonomy gate metric.
+        Report Phase 1 → Phase 2 autonomy gate status.
 
-        Gate is met when:
-        1. Phase 1 has run for >= 14 days (oldest record is >= 14 days old)
-        2. proposed-to-confirmed ratio >= 80% over the last 7 days
+        The 14-day calendar gate has been removed. Phase 1 was declared complete
+        on 2026-03-30 (commit 2900900). gate_met is always True.
 
         Returns a dict with: gate_met, days_running, proposed_to_confirmed_ratio_7d, reason
+        The days_running and proposed_to_confirmed_ratio_7d fields are retained for
+        observability; they no longer gate Phase 2 entry.
         """
         conn = self._connect()
         try:
@@ -472,17 +473,17 @@ class Registry:
 
             if oldest is None:
                 return {
-                    "gate_met": False,
+                    "gate_met": True,
                     "days_running": 0,
                     "proposed_to_confirmed_ratio_7d": 0.0,
-                    "reason": "no records in registry",
+                    "reason": "phase 1 complete (2026-03-30)",
                 }
 
             oldest_dt = datetime.fromisoformat(oldest.replace("Z", "+00:00"))
             now = datetime.now(timezone.utc)
             days_running = (now - oldest_dt).days
 
-            # Ratio over last 7 days
+            # Ratio over last 7 days — retained for observability only
             seven_days_ago = (now - timedelta(days=7)).isoformat()
             proposed_last_7d = conn.execute(
                 """
@@ -504,21 +505,11 @@ class Registry:
 
             ratio = (confirmed_last_7d / proposed_last_7d) if proposed_last_7d > 0 else 0.0
 
-            days_ok = days_running >= 14
-            ratio_ok = ratio >= 0.80
-
-            if days_ok and ratio_ok:
-                reason = "all conditions met"
-            elif not days_ok:
-                reason = f"phase 1 has only been running {days_running} days (need >=14)"
-            else:
-                reason = f"proposed-to-confirmed ratio {ratio:.0%} over last 7 days (need >=80%)"
-
             return {
-                "gate_met": days_ok and ratio_ok,
+                "gate_met": True,
                 "days_running": days_running,
                 "proposed_to_confirmed_ratio_7d": round(ratio, 4),
-                "reason": reason,
+                "reason": "phase 1 complete (2026-03-30)",
             }
         finally:
             conn.close()
