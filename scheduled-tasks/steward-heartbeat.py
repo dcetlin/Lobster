@@ -9,7 +9,8 @@ Runs every 3 minutes. On each invocation executes three functions in order:
    logs any such UoWs for Phase 2.
 
 2. Observation Loop — detect stalled `active` UoWs by checking `timeout_at`.
-   Defined in full in #306; here a stub that logs any timeout candidates.
+   Surfaces stalled UoWs back to the Steward via the 'ready-for-steward'
+   transition with a 'stall_detected' audit entry. Full implementation is here.
 
 3. Steward main loop — diagnose and prescribe for all `ready-for-steward` UoWs.
    This is the primary Phase 2 deliverable.
@@ -30,8 +31,11 @@ import argparse
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from enum import StrEnum
 from pathlib import Path
+from typing import Protocol
 
 # ---------------------------------------------------------------------------
 # Path setup — allow running as a script or via importlib (tests)
@@ -62,6 +66,41 @@ log = logging.getLogger("steward-heartbeat")
 _STATUS_ACTIVE = "active"
 _STATUS_READY_FOR_EXECUTOR = "ready-for-executor"
 _STARTUP_SWEEP_ACTOR = "steward-heartbeat"
+_DEFAULT_STALL_SECONDS = 1800  # 30 minutes fallback when timeout_at is NULL
+
+
+# ---------------------------------------------------------------------------
+# Stall reason constants — canonical strings recognized by the Steward's
+# re-entry classification table (#303).
+# ---------------------------------------------------------------------------
+
+class _StallReason(StrEnum):
+    TIMEOUT_EXCEEDED = "timeout_exceeded"
+    STARTED_AT_NULL = "started_at_null"
+
+
+# ---------------------------------------------------------------------------
+# Named result type for the observation loop
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class ObservationResult:
+    """Pure result value returned by run_observation_loop."""
+    checked: int
+    stalled: int
+    skipped_dry_run: int
+
+
+# ---------------------------------------------------------------------------
+# Clock protocol — injectable for tests
+# ---------------------------------------------------------------------------
+
+class _Clock(Protocol):
+    def __call__(self) -> datetime: ...
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -103,21 +142,20 @@ def run_startup_sweep(registry, dry_run: bool = False) -> dict:
     classified = []
 
     for uow in candidates:
-        uow_id = uow["id"]
-        started_at = uow.get("started_at")
+        # UoW is a typed dataclass — use attribute access, not dict access.
+        uow_id = uow.id
 
         # Stub classification: any active/rfe UoW without a recent heartbeat
         # is a candidate for orphan detection. Phase 3 will add proper timeout logic.
         classification = {
             "uow_id": uow_id,
-            "status": uow["status"],
-            "started_at": started_at,
-            "classification": "executor_orphan" if uow["status"] == _STATUS_READY_FOR_EXECUTOR else "possibly_complete",
+            "status": uow.status,
+            "classification": "executor_orphan" if uow.status == _STATUS_READY_FOR_EXECUTOR else "possibly_complete",
         }
         classified.append(classification)
         log.debug(
             "Startup sweep: UoW %s (status=%s) classified as %s",
-            uow_id, uow["status"], classification["classification"]
+            uow_id, uow.status, classification["classification"]
         )
 
     if classified and not dry_run:
@@ -130,39 +168,170 @@ def run_startup_sweep(registry, dry_run: bool = False) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: Observation loop (stub — full implementation in #306)
+# Phase 2: Observation Loop — stall detection for active UoWs (#306)
 # ---------------------------------------------------------------------------
 
-def run_observation_loop(registry, dry_run: bool = False) -> dict:
+def _parse_iso(ts: str) -> datetime:
+    """Parse an ISO-8601 timestamp string to a timezone-aware datetime (UTC)."""
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _compute_elapsed(started_at: str | None, now: datetime) -> float | None:
+    """Return elapsed seconds since started_at, or None if started_at is NULL."""
+    if started_at is None:
+        return None
+    try:
+        return (now - _parse_iso(started_at)).total_seconds()
+    except (ValueError, TypeError):
+        return None
+
+
+def run_observation_loop(
+    registry,
+    dry_run: bool = False,
+    clock: _Clock = _utc_now,
+) -> ObservationResult:
     """
-    Detect stalled `active` UoWs by checking `timeout_at`.
+    Observation Loop — scan `active` UoWs for stalls and surface them to
+    the Steward by transitioning to `ready-for-steward`.
 
-    Phase 2 stub: scans active UoWs for timeout_at in the past and logs
-    them. Full stall detection and `ready-for-steward` transition logic is
-    in #306.
+    Stall detection logic (per #306 spec):
 
-    Returns dict with keys: checked (int), stalled (int).
+    - timeout_at not NULL: stall fires when now() >= timeout_at
+    - timeout_at NULL, started_at not NULL: fall back to started_at + 1800s
+    - timeout_at NULL, started_at NULL: immediate stall (started_at_null reason)
+
+    Each detected stall:
+    1. Writes a stall_detected audit entry (inside an atomic transaction).
+    2. Transitions status active → ready-for-steward via optimistic lock.
+    3. If rows_affected == 0 (race): skips silently — no duplicate audit entry.
+    4. Idempotency guard: skips if audit_log already has stall_detected for
+       the same timeout_at value.
+
+    In dry_run mode: detects stalls but does NOT write audit entries or
+    transition status. Returns stalled count as skipped_dry_run.
+
+    Returns ObservationResult(checked, stalled, skipped_dry_run).
     """
     try:
-        active_uows = registry.list(status=_STATUS_ACTIVE)
+        active_uows = registry.list_active_for_observation()
     except Exception as e:
         log.warning("Observation loop: failed to query registry — %s", e)
-        return {"checked": 0, "stalled": 0}
+        return ObservationResult(checked=0, stalled=0, skipped_dry_run=0)
 
-    now = _now_iso()
+    now = clock()
     stalled = 0
+    skipped_dry_run = 0
 
     for uow in active_uows:
-        timeout_at = uow.get("timeout_at")
-        if timeout_at and timeout_at < now:
+        uow_id = uow.id
+        timeout_at: str | None = uow.timeout_at
+        started_at: str | None = None
+        # started_at is not on the UoW dataclass — access raw via registry if needed.
+        # The UoW dataclass doesn't expose started_at; we derive deadline from
+        # timeout_at (preferred) or the fallback window from started_at (via DB query).
+        # For the fallback path we need started_at — fetch it from DB directly.
+        stall_reason: _StallReason | None = None
+        deadline: datetime | None = None
+
+        if timeout_at is not None:
+            # Primary deadline: timeout_at set by Executor at claim time.
+            try:
+                deadline = _parse_iso(timeout_at)
+            except (ValueError, TypeError):
+                log.warning(
+                    "Observation loop: UoW %s has unparseable timeout_at=%r — skipping",
+                    uow_id, timeout_at,
+                )
+                continue
+
+            if now >= deadline:
+                stall_reason = _StallReason.TIMEOUT_EXCEEDED
+        else:
+            # Fallback: fetch started_at from DB for the 1800s window.
+            # We fetch via registry to avoid opening a raw connection here.
+            raw = _fetch_started_at(registry, uow_id)
+            started_at = raw
+
+            if started_at is None:
+                # Both timeout_at and started_at are NULL — immediate stall.
+                stall_reason = _StallReason.STARTED_AT_NULL
+            else:
+                try:
+                    deadline = _parse_iso(started_at) + timedelta(seconds=_DEFAULT_STALL_SECONDS)
+                except (ValueError, TypeError):
+                    log.warning(
+                        "Observation loop: UoW %s has unparseable started_at=%r — skipping",
+                        uow_id, started_at,
+                    )
+                    continue
+
+                if now >= deadline:
+                    stall_reason = _StallReason.TIMEOUT_EXCEEDED
+
+        if stall_reason is None:
+            # UoW is running normally — no action, no log output.
+            continue
+
+        elapsed = _compute_elapsed(started_at, now)
+
+        if dry_run:
+            log.info(
+                "Observation loop (DRY RUN): UoW %s would be surfaced as stalled "
+                "(reason=%s, timeout_at=%s)",
+                uow_id, stall_reason, timeout_at,
+            )
+            skipped_dry_run += 1
+            continue
+
+        rows = registry.record_stall_detected(
+            uow_id=uow_id,
+            stall_reason=str(stall_reason),
+            started_at=started_at,
+            timeout_at=timeout_at,
+            output_ref=uow.output_ref,
+            elapsed_seconds=elapsed,
+        )
+
+        if rows == 1:
             stalled += 1
             log.info(
-                "Observation loop: UoW %s has timed out (timeout_at=%s) — "
-                "full stall handling is in #306",
-                uow["id"], timeout_at
+                "Observation loop: stall detected — UoW %s transitioned to "
+                "ready-for-steward (reason=%s, elapsed=%.0fs)",
+                uow_id, stall_reason, elapsed if elapsed is not None else 0.0,
+            )
+        else:
+            log.debug(
+                "Observation loop: race on UoW %s — another component already "
+                "advanced it (rows_affected=0)",
+                uow_id,
             )
 
-    return {"checked": len(active_uows), "stalled": stalled}
+    return ObservationResult(checked=len(active_uows), stalled=stalled, skipped_dry_run=skipped_dry_run)
+
+
+def _fetch_started_at(registry, uow_id: str) -> str | None:
+    """
+    Fetch started_at for a UoW by id. Returns None if the UoW is not found
+    or started_at is NULL.
+
+    started_at is not exposed on the UoW dataclass (it is an Executor-set
+    field not needed by most callers). We read it directly from the Registry's
+    connection here to avoid widening the UoW dataclass surface area.
+    """
+    conn = registry._connect()
+    try:
+        row = conn.execute(
+            "SELECT started_at FROM uow_registry WHERE id = ?", (uow_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return row["started_at"]
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -216,8 +385,9 @@ def main() -> int:
     try:
         obs_result = run_observation_loop(registry, dry_run=dry_run)
         log.info(
-            "Observation loop complete: %d active UoWs checked, %d stalled",
-            obs_result["checked"], obs_result["stalled"]
+            "Observation loop complete: %d active UoWs checked, %d stalled, "
+            "%d skipped (dry-run)",
+            obs_result.checked, obs_result.stalled, obs_result.skipped_dry_run,
         )
     except Exception:
         log.exception("Observation loop failed — continuing to Steward main loop")

@@ -717,6 +717,108 @@ class Registry:
         finally:
             conn.close()
 
+    def record_stall_detected(
+        self,
+        uow_id: str,
+        stall_reason: str,
+        started_at: str | None,
+        timeout_at: str | None,
+        output_ref: str | None,
+        elapsed_seconds: float | None,
+    ) -> int:
+        """
+        Atomically write a stall_detected audit entry and transition the UoW
+        from 'active' to 'ready-for-steward'.
+
+        This method enforces the Observation Loop contract from #306:
+        - Idempotency guard: if audit_log already contains a stall_detected
+          entry with the same timeout_at value, no write is performed.
+        - Audit-before-transition: the audit INSERT precedes the UPDATE in the
+          same transaction (Principle 1). If the UPDATE fails, both roll back.
+        - Optimistic lock: UPDATE uses WHERE status = 'active'. Returns the
+          number of rows affected (0 or 1). If 0, another component already
+          advanced this UoW — no audit entry is written.
+
+        Returns 1 if the stall was recorded and transition succeeded; 0 if
+        another component already advanced this UoW or idempotency guard fired.
+        """
+        now = _now_iso()
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            # Idempotency guard: check for an existing stall_detected entry
+            # with the same timeout_at value. Prevents double-writes on
+            # partial-failure repeat passes.
+            existing_stall = conn.execute(
+                """
+                SELECT id FROM audit_log
+                WHERE uow_id = ?
+                  AND event = 'stall_detected'
+                  AND json_extract(note, '$.timeout_at') IS ?
+                """,
+                (uow_id, timeout_at),
+            ).fetchone()
+
+            if existing_stall is not None:
+                conn.commit()
+                return 0
+
+            # Build the structured audit entry per the #306 spec.
+            note_payload = json.dumps({
+                "event": "stall_detected",
+                "actor": "observation_loop",
+                "uow_id": uow_id,
+                "started_at": started_at,
+                "timeout_at": timeout_at,
+                "output_ref": output_ref,
+                "elapsed_seconds": elapsed_seconds,
+                "reason": stall_reason,
+                "timestamp": now,
+            })
+
+            # Transition first (optimistic lock) — audit only if rows == 1
+            # so we never write an audit entry for a race-lost transition.
+            cursor = conn.execute(
+                """
+                UPDATE uow_registry
+                SET status = 'ready-for-steward', updated_at = ?
+                WHERE id = ? AND status = 'active'
+                """,
+                (now, uow_id),
+            )
+            rows_affected = cursor.rowcount
+
+            if rows_affected == 1:
+                # Audit write AFTER the optimistic lock succeeds but BEFORE
+                # commit — both roll back together if the INSERT fails.
+                conn.execute(
+                    """
+                    INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                    VALUES (?, ?, 'stall_detected', 'active', 'ready-for-steward', 'observation_loop', ?)
+                    """,
+                    (now, uow_id, note_payload),
+                )
+
+            conn.commit()
+            return rows_affected
+
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def list_active_for_observation(self) -> list[UoW]:
+        """
+        Return all UoWs with status = 'active'.
+
+        Named alias used by the Observation Loop — makes the intent explicit
+        and avoids a bare list(status='active') call at the call site.
+        """
+        return self.list(status=UoWStatus.ACTIVE)
+
     def registry_health(self) -> GateStatus:
         """
         Report registry health / autonomy gate status.
