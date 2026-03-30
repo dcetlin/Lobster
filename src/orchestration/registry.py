@@ -454,6 +454,90 @@ class Registry:
         finally:
             conn.close()
 
+    def query(self, status: str) -> list[dict[str, Any]]:
+        """
+        Return all UoW records with the given status.
+
+        This is a named alias for `list(status=...)` with an explicit status
+        parameter — used by the Registrar sweep to fetch only `pending` UoWs.
+        """
+        return self.list(status=status)
+
+    def transition(
+        self,
+        uow_id: str,
+        to_status: str,
+        where_status: str,
+    ) -> int:
+        """
+        Conditional status transition — optimistic lock pattern.
+
+        Atomically updates status to `to_status` only if the current status
+        equals `where_status`. Returns the number of rows affected (0 or 1).
+
+        Callers must check the return value:
+        - 1: transition succeeded — write audit entry, proceed.
+        - 0: another sweep already advanced this UoW — skip silently.
+
+        Does NOT write an audit entry (the caller is responsible for that,
+        conditioned on rows == 1). This keeps audit responsibility at the
+        sweep layer where the business context is available.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            now = _now_iso()
+            cursor = conn.execute(
+                """
+                UPDATE uow_registry
+                SET status = ?, updated_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                (to_status, now, uow_id, where_status),
+            )
+            rows_affected = cursor.rowcount
+            conn.commit()
+            return rows_affected
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def append_audit_log(self, uow_id: str, entry: dict[str, Any]) -> None:
+        """
+        Append an unstructured audit log entry for a UoW.
+
+        The `entry` dict is serialized as JSON into the `note` column.
+        The `entry['event']` key is used as the audit event name.
+
+        This method is used by callers (e.g., the sweep loop, conditions.py)
+        that need to write rich structured events beyond the structured fields
+        in `_write_audit`. The entry dict may contain any keys the caller
+        finds useful for diagnostics.
+
+        Writes atomically in a BEGIN IMMEDIATE transaction. Does not write
+        a from_status or to_status — this is an annotation, not a transition.
+        """
+        event = entry.get("event", "unknown")
+        note_json = json.dumps(entry)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO audit_log (ts, uow_id, event, note)
+                VALUES (?, ?, ?, ?)
+                """,
+                (_now_iso(), uow_id, event, note_json),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def gate_readiness(self) -> dict[str, Any]:
         """
         Compute Phase 1 → Phase 2 autonomy gate metric.
