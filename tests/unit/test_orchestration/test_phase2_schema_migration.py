@@ -347,9 +347,10 @@ class TestPreMigrationUoWSurvival:
         reg = Registry(db_path)
 
         today = "2026-01-01"
+        from src.orchestration.registry import UpsertInserted
         result = reg.upsert(issue_number=1001, title="Pre-migration UoW", sweep_date=today)
-        uow_id = result["id"]
-        assert result["action"] == "inserted"
+        assert isinstance(result, UpsertInserted)
+        uow_id = result.id
 
         # Run migration
         migration_result = _run_migration(db_path)
@@ -359,38 +360,38 @@ class TestPreMigrationUoWSurvival:
         reg2 = Registry(db_path)
         record = reg2.get(uow_id)
 
-        assert "error" not in record, f"get() returned error: {record}"
-        assert record["id"] == uow_id
-        assert record["workflow_artifact"] is None
+        assert record is not None, f"get() returned None for id {uow_id}"
+        assert record.id == uow_id
+        assert record.workflow_artifact is None
         # success_criteria is NOT NULL DEFAULT '' — pre-migration rows get '' after migration
-        assert record["success_criteria"] == ""
-        assert record["prescribed_skills"] is None
-        assert record["steward_cycles"] == 0
-        assert record["timeout_at"] is None
-        assert record["estimated_runtime"] is None
-        assert record["steward_agenda"] is None
-        assert record["steward_log"] is None
+        assert record.success_criteria == ""
+        assert record.prescribed_skills is None
+        assert record.steward_cycles == 0
+        assert record.timeout_at is None
+        assert record.estimated_runtime is None
+        assert record.steward_agenda is None
+        assert record.steward_log is None
 
     def test_new_uow_after_migration_has_correct_defaults(self, migrated_db):
         """New UoW created after migration has all Phase 2 fields with correct defaults."""
-        from src.orchestration.registry import Registry
+        from src.orchestration.registry import Registry, UpsertInserted
         reg = Registry(migrated_db)
         result = reg.upsert(issue_number=1002, title="Post-migration UoW", sweep_date="2026-01-02")
-        uow_id = result["id"]
-        assert result["action"] == "inserted"
+        assert isinstance(result, UpsertInserted)
+        uow_id = result.id
 
         record = reg.get(uow_id)
-        assert "error" not in record
-        assert record["workflow_artifact"] is None
+        assert record is not None
+        assert record.workflow_artifact is None
         # success_criteria is NOT NULL DEFAULT '' — new UoWs default to ''
         # (Application layer: UoW Registrar must reject empty success_criteria at germination)
-        assert record["success_criteria"] == ""
-        assert record["prescribed_skills"] is None
-        assert record["steward_cycles"] == 0
-        assert record["timeout_at"] is None
-        assert record["estimated_runtime"] is None
-        assert record["steward_agenda"] is None
-        assert record["steward_log"] is None
+        assert record.success_criteria == ""
+        assert record.prescribed_skills is None
+        assert record.steward_cycles == 0
+        assert record.timeout_at is None
+        assert record.estimated_runtime is None
+        assert record.steward_agenda is None
+        assert record.steward_log is None
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +426,8 @@ class TestPrescribedSkillsDeserialization:
         uow_id = self._insert_uow_with_prescribed_skills(migrated_db, None)
         reg = Registry(migrated_db)
         record = reg.get(uow_id)
-        assert record["prescribed_skills"] is None
+        assert record is not None
+        assert record.prescribed_skills is None
 
     def test_prescribed_skills_empty_json_array_returns_empty_list(self, migrated_db):
         """prescribed_skills = '[]' → deserializes to [] (not None)."""
@@ -433,7 +435,8 @@ class TestPrescribedSkillsDeserialization:
         uow_id = self._insert_uow_with_prescribed_skills(migrated_db, "[]")
         reg = Registry(migrated_db)
         record = reg.get(uow_id)
-        assert record["prescribed_skills"] == []
+        assert record is not None
+        assert record.prescribed_skills == []
 
     def test_prescribed_skills_json_array_returns_list(self, migrated_db):
         """prescribed_skills = '["skill-a","skill-b"]' → deserializes to list."""
@@ -443,7 +446,8 @@ class TestPrescribedSkillsDeserialization:
         )
         reg = Registry(migrated_db)
         record = reg.get(uow_id)
-        assert record["prescribed_skills"] == [
+        assert record is not None
+        assert record.prescribed_skills == [
             "systematic-debugging", "verification-before-completion"
         ]
 
@@ -477,32 +481,33 @@ class TestStewardPrivateFields:
             conn.close()
 
     def test_steward_agenda_null_returns_none(self, migrated_db):
-        """steward_agenda = NULL → returned as None by _row_to_dict (not deserialized)."""
+        """steward_agenda = NULL → returned as None on the UoW."""
         from src.orchestration.registry import Registry
         uow_id = self._insert_uow_with_steward_fields(migrated_db, None, None)
         reg = Registry(migrated_db)
         record = reg.get(uow_id)
-        assert record["steward_agenda"] is None
+        assert record is not None
+        assert record.steward_agenda is None
 
     def test_steward_log_null_returns_none(self, migrated_db):
-        """steward_log = NULL → returned as None by _row_to_dict (not deserialized)."""
+        """steward_log = NULL → returned as None on the UoW."""
         from src.orchestration.registry import Registry
         uow_id = self._insert_uow_with_steward_fields(migrated_db, None, None)
         reg = Registry(migrated_db)
         record = reg.get(uow_id)
-        assert record["steward_log"] is None
+        assert record is not None
+        assert record.steward_log is None
 
-    def test_steward_agenda_json_not_auto_deserialized(self, migrated_db):
+    def test_steward_agenda_returned_as_raw_string(self, migrated_db):
         """steward_agenda stored as JSON string is returned as raw string (not parsed)."""
         from src.orchestration.registry import Registry
         agenda_json = '[{"posture": "solo", "status": "pending"}]'
         uow_id = self._insert_uow_with_steward_fields(migrated_db, agenda_json, None)
         reg = Registry(migrated_db)
         record = reg.get(uow_id)
-        # steward_agenda is private — we just confirm it's returned (as string or None)
-        # The contract is: it is NOT in the executor_uow_view, and _row_to_dict returns it
-        # as-is (string). It must not crash.
-        assert record["steward_agenda"] == agenda_json
+        # steward_agenda is private — returned as raw string, not deserialized.
+        assert record is not None
+        assert record.steward_agenda == agenda_json
 
 
 # ---------------------------------------------------------------------------

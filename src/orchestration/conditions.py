@@ -19,7 +19,10 @@ from __future__ import annotations
 
 import json
 import subprocess
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from .registry import UoW
 
 
 # ---------------------------------------------------------------------------
@@ -75,14 +78,14 @@ def _default_github_client(issue_number: int) -> dict[str, Any]:
 # github_client) → bool. Each handler is responsible only for its trigger type.
 # ---------------------------------------------------------------------------
 
-def _eval_immediate(_trigger: dict, _uow: dict, **_kwargs) -> bool:
+def _eval_immediate(_trigger: dict, _uow: "UoW", **_kwargs) -> bool:
     """Immediate trigger always fires."""
     return True
 
 
 def _eval_issue_closed(
     trigger: dict,
-    uow: dict,
+    uow: "UoW",
     registry: Any | None,
     github_client: GithubClient,
 ) -> bool:
@@ -100,18 +103,18 @@ def _eval_issue_closed(
 
     # Non-200: cannot confirm condition — defer (return False) and log.
     if registry is not None:
-        registry.append_audit_log(uow["id"], {
+        registry.append_audit_log(uow.id, {
             "event": "condition_eval_failed",
             "error_code": status_code,
             "trigger_type": "issue_closed",
-            "uow_id": uow["id"],
+            "uow_id": uow.id,
         })
     return False
 
 
 def _eval_registry_state(
     trigger: dict,
-    uow: dict,
+    uow: "UoW",
     registry: Any | None,
 ) -> bool:
     """
@@ -132,15 +135,15 @@ def _eval_registry_state(
         # Unreadable registry — return False without crashing.
         return False
 
-    if target.get("error") == "not found":
-        registry.append_audit_log(uow["id"], {
+    if target is None:
+        registry.append_audit_log(uow.id, {
             "event": "condition_eval_error",
             "note": f"referenced uow_id not found: {target_uow_id}",
-            "uow_id": uow["id"],
+            "uow_id": uow.id,
         })
         return False
 
-    return target.get("status") == target_state
+    return str(target.status) == target_state
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +160,7 @@ _TRIGGER_REGISTRY_STATE = "registry_state"
 # ---------------------------------------------------------------------------
 
 def evaluate_condition(
-    uow: dict[str, Any],
+    uow: "UoW",
     *,
     registry: Any | None = None,
     github_client: GithubClient | None = None,
@@ -165,8 +168,7 @@ def evaluate_condition(
     """
     Returns True if the UoW's trigger condition is met.
 
-    uow: a dict from registry._row_to_dict — reads uow['trigger'], uow['source_issue_number'],
-         uow['id']
+    uow: a typed UoW value object — reads uow.trigger, uow.source_issue_number, uow.id
     registry: optional Registry instance for registry_state lookups and audit_log writes.
               In production the sweep loop passes the registry instance. In isolated unit
               tests it can be None (disables audit writes and registry_state lookups).
@@ -185,8 +187,8 @@ def evaluate_condition(
     if github_client is None:
         github_client = _default_github_client
 
-    uow_id = uow.get("id", "unknown")
-    trigger = uow.get("trigger")
+    uow_id = uow.id
+    trigger = uow.trigger
 
     # NULL trigger: backward compat with pre-trigger UoWs — always fire.
     if trigger is None:

@@ -9,7 +9,7 @@ Usage:
     uv run registry_cli.py upsert --issue <N> --title <T> [--sweep-date <YYYY-MM-DD>]
     uv run registry_cli.py get --id <uow-id>
     uv run registry_cli.py list [--status <status>]
-    uv run registry_cli.py confirm --id <uow-id>
+    uv run registry_cli.py approve --id <uow-id>
     uv run registry_cli.py check-stale
     uv run registry_cli.py expire-proposals
     uv run registry_cli.py gate-readiness
@@ -19,6 +19,7 @@ Environment:
 """
 
 import argparse
+import dataclasses
 import json
 import os
 import sys
@@ -29,7 +30,17 @@ _SRC_DIR = Path(__file__).parent.parent
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-from orchestration.registry import Registry, _gh_issue_is_closed
+from orchestration.registry import (
+    ApproveConfirmed,
+    ApproveExpired,
+    ApproveNotFound,
+    ApproveSkipped,
+    Registry,
+    UoW,
+    UpsertInserted,
+    UpsertSkipped,
+    _gh_issue_is_closed,
+)
 
 
 def _get_db_path() -> Path:
@@ -38,6 +49,13 @@ def _get_db_path() -> Path:
         return Path(env_override)
     workspace = os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
     return Path(workspace) / "orchestration" / "registry.db"
+
+
+def _uow_to_dict(uow: UoW) -> dict:
+    """Serialize a UoW dataclass to a JSON-safe dict."""
+    d = dataclasses.asdict(uow)
+    d["status"] = str(uow.status)  # convert StrEnum to plain string
+    return d
 
 
 def _output(data: dict | list) -> None:
@@ -54,28 +72,56 @@ def cmd_upsert(registry: Registry, args: argparse.Namespace) -> None:
         title=args.title,
         sweep_date=getattr(args, "sweep_date", None),
     )
-    _output(result)
+    match result:
+        case UpsertInserted(id=uow_id):
+            _output({"id": uow_id, "action": "inserted"})
+        case UpsertSkipped(id=uow_id, reason=reason):
+            _output({"id": uow_id, "action": "skipped", "reason": reason})
 
 
 def cmd_get(registry: Registry, args: argparse.Namespace) -> None:
     result = registry.get(args.id)
-    _output(result)
+    if result is None:
+        _output({"error": "not found", "id": args.id})
+    else:
+        _output(_uow_to_dict(result))
 
 
 def cmd_list(registry: Registry, args: argparse.Namespace) -> None:
     status = getattr(args, "status", None)
-    result = registry.list(status=status)
-    _output(result)
+    records = registry.list(status=status)
+    _output([_uow_to_dict(r) for r in records])
 
 
-def cmd_confirm(registry: Registry, args: argparse.Namespace) -> None:
-    result = registry.confirm(args.id)
-    _output(result)
+def cmd_approve(registry: Registry, args: argparse.Namespace) -> None:
+    result = registry.approve(args.id)
+    match result:
+        case ApproveConfirmed(id=uow_id):
+            _output({"id": uow_id, "status": "pending", "previous_status": "proposed"})
+        case ApproveNotFound(id=uow_id):
+            _output({
+                "error": "not found",
+                "id": uow_id,
+                "message": f"UoW `{uow_id}` not found. Run `list --status proposed` to see current proposals.",
+            })
+        case ApproveExpired(id=uow_id):
+            _output({
+                "error": "expired",
+                "id": uow_id,
+                "message": f"UoW `{uow_id}` has expired. Wait for the next sweep to re-propose.",
+            })
+        case ApproveSkipped(id=uow_id, current_status=current_status, reason=reason):
+            _output({
+                "id": uow_id,
+                "status": current_status,
+                "action": "noop",
+                "reason": reason,
+            })
 
 
 def cmd_check_stale(registry: Registry, args: argparse.Namespace) -> None:
-    result = registry.check_stale(issue_checker=_gh_issue_is_closed)
-    _output(result)
+    stale = registry.check_stale(issue_checker=_gh_issue_is_closed)
+    _output([_uow_to_dict(u) for u in stale])
 
 
 def cmd_expire_proposals(registry: Registry, args: argparse.Namespace) -> None:
@@ -84,8 +130,13 @@ def cmd_expire_proposals(registry: Registry, args: argparse.Namespace) -> None:
 
 
 def cmd_gate_readiness(registry: Registry, args: argparse.Namespace) -> None:
-    result = registry.gate_readiness()
-    _output(result)
+    gs = registry.registry_health()
+    _output({
+        "gate_met": gs.gate_met,
+        "days_running": gs.days_running,
+        "proposed_to_confirmed_ratio_7d": gs.approval_rate,
+        "reason": gs.reason,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -116,9 +167,9 @@ def _build_parser() -> argparse.ArgumentParser:
                         choices=["proposed", "pending", "active", "blocked", "done", "failed", "expired"],
                         help="Filter by status")
 
-    # confirm
-    p_confirm = subparsers.add_parser("confirm", help="Confirm a proposed UoW (proposed → pending)")
-    p_confirm.add_argument("--id", required=True, help="UoW id")
+    # approve
+    p_approve = subparsers.add_parser("approve", help="Approve a proposed UoW (proposed → pending)")
+    p_approve.add_argument("--id", required=True, help="UoW id")
 
     # check-stale
     subparsers.add_parser("check-stale", help="Report active UoWs whose source issue is closed")
@@ -136,7 +187,7 @@ _COMMAND_MAP = {
     "upsert": cmd_upsert,
     "get": cmd_get,
     "list": cmd_list,
-    "confirm": cmd_confirm,
+    "approve": cmd_approve,
     "check-stale": cmd_check_stale,
     "expire-proposals": cmd_expire_proposals,
     "gate-readiness": cmd_gate_readiness,
