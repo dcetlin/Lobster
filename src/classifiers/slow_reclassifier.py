@@ -27,6 +27,8 @@ Pattern Detection Rules
                      signal_type='task_request', urgency='high'
 - "meta_thread":     2+ meta_reflection events within 2 hours → signal_type='meta_thread',
                      posture_hint='structural_coherence'
+- "philosophy_thread": 2+ philosophy events within 4 hours → signal_type='philosophy_thread',
+                     posture_hint='attunement'
 
 Integration Points
 ------------------
@@ -102,6 +104,9 @@ COMPLEX_REQUEST_WINDOW_MINUTES = 5
 
 META_THREAD_THRESHOLD = 2           # 2+ meta_reflection events within 2 hours
 META_THREAD_WINDOW_MINUTES = 120
+
+PHILOSOPHY_THREAD_THRESHOLD = 2    # 2+ philosophy events within 4 hours → philosophy_thread
+PHILOSOPHY_THREAD_WINDOW_MINUTES = 240
 
 
 # ---------------------------------------------------------------------------
@@ -631,16 +636,56 @@ def detect_meta_thread(
     return observations
 
 
+def detect_philosophy_thread(
+    cluster: list[EventRow],
+    quick_tags: dict[int, dict],
+) -> list[PatternObservation]:
+    """
+    Detect philosophy threads: 2+ events tagged philosophy within 4 hours.
+
+    Philosophy threads differ from meta_reflection threads in that they involve
+    conceptual exploration, phenomenological language, ToL arc references, or
+    epistemic framework questions — not operational retrospection. They route to
+    the philosophy handler, not generic meta routing.
+    """
+    philosophy_events = [
+        ev for ev in cluster
+        if quick_tags.get(ev.id, {}).get("signal_type") == "philosophy"
+    ]
+    philosophy_events.sort(key=lambda e: e.timestamp)
+
+    observations: list[PatternObservation] = []
+    used: set[int] = set()
+
+    for group in events_within_window(philosophy_events, PHILOSOPHY_THREAD_WINDOW_MINUTES):
+        if len(group) >= PHILOSOPHY_THREAD_THRESHOLD:
+            new_ids = [e.id for e in group if e.id not in used]
+            if len(new_ids) >= PHILOSOPHY_THREAD_THRESHOLD:
+                used.update(new_ids)
+                observations.append(PatternObservation(
+                    pattern_type="philosophy_thread",
+                    source=group[0].source,
+                    event_ids=[e.id for e in group],
+                    signal_type="philosophy_thread",
+                    urgency="normal",
+                    posture_hint="attunement",
+                    valence=classify_valence("philosophy_thread", ""),
+                ))
+
+    return observations
+
+
 def detect_all_patterns(
     cluster: list[EventRow],
     quick_tags: dict[int, dict],
 ) -> list[PatternObservation]:
-    """Run all four pattern detectors against a cluster. Pure function."""
+    """Run all five pattern detectors against a cluster. Pure function."""
     return (
         detect_design_session(cluster, quick_tags)
         + detect_brainstorm_mode(cluster, quick_tags)
         + detect_complex_request(cluster, quick_tags)
         + detect_meta_thread(cluster, quick_tags)
+        + detect_philosophy_thread(cluster, quick_tags)
     )
 
 

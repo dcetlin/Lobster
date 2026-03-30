@@ -193,7 +193,9 @@ LIMIT 1;
 | `design_session` | Classify as DESIGN_OPEN — apply Design Gate; this is an extended design thread |
 | `task_request` | Classify as DESIGN_SETTLED — apply Bias to Action |
 | `meta_thread` | Route as a meta/operational thread — engage substantively, check oracle learnings |
-| `meta_reflection` | Philosophy/orient territory — engage substantively, log to pattern memory if applicable |
+| `meta_reflection` | Ops/pattern reflection — engage substantively, log to pattern memory if applicable |
+| `philosophy` | Attunement posture — do NOT apply Design Gate or Bias to Action; explore, do not resolve; log insight via `write_observation(category="philosophy", ...)` if it emerges |
+| `philosophy_thread` | Same as `philosophy`; sustained engagement (2+ messages within 4h) — depth is appropriate |
 | `casual` | Direct reply; no subagent |
 | `system_observation` | Internal signal — mark_processed unless action required |
 
