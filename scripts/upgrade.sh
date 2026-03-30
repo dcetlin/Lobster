@@ -2652,6 +2652,37 @@ sys.exit(0 if 'vision_ref' in cols else 1)
         fi
     fi
 
+    # Migration 54: Normalize abbreviated phase1-default route_reason rows.
+    # PR #331 typed the WOS registry but some installs may contain rows where
+    # route_reason is the abbreviated "phase1-default" (without the suffix
+    # ": no classifier") written by earlier code. The canonical value is
+    # "phase1-default: no classifier" (as produced by _PHASE1_ROUTE_REASON in
+    # registry.py). This UPDATE is a no-op when all rows already use the full
+    # string.
+    local registry_db="$WORKSPACE_DIR/orchestration/registry.db"
+    if [ -f "$registry_db" ]; then
+        local abbrev_count
+        abbrev_count=$(uv run python3 -c "
+import sqlite3
+conn = sqlite3.connect('$registry_db')
+n = conn.execute(\"SELECT COUNT(*) FROM uow_registry WHERE route_reason = 'phase1-default'\").fetchone()[0]
+print(n)
+conn.close()
+" 2>/dev/null || echo "0")
+        if [ "$abbrev_count" -gt 0 ]; then
+            uv run python3 -c "
+import sqlite3
+conn = sqlite3.connect('$registry_db')
+conn.execute(\"UPDATE uow_registry SET route_reason = 'phase1-default: no classifier' WHERE route_reason = 'phase1-default'\")
+conn.commit()
+conn.close()
+" 2>/dev/null && \
+                substep "Normalized $abbrev_count phase1-default route_reason row(s) to canonical value" || \
+                warn "Could not normalize phase1-default route_reason rows (non-fatal)"
+            migrated=$((migrated + 1))
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
