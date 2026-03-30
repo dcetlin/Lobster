@@ -411,13 +411,23 @@ class TestCheckStale:
 # ---------------------------------------------------------------------------
 
 class TestGateReadiness:
-    def test_gate_not_ready_when_too_few_days(self, registry):
-        # Fewer than 14 days of data → gate not ready
+    def test_gate_met_regardless_of_days_running(self, registry):
+        # Phase 1 declared complete — 14-day calendar gate removed.
+        # gate_met is True even with a fresh (0-day-old) registry.
         readiness = registry.gate_readiness()
-        assert readiness["gate_met"] is False
-        assert "days_running" in readiness
+        assert readiness["gate_met"] is True
+
+    def test_gate_readiness_reports_phase1_complete(self, registry):
+        readiness = registry.gate_readiness()
+        assert "phase 1 complete" in readiness["reason"].lower()
 
     def test_gate_readiness_fields_present(self, registry):
         readiness = registry.gate_readiness()
         required_fields = {"gate_met", "days_running", "proposed_to_confirmed_ratio_7d", "reason"}
         assert required_fields.issubset(set(readiness.keys()))
+
+    def test_gate_readiness_no_records(self, registry):
+        # Empty registry should still report gate_met True (phase 1 complete).
+        readiness = registry.gate_readiness()
+        assert readiness["gate_met"] is True
+        assert readiness["days_running"] == 0
