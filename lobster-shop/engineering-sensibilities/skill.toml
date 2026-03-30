@@ -1,0 +1,38 @@
+[skill]
+name = "engineering-sensibilities"
+version = "1.0.0"
+description = "Engineering principles as a PR-review checklist — fractal structure, golden patterns, maximal elegance, and cognitive clarity. Activates during PR reviews and WOS implementation work."
+author = "dcetlin"
+category = "behavioral"
+
+[activation]
+mode = "triggered"
+triggers = ["/eng-check", "pr review", "ready for review", "implementation", "wos"]
+context_patterns = [
+    "when user asks to review a PR",
+    "when user says something is ready for review",
+    "when user asks about implementation approach",
+    "when user is working on WOS pipeline",
+    "when user asks about code structure or organization",
+]
+
+[layering]
+priority = 60
+merge_strategy = "append"
+
+[provides]
+mcp_tools = []
+bot_commands = ["/eng-check"]
+
+[compatibility]
+enhances = ["desloppify"]
+conflicts = []
+
+[dependencies]
+pip = []
+npm = []
+system = []
+api_keys = []
+
+[dependencies.runtime]
+python = ">=3.11"
