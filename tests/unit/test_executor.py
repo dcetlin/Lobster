@@ -160,7 +160,7 @@ class TestSuccessfulExecution:
             return "task-abc"
 
         executor = Executor(registry, dispatcher=fake_dispatcher)
-        result = executor.run(uow_id)
+        result = executor.execute_uow(uow_id)
 
         assert result.outcome == ExecutorOutcome.COMPLETE
         assert result.success is True
@@ -179,7 +179,7 @@ class TestSuccessfulExecution:
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
         executor = Executor(registry)
-        result = executor.run(uow_id)
+        result = executor.execute_uow(uow_id)
 
         output_ref = _get_output_ref(db_path, uow_id)
         result_data = _read_result_json(output_ref)
@@ -193,7 +193,7 @@ class TestSuccessfulExecution:
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
         executor = Executor(registry)
-        executor.run(uow_id)
+        executor.execute_uow(uow_id)
 
         assert _get_uow_status(db_path, uow_id) == "ready-for-steward"
 
@@ -203,7 +203,7 @@ class TestSuccessfulExecution:
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
         executor = Executor(registry)
-        executor.run(uow_id)
+        executor.execute_uow(uow_id)
 
         status = _get_uow_status(db_path, uow_id)
         assert status != "done", "Executor must never set status to 'done' — that is the Steward's role"
@@ -214,7 +214,7 @@ class TestSuccessfulExecution:
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
         executor = Executor(registry)
-        executor.run(uow_id)
+        executor.execute_uow(uow_id)
 
         events = _get_audit_events(db_path, uow_id)
         assert "execution_complete" in events
@@ -225,7 +225,7 @@ class TestSuccessfulExecution:
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
         executor = Executor(registry)
-        executor.run(uow_id)
+        executor.execute_uow(uow_id)
 
         output_ref = _get_output_ref(db_path, uow_id)
         assert Path(output_ref).is_absolute(), f"output_ref must be absolute: {output_ref!r}"
@@ -236,7 +236,7 @@ class TestSuccessfulExecution:
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
         executor = Executor(registry)
-        executor.run(uow_id)
+        executor.execute_uow(uow_id)
 
         started_at = _get_uow_field(db_path, uow_id, "started_at")
         assert started_at is not None, "started_at must be set at claim time"
@@ -247,7 +247,7 @@ class TestSuccessfulExecution:
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id), estimated_runtime=600)
 
         executor = Executor(registry)
-        executor.run(uow_id)
+        executor.execute_uow(uow_id)
 
         timeout_at = _get_uow_field(db_path, uow_id, "timeout_at")
         assert timeout_at is not None, "timeout_at must be written at claim time"
@@ -258,7 +258,7 @@ class TestSuccessfulExecution:
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
         executor = Executor(registry)
-        executor.run(uow_id)
+        executor.execute_uow(uow_id)
 
         events = _get_audit_events(db_path, uow_id)
         assert "claimed" in events
@@ -280,7 +280,7 @@ class TestFailedExecution:
         executor = Executor(registry, dispatcher=failing_dispatcher)
 
         with pytest.raises(RuntimeError, match="dispatch failed"):
-            executor.run(uow_id)
+            executor.execute_uow(uow_id)
 
         output_ref = _get_output_ref(db_path, uow_id)
         result_data = _read_result_json(output_ref)
@@ -301,7 +301,7 @@ class TestFailedExecution:
         executor = Executor(registry, dispatcher=crashing_dispatcher)
 
         with pytest.raises(ValueError):
-            executor.run(uow_id)
+            executor.execute_uow(uow_id)
 
         output_ref = _get_output_ref(db_path, uow_id)
         result_path = _result_json_path(output_ref)
@@ -320,7 +320,7 @@ class TestFailedExecution:
 
         executor = Executor(registry, dispatcher=failing_dispatcher)
         with pytest.raises(RuntimeError):
-            executor.run(uow_id)
+            executor.execute_uow(uow_id)
 
         status = _get_uow_status(db_path, uow_id)
         assert status == "failed"
@@ -335,7 +335,7 @@ class TestFailedExecution:
 
         executor = Executor(registry, dispatcher=failing_dispatcher)
         with pytest.raises(RuntimeError):
-            executor.run(uow_id)
+            executor.execute_uow(uow_id)
 
         status = _get_uow_status(db_path, uow_id)
         assert status not in {"done", "ready-for-steward"}
@@ -350,7 +350,7 @@ class TestFailedExecution:
 
         executor = Executor(registry, dispatcher=failing_dispatcher)
         with pytest.raises(RuntimeError):
-            executor.run(uow_id)
+            executor.execute_uow(uow_id)
 
         events = _get_audit_events(db_path, uow_id)
         assert "execution_failed" in events
@@ -412,7 +412,7 @@ class TestOptimisticLock:
 
         executor = Executor(registry)
         with pytest.raises(RuntimeError, match="optimistic lock failed"):
-            executor.run(uow_id)
+            executor.execute_uow(uow_id)
 
     def test_rejects_if_status_is_pending(self, registry: Registry, db_path: Path) -> None:
         """Claim must be rejected for 'pending' status."""
@@ -421,13 +421,13 @@ class TestOptimisticLock:
 
         executor = Executor(registry)
         with pytest.raises(RuntimeError, match="optimistic lock failed"):
-            executor.run(uow_id)
+            executor.execute_uow(uow_id)
 
     def test_raises_value_error_for_unknown_uow(self, registry: Registry, db_path: Path) -> None:
         """Running an unknown UoW ID must raise ValueError."""
         executor = Executor(registry)
         with pytest.raises(ValueError, match="not found in registry"):
-            executor.run("nonexistent-uow-id")
+            executor.execute_uow("nonexistent-uow-id")
 
     def test_concurrent_claim_silently_aborts_second(self, registry: Registry, db_path: Path) -> None:
         """Simulate two executors claiming the same UoW: second must be rejected."""
@@ -436,12 +436,12 @@ class TestOptimisticLock:
 
         # First executor claims successfully
         executor1 = Executor(registry)
-        executor1.run(uow_id)  # transitions to ready-for-steward after success
+        executor1.execute_uow(uow_id)  # transitions to ready-for-steward after success
 
         # Now status is 'ready-for-steward', not 'ready-for-executor'
         executor2 = Executor(registry)
         with pytest.raises(RuntimeError, match="optimistic lock failed"):
-            executor2.run(uow_id)
+            executor2.execute_uow(uow_id)
 
     def test_truly_concurrent_claim_exactly_one_succeeds(
         self, registry: Registry, db_path: Path
@@ -463,7 +463,7 @@ class TestOptimisticLock:
         def try_run(executor: Executor) -> None:
             barrier.wait()  # both threads reach this point before either proceeds
             try:
-                executor.run(uow_id)
+                executor.execute_uow(uow_id)
                 results.append("success")
             except RuntimeError as exc:
                 results.append("RuntimeError")
@@ -515,7 +515,7 @@ class TestSkillActivation:
             return "task-xyz"
 
         executor = Executor(registry, skill_activator=tracking_activator, dispatcher=tracking_dispatcher)
-        executor.run(uow_id)
+        executor.execute_uow(uow_id)
 
         assert "systematic-debugging" in activated_skills
         # Skills must be activated before dispatch
@@ -544,7 +544,7 @@ class TestSkillActivation:
             activated_skills.append(skill_id)
 
         executor = Executor(registry, skill_activator=tracking_activator)
-        executor.run(uow_id)
+        executor.execute_uow(uow_id)
 
         assert activated_skills == [], "activate_skill must not be called when prescribed_skills is None"
 
@@ -560,7 +560,7 @@ class TestSkillActivation:
             activated_skills.append(skill_id)
 
         executor = Executor(registry, skill_activator=tracking_activator)
-        executor.run(uow_id)
+        executor.execute_uow(uow_id)
 
         assert activated_skills == [], "activate_skill must not be called for empty prescribed_skills"
 
@@ -577,7 +577,7 @@ class TestSkillActivation:
             activated_skills.append(skill_id)
 
         executor = Executor(registry, skill_activator=tracking_activator)
-        executor.run(uow_id)
+        executor.execute_uow(uow_id)
 
         assert set(activated_skills) == set(skills)
 
@@ -606,7 +606,7 @@ class TestCrashRecoveryProperties:
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
         executor = Executor(registry)
-        executor.run(uow_id)
+        executor.execute_uow(uow_id)
 
         started_at = _get_uow_field(db_path, uow_id, "started_at")
         assert started_at is not None, "started_at must be written atomically with claim"
@@ -621,7 +621,7 @@ class TestCrashRecoveryProperties:
 
         executor = Executor(registry)
         with pytest.raises(RuntimeError, match="claim rejected"):
-            executor.run(uow_id)
+            executor.execute_uow(uow_id)
 
         # Status should be 'failed' after graceful handling
         status = _get_uow_status(db_path, uow_id)
@@ -648,7 +648,7 @@ class TestCrashRecoveryProperties:
 
         try:
             executor = Executor(registry)
-            result = executor.run(uow_id)
+            result = executor.execute_uow(uow_id)
         finally:
             monkeypatch.setattr(_executor_mod, "_OUTPUT_DIR_TEMPLATE", original_template)
 
@@ -879,7 +879,7 @@ class TestDispatchViaInbox:
 
         # No dispatcher injected — should default to _dispatch_via_inbox
         executor = Executor(registry)
-        result = executor.run(uow_id)
+        result = executor.execute_uow(uow_id)
 
         assert result.outcome == ExecutorOutcome.COMPLETE
 
@@ -907,7 +907,7 @@ class TestDispatchViaInbox:
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
         executor = Executor(registry)
-        result = executor.run(uow_id)
+        result = executor.execute_uow(uow_id)
 
         # Read the inbox message to get the message_id
         inbox_files = list(inbox_dir.glob("*.json"))

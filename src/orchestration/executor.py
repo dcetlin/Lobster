@@ -201,7 +201,7 @@ class Executor:
 
     Usage:
         executor = Executor(registry)
-        result = executor.run(uow_id)
+        result = executor.execute_uow(uow_id)
     """
 
     def __init__(
@@ -228,7 +228,7 @@ class Executor:
     # Public API
     # -----------------------------------------------------------------------
 
-    def run(self, uow_id: str) -> ExecutorResult:
+    def execute_uow(self, uow_id: str) -> ExecutorResult:
         """
         Claim and execute a single UoW.
 
@@ -246,7 +246,7 @@ class Executor:
                 # Optimistic lock failed or artifact missing — caller may retry or skip.
                 raise RuntimeError(f"Executor: claim rejected for {uow_id!r} — {reason}")
             case ClaimSucceeded(uow_id=uid, output_ref=output_ref, artifact=artifact):
-                return self._execute(uid, output_ref, artifact)
+                return self._run_step_sequence(uid, output_ref, artifact)
 
     # -----------------------------------------------------------------------
     # Claim sequence (6 steps, single transaction)
@@ -343,7 +343,7 @@ class Executor:
             # Post-claim validation: these are planned stops, not crashes.
             # The atomic claim (steps 2-6) has already committed; output_ref is
             # registered. Each branch below writes result.json before calling
-            # _fail_uow so the Steward can distinguish a planned stop from an
+            # registry.fail_uow so the Steward can distinguish a planned stop from an
             # orphan (executor-contract.md: every intentional exit must produce
             # a result file).
             workflow_artifact_raw = row["workflow_artifact"]
@@ -356,7 +356,7 @@ class Executor:
                     reason=null_reason,
                 )
                 _write_result_json(output_ref, null_result)
-                self._fail_uow(uow_id, null_reason)
+                self.registry.fail_uow(uow_id, null_reason)
                 return ClaimRejected(
                     uow_id=uow_id,
                     reason="workflow_artifact field is NULL or empty",
@@ -373,7 +373,7 @@ class Executor:
                     reason=deser_reason,
                 )
                 _write_result_json(output_ref, deser_result)
-                self._fail_uow(uow_id, deser_reason)
+                self.registry.fail_uow(uow_id, deser_reason)
                 return ClaimRejected(
                     uow_id=uow_id,
                     reason=f"workflow_artifact deserialization failed: {e}",
@@ -394,17 +394,17 @@ class Executor:
     # Execution
     # -----------------------------------------------------------------------
 
-    def _execute(
+    def _run_step_sequence(
         self,
         uow_id: str,
         output_ref: str,
         artifact: WorkflowArtifact,
     ) -> ExecutorResult:
         """
-        Execute a claimed UoW.
+        Execute a claimed UoW through its full step sequence.
 
         On any unhandled exception: write result.json with outcome='failed',
-        transition to 'failed' status, then re-raise.
+        transition to 'failed' status via the Registry, then re-raise.
         """
         try:
             return self._run_execution(uow_id, output_ref, artifact)
@@ -419,7 +419,7 @@ class Executor:
             )
             _write_output_ref_content(output_ref, f"execution failed: {reason}")
             _write_result_json(output_ref, result)
-            self._fail_uow(uow_id, reason)
+            self.registry.fail_uow(uow_id, reason)
             raise
 
     def _run_execution(
@@ -456,70 +456,9 @@ class Executor:
         _write_result_json(output_ref, result)
 
         # Step 6: Transition to ready-for-steward (audit before status update, single transaction)
-        self._complete_uow(uow_id, output_ref)
+        self.registry.complete_uow(uow_id, output_ref)
 
         return result
-
-    # -----------------------------------------------------------------------
-    # Completion transition helpers (audit-before-transition)
-    # -----------------------------------------------------------------------
-
-    def _complete_uow(self, uow_id: str, output_ref: str) -> None:
-        """
-        Transition to 'ready-for-steward'.
-
-        Single transaction: audit INSERT before status UPDATE.
-        Executor NEVER transitions to 'done'.
-        """
-        conn = self._connect()
-        try:
-            now = _now_iso()
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                """
-                INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
-                VALUES (?, ?, 'execution_complete', 'active', 'ready-for-steward', 'executor', ?)
-                """,
-                (now, uow_id, json.dumps({"actor": "executor", "output_ref": output_ref, "timestamp": now})),
-            )
-            conn.execute(
-                "UPDATE uow_registry SET status = 'ready-for-steward', updated_at = ? WHERE id = ?",
-                (now, uow_id),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-    def _fail_uow(self, uow_id: str, reason: str) -> None:
-        """
-        Transition to 'failed'.
-
-        Single transaction: audit INSERT before status UPDATE.
-        """
-        conn = self._connect()
-        try:
-            now = _now_iso()
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                """
-                INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
-                VALUES (?, ?, 'execution_failed', 'active', 'failed', 'executor', ?)
-                """,
-                (now, uow_id, json.dumps({"actor": "executor", "reason": reason, "timestamp": now})),
-            )
-            conn.execute(
-                "UPDATE uow_registry SET status = 'failed', updated_at = ? WHERE id = ?",
-                (now, uow_id),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
     # -----------------------------------------------------------------------
     # Result helpers for callers that need non-complete outcomes
@@ -549,7 +488,7 @@ class Executor:
         )
         _write_output_ref_content(output_ref, f"partial: {reason}")
         _write_result_json(output_ref, result)
-        self._complete_uow(uow_id, output_ref)
+        self.registry.complete_uow(uow_id, output_ref)
         return result
 
     def report_blocked(
@@ -572,7 +511,7 @@ class Executor:
         )
         _write_output_ref_content(output_ref, f"blocked: {reason}")
         _write_result_json(output_ref, result)
-        self._complete_uow(uow_id, output_ref)
+        self.registry.complete_uow(uow_id, output_ref)
         return result
 
     # -----------------------------------------------------------------------

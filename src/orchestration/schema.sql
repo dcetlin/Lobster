@@ -67,6 +67,10 @@ CREATE TABLE IF NOT EXISTS uow_registry (
     --   Executor must never read this. Excluded from executor_uow_view.
     steward_log         TEXT    NULL,
 
+    -- notes: unstructured JSONB scratch space for arbitrary key/value annotations.
+    --   Written via NoteAccessor. Excluded from executor_uow_view.
+    notes               TEXT    NOT NULL DEFAULT '{}',
+
     UNIQUE(source_issue_number, sweep_date)
 );
 -- vision_ref: JSON {layer, field, statement, anchored_at}
