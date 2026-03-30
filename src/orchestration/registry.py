@@ -1028,6 +1028,66 @@ class Registry:
         finally:
             conn.close()
 
+    def complete_uow(self, uow_id: str, output_ref: str) -> None:
+        """
+        Transition a UoW from 'active' to 'ready-for-steward'.
+
+        Single transaction: audit INSERT before status UPDATE
+        (audit-before-transition invariant).
+        The Executor NEVER transitions to 'done' — that authority belongs
+        solely to the Steward.
+        """
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                VALUES (?, ?, 'execution_complete', 'active', 'ready-for-steward', 'executor', ?)
+                """,
+                (now, uow_id, json.dumps({"actor": "executor", "output_ref": output_ref, "timestamp": now})),
+            )
+            conn.execute(
+                "UPDATE uow_registry SET status = 'ready-for-steward', updated_at = ? WHERE id = ?",
+                (now, uow_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def fail_uow(self, uow_id: str, reason: str) -> None:
+        """
+        Transition a UoW from 'active' to 'failed'.
+
+        Single transaction: audit INSERT before status UPDATE
+        (audit-before-transition invariant).
+        """
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                VALUES (?, ?, 'execution_failed', 'active', 'failed', 'executor', ?)
+                """,
+                (now, uow_id, json.dumps({"actor": "executor", "reason": reason, "timestamp": now})),
+            )
+            conn.execute(
+                "UPDATE uow_registry SET status = 'failed', updated_at = ? WHERE id = ?",
+                (now, uow_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def registry_health(self) -> GateStatus:
         """
         Report registry health / autonomy gate status.
@@ -1131,6 +1191,137 @@ def validate_phase2_schema(conn: sqlite3.Connection) -> None:
             f"schema migration not applied — run scripts/migrate_add_steward_fields.py first. "
             f"Missing fields: {missing_sorted}"
         )
+
+
+# ---------------------------------------------------------------------------
+# NoteAccessor — thin wrapper for the notes JSONB column in uow_registry
+# ---------------------------------------------------------------------------
+
+class NoteAccessor:
+    """
+    Thin wrapper for reads/writes to the `notes` JSONB column in uow_registry.
+
+    Enforces the following invariants:
+    - Keys must not contain '.' — nested path writes are not supported.
+    - All writes are atomic UPDATE statements (BEGIN IMMEDIATE transaction).
+    - Uses the Registry's existing connection pattern — no new DB connections.
+
+    Usage:
+        notes = NoteAccessor(registry)
+        notes.set("uow_20260330_abc123", "deploy_tag", "v1.2.3")
+        tag = notes.get("uow_20260330_abc123", "deploy_tag")   # → "v1.2.3"
+        notes.append_log("uow_20260330_abc123", "step 1 complete")
+    """
+
+    def __init__(self, registry: "Registry") -> None:
+        self._registry = registry
+
+    @staticmethod
+    def _validate_key(key: str) -> None:
+        """Reject keys containing '.' — no nested path writes."""
+        if "." in key:
+            raise ValueError(
+                f"NoteAccessor: key {key!r} contains '.' — nested path writes are not supported"
+            )
+
+    def get(self, uow_id: str, key: str) -> Any | None:
+        """
+        Read a specific key from the notes JSON for a UoW.
+
+        Returns the value associated with `key`, or None if:
+        - the UoW does not exist
+        - the notes field is NULL or not valid JSON
+        - the key is absent
+        """
+        self._validate_key(key)
+        conn = self._registry._connect()
+        try:
+            row = conn.execute(
+                "SELECT notes FROM uow_registry WHERE id = ?", (uow_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            raw = row["notes"]
+            if not raw:
+                return None
+            try:
+                data: dict = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                return None
+            return data.get(key)
+        finally:
+            conn.close()
+
+    def set(self, uow_id: str, key: str, value: Any) -> None:
+        """
+        Write or update a single key in the notes JSON for a UoW.
+
+        Uses an atomic JSON_patch UPDATE — reads the current notes, merges
+        the new key, and writes back in a single BEGIN IMMEDIATE transaction.
+        """
+        self._validate_key(key)
+        conn = self._registry._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT notes FROM uow_registry WHERE id = ?", (uow_id,)
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return
+            raw = row["notes"]
+            try:
+                data: dict = json.loads(raw) if raw else {}
+            except (json.JSONDecodeError, TypeError):
+                data = {}
+            data[key] = value
+            conn.execute(
+                "UPDATE uow_registry SET notes = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(data), _now_iso(), uow_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def append_log(self, uow_id: str, entry: str) -> None:
+        """
+        Append a string entry to notes['log'] list.
+
+        Creates the list if it does not exist. Atomic: reads current notes,
+        appends the entry, and writes back in a single BEGIN IMMEDIATE
+        transaction.
+        """
+        conn = self._registry._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT notes FROM uow_registry WHERE id = ?", (uow_id,)
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return
+            raw = row["notes"]
+            try:
+                data: dict = json.loads(raw) if raw else {}
+            except (json.JSONDecodeError, TypeError):
+                data = {}
+            log_entries: list = data.get("log") or []
+            log_entries = list(log_entries)
+            log_entries.append(entry)
+            data["log"] = log_entries
+            conn.execute(
+                "UPDATE uow_registry SET notes = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(data), _now_iso(), uow_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------

@@ -453,3 +453,159 @@ class TestRegistryHealth:
         assert isinstance(readiness, GateStatus)
         assert readiness.gate_met is True
         assert readiness.days_running == 0
+
+
+# ---------------------------------------------------------------------------
+# Item 16: Registry.complete_uow and Registry.fail_uow public API
+# ---------------------------------------------------------------------------
+
+class TestRegistryCompleteUow:
+    def _make_active_uow(self, registry, db_path: Path) -> str:
+        """Helper: create a UoW in 'active' status for transition tests."""
+        from src.orchestration.registry import UpsertInserted
+        result = registry.upsert(issue_number=9001, title="Test active UoW")
+        assert isinstance(result, UpsertInserted)
+        uow_id = result.id
+        registry.approve(uow_id)
+        # Manually advance to 'active' (bypassing executor claim sequence)
+        registry.set_status_direct(uow_id, "active")
+        return uow_id
+
+    def test_complete_uow_transitions_to_ready_for_steward(self, registry, db_path):
+        uow_id = self._make_active_uow(registry, db_path)
+        registry.complete_uow(uow_id, "/tmp/output.json")
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert str(uow.status) == "ready-for-steward"
+
+    def test_complete_uow_writes_audit_entry(self, registry, db_path):
+        uow_id = self._make_active_uow(registry, db_path)
+        registry.complete_uow(uow_id, "/tmp/output.json")
+        conn = _open_db(db_path)
+        row = conn.execute(
+            "SELECT * FROM audit_log WHERE uow_id = ? AND event = 'execution_complete'",
+            (uow_id,),
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row["from_status"] == "active"
+        assert row["to_status"] == "ready-for-steward"
+        assert row["agent"] == "executor"
+
+    def test_fail_uow_transitions_to_failed(self, registry, db_path):
+        uow_id = self._make_active_uow(registry, db_path)
+        registry.fail_uow(uow_id, "test failure reason")
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert str(uow.status) == "failed"
+
+    def test_fail_uow_writes_audit_entry(self, registry, db_path):
+        uow_id = self._make_active_uow(registry, db_path)
+        registry.fail_uow(uow_id, "disk full")
+        conn = _open_db(db_path)
+        row = conn.execute(
+            "SELECT * FROM audit_log WHERE uow_id = ? AND event = 'execution_failed'",
+            (uow_id,),
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row["from_status"] == "active"
+        assert row["to_status"] == "failed"
+        note_data = json.loads(row["note"])
+        assert note_data["reason"] == "disk full"
+
+
+# ---------------------------------------------------------------------------
+# Item 18: NoteAccessor
+# ---------------------------------------------------------------------------
+
+class TestNoteAccessor:
+    def _make_uow_id(self, registry) -> str:
+        from src.orchestration.registry import UpsertInserted
+        result = registry.upsert(issue_number=5555, title="NoteAccessor test UoW")
+        assert isinstance(result, UpsertInserted)
+        return result.id
+
+    def test_get_returns_none_for_missing_key(self, registry):
+        from src.orchestration.registry import NoteAccessor
+        uow_id = self._make_uow_id(registry)
+        notes = NoteAccessor(registry)
+        assert notes.get(uow_id, "nonexistent") is None
+
+    def test_get_returns_none_for_missing_uow(self, registry):
+        from src.orchestration.registry import NoteAccessor
+        notes = NoteAccessor(registry)
+        assert notes.get("uow_does_not_exist", "key") is None
+
+    def test_set_and_get_roundtrip(self, registry):
+        from src.orchestration.registry import NoteAccessor
+        uow_id = self._make_uow_id(registry)
+        notes = NoteAccessor(registry)
+        notes.set(uow_id, "deploy_tag", "v1.2.3")
+        assert notes.get(uow_id, "deploy_tag") == "v1.2.3"
+
+    def test_set_overwrites_existing_key(self, registry):
+        from src.orchestration.registry import NoteAccessor
+        uow_id = self._make_uow_id(registry)
+        notes = NoteAccessor(registry)
+        notes.set(uow_id, "status", "pending")
+        notes.set(uow_id, "status", "done")
+        assert notes.get(uow_id, "status") == "done"
+
+    def test_set_does_not_affect_other_keys(self, registry):
+        from src.orchestration.registry import NoteAccessor
+        uow_id = self._make_uow_id(registry)
+        notes = NoteAccessor(registry)
+        notes.set(uow_id, "key_a", "value_a")
+        notes.set(uow_id, "key_b", "value_b")
+        assert notes.get(uow_id, "key_a") == "value_a"
+        assert notes.get(uow_id, "key_b") == "value_b"
+
+    def test_set_rejects_dotted_key(self, registry):
+        from src.orchestration.registry import NoteAccessor
+        uow_id = self._make_uow_id(registry)
+        notes = NoteAccessor(registry)
+        with pytest.raises(ValueError, match="nested path"):
+            notes.set(uow_id, "parent.child", "value")
+
+    def test_get_rejects_dotted_key(self, registry):
+        from src.orchestration.registry import NoteAccessor
+        uow_id = self._make_uow_id(registry)
+        notes = NoteAccessor(registry)
+        with pytest.raises(ValueError, match="nested path"):
+            notes.get(uow_id, "a.b")
+
+    def test_append_log_creates_list(self, registry):
+        from src.orchestration.registry import NoteAccessor
+        uow_id = self._make_uow_id(registry)
+        notes = NoteAccessor(registry)
+        notes.append_log(uow_id, "step 1 complete")
+        log = notes.get(uow_id, "log")
+        assert log == ["step 1 complete"]
+
+    def test_append_log_accumulates_entries(self, registry):
+        from src.orchestration.registry import NoteAccessor
+        uow_id = self._make_uow_id(registry)
+        notes = NoteAccessor(registry)
+        notes.append_log(uow_id, "entry one")
+        notes.append_log(uow_id, "entry two")
+        notes.append_log(uow_id, "entry three")
+        log = notes.get(uow_id, "log")
+        assert log == ["entry one", "entry two", "entry three"]
+
+    def test_set_stores_non_string_values(self, registry):
+        from src.orchestration.registry import NoteAccessor
+        uow_id = self._make_uow_id(registry)
+        notes = NoteAccessor(registry)
+        notes.set(uow_id, "count", 42)
+        notes.set(uow_id, "flag", True)
+        notes.set(uow_id, "data", {"nested": "dict"})
+        assert notes.get(uow_id, "count") == 42
+        assert notes.get(uow_id, "flag") is True
+        assert notes.get(uow_id, "data") == {"nested": "dict"}
+
+    def test_set_on_missing_uow_is_noop(self, registry):
+        from src.orchestration.registry import NoteAccessor
+        notes = NoteAccessor(registry)
+        # Should not raise — silently no-ops when UoW doesn't exist
+        notes.set("nonexistent_id", "key", "value")
