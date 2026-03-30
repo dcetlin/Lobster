@@ -490,6 +490,46 @@ Steward cycle 2:
 
 **Done condition:** A UoW completes a full Steward/Executor loop — Steward diagnoses (writes `steward_agenda` on first contact), Executor runs (via `executor_uow_view`), Steward re-diagnoses and closes. Audit trail shows all cycle entries. `success_criteria` evaluated at closure. `steward_cycles` incremented correctly.
 
+### Steward↔Executor Contract
+
+This contract governs the completion handshake between the Executor (PR4/#305) and the Steward. It is introduced by the Steward but must be fulfilled by the Executor — every Executor implementation must honor it.
+
+**Executor MUST write a result file at completion**
+
+When execution of a UoW finishes (success or failure), the Executor must write a structured result file before returning the UoW to `ready-for-steward`. The result file path is derived from `output_ref`:
+
+- Primary convention: `{output_ref}.result.json` (replace the extension with `.result.json`)
+- Fallback convention: `{output_ref}.result.json` appended as a suffix (i.e. `{output_ref}.result.json` where output_ref is treated as a full path with no extension replacement)
+
+The Steward's `_assess_completion()` checks both paths, preferring the primary convention.
+
+**Minimum required fields in the result file**
+
+```json
+{
+  "success": true,
+  "uow_id": "<uow_id>"
+}
+```
+
+- `success` (bool, required): `true` if the UoW objective was achieved; `false` if not.
+- `uow_id` (string, required): the UoW ID this result belongs to.
+- `reason` (string, optional): human-readable explanation when `success` is `false`.
+
+Additional fields are permitted and ignored by the Steward.
+
+**What the Steward does with this file**
+
+`_assess_completion()` reads the result file after verifying `output_ref` is valid and the re-entry posture is `execution_complete` or `startup_sweep_possibly_complete`. Behavior:
+
+- `success: true` → Steward declares the UoW done, transitions to `done`.
+- `success: false` → Steward treats the UoW as not complete; prescribes another cycle or surfaces to Dan depending on `steward_cycles` and stuck-condition detection.
+- File absent → Steward treats the UoW as still running / inconclusive; will not declare done if `success_criteria` is present. (Phase 1 / legacy UoWs with no `success_criteria` fall through to a posture-based heuristic.)
+
+**Absence is a contract violation, not a soft condition**
+
+If the result file is absent and the UoW has `success_criteria`, the Steward cannot declare done and will surface to Dan after the hard cap is reached. Executors that skip writing the result file will cause unnecessary human interrupts.
+
 ### Phase 3: Routing Classifier + Hook System + Fan-out
 
 **What to build:** Routing Classifier (#168) — rule engine evaluating `classifier.yaml`, assigning postures, writing `route_reason` to each UoW record. Conditional Hook System — structural hooks (retry logic, loop guards) in system repo; behavioral hooks in user-config. Full diverge/converge execution — decomposition agents create child UoWs, `all_children_done` hook triggers synthesis agent. Visualization: audit log to timeline/tree on request. Observation Loop: META monitoring degradation signals with structured surfacing. Classifier evolution: `route_reason` pattern analysis, first-match to weighted scoring if systematic misrouting detected.

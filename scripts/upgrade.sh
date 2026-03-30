@@ -2424,6 +2424,20 @@ if [ "${has_block_claude_p:-0}" = "0" ] || [ "${has_block_claude_p:-0}" = "" ]; 
         migrated=$((migrated + 1))
     fi
 
+    # Migration 54: Add LOBSTER-STEWARD-HEARTBEAT cron entry (WOS Phase 2, issue #303).
+    # steward-heartbeat.py runs every 3 minutes. It is a direct Python script (not an
+    # LLM-dispatched job) that: (1) scans for orphaned active/ready-for-executor UoWs,
+    # (2) detects stalled active UoWs via timeout_at, and (3) diagnoses and prescribes
+    # for all ready-for-steward UoWs. Requires Phase 2 schema migration to have been
+    # applied first (scripts/migrate_add_steward_fields.py).
+    local STEWARD_MARKER="# LOBSTER-STEWARD-HEARTBEAT"
+    if ! crontab -l 2>/dev/null | grep -q "$STEWARD_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$STEWARD_MARKER" \
+            "*/3 * * * * cd $HOME && uv run $LOBSTER_DIR/scheduled-tasks/steward-heartbeat.py >> $WORKSPACE_DIR/logs/steward-heartbeat.log 2>&1 $STEWARD_MARKER"
+        substep "Added steward heartbeat cron entry (steward-heartbeat.py, every 3 min)"
+        migrated=$((migrated + 1))
+    fi
+
 # Migration 50: Add valence column to memory.db events table.
     # Classifies observations as golden (reinforce), smell (address), or neutral.
     # The Python code handles this via ALTER TABLE on startup for existing DBs,
