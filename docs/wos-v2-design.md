@@ -26,6 +26,8 @@ The v2 model replaces the Phase 1 dispatcher-centric model with a two-actor **St
 
 **Seed** — Unclassified potential. An idea, observation, or open question that may or may not become executable work. Not yet in the UoWRegistry. Seeds can originate from philosophy sessions, Telegram observations, direct feature requests, or any source.
 
+**Seed spec and `success_criteria`:** A Seed that resolves to executable work becomes a GitHub issue. That issue body functions as the immutable Seed spec for the duration of the UoW's lifecycle. The `success_criteria` field (required, TEXT, prose) is the Seed's anchor: a human-readable statement of what completion looks like. It is written at germination time and does not change. The Steward evaluates `steward_agenda` against `success_criteria` at every re-entry — this is the mechanism that prevents both premature termination (declaring done before `success_criteria` is satisfied) and endless refinement (continuing past the point where `success_criteria` is satisfied). A Seed without `success_criteria` is invalid and is rejected at germination time. The field is prose, not a checklist: "implementation-ready spec for all 7 sub-issues" is sufficient. The Steward's judgment evaluates the current `output_ref` against this prose anchor; the anchor gives that judgment something principled to push against. Without it, termination behavior is inconsistent across UoW types.
+
 **Pearl** — A philosophy session output that is a distillation rather than an action item. Pearls route to the write-path (frontier docs, bootup candidates) via the Cultivator. They do not enter the UoWRegistry. Pearl outputs circulate via re-encounter rather than via a separate execution pipeline.
 
 **Germination** — The classification event at which a seed's output type is resolved (pearl or executable work). For seeds that resolve to executable work, germination produces a GitHub issue.
@@ -144,12 +146,29 @@ Each UoW entry in the UoWRegistry has the following fields. Fields are written a
 | `output_file` | `TEXT` \| `NULL` | Executor claim | Written by the Executor when it claims the UoW. Full path to the Executor's output artifact. Enables crash recovery: if the Executor crashes, `output_file` is the last known artifact. The startup sweep checks `output_file` existence to classify stale-active records as potentially-complete vs. crashed. |
 | `workflow_artifact` | `TEXT` \| `NULL` | Steward prescription | Path to the workflow artifact written by the Steward. |
 | `prescribed_skills` | `TEXT` (JSON array) \| `NULL` | Steward prescription | Skill IDs to be loaded by the Executor at task start. |
-| `steward_cycles` | `INTEGER` | Steward re-entry | Count of Steward diagnosis/prescription cycles completed on this UoW. |
+| `success_criteria` | `TEXT NOT NULL` | creation (germination) | Required. Prose description of what completion looks like for this UoW. Written at germination time; immutable thereafter. The Steward evaluates `steward_agenda` against this field at every re-entry — it is the anchor that prevents premature termination and endless refinement. A UoW without `success_criteria` is invalid and is rejected at germination time. |
+| `steward_cycles` | `INTEGER NOT NULL DEFAULT 0` | Steward re-entry | Count of Steward diagnosis/prescription cycles completed on this UoW. Surface condition 3 (hard cap) fires at 5. |
+| `steward_agenda` | `TEXT NULL` (JSON) | Steward only | Oracle-style forward forecast written by the Steward at first contact (`steward_cycles == 0`). List/tree of anticipated prescription nodes, each: `{posture, context, constraints, status: pending\|prescribed\|complete}`. Updated on each re-entry as new information arrives. **Steward-private — never read by the Executor.** |
+| `steward_log` | `TEXT NULL` | Steward only | Append-only newline-delimited JSON log of every Steward decision point — diagnosis rationale, prescription decisions, surface-to-Dan trigger fires, agenda updates. Steward-to-future-self. **Steward-private — never read by the Executor.** |
 | `audit_log` | JSON array \| external table | every event | Ordered audit entries. Each entry: `{event, actor, timestamp, note}`. Every state transition is appended here before the transition is considered complete. |
 | `route_reason` | `TEXT` \| `NULL` | Classifier | Human-readable rationale for the posture assigned by the Routing Classifier. |
 | `hooks_applied` | `TEXT` (JSON array) \| `NULL` | hook execution | Hook IDs that fired on this UoW. |
 | `closed_at` | `TEXT` (ISO-8601) \| `NULL` | Steward closure | When the Steward declared `done`. |
 | `parent_id` | `TEXT` \| `NULL` | creation | Parent UoW ID for sub-UoWs spawned by spec-breakdown. `NULL` for root UoWs. |
+
+**IMPORTANT — Field naming:** The schema table above uses conceptual names. The actual SQLite schema uses different names. **All Phase 2 code must use the actual schema names:**
+
+| Design doc name | Actual schema name | Notes |
+|----------------|-------------------|-------|
+| `issue_id` | `source_issue_number` | Stores integer issue number, not qualified string |
+| `title` | `summary` | Already accurate |
+| `claimed_at` | `started_at` | Same semantic role |
+| `output_file` | `output_ref` | Live production data uses `output_ref` |
+| `closed_at` | `completed_at` | Same pattern |
+
+These are kept as-is to avoid breaking migrations. The design doc preserves conceptual names for readability; the actual schema is authoritative. See #309 for the full field mapping and migration spec.
+
+**Column visibility contract:** Every new column added to `uow_registry` must declare its executor visibility at add time. Two options: (1) **Executor-accessible** — include in `executor_uow_view`; (2) **Steward-private or system-only** — explicitly exclude from `executor_uow_view` with a comment in the migration explaining why. `steward_agenda` and `steward_log` are excluded. All other fields listed above are Executor-accessible via the view. This is a standing convention that applies to all future columns.
 
 ---
 
@@ -213,14 +232,24 @@ for each UoW where status == "active":
 
 ### Steward Heartbeat
 
-Runs on a cron heartbeat (initially ~3 minutes). Queries for UoWs in `ready-for-steward` state. For each, the Steward:
+Runs on a cron heartbeat (initially ~3 minutes). On each invocation, executes three functions in order: (1) startup sweep (crash recovery), (2) Observation Loop (stall detection), (3) Steward main loop (diagnose and prescribe for all `ready-for-steward` UoWs).
 
-1. **Diagnoses** — reads the UoW trail (original intent, prior prescriptions, execution logs, current UoWRegistry state, Vision Object context). Writes the diagnosis to the audit trail before prescribing. **Diagnosis inputs:** `{uow_record, audit_log, output_file contents if exists, steward_cycles count, Dan's current register from context}`. **Diagnosis output:** a written assessment logged to `audit_log` before any prescription is written.
-2. **Prescribes** — selects a workflow primitive with a written rationale. Writes the prescription (named workflow + artifact path) to the audit trail. Transitions UoW to `ready-for-executor`. **Prescription output written to UoW record:** `{workflow_artifact: <path>, prescribed_skills: [...], route_reason: <rationale>}`.
-3. **Evaluates** (on re-entry after execution) — reads execution results (from `output_file` and `audit_log`), re-diagnoses fresh, decides: loop again or declare closure. Increments `steward_cycles`.
-4. **Closes** — writes a closing diagnosis when convergence conditions are met. Transitions to `done`. Sets `closed_at`.
+For each `ready-for-steward` UoW, the Steward:
 
-The Steward surfaces to Dan under three conditions: (1) something is severely wrong and outside confident operating range; (2) Dan's perspective would materially change the prescription; (3) the Steward has prescribed the same primitive twice with no new input in the audit trail (convergence-velocity proxy for orientation distortion — the Steward cannot reliably detect its own distortion from inside it, so this is measured externally).
+1. **Diagnoses** — reads the UoW trail (original intent, prior prescriptions, execution logs, current UoWRegistry state, Vision Object context). Writes the diagnosis to the audit trail before prescribing. **Diagnosis inputs:** `{uow_record, audit_log, output_ref contents if exists, steward_cycles count, steward_agenda, steward_log, Dan's current register from context}`. **Diagnosis output:** a written assessment logged to `audit_log` before any prescription is written.
+2. **Prescribes** — selects a workflow primitive with a written rationale. Writes the prescription (named workflow + artifact path) to the audit trail. Transitions UoW to `ready-for-executor`. **Prescription output written to UoW record:** `{workflow_artifact: <path>, prescribed_skills: [...], route_reason: <rationale>, steward_agenda: <updated>, steward_log: <appended>}`.
+3. **Evaluates** (on re-entry after execution) — reads execution results (from `output_ref` and `audit_log`), re-diagnoses fresh, decides: loop again or declare closure. Increments `steward_cycles`.
+4. **Closes** — writes a closing diagnosis when convergence conditions are met. Transitions to `done`. Sets `completed_at`.
+
+**Initialization ritual:** On first contact with a new UoW (`steward_cycles == 0` at the start of a diagnosis pass), the Steward's first act is to write an initial `steward_agenda` before any prescription decision is made. Forecast depth is calibrated by the Steward: well-defined UoWs (concrete deliverable, clear scope) get a full agenda upfront; open-ended UoWs (exploratory, ill-defined scope) get 1-2 steps with a `"pending evaluation"` marker for the remainder. The agenda is a structured forecast, not a contract.
+
+**Re-entry decision protocol (summary):** On every Executor return, the Steward reads all inputs (Seed, `steward_agenda`, `steward_log`, Executor's structured return, `output_ref` contents, `steward_cycles`) before writing anything. Decision sequence: (1) parse the `return_reason` and classify (Normal / Blocked / Abnormal / Error / Orphan); (2) assess completion against the Seed and `success_criteria` — this is the primary gate, not `return_reason` alone; (3a) if complete: write closure, mark agenda nodes, set `completed_at`, transition to `done`; (3b) if incomplete: update `steward_agenda`, write next prescription, append `steward_log` entry, transition to `ready-for-executor`. Full re-entry spec lives in #303.
+
+The Steward surfaces to Dan under three conditions: (1) something is severely wrong and outside confident operating range; (2) Dan's perspective would materially change the prescription; (3) `steward_cycles >= 5` — hard cap, surface unconditionally. (The prior surface condition 3 was "same primitive twice, no new input." The hard cap at 5 replaces this as the convergence-velocity proxy — it is externally measurable without requiring the Steward to classify its own state.)
+
+**Executor isolation (`executor_uow_view`):** The Executor MUST query `executor_uow_view`, never the `uow_registry` table directly. This is a Phase 2 requirement. The view excludes `steward_agenda` and `steward_log` — the Executor cannot read steward-private fields at the DB layer, with no application enforcement needed. All Executor SQL must target the view.
+
+**Observability:** Structured logging is required at every Steward decision point. Key metrics: `steward_cycles` distribution, agenda completion rate (nodes marked `complete` / nodes total at closure), `return_reason` distribution across all UoWs. These signals indicate whether the Steward is converging efficiently or looping without progress.
 
 **Prescribed skills**: Steward diagnosis MAY include a `prescribed_skills` field — a list of skill IDs to be loaded by the executor at task start. This keeps methodology context out of the always-loaded context and activates it situationally. Examples:
 - A bug-fix UoW → prescribe `systematic-debugging` (4-phase root-cause process)
@@ -235,13 +264,17 @@ The Steward's diagnostic function has a developmental dimension distinct from th
 
 Picks up UoWs in `ready-for-executor` state. Carries out the prescribed workflow as specified in the workflow artifact. Writes execution results to an output artifact. Transitions the UoW back to `ready-for-steward` with the execution log. The Executor does not diagnose or decide — it executes and reports.
 
-**Executor claim sequence (atomic):**
-1. Transition UoW status from `ready-for-executor` to `active`.
-2. Write `claimed_at = NOW()` to UoW record.
-3. Write `output_file = <path to output artifact>` to UoW record. This is the ground-truth re-entry point: if the Executor crashes mid-execution, `output_file` is the last known artifact and the startup sweep uses it to classify the record.
-4. Compute and write `timeout_at = claimed_at + estimated_runtime` (or default 30 min if `estimated_runtime` is NULL).
-5. Append `{event: "claimed", actor: "executor", claimed_at, output_file, timeout_at}` to audit_log.
-6. Begin executing the prescribed workflow.
+**Executor claim sequence (atomic, 6 steps — steps 2-6 in a single SQLite transaction):**
+1. Read UoW — verify `status == 'ready-for-executor'`.
+2. `UPDATE uow_registry SET status='active' WHERE id=? AND status='ready-for-executor'` — check rows affected; if 0, another Executor claimed first, abort.
+3. Write `started_at = NOW()` to UoW record. (Actual schema field name; design doc called this `claimed_at`.)
+4. Write `output_ref = <absolute path to output artifact>` to UoW record. This is the ground-truth re-entry point: if the Executor crashes mid-execution, `output_ref` is the last known artifact path and the startup sweep uses it to classify the record. (Actual schema field name; design doc called this `output_file`.)
+5. Compute and write `timeout_at = started_at + estimated_runtime` (or default 1800s if `estimated_runtime` is NULL).
+6. Append `{event: "claimed", actor: "executor", started_at, output_ref, timeout_at}` to audit_log. This INSERT is in the same transaction as steps 2-5.
+
+Begin executing the prescribed workflow only after the transaction commits.
+
+> **Atomicity lineage:** This claim sequence inherits the same atomic-claim pattern that Lobster's inbox uses to prevent concurrent double-processing. In Lobster's inbox, a message is claimed via an atomic filesystem move (`inbox/` → `processing/`); no two agents can claim the same file because the move is atomic at the OS level. WOS uses the equivalent mechanism at the database layer: the status transition from `ready-for-executor` to `active` is executed inside a SQLite transaction with optimistic locking — if two Executors race, only one wins the transition. The recovery equivalence also holds: Lobster's `processing/` sweep on startup (finding abandoned in-flight messages) maps directly to WOS's startup sweep over stale `active` records. Same pattern, different substrate.
 
 The Steward/Executor loop continues until the Steward declares convergence:
 
@@ -253,7 +286,7 @@ Steward → Executor → Steward → Executor → ... → Steward declares done
 
 META monitors the UoWRegistry and audit log for degradation signals: dark pipeline (no audit entries for >3 days), orphaned active records, ready-queue growth without drain, stale count accumulation, issue-open rate exceeding close rate for >2 consecutive weeks. When a signal fires, META surfaces it to Dan with evidence, not guesswork.
 
-**Stall detection:** On each Observation Loop pass, for every UoW where `status = 'active'` and `timeout_at IS NOT NULL`: if `NOW() > timeout_at`, the record is a stall candidate. Surface to Steward: `{uow_id, claimed_at, timeout_at, output_file, elapsed}`. The Steward classifies and decides — the Observation Loop only detects and surfaces, never acts unilaterally.
+**Stall detection (MVP scope — Phase 2):** On each Observation Loop pass, for every UoW where `status = 'active'`: if `NOW() >= timeout_at` (or `started_at + 1800s` if `timeout_at` is NULL), the record is a stall candidate. Write audit entry `{event: "stall_detected", actor: "observation_loop", uow_id, started_at, timeout_at, output_ref, elapsed_seconds}` then transition to `ready-for-steward` via optimistic lock. The Steward classifies and decides — the Observation Loop only detects and surfaces, never acts unilaterally. Does NOT send Telegram messages directly. Phase 3 scope adds: dark pipeline detection, ready-queue growth signals, issue-open rate trend monitoring.
 
 ### Crash Recovery and Idempotency
 
@@ -263,22 +296,32 @@ These four properties are required for the system to be safe to operate continuo
 
 Every UoW in `active` state has a `timeout_at` timestamp computed at claim time. `estimated_runtime` (optional, set at proposal time or by the Steward) drives the computation; the default is 1800 seconds (30 min). The Observation Loop checks `timeout_at` on each pass. A UoW that exceeds `timeout_at` without transitioning is a silent stall — it is surfaced to the Steward for classification (crashed vs. slow vs. legitimate blocking condition). This prevents `active` records from disappearing into silence.
 
-**2. Executor writes output_file at claim time**
+**2. Executor writes `output_ref` at claim time**
 
-When an Executor claims a UoW, it writes the `output_file` path to the UoW record before beginning execution. This is not optional. The `output_file` field is the last known artifact pointer: if the Executor crashes mid-execution, the UoW record contains the path to whatever was written before the crash. The startup sweep (below) uses `output_file` to distinguish completed-before-crash from nothing-written.
+When an Executor claims a UoW, it writes the `output_ref` path to the UoW record before beginning execution. This is not optional. The `output_ref` field is the last known artifact pointer: if the Executor crashes mid-execution, the UoW record contains the path to whatever was written before the crash. The startup sweep (below) uses `output_ref` to distinguish completed-before-crash from nothing-written. (Actual schema field name; design doc originally called this `output_file`.)
 
-**3. Steward startup sweep for orphaned-active UoWs**
+**3. Steward startup sweep for orphaned UoWs**
 
-At Steward startup (and on a periodic sweep, frequency: configurable, default: every 15 minutes), scan UoWRegistry for UoWs where `status = 'active'`. For each:
+Runs on every `steward-heartbeat.py` invocation (every 3 minutes), not only at process startup. Scans UoWRegistry for two classes of orphaned UoWs:
+
+Class 1 — `active` UoWs (Executors that may have crashed mid-execution):
 ```
-if output_file IS NOT NULL and os.path.exists(output_file):
-    surface to Steward as "potentially complete" — Executor may have finished before crash.
-    Steward reviews output_file, decides: accept as complete or re-queue.
-else:
-    surface to Steward as "crashed with no output" — nothing was written.
-    Steward decides: re-queue (transition back to ready-for-executor) or escalate to Dan.
+if output_ref IS NOT NULL and os.path.exists(output_ref) and file is non-empty:
+    classification = 'possibly_complete' — Executor may have finished before crash.
+elif output_ref IS NOT NULL and file exists but is 0 bytes:
+    classification = 'crashed_zero_bytes'
+elif output_ref IS NOT NULL and file does not exist:
+    classification = 'crashed_output_ref_missing'
+else (output_ref IS NULL):
+    classification = 'crashed_no_output_ref'
 ```
-This is the crash recovery path. The sweep does not act unilaterally — it classifies and presents. The Steward makes the decision and writes it to the audit log.
+
+Class 2 — `ready-for-executor` UoWs older than 1 hour (Executors that crashed before step 1 of the claim sequence, before ever transitioning to `active`):
+```
+    classification = 'executor_orphan'
+```
+
+For each: write `{event: "startup_sweep", classification: <value>}` to audit_log, then transition to `ready-for-steward` via optimistic lock. The sweep does not act unilaterally — it classifies and presents. The Steward makes the decision and writes it to the audit log.
 
 **4. Idempotent proposal creation keyed on issue_id**
 
@@ -415,15 +458,26 @@ Steward cycle 2:
 
 **Phase 2 build can begin.**
 
-**What to build:** Steward agent (cron heartbeat, diagnose/prescribe/evaluate/close loop), Executor agent (picks up `ready-for-executor` UoWs, runs prescribed workflow, returns results). UoWRegistry extended with Steward-cycle audit fields. Routing Classifier added: rule engine evaluating `classifier.yaml`, assigning postures, writing `route_reason`. Conditional Hook System wired. Cultivator wired to file seeds from philosophy sessions programmatically (Phase 2 trigger design).
+**What to build:** Seven PRs in sequence (see #301 umbrella):
+- PR0 (#309): schema migration — add all Phase 2 fields (`workflow_artifact`, `prescribed_skills`, `steward_cycles`, `timeout_at`, `estimated_runtime`, `steward_agenda`, `steward_log`) + `executor_uow_view`
+- PR1 (#302): WorkflowArtifact struct (`src/orchestration/workflow_artifact.py`) with `to_json()` / `from_json()`
+- PR2 (#303): Steward heartbeat script (`scheduled-tasks/steward-heartbeat.py`) — diagnose/prescribe/re-entry loop
+- PR3 (#304): `evaluate_condition(uow)` callable + Registrar sweep wiring (`pending → ready-for-steward`)
+- PR4 (#305): Executor MVP — 6-step atomic claim, execute via LLM dispatch, write `output_ref`, return to Steward
+- PR5 (#306): Observation Loop — stall detection for `active` UoWs within steward heartbeat
+- PR6 (#307): Startup sweep (crash recovery) — classify orphaned `active` and `ready-for-executor` UoWs
 
-**Done condition:** A UoW completes a full Steward/Executor loop — Steward diagnoses, Executor runs, Steward re-diagnoses and closes. Audit trail shows all cycle entries. Classifier assigns posture and writes `route_reason`. At least one hook fires and appears in `hooks_applied`.
+**Note on Routing Classifier, Hook System, and Cultivator:** These are NOT Phase 2 deliverables. The Routing Classifier and Conditional Hook System are defined in issue #168 and are Phase 3 scope. The `route_reason` field exists in the schema and the Steward writes it as free text in Phase 2; the Routing Classifier that parses and assigns postures systematically is Phase 3. The Cultivator (philosophy pipeline classification agent) is aspirational and not in any current phase scope.
 
-### Phase 3: Routing Classifier + Observation Loop
+**Out of scope for Phase 2:** Multi-executor fan-out from a single Steward prescription (filed as #314 for Phase 3+). The Phase 2 design must not foreclose fan-out — the `executor_type` field in WorkflowArtifact and the `parent_id` field in the registry are the designed seams. Phase 2 delivers single-Executor-per-prescription only.
 
-**What to build:** Full diverge/converge execution — decomposition agents create child UoWs, `all_children_done` hook triggers synthesis agent. Visualization: audit log to timeline/tree on request. Observation Loop: META monitoring degradation signals with structured surfacing. Classifier evolution: `route_reason` pattern analysis, first-match to weighted scoring if systematic misrouting detected.
+**Done condition:** A UoW completes a full Steward/Executor loop — Steward diagnoses (writes `steward_agenda` on first contact), Executor runs (via `executor_uow_view`), Steward re-diagnoses and closes. Audit trail shows all cycle entries. `success_criteria` evaluated at closure. `steward_cycles` incremented correctly.
 
-**Done condition:** A fan-out UoW completes its full cycle — root created, children created, all children done, synthesis fires, root transitions to `done`. Parent/children traversal works. Dan can ask "show me the tree for [UoW]" and get a readable summary.
+### Phase 3: Routing Classifier + Hook System + Fan-out
+
+**What to build:** Routing Classifier (#168) — rule engine evaluating `classifier.yaml`, assigning postures, writing `route_reason` to each UoW record. Conditional Hook System — structural hooks (retry logic, loop guards) in system repo; behavioral hooks in user-config. Full diverge/converge execution — decomposition agents create child UoWs, `all_children_done` hook triggers synthesis agent. Visualization: audit log to timeline/tree on request. Observation Loop: META monitoring degradation signals with structured surfacing. Classifier evolution: `route_reason` pattern analysis, first-match to weighted scoring if systematic misrouting detected.
+
+**Done condition:** A new UoW arrives, Classifier assigns posture, `route_reason` in Registry reflects which rule fired. At least one hook fires and appears in `hooks_applied`. A fan-out UoW completes its full cycle — root created, children created, all children done, synthesis fires, root transitions to `done`. Parent/children traversal works. Dan can ask "show me the tree for [UoW]" and get a readable summary.
 
 ### Phase 4: Dan Interrupt + Multi-Perspective Chains
 
