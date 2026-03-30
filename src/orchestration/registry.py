@@ -45,7 +45,9 @@ class UoWStatus(StrEnum):
     PROPOSED = "proposed"
     PENDING = "pending"
     READY_FOR_STEWARD = "ready-for-steward"
+    READY_FOR_EXECUTOR = "ready-for-executor"
     ACTIVE = "active"
+    DIAGNOSING = "diagnosing"
     BLOCKED = "blocked"
     DONE = "done"
     FAILED = "failed"
@@ -56,8 +58,14 @@ class UoWStatus(StrEnum):
         return self in {UoWStatus.DONE, UoWStatus.FAILED, UoWStatus.EXPIRED}
 
     def is_in_flight(self) -> bool:
-        """True for statuses that block re-proposal (active, pending, ready-for-steward)."""
-        return self in {UoWStatus.ACTIVE, UoWStatus.PENDING, UoWStatus.READY_FOR_STEWARD}
+        """True for statuses that block re-proposal (active, pending, ready-for-steward, ready-for-executor, diagnosing)."""
+        return self in {
+            UoWStatus.ACTIVE,
+            UoWStatus.PENDING,
+            UoWStatus.READY_FOR_STEWARD,
+            UoWStatus.READY_FOR_EXECUTOR,
+            UoWStatus.DIAGNOSING,
+        }
 
 
 # ---------------------------------------------------------------------------
