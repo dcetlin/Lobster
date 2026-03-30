@@ -15,11 +15,14 @@ Design principles:
 """
 
 import json
+import logging
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Re-export atomic filesystem helpers from the canonical location.
@@ -153,6 +156,9 @@ def audit_log(
         duration_ms: How long the call took.
     """
     if _AUDIT_LOG_PATH is None:
+        log.warning(
+            "audit_log called before init_audit_log() — dropping event: tool=%s", tool
+        )
         return  # Not initialized yet
 
     entry = {

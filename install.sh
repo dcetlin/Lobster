@@ -343,7 +343,10 @@ if [ "$CONTAINER_SETUP" = true ]; then
     # triggering a restart loop before Claude has had time to initialize.
     state_file="$MESSAGES_DIR/config/lobster-state.json"
     if [ ! -f "$state_file" ]; then
-        echo '{"mode": "active", "booted_at": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' > "$state_file"
+        # Write atomically via tmp+rename to prevent a truncated file on interrupt (#924)
+        _state_tmp="${state_file}.tmp.$$"
+        printf '{"mode": "active", "booted_at": "%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$_state_tmp"
+        mv "$_state_tmp" "$state_file"
         info "  Seeded lobster-state.json with initial booted_at timestamp"
     fi
     success "Directories created"
@@ -491,6 +494,20 @@ if [ "$(id -u)" = "0" ]; then
     else
         # Docker not installed — this is the normal case on a fresh machine, not a warning
         info "Docker not installed — skipping docker group setup. Install Docker later to enable Docker features."
+    fi
+    # Add lobster user to the crontab group so sync-crontab.sh works under NoNewPrivs.
+    # Claude Code sets PR_SET_NO_NEW_PRIVS on the MCP server process, which propagates to
+    # child processes and suppresses setgid bits. The `crontab` binary is setgid-crontab —
+    # that privilege is what lets it write to /var/spool/cron/crontabs/. Without it,
+    # `crontab -` fails with "mkstemp: Permission denied". Group membership lets the
+    # lobster user write directly to /var/spool/cron/crontabs/ (group-writable) without
+    # needing the setgid bit.
+    if getent group crontab &>/dev/null; then
+        usermod -aG crontab lobster
+        success "Added 'lobster' to the crontab group (fixes NoNewPrivs crontab permission error)."
+        warn "Group membership takes effect at next login. Run 'newgrp crontab' or restart after install to apply."
+    else
+        warn "The 'crontab' group does not exist — scheduled job syncing may fail. Run: sudo groupadd crontab && sudo usermod -aG crontab lobster"
     fi
     # Copy script to /tmp so lobster user can read it regardless of working directory
     INSTALL_SCRIPT="$(readlink -f "$0")"
@@ -1074,7 +1091,10 @@ rm -f "$MESSAGES_DIR/config/agents.db" "$WORKSPACE_DIR/data/agents.db"
 # triggering a restart loop before Claude has had time to initialize.
 STATE_FILE="$MESSAGES_DIR/config/lobster-state.json"
 if [ ! -f "$STATE_FILE" ]; then
-    echo '{"mode": "active", "booted_at": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' > "$STATE_FILE"
+    # Write atomically via tmp+rename to prevent a truncated file on interrupt (#924)
+    _STATE_TMP="${STATE_FILE}.tmp.$$"
+    printf '{"mode": "active", "booted_at": "%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$_STATE_TMP"
+    mv "$_STATE_TMP" "$STATE_FILE"
     info "  Seeded lobster-state.json with initial booted_at timestamp"
 fi
 
@@ -1126,6 +1146,32 @@ for stub_file in "user.base.bootup.md" "user.base.context.md" "user.dispatcher.b
         info "  Created stub: agents/$stub_file"
     fi
 done
+
+# Seed skill configuration templates (only files that don't already exist)
+# Skills can have .env.template files in their config/ directory
+for skill_dir in "$INSTALL_DIR"/lobster-shop/*/; do
+    [ -d "$skill_dir" ] || continue
+    skill_name=$(basename "$skill_dir")
+    config_template="$skill_dir/config/${skill_name}.env.template"
+    if [ -f "$config_template" ]; then
+        # Handle special cases: obsidian-km → obsidian.env
+        env_name="${skill_name%.env.template}"
+        env_name="${env_name/-km/}"  # obsidian-km → obsidian
+        dest_file="$CONFIG_DIR/${env_name}.env"
+        if [ ! -f "$dest_file" ]; then
+            cp "$config_template" "$dest_file"
+            info "  Seeded skill config: ${env_name}.env"
+        fi
+    fi
+done
+
+# Also handle obsidian.env.template specifically (named differently from skill)
+OBSIDIAN_TEMPLATE="$INSTALL_DIR/lobster-shop/obsidian-km/config/obsidian.env.template"
+OBSIDIAN_DEST="$CONFIG_DIR/obsidian.env"
+if [ -f "$OBSIDIAN_TEMPLATE" ] && [ ! -f "$OBSIDIAN_DEST" ]; then
+    cp "$OBSIDIAN_TEMPLATE" "$OBSIDIAN_DEST"
+    info "  Seeded skill config: obsidian.env"
+fi
 
 success "Directories created"
 info "  $PROJECTS_DIR - All Lobster-managed projects"
@@ -1202,187 +1248,8 @@ if [ ! -f "$JOBS_FILE" ]; then
     echo '{"jobs": {}}' > "$JOBS_FILE"
 fi
 
-# Create run-job.sh
-cat > "$INSTALL_DIR/scheduled-tasks/run-job.sh" << 'RUNJOB'
-#!/bin/bash
-# Lobster Scheduled Task Executor
-# Runs a scheduled job in a fresh Claude instance
-
-set -e
-
-# Ensure Claude is in PATH (cron doesn't inherit user PATH)
-export PATH="$HOME/.local/bin:$PATH"
-
-# Prevent "cannot launch inside another Claude Code session" error.
-# CLAUDECODE leaks when run-job.sh is manually tested from a Claude session.
-unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT 2>/dev/null || true
-
-JOB_NAME="$1"
-
-if [ -z "$JOB_NAME" ]; then
-    echo "Usage: $0 <job-name>"
-    exit 1
-fi
-
-REPO_DIR="${LOBSTER_INSTALL_DIR:-$HOME/lobster}"
-WORKSPACE="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}"
-TASK_FILE="$WORKSPACE/scheduled-jobs/tasks/${JOB_NAME}.md"
-OUTPUT_DIR="$HOME/messages/task-outputs"
-LOG_DIR="$WORKSPACE/scheduled-jobs/logs"
-TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-JOBS_FILE="$WORKSPACE/scheduled-jobs/jobs.json"
-
-mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
-
-if [ ! -f "$TASK_FILE" ]; then
-    echo "Error: Task file not found: $TASK_FILE"
-    exit 1
-fi
-
-TASK_CONTENT=$(cat "$TASK_FILE")
-LOG_FILE="$LOG_DIR/${JOB_NAME}-${TIMESTAMP}.log"
-
-START_TIME=$(date +%s)
-START_ISO=$(date -Iseconds)
-
-echo "[$START_ISO] Starting job: $JOB_NAME" | tee "$LOG_FILE"
-
-claude -p "$TASK_CONTENT
-
----
-
-IMPORTANT: You are running as a scheduled task. When you complete your task:
-1. Call write_task_output() with your results summary
-2. Keep output concise - the main Lobster instance will review this later
-3. Exit after writing output - do not start a loop" \
-    --dangerously-skip-permissions \
-    --max-turns 15 \
-    2>&1 | tee -a "$LOG_FILE"
-
-EXIT_CODE=$?
-
-END_TIME=$(date +%s)
-END_ISO=$(date -Iseconds)
-DURATION=$((END_TIME - START_TIME))
-
-echo "" | tee -a "$LOG_FILE"
-echo "[$END_ISO] Job completed in ${DURATION}s with exit code: $EXIT_CODE" | tee -a "$LOG_FILE"
-
-if [ -f "$JOBS_FILE" ]; then
-    # Use jq if available, otherwise use Python
-    if command -v jq &> /dev/null; then
-        STATUS="success"
-        [ $EXIT_CODE -ne 0 ] && STATUS="failed"
-
-        TMP_FILE=$(mktemp)
-        jq --arg name "$JOB_NAME" \
-           --arg last_run "$END_ISO" \
-           --arg status "$STATUS" \
-           '.jobs[$name].last_run = $last_run | .jobs[$name].last_status = $status' \
-           "$JOBS_FILE" > "$TMP_FILE" && mv "$TMP_FILE" "$JOBS_FILE"
-    else
-        python3 -c "
-import json
-import sys
-with open('$JOBS_FILE', 'r') as f:
-    data = json.load(f)
-if '$JOB_NAME' in data.get('jobs', {}):
-    data['jobs']['$JOB_NAME']['last_run'] = '$END_ISO'
-    data['jobs']['$JOB_NAME']['last_status'] = 'success' if $EXIT_CODE == 0 else 'failed'
-    with open('$JOBS_FILE', 'w') as f:
-        json.dump(data, f, indent=2)
-"
-    fi
-fi
-
-# Post a reminder to the dispatcher inbox so it learns the job completed
-POST_REMINDER="$REPO_DIR/scheduled-tasks/post-reminder.sh"
-if [ -f "$POST_REMINDER" ]; then
-    bash "$POST_REMINDER" "$JOB_NAME" "$EXIT_CODE" "$DURATION" 2>&1 | tee -a "$LOG_FILE" || true
-fi
-
-exit $EXIT_CODE
-RUNJOB
-chmod +x "$INSTALL_DIR/scheduled-tasks/run-job.sh" || true
-
-# Create post-reminder.sh
-cat > "$INSTALL_DIR/scheduled-tasks/post-reminder.sh" << 'POSTREMINDER'
-#!/bin/bash
-# Cron Job Post-Reminder
-# Called by run-job.sh after each scheduled job. Writes a cron_reminder message
-# to the Lobster inbox so the dispatcher is notified that output is available.
-#
-# Usage: post-reminder.sh <job-name> <exit-code> <duration-seconds>
-
-set -e
-
-JOB_NAME="$1"
-EXIT_CODE="${2:-0}"
-DURATION_SECONDS="${3:-0}"
-
-if [ -z "$JOB_NAME" ]; then
-    echo "Usage: $0 <job-name> <exit-code> <duration-seconds>"
-    exit 1
-fi
-
-INBOX_DIR="${LOBSTER_MESSAGES:-$HOME/messages}/inbox"
-mkdir -p "$INBOX_DIR"
-
-if [ "$EXIT_CODE" -eq 0 ]; then
-    STATUS="success"
-else
-    STATUS="failed"
-fi
-
-TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%S.%6N)
-EPOCH_MS=$(date +%s%3N)
-MSG_ID="${EPOCH_MS}_cron_${JOB_NAME}"
-
-python3 - \
-    "${INBOX_DIR}/${MSG_ID}.json" \
-    "${MSG_ID}" \
-    "${TIMESTAMP}" \
-    "${JOB_NAME}" \
-    "${EXIT_CODE}" \
-    "${DURATION_SECONDS}" \
-    "${STATUS}" \
-    << 'PYEOF'
-import json, sys, os
-out_path = sys.argv[1]
-msg_id = sys.argv[2]
-timestamp = sys.argv[3]
-job_name = sys.argv[4]
-exit_code = int(sys.argv[5])
-duration_seconds = int(sys.argv[6])
-status = sys.argv[7]
-
-msg = {
-    "id": msg_id,
-    "source": "system",
-    "type": "cron_reminder",
-    "chat_id": 0,
-    "user_id": 0,
-    "username": "lobster-cron",
-    "user_name": "Cron",
-    "text": f"[Cron] Job '{job_name}' finished ({status}, {duration_seconds}s)",
-    "job_name": job_name,
-    "exit_code": exit_code,
-    "duration_seconds": duration_seconds,
-    "status": status,
-    "timestamp": timestamp,
-}
-
-tmp_path = out_path + ".tmp"
-with open(tmp_path, "w") as f:
-    json.dump(msg, f, ensure_ascii=False, indent=2)
-    f.flush()
-
-os.replace(tmp_path, out_path)
-PYEOF
-
-echo "Reminder posted for job: $JOB_NAME (status=$STATUS, duration=${DURATION_SECONDS}s)"
-POSTREMINDER
-chmod +x "$INSTALL_DIR/scheduled-tasks/post-reminder.sh" || true
+# Install dispatch-job.sh (posts scheduled_reminder to inbox; no direct Claude invocation)
+chmod +x "$INSTALL_DIR/scheduled-tasks/dispatch-job.sh" || true
 
 # Create sync-crontab.sh
 cat > "$INSTALL_DIR/scheduled-tasks/sync-crontab.sh" << 'SYNCCRON'
@@ -1394,7 +1261,7 @@ set -e
 WORKSPACE="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}"
 REPO_DIR="${LOBSTER_INSTALL_DIR:-$HOME/lobster}"
 JOBS_FILE="$WORKSPACE/scheduled-jobs/jobs.json"
-RUNNER="$REPO_DIR/scheduled-tasks/run-job.sh"
+RUNNER="$REPO_DIR/scheduled-tasks/dispatch-job.sh"
 
 if ! command -v crontab &> /dev/null; then
     echo "Warning: crontab not found. Install cron to enable scheduled tasks."
@@ -1410,13 +1277,34 @@ MARKER="# LOBSTER-SCHEDULED"
 EXISTING=$(crontab -l 2>/dev/null | grep -v "$MARKER" | grep -v "$RUNNER" || true)
 
 if command -v jq &> /dev/null; then
-    CRON_ENTRIES=$(jq -r --arg runner "$RUNNER" --arg marker "$MARKER" '
+    CRON_ENTRIES=$(jq -r --arg runner "$RUNNER" --arg marker "$MARKER" \
+        --arg repo_dir "$REPO_DIR" '
         .jobs | to_entries[] |
         select(.value.enabled == true) |
-        "\(.value.schedule) \($runner) \(.key) \($marker)"
+        (.value.runner // $runner) as $job_runner |
+        # Expand $REPO_DIR placeholder so per-job runners can reference the install dir
+        ($job_runner | gsub("\\$REPO_DIR"; $repo_dir)) as $resolved_runner |
+        "\(.value.schedule) \($resolved_runner) \(.key) \($marker)"
     ' "$JOBS_FILE" 2>/dev/null || echo "")
 else
-    CRON_ENTRIES=""
+    CRON_ENTRIES=$(python3 -c "
+import json
+import sys
+try:
+    with open('$JOBS_FILE', 'r') as f:
+        data = json.load(f)
+    repo_dir = '$REPO_DIR'
+    default_runner = '$RUNNER'
+    for name, job in data.get('jobs', {}).items():
+        if job.get('enabled', True):
+            schedule = job.get('schedule', '')
+            if schedule:
+                runner = job.get('runner', default_runner)
+                runner = runner.replace('\$REPO_DIR', repo_dir)
+                print(f\"{schedule} {runner} {name} $MARKER\")
+except Exception as e:
+    sys.stderr.write(f'Error: {e}\n')
+" 2>/dev/null || echo "")
 fi
 
 {
@@ -1499,14 +1387,33 @@ chmod +x "$INSTALL_DIR/scheduled-tasks/export-logs.py" 2>/dev/null || true
 success "Log export configured (runs at 03:00 UTC daily)"
 
 #===============================================================================
-# Cron-to-Inbox Reminder System (post-reminder.sh)
+# Ghost Detector (agent-monitor)
 #===============================================================================
 
-step "Installing post-reminder.sh..."
+step "Setting up ghost detector cron..."
 
-chmod +x "$INSTALL_DIR/scripts/post-reminder.sh" || true
+# agent-monitor.py runs every 5 minutes, checks for stale/dead agent sessions,
+# sends a Telegram alert if GHOST_CONFIRMED or UNREGISTERED agents are found,
+# and marks ghost sessions as failed in agent_sessions.db. No LLM involved.
+"$INSTALL_DIR/scripts/cron-manage.sh" add "# LOBSTER-GHOST-DETECTOR" \
+    "*/5 * * * * cd $HOME && uv run $INSTALL_DIR/scripts/agent-monitor.py --alert --mark-failed >> $HOME/lobster-workspace/logs/agent-monitor.log 2>&1 # LOBSTER-GHOST-DETECTOR"
 
-success "post-reminder.sh installed"
+success "Ghost detector configured (runs every 5 minutes)"
+
+#===============================================================================
+# OOM Monitor
+#===============================================================================
+
+step "Setting up OOM monitor cron..."
+
+# oom-monitor.py runs every 10 minutes, scans the kernel journal for OOM kills
+# affecting Lobster/Claude processes, and writes an inbox message for the
+# dispatcher when new OOM kill events are detected. No LLM involved.
+# Only active when LOBSTER_DEBUG=true (the script is a no-op otherwise).
+"$INSTALL_DIR/scripts/cron-manage.sh" add "# LOBSTER-OOM-CHECK" \
+    "*/10 * * * * cd $HOME && uv run $INSTALL_DIR/scripts/oom-monitor.py --since-minutes 10 >> $HOME/lobster-workspace/logs/oom-monitor.log 2>&1 # LOBSTER-OOM-CHECK"
+
+success "OOM monitor configured (runs every 10 minutes, active only when LOBSTER_DEBUG=true)"
 
 # Ensure any lingering self-check cron entry is removed on fresh installs
 { crontab -l 2>/dev/null | grep -v "# LOBSTER-SELF-CHECK" | grep -v "periodic-self-check" || true; } | crontab -
@@ -1740,7 +1647,35 @@ else
     info "Skipping auto-register-agent hook (settings.json not yet created)"
 fi
 
-# Set up Claude Code PreToolUse hook to block tool use after compaction without context reload
+# Set up Claude Code PostToolUse hook to monitor context window usage and write a
+# context_warning to inbox when usage crosses 70%.  Scoped to mcp__lobster-inbox__ and Agent
+# tool calls only — these are the high-token events where context growth is most likely.
+# Skipping Read/Edit/Write/Bash PostToolUse reduces spawns by ~65% with no meaningful loss
+# of monitoring coverage.
+chmod +x "$INSTALL_DIR/hooks/context-monitor.py" || true
+if [ -f "$CLAUDE_SETTINGS" ]; then
+    if ! jq -e '.hooks.PostToolUse[]? | select(.hooks[]?.command | contains("context-monitor"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
+        TMP_SETTINGS=$(mktemp)
+        jq '.hooks.PostToolUse = (.hooks.PostToolUse // []) + [{
+            "matcher": "mcp__lobster-inbox__|Agent",
+            "hooks": [{
+                "type": "command",
+                "command": "python3 '"$INSTALL_DIR"'/hooks/context-monitor.py",
+                "timeout": 5
+            }]
+        }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+        success "context-monitor hook installed (mcp__lobster-inbox__|Agent)"
+    else
+        info "context-monitor hook already configured in Claude Code settings"
+    fi
+else
+    info "Skipping context-monitor hook (settings.json not yet created)"
+fi
+
+# Set up Claude Code PreToolUse hook to block tool use after compaction without context reload.
+# Uses a shell wrapper so Python is only spawned when the sentinel file exists (~1% of calls).
+# On the 99%+ of calls where the sentinel is absent, `test ! -f ...` exits in ~1ms with no
+# Python startup overhead (~50ms saved per tool call).
 chmod +x "$INSTALL_DIR/hooks/post-compact-gate.py" || true
 if [ -f "$CLAUDE_SETTINGS" ]; then
     if ! jq -e '.hooks.PreToolUse[]? | select(.matcher == "")' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
@@ -1749,11 +1684,11 @@ if [ -f "$CLAUDE_SETTINGS" ]; then
             "matcher": "",
             "hooks": [{
                 "type": "command",
-                "command": "python3 '"$INSTALL_DIR"'/hooks/post-compact-gate.py",
+                "command": "test ! -f /home/lobster/messages/config/compact-pending || python3 '"$INSTALL_DIR"'/hooks/post-compact-gate.py",
                 "timeout": 5
             }]
         }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
-        success "post-compact-gate hook installed"
+        success "post-compact-gate hook installed (shell wrapper)"
     else
         info "post-compact-gate hook already configured in Claude Code settings"
     fi
@@ -1994,6 +1929,13 @@ else
     success "Python venv already exists"
 fi
 
+# Ensure pip binaries in the venv are executable (uv venv may create them
+# without the execute bit set on some platforms, causing "permission denied"
+# warnings during upgrade checks).
+chmod +x .venv/bin/pip .venv/bin/pip3 2>/dev/null || true
+# Also fix any versioned pip binary (e.g. pip3.12)
+chmod +x .venv/bin/pip3.* 2>/dev/null || true
+
 # Activate venv for uv pip commands
 export VIRTUAL_ENV="$INSTALL_DIR/.venv"
 export PATH="$INSTALL_DIR/.venv/bin:$PATH"
@@ -2108,7 +2050,7 @@ TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_ALLOWED_USERS=
 
 # Admin chat ID (Telegram numeric user ID for the primary admin user).
-# Used by run-job.sh (scheduled tasks) and alert.sh to deliver messages.
+# Used by dispatch-job.sh (scheduled tasks) and alert.sh to deliver messages.
 LOBSTER_ADMIN_CHAT_ID=
 
 # Environment mode: production | dev | test
@@ -2172,7 +2114,7 @@ TELEGRAM_BOT_TOKEN=$BOT_TOKEN
 TELEGRAM_ALLOWED_USERS=$USER_ID
 
 # Admin chat ID (Telegram numeric user ID for the primary admin user).
-# Used by run-job.sh (scheduled tasks) and alert.sh to deliver messages.
+# Used by dispatch-job.sh (scheduled tasks) and alert.sh to deliver messages.
 LOBSTER_ADMIN_CHAT_ID=$USER_ID
 
 # Environment mode: production | dev | test
@@ -2707,6 +2649,14 @@ if [ -f "$MCP_TEMPLATE" ]; then
         "$INSTALL_DIR/services/lobster-mcp.service"
 fi
 
+# Generate MCP local HTTP server service if template exists
+MCP_LOCAL_TEMPLATE="$INSTALL_DIR/services/lobster-mcp-local.service.template"
+if [ -f "$MCP_LOCAL_TEMPLATE" ]; then
+    generate_from_template \
+        "$MCP_LOCAL_TEMPLATE" \
+        "$INSTALL_DIR/services/lobster-mcp-local.service"
+fi
+
 # Generate observability server service if template exists
 OBSERVABILITY_TEMPLATE="$INSTALL_DIR/services/lobster-observability.service.template"
 if [ -f "$OBSERVABILITY_TEMPLATE" ]; then
@@ -2735,10 +2685,17 @@ else
         info "Slack router service installed (enable manually with: sudo systemctl enable lobster-slack-router)"
     fi
 
-    # Install MCP HTTP bridge service if generated
+    # Install MCP HTTP bridge service if generated (remote read-only bridge)
     if [ -f "$INSTALL_DIR/services/lobster-mcp.service" ]; then
         sudo cp "$INSTALL_DIR/services/lobster-mcp.service" /etc/systemd/system/
         info "MCP HTTP bridge service installed (enable manually with: sudo systemctl enable lobster-mcp)"
+    fi
+
+    # Install MCP local HTTP server service (full-access, localhost only)
+    if [ -f "$INSTALL_DIR/services/lobster-mcp-local.service" ]; then
+        sudo cp "$INSTALL_DIR/services/lobster-mcp-local.service" /etc/systemd/system/
+        sudo systemctl enable lobster-mcp-local 2>/dev/null || true
+        success "MCP local HTTP server service installed and enabled (lobster-mcp-local)"
     fi
 
     # Install observability service if generated
@@ -2785,13 +2742,27 @@ fi
 
 step "Registering MCP server with Claude..."
 
-# Remove existing registration if present
+# Remove any legacy stdio mcpServers.lobster-inbox entry from settings.json if present.
+# The claude mcp add/remove CLI stores entries in ~/.claude.json, not settings.json,
+# but defensive cleanup costs nothing and handles any manual or legacy configs.
+if [ -f "$CLAUDE_SETTINGS" ] && command -v jq >/dev/null 2>&1; then
+    if jq -e '.mcpServers."lobster-inbox"' "$CLAUDE_SETTINGS" >/dev/null 2>&1; then
+        TMP_SETTINGS=$(mktemp)
+        jq 'del(.mcpServers."lobster-inbox")' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+        info "Removed legacy mcpServers.lobster-inbox entry from settings.json"
+    fi
+fi
+
+# Remove existing registration if present (handles both stdio and http registrations)
 claude mcp remove lobster-inbox 2>/dev/null || true
 
-# Add new registration
-PYTHON_PATH="$INSTALL_DIR/.venv/bin/python"
-if claude mcp add lobster-inbox -s user -- "$PYTHON_PATH" "$INSTALL_DIR/src/mcp/inbox_server.py" 2>/dev/null; then
-    success "MCP server registered"
+# Register MCP server using HTTP transport (streamable-http).
+# Claude Code connects to the locally-running lobster-mcp-local service on port 8766.
+# This decouples the MCP server lifetime from the Claude Code process, so CC
+# auto-updates no longer cause a stdio pipe drop / stuck wait_for_messages call.
+MCP_LOCAL_URL="http://localhost:8766/mcp"
+if claude mcp add --transport http lobster-inbox -s user "$MCP_LOCAL_URL" 2>/dev/null; then
+    success "MCP server registered (HTTP transport: $MCP_LOCAL_URL)"
 else
     warn "MCP server registration may have failed. Check with: claude mcp list"
 fi
@@ -2961,10 +2932,10 @@ echo -e "${BOLD}Required post-install steps:${NC}"
 if [ "$GITHUB_TOKEN_SET" = false ]; then
 echo "  1. Set your GitHub PAT:    lobster env set GITHUB_TOKEN <your-token>"
 echo "  2. Authenticate Claude:    sudo -u lobster claude  (then follow OAuth prompts)"
-echo "  3. Start services:         sudo systemctl start lobster-claude lobster-mcp lobster-router"
+echo "  3. Start services:         sudo systemctl start lobster-mcp-local lobster-claude lobster-router"
 else
 echo "  1. Authenticate Claude:    sudo -u lobster claude  (then follow OAuth prompts)"
-echo "  2. Start services:         sudo systemctl start lobster-claude lobster-mcp lobster-router"
+echo "  2. Start services:         sudo systemctl start lobster-mcp-local lobster-claude lobster-router"
 fi
 echo ""
 echo -e "${BOLD}Commands:${NC}"

@@ -35,6 +35,16 @@ if _MCP_SRC_DIR not in sys.path:
     sys.path.insert(0, _MCP_SRC_DIR)
 from log_utils import JsonFormatter, configure_file_handler
 
+# Event bus — structured observability infrastructure (issue #890).
+# Imported here so callsites can use _emit_event() throughout the module.
+# The singleton is initialised later in main(); events emitted before init
+# are silently dropped (bus has no listeners yet — safe, not a hard error).
+try:
+    from event_bus import get_event_bus, LobsterEvent
+    _EVENT_BUS_AVAILABLE = True
+except ImportError:
+    _EVENT_BUS_AVAILABLE = False
+
 # Ensure the parent src/ directory is on sys.path so that sibling packages
 # (e.g. integrations, utils, bot) can be imported when this script is run
 # directly via `python inbox_server.py` (which only adds src/mcp/ to sys.path).
@@ -173,8 +183,7 @@ def _observation_worker() -> None:
             if _user_model is not None:
                 obs_ids = _user_model.observe(msg_text, msg_id, context=source or "", message_ts=ts)
                 # Debug: emit Tier 1 signal summary when LOBSTER_DEBUG=true.
-                # _emit_debug_observation resolves debug mode lazily and is a no-op
-                # when LOBSTER_DEBUG != true, so this is safe on the hot path.
+                # _emit_event is a no-op when LOBSTER_DEBUG != true (bus filter).
                 if obs_ids:
                     try:
                         from user_model.observation import extract_signals
@@ -192,18 +201,23 @@ def _observation_worker() -> None:
                                 )
                             summary = ", ".join(signal_parts[:6])  # cap at 6
                             short_id = msg_id[:20] if len(msg_id) > 20 else msg_id
-                            _emit_debug_observation(
+                            _emit_event(
                                 f"\U0001f50d [tier 1 fired] msg={short_id} "
-                                f"extracted {len(signals)} signal(s): {summary}"
+                                f"extracted {len(signals)} signal(s): {summary}",
+                                event_type="user_model.tier1",
+                                severity="debug",
+                                source="observation-worker",
                             )
                     except Exception:
                         pass  # never block observation on debug emit
         except Exception as _obs_exc:
             import traceback as _tb
-            _emit_debug_observation(
+            _emit_event(
                 f"\U0001f50d [observation worker error] {type(_obs_exc).__name__}: {_obs_exc}\n"
                 + _tb.format_exc()[-800:],
-                category="system_error",
+                event_type="system.error",
+                severity="error",
+                source="observation-worker",
             )
             # never crash the worker
 
@@ -233,195 +247,54 @@ def _queue_observation(msg_text: str, msg_id: str, source: str | None = None, ts
 # ---------------------------------------------------------------------------
 # Debug observability — LOBSTER_DEBUG=true push notifications
 #
-# _emit_debug_observation() is defined here (early, so workers can call it)
-# but the actual mode/chat_id detection is lazy (reads config on first call)
-# to avoid referencing _CONFIG_DIR / INBOX_DIR before they are defined.
+# _emit_event() is a thin wrapper around the event bus singleton.  It replaces
+# the old _emit_debug_observation / _resolve_debug_config pattern (issue #891).
+# Filtering (debug-mode gate, category suppression) is handled inside the bus
+# listeners — callers just emit a LobsterEvent and the bus decides delivery.
+#
+# Backward-compat: _resolve_debug_config is kept as a no-op so any callsites
+# that haven't been updated yet don't crash.
 # ---------------------------------------------------------------------------
 
-_DEBUG_MODE: bool | None = None        # None = not yet resolved
-_DEBUG_ALERTS_ENABLED: bool = False    # True only when alerts are explicitly configured
-_DEBUG_OWNER_CHAT_ID: int | None = None
-_DEBUG_OWNER_SOURCE: str = "telegram"  # messaging source for debug alerts
-_DEBUG_RESOLVED: bool = False
+
+def _emit_event(
+    text: str,
+    event_type: str = "debug.observation",
+    severity: str = "debug",
+    source: str = "inbox-server",
+    emitter: str | None = None,
+    task_id: str | None = None,
+    chat_id: int | str | None = None,
+) -> None:
+    """
+    Emit a structured event to the bus.
+
+    Replaces _emit_debug_observation().  All filtering (debug-mode gate,
+    system_context suppression) lives in the bus listeners registered at
+    startup, so callers do not need to check LOBSTER_DEBUG themselves.
+
+    Never raises — must be safe to call from any thread.
+    """
+    if not _EVENT_BUS_AVAILABLE:
+        return
+    try:
+        bus = get_event_bus()
+        event = LobsterEvent(
+            event_type=event_type,
+            severity=severity,
+            source=source,
+            payload={"text": text},
+            task_id=task_id,
+            chat_id=chat_id,
+        )
+        bus.emit_sync(event)
+    except Exception:
+        pass  # never block on observability
 
 
 def _resolve_debug_config() -> None:
-    """
-    Lazily resolve LOBSTER_DEBUG, owner chat_id, and messaging source from env + config.env.
-    Must only be called after _CONFIG_DIR is available (module init complete).
-    Thread-safe by idempotency — worst case reads config twice.
-
-    Debug alerts are only enabled when LOBSTER_DEBUG=true AND a valid admin chat_id
-    can be resolved from config. This prevents spurious inbox writes in environments
-    where LOBSTER_DEBUG=true is set but no admin notification channel is configured
-    (e.g. test environments, staging).
-
-    Source resolution order:
-      1. LOBSTER_DEBUG_SOURCE env var (explicit override)
-      2. Detected from config: if LOBSTER_ENABLE_SLACK=true, use "slack"; else "telegram"
-    """
-    global _DEBUG_MODE, _DEBUG_ALERTS_ENABLED, _DEBUG_OWNER_CHAT_ID, _DEBUG_OWNER_SOURCE, _DEBUG_RESOLVED
-    if _DEBUG_RESOLVED:
-        return
-
-    # Determine debug mode
-    env_val = os.environ.get("LOBSTER_DEBUG", "").lower()
-    debug = env_val == "true"
-    if not debug:
-        try:
-            config_file = _CONFIG_DIR / "config.env"
-            if config_file.exists():
-                for line in config_file.read_text().splitlines():
-                    if line.strip().startswith("LOBSTER_DEBUG="):
-                        val = line.split("=", 1)[1].strip().strip('"').strip("'").lower()
-                        debug = val == "true"
-                        break
-        except Exception as _debug_cfg_err:
-            log.warning("Failed to read LOBSTER_DEBUG from config.env: %s", _debug_cfg_err)
-    _DEBUG_MODE = debug
-
-    # Determine owner chat_id and messaging source.
-    # _DEBUG_ALERTS_ENABLED is only set to True when both a valid chat_id AND
-    # the source's bot credentials are present. This prevents spurious inbox writes
-    # in environments that have LOBSTER_DEBUG=true but no bot configured for delivery
-    # (e.g. test environments, CI, staging without a bot token).
-    if debug:
-        try:
-            # Allow explicit source override via env var
-            explicit_source = os.environ.get("LOBSTER_DEBUG_SOURCE", "").strip().lower()
-
-            slack_enabled = False
-            slack_channel: str | None = None
-            slack_bot_token: str | None = None
-            telegram_chat_id: int | None = None
-            telegram_bot_token: str | None = None
-
-            config_file = _CONFIG_DIR / "config.env"
-            if config_file.exists():
-                for line in config_file.read_text().splitlines():
-                    stripped = line.strip()
-                    if stripped.startswith("TELEGRAM_ALLOWED_USERS="):
-                        val = stripped.split("=", 1)[1].strip().strip('"').strip("'")
-                        first = val.split(",")[0].strip()
-                        if first.lstrip("-").isdigit():
-                            telegram_chat_id = int(first)
-                    elif stripped.startswith("TELEGRAM_BOT_TOKEN="):
-                        val = stripped.split("=", 1)[1].strip().strip('"').strip("'")
-                        if val:
-                            telegram_bot_token = val
-                    elif stripped.startswith("LOBSTER_ENABLE_SLACK="):
-                        val = stripped.split("=", 1)[1].strip().strip('"').strip("'").lower()
-                        slack_enabled = val == "true"
-                    elif stripped.startswith("LOBSTER_SLACK_ALLOWED_CHANNELS="):
-                        val = stripped.split("=", 1)[1].strip().strip('"').strip("'")
-                        first_chan = val.split(",")[0].strip()
-                        if first_chan:
-                            slack_channel = first_chan
-                    elif stripped.startswith("LOBSTER_SLACK_BOT_TOKEN="):
-                        val = stripped.split("=", 1)[1].strip().strip('"').strip("'")
-                        if val:
-                            slack_bot_token = val
-
-            if explicit_source:
-                _DEBUG_OWNER_SOURCE = explicit_source
-            elif slack_enabled:
-                _DEBUG_OWNER_SOURCE = "slack"
-            else:
-                _DEBUG_OWNER_SOURCE = "telegram"
-
-            # chat_id: use Slack channel if source is slack, else Telegram numeric id.
-            # Require the source's bot credentials to be present before enabling alerts —
-            # this prevents silent inbox pollution in environments where LOBSTER_DEBUG=true
-            # is set but the bot that delivers messages is not configured.
-            if _DEBUG_OWNER_SOURCE == "slack" and slack_channel and slack_bot_token:
-                _DEBUG_OWNER_CHAT_ID = slack_channel  # type: ignore[assignment]
-                _DEBUG_ALERTS_ENABLED = True
-            elif _DEBUG_OWNER_SOURCE != "slack" and telegram_chat_id is not None and telegram_bot_token:
-                _DEBUG_OWNER_CHAT_ID = telegram_chat_id
-                _DEBUG_ALERTS_ENABLED = True
-        except Exception as _debug_resolve_err:
-            log.warning(
-                "Failed to resolve debug alert destination from config.env — "
-                "debug alerts will be disabled: %s",
-                _debug_resolve_err,
-            )
-
-    _DEBUG_RESOLVED = True
-
-
-def _emit_debug_observation(
-    text: str,
-    category: str = "system_context",
-    visibility: str = "mcp-only",
-    emitter: str | None = None,
-) -> None:
-    """
-    Emit a debug notification directly to the bot outbox when LOBSTER_DEBUG=true.
-
-    Writes directly to OUTBOX_DIR (the bot watchdog outbox) so the message is
-    delivered to Telegram without entering the dispatcher inbox. The dispatcher
-    never sees these messages and no dispatcher tokens are burned.
-
-    When debug mode is off, this function is a no-op.
-    When category is "system_context", this function is always a no-op — per the
-    dispatcher bootup doc, system_context observations must be stored silently and
-    never forwarded to the user, even in debug mode.
-
-    Args:
-        text: The observation body text.
-        category: "system_context" (always suppressed), "system_error", or "user_context".
-        visibility: "mcp-only" if the MCP layer is emitting this directly (dispatcher
-            has not seen it yet), or "dispatcher" if the dispatcher's main loop is
-            emitting this after processing the message through its inbox.
-        emitter: task_id or agent description identifying who generated the observation.
-            Falls back to "unknown" if not provided.
-
-    Label format: [debug|{visibility}] {category} from {emitter}
-    Example: [debug|mcp-only] system_error from task:linear-digest
-
-    Never raises — must be safe to call from any context including threads.
-    """
-    # system_context observations are internal routing decisions — never forward
-    # to Telegram. The dispatcher bootup doc is explicit: system_context must be
-    # stored silently (memory_store), do NOT send_reply, even in debug mode.
-    # This mirrors the suppression already present in handle_write_observation().
-    if category == "system_context":
-        return
-
-    # Fast path: skip I/O if debug alerts have been resolved and are disabled.
-    if _DEBUG_RESOLVED and not _DEBUG_ALERTS_ENABLED:
-        return
-    _resolve_debug_config()
-    if not _DEBUG_ALERTS_ENABLED:
-        return
-    chat_id = _DEBUG_OWNER_CHAT_ID
-    if chat_id is None:
-        return
-    try:
-        emitter_label = emitter or "unknown"
-        label = f"[debug|{visibility}] {category} from {emitter_label}"
-        full_text = f"{label}\n{text}"
-
-        from datetime import datetime, timezone as _timezone
-        now = datetime.now(_timezone.utc)
-        ts_ms = int(now.timestamp() * 1000)
-        safe_emitter = "".join(c if c.isalnum() or c in "-_" else "_" for c in emitter_label)[:40]
-        message_id = f"{ts_ms}_debug_{safe_emitter}"
-        message = {
-            "id": message_id,
-            "type": "debug_observation",
-            "source": _DEBUG_OWNER_SOURCE,
-            "chat_id": chat_id,
-            "text": full_text,
-            "timestamp": now.isoformat(),
-        }
-        # Deliver directly to the bot outbox so the message reaches Telegram
-        # without entering the dispatcher inbox. The dispatcher never sees
-        # debug_observation messages — no tokens burned, no silent drops.
-        outbox_file = OUTBOX_DIR / f"{message_id}.json"
-        atomic_write_json(outbox_file, message)
-    except Exception:
-        pass  # never block on debug instrumentation
+    """No-op — preserved for call compatibility. Config resolution moved to event bus."""
+    pas
 
 
 # ---------------------------------------------------------------------------
@@ -785,13 +658,36 @@ LOBSTER_STATE_FILE = CONFIG_DIR / "lobster-state.json"
 # - This prevents the health-check from triggering a restart loop when the state
 #   file is left in a transient mode (e.g. when using claude-wrapper.exp which
 #   does not itself write the state file).
+#
+# Guard: skip the reset if state is already "active" and the file was written
+# within the last 30 minutes.  That pattern indicates a mid-session MCP
+# reconnect (e.g. Claude Code auto-updating), not a fresh boot.  Without this
+# guard, the reconnect path re-writes booted_at/woke_at, confusing the health
+# check about session age and causing unnecessary restarts (issue #910).
 _TRANSIENT_MODES = {"hibernate", "starting", "restarting", "waking"}
+_RECONNECT_GRACE_SECONDS = 30 * 60  # 30 minutes
+
 
 def _reset_state_on_startup():
     try:
         if LOBSTER_STATE_FILE.exists():
             data = json.loads(LOBSTER_STATE_FILE.read_text())
-            if data.get("mode") in _TRANSIENT_MODES:
+            mode = data.get("mode", "active")
+
+            # Skip reset for reconnects: if mode is already "active" and the
+            # state file is fresh (< 30 min old), this is a mid-session MCP
+            # restart, not a fresh dispatcher boot.  Rewriting booted_at/woke_at
+            # would make the health check think this is a brand-new session and
+            # apply incorrect freshness thresholds.
+            if mode not in _TRANSIENT_MODES:
+                try:
+                    file_age = time.time() - LOBSTER_STATE_FILE.stat().st_mtime
+                    if file_age < _RECONNECT_GRACE_SECONDS:
+                        return  # Mid-session reconnect — leave state untouched
+                except OSError:
+                    pass  # Can't stat — fall through to normal reset
+
+            if mode in _TRANSIENT_MODES:
                 data["mode"] = "active"
                 data["woke_at"] = datetime.now(timezone.utc).isoformat()
                 tmp = LOBSTER_STATE_FILE.parent / f".lobster-state-{os.getpid()}.tmp"
@@ -799,6 +695,7 @@ def _reset_state_on_startup():
                 tmp.rename(LOBSTER_STATE_FILE)
     except Exception:
         pass  # If we can't reset, _read_lobster_state defaults to "active" anyway
+
 
 _reset_state_on_startup()
 
@@ -921,6 +818,142 @@ if not SCHEDULED_JOBS_FILE.exists():
 # Record the moment this server process started. Used by stale-session cleanup
 # to distinguish output files from the current run vs a previous (dead) run.
 _SERVER_START_TIME = datetime.now(timezone.utc)
+
+# ---------------------------------------------------------------------------
+# HTTP session identity — dispatcher session tagging (Options A and B)
+# ---------------------------------------------------------------------------
+#
+# When running in HTTP transport mode, multiple Claude Code sessions can
+# connect simultaneously (dispatcher + subagents). The server needs to know
+# which session is the dispatcher so that:
+#   - guarded tools (wait_for_messages, send_reply, etc.) are allowed only
+#     for the dispatcher session
+#   - health checks and the reconciler can verify the dispatcher is connected
+#
+# Session ID propagation:
+#   Each HTTP request carries an "mcp-session-id" header (set by the MCP
+#   client after the initial handshake).  The MCP library stores the raw
+#   Starlette Request object in the per-request RequestContext
+#   (request_ctx.get().request).  Tool handlers running inside the session
+#   task can retrieve the session ID by reading that header:
+#
+#     _get_current_http_session_id()  →  request_ctx.get().request.headers[...]
+#
+#   This works because request_ctx is a ContextVar set in the session task
+#   itself (by mcp.server.lowlevel.server._handle_request) before the tool
+#   handler is called.
+#
+# Option A — tag-on-first-use:
+#   The first call to wait_for_messages (dispatcher-exclusive) records the
+#   current session ID as the dispatcher session.  On CC reconnect after a
+#   restart, the tag is updated automatically so the new session is tracked.
+#
+# Option B — explicit declaration:
+#   When a session calls session_start(agent_type="dispatcher", ...) the
+#   current session ID is immediately recorded.  This is explicit and robust
+#   — it fires before any guarded tool is needed.
+#
+# Both layers coexist; whichever fires first wins.  A subsequent call from
+# either path updates the tag (CC restart recovery).
+#
+# _dispatcher_session_id: module-level str, set by Option A or B
+# _http_session_manager: reference to the StreamableHTTPSessionManager
+#   instance (set in main() when HTTP mode is active).  Non-None iff in HTTP
+#   mode.  Used by /dispatcher-session endpoint and by _dispatch_tool to
+#   select the correct guard path.
+# ---------------------------------------------------------------------------
+
+_dispatcher_session_id: str | None = None
+_http_session_manager = None  # Set to StreamableHTTPSessionManager in main() when HTTP mode is active
+
+# State file: the dispatcher session ID persisted to disk so hooks can read it
+# without network calls or JSONL parsing.  Written atomically by
+# _tag_dispatcher_session(); cleared at server startup.
+_DISPATCHER_SESSION_STATE_FILE = _WORKSPACE / "data" / "dispatcher-session-id"
+
+
+def _write_dispatcher_state_file(session_id: str) -> None:
+    """Atomically write session_id to the dispatcher state file.
+
+    Uses a temp-file + os.rename() for atomicity so concurrent readers never
+    see a partial write.  Silent on any failure — must never crash the caller.
+    """
+    try:
+        _DISPATCHER_SESSION_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _DISPATCHER_SESSION_STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(session_id.strip())
+        tmp.replace(_DISPATCHER_SESSION_STATE_FILE)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _clear_dispatcher_state_file() -> None:
+    """Remove the dispatcher state file on server startup.
+
+    Prevents a stale session ID from a previous run from being mistaken for
+    the current dispatcher session.  Silent on any failure.
+    """
+    try:
+        if _DISPATCHER_SESSION_STATE_FILE.exists():
+            _DISPATCHER_SESSION_STATE_FILE.unlink()
+            log.info("[session-tag] Cleared stale dispatcher-session-id state file on startup")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _get_current_http_session_id() -> str | None:
+    """Return the MCP session ID for the current tool call request.
+
+    Reads the 'mcp-session-id' header from the Starlette Request object
+    stored in the MCP request context.  Returns None if:
+      - not running in HTTP mode
+      - called outside of an active MCP request (e.g. during startup)
+      - the header is absent (first initialise request has no session ID)
+    """
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+        req_ctx = request_ctx.get()
+        raw_request = req_ctx.request  # Starlette Request or None
+        if raw_request is None:
+            return None
+        return raw_request.headers.get("mcp-session-id")
+    except LookupError:
+        # request_ctx not set — called outside a request context
+        return None
+    except Exception:
+        return None
+
+
+def _tag_dispatcher_session(session_id: str) -> None:
+    """Record session_id as the privileged dispatcher session.
+
+    Called by Option A (handle_wait_for_messages), Option B
+    (handle_session_start with agent_type="dispatcher"), and Option C
+    (auto-tag on first guarded tool call after server restart).  Whichever
+    fires first wins; both paths update on reconnect.
+
+    Also writes the session_id to the dispatcher state file
+    (_DISPATCHER_SESSION_STATE_FILE) so hooks can read the current dispatcher
+    session without network calls or JSONL parsing.
+    """
+    global _dispatcher_session_id
+    if session_id and session_id != _dispatcher_session_id:
+        _dispatcher_session_id = session_id
+        log.info(f"[session-tag] Dispatcher session tagged: {session_id}")
+        _write_dispatcher_state_file(session_id)
+
+
+def _is_main_http_session() -> bool:
+    """Return True if the current HTTP session is the tagged dispatcher session.
+
+    Only meaningful when running in HTTP transport mode (_http_session_manager
+    is not None).  Fails closed: returns False if no session is tagged or if
+    the current session ID cannot be determined.
+    """
+    if _dispatcher_session_id is None:
+        return False
+    current = _get_current_http_session_id()
+    return current is not None and current == _dispatcher_session_id
 
 # Initialize SQLite agent session store (idempotent, runs JSON migration on first boot)
 try:
@@ -1133,15 +1166,26 @@ def _read_lobster_state(state_file: Path = None) -> str:
 def _write_lobster_state(state_file: Path = None, mode: str = "active") -> None:
     """Atomically write Lobster state to state file.
 
+    Reads existing state first and merges new fields in so that caller-supplied
+    fields (compacted_at, booted_at, last_restart_at, catchup_started_at, etc.)
+    are never clobbered — the bug tracked in #825.  Only ``mode`` and
+    ``updated_at`` are unconditionally overwritten; all other fields survive.
+
     Uses write-to-temp-then-rename so readers never see a partial file.
     """
     if state_file is None:
         state_file = LOBSTER_STATE_FILE
-    data = {
+    # Read existing state so we preserve fields we are not updating (#825).
+    existing: dict = {}
+    try:
+        existing = json.loads(state_file.read_text())
+    except Exception:
+        pass
+    existing.update({
         "mode": mode,
         "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    content = json.dumps(data, indent=2)
+    })
+    content = json.dumps(existing, indent=2)
     tmp = state_file.parent / f".lobster-state-{os.getpid()}.tmp"
     try:
         tmp.write_text(content)
@@ -1152,6 +1196,46 @@ def _write_lobster_state(state_file: Path = None, mode: str = "active") -> None:
             tmp.unlink()
         except Exception:
             pass
+
+
+def _update_lobster_state_fields(fields: dict, state_file: Path = None) -> None:
+    """Atomically merge one or more fields into lobster-state.json.
+
+    Reads the current state, updates the given fields, and writes back via
+    temp-then-rename so readers always see a consistent snapshot.  Other
+    fields (mode, compacted_at, catchup_started_at, etc.) are preserved.
+
+    This is a non-destructive merge — callers supply only the keys they want
+    to update.  Unlike _write_lobster_state, which replaces the entire file,
+    this function is safe to call from any context that must not clobber
+    concurrently-written lifecycle fields.
+
+    Failures are logged but not raised — the caller (mark_processed) must
+    not fail just because the heartbeat write failed.
+    """
+    if state_file is None:
+        state_file = LOBSTER_STATE_FILE
+    try:
+        existing: dict = {}
+        if state_file.exists():
+            try:
+                existing = json.loads(state_file.read_text())
+            except (json.JSONDecodeError, OSError):
+                existing = {}
+        existing.update(fields)
+        content = json.dumps(existing, indent=2) + "\n"
+        tmp = state_file.parent / f".lobster-state-{os.getpid()}.tmp"
+        try:
+            tmp.write_text(content)
+            tmp.rename(state_file)
+        except Exception as e:
+            log.error(f"Failed to update lobster state fields {list(fields)}: {e}")
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+    except Exception as e:
+        log.error(f"_update_lobster_state_fields unexpected error: {e}")
 
 
 @server.list_tools()
@@ -1445,7 +1529,7 @@ async def list_tools() -> list[Tool]:
         # Conversation History Tool
         Tool(
             name="get_conversation_history",
-            description="Retrieve past messages from conversation history - both received messages and sent replies. Supports pagination, filtering by chat_id, and text search. Use this to scroll back through previous conversations.",
+            description="Retrieve past messages from conversation history - both received messages and sent replies. Supports pagination, filtering by chat_id, text search, and sender_type to isolate real conversation from system/cron noise. Use this to scroll back through previous conversations.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1472,12 +1556,24 @@ async def list_tools() -> list[Tool]:
                     },
                     "direction": {
                         "type": "string",
-                        "description": "Filter by direction: 'received' for incoming messages only, 'sent' for outgoing replies only, or 'all' for both. Default 'all'.",
+                        "description": "Filter by direction: 'received' for incoming messages only, 'sent' for outgoing replies only, or 'all' for both. Default 'all'. Ignored when sender_type is set.",
                         "default": "all",
                     },
                     "source": {
                         "type": "string",
                         "description": "Filter by source (telegram, slack, etc.). Leave empty for all sources.",
+                    },
+                    "sender_type": {
+                        "type": "string",
+                        "description": (
+                            "Filter by who sent the message. "
+                            "'user' — only messages from the user (inbound Telegram/Slack, excludes system/cron). "
+                            "'lobster' — only messages sent by Lobster/subagents to the user (outbound). "
+                            "'conversation' — both user and lobster messages (real conversation only, no cron/system noise). "
+                            "Omit for all messages including system and cron (current default behaviour). "
+                            "When sender_type is set, the direction parameter is ignored."
+                        ),
+                        "enum": ["user", "lobster", "conversation"],
                     },
                 },
             },
@@ -1516,6 +1612,10 @@ async def list_tools() -> list[Tool]:
                         "description": "Filter by status: pending, in_progress, completed, or all (default).",
                         "default": "all",
                     },
+                    "chat_id": {
+                        "type": "string",
+                        "description": "Optional: filter to tasks owned by this chat_id (legacy tasks without chat_id are always included).",
+                    },
                 },
             },
         ),
@@ -1532,6 +1632,10 @@ async def list_tools() -> list[Tool]:
                     "description": {
                         "type": "string",
                         "description": "Detailed description of what needs to be done.",
+                    },
+                    "chat_id": {
+                        "type": "string",
+                        "description": "Optional: chat_id of the user who owns this task.",
                     },
                 },
                 "required": ["subject"],
@@ -1648,6 +1752,10 @@ async def list_tools() -> list[Tool]:
                     "context": {
                         "type": "string",
                         "description": "Instructions for the job. Describe what the scheduled task should do.",
+                    },
+                    "chat_id": {
+                        "type": "string",
+                        "description": "Optional: chat_id of the user who owns this job. Notifications route to this user.",
                     },
                 },
                 "required": ["name", "schedule", "context"],
@@ -2082,7 +2190,12 @@ async def list_tools() -> list[Tool]:
             ),
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "chat_id": {
+                        "type": "string",
+                        "description": "Optional: filter to sessions for this chat_id only.",
+                    },
+                },
             },
         ),
         Tool(
@@ -2337,6 +2450,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Optional subagent task identifier. Included in debug alerts when LOBSTER_DEBUG=true so the caller is visible in the memory write notification.",
                     },
+                    "chat_id": {
+                        "type": "string",
+                        "description": "Optional: chat_id of the user storing this memory. Embedded as source_chat_id in metadata for attribution.",
+                    },
                 },
                 "required": ["content"],
             },
@@ -2372,6 +2489,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Optional subagent task identifier. Included in debug alerts when LOBSTER_DEBUG=true so the caller is visible in the memory search notification.",
                     },
+                    "chat_id": {
+                        "type": "string",
+                        "description": "Optional: filter results to memories attributed to this chat_id (plus unattributed legacy memories).",
+                    },
                 },
                 "required": ["query"],
             },
@@ -2390,6 +2511,10 @@ async def list_tools() -> list[Tool]:
                     "project": {
                         "type": "string",
                         "description": "Optional project filter.",
+                    },
+                    "chat_id": {
+                        "type": "string",
+                        "description": "Optional: filter results to memories attributed to this chat_id (plus unattributed legacy memories).",
                     },
                 },
             },
@@ -2894,6 +3019,91 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        # Session File Management Tools
+        Tool(
+            name="create_session_file",
+            description=(
+                "Create a new session file for today. Copies the session template, "
+                "substitutes the date/sequence/timestamps, writes the file to "
+                "~/lobster-user-config/memory/canonical/sessions/YYYYMMDD-NNN.md, "
+                "and records the path in /tmp/lobster-current-session-file. "
+                "Returns {path, session_id}."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
+        Tool(
+            name="get_session_file",
+            description=(
+                "Read a session file. If session_id is 'current' (the default), "
+                "reads the pointer at /tmp/lobster-current-session-file, or finds "
+                "today's latest session. Otherwise looks up the file matching the "
+                "given YYYYMMDD-NNN session_id. "
+                "Returns {path, content, session_id}."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID (e.g. '20260329-001') or 'current'. Defaults to 'current'.",
+                        "default": "current",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="update_session_file",
+            description=(
+                "Update a named H2 section (e.g. '## Summary', '## Open Threads') "
+                "inside a session file. Replaces only the targeted section; all other "
+                "sections and the file header are preserved verbatim. Write is atomic "
+                "(temp-file + rename). "
+                "Returns {path, section, updated: true}."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "section": {
+                        "type": "string",
+                        "description": "Section name without the '## ' prefix, e.g. 'Summary' or 'Open Threads'.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "New content for the section (replaces everything between the section header and the next H2 or EOF).",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID (e.g. '20260329-001') or 'current'. Defaults to 'current'.",
+                        "default": "current",
+                    },
+                },
+                "required": ["section", "content"],
+            },
+        ),
+        Tool(
+            name="list_session_files",
+            description=(
+                "List session files, optionally filtered to a single date. "
+                "Returns a sorted list of {session_id, path, has_content} objects. "
+                "has_content is true when the Summary section contains more than 50 "
+                "characters of non-boilerplate text."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "date": {
+                        "type": "string",
+                        "description": "Optional YYYYMMDD date string to filter results.",
+                    },
+                },
+                "required": [],
+            },
+        ),
     ] + (
         # User Model Tools (only registered when feature flag is enabled)
         [
@@ -2962,12 +3172,51 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
 async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Dispatch tool calls to handlers."""
-    # Session guard: block inbox-monitoring and outbox-write tools for any
-    # Claude process that is not a descendant of the lobster tmux session
-    # (primary check) or does not have LOBSTER_MAIN_SESSION=1 (fallback).
-    if name in _SESSION_GUARDED_TOOLS and not _is_main_session():
-        log.warning(f"Session guard blocked '{name}' — not in lobster tmux session")
-        return _session_guard_error(name)
+    # Session guard: block inbox-monitoring and outbox-write tools for
+    # any session that is not the designated dispatcher session.
+    #
+    # In HTTP transport mode: use per-session tagging (_is_main_http_session).
+    #   - A session becomes the dispatcher by calling wait_for_messages (Option A),
+    #     session_start(agent_type="dispatcher") (Option B), or any guarded tool
+    #     when no dispatcher is currently tagged (Option C — restart recovery).
+    #   - All other sessions are blocked from guarded tools.
+    #
+    # Option C — restart recovery (no-dispatcher-tagged auto-tag):
+    #   When _dispatcher_session_id is None the MCP server has just restarted and
+    #   has no record of any dispatcher session.  The first session to call any
+    #   guarded tool must be the new dispatcher — subagents cannot be running yet
+    #   because they require the dispatcher to spawn them.  Auto-tagging here closes
+    #   the window between server start and the dispatcher's first WFM or
+    #   session_start call, which is when backlog send_reply calls would otherwise
+    #   be blocked.
+    #
+    # In stdio transport mode: use the legacy tmux ancestry / env-var check
+    #   (_is_main_session).  This path is unchanged.
+    if name in _SESSION_GUARDED_TOOLS:
+        if _http_session_manager is not None:
+            # HTTP mode: per-session guard.  wait_for_messages is always exempted
+            # (Option A tagging).  When no dispatcher is tagged yet (Option C),
+            # auto-tag the calling session before the guard check so the call
+            # proceeds — this handles the restart race where the dispatcher calls
+            # send_reply or check_inbox before its first WFM/session_start fires.
+            if _dispatcher_session_id is None:
+                session_id = _get_current_http_session_id()
+                if session_id is not None:
+                    log.info(
+                        f"[session-tag] Option C: no dispatcher tagged, auto-tagging "
+                        f"on '{name}' call — session {session_id!r}"
+                    )
+                    _tag_dispatcher_session(session_id)
+            if name != "wait_for_messages" and not _is_main_http_session():
+                log.warning(
+                    f"Session guard blocked '{name}' — HTTP session "
+                    f"{_get_current_http_session_id()!r} is not the dispatcher "
+                    f"(dispatcher={_dispatcher_session_id!r})"
+                )
+                return _session_guard_error(name)
+        elif not _is_main_session():
+            log.warning(f"Session guard blocked '{name}' — not in lobster tmux session")
+            return _session_guard_error(name)
 
     if name == "wait_for_messages":
         return await handle_wait_for_messages(arguments)
@@ -3123,6 +3372,15 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         return await handle_create_report(arguments)
     elif name == "list_reports":
         return await handle_list_reports(arguments)
+    # Session File Management Tools
+    elif name == "create_session_file":
+        return await handle_create_session_file(arguments)
+    elif name == "get_session_file":
+        return await handle_get_session_file(arguments)
+    elif name == "update_session_file":
+        return await handle_update_session_file(arguments)
+    elif name == "list_session_files":
+        return await handle_list_session_files(arguments)
     # User Model Tools (dispatched to user_model subsystem)
     elif name in _user_model_tool_names and _user_model is not None:
         result_json = _user_model.dispatch(name, arguments)
@@ -3297,8 +3555,22 @@ async def handle_wait_for_messages(args: dict) -> list[TextContent]:
     timeout = args.get("timeout", 72000)
     hibernate_on_timeout = args.get("hibernate_on_timeout", False)
 
+    # Option A: tag-on-first-use.  wait_for_messages is dispatcher-exclusive,
+    # so the session calling it is the dispatcher.  Tag it now so subsequent
+    # guarded tool calls from this same session are allowed.
+    if _http_session_manager is not None:
+        session_id = _get_current_http_session_id()
+        if session_id is not None:
+            _tag_dispatcher_session(session_id)
+
     # Touch heartbeat at start - signals Claude is alive and waiting for messages
     touch_heartbeat()
+
+    # Write "active" state so the health check always sees a live signal when
+    # wait_for_messages is called.  This is the authoritative steady-state write:
+    # even if claude-persistent.sh left the state in "starting" or another
+    # transient mode, calling wait_for_messages means Claude is up and running.
+    _write_lobster_state(LOBSTER_STATE_FILE, "active")
 
     # Recover stale processing and retryable failed messages
     _recover_stale_processing()
@@ -3965,6 +4237,12 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
                         _db_persist_inbound(json.loads(dest.read_text()))
                     except Exception as _db_exc:
                         log.warning(f"[DB] inbound persist failed for {mid}: {_db_exc}")
+                # Per-message WFM heartbeat: reset the WFM staleness clock so
+                # a long message batch does not exhaust the suppression window
+                # and trigger a spurious health-check restart (issue #694).
+                _update_lobster_state_fields(
+                    {"last_processed_at": datetime.now(timezone.utc).isoformat()}
+                )
             else:
                 mark_info = f" | ⚠️ message {mid} not found for mark_processed"
                 log.warning(f"Atomic mark_processed: message not found: {mid}")
@@ -4154,6 +4432,16 @@ async def handle_mark_processed(args: dict) -> list[TextContent]:
         except Exception as _db_exc:
             log.warning(f"[DB] inbound persist failed for {message_id}: {_db_exc}")
 
+    # Write a per-message heartbeat so the health check can distinguish a
+    # dispatcher that is actively draining a long message batch from one that
+    # is genuinely stuck.  The WFM freshness check uses the more recent of the
+    # WFM heartbeat file and this timestamp, so a burst of 20+ cron pings
+    # processed without returning to wait_for_messages does not exhaust the
+    # suppression window and trigger a spurious restart (issue #694).
+    _update_lobster_state_fields(
+        {"last_processed_at": datetime.now(timezone.utc).isoformat()}
+    )
+
     log.info(f"Message processed: {message_id}")
     return [TextContent(type="text", text=f"✅ Message marked as processed: {message_id}")]
 
@@ -4222,24 +4510,31 @@ async def handle_mark_processing(args: dict) -> list[TextContent]:
                         f"{ctx}"
                     )
                     # Debug: notify context was injected
-                    _emit_debug_observation(
+                    _emit_event(
                         f"\U0001f50d [context injected] msg={short_msg_id} "
-                        f"trigger matched, injected {len(ctx)} chars of user model context"
+                        f"trigger matched, injected {len(ctx)} chars of user model context",
+                        event_type="user_model.context_inject",
+                        severity="debug",
+                        source="mark-processing",
                     )
                 else:
                     # Debug: trigger matched but no context available.
-                    # _emit_debug_observation is a no-op when not in debug mode.
-                    _emit_debug_observation(
+                    _emit_event(
                         f"\U0001f50d [context skipped] msg={short_msg_id} "
-                        "trigger matched but user model returned empty context"
+                        "trigger matched but user model returned empty context",
+                        event_type="user_model.context_skip",
+                        severity="debug",
+                        source="mark-processing",
                     )
             except Exception as _ctx_exc:
                 import traceback as _tb
-                _emit_debug_observation(
+                _emit_event(
                     f"\U0001f50d [context inject error] msg={short_msg_id} "
                     f"{type(_ctx_exc).__name__}: {_ctx_exc}\n"
                     + _tb.format_exc()[-600:],
-                    category="system_error",
+                    event_type="system.error",
+                    severity="error",
+                    source="mark-processing",
                 )
                 # never block mark_processing
         else:
@@ -4543,6 +4838,41 @@ def _scan_json_dirs_for_history(direction: str) -> list[dict]:
     return messages
 
 
+def _apply_sender_type_filter(messages: list[dict], sender_type: str | None) -> list[dict]:
+    """Return only messages matching the given sender_type.
+
+    Pure function: does not mutate the input list.
+
+    sender_type semantics mirror the SQL layer in db/reader.py:
+      'user'         — inbound (_direction='received') messages whose type is in
+                       INBOX_USER_TYPES (real user messages, no system/cron noise)
+      'lobster'      — outbound (_direction='sent') messages
+      'conversation' — union of user and lobster (both, but no system noise)
+      None / other   — all messages unchanged
+    """
+    if not sender_type or sender_type == "all":
+        return messages
+
+    if sender_type == "user":
+        return [
+            m for m in messages
+            if m.get("_direction") == "received" and m.get("type", "text") in INBOX_USER_TYPES
+        ]
+
+    if sender_type == "lobster":
+        return [m for m in messages if m.get("_direction") == "sent"]
+
+    if sender_type == "conversation":
+        return [
+            m for m in messages
+            if m.get("_direction") == "sent"
+            or (m.get("_direction") == "received" and m.get("type", "text") in INBOX_USER_TYPES)
+        ]
+
+    # Unknown value — degrade gracefully
+    return messages
+
+
 def _apply_filters_and_paginate(
     messages: list[dict],
     *,
@@ -4551,8 +4881,9 @@ def _apply_filters_and_paginate(
     search_text: str,
     limit: int,
     offset: int,
+    sender_type: str | None = None,
 ) -> tuple[list[dict], int]:
-    """Apply chat_id / source / search filters, sort by timestamp, then paginate.
+    """Apply chat_id / source / search / sender_type filters, sort by timestamp, then paginate.
 
     Returns (paginated_slice, total_count_before_pagination).
     All filtering and sorting is performed in-memory. This is the legacy
@@ -4568,6 +4899,9 @@ def _apply_filters_and_paginate(
             return datetime.min.replace(tzinfo=timezone.utc)
 
     filtered = messages
+
+    if sender_type:
+        filtered = _apply_sender_type_filter(filtered, sender_type)
 
     if chat_id_filter is not None:
         chat_id_str = str(chat_id_filter)
@@ -4647,6 +4981,7 @@ async def handle_get_conversation_history(args: dict) -> list[TextContent]:
     offset = args.get("offset", 0)
     direction = args.get("direction", "all").lower()
     source_filter = args.get("source", "").lower().strip()
+    sender_type = args.get("sender_type") or None  # None when omitted or empty string
 
     paginated: list[dict] = []
     total_count: int = 0
@@ -4665,6 +5000,7 @@ async def handle_get_conversation_history(args: dict) -> list[TextContent]:
                     source=source_filter or None,
                     search=search_text or None,
                     direction=direction,
+                    sender_type=sender_type,
                     limit=limit,
                     offset=offset,
                 )
@@ -4674,6 +5010,7 @@ async def handle_get_conversation_history(args: dict) -> list[TextContent]:
                     source=source_filter or None,
                     search=search_text or None,
                     direction=direction,
+                    sender_type=sender_type,
                 )
                 used_db = True
                 log.debug(
@@ -4704,6 +5041,7 @@ async def handle_get_conversation_history(args: dict) -> list[TextContent]:
             search_text=search_text,
             limit=limit,
             offset=offset,
+            sender_type=sender_type,
         )
 
     # ------------------------------------------------------------------
@@ -4715,10 +5053,12 @@ async def handle_get_conversation_history(args: dict) -> list[TextContent]:
             filter_info.append(f"chat_id={chat_id_filter}")
         if search_text:
             filter_info.append(f"search='{search_text}'")
-        if direction != "all":
+        if direction != "all" and not sender_type:
             filter_info.append(f"direction={direction}")
         if source_filter:
             filter_info.append(f"source={source_filter}")
+        if sender_type:
+            filter_info.append(f"sender_type={sender_type}")
         filter_str = f" (filters: {', '.join(filter_info)})" if filter_info else ""
         return [TextContent(type="text", text=f"No messages found{filter_str}.")]
 
@@ -4884,8 +5224,13 @@ def save_tasks(data: dict) -> None:
 async def handle_list_tasks(args: dict) -> list[TextContent]:
     """List all tasks."""
     status_filter = args.get("status", "all").lower()
+    chat_id = args.get("chat_id")
     data = load_tasks()
     tasks = data.get("tasks", [])
+
+    # Filter by chat_id: show tasks owned by this user + legacy tasks (no chat_id)
+    if chat_id is not None:
+        tasks = [t for t in tasks if t.get("chat_id") == chat_id or "chat_id" not in t]
 
     if status_filter != "all":
         tasks = [t for t in tasks if t.get("status", "").lower() == status_filter]
@@ -4927,6 +5272,7 @@ async def handle_create_task(args: dict) -> list[TextContent]:
     """Create a new task."""
     subject = args.get("subject", "").strip()
     description = args.get("description", "").strip()
+    chat_id = args.get("chat_id")
 
     if not subject:
         return [TextContent(type="text", text="Error: subject is required.")]
@@ -4942,6 +5288,8 @@ async def handle_create_task(args: dict) -> list[TextContent]:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+    if chat_id is not None:
+        task["chat_id"] = chat_id
 
     data["tasks"].append(task)
     data["next_id"] = task_id + 1
@@ -5031,6 +5379,231 @@ async def handle_delete_task(args: dict) -> list[TextContent]:
 
     save_tasks(data)
     return [TextContent(type="text", text=f"🗑️ Task #{task_id} deleted.")]
+
+
+# =============================================================================
+# Session File Management Handlers
+# =============================================================================
+
+# Pointer file written/read to track the current session
+_SESSION_POINTER_FILE = Path("/tmp/lobster-current-session-file")
+
+# Boilerplate placeholder text in session template summaries
+_SESSION_SUMMARY_BOILERPLATE = "<1-3 sentence summary"
+
+
+def _resolve_sessions_dir() -> Path:
+    """Return the sessions directory, creating it if absent."""
+    sessions_dir = _USER_CONFIG / "memory" / "canonical" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    return sessions_dir
+
+
+def _resolve_session_template(sessions_dir: Path) -> str | None:
+    """Return template content, or None if the template file does not exist."""
+    template_path = sessions_dir / "session.template.md"
+    if template_path.exists():
+        return template_path.read_text()
+    return None
+
+
+def _next_sequence_number(sessions_dir: Path, date_str: str) -> int:
+    """Return the next available sequence number for *date_str* (YYYYMMDD)."""
+    existing = [
+        p.stem for p in sessions_dir.glob(f"{date_str}-*.md")
+        if p.stem != "session.template"
+    ]
+    if not existing:
+        return 1
+    numbers = []
+    for stem in existing:
+        parts = stem.split("-", 1)
+        if len(parts) == 2:
+            try:
+                numbers.append(int(parts[1]))
+            except ValueError:
+                pass
+    return max(numbers) + 1 if numbers else 1
+
+
+def _session_id_to_path(sessions_dir: Path, session_id: str) -> Path | None:
+    """Return the Path for *session_id*, or None if not found."""
+    candidate = sessions_dir / f"{session_id}.md"
+    return candidate if candidate.exists() else None
+
+
+def _resolve_current_session_path(sessions_dir: Path) -> Path | None:
+    """Return the 'current' session path via pointer file or latest today."""
+    if _SESSION_POINTER_FILE.exists():
+        try:
+            pointer = Path(_SESSION_POINTER_FILE.read_text().strip())
+            if pointer.exists():
+                return pointer
+        except Exception:
+            pass
+
+    # Fall back to the latest session file for today (UTC)
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    candidates = sorted(sessions_dir.glob(f"{today}-*.md"))
+    return candidates[-1] if candidates else None
+
+
+def _extract_section_content(text: str, section_name: str) -> str | None:
+    """Return the body text of a named H2 section, or None if not found."""
+    pattern = re.compile(
+        rf"^## {re.escape(section_name)}\s*\n(.*?)(?=\Z|^## )",
+        re.MULTILINE | re.DOTALL,
+    )
+    m = pattern.search(text)
+    return m.group(1) if m else None
+
+
+def _replace_section_content(text: str, section_name: str, new_body: str) -> str | None:
+    """
+    Replace the body of the named H2 section with *new_body*.
+
+    Returns the updated full text, or None if the section was not found.
+    """
+    pattern = re.compile(
+        rf"(^## {re.escape(section_name)}\s*\n)(.*?)(?=\Z|^## )",
+        re.MULTILINE | re.DOTALL,
+    )
+    if not pattern.search(text):
+        return None
+    body = new_body if new_body.endswith("\n") else new_body + "\n"
+    return pattern.sub(lambda m: m.group(1) + body, text)
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    """Write *content* to *path* atomically via a sibling temp file + rename."""
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(content, encoding="utf-8")
+    os.rename(tmp_path, path)
+
+
+async def handle_create_session_file(args: dict) -> list[TextContent]:
+    """Create a new session file from the template."""
+    sessions_dir = _resolve_sessions_dir()
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    seq = _next_sequence_number(sessions_dir, today)
+    session_id = f"{today}-{seq:03d}"
+    file_path = sessions_dir / f"{session_id}.md"
+
+    template = _resolve_session_template(sessions_dir)
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    if template:
+        content = (
+            template
+            .replace("YYYYMMDD-NNN", session_id)
+            .replace("<ISO timestamp, e.g. 2026-03-25T14:32:00Z>", now_iso)
+        )
+    else:
+        content = (
+            f"# Session {session_id}\n\n"
+            f"**Started:** {now_iso}\n"
+            f"**Ended:** active\n\n"
+            "## Summary\n\n"
+            "## Open Threads\n\n"
+            "## Open Tasks\n\n"
+            "## Open Subagents\n\n"
+            "## Communication Channels\n\n"
+            "## Notable Events\n"
+        )
+
+    _atomic_write(file_path, content)
+    _atomic_write(_SESSION_POINTER_FILE, str(file_path))
+
+    import json as _json
+    result = _json.dumps({"path": str(file_path), "session_id": session_id})
+    return [TextContent(type="text", text=result)]
+
+
+async def handle_get_session_file(args: dict) -> list[TextContent]:
+    """Read a session file by ID or return the current one."""
+    import json as _json
+
+    session_id = args.get("session_id", "current")
+    sessions_dir = _resolve_sessions_dir()
+
+    if session_id == "current":
+        path = _resolve_current_session_path(sessions_dir)
+        if path is None:
+            return [TextContent(type="text", text='{"error": "No current session file found."}')]
+        resolved_id = path.stem
+    else:
+        path = _session_id_to_path(sessions_dir, session_id)
+        if path is None:
+            return [TextContent(type="text", text=_json.dumps({"error": f"Session file not found: {session_id}"}))]
+        resolved_id = session_id
+
+    content = path.read_text(encoding="utf-8")
+    result = _json.dumps({"path": str(path), "content": content, "session_id": resolved_id})
+    return [TextContent(type="text", text=result)]
+
+
+async def handle_update_session_file(args: dict) -> list[TextContent]:
+    """Update a named H2 section in a session file."""
+    import json as _json
+
+    section = args.get("section")
+    new_content = args.get("content")
+    session_id = args.get("session_id", "current")
+
+    if not section:
+        return [TextContent(type="text", text='{"error": "section is required."}')]
+    if new_content is None:
+        return [TextContent(type="text", text='{"error": "content is required."}')]
+
+    sessions_dir = _resolve_sessions_dir()
+
+    if session_id == "current":
+        path = _resolve_current_session_path(sessions_dir)
+        if path is None:
+            return [TextContent(type="text", text='{"error": "No current session file found."}')]
+    else:
+        path = _session_id_to_path(sessions_dir, session_id)
+        if path is None:
+            return [TextContent(type="text", text=_json.dumps({"error": f"Session file not found: {session_id}"}))]
+
+    original = path.read_text(encoding="utf-8")
+    updated = _replace_section_content(original, section, new_content)
+
+    if updated is None:
+        return [TextContent(type="text", text=_json.dumps({"error": f"Section not found: {section}"}))]
+
+    _atomic_write(path, updated)
+    result = _json.dumps({"path": str(path), "section": section, "updated": True})
+    return [TextContent(type="text", text=result)]
+
+
+async def handle_list_session_files(args: dict) -> list[TextContent]:
+    """List session files, optionally filtered by date."""
+    import json as _json
+
+    date_filter = args.get("date")
+    sessions_dir = _resolve_sessions_dir()
+
+    pattern = f"{date_filter}-*.md" if date_filter else "*.md"
+    candidates = sorted(
+        p for p in sessions_dir.glob(pattern)
+        if p.stem != "session.template" and re.match(r"^\d{8}-\d{3}$", p.stem)
+    )
+
+    def _has_content(path: Path) -> bool:
+        try:
+            text = path.read_text(encoding="utf-8")
+            body = _extract_section_content(text, "Summary") or ""
+            stripped = body.strip()
+            return len(stripped) > 50 and not stripped.startswith(_SESSION_SUMMARY_BOILERPLATE)
+        except Exception:
+            return False
+
+    entries = [
+        {"session_id": p.stem, "path": str(p), "has_content": _has_content(p)}
+        for p in candidates
+    ]
+    return [TextContent(type="text", text=_json.dumps(entries))]
 
 
 # =============================================================================
@@ -5480,22 +6053,29 @@ def validate_job_name(name: str) -> tuple[bool, str]:
     return True, ""
 
 
-def sync_crontab() -> tuple[bool, str]:
-    """Sync jobs.json to crontab. Returns (success, message)."""
+async def sync_crontab() -> tuple[bool, str]:
+    """Sync jobs.json to crontab. Returns (success, message).
+
+    Uses asyncio.create_subprocess_exec so the event loop remains responsive
+    while the crontab subprocess runs (fixes: sync was blocking for up to 10s).
+    """
     sync_script = _REPO_DIR / "scheduled-tasks" / "sync-crontab.sh"
     try:
-        result = subprocess.run(
-            [str(sync_script)],
-            capture_output=True,
-            text=True,
-            timeout=10
+        proc = await asyncio.create_subprocess_exec(
+            str(sync_script),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        if result.returncode == 0:
-            return True, result.stdout
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            return False, "Sync script timed out"
+        if proc.returncode == 0:
+            return True, stdout.decode()
         else:
-            return False, result.stderr or "Sync failed"
-    except subprocess.TimeoutExpired:
-        return False, "Sync script timed out"
+            return False, stderr.decode() or "Sync failed"
     except Exception as e:
         return False, str(e)
 
@@ -5556,7 +6136,7 @@ Keep output concise. The main Lobster instance will review this later.
     task_file.write_text(task_content)
 
     # Add to jobs.json
-    data["jobs"][name] = {
+    job_record = {
         "name": name,
         "schedule": schedule,
         "schedule_human": schedule_human,
@@ -5567,10 +6147,14 @@ Keep output concise. The main Lobster instance will review this later.
         "last_run": None,
         "last_status": None,
     }
+    chat_id = args.get("chat_id")
+    if chat_id is not None:
+        job_record["chat_id"] = chat_id
+    data["jobs"][name] = job_record
     save_scheduled_jobs(data)
 
     # Sync to crontab
-    success, msg = sync_crontab()
+    success, msg = await sync_crontab()
     if not success:
         return [TextContent(type="text", text=f"Job created but crontab sync failed: {msg}")]
 
@@ -5716,7 +6300,7 @@ Keep output concise. The main Lobster instance will review this later.
     save_scheduled_jobs(data)
 
     # Sync to crontab
-    success, msg = sync_crontab()
+    success, msg = await sync_crontab()
     sync_status = "" if success else f"\n(Warning: crontab sync failed: {msg})"
 
     return [TextContent(type="text", text=f"Updated job '{name}':\n- " + "\n- ".join(updated) + sync_status)]
@@ -5743,7 +6327,7 @@ async def handle_delete_scheduled_job(args: dict) -> list[TextContent]:
         task_file.unlink()
 
     # Sync to crontab
-    success, msg = sync_crontab()
+    success, msg = await sync_crontab()
     sync_status = "" if success else f"\n(Warning: crontab sync failed: {msg})"
 
     return [TextContent(type="text", text=f"Deleted job '{name}'" + sync_status)]
@@ -5755,8 +6339,12 @@ async def handle_check_task_outputs(args: dict) -> list[TextContent]:
     limit = args.get("limit", 10)
     job_name_filter = args.get("job_name", "").strip().lower()
 
-    # Get all output files
-    output_files = sorted(TASK_OUTPUTS_DIR.glob("*.json"), reverse=True)
+    # Get all output files, sorted by mtime descending (newest first).
+    # Sorting by filename is unreliable: non-date-prefixed files (e.g. old
+    # write_result artifacts) sort lexicographically ahead of date-prefixed
+    # write_task_output files and would dominate every result page.
+    all_files = list(TASK_OUTPUTS_DIR.glob("*.json"))
+    output_files = sorted(all_files, key=lambda p: p.stat().st_mtime, reverse=True)
 
     if not output_files:
         return [TextContent(type="text", text="No task outputs yet.\n\nOutputs will appear here when scheduled jobs complete.")]
@@ -5776,6 +6364,13 @@ async def handle_check_task_outputs(args: dict) -> list[TextContent]:
         try:
             with open(f) as fp:
                 data = json.load(fp)
+
+            # Skip files that are not write_task_output records.  The task-outputs
+            # directory may contain stale write_result artifacts (schema: task_id/text)
+            # from an older code path.  These have no job_name or output fields and
+            # would render as "unknown" / "(no output)".  Silently skip them.
+            if "job_name" not in data:
+                continue
 
             # Filter by job name
             if job_name_filter and data.get("job_name", "").lower() != job_name_filter:
@@ -5979,10 +6574,10 @@ async def handle_write_result(args: dict) -> list[TextContent]:
     # Notify wire server so SSE clients update within 40ms
     asyncio.create_task(_notify_wire_server())
 
-    # Debug alert: enqueue best-effort inbox message when LOBSTER_DEBUG=true.
+    # Debug alert: emit bus event when LOBSTER_DEBUG=true.
     # Fires at the MCP layer (before the dispatcher picks up the inbox message)
     # so the user sees the subagent message arrive in real time.
-    # _emit_debug_observation is a no-op when debug alerts are disabled — single gate.
+    # system_context events are suppressed by TelegramOutboxListener — bus gate.
     agent_id = args.get("agent_id", "").strip() or None
     alert_lines = [
         f"\U0001f4e8 [subagent\u2192dispatcher] type: {msg_type}",
@@ -5993,11 +6588,13 @@ async def handle_write_result(args: dict) -> list[TextContent]:
     if status:
         alert_lines.append(f"status: {status}")
     alert_lines.append(f"sent_reply: {bool(sent_reply_to_user)}")
-    _emit_debug_observation(
+    _emit_event(
         "\n".join(alert_lines),
-        category="system_context",
-        visibility="mcp-only",
+        event_type="agent.write_result",
+        severity="debug",
+        source="write-result",
         emitter=f"task:{task_id}",
+        task_id=task_id,
     )
 
     log.info(f"Subagent result queued in inbox: task_id={task_id} status={status} chat_id={chat_id}")
@@ -6099,18 +6696,19 @@ async def handle_write_observation(args: dict) -> list[TextContent]:
         except OSError as exc:
             log.warning(f"Failed to write observation to {obs_log}: {exc}")
 
-    # When LOBSTER_DEBUG=true, also enqueue a debug inbox message so the user
-    # sees what the dispatcher sees in real time. This is additive — the inbox
-    # write above always happens first regardless of debug mode.
-    # Visibility is "mcp-only": this fires at the MCP layer before the dispatcher
-    # picks up the inbox message, so the dispatcher has not yet seen it.
-    #
-    # system_context observations are internal routing decisions — never forward
-    # to Telegram (noisy, not actionable). Only system_error warrants real-time
-    # visibility; user_context is also forwarded as it may affect dispatcher behavior.
-    if _DEBUG_MODE and category != "system_context":
-        emitter = f"task:{task_id}" if task_id else "unknown"
-        _emit_debug_observation(text, category=category, visibility="mcp-only", emitter=emitter)
+    # When LOBSTER_DEBUG=true, emit a bus event so the user sees this observation
+    # arrive in real time. The bus listener handles the debug-mode gate and
+    # system_context suppression — callers do not need to check _DEBUG_MODE.
+    # This is additive: the inbox write above always happens regardless of debug mode.
+    emitter = f"task:{task_id}" if task_id else "unknown"
+    _emit_event(
+        text,
+        event_type=f"agent.observation.{category}",
+        severity="info" if category == "user_context" else "error" if category == "system_error" else "debug",
+        source="write-observation",
+        emitter=emitter,
+        task_id=task_id,
+    )
 
     log.info(
         f"Subagent observation queued in inbox: category={category} chat_id={chat_id}"
@@ -6264,6 +6862,17 @@ async def handle_session_start(args: dict) -> list[TextContent]:
         return [TextContent(type="text", text=f"Error starting session: {exc}")]
 
     log.info(f"Session started: agent_id={agent_id!r} agent_type={agent_type!r} chat_id={chat_id}")
+
+    # Option B: explicit dispatcher declaration.
+    # If the caller declares itself as the dispatcher, tag its MCP session ID
+    # immediately.  This is more robust than Option A (tag-on-first-use via
+    # wait_for_messages) because it fires during session_start, before any
+    # guarded tools are called.  Both options coexist; whichever fires first wins.
+    if agent_type == "dispatcher" and _http_session_manager is not None:
+        http_session_id = _get_current_http_session_id()
+        if http_session_id is not None:
+            _tag_dispatcher_session(http_session_id)
+
     # Notify wire server so SSE clients update within 40ms
     asyncio.create_task(_notify_wire_server())
     return [TextContent(
@@ -6310,7 +6919,8 @@ async def handle_session_end(args: dict) -> list[TextContent]:
 async def handle_get_active_sessions(args: dict) -> list[TextContent]:
     """Return all currently running agent sessions from the SQLite store."""
     try:
-        sessions = _session_store.get_active_sessions()
+        chat_id = args.get("chat_id")
+        sessions = _session_store.get_active_sessions(chat_id=chat_id)
     except Exception as exc:
         log.error(f"get_active_sessions failed: {exc}", exc_info=True)
         return [TextContent(type="text", text=f"Error querying active sessions: {exc}")]
@@ -6770,6 +7380,10 @@ async def handle_memory_store(arguments: dict[str, Any]) -> list[TextContent]:
     from memory.provider import VALENCE_VALUES
     raw_valence = arguments.get("valence", "neutral")
     valence = raw_valence if raw_valence in VALENCE_VALUES else "neutral"
+    metadata = {"tags": arguments.get("tags", [])}
+    chat_id_arg = arguments.get("chat_id")
+    if chat_id_arg is not None:
+        metadata["source_chat_id"] = chat_id_arg
 
     event = MemoryEvent(
         id=None,
@@ -6778,7 +7392,7 @@ async def handle_memory_store(arguments: dict[str, Any]) -> list[TextContent]:
         source=arguments.get("source", "internal"),
         project=arguments.get("project"),
         content=content,
-        metadata={"tags": arguments.get("tags", [])},
+        metadata=metadata,
         valence=valence,
     )
 
@@ -6790,17 +7404,19 @@ async def handle_memory_store(arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=f"Error storing memory: {e}")]
 
     # Debug alert: best-effort, isolated so a failure here never affects the store result.
-    # _emit_debug_observation is a no-op when debug alerts are disabled — single gate.
+    # system_context events are suppressed by TelegramOutboxListener — no manual gate needed.
     try:
         task_id_label = arguments.get("task_id", "").strip() or "dispatcher"
         content_preview = content[:80] + "…" if len(content) > 80 else content
-        _emit_debug_observation(
+        _emit_event(
             f"\U0001f9e0 [memory write] agent: {task_id_label}\n"
             f"type: {event.type}\n"
             f"content: {content_preview}",
-            category="system_context",
-            visibility="mcp-only",
+            event_type="memory.write",
+            severity="debug",
+            source="memory-store",
             emitter=task_id_label,
+            task_id=task_id_label if task_id_label != "dispatcher" else None,
         )
     except Exception:
         pass
@@ -6830,18 +7446,29 @@ async def handle_memory_search(arguments: dict[str, Any]) -> list[TextContent]:
         log.error(f"memory_search failed: {e}", exc_info=True)
         return [TextContent(type="text", text=f"Error searching memory: {e}")]
 
+    # Post-filter by chat_id if provided (attribution-based filtering)
+    chat_id = arguments.get("chat_id")
+    if chat_id is not None and results:
+        results = [
+            e for e in results
+            if e.metadata.get("source_chat_id") == chat_id
+            or "source_chat_id" not in e.metadata
+        ]
+
     # Debug alert: best-effort, isolated so a failure here never affects the search result.
-    # _emit_debug_observation is a no-op when debug alerts are disabled — single gate.
+    # system_context events are suppressed by TelegramOutboxListener — no manual gate needed.
     try:
         task_id_label = arguments.get("task_id", "").strip() or "dispatcher"
         result_count = len(results) if results else 0
-        _emit_debug_observation(
+        _emit_event(
             f"\U0001f50d [memory read] agent: {task_id_label}\n"
             f"query: {query}\n"
             f"results: {result_count} found",
-            category="system_context",
-            visibility="mcp-only",
+            event_type="memory.search",
+            severity="debug",
+            source="memory-search",
             emitter=task_id_label,
+            task_id=task_id_label if task_id_label != "dispatcher" else None,
         )
     except Exception:
         pass
@@ -6875,6 +7502,15 @@ async def handle_memory_recent(arguments: dict[str, Any]) -> list[TextContent]:
 
     try:
         results = _memory_provider.recent(hours=hours, project=project)
+
+        # Post-filter by chat_id if provided (attribution-based filtering)
+        chat_id = arguments.get("chat_id")
+        if chat_id is not None and results:
+            results = [
+                e for e in results
+                if e.metadata.get("source_chat_id") == chat_id
+                or "source_chat_id" not in e.metadata
+            ]
 
         if not results:
             return [TextContent(type="text", text=f"No events in the last {hours} hours.")]
@@ -8577,6 +9213,19 @@ async def main():
     setup_logging()
     _ensure_observation_worker()
 
+    # Clear the dispatcher state file on startup so a stale session ID from a
+    # previous run cannot linger and mislead hooks into thinking the old session
+    # is still active.  The file is re-written by _tag_dispatcher_session() once
+    # the dispatcher identifies itself via Options A, B, or C.
+    _clear_dispatcher_state_file()
+
+    # Initialize the event bus singleton with standard listeners.
+    # JsonlFileListener writes all events to logs/events.jsonl.
+    # TelegramOutboxListener delivers debug events to Telegram when LOBSTER_DEBUG=true.
+    # This is a no-op if called more than once (idempotent).
+    from event_bus import init_event_bus
+    init_event_bus()
+
     # Startup cleanup: mark stale 'running' rows as 'dead' before reconciler loop begins.
     # After a force-restart, agents killed mid-run leave their output files with
     # stop_reason=tool_use, which the reconciler treats as still-running. We fix this
@@ -8621,8 +9270,98 @@ async def main():
         log.warning(f"[startup] Pre-restart message recovery failed (non-fatal): {_recovery_err}")
 
     asyncio.create_task(reconcile_agent_sessions())
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+
+    # Transport selection: HTTP (streamable-http) or stdio.
+    #
+    # HTTP mode is activated by --http flag or MCP_TRANSPORT=http env var.
+    # In HTTP mode the server binds to localhost:PORT (default 8766) and
+    # Claude Code connects via "url": "http://localhost:PORT/mcp" in settings.json.
+    # The server process is managed by the lobster-mcp-local systemd service, so
+    # its lifetime is decoupled from the Claude Code process — CC restarts no
+    # longer kill the MCP server.
+    #
+    # stdio mode is the legacy default; it remains available for local dev and
+    # fallback scenarios.
+    use_http = (
+        "--http" in sys.argv
+        or os.environ.get("MCP_TRANSPORT", "").lower() == "http"
+    )
+
+    if use_http:
+        import contextlib
+        import uvicorn
+        from starlette.applications import Starlette
+        from starlette.requests import Request
+        from starlette.responses import Response
+        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+        # Determine port (--port N or MCP_HTTP_PORT env, default 8766)
+        port = int(os.environ.get("MCP_HTTP_PORT", 8766))
+        if "--port" in sys.argv:
+            try:
+                port = int(sys.argv[sys.argv.index("--port") + 1])
+            except (ValueError, IndexError):
+                pass
+
+        session_manager = StreamableHTTPSessionManager(app=server, stateless=False)
+
+        # Publish the session_manager reference so tool handlers (and /dispatcher-session)
+        # can inspect live session state without importing from main().
+        global _http_session_manager
+        _http_session_manager = session_manager
+
+        @contextlib.asynccontextmanager
+        async def _lifespan(app: Starlette):
+            async with session_manager.run():
+                log.info(f"[http-transport] Lobster MCP server listening on http://localhost:{port}/mcp")
+                yield
+
+        async def _mcp_handler(scope, receive, send):
+            request = Request(scope, receive)
+            path = request.url.path
+            if path == "/health":
+                response = Response('{"ok":true}', status_code=200, media_type="application/json")
+                await response(scope, receive, send)
+            elif path == "/mcp":
+                await session_manager.handle_request(scope, receive, send)
+            elif path == "/dispatcher-session":
+                # Returns the currently tagged dispatcher session ID and whether
+                # that session is still active in the session manager.
+                # Used by health checks and the reconciler to verify the dispatcher
+                # is connected.  Returns 200 with JSON payload in all cases;
+                # callers should check the "active" field.
+                dsid = _dispatcher_session_id
+                active = (
+                    dsid is not None
+                    and dsid in getattr(session_manager, "_server_instances", {})
+                )
+                payload = json.dumps({"session_id": dsid, "active": active})
+                response = Response(payload, status_code=200, media_type="application/json")
+                await response(scope, receive, send)
+            else:
+                response = Response("Not Found", status_code=404)
+                await response(scope, receive, send)
+
+        _inner_app = Starlette(lifespan=_lifespan)
+
+        async def _asgi_app(scope, receive, send):
+            if scope["type"] == "lifespan":
+                await _inner_app(scope, receive, send)
+            elif scope["type"] == "http":
+                await _mcp_handler(scope, receive, send)
+
+        config = uvicorn.Config(
+            _asgi_app,
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+            access_log=False,
+        )
+        http_server = uvicorn.Server(config)
+        await http_server.serve()
+    else:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
 if __name__ == "__main__":

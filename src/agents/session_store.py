@@ -668,8 +668,15 @@ def get_unnotified_completed(
 # Public: queries (pure — no side effects)
 # ---------------------------------------------------------------------------
 
-def get_active_sessions(path: Path | None = None) -> list[dict]:
+def get_active_sessions(
+    path: Path | None = None,
+    chat_id: str | None = None,
+) -> list[dict]:
     """Return all currently running sessions with elapsed time.
+
+    Args:
+        path: Optional DB path override.
+        chat_id: When provided, filter to sessions for this chat_id only.
 
     Returns:
         List of dicts with all session columns plus elapsed_seconds.
@@ -679,14 +686,26 @@ def get_active_sessions(path: Path | None = None) -> list[dict]:
     resolved = path if path is not None else _DEFAULT_DB_PATH
     conn = _get_connection(resolved)
 
-    cursor = conn.execute(
-        """
-        SELECT * FROM agent_sessions
-        WHERE status IN ('running', 'starting')
-          AND (agent_type IS NULL OR agent_type NOT IN ('dispatcher', 'hook'))
-        ORDER BY spawned_at ASC
-        """
-    )
+    if chat_id is not None:
+        cursor = conn.execute(
+            """
+            SELECT * FROM agent_sessions
+            WHERE status IN ('running', 'starting')
+              AND (agent_type IS NULL OR agent_type NOT IN ('dispatcher', 'hook'))
+              AND chat_id = ?
+            ORDER BY spawned_at ASC
+            """,
+            (chat_id,),
+        )
+    else:
+        cursor = conn.execute(
+            """
+            SELECT * FROM agent_sessions
+            WHERE status IN ('running', 'starting')
+              AND (agent_type IS NULL OR agent_type NOT IN ('dispatcher', 'hook'))
+            ORDER BY spawned_at ASC
+            """
+        )
     rows = cursor.fetchall()
     now = datetime.now(timezone.utc)
 
@@ -803,7 +822,7 @@ def format_active_sessions_block(sessions: list[dict]) -> str:
     Produces output like:
         [2 agents running]
         - functional-engineer: "Implement GSD phase plan for BIS-51" (chat: OWNER_CHAT_ID_PLACEHOLDER, 12m ago)
-        - general-purpose: "Archive link for Drew" (chat: OWNER_CHAT_ID_PLACEHOLDER, 2m ago)
+        - general-purpose: "Archive link for the user" (chat: OWNER_CHAT_ID_PLACEHOLDER, 2m ago)
 
     Returns an empty string if sessions is empty.
     """

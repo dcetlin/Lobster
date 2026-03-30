@@ -39,7 +39,7 @@ PROCESSED_DIR="$MESSAGES_DIR/processed"
 MAINTENANCE_FLAG="$MESSAGES_DIR/config/lobster-maintenance"
 
 # Services
-SERVICES=("lobster-router" "lobster-claude")
+SERVICES=("lobster-mcp-local" "lobster-router" "lobster-claude")
 
 #-------------------------------------------------------------------------------
 # Helper Functions
@@ -165,7 +165,7 @@ cmd_restart() {
 
     echo "Scheduling start via systemd-run in 2s..."
     if ! sudo systemd-run --system --on-active=2s --unit=lobster-restart-oneshot \
-            /bin/bash -c "rm -f '${MAINTENANCE_FLAG}'; systemctl start lobster-router lobster-claude" \
+            /bin/bash -c "rm -f '${MAINTENANCE_FLAG}'; systemctl start lobster-mcp-local lobster-router lobster-claude" \
             2>/dev/null; then
         echo -e "${RED}systemd-run failed — falling back to stop+start${NC}"
         echo -e "${YELLOW}Warning: if running inside lobster-claude, the start may not execute.${NC}"
@@ -407,11 +407,11 @@ cmd_ps() {
         if echo "$cmd" | grep -q -- '--max-turns'; then
             role="scheduled"
         fi
-        # Check if parent is run-job.sh
+        # Check if parent is dispatch-job.sh
         local ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
         if [ -n "$ppid" ]; then
             local parent_cmd=$(ps -o args= -p "$ppid" 2>/dev/null || true)
-            if echo "$parent_cmd" | grep -q 'run-job.sh'; then
+            if echo "$parent_cmd" | grep -qE 'run-job.sh|dispatch-job.sh'; then
                 role="scheduled"
             fi
         fi

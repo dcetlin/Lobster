@@ -101,6 +101,9 @@ MAX_RESTART_ATTEMPTS=3
 RESTART_COOLDOWN_SECONDS=600         # 10 min window for counting attempts
 RESTART_STATE_FILE="$WORKSPACE_DIR/logs/health-restart-state-v3"
 
+ALERT_DEDUP_COOLDOWN_SECONDS=900     # 15 minutes between alerts for the same issue type
+ALERT_DEDUP_DIR="$WORKSPACE_DIR/logs/health-alert-dedup"
+
 MEMORY_THRESHOLD=90                  # percentage
 DISK_THRESHOLD=95                    # percentage
 
@@ -135,6 +138,7 @@ LOBSTER_ENV="${LOBSTER_ENV:-production}"
 # Ensure log directory exists
 mkdir -p "$(dirname "$LOG_FILE")"
 mkdir -p "$(dirname "$RESTART_STATE_FILE")"
+mkdir -p "$ALERT_DEDUP_DIR"
 
 # Lifecycle gate: skip monitoring and restart loop in non-production environments.
 # Resource checks (disk/memory/auth) do not run either — the service is intentionally
@@ -202,6 +206,46 @@ send_telegram_alert() {
     else
         log_error "Telegram alert failed (curl exit $rc)"
     fi
+}
+
+# send_telegram_alert_deduped — like send_telegram_alert but suppresses repeat
+# alerts for the same issue_key within ALERT_DEDUP_COOLDOWN_SECONDS.
+#
+# Usage:
+#   send_telegram_alert_deduped "issue_key" "message text"
+#
+# The issue_key is a short stable identifier for the problem category
+# (e.g. "stale-inbox", "wrapper-missing", "auth-expired").  Alerts with the
+# same key are suppressed if a previous alert with that key was sent within
+# ALERT_DEDUP_COOLDOWN_SECONDS.  This prevents a restart storm from flooding
+# Telegram with dozens of identical alerts every 4 minutes.
+#
+# BLACK-state alerts and post-restart recovery confirmations should use the
+# raw send_telegram_alert() to guarantee delivery regardless of cooldown.
+send_telegram_alert_deduped() {
+    local issue_key="$1"
+    local message="$2"
+    local now
+    now=$(date +%s)
+
+    # Sanitize the key to a safe filename (alphanumeric + hyphen)
+    local safe_key
+    safe_key=$(echo "$issue_key" | tr -cs 'a-zA-Z0-9-' '-' | sed 's/-\+/-/g; s/^-//; s/-$//')
+    local stamp_file="$ALERT_DEDUP_DIR/${safe_key}"
+
+    if [[ -f "$stamp_file" ]]; then
+        local last_sent
+        last_sent=$(cat "$stamp_file" 2>/dev/null || echo 0)
+        local age=$(( now - last_sent ))
+        if [[ $age -lt $ALERT_DEDUP_COOLDOWN_SECONDS ]]; then
+            log_info "Alert dedup: suppressing '$issue_key' alert (sent ${age}s ago, cooldown ${ALERT_DEDUP_COOLDOWN_SECONDS}s)"
+            return 0
+        fi
+    fi
+
+    # Record send time before the curl call to avoid double-sends on retry
+    echo "$now" > "$stamp_file"
+    send_telegram_alert "$message"
 }
 
 #===============================================================================
@@ -828,13 +872,23 @@ check_outbox_drain() {
 }
 
 # Check 6: wait_for_messages freshness
-# Checks the mtime of the claude-heartbeat file, which inbox_server.py touches
-# at the start of every wait_for_messages call. If the file hasn't been updated
-# within WFM_STALE_SECONDS, the main loop is presumed stuck (e.g. infinite
-# loop, hung tool call, or Claude exit without wrapper noticing). Suppressed
-# during hibernation and the compaction window.
+# The dispatcher is considered "fresh" if EITHER:
+#   (a) the claude-heartbeat file was touched recently — inbox_server.py touches
+#       it at the start of every wait_for_messages call, OR
+#   (b) last_processed_at in lobster-state.json was updated recently — written
+#       by inbox_server.py on every successful mark_processed call (issue #694).
+#
+# Using both signals prevents a spurious restart when the dispatcher is actively
+# processing a long batch of messages (e.g. 20 cron pings) without returning to
+# wait_for_messages.  Before this fix, a long batch could exhaust the suppression
+# window mid-batch, triggering a false-positive health-check restart even though
+# the dispatcher was busy and healthy.
+#
+# The effective freshness timestamp is max(wfm_heartbeat_mtime, last_processed_at).
 #
 # Gracefully skips the check if the heartbeat file does not exist (fresh install).
+# Gracefully ignores a missing or unparseable last_processed_at (field absent on
+# older installs before this change was deployed).
 #
 # Returns: 0=GREEN (fresh or skipped), 2=RED (stale)
 check_wfm_freshness() {
@@ -850,16 +904,43 @@ check_wfm_freshness() {
         return 0
     fi
 
+    # Read the per-message heartbeat written by mark_processed (issue #694).
+    # Use whichever signal is more recent as the effective freshness epoch.
+    local last_processed_epoch=0
+    if [[ -f "$LOBSTER_STATE_FILE" ]]; then
+        local last_processed_at
+        last_processed_at=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('$LOBSTER_STATE_FILE'))
+    print(d.get('last_processed_at', ''))
+except Exception:
+    print('')
+" 2>/dev/null)
+        if [[ -n "$last_processed_at" ]]; then
+            last_processed_epoch=$(date -d "$last_processed_at" +%s 2>/dev/null) || last_processed_epoch=0
+        fi
+    fi
+
+    # Effective freshness = most recent of the two signals
+    local effective_last
+    if [[ "$last_processed_epoch" -gt "$last_heartbeat" ]]; then
+        effective_last="$last_processed_epoch"
+        log_info "WFM freshness: using last_processed_at signal (more recent than WFM heartbeat)"
+    else
+        effective_last="$last_heartbeat"
+    fi
+
     local now age
     now=$(date +%s)
-    age=$(( now - last_heartbeat ))
+    age=$(( now - effective_last ))
 
     if [[ $age -gt $WFM_STALE_SECONDS ]]; then
-        log_error "RED: wait_for_messages stale — heartbeat last updated ${age}s ago (threshold: ${WFM_STALE_SECONDS}s)"
+        log_error "RED: dispatcher stale — last activity ${age}s ago (threshold: ${WFM_STALE_SECONDS}s, wfm=${last_heartbeat}, last_processed=${last_processed_epoch})"
         return 2
     fi
 
-    log_info "WFM freshness OK: last wait_for_messages ${age}s ago"
+    log_info "WFM freshness OK: last dispatcher activity ${age}s ago"
     return 0
 }
 
@@ -1281,7 +1362,7 @@ do_restart() {
     if [[ "$active_subagents" -gt 0 ]]; then
         log_warn "SUBAGENT GUARD: Skipping restart ($active_subagents active subagent(s) running) — will re-evaluate next check"
         if [[ "$suppress_alert" != "true" ]]; then
-            send_telegram_alert "Health check deferred restart: $active_subagents active subagent(s) in flight.
+            send_telegram_alert_deduped "subagent-guard" "Health check deferred restart: $active_subagents active subagent(s) in flight.
 
 Reason that triggered restart: $reason
 
@@ -1398,7 +1479,7 @@ Manual intervention required:
     # dispatchers running simultaneously.
     if [[ -n "$pre_restart_pid" ]] && kill -0 "$pre_restart_pid" 2>/dev/null; then
         log_error "ABORT: Could not kill pre-restart Claude PID $pre_restart_pid — refusing to start new session to prevent duplicate dispatcher"
-        send_telegram_alert "Restart aborted — could not kill existing Claude process (PID $pre_restart_pid).
+        send_telegram_alert_deduped "restart-aborted-pid" "Restart aborted — could not kill existing Claude process (PID $pre_restart_pid).
 
 Reason: $reason
 
@@ -1497,7 +1578,7 @@ Manual intervention required to kill the process before restarting:
             local post_rc=$?
             if [[ $post_rc -eq 2 ]]; then
                 log_warn "Post-restart: inbox still has NEW stale messages (not same as pre-restart)"
-                send_telegram_alert "System restarted but inbox still has stale messages.
+                send_telegram_alert_deduped "post-restart-stale-inbox" "System restarted but inbox still has stale messages.
 
 Reason: $reason
 Status: Restarted, but new stale messages detected post-restart"
@@ -1508,6 +1589,7 @@ Status: Restarted, but new stale messages detected post-restart"
         log_info "Restart successful"
         write_boot_timestamp
         if [[ "$suppress_alert" != "true" ]]; then
+            # "Recovered" alert: use raw send (important positive signal, not spammy)
             send_telegram_alert "System recovered automatically.
 
 Reason: $reason
@@ -1521,7 +1603,7 @@ Status: Restarted successfully"
         if [[ "$pid_changed" == false ]]; then
             # PID did not change: the old process survived the restart attempt.
             log_error "Restart failed: Claude PID $pre_restart_pid unchanged after 3 checks — old session survived"
-            send_telegram_alert "Restart failed — process still running under original PID $pre_restart_pid.
+            send_telegram_alert_deduped "restart-failed-pid" "Restart failed — process still running under original PID $pre_restart_pid.
 
 Reason: $reason
 Manual intervention may be required: \`lobster restart\`"
@@ -1536,7 +1618,7 @@ Manual intervention may be required: \`lobster restart\`"
                 not_ready_detail="tmux session missing (service is active)"
             fi
             log_warn "Restart confirmed (PID changed) but service/tmux not ready after ${svc_timeout_s}s: $not_ready_detail"
-            send_telegram_alert "Restart confirmed (PID changed) — service/tmux not yet ready after ${svc_timeout_s}s.
+            send_telegram_alert_deduped "restart-not-ready" "Restart confirmed (PID changed) — service/tmux not yet ready after ${svc_timeout_s}s.
 
 Reason: $reason
 Detail: $not_ready_detail

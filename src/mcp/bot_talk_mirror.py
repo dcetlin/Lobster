@@ -3,7 +3,7 @@
 Bot-talk mirroring module.
 
 Mirrors Lobster's inbound and outbound messages to the shared bot-talk channel
-so Albert's Lobster can observe what Sahar's Lobster is doing.
+so Albert's Lobster can observe what the owner's Lobster is doing.
 
 Architecture
 ------------
@@ -54,6 +54,11 @@ log = logging.getLogger(__name__)
 # Falls back to reading config.env (same pattern as inbox_server.py / OPENAI_API_KEY).
 # If BOT_TALK_HTTP_URL is empty after all lookups, HTTP mirroring is silently
 # disabled (SSH fallback still applies if sharedLobster is reachable).
+#
+# IMPORTANT: The bot-talk service runs plain HTTP on port 4242 — there is no
+# TLS on this endpoint (TLS was intentionally removed).  Always use http://
+# (never https://) when constructing or configuring BOT_TALK_HTTP_URL.
+# Using https:// causes an SSL handshake failure on every request.
 # ---------------------------------------------------------------------------
 
 def _read_config_env(key: str) -> str:
@@ -92,6 +97,11 @@ BOT_TALK_SSH_LOG: str = (
     os.environ.get("BOT_TALK_SSH_LOG_PATH")
     or _read_config_env("BOT_TALK_SSH_LOG_PATH")
     or "/home/shared/bot-talk/log.txt"
+)
+BOT_TALK_TOKEN: str = (
+    os.environ.get("BOT_TALK_TOKEN")
+    or _read_config_env("BOT_TALK_TOKEN")
+    or ""
 )
 BOT_TALK_HTTP_TIMEOUT = 3.0   # seconds
 BOT_TALK_HTTP_RETRIES = 2
@@ -148,6 +158,17 @@ def _build_ssh_log_line(content: str, genre: str) -> str:
     return f"[{ts}] [{BOT_TALK_SENDER}] [{BOT_TALK_TIER}] [{genre}] {short}"
 
 
+def _build_auth_headers() -> dict:
+    """Build HTTP headers including X-Bot-Token if configured.
+
+    Returns a plain dict; no I/O performed.
+    """
+    headers: dict = {}
+    if BOT_TALK_TOKEN:
+        headers["X-Bot-Token"] = BOT_TALK_TOKEN
+    return headers
+
+
 def _try_http(payload: dict) -> bool:
     """Attempt to POST payload to the bot-talk HTTP server.
 
@@ -156,10 +177,11 @@ def _try_http(payload: dict) -> bool:
     """
     if not BOT_TALK_HTTP_URL:
         return False
+    headers = _build_auth_headers()
     for attempt in range(BOT_TALK_HTTP_RETRIES + 1):
         try:
             with httpx.Client(timeout=BOT_TALK_HTTP_TIMEOUT) as client:
-                resp = client.post(BOT_TALK_HTTP_URL, json=payload)
+                resp = client.post(BOT_TALK_HTTP_URL, json=payload, headers=headers)
                 if resp.status_code in (200, 201):
                     return True
                 log.debug(f"bot-talk HTTP returned {resp.status_code} (attempt {attempt + 1})")

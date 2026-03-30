@@ -47,12 +47,44 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 from collections import deque
 
 
+# URLs longer than this are copy-paste targets (e.g. OAuth flows).  Telegram
+# hides the raw URL when it is embedded in an <a> tag, so we render them as
+# plain text instead — label on the first line, URL on the next — so the user
+# can long-press and copy without hunting through a menu.
+_LONG_URL_THRESHOLD = 200
+
+
+def _link_to_html(link_text: str, url: str) -> str:
+    """Convert a single [text](url) Markdown link to HTML.
+
+    Short URLs (≤ _LONG_URL_THRESHOLD chars) become a normal <a> tag so
+    Telegram renders them as a tappable hyperlink.
+
+    Long URLs (> _LONG_URL_THRESHOLD chars) are expanded to two lines of plain
+    text:
+        <b>link_text</b>
+        <pre>url</pre>
+
+    The <pre> wrapper prevents Telegram from collapsing the URL and makes it
+    easy to long-press and copy on mobile.
+    """
+    if len(url) > _LONG_URL_THRESHOLD:
+        # Escape HTML entities in the URL (it may contain & params already escaped)
+        escaped_url = url.replace('&amp;', '&').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        return f"<b>{link_text}</b>\n<pre>{escaped_url}</pre>"
+    return f'<a href="{url}">{link_text}</a>'
+
+
 def md_to_html(text: str) -> str:
     """Convert Telegram-flavored Markdown to HTML for reliable rendering.
 
     Handles: [text](url) links, `code`, ```code blocks```, **bold**, *bold*, _italic_,
     ## headings, ### headings, --- horizontal rules.
     Escapes &, <, > in non-HTML portions.
+
+    Long URLs (> _LONG_URL_THRESHOLD chars) are rendered as plain text rather
+    than hyperlinks — Telegram hides embedded URLs from users who need to
+    copy-paste them (e.g. OAuth flows).
     """
     # Split on code blocks first to avoid formatting inside them
     parts = re.split(r'(```[\s\S]*?```|`[^`\n]+`)', text)
@@ -79,8 +111,12 @@ def md_to_html(text: str) -> str:
             p = re.sub(r'(?m)^---+\s*$', '', p)
             # Headers: ### or ## or # at start of line → <b>text</b>
             p = re.sub(r'(?m)^#{1,6}\s+(.+)$', r'<b>\1</b>', p)
-            # Links: [text](url)
-            p = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', p)
+            # Links: [text](url) — long URLs rendered as plain text for copy-paste
+            p = re.sub(
+                r'\[([^\]]+)\]\(([^)]+)\)',
+                lambda m: _link_to_html(m.group(1), m.group(2)),
+                p,
+            )
             # Bold: **text**
             p = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', p)
             # Italic: _text_ (single, not double)
@@ -380,6 +416,12 @@ main_loop = None
 # Tracks files currently being processed to prevent duplicate sends
 _processing_files: set[str] = set()
 
+# Lock serialising the _processing_files check-and-add in _schedule_processing.
+# Without this, two watchdog events for the same file (e.g. IN_MOVED_TO and
+# IN_MODIFY arriving close together) could both pass the `not in` guard before
+# either has added the path, causing duplicate Telegram delivery (#922).
+_processing_files_lock = threading.Lock()
+
 # Lock to prevent concurrent wake attempts (race condition: two simultaneous
 # incoming messages while hibernating should only trigger one Claude spawn)
 _wake_lock = threading.Lock()
@@ -579,9 +621,20 @@ def wake_claude_if_hibernating() -> None:
         # This prevents restart storms: even if spawn fails, the state is no longer
         # "hibernate", so the health check won't skip its safety net.
         try:
-            state_data = {"mode": "active", "woke_at": datetime.now(timezone.utc).isoformat()}
+            # Read existing state first so we preserve fields like compacted_at,
+            # booted_at, and last_restart_at — same pattern as _write_lobster_state()
+            # in inbox_server.py. Overwriting with a bare dict was bug #923.
+            existing: dict = {}
+            try:
+                existing = json.loads(LOBSTER_STATE_FILE.read_text())
+            except Exception:
+                pass
+            existing.update({
+                "mode": "active",
+                "woke_at": datetime.now(timezone.utc).isoformat(),
+            })
             tmp = LOBSTER_STATE_FILE.parent / f".lobster-state-wake-{os.getpid()}.tmp"
-            tmp.write_text(json.dumps(state_data, indent=2))
+            tmp.write_text(json.dumps(existing, indent=2))
             tmp.rename(LOBSTER_STATE_FILE)
             log.info("wake_claude: reset state to 'active'")
         except Exception as e:
@@ -1348,12 +1401,17 @@ class OutboxHandler(FileSystemEventHandler):
     def _schedule_processing(self, filepath):
         if filepath.endswith('.json') and not filepath.endswith('.tmp'):
             if bot_app and main_loop and main_loop.is_running():
-                if filepath not in _processing_files:
+                # Hold the lock for the full check-and-add so two watchdog
+                # events for the same file cannot both pass the guard before
+                # either has added the path (TOCTOU — fixes #922).
+                with _processing_files_lock:
+                    if filepath in _processing_files:
+                        return
                     _processing_files.add(filepath)
-                    asyncio.run_coroutine_threadsafe(
-                        self.process_reply(filepath),
-                        main_loop
-                    )
+                asyncio.run_coroutine_threadsafe(
+                    self.process_reply(filepath),
+                    main_loop
+                )
 
     def on_created(self, event):
         if event.is_directory:

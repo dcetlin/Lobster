@@ -1334,7 +1334,7 @@ with open(path, 'w') as f:
         ' "$CLAUDE_SETTINGS" 2>/dev/null || echo "0")
         if [ "${has_file_protect:-0}" = "0" ] || [ "${has_file_protect:-0}" = "" ]; then
             TMP_SETTINGS=$(mktemp)
-            jq --arg cmd "python3 $INSTALL_DIR/hooks/system-file-protect.py" \
+            jq --arg cmd "python3 $LOBSTER_DIR/hooks/system-file-protect.py" \
                '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
                 "matcher": "Edit|Write|NotebookEdit",
                 "hooks": [{
@@ -1356,7 +1356,7 @@ with open(path, 'w') as f:
         ' "$CLAUDE_SETTINGS" 2>/dev/null || echo "0")
         if [ "${has_auditor:-0}" = "0" ] || [ "${has_auditor:-0}" = "" ]; then
             TMP_SETTINGS=$(mktemp)
-            jq --arg cmd "python3 $INSTALL_DIR/hooks/require-auditor-context-update.py" \
+            jq --arg cmd "python3 $LOBSTER_DIR/hooks/require-auditor-context-update.py" \
                '.hooks.SubagentStop = (.hooks.SubagentStop // []) + [{
                 "matcher": "",
                 "hooks": [{
@@ -1441,9 +1441,9 @@ with open(path, 'w') as f:
             | length
         ' "$CLAUDE_SETTINGS" 2>/dev/null || echo "0")
         if [ "${has_secret_scanner:-0}" = "0" ] || [ "${has_secret_scanner:-0}" = "" ]; then
-            chmod +x "$INSTALL_DIR/hooks/secret-scanner.py" 2>/dev/null || true
+            chmod +x "$LOBSTER_DIR/hooks/secret-scanner.py" 2>/dev/null || true
             TMP_SETTINGS=$(mktemp)
-            jq --arg cmd "python3 $INSTALL_DIR/hooks/secret-scanner.py" \
+            jq --arg cmd "python3 $LOBSTER_DIR/hooks/secret-scanner.py" \
                '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
                 "matcher": "mcp__lobster-inbox__send_reply|Bash",
                 "hooks": [{
@@ -1533,13 +1533,13 @@ EOF
     # via is_dispatcher() — the hook is a no-op for anything that is not the dispatcher.
     if [ -f "$CLAUDE_SETTINGS" ]; then
         if ! jq -e '.hooks.Stop[]? | select(.hooks[]?.command | contains("require-wait-for-messages"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
-            chmod +x "$INSTALL_DIR/hooks/require-wait-for-messages.py" 2>/dev/null || true
+            chmod +x "$LOBSTER_DIR/hooks/require-wait-for-messages.py" 2>/dev/null || true
             TMP_SETTINGS=$(mktemp)
             jq '.hooks.Stop = (.hooks.Stop // []) + [{
                 "matcher": "",
                 "hooks": [{
                     "type": "command",
-                    "command": "python3 '"$INSTALL_DIR"'/hooks/require-wait-for-messages.py",
+                    "command": "python3 '"$LOBSTER_DIR"'/hooks/require-wait-for-messages.py",
                     "timeout": 10
                 }]
             }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
@@ -1566,13 +1566,13 @@ EOF
     # threshold. Skips compaction events and subagent sessions.
     if [ -f "$CLAUDE_SETTINGS" ]; then
         if ! jq -e '.hooks.SessionStart[]? | select(.hooks[]?.command | contains("on-fresh-start"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
-            chmod +x "$INSTALL_DIR/hooks/on-fresh-start.py" 2>/dev/null || true
+            chmod +x "$LOBSTER_DIR/hooks/on-fresh-start.py" 2>/dev/null || true
             TMP_SETTINGS=$(mktemp)
             jq '.hooks.SessionStart = (.hooks.SessionStart // []) + [{
                 "matcher": "",
                 "hooks": [{
                     "type": "command",
-                    "command": "python3 '"$INSTALL_DIR"'/hooks/on-fresh-start.py",
+                    "command": "python3 '"$LOBSTER_DIR"'/hooks/on-fresh-start.py",
                     "timeout": 30
                 }]
             }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
@@ -1744,7 +1744,15 @@ DAILY_METRICS_TASK
         migrated=$((migrated + 1))
     fi
 
-    # Migration 42: Register decay-detector scheduled job (issue #137)
+# Migration 39: (removed) Previously copied bot-talk-poller.md and bot-talk-poller-fast.md
+    # from scheduled-tasks/tasks/ into the workspace. Those files contained hardcoded instance
+    # data (IP addresses, chat_ids, identity names) and have been removed from the public repo.
+    # Instance-specific task files belong in ~/lobster-workspace/scheduled-jobs/tasks/ and are
+    # created via MCP tools (create_scheduled_job) or user-config hooks — not pushed from the repo.
+
+    # Migration 37: Remove run-job.sh cron entries and make dispatch-job.sh executable.
+
+# Migration 42: Register decay-detector scheduled job (issue #137)
     # Pipeline Layer — Mode A: detects frozen intentions in the issue backlog.
     # Runs nightly at 04:00 UTC (after the 02:00 negentropic sweep), checks
     # rotation-state.json, and only executes on Night 4 of the sweep cycle.
@@ -2146,7 +2154,7 @@ AUTO_ROUTER_TASK
         migrated=$((migrated + 1))
     fi
 
-    # Migration 48: Update bot-talk poller task files to mirror both sides of conversation
+# Migration 48: Update bot-talk poller task files to mirror both sides of conversation
     # The poller previously only forwarded AlbertLobster messages to the owner. The updated
     # task files instruct the poller to collect both SaharLobster and AlbertLobster
     # messages, sort them chronologically, and send a single conversation block to the owner.
@@ -2169,19 +2177,18 @@ AUTO_ROUTER_TASK
     # `claude --print` invocations in Bash tool calls. Deploying in warn mode first
     # validates zero false positives before switching to hard-block. Mode is
     # controlled by LOBSTER_BLOCK_CLAUDE_P_MODE env var (default: warn).
-    # Note: Migration 41 already does this for our naming; this migration is for
-    # installations that came from upstream and need the updated hook path/format.
-    if [ -f "$CLAUDE_SETTINGS" ] && command -v jq >/dev/null 2>&1; then
-        local has_block_claude_p_updated
-        has_block_claude_p_updated=$(jq -r '
+if [ -f "$CLAUDE_SETTINGS" ] && command -v jq >/dev/null 2>&1; then
+        local has_block_claude_p
+        has_block_claude_p=$(jq -r '
             [.hooks.PreToolUse[]?.hooks[]?.command // empty]
             | map(select(contains("block-claude-p")))
             | length
         ' "$CLAUDE_SETTINGS" 2>/dev/null || echo "0")
-        if [ "${has_block_claude_p_updated:-0}" = "0" ] || [ "${has_block_claude_p_updated:-0}" = "" ]; then
-            chmod +x "$LOBSTER_DIR/hooks/block-claude-p.py" 2>/dev/null || true
+if [ "${has_block_claude_p:-0}" = "0" ] || [ "${has_block_claude_p:-0}" = "" ]; then
+            chmod +x "$INSTALL_DIR/hooks/block-claude-p.py" 2>/dev/null || true
             TMP_SETTINGS=$(mktemp)
-            jq --arg cmd "python3 $LOBSTER_DIR/hooks/block-claude-p.py"                '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
+            jq --arg cmd "python3 $INSTALL_DIR/hooks/block-claude-p.py" \
+               '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
                 "matcher": "Bash",
                 "hooks": [{
                     "type": "command",
@@ -2194,7 +2201,230 @@ AUTO_ROUTER_TASK
         fi
     fi
 
-    # Migration 50: Add valence column to memory.db events table.
+# Migration 41: Replace bare python3 invocation in post-compact-gate PreToolUse hook with
+    # a shell wrapper that skips Python startup when the sentinel file is absent.
+    # On the 99%+ of tool calls where compact-pending does not exist, `test ! -f ...` exits
+    # in ~1ms vs ~50ms for Python startup — eliminating ~14 unnecessary spawns per message cycle.
+    if [ -f "$CLAUDE_SETTINGS" ] && command -v jq >/dev/null 2>&1; then
+        local gate_cmd="python3 $LOBSTER_DIR/hooks/post-compact-gate.py"
+        local gate_wrapper="test ! -f /home/lobster/messages/config/compact-pending || python3 $LOBSTER_DIR/hooks/post-compact-gate.py"
+        local has_bare_gate
+        has_bare_gate=$(jq -r --arg cmd "$gate_cmd" '
+            [.hooks.PreToolUse[]?.hooks[]?.command // empty]
+            | map(select(. == $cmd))
+            | length
+        ' "$CLAUDE_SETTINGS" 2>/dev/null || echo "0")
+        if [ "${has_bare_gate:-0}" != "0" ] && [ "${has_bare_gate:-0}" != "" ]; then
+            TMP_SETTINGS=$(mktemp)
+            jq --arg old "$gate_cmd" --arg new "$gate_wrapper" '
+                .hooks.PreToolUse = [
+                    .hooks.PreToolUse[]? |
+                    .hooks = [
+                        .hooks[]? |
+                        if .command == $old then .command = $new else . end
+                    ]
+                ]
+            ' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+            substep "Updated post-compact-gate hook to use shell wrapper (skips Python when sentinel absent)"
+            migrated=$((migrated + 1))
+        fi
+    fi
+
+    # Migration 42: Narrow context-monitor PostToolUse hook matcher from "" (every tool) to
+    # "mcp__lobster-inbox__|Agent". Context window tracking is most relevant after MCP inbox
+    # calls and Agent spawns — the two events where token consumption is highest. This reduces
+    # PostToolUse spawns by ~65% with no meaningful loss of monitoring coverage.
+    # Also registers the hook if it is absent entirely (for installs that predate install.sh entry).
+    if [ -f "$CLAUDE_SETTINGS" ] && command -v jq >/dev/null 2>&1; then
+        local has_monitor_any
+        has_monitor_any=$(jq -r '
+            [.hooks.PostToolUse[]?.hooks[]?.command // empty]
+            | map(select(contains("context-monitor")))
+            | length
+        ' "$CLAUDE_SETTINGS" 2>/dev/null || echo "0")
+        if [ "${has_monitor_any:-0}" = "0" ] || [ "${has_monitor_any:-0}" = "" ]; then
+            # Hook is absent — install it with the correct (narrow) matcher.
+            chmod +x "$LOBSTER_DIR/hooks/context-monitor.py" 2>/dev/null || true
+            TMP_SETTINGS=$(mktemp)
+            jq --arg cmd "python3 $LOBSTER_DIR/hooks/context-monitor.py" \
+               '.hooks.PostToolUse = (.hooks.PostToolUse // []) + [{
+                "matcher": "mcp__lobster-inbox__|Agent",
+                "hooks": [{
+                    "type": "command",
+                    "command": $cmd,
+                    "timeout": 5
+                }]
+            }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+            substep "Registered context-monitor hook with narrow matcher (mcp__lobster-inbox__|Agent)"
+            migrated=$((migrated + 1))
+        else
+            # Hook exists — check if it has the old empty matcher and fix it.
+            local has_empty_matcher
+            has_empty_matcher=$(jq -r '
+                [.hooks.PostToolUse[]? | select(.hooks[]?.command | contains("context-monitor")) | .matcher]
+                | map(select(. == ""))
+                | length
+            ' "$CLAUDE_SETTINGS" 2>/dev/null || echo "0")
+            if [ "${has_empty_matcher:-0}" != "0" ] && [ "${has_empty_matcher:-0}" != "" ]; then
+                TMP_SETTINGS=$(mktemp)
+                jq '
+                    .hooks.PostToolUse = [
+                        .hooks.PostToolUse[]? |
+                        if (.hooks[]?.command | contains("context-monitor")) and .matcher == ""
+                        then .matcher = "mcp__lobster-inbox__|Agent"
+                        else .
+                        end
+                    ]
+                ' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+                substep "Narrowed context-monitor matcher from empty to mcp__lobster-inbox__|Agent"
+                migrated=$((migrated + 1))
+            fi
+        fi
+    fi
+
+    # Migration 43: Switch MCP transport from stdio to HTTP (issue #960).
+    # The lobster-mcp-local systemd service now runs inbox_server.py as a
+    # persistent HTTP server on localhost:8766.  Claude Code must be registered
+    # to connect via "url" instead of a stdio command so that CC auto-updates
+    # no longer kill the MCP server (they would close the stdio pipe).
+    #
+    # This migration:
+    #   a) Installs (or updates) the lobster-mcp-local systemd service.
+    #   b) Re-registers the lobster-inbox MCP server using HTTP transport.
+    #
+    # Idempotent: skipped if the HTTP registration already exists.
+    local mcp_http_already_registered
+    mcp_http_already_registered=$(claude mcp list 2>/dev/null | grep -c "localhost:8766" || echo "0")
+    if [ "${mcp_http_already_registered:-0}" = "0" ]; then
+        # Install / refresh the lobster-mcp-local service
+        local mcp_local_template="$LOBSTER_DIR/services/lobster-mcp-local.service.template"
+        local mcp_local_service="$LOBSTER_DIR/services/lobster-mcp-local.service"
+
+        if [ -f "$mcp_local_template" ]; then
+            # Render template (reuse generate_from_template if available, else sed directly)
+            if declare -f generate_from_template >/dev/null 2>&1; then
+                generate_from_template "$mcp_local_template" "$mcp_local_service"
+            else
+                # Minimal inline rendering matching install.sh variable names
+                local _user _group _config_dir _messages_dir _workspace_dir _user_config_dir
+                _user=$(whoami)
+                _group=$(id -gn)
+                _config_dir="${LOBSTER_CONFIG_DIR:-$HOME/lobster-config}"
+                _messages_dir="${LOBSTER_MESSAGES:-$HOME/messages}"
+                _workspace_dir="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}"
+                _user_config_dir="${LOBSTER_USER_CONFIG:-$HOME/lobster-user-config}"
+                sed \
+                    -e "s|{{USER}}|$_user|g" \
+                    -e "s|{{GROUP}}|$_group|g" \
+                    -e "s|{{INSTALL_DIR}}|$LOBSTER_DIR|g" \
+                    -e "s|{{CONFIG_DIR}}|$_config_dir|g" \
+                    -e "s|{{MESSAGES_DIR}}|$_messages_dir|g" \
+                    -e "s|{{WORKSPACE_DIR}}|$_workspace_dir|g" \
+                    -e "s|{{USER_CONFIG_DIR}}|$_user_config_dir|g" \
+                    "$mcp_local_template" > "$mcp_local_service"
+            fi
+        fi
+
+        if [ -f "$mcp_local_service" ] && pidof systemd >/dev/null 2>&1; then
+            sudo cp "$mcp_local_service" /etc/systemd/system/
+            sudo systemctl daemon-reload
+            sudo systemctl enable lobster-mcp-local 2>/dev/null || true
+            sudo systemctl restart lobster-mcp-local 2>/dev/null || true
+            substep "lobster-mcp-local service installed and (re)started"
+            # Wait briefly for the server to come up before re-registering
+            sleep 3
+        fi
+
+        # Remove any legacy mcpServers.lobster-inbox entry from settings.json if present.
+        # The claude mcp CLI stores entries in ~/.claude.json, not settings.json,
+        # but defensive cleanup costs nothing and handles any manual or legacy configs.
+        if [ -f "$CLAUDE_SETTINGS" ] && command -v jq >/dev/null 2>&1; then
+            if jq -e '.mcpServers."lobster-inbox"' "$CLAUDE_SETTINGS" >/dev/null 2>&1; then
+                TMP_SETTINGS=$(mktemp)
+                jq 'del(.mcpServers."lobster-inbox")' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+                substep "Removed legacy mcpServers.lobster-inbox entry from settings.json"
+            fi
+        fi
+
+        # Re-register MCP server using HTTP transport
+        claude mcp remove lobster-inbox 2>/dev/null || true
+        if claude mcp add --transport http lobster-inbox -s user "http://localhost:8766/mcp" 2>/dev/null; then
+            substep "lobster-inbox re-registered with HTTP transport (http://localhost:8766/mcp)"
+            migrated=$((migrated + 1))
+        else
+            warn "Migration 43: MCP HTTP re-registration may have failed. Run: claude mcp list"
+        fi
+    fi
+
+    # Migration 44: Switch bot-talk-poller cron entry to use bot-talk-check-dispatch.sh.
+    # The pre-check wrapper queries the bot-talk API before writing to the inbox,
+    # so no LLM subagent is spawned on empty polls. The runner field in jobs.json
+    # drives this via sync-crontab.sh; this migration re-syncs the crontab so the
+    # change takes effect on existing installs without a manual sync.
+    local BOT_TALK_CHECK_SCRIPT="$INSTALL_DIR/scheduled-tasks/bot-talk-check-dispatch.sh"
+    if [ -f "$BOT_TALK_CHECK_SCRIPT" ]; then
+        if ! crontab -l 2>/dev/null | grep -q "bot-talk-check-dispatch.sh"; then
+            chmod +x "$BOT_TALK_CHECK_SCRIPT" 2>/dev/null || true
+            # Re-run sync-crontab.sh to rebuild the crontab from jobs.json, picking up
+            # the new runner field for bot-talk-poller.
+            if [ -f "$INSTALL_DIR/scheduled-tasks/sync-crontab.sh" ]; then
+                chmod +x "$INSTALL_DIR/scheduled-tasks/sync-crontab.sh" 2>/dev/null || true
+                "$INSTALL_DIR/scheduled-tasks/sync-crontab.sh" 2>/dev/null || true
+                substep "Crontab re-synced: bot-talk-poller now uses bot-talk-check-dispatch.sh"
+                migrated=$((migrated + 1))
+            fi
+        fi
+    fi
+
+    # Migration 46: Add lobster user to the `crontab` group.
+    # The MCP server process runs under PR_SET_NO_NEW_PRIVS (NoNewPrivs=1), which
+    # suppresses setgid bits on child processes. The `crontab` binary is setgid-crontab,
+    # so `crontab -` fails with "mkstemp: Permission denied" when called from the MCP
+    # server. Fix: add the lobster user to the crontab group so sync-crontab.sh can
+    # write directly to /var/spool/cron/crontabs/$USER (group-writable directory) without
+    # needing the setgid bit. Requires sudo; warns and skips if sudo is unavailable.
+    local CRONTAB_DIR="/var/spool/cron/crontabs"
+    if [ -d "$CRONTAB_DIR" ] && ! id -nG "$USER" | grep -qw "crontab"; then
+        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            sudo usermod -aG crontab "$USER" 2>/dev/null && {
+                substep "Added $USER to the crontab group (fixes NoNewPrivs crontab permission error)"
+                migrated=$((migrated + 1))
+                warn "Group membership change takes effect at next login. Run 'newgrp crontab' or restart the Lobster service to apply immediately."
+            } || warn "Failed to add $USER to crontab group — run: sudo usermod -aG crontab $USER"
+        else
+            warn "Cannot add $USER to crontab group (sudo unavailable). Run manually: sudo usermod -aG crontab $USER"
+            warn "Until this is done, create_scheduled_job/update_scheduled_job/delete_scheduled_job will fail to sync crontab."
+        fi
+    fi
+
+    # Migration 52: Add LOBSTER-GHOST-DETECTOR cron entry.
+    # agent-monitor.py runs every 5 minutes and calls --alert --mark-failed directly,
+    # sending Telegram alerts when ghost agents are found. No LLM subagent is needed.
+    # Previously this was routed through REMINDER_ROUTING in sys.dispatcher.bootup.md
+    # which spawned a lobster-generalist just to run the script and relay its output.
+    # That LLM relay layer has been removed; the script now runs directly from cron.
+    local GHOST_DETECTOR_MARKER="# LOBSTER-GHOST-DETECTOR"
+    if ! crontab -l 2>/dev/null | grep -q "$GHOST_DETECTOR_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$GHOST_DETECTOR_MARKER" \
+            "*/5 * * * * cd $HOME && uv run $LOBSTER_DIR/scripts/agent-monitor.py --alert --mark-failed >> $WORKSPACE_DIR/logs/agent-monitor.log 2>&1 $GHOST_DETECTOR_MARKER"
+        substep "Added ghost detector cron entry (agent-monitor.py --alert --mark-failed, every 5 min)"
+        migrated=$((migrated + 1))
+    fi
+
+    # Migration 53: Add LOBSTER-OOM-CHECK cron entry.
+    # oom-monitor.py runs every 10 minutes, scans the kernel journal for OOM kills,
+    # and writes inbox messages directly when new events are detected. No LLM needed.
+    # Previously this was routed through REMINDER_ROUTING which spawned a subagent.
+    # Only active when LOBSTER_DEBUG=true (the script exits 0 silently otherwise).
+    local OOM_CHECK_MARKER="# LOBSTER-OOM-CHECK"
+    if ! crontab -l 2>/dev/null | grep -q "$OOM_CHECK_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$OOM_CHECK_MARKER" \
+            "*/10 * * * * cd $HOME && uv run $LOBSTER_DIR/scripts/oom-monitor.py --since-minutes 10 >> $WORKSPACE_DIR/logs/oom-monitor.log 2>&1 $OOM_CHECK_MARKER"
+        substep "Added OOM monitor cron entry (oom-monitor.py --since-minutes 10, every 10 min)"
+        migrated=$((migrated + 1))
+    fi
+
+# Migration 50: Add valence column to memory.db events table.
     # Classifies observations as golden (reinforce), smell (address), or neutral.
     # The Python code handles this via ALTER TABLE on startup for existing DBs,
     # but this migration catches cases where the MCP server hasn't restarted yet
