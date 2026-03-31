@@ -675,11 +675,49 @@ Respond with a JSON object only (no markdown, no explanation outside the JSON):
         return None
 
 
+def _fetch_prior_prescriptions(
+    current_log_str: str | None,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    """
+    Extract the last N prescription entries from the steward_log text.
+
+    The steward_log is a newline-delimited sequence of JSON objects.
+    Prescription events have event == "prescription" or "reentry_prescription".
+
+    Pure function: parses the log text and returns a list of at most `limit`
+    prescription dicts, ordered oldest-first (most recent last).  Returns []
+    when the log is absent, empty, or contains no prescription entries.
+
+    Each returned dict contains the keys present in the prescription log entry:
+    completion_assessment, next_posture_rationale, return_reason,
+    steward_cycles, and timestamp.
+    """
+    if not current_log_str:
+        return []
+
+    prescriptions: list[dict[str, Any]] = []
+    for line in current_log_str.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if entry.get("event") in ("prescription", "reentry_prescription"):
+            prescriptions.append(entry)
+
+    # Return the last `limit` entries (oldest-first ordering preserved).
+    return prescriptions[-limit:] if prescriptions else []
+
+
 def _build_deterministic_prescription_instructions(
     uow: UoW,
     reentry_posture: str,
     completion_gap: str,
     issue_body: str = "",
+    prior_prescriptions: list[dict[str, Any]] | None = None,
 ) -> str:
     """
     Build natural language prescription instructions for the Executor using
@@ -688,6 +726,17 @@ def _build_deterministic_prescription_instructions(
     This is the fallback path used when the LLM call fails or is unavailable.
     It is also the implementation called by _build_prescription_instructions
     when llm_prescriber returns None.
+
+    Args:
+        uow: The Unit of Work being prescribed.
+        reentry_posture: Categorized executor state from diagnosis.
+        completion_gap: Human-readable rationale for why work is incomplete.
+        issue_body: Raw GitHub issue body text. Used to compose context when
+            success_criteria is absent. Pass empty string if unavailable.
+        prior_prescriptions: List of prior steward_log prescription entries
+            (from _fetch_prior_prescriptions). Injected into re-prescription
+            context so the Steward can avoid repeating approaches that did not
+            work. Pass None or [] for the first cycle.
     """
     summary = uow.summary
     success_criteria = uow.success_criteria
@@ -738,6 +787,21 @@ def _build_deterministic_prescription_instructions(
     ]
     if criteria_block:
         parts += ["", criteria_block]
+
+    # Inject prior prescription attempts so the Executor avoids repeating
+    # approaches that already failed.  Only included when prior data exists.
+    if prior_prescriptions:
+        prior_lines = ["", "Prior prescription attempts (do not repeat these approaches):"]
+        for i, entry in enumerate(prior_prescriptions, start=1):
+            assessment = entry.get("completion_assessment", "")
+            rationale = entry.get("next_posture_rationale", "")
+            cycle_num = entry.get("steward_cycles", "?")
+            prior_lines.append(
+                f"  {i}. Cycle {cycle_num}: assessment={assessment!r}; "
+                f"rationale={rationale!r}"
+            )
+        parts += prior_lines
+
     return "\n".join(parts)
 
 
@@ -747,6 +811,7 @@ def _build_prescription_instructions(
     completion_gap: str,
     issue_body: str = "",
     llm_prescriber: Callable[..., dict[str, Any] | None] | None = _llm_prescribe,
+    prior_prescriptions: list[dict[str, Any]] | None = None,
 ) -> str:
     """
     Build natural language prescription instructions for the Executor.
@@ -763,6 +828,10 @@ def _build_prescription_instructions(
         llm_prescriber: Callable that takes (uow, reentry_posture, completion_gap,
             issue_body) and returns a dict or None. Inject None or a stub in tests
             to bypass the LLM call. Defaults to _llm_prescribe.
+        prior_prescriptions: List of prior steward_log prescription entries
+            (from _fetch_prior_prescriptions). Passed to the deterministic fallback
+            to inject re-prescription context. Ignored on the LLM path (LLM reads
+            steward_log directly via uow). Pass None or [] for the first cycle.
     """
     if llm_prescriber is not None:
         llm_result = llm_prescriber(uow, reentry_posture, completion_gap, issue_body)
@@ -780,7 +849,8 @@ def _build_prescription_instructions(
 
     # Deterministic fallback
     return _build_deterministic_prescription_instructions(
-        uow, reentry_posture, completion_gap, issue_body
+        uow, reentry_posture, completion_gap, issue_body,
+        prior_prescriptions=prior_prescriptions,
     )
 
 
@@ -1475,6 +1545,15 @@ def _process_uow(
 
     issue_body = issue_info.get("body", "") if issue_info else ""
 
+    # Fetch prior prescription attempts from steward_log when re-prescribing
+    # (cycles > 0).  This lets the Executor see what was already tried so it
+    # can avoid repeating approaches that did not work.
+    prior_prescriptions = (
+        _fetch_prior_prescriptions(current_log_str, limit=3)
+        if cycles > 0
+        else []
+    )
+
     # Wrap llm_prescriber to capture which path was taken (llm vs fallback).
     # The sentinel records a non-None return, indicating the LLM path succeeded.
     _llm_path_taken: list[bool] = [False]
@@ -1495,6 +1574,7 @@ def _process_uow(
     instructions = _build_prescription_instructions(
         uow, reentry_posture, completion_gap_for_prescription, issue_body,
         llm_prescriber=effective_prescriber,
+        prior_prescriptions=prior_prescriptions,
     )
 
     prescription_path = "llm" if _llm_path_taken[0] else "fallback"

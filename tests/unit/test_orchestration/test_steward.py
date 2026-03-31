@@ -18,6 +18,11 @@ Tests cover:
 - BOOTUP_CANDIDATE_GATE=False → bootup-candidate UoW is processed
 - re-entry: steward_agenda node updated; steward_log appended (not overwritten)
 - WorkflowArtifact path is absolute (expanded via os.path.expanduser)
+- Feedback loop: _fetch_prior_prescriptions parses steward_log correctly
+- Feedback loop: prior prescriptions injected into re-prescription instructions
+- Feedback loop: first cycle (steward_cycles=0) receives no prior context
+- Feedback loop: empty/None steward_log returns []
+- Feedback loop: only last N=3 entries returned when log has more
 - Diagnosis audit entry written BEFORE prescription/transition
 - workflow_artifact and prescribed_skills written before status transition
 - steward_cycles incremented on each prescription
@@ -1486,6 +1491,201 @@ class TestHardCapSurfaceIncludesReturnReason:
         assert notifications[0]["condition"] == "hard_cap"
         # return_reason is None when there are no audit entries recording a return_reason
         assert notifications[0]["return_reason"] is None
+
+
+# ---------------------------------------------------------------------------
+# Feedback loop tests
+# ---------------------------------------------------------------------------
+
+class TestFetchPriorPrescriptions:
+    """Unit tests for _fetch_prior_prescriptions — pure function."""
+
+    def test_returns_empty_for_none_log(self):
+        steward = _import_steward()
+        assert steward._fetch_prior_prescriptions(None) == []
+
+    def test_returns_empty_for_empty_string(self):
+        steward = _import_steward()
+        assert steward._fetch_prior_prescriptions("") == []
+
+    def test_returns_empty_when_no_prescription_events(self):
+        steward = _import_steward()
+        log = json.dumps({"event": "diagnosis", "steward_cycles": 0}) + "\n"
+        log += json.dumps({"event": "agenda_update", "steward_cycles": 0})
+        assert steward._fetch_prior_prescriptions(log) == []
+
+    def test_returns_prescription_events(self):
+        steward = _import_steward()
+        entry = {
+            "event": "prescription",
+            "steward_cycles": 0,
+            "completion_assessment": "no output",
+            "next_posture_rationale": "initial pass",
+            "return_reason": None,
+        }
+        log = json.dumps(entry)
+        result = steward._fetch_prior_prescriptions(log)
+        assert len(result) == 1
+        assert result[0]["event"] == "prescription"
+        assert result[0]["completion_assessment"] == "no output"
+
+    def test_returns_reentry_prescription_events(self):
+        steward = _import_steward()
+        entry = {
+            "event": "reentry_prescription",
+            "steward_cycles": 1,
+            "completion_assessment": "partial",
+            "next_posture_rationale": "retry",
+        }
+        log = json.dumps(entry)
+        result = steward._fetch_prior_prescriptions(log)
+        assert len(result) == 1
+        assert result[0]["event"] == "reentry_prescription"
+
+    def test_limits_to_last_n_entries(self):
+        steward = _import_steward()
+        lines = []
+        for i in range(5):
+            lines.append(json.dumps({
+                "event": "reentry_prescription" if i > 0 else "prescription",
+                "steward_cycles": i,
+                "completion_assessment": f"attempt {i}",
+            }))
+        log = "\n".join(lines)
+        result = steward._fetch_prior_prescriptions(log, limit=3)
+        assert len(result) == 3
+        # Most recent 3 (cycles 2, 3, 4)
+        assert result[0]["steward_cycles"] == 2
+        assert result[2]["steward_cycles"] == 4
+
+    def test_skips_malformed_json_lines(self):
+        steward = _import_steward()
+        log = (
+            json.dumps({"event": "prescription", "steward_cycles": 0, "completion_assessment": "gap"})
+            + "\nnot-json\n"
+            + json.dumps({"event": "reentry_prescription", "steward_cycles": 1, "completion_assessment": "gap2"})
+        )
+        result = steward._fetch_prior_prescriptions(log)
+        assert len(result) == 2
+
+    def test_ignores_blank_lines(self):
+        steward = _import_steward()
+        log = (
+            "\n"
+            + json.dumps({"event": "prescription", "steward_cycles": 0, "completion_assessment": "x"})
+            + "\n\n"
+        )
+        result = steward._fetch_prior_prescriptions(log)
+        assert len(result) == 1
+
+
+class TestFeedbackLoopIntegration:
+    """Integration tests: prior prescriptions appear in re-prescription instructions."""
+
+    def test_first_cycle_has_no_prior_context(self, db_path, registry, tmp_path):
+        """cycle=0 prescription must NOT include a 'Prior prescription attempts' block."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        conn = _open_db(db_path)
+        _make_uow_row(conn, status="ready-for-steward", steward_cycles=0)
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan=lambda *a, **kw: None,
+        )
+
+        # Read back the written workflow artifact and check instructions
+        artifacts = list((tmp_path / "artifacts").glob("*.json"))
+        assert artifacts, "Expected a workflow artifact to be written"
+        artifact_data = json.loads(artifacts[0].read_text())
+        instructions = artifact_data.get("instructions", "")
+        assert "Prior prescription attempts" not in instructions
+
+    def test_second_cycle_includes_prior_context(self, db_path, registry, tmp_path):
+        """cycle=1 (re-prescription) instructions must include prior prescription context."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        # Build a steward_log that already has a prescription entry from cycle 0
+        prior_entry = json.dumps({
+            "event": "prescription",
+            "steward_cycles": 0,
+            "completion_assessment": "no result file found",
+            "next_posture_rationale": "steward: first_execution — no result",
+            "return_reason": None,
+        })
+
+        conn = _open_db(db_path)
+        _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=1,
+            steward_log=prior_entry,
+            # Audit entry so diagnosis doesn't classify as first_execution
+            audit_log_entries=[
+                {
+                    "event": "execution_failed",
+                    "note": json.dumps({"return_reason": "execution_failed"}),
+                }
+            ],
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan=lambda *a, **kw: None,
+        )
+
+        artifacts = list((tmp_path / "artifacts").glob("*.json"))
+        assert artifacts, "Expected a workflow artifact to be written"
+        artifact_data = json.loads(artifacts[0].read_text())
+        instructions = artifact_data.get("instructions", "")
+        assert "Prior prescription attempts" in instructions, (
+            f"Re-prescription instructions must include prior context.\nInstructions:\n{instructions}"
+        )
+        assert "no result file found" in instructions
+
+    def test_prior_context_absent_when_steward_log_is_empty(self, db_path, registry, tmp_path):
+        """Re-prescription with steward_cycles=1 but empty log: no prior context block."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        conn = _open_db(db_path)
+        _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=1,
+            steward_log=None,
+            audit_log_entries=[
+                {
+                    "event": "execution_failed",
+                    "note": json.dumps({"return_reason": "execution_failed"}),
+                }
+            ],
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan=lambda *a, **kw: None,
+        )
+
+        artifacts = list((tmp_path / "artifacts").glob("*.json"))
+        assert artifacts, "Expected a workflow artifact to be written"
+        artifact_data = json.loads(artifacts[0].read_text())
+        instructions = artifact_data.get("instructions", "")
+        assert "Prior prescription attempts" not in instructions
 
 
 # ---------------------------------------------------------------------------
