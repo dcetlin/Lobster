@@ -172,6 +172,16 @@ For changes that affect existing installs (new cron entries, new directories, co
 - `~/messages/audio/` - Voice message audio files
 - `~/messages/task-outputs/` - Outputs from scheduled jobs
 
+## WOS Runtime Execution Control
+
+WOS executor dispatch is gated by `~/lobster-workspace/data/wos-config.json`:
+
+- `execution_enabled: true` — executor-heartbeat dispatches UoWs normally
+- `execution_enabled: false` — executor-heartbeat skips dispatch (TTL recovery still runs)
+- File absent — treated as `false` (safe default)
+
+Toggle via dispatcher commands: `wos start` sets `execution_enabled: true`; `wos stop` sets it `false`. These are handled directly in the dispatcher (no subagent). See `src/orchestration/dispatcher_handlers.py` for implementation.
+
 ## Permissions
 
 This system runs with `--dangerously-skip-permissions`. All tool calls are pre-authorized. Execute tasks directly without asking for permission.
