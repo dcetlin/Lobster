@@ -70,6 +70,30 @@ class TestUpsertCommand:
         assert "id" in result
         assert "action" in result
 
+    def test_upsert_with_issue_body_populates_success_criteria(self, db_path):
+        """--issue-body containing ## Acceptance Criteria must produce non-empty success_criteria."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        issue_body = (
+            "## Summary\nFix the thing.\n\n"
+            "## Acceptance Criteria\n"
+            "- It works\n"
+            "- Tests pass\n\n"
+            "## Notes\nSee PR for details."
+        )
+        inserted = run_cli(
+            db_path,
+            "upsert", "--issue", "3", "--title", "CLI criteria test",
+            "--sweep-date", today,
+            "--issue-body", issue_body,
+        )
+        assert inserted["action"] == "inserted"
+        uow_id = inserted["id"]
+
+        # Retrieve the record and assert success_criteria is populated
+        record = run_cli(db_path, "get", "--id", uow_id)
+        assert record["success_criteria"], "success_criteria must be non-empty when --issue-body is provided"
+        assert "It works" in record["success_criteria"]
+
 
 # ---------------------------------------------------------------------------
 # get command

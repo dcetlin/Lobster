@@ -67,10 +67,17 @@ def _output(data: dict | list) -> None:
 # ---------------------------------------------------------------------------
 
 def cmd_upsert(registry: Registry, args: argparse.Namespace) -> None:
+    issue_body = getattr(args, "issue_body", None) or ""
+    if issue_body:
+        from orchestration.cultivator import _extract_success_criteria
+        success_criteria = _extract_success_criteria(issue_body)
+    else:
+        success_criteria = ""
     result = registry.upsert(
         issue_number=args.issue,
         title=args.title,
         sweep_date=getattr(args, "sweep_date", None),
+        success_criteria=success_criteria,
     )
     match result:
         case UpsertInserted(id=uow_id):
@@ -193,6 +200,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_upsert.add_argument("--title", required=True, help="Issue title / UoW summary")
     p_upsert.add_argument("--sweep-date", dest="sweep_date", default=None,
                           help="Sweep date (YYYY-MM-DD). Defaults to today.")
+    p_upsert.add_argument("--issue-body", dest="issue_body", default=None,
+                          help="Full GitHub issue body text (used to extract success criteria).")
 
     # get
     p_get = subparsers.add_parser("get", help="Get a UoW by id")

@@ -172,20 +172,25 @@ def _bootup_gate_status(registry: Any) -> dict[str, Any]:
 
     'gate_open' = True means the gate is active and blocking bootup candidates.
     blocked_count is the number of ready-for-steward UoWs that would be skipped.
+
+    Reads the file flag via is_bootup_candidate_gate_active() so the dashboard
+    always reflects the current on-disk state, not a stale module-load value.
     """
-    from src.orchestration.steward import BOOTUP_CANDIDATE_GATE
+    from src.orchestration.steward import is_bootup_candidate_gate_active
     from src.orchestration.registry import UoWStatus
+
+    gate_active = is_bootup_candidate_gate_active()
 
     # Count UoWs in ready-for-steward (candidates that the gate might block).
     ready_for_steward = registry.list(status=str(UoWStatus.READY_FOR_STEWARD))
     blocked_count = len(ready_for_steward)
 
     return {
-        "gate_open": BOOTUP_CANDIDATE_GATE,
-        "blocked_count": blocked_count if BOOTUP_CANDIDATE_GATE else 0,
+        "gate_open": gate_active,
+        "blocked_count": blocked_count if gate_active else 0,
         "description": (
             "gate is OPEN — bootup-candidate UoWs are skipped by the Steward"
-            if BOOTUP_CANDIDATE_GATE
+            if gate_active
             else "gate is CLOSED — all UoWs are processed normally"
         ),
     }

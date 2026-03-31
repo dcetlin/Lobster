@@ -7,7 +7,7 @@ Tests cover:
 - _throughput_24h: delegates to execution_outcomes, maps key names
 - _cycle_histogram_last_7d: groups by steward_cycles for completed UoWs
 - _stalled_uows: filters by status + elapsed threshold
-- _bootup_gate_status: reads BOOTUP_CANDIDATE_GATE module constant
+- _bootup_gate_status: calls is_bootup_candidate_gate_active()
 - build_dashboard_data: assembles all sections into a single dict
 - render_text: renders expected section headers and data
 - render_text: empty states render '(none)' placeholders
@@ -259,7 +259,7 @@ class TestBootupGateStatus:
         registry.list.side_effect = lambda status=None: (
             [uow_rfs] if status == "ready-for-steward" else []
         )
-        with patch("src.orchestration.steward.BOOTUP_CANDIDATE_GATE", True):
+        with patch("src.orchestration.steward.is_bootup_candidate_gate_active", return_value=True):
             result = _bootup_gate_status(registry)
         assert result["gate_open"] is True
         assert result["blocked_count"] == 1
@@ -269,7 +269,7 @@ class TestBootupGateStatus:
         from src.orchestration.wos_dashboard import _bootup_gate_status
         registry = _make_registry([])
         registry.list.side_effect = lambda status=None: []
-        with patch("src.orchestration.steward.BOOTUP_CANDIDATE_GATE", False):
+        with patch("src.orchestration.steward.is_bootup_candidate_gate_active", return_value=False):
             result = _bootup_gate_status(registry)
         assert result["gate_open"] is False
         assert result["blocked_count"] == 0
@@ -288,7 +288,7 @@ class TestBuildDashboardData:
 
         with patch("src.orchestration.audit_queries.execution_outcomes", return_value={}), \
              patch("src.orchestration.wos_dashboard._fetch_completed_uow_ids_since", return_value=[]), \
-             patch("src.orchestration.steward.BOOTUP_CANDIDATE_GATE", True):
+             patch("src.orchestration.steward.is_bootup_candidate_gate_active", return_value=True):
             data = build_dashboard_data(registry, db_path)
 
         assert "generated_at" in data
@@ -305,7 +305,7 @@ class TestBuildDashboardData:
 
         with patch("src.orchestration.audit_queries.execution_outcomes", return_value={}), \
              patch("src.orchestration.wos_dashboard._fetch_completed_uow_ids_since", return_value=[]), \
-             patch("src.orchestration.steward.BOOTUP_CANDIDATE_GATE", False):
+             patch("src.orchestration.steward.is_bootup_candidate_gate_active", return_value=False):
             data = build_dashboard_data(registry, db_path)
 
         # Should parse without error

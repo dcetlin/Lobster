@@ -95,9 +95,30 @@ StewardOutcome = Prescribed | Done | Surfaced | RaceSkipped
 # Module-level constants
 # ---------------------------------------------------------------------------
 
+# Path to the file-flag that clears BOOTUP_CANDIDATE_GATE.
+# When this file exists, the gate is cleared and bootup-candidate UoWs are
+# processed normally. Create via `/wos unblock` dispatcher command.
+_GATE_CLEARED_FLAG: Path = Path(
+    os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
+) / "data" / "wos-gate-cleared"
+
+
+def is_bootup_candidate_gate_active() -> bool:
+    """Return True if BOOTUP_CANDIDATE_GATE is active (blocking bootup-candidates).
+
+    Returns False when the wos-gate-cleared file flag exists, indicating the
+    Phase 2 validation sequence has passed and all UoWs should be processed.
+
+    This function reads from disk on every call so that the gate state is always
+    current — cron processes get a fresh read on every invocation.
+    """
+    return not _GATE_CLEARED_FLAG.exists()
+
+
 # When True, the Steward skips UoWs with the `bootup-candidate` label.
-# This gate is True by default until the Phase 2 validation sequence passes.
-BOOTUP_CANDIDATE_GATE: bool = True
+# Evaluated at module load; re-evaluated on each cron process start.
+# To clear: create ~/lobster-workspace/data/wos-gate-cleared (or /wos unblock).
+BOOTUP_CANDIDATE_GATE: bool = is_bootup_candidate_gate_active()
 
 # Status values — use UoWStatus StrEnum (kept as aliases for backward compat)
 _STATUS_READY_FOR_STEWARD = UoWStatus.READY_FOR_STEWARD
@@ -503,23 +524,47 @@ def _build_prescription_instructions(
     uow: UoW,
     reentry_posture: str,
     completion_gap: str,
+    issue_body: str = "",
 ) -> str:
     """
     Build natural language prescription instructions for the Executor.
 
     The instruction is targeted at the specific gap identified.
+
+    Args:
+        uow: The Unit of Work being prescribed.
+        reentry_posture: Categorized executor state from diagnosis.
+        completion_gap: Human-readable rationale for why work is incomplete.
+        issue_body: Raw GitHub issue body text. Used to compose context when
+            success_criteria is absent. Pass empty string if unavailable.
     """
     summary = uow.summary
     success_criteria = uow.success_criteria
     cycles = uow.steward_cycles
 
+    # Build the criteria/context block from whatever is available.
+    # Priority: explicit success_criteria > issue body > nothing.
+    if success_criteria:
+        criteria_block = f"Success criteria: {success_criteria}"
+    elif issue_body:
+        # Truncate very long issue bodies to keep instructions readable.
+        body_excerpt = issue_body.strip()
+        if len(body_excerpt) > 1500:
+            body_excerpt = body_excerpt[:1500] + "\n[...truncated]"
+        criteria_block = f"Issue context:\n{body_excerpt}"
+    else:
+        criteria_block = ""
+
     if cycles == 0:
-        return (
-            f"Execute the following task:\n\n"
-            f"Summary: {summary}\n\n"
-            f"Success criteria: {success_criteria or 'See issue body for details.'}\n\n"
-            f"Write your output to the output_ref path."
-        )
+        parts = [
+            "Execute the following task:",
+            "",
+            f"Summary: {summary}",
+        ]
+        if criteria_block:
+            parts += ["", criteria_block]
+        parts += ["", "Write your output to the output_ref path."]
+        return "\n".join(parts)
 
     posture_context = {
         "execution_complete": "Previous execution completed but output needs improvement.",
@@ -531,13 +576,18 @@ def _build_prescription_instructions(
 
     posture_msg = posture_context.get(reentry_posture, "Continue from previous attempt.")
 
-    return (
-        f"Re-execution pass (cycle {cycles + 1}):\n\n"
-        f"{posture_msg}\n\n"
-        f"Gap identified: {completion_gap}\n\n"
-        f"Original task: {summary}\n\n"
-        f"Success criteria: {success_criteria or 'See issue body for details.'}"
-    )
+    parts = [
+        f"Re-execution pass (cycle {cycles + 1}):",
+        "",
+        posture_msg,
+        "",
+        f"Gap identified: {completion_gap}",
+        "",
+        f"Original task: {summary}",
+    ]
+    if criteria_block:
+        parts += ["", criteria_block]
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -1228,7 +1278,8 @@ def _process_uow(
         completion_gap_for_prescription = completion_rationale
         route_reason = f"steward: {reentry_posture} — {completion_rationale[:120]}"
 
-    instructions = _build_prescription_instructions(uow, reentry_posture, completion_gap_for_prescription)
+    issue_body = issue_info.get("body", "") if issue_info else ""
+    instructions = _build_prescription_instructions(uow, reentry_posture, completion_gap_for_prescription, issue_body)
 
     # Update agenda: mark current pending node as prescribed
     updated_agenda = _mark_current_agenda_node_prescribed(agenda)

@@ -143,3 +143,26 @@ Applied in WOS Phase 2 design (2026-03-30):
 ---
 
 *Entries should be added when: (1) an oracle decision receives an "Alignment verdict: Confirmed" with notable quality findings; (2) a negentropic sweep identifies an "undernamed gem" in the golden patterns section; (3) a reflection-systems review names a structural win specific to this codebase.*
+
+---
+
+### [2026-03-30] Pattern: importlib re-export bridge for backward-compatible file splits
+
+**Pattern:** When splitting a monolithic script into two files (concern A in file-A.py, concern B stays in file-B.py), use `importlib.util.spec_from_file_location` at module scope in file-B.py to load file-A.py and bind its exported symbols as top-level names in file-B.py. Register the loaded module in `sys.modules` before `exec_module` to prevent double-execution and ensure `@dataclass __module__` resolution works correctly.
+
+```python
+import importlib.util as _ilu
+_SWEEP_PATH = Path(__file__).parent / "startup-sweep.py"
+_sweep_spec = _ilu.spec_from_file_location("startup_sweep", _SWEEP_PATH)
+_sweep_mod = _ilu.module_from_spec(_sweep_spec)
+sys.modules["startup_sweep"] = _sweep_mod
+_sweep_spec.loader.exec_module(_sweep_mod)
+run_startup_sweep = _sweep_mod.run_startup_sweep
+StartupSweepResult = _sweep_mod.StartupSweepResult
+```
+
+**Why it works:** Tests that load file-B.py via importlib and access symbols by name continue to work without modification after the split. The re-export makes the file split invisible to callers — their import path (load heartbeat, access sweep symbols) still resolves correctly. Registering in `sys.modules` before `exec_module` is critical for `@dataclass` forward reference resolution. The failure mode for a missing file-A.py is a hard `FileNotFoundError` at import time, which makes the deployment dependency explicit rather than producing silent misbehavior.
+
+**Where it appears:** `scheduled-tasks/steward-heartbeat.py` lines 62–72 (PR #358). The split extracted startup sweep logic from the heartbeat; the re-export bridge preserved the test surface without requiring test modifications.
+
+**Reuse guidance:** Apply when splitting a scheduled-task script that is loaded by name via importlib in tests. The bridge belongs at module scope near the top of the file (after path setup, before the module's own logic). Note: this pattern introduces a deployment coupling — file-B requires file-A to exist at the expected relative path. Document this coupling in the module docstring. Do not use for src/ package modules where normal relative imports are available — importlib bridging is a script-context workaround, not a general-purpose import pattern.

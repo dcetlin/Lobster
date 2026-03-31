@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -132,6 +133,62 @@ def _classify_priority(issue: GitHubIssue) -> str:
     return "medium"
 
 
+# Section headings that indicate acceptance/success criteria in issue bodies.
+# Checked in order; first match wins.
+_SUCCESS_CRITERIA_HEADINGS = (
+    "## Acceptance Criteria",
+    "## acceptance criteria",
+    "## Success Criteria",
+    "## success criteria",
+    "## Definition of Done",
+    "## definition of done",
+)
+
+
+def _extract_success_criteria(body: str) -> str:
+    """
+    Extract success criteria from a GitHub issue body.
+
+    Looks for a section headed by one of _SUCCESS_CRITERIA_HEADINGS and returns
+    its content (everything up to the next ## heading or end of body). Falls back
+    to the first paragraph of the body if no criteria section is found.
+
+    Pure function — no I/O, no mutation.
+    """
+    if not body:
+        return ""
+
+    for heading in _SUCCESS_CRITERIA_HEADINGS:
+        idx = body.find(heading)
+        if idx == -1:
+            continue
+        # Advance past the heading line
+        section_start = body.find("\n", idx)
+        if section_start == -1:
+            continue
+        section_start += 1
+        # Find the next ## heading (or end of string)
+        next_heading = body.find("\n##", section_start)
+        if next_heading == -1:
+            section = body[section_start:]
+        else:
+            section = body[section_start:next_heading]
+        criteria = section.strip()
+        if criteria:
+            return criteria
+
+    # Fallback: use the first non-empty paragraph of the body.
+    # This gives the executor something concrete even on issues with no
+    # formal criteria section.
+    for paragraph in body.split("\n\n"):
+        paragraph = paragraph.strip()
+        if paragraph and not paragraph.startswith("#"):
+            # Truncate long paragraphs to keep the field readable.
+            return paragraph[:500] if len(paragraph) > 500 else paragraph
+
+    return ""
+
+
 def classify_issues(issues: list[GitHubIssue]) -> tuple[list[ClassifiedIssue], int]:
     """
     Classify all issues. Returns (classified_issues, skipped_count).
@@ -153,8 +210,14 @@ def classify_issues(issues: list[GitHubIssue]) -> tuple[list[ClassifiedIssue], i
 # ---------------------------------------------------------------------------
 
 def _build_db_path() -> Path:
-    """Resolve the WOS database path."""
-    return Path.home() / "lobster-workspace" / "data" / "wos.db"
+    """Resolve the WOS database path.
+
+    Uses LOBSTER_WORKSPACE env var when set (consistent with registry_cli,
+    audit_queries, and wos_dashboard). Falls back to the default workspace path.
+    The canonical registry DB lives at orchestration/registry.db.
+    """
+    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+    return workspace / "orchestration" / "registry.db"
 
 
 def promote_to_wos(
@@ -194,6 +257,7 @@ def promote_to_wos(
         result = registry.upsert(
             issue_number=issue.number,
             title=issue.title,
+            success_criteria=_extract_success_criteria(issue.body),
         )
 
         if isinstance(result, UpsertInserted):
