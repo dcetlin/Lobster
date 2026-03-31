@@ -1,81 +1,54 @@
-# Oracle Decisions
+# Oracle: Decisions
 
-## WOS Tier 6 Item #15 — TTL Recovery Integration Test
+## [2026-03-31] Tier 6 Item 14 — Re-prescription cycle integration test
 
-**Date**: 2026-03-31
-**File**: `tests/integration/test_wos_ttl_recovery.py`
+### Stage 1 review: design correctness
 
----
+**Q: Does the hard cap check in _detect_stuck_condition match the design doc's stated cap?**
 
-### Stage 1: Correctness Review
+The design doc specifies _HARD_CAP_CYCLES = 5. The check is `cycles >= _HARD_CAP_CYCLES`.
+This means the cap fires on the Steward cycle that reads `steward_cycles=5`, which is the
+*sixth* Steward invocation (after five prescriptions and five executor failures). This is
+correct behavior: the UoW gets exactly 5 chances before the Steward surfaces.
 
-**Question**: Do the tests correctly exercise the recovery mechanisms?
+The test was initially written with `_HARD_CAP_CYCLES - 1` fail cycles, which would only
+reach steward_cycles=4 (below the cap). Fixed to run `_HARD_CAP_CYCLES` fail cycles so
+steward_cycles reaches 5, which is the threshold that triggers surfacing.
 
-**TTL recovery path (`recover_ttl_exceeded_uows`)**:
-- Test seeds a UoW, advances it to `active` via direct SQL (mimicking Executor
-  claim), then backdates `started_at` to `TTL_EXCEEDED_HOURS + 1 minute` in the past.
-- `recover_ttl_exceeded_uows(registry)` is the exact production function from
-  `orchestration/executor.py` — no mock wrapper, no stub.
-- Assert: UoW id appears in the returned recovered list, status is `failed`,
-  and the `audit_log` contains an `execution_failed` entry with `ttl_exceeded`
-  in the reason field.
-- Negative test: fresh `active` UoW (started_at = now) is NOT in the recovered
-  list and stays `active`.
+**Q: Does `_simulate_executor_fail` faithfully reproduce the production failure path?**
 
-**Decision**: Correct. The test exercises the real function with a real in-memory
-DB and verifies the state machine transition plus audit trail.
+The helper uses the real Executor (6-step claim sequence), then overwrites result.json with
+outcome=failed. This correctly exercises: (a) the atomic claim transaction, (b) the
+output_ref being non-NULL and non-empty (Executor writes it), and (c) the Steward's
+`_assess_completion` reading the result file and returning is_complete=False for
+outcome=failed. The `execution_failed` audit entry is injected directly to simulate what
+the subagent would write via write_result in production.
 
-**executor_orphan path (`run_startup_sweep`)**:
-- Test seeds a UoW, advances it to `ready-for-executor`, then backdates
-  `created_at` to 2 hours ago (past the 1-hour orphan threshold).
-- `run_startup_sweep` is loaded via `importlib.util` because the filename is
-  `startup-sweep.py` (hyphen, not importable directly). This is a load-path
-  workaround, not a behavioral mock — the real function runs.
-- The `github_client` is a no-op lambda returning empty labels (bypasses the
-  bootup-candidate gate without stubbing internal gate logic).
-- Assert: `result.executor_orphans_swept == 1`, UoW status transitions to
-  `ready-for-steward`, and audit note carries `classification: executor_orphan`.
-- Negative test: UoW with recent `created_at` (under 1 hour) stays at
-  `ready-for-executor` and sweep count stays 0.
+**Q: Is the transition from active → ready-for-steward handled correctly after executor fails?**
 
-**Decision**: Correct. The no-op github_client is the minimal injectable seam
-the function exposes — injecting it rather than mocking internals is the right
-approach.
+The real Executor's `execute_uow` → `_run_execution` → `complete_uow` call transitions to
+ready-for-steward even when dispatching succeeds (because dispatch is a noop in tests). The
+result.json overwrite then makes the *Steward's* view of the outcome be "failed". This is
+the correct simulation: the Executor always returns the UoW to ready-for-steward; the Steward
+reads the result file to determine whether the work succeeded.
 
----
+### Stage 2 review: test coverage completeness
 
-### Stage 2: Boundary and Edge Case Review
+**Covered:**
+- Single failure → re-prescription (steward_cycles 0→1→2)
+- Multiple failures → steward_cycles increments correctly (1, 2, 3)
+- Hard cap fires at exactly steward_cycles=5 (not earlier, not later)
+- status=blocked at cap, not ready-for-executor
+- notify_dan called with condition='hard_cap' at cap
+- Early-warning notification fires at steward_cycles=4 (EARLY_WARNING_CYCLES)
+- Audit log records steward_prescription events for each re-prescription pass
+- Full end-to-end sequence from seed through cap
 
-**What is NOT tested (by design)**:
-- Concurrent recovery (two heartbeats running simultaneously) — race safety is
-  tested in the existing `test_wos_pipeline.py` concurrency test.
-- The `dry_run=True` path — tested indirectly by the pipeline test; not needed
-  here since this test is specifically about the live transition.
-- The `bootup_candidate_gate=True` path — would require a mock github_client
-  returning `bootup-candidate` label. Not part of this item's scope (TTL
-  recovery, not gate logic).
+**Out of scope (not covered by this test):**
+- outcome=partial re-prescription path (partial steps context)
+- outcome=blocked surfaces to Dan via executor_blocked condition
+- TTL-exceeded UoWs (separate recovery path via recover_ttl_exceeded_uows)
+- Concurrent Steward instances (optimistic lock race)
+- BOOTUP_CANDIDATE_GATE interaction (tested in test_wos_pipeline.py)
 
-**Pre-existing regression identified**: `test_wos_pipeline.py` uses dict-style
-access on `upsert()` return values (`result["action"]`, `result["id"]`), but the
-Registry API now returns typed dataclasses (`UpsertInserted`, `UpsertSkipped`).
-This causes the existing pipeline tests to ERROR at setup. This is a pre-existing
-regression in `test_wos_pipeline.py`, not introduced by this PR. Filed separately.
-
-**Schema migration**: The test applies Phase 2 columns idempotently (mirrors
-`test_wos_pipeline.py` pattern). The `executor_uow_view` DDL from the pipeline
-test is not applied here — not needed because `recover_ttl_exceeded_uows` and
-`run_startup_sweep` access `uow_registry` directly, not via the view.
-
-**Decision**: Test is complete for the stated scope. The pre-existing dict-access
-regression in `test_wos_pipeline.py` should be addressed in a follow-on issue.
-
----
-
-### Summary
-
-- 4 tests, all passing.
-- Covers TTL recovery (2 tests: positive + negative) and executor_orphan
-  detection (2 tests: positive + negative).
-- No src/ changes — test only, per task boundary.
-- Pre-existing bug found in `test_wos_pipeline.py`: API mismatch (dict vs
-  typed dataclass return). Recommend filing a GH issue.
+**Decision: all in-scope requirements from Tier 6 Item 14 are covered.**
