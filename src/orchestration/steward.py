@@ -182,28 +182,43 @@ def _most_recent_return_reason(audit_entries: list[dict]) -> str | None:
     """
     Extract the most recent return_reason from audit entries.
     Looks for the last audit_log entry with a `return_reason` key in its note.
+
+    For `execution_complete` events: return `"execution_complete"` as the
+    authoritative signal even when the note does not carry an explicit
+    `return_reason` or `classification`.  Formerly, the absence of those fields
+    caused the function to fall through and pick up the nearest prior
+    `startup_sweep executor_orphan` entry — making the Steward treat a
+    successful Executor dispatch as an orphan and re-prescribe indefinitely.
     """
     for entry in reversed(audit_entries):
+        event = entry.get("event", "")
         note = entry.get("note")
+
+        note_data: dict = {}
         if note:
             try:
-                data = json.loads(note)
-                if "return_reason" in data:
-                    return data["return_reason"]
+                note_data = json.loads(note)
             except (json.JSONDecodeError, TypeError):
                 pass
-        # Also check event name for startup_sweep classifications
-        event = entry.get("event", "")
-        if event in ("startup_sweep", "execution_complete", "execution_failed"):
-            note_data = {}
-            if note:
-                try:
-                    note_data = json.loads(note)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            rr = note_data.get("return_reason") or note_data.get("classification")
-            if rr:
-                return rr
+
+        # Explicit return_reason in note always wins regardless of event type.
+        if "return_reason" in note_data:
+            return note_data["return_reason"]
+
+        # Event-type defaults: return the canonical reason for each terminal event.
+        if event == "execution_complete":
+            # Authoritative: Executor successfully dispatched.  Return immediately
+            # so older startup_sweep entries cannot mask this completion.
+            return "execution_complete"
+        elif event == "startup_sweep":
+            clf = note_data.get("classification")
+            if clf:
+                return clf
+        elif event == "execution_failed":
+            clf = note_data.get("return_reason") or note_data.get("classification")
+            if clf:
+                return clf
+
     return None
 
 
