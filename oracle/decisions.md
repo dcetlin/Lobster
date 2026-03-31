@@ -1,49 +1,54 @@
-# Oracle Decisions
+# Oracle: Decisions
 
-## 2026-03-31 — WOS Simple Arc Integration Test (Tier 6 item #13)
+## [2026-03-31] Tier 6 Item 14 — Re-prescription cycle integration test
 
-### Stage 1: Right problem?
+### Stage 1 review: design correctness
 
-**Question:** Does the test prove the happy-path arc the task specification asks for?
+**Q: Does the hard cap check in _detect_stuck_condition match the design doc's stated cap?**
 
-**Arc specified:**
-1. GH issue → Cultivator seeds UoW (status: pending)
-2. Steward evaluates UoW, prescribes work (status: ready-for-executor)
-3. Executor claims UoW, dispatches subagent (status: active)
-4. Subagent writes result.json at output_ref (status still active)
-5. Steward evaluates result, marks done (status: done)
+The design doc specifies _HARD_CAP_CYCLES = 5. The check is `cycles >= _HARD_CAP_CYCLES`.
+This means the cap fires on the Steward cycle that reads `steward_cycles=5`, which is the
+*sixth* Steward invocation (after five prescriptions and five executor failures). This is
+correct behavior: the UoW gets exactly 5 chances before the Steward surfaces.
 
-**What the test actually tests:**
+The test was initially written with `_HARD_CAP_CYCLES - 1` fail cycles, which would only
+reach steward_cycles=4 (below the cap). Fixed to run `_HARD_CAP_CYCLES` fail cycles so
+steward_cycles reaches 5, which is the threshold that triggers surfacing.
 
-`test_full_arc_reaches_done` — seeds a UoW at pending (steps 1–2 via upsert + approve), advances to ready-for-steward (simulates trigger evaluator), runs Steward cycle 1 (step 2 → ready-for-executor), runs Executor with mocked dispatcher (steps 3–4: claims → active → writes result.json → ready-for-steward), runs Steward cycle 2 (step 5 → done). Asserts final status = done.
+**Q: Does `_simulate_executor_fail` faithfully reproduce the production failure path?**
 
-`test_arc_status_sequence_is_correct` — re-runs the same arc and verifies the audit_log contains the required events in the correct sequence: created, status_change (×2), steward_prescription, claimed, execution_complete, steward_closure.
+The helper uses the real Executor (6-step claim sequence), then overwrites result.json with
+outcome=failed. This correctly exercises: (a) the atomic claim transaction, (b) the
+output_ref being non-NULL and non-empty (Executor writes it), and (c) the Steward's
+`_assess_completion` reading the result file and returning is_complete=False for
+outcome=failed. The `execution_failed` audit entry is injected directly to simulate what
+the subagent would write via write_result in production.
 
-`test_done_is_terminal` — proves that a third Steward cycle after done finds 0 UoWs to evaluate (done has no re-entry path).
+**Q: Is the transition from active → ready-for-steward handled correctly after executor fails?**
 
-**Verdict: yes.** The test proves the pipeline wiring for the happy path. The single deviation from the specification is that the trigger evaluator (pending → ready-for-steward) is simulated via `set_status_direct` rather than a real trigger evaluator. This is appropriate: the trigger evaluator is not built yet (it is labeled ASPIRATIONAL in the design doc), and the test's goal is pipeline wiring, not trigger logic.
+The real Executor's `execute_uow` → `_run_execution` → `complete_uow` call transitions to
+ready-for-steward even when dispatching succeeds (because dispatch is a noop in tests). The
+result.json overwrite then makes the *Steward's* view of the outcome be "failed". This is
+the correct simulation: the Executor always returns the UoW to ready-for-steward; the Steward
+reads the result file to determine whether the work succeeded.
 
----
+### Stage 2 review: test coverage completeness
 
-### Stage 2: Well made?
+**Covered:**
+- Single failure → re-prescription (steward_cycles 0→1→2)
+- Multiple failures → steward_cycles increments correctly (1, 2, 3)
+- Hard cap fires at exactly steward_cycles=5 (not earlier, not later)
+- status=blocked at cap, not ready-for-executor
+- notify_dan called with condition='hard_cap' at cap
+- Early-warning notification fires at steward_cycles=4 (EARLY_WARNING_CYCLES)
+- Audit log records steward_prescription events for each re-prescription pass
+- Full end-to-end sequence from seed through cap
 
-**Functional principles applied:**
-- All mocks are pure functions (no shared mutable state between tests).
-- `_make_mock_dispatcher` returns a (function, calls_log) pair — the function is stateless; the log list is per-call-site.
-- `_noop_github_client`, `_noop_notify_dan`, `_noop_notify_dan_early_warning` are pure constants injected via the `run_steward_cycle` injectable parameters.
-- No global state mutation; each test fixture (`arc_env`) creates a fresh Registry in a fresh tmp_path.
+**Out of scope (not covered by this test):**
+- outcome=partial re-prescription path (partial steps context)
+- outcome=blocked surfaces to Dan via executor_blocked condition
+- TTL-exceeded UoWs (separate recovery path via recover_ttl_exceeded_uows)
+- Concurrent Steward instances (optimistic lock race)
+- BOOTUP_CANDIDATE_GATE interaction (tested in test_wos_pipeline.py)
 
-**Isolation:**
-- DB: per-test `tmp_path` SQLite file — not in-memory (correct: multiple connections need to share the DB, matching production).
-- Artifact dir: `tmp_path/artifacts` — no writes to production `~/lobster-workspace/`.
-- Output dir: `tmp_path/outputs` — `executor_module._OUTPUT_DIR_TEMPLATE` is patched and restored in a try/finally block.
-
-**Gaps / known issues:**
-
-1. `_OUTPUT_DIR_TEMPLATE` is patched at the module level, not via a proper injectable. This is the only mutation of shared state in the test. It is safe because tests run sequentially (pytest default), but is fragile under parallel execution. The Executor constructor already accepts `dispatcher` as injectable; an `output_dir` injectable on the Executor would be the clean fix. Filed as a known gap — not fixing in this PR (constraint: no src/ changes).
-
-2. The test does not cover the `pending → ready-for-steward` trigger evaluator step. The trigger evaluator is not yet built; `set_status_direct` is the correct stand-in.
-
-3. The existing `tests/integration/test_wos_pipeline.py` has several ERRORing fixtures (stale API calls like `result["action"]` and `registry.confirm()`). These pre-exist this PR and are not regressions introduced here.
-
-**Verdict: well made.** The three test cases are focused, self-contained, and each asserts a distinct property of the arc. The mock injection pattern is clean. The one shared-state mutation is documented and safe for sequential execution.
+**Decision: all in-scope requirements from Tier 6 Item 14 are covered.**
