@@ -1837,45 +1837,9 @@ if msg["text"].strip().lower().startswith("/re-review"):
 
 **Webhook coverage note:** This rule handles `/re-review` typed by the user in Telegram. A separate path — where the author posts `/re-review` as a comment directly on the GitHub PR — is not yet wired. GitHub PR comments are not currently delivered to the dispatcher inbox via webhook. That path requires webhook infrastructure and is tracked in issue #885. Until that lands, authors must relay the `/re-review` command via Telegram.
 
-### PR Merge Gate — oracle approval required before merge
+### PR Merge Gate
 
-Every code PR must pass oracle review before it is merged. This is a process-enforced gate: Lobster enforces the oracle → approve → merge sequence, not GitHub branch protection.
-
-**Mandatory flow:**
-
-```
-open PR
-  → dispatch lobster-oracle agent (reads PR, posts verdict to oracle/decisions.md)
-  → read oracle/decisions.md for this PR number
-  → if latest entry verdict is APPROVED:
-      dispatch merge agent → merge
-  → if latest entry verdict is NEEDS_CHANGES:
-      dispatch fix agent (implements required changes, pushes to branch)
-      → re-dispatch oracle agent
-      → repeat
-```
-
-**Merge agent pre-condition check (required before merging):**
-
-The merge agent must execute this check before calling `gh pr merge`:
-
-1. Read `~/lobster-workspace/oracle/decisions.md`
-2. Find the latest entry matching this PR number: `grep -n "PR #<N>" ~/lobster-workspace/oracle/decisions.md | tail -1`
-3. Read that entry and confirm the body contains `**Alignment verdict:** Confirmed` (and no subsequent NEEDS_CHANGES entry for the same PR number exists)
-4. Only if confirmed: proceed with merge
-5. If not confirmed: do NOT merge — report the missing or negative verdict to the dispatcher
-
-**Lookup pattern in oracle/decisions.md:**
-
-Entries for PRs use the header format:
-```
-### [DATE] PR #NNN — <description> (task: <task-id>)
-**Alignment verdict:** Confirmed
-```
-
-To find the oracle verdict for PR #123, scan for `PR #123` in decisions.md and read the most recent matching entry. A verdict of `**Alignment verdict:** Confirmed` means APPROVED. Any entry lacking an alignment verdict, or containing a negative finding without a subsequent APPROVED re-review, means the gate has not cleared.
-
-**Never merge a code PR that has not passed oracle review.** If the oracle entry is absent or the latest entry shows NEEDS_CHANGES, dispatch a fix agent rather than proceeding.
+Canonical encoding lives in the **Tier-1 Gate Register** table in `CLAUDE.md` — that row survives context compaction; this section does not. Consult that table for the authoritative trigger and enforcement rule.
 
 
 ## Processing Voice Note Brain Dumps
