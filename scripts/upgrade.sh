@@ -2929,8 +2929,8 @@ conn.close()
     # Migration 62: Add LOBSTER-GARDEN-CARETAKER cron entry and jobs.json registration
     # (GardenCaretaker PR4, WOS Phase 2).
     # Replaces cultivator.py + issue-sweeper.py with a unified scan-and-tend loop.
-    # Runs every 15 minutes as a Type B cron-direct script (not LLM-dispatched).
-    # jobs.json registration records it as Type B (dispatch=cron-direct) so the
+    # Runs every 15 minutes as a Type C cron-direct script (not LLM-dispatched).
+    # jobs.json registration records it as Type C (dispatch=cron-direct) so the
     # enabled gate in garden-caretaker.py can be toggled at runtime without touching cron.
     local GARDEN_CARETAKER_MARKER="# LOBSTER-GARDEN-CARETAKER"
     if ! crontab -l 2>/dev/null | grep -q "$GARDEN_CARETAKER_MARKER"; then
@@ -2958,7 +2958,7 @@ conn.close()
                 "type": "C",
                 "dispatch": "cron-direct"
             }' "$GARDEN_JOBS_FILE" > "$TMP_JOBS" && mv "$TMP_JOBS" "$GARDEN_JOBS_FILE"
-            substep "Registered garden-caretaker in jobs.json (Type B, every 15 min)"
+            substep "Registered garden-caretaker in jobs.json (Type C, every 15 min)"
             migrated=$((migrated + 1))
         fi
     fi

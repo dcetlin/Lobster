@@ -4,10 +4,9 @@ GardenCaretaker Heartbeat — cron-driven scan-and-tend cycle for WOS registry.
 
 Runs every 15 minutes. On each invocation:
 1. Checks the enabled gate in jobs.json (Type C job — cron-direct dispatch).
-2. Checks WOS execution_enabled from wos-config.json.
-3. Instantiates GardenCaretaker with the GitHubIssueSource for dcetlin/Lobster.
-4. Calls run_reconciliation_cycle() — which runs scan() then tend() in sequence.
-5. Logs a structured summary of seeded/qualified/archived/surfaced/reactivated counts.
+2. Instantiates GardenCaretaker with the GitHubIssueSource for dcetlin/Lobster.
+3. Calls run_reconciliation_cycle() — which runs scan() then tend() in sequence.
+4. Logs a structured summary of seeded/qualified/archived/surfaced/reactivated counts.
 
 Replaces the split responsibility of cultivator.py and issues-sweeper.py with
 a single infrastructure polling loop. This is a Type C job (pure Python script
@@ -127,18 +126,6 @@ def main() -> int:
         log.info(
             "GardenCaretaker: job disabled in jobs.json (enabled=false) "
             "— skipping cycle. Set enabled=true in jobs.json to re-enable."
-        )
-        return 0
-
-    # Gate 2: WOS execution_enabled check
-    from src.orchestration.dispatcher_handlers import is_execution_enabled
-    execution_enabled = is_execution_enabled()
-    log.info("WOS execution_enabled = %s", execution_enabled)
-
-    if not execution_enabled:
-        log.info(
-            "GardenCaretaker: WOS execution disabled (wos-config.json execution_enabled=false) "
-            "— skipping cycle. Use 'wos start' to enable."
         )
         return 0
 
