@@ -38,6 +38,17 @@ from src.orchestration.registry import UoW
 
 log = logging.getLogger("steward")
 
+# ---------------------------------------------------------------------------
+# LLM prescription model
+# ---------------------------------------------------------------------------
+
+# Use haiku for cost efficiency — prescriptions are structured short outputs.
+_LLM_PRESCRIPTION_MODEL = "claude-haiku-4-5"
+
+# Hard timeout for the LLM prescription call (seconds). If exceeded, falls
+# back to the deterministic template.
+_LLM_PRESCRIPTION_TIMEOUT_SECS = 30
+
 
 # ---------------------------------------------------------------------------
 # Status enum (golden pattern: StrEnum so values serialize as plain strings)
@@ -520,23 +531,163 @@ def _select_prescribed_skills(uow: "UoW", reentry_posture: str) -> list[str]:
     return skills
 
 
-def _build_prescription_instructions(
+def _llm_prescribe(
+    uow: UoW,
+    reentry_posture: str,
+    completion_gap: str,
+    issue_body: str = "",
+) -> dict[str, Any] | None:
+    """
+    Call Claude to generate a tailored prescription for the given UoW.
+
+    Returns a dict with keys:
+      - "instructions": str — full instruction block for the Executor
+      - "success_criteria_check": str — how to verify completion
+      - "estimated_cycles": int — expected execution passes needed
+
+    Returns None if the LLM call fails, is unavailable, or times out.
+    The caller must fall back to the deterministic template on None.
+
+    This function is a pure side-effect boundary: the only observable effect
+    is the Anthropic API call. All inputs are immutable value types.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        log.warning(
+            "LLM prescription unavailable: ANTHROPIC_API_KEY not set — using deterministic fallback"
+        )
+        return None
+
+    try:
+        import anthropic  # local import — optional dependency
+    except ImportError:
+        log.debug("_llm_prescribe: anthropic package not installed, skipping LLM call")
+        return None
+
+    # Build prior prescription summary from steward_log if available
+    prior_prescriptions: list[str] = []
+    if uow.steward_log:
+        try:
+            for line in uow.steward_log.strip().splitlines():
+                if not line.strip():
+                    continue
+                entry = json.loads(line)
+                event = entry.get("event", "")
+                if event in ("prescription", "reentry_prescription"):
+                    assessment = entry.get("completion_assessment", "")
+                    cycle = entry.get("steward_cycles", "?")
+                    if assessment:
+                        prior_prescriptions.append(
+                            f"  - Cycle {cycle}: {assessment}"
+                        )
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # Build the context block for the prompt
+    context_parts: list[str] = [
+        f"UoW ID: {uow.id}",
+        f"Summary: {uow.summary}",
+        f"Type: {uow.type}",
+    ]
+
+    if uow.success_criteria:
+        context_parts.append(f"Success criteria: {uow.success_criteria}")
+    elif issue_body:
+        body_excerpt = issue_body.strip()
+        if len(body_excerpt) > 2000:
+            body_excerpt = body_excerpt[:2000] + "\n[...truncated]"
+        context_parts.append(f"Issue body:\n{body_excerpt}")
+
+    context_parts.append(f"Execution cycle: {uow.steward_cycles} (0 = first pass)")
+    context_parts.append(f"Executor posture: {reentry_posture}")
+    context_parts.append(f"Completion gap identified: {completion_gap}")
+
+    if prior_prescriptions:
+        context_parts.append(
+            "Prior prescription history:\n" + "\n".join(prior_prescriptions)
+        )
+
+    uow_context = "\n".join(context_parts)
+
+    system_prompt = (
+        "You are prescribing work instructions for a Lobster subagent that will execute "
+        "a Unit of Work (UoW) in a software development pipeline. "
+        "Your prescription must be concrete, actionable, and directly executable. "
+        "Avoid vague language. Use the success_criteria as your north star for what 'done' means. "
+        "The Executor is a capable autonomous coding agent — write instructions at that level."
+    )
+
+    user_prompt = f"""Given this Unit of Work, write a precise prescription for the Executor.
+
+{uow_context}
+
+Respond with a JSON object only (no markdown, no explanation outside the JSON):
+{{
+  "instructions": "<complete, actionable instructions for the Executor — include the specific steps, what to produce, where to write output, and any constraints from the success criteria>",
+  "success_criteria_check": "<one or two sentences describing exactly how to verify the work is complete — what to check, what file exists, what content to confirm>",
+  "estimated_cycles": <integer 1-3 — how many Executor passes this is expected to need>
+}}"""
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=_LLM_PRESCRIPTION_MODEL,
+            max_tokens=1024,
+            timeout=_LLM_PRESCRIPTION_TIMEOUT_SECS,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        raw_text = response.content[0].text.strip()
+
+        # Strip markdown code fences if present
+        if raw_text.startswith("```"):
+            lines = raw_text.splitlines()
+            raw_text = "\n".join(
+                line for line in lines
+                if not line.startswith("```")
+            ).strip()
+
+        parsed = json.loads(raw_text)
+
+        instructions = str(parsed.get("instructions", "")).strip()
+        success_criteria_check = str(parsed.get("success_criteria_check", "")).strip()
+        estimated_cycles = int(parsed.get("estimated_cycles", 1))
+
+        if not instructions:
+            log.warning("_llm_prescribe: LLM returned empty instructions, falling back")
+            return None
+
+        log.debug(
+            "_llm_prescribe: LLM prescription generated for %s (estimated_cycles=%d)",
+            uow.id, estimated_cycles,
+        )
+        return {
+            "instructions": instructions,
+            "success_criteria_check": success_criteria_check,
+            "estimated_cycles": max(1, min(3, estimated_cycles)),
+        }
+
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "_llm_prescribe: LLM call failed for %s (%s: %s), falling back to deterministic template",
+            uow.id, type(exc).__name__, exc,
+        )
+        return None
+
+
+def _build_deterministic_prescription_instructions(
     uow: UoW,
     reentry_posture: str,
     completion_gap: str,
     issue_body: str = "",
 ) -> str:
     """
-    Build natural language prescription instructions for the Executor.
+    Build natural language prescription instructions for the Executor using
+    the deterministic keyword-matching template.
 
-    The instruction is targeted at the specific gap identified.
-
-    Args:
-        uow: The Unit of Work being prescribed.
-        reentry_posture: Categorized executor state from diagnosis.
-        completion_gap: Human-readable rationale for why work is incomplete.
-        issue_body: Raw GitHub issue body text. Used to compose context when
-            success_criteria is absent. Pass empty string if unavailable.
+    This is the fallback path used when the LLM call fails or is unavailable.
+    It is also the implementation called by _build_prescription_instructions
+    when llm_prescriber returns None.
     """
     summary = uow.summary
     success_criteria = uow.success_criteria
@@ -588,6 +739,49 @@ def _build_prescription_instructions(
     if criteria_block:
         parts += ["", criteria_block]
     return "\n".join(parts)
+
+
+def _build_prescription_instructions(
+    uow: UoW,
+    reentry_posture: str,
+    completion_gap: str,
+    issue_body: str = "",
+    llm_prescriber: Callable[..., dict[str, Any] | None] | None = _llm_prescribe,
+) -> str:
+    """
+    Build natural language prescription instructions for the Executor.
+
+    Tries the LLM-class prescription path first (via llm_prescriber). If that
+    returns None (API unavailable, timeout, parse failure), falls back to the
+    deterministic keyword-matching template.
+
+    Args:
+        uow: The Unit of Work being prescribed.
+        reentry_posture: Categorized executor state from diagnosis.
+        completion_gap: Human-readable rationale for why work is incomplete.
+        issue_body: Raw GitHub issue body text. Used when success_criteria is absent.
+        llm_prescriber: Callable that takes (uow, reentry_posture, completion_gap,
+            issue_body) and returns a dict or None. Inject None or a stub in tests
+            to bypass the LLM call. Defaults to _llm_prescribe.
+    """
+    if llm_prescriber is not None:
+        llm_result = llm_prescriber(uow, reentry_posture, completion_gap, issue_body)
+        if llm_result is not None:
+            instructions = llm_result["instructions"]
+            success_check = llm_result.get("success_criteria_check", "")
+            # Append the success_criteria_check as a verification note so the
+            # Executor has an explicit completion signal alongside the instructions.
+            if success_check:
+                instructions = (
+                    instructions.rstrip()
+                    + f"\n\nCompletion check: {success_check}"
+                )
+            return instructions
+
+    # Deterministic fallback
+    return _build_deterministic_prescription_instructions(
+        uow, reentry_posture, completion_gap, issue_body
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1070,6 +1264,7 @@ def _process_uow(
     artifact_dir: Path | None,
     notify_dan: Callable | None,
     notify_dan_early_warning: Callable | None = None,
+    llm_prescriber: Callable[..., dict[str, Any] | None] | None = _llm_prescribe,
 ) -> StewardOutcome:
     """
     Process a single UoW through the full diagnosis + prescribe/close/surface cycle.
@@ -1279,7 +1474,30 @@ def _process_uow(
         route_reason = f"steward: {reentry_posture} — {completion_rationale[:120]}"
 
     issue_body = issue_info.get("body", "") if issue_info else ""
-    instructions = _build_prescription_instructions(uow, reentry_posture, completion_gap_for_prescription, issue_body)
+
+    # Wrap llm_prescriber to capture which path was taken (llm vs fallback).
+    # The sentinel records a non-None return, indicating the LLM path succeeded.
+    _llm_path_taken: list[bool] = [False]
+
+    def _capturing_prescriber(
+        uow_arg: UoW,
+        reentry_posture_arg: str,
+        completion_gap_arg: str,
+        issue_body_arg: str = "",
+    ) -> dict[str, Any] | None:
+        result = llm_prescriber(uow_arg, reentry_posture_arg, completion_gap_arg, issue_body_arg)  # type: ignore[misc]
+        if result is not None:
+            _llm_path_taken[0] = True
+        return result
+
+    effective_prescriber = _capturing_prescriber if llm_prescriber is not None else None
+
+    instructions = _build_prescription_instructions(
+        uow, reentry_posture, completion_gap_for_prescription, issue_body,
+        llm_prescriber=effective_prescriber,
+    )
+
+    prescription_path = "llm" if _llm_path_taken[0] else "fallback"
 
     # Update agenda: mark current pending node as prescribed
     updated_agenda = _mark_current_agenda_node_prescribed(agenda)
@@ -1290,6 +1508,7 @@ def _process_uow(
         "steward_cycles": cycles,
         "return_reason": return_reason,
         "completion_assessment": completion_rationale,
+        "prescription_path": prescription_path,
         "dod_revised": False,
         "agenda_revised": False,
         "next_posture_rationale": route_reason,
@@ -1366,6 +1585,7 @@ def run_steward_cycle(
     notify_dan_early_warning: Callable | None = None,
     bootup_candidate_gate: bool | None = None,
     db_path: Path | None = None,
+    llm_prescriber: Callable[..., dict[str, Any] | None] | None = _llm_prescribe,
 ) -> dict[str, Any]:
     """
     Execute one full Steward heartbeat cycle.
@@ -1394,6 +1614,11 @@ def run_steward_cycle(
         Override for BOOTUP_CANDIDATE_GATE. If None, uses the module constant.
     db_path:
         Path to registry DB. Only used if registry is None.
+    llm_prescriber:
+        Callable(uow, reentry_posture, completion_gap, issue_body) → dict | None.
+        Called during prescription to generate LLM-quality instructions.
+        Inject None to bypass LLM (tests), or a stub to capture calls.
+        Defaults to _llm_prescribe (production path).
 
     Returns
     -------
@@ -1488,6 +1713,7 @@ def run_steward_cycle(
                 artifact_dir=artifact_dir,
                 notify_dan=notify_dan,
                 notify_dan_early_warning=notify_dan_early_warning,
+                llm_prescriber=llm_prescriber,
             )
         except Exception:
             log.exception("Steward: unhandled error processing UoW %s — skipping", uow_id)
