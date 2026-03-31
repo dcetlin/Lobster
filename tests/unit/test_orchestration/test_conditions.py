@@ -232,7 +232,7 @@ class TestRegistryStateTrigger:
         from src.orchestration.conditions import evaluate_condition
 
         # Insert a target UoW into the registry and advance it to "done"
-        result = registry.upsert(issue_number=99, title="target UoW")
+        result = registry.upsert(issue_number=99, title="target UoW", success_criteria="Test completion.")
         target_id = result.id
         registry.approve(target_id)
         registry.set_status_direct(target_id, "done")
@@ -248,7 +248,7 @@ class TestRegistryStateTrigger:
     def test_target_uow_not_in_specified_state_returns_false(self, registry, db_path):
         from src.orchestration.conditions import evaluate_condition
 
-        result = registry.upsert(issue_number=100, title="pending target")
+        result = registry.upsert(issue_number=100, title="pending target", success_criteria="Test completion.")
         target_id = result.id
         # UoW stays in "proposed" state
 
@@ -280,7 +280,7 @@ class TestRegistryStateTrigger:
     def test_no_audit_when_state_not_matched(self, registry, db_path):
         """False condition (state not matched) must not write audit entry."""
         from src.orchestration.conditions import evaluate_condition
-        result = registry.upsert(issue_number=101, title="still proposed")
+        result = registry.upsert(issue_number=101, title="still proposed", success_criteria="Test completion.")
         target_id = result.id
 
         uow_id = "uow_rs_silent"

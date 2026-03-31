@@ -1096,9 +1096,32 @@ def _diagnose_uow(
 # GitHub client helper
 # ---------------------------------------------------------------------------
 
-def _default_github_client(issue_number: int) -> dict[str, Any]:
+def _repo_from_issue_url(issue_url: str | None) -> str | None:
+    """Extract 'owner/repo' from a GitHub issue URL.
+
+    Pure function — no side effects.
+
+    Examples:
+        "https://github.com/dcetlin/Lobster/issues/42" → "dcetlin/Lobster"
+        None → None
+        "not-a-url" → None
     """
-    Fetch issue info from GitHub using gh CLI.
+    if not issue_url:
+        return None
+    # URL form: https://github.com/{owner}/{repo}/issues/{number}
+    prefix = "https://github.com/"
+    if not issue_url.startswith(prefix):
+        return None
+    rest = issue_url[len(prefix):]
+    parts = rest.split("/")
+    if len(parts) >= 2:
+        return f"{parts[0]}/{parts[1]}"
+    return None
+
+
+def _fetch_github_issue(issue_number: int, repo: str) -> dict[str, Any]:
+    """
+    Fetch issue info from GitHub using gh CLI for a given repo.
 
     Returns dict with keys: status_code, state, labels (list), body, title.
     On any error, returns status_code=0 with empty fields.
@@ -1108,7 +1131,7 @@ def _default_github_client(issue_number: int) -> dict[str, Any]:
         result = subprocess.run(
             [
                 "gh", "issue", "view", str(issue_number),
-                "--repo", "dcetlin/Lobster",
+                "--repo", repo,
                 "--json", "state,labels,body,title",
             ],
             capture_output=True,
@@ -1127,8 +1150,23 @@ def _default_github_client(issue_number: int) -> dict[str, Any]:
             "title": data.get("title", ""),
         }
     except Exception as e:
-        log.warning("GitHub client error for issue %s: %s", issue_number, e)
+        log.warning("GitHub client error for issue %s (repo=%s): %s", issue_number, repo, e)
         return {"status_code": 0, "state": None, "labels": [], "body": "", "title": ""}
+
+
+def _default_github_client(issue_number: int) -> dict[str, Any]:
+    """
+    Fetch issue info from GitHub using gh CLI.
+
+    Falls back to the hardcoded 'dcetlin/Lobster' repo for UoWs that
+    pre-date the issue_url field (migration 0005). New UoWs provide
+    issue_url and the Steward loop calls _fetch_github_issue directly
+    with the derived repo, bypassing this function.
+
+    Returns dict with keys: status_code, state, labels (list), body, title.
+    On any error, returns status_code=0 with empty fields.
+    """
+    return _fetch_github_issue(issue_number, repo="dcetlin/Lobster")
 
 
 # ---------------------------------------------------------------------------
@@ -1767,9 +1805,20 @@ def run_steward_cycle(
         source_issue_number = uow.source_issue_number
         considered_ids.append(uow_id)
 
+        # Resolve the GitHub client for this UoW. When issue_url is present
+        # (populated at proposal time since migration 0005), derive the repo
+        # from the URL — no hardcoded repo slug. For pre-migration UoWs where
+        # issue_url is NULL, fall back to _github_client (which uses the legacy
+        # hardcoded repo). Pure resolution: no side effects.
+        resolved_repo = _repo_from_issue_url(getattr(uow, "issue_url", None))
+        def _resolve_issue_info(n: int) -> dict[str, Any]:
+            if resolved_repo:
+                return _fetch_github_issue(n, resolved_repo)
+            return _github_client(n)
+
         # BOOTUP_CANDIDATE_GATE: skip if label present and gate is True
         if _gate and source_issue_number:
-            issue_info = _github_client(source_issue_number)
+            issue_info = _resolve_issue_info(source_issue_number)
             labels = issue_info.get("labels", [])
             if "bootup-candidate" in labels:
                 log.debug(
@@ -1780,7 +1829,7 @@ def run_steward_cycle(
                 continue
         else:
             issue_info = (
-                _github_client(source_issue_number)
+                _resolve_issue_info(source_issue_number)
                 if source_issue_number
                 else None
             )

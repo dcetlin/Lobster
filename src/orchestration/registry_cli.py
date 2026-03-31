@@ -73,6 +73,11 @@ def cmd_upsert(registry: Registry, args: argparse.Namespace) -> None:
         success_criteria = _extract_success_criteria(issue_body)
     else:
         success_criteria = ""
+    # Enforce the germination contract: success_criteria must not be empty.
+    # Fall back to the title so CLI users without --issue-body still succeed;
+    # callers who need richer criteria should pass --issue-body.
+    if not success_criteria or not success_criteria.strip():
+        success_criteria = args.title
     result = registry.upsert(
         issue_number=args.issue,
         title=args.title,

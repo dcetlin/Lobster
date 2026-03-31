@@ -192,9 +192,16 @@ class GardenCaretaker:
                 logger.warning("scan: cannot extract issue number from source_ref=%s", snapshot.source_ref)
                 continue
 
+            # Use the issue body as success_criteria — it is the Seed spec.
+            # If the body is empty, fall back to the title so every UoW has
+            # a non-empty anchor (the Steward can refine it on first diagnosis).
+            success_criteria = snapshot.body.strip() if snapshot.body.strip() else snapshot.title
+
             result = self.registry.upsert(
                 issue_number=issue_number,
                 title=snapshot.title,
+                success_criteria=success_criteria,
+                issue_url=snapshot.url or None,
             )
 
             if not isinstance(result, UpsertInserted):

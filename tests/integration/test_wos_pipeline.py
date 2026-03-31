@@ -134,6 +134,7 @@ def _seed_uow(
         issue_number=issue_number,
         title=title,
         sweep_date=sweep_date,
+        success_criteria="Test completion.",
     )
     assert isinstance(result, UpsertInserted), f"Expected UpsertInserted, got: {result}"
     uow_id = result.id
@@ -586,7 +587,7 @@ class TestSchemaHarness:
 
     def test_new_uow_has_steward_executor_column_defaults(self, db, phase2_registry):
         """New UoWs have correct NULL/0 defaults for steward/executor columns."""
-        result = phase2_registry.upsert(issue_number=1001, title="Test record defaults")
+        result = phase2_registry.upsert(issue_number=1001, title="Test record defaults", success_criteria="Test completion.")
         assert isinstance(result, UpsertInserted), f"Expected UpsertInserted, got: {result}"
         uow_id = result.id
 

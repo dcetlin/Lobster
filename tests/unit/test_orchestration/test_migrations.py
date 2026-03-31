@@ -276,7 +276,7 @@ class TestRegistryIntegration:
         from src.orchestration.registry import Registry, UpsertInserted
         db_path = tmp_path / "reg.db"
         reg = Registry(db_path)
-        result = reg.upsert(issue_number=42, title="Post-migration UoW", sweep_date="2026-01-01")
+        result = reg.upsert(issue_number=42, title="Post-migration UoW", sweep_date="2026-01-01", success_criteria="Test completion.")
         assert isinstance(result, UpsertInserted)
 
     def test_notes_column_accessible_after_registry_init(self, tmp_path: Path) -> None:
