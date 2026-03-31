@@ -1476,6 +1476,45 @@ class OutboxHandler(FileSystemEventHandler):
                         os.remove(filepath)
                         return
 
+            # Handle document/file messages (e.g. PDF reports from wos_report.py)
+            if reply_type == 'document' and chat_id and bot_app:
+                doc_path = reply.get('document_path', '')
+                filename = reply.get('filename', '')
+                mime_type = reply.get('mime_type', 'application/octet-stream')
+                doc_caption = reply.get('caption', '')
+                if doc_path and os.path.exists(doc_path):
+                    try:
+                        doc_reply_params = ReplyParameters(message_id=int(reply_to_id)) if reply_to_id else None
+                        with open(doc_path, 'rb') as f:
+                            await bot_app.bot.send_document(
+                                chat_id=chat_id,
+                                document=f,
+                                filename=filename or os.path.basename(doc_path),
+                                caption=doc_caption or None,
+                                read_timeout=60,
+                                write_timeout=60,
+                                connect_timeout=30,
+                                reply_parameters=doc_reply_params,
+                            )
+                        log.info(f"Sent document to {chat_id}: {doc_path}")
+                        os.remove(filepath)
+                        return
+                    except Exception as e:
+                        log.error(f"send_document failed for {chat_id} ({doc_path}): {e}", exc_info=True)
+                        try:
+                            await bot_app.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"Failed to send document: {e}"
+                            )
+                        except Exception:
+                            pass
+                        os.remove(filepath)
+                        return
+                else:
+                    log.warning(f"Document outbox entry missing or file not found: {doc_path!r}")
+                    os.remove(filepath)
+                    return
+
             if chat_id and text and bot_app:
                 reply_markup = build_inline_keyboard(buttons) if buttons else None
                 reply_params = ReplyParameters(message_id=int(reply_to_id)) if reply_to_id else None
