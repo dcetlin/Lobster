@@ -111,6 +111,37 @@ class TestUpsert:
         assert row["route_reason"] == "phase1-default: no classifier"
         conn.close()
 
+    def test_upsert_stores_success_criteria(self, registry, db_path):
+        """success_criteria passed to upsert() must be persisted in the INSERT row."""
+        from src.orchestration.registry import UpsertInserted
+        issue_body = (
+            "## Summary\nFix the widget.\n\n"
+            "## Acceptance Criteria\n"
+            "- Widget renders correctly\n"
+            "- No regression in tests\n\n"
+            "## Notes\nSee attached mockup."
+        )
+        from src.orchestration.cultivator import _extract_success_criteria
+        criteria = _extract_success_criteria(issue_body)
+
+        today = datetime.now(timezone.utc).date().isoformat()
+        result = registry.upsert(
+            issue_number=9999,
+            title="Widget fix",
+            sweep_date=today,
+            success_criteria=criteria,
+        )
+        assert isinstance(result, UpsertInserted)
+
+        conn = _open_db(db_path)
+        row = conn.execute(
+            "SELECT success_criteria FROM uow_registry WHERE id = ?", (result.id,)
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row["success_criteria"], "success_criteria must be non-empty after upsert with issue body"
+        assert "Widget renders correctly" in row["success_criteria"]
+
     def test_audit_entry_on_insert(self, registry, db_path):
         today = datetime.now(timezone.utc).date().isoformat()
         result = registry.upsert(issue_number=2, title="Issue with audit", sweep_date=today)
