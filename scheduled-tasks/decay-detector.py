@@ -55,12 +55,17 @@ def find_todays_sweep_file() -> Path | None:
     return None
 
 
-def is_night4_sweep(sweep_file: Path) -> bool:
-    """Check if today's sweep was a Night 4 (Issues + Memory) sweep."""
+def is_night4_rotation() -> bool:
+    """Check if the most recent sweep was Night 4 (Issues + Memory).
+
+    Reads rotation-state.json directly rather than inspecting sweep file content.
+    The rotation state is incremented *after* the sweep completes, so current_night==5
+    means Night 4 just finished and decay-detector is running in the post-sweep window.
+    """
+    state_file = HYGIENE_DIR / "rotation-state.json"
     try:
-        content = sweep_file.read_text()
-        first_lines = "\n".join(content.splitlines()[:10])
-        return "Night 4" in first_lines
+        state = json.loads(state_file.read_text())
+        return int(state["current_night"]) == 5
     except Exception:
         return False
 
@@ -280,8 +285,8 @@ def main() -> int:
         print("No sweep file found for today — skipping decay detection.", file=sys.stderr)
         return 0
 
-    # 2. Confirm it's a Night 4 sweep
-    if not is_night4_sweep(sweep_file):
+    # 2. Confirm it's a Night 4 sweep (check rotation-state.json, not sweep file content)
+    if not is_night4_rotation():
         print("Today's sweep is not Night 4 — decay detector not applicable.", file=sys.stderr)
         return 0
 
