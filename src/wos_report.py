@@ -23,6 +23,8 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.orchestration.analytics import prescription_quality_summary
+
 # ── fpdf2 ──────────────────────────────────────────────────────────────────────
 try:
     from fpdf import FPDF
@@ -824,6 +826,176 @@ def _render_index_page(pdf: WoSReport, uows: list[dict]) -> None:
     pdf.line(MARGIN, pdf.get_y(), PAGE_W - MARGIN, pdf.get_y())
 
 
+# ── prescription quality page ─────────────────────────────────────────────────
+
+def _render_prescription_quality_page(pdf: WoSReport) -> None:
+    """
+    Render a Prescription Quality summary page using analytics.prescription_quality_summary().
+
+    Reads directly from the registry DB (same path REGISTRY_DB points to).
+    If data is sparse, renders the data_gap note instead of an empty table.
+    """
+    try:
+        summary = prescription_quality_summary(registry_path=REGISTRY_DB)
+    except Exception as exc:  # noqa: BLE001
+        # Don't let an analytics failure break the whole report
+        summary = {
+            "per_uow": [],
+            "aggregate": {
+                "total_uows": 0, "uows_with_data": 0,
+                "avg_cycles_to_done": None,
+                "pct_llm": None, "pct_fallback": None,
+                "total_prescriptions": 0,
+                "llm_prescriptions": 0, "fallback_prescriptions": 0,
+            },
+            "data_gap": f"analytics error: {exc}",
+        }
+
+    pdf.add_page()
+
+    # Section title
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.set_text_color(*C_HEADING_TEXT)
+    pdf.cell(0, 8, "Prescription Quality",
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="L")
+    pdf.set_draw_color(*C_GRID_LINE)
+    pdf.set_line_width(0.3)
+    pdf.line(MARGIN, pdf.get_y(), PAGE_W - MARGIN, pdf.get_y())
+    pdf.ln(4)
+    pdf.set_text_color(*C_DARK)
+
+    agg = summary["aggregate"]
+    data_gap = summary.get("data_gap")
+
+    # ── Aggregate metrics ──────────────────────────────────────────────────────
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_text_color(*C_HEADING_TEXT)
+    pdf.set_fill_color(*C_HEADING_BG)
+    pdf.cell(CONTENT_W, 5.5, "  AGGREGATE METRICS",
+             fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(2)
+    pdf.set_text_color(*C_DARK)
+
+    def _metric_row(label: str, value: str) -> None:
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_text_color(*C_MUTED)
+        pdf.cell(60, 5, label + ":", new_x=XPos.RIGHT, new_y=YPos.TOP)
+        pdf.set_font("Helvetica", "", 8)
+        pdf.set_text_color(*C_DARK)
+        pdf.cell(CONTENT_W - 60, 5, value, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    _metric_row("Total UoWs", str(agg["total_uows"]))
+    _metric_row("UoWs with prescription data", str(agg["uows_with_data"]))
+    _metric_row("Total prescriptions", str(agg["total_prescriptions"]))
+
+    if agg["pct_llm"] is not None:
+        _metric_row(
+            "LLM prescriptions",
+            f"{agg['llm_prescriptions']}  ({agg['pct_llm']}%)",
+        )
+        _metric_row(
+            "Fallback prescriptions",
+            f"{agg['fallback_prescriptions']}  ({agg['pct_fallback']}%)",
+        )
+    else:
+        _metric_row("LLM / Fallback split", "no prescription data yet")
+
+    if agg["avg_cycles_to_done"] is not None:
+        _metric_row(
+            "Avg cycles to done",
+            f"{agg['avg_cycles_to_done']:.1f}",
+        )
+    else:
+        _metric_row("Avg cycles to done", "no completed UoWs yet")
+
+    pdf.ln(4)
+
+    # ── Data gap note ──────────────────────────────────────────────────────────
+    if data_gap:
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.set_text_color(140, 100, 40)
+        pdf.multi_cell(CONTENT_W, 5, _safe(f"Note: {data_gap}"),
+                       new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(3)
+        pdf.set_text_color(*C_DARK)
+
+    # ── Per-UoW table ──────────────────────────────────────────────────────────
+    per_uow = summary["per_uow"]
+    uows_with_data = [r for r in per_uow if r["prescription_paths"]]
+
+    if not uows_with_data:
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.set_text_color(*C_MUTED)
+        pdf.cell(0, 5, "No per-UoW prescription data to display.",
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        return
+
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_text_color(*C_HEADING_TEXT)
+    pdf.set_fill_color(*C_HEADING_BG)
+    pdf.cell(CONTENT_W, 5.5, "  PER-UOW BREAKDOWN",
+             fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(2)
+
+    # Table headers
+    col_widths = [12, 58, 22, 14, 16, 16, 44]
+    col_headers = ["ID", "Summary", "Status", "Cycles", "LLM", "Fallback", "Path sequence"]
+
+    pdf.set_fill_color(*C_HEADING_BG)
+    pdf.set_font("Helvetica", "B", 7.5)
+    pdf.set_text_color(*C_HEADING_TEXT)
+    hx = MARGIN
+    hy = pdf.get_y() + 1
+    for w, h in zip(col_widths, col_headers):
+        pdf.set_xy(hx, hy)
+        pdf.cell(w, 5, h, border=0, fill=True, align="L")
+        hx += w
+    pdf.ln(6)
+
+    # Table rows
+    for i, rec in enumerate(uows_with_data):
+        row_y = pdf.get_y()
+        row_bg = (250, 250, 252) if i % 2 == 0 else (255, 255, 255)
+        pdf.set_fill_color(*row_bg)
+        pdf.rect(MARGIN, row_y, sum(col_widths), 5, style="F")
+
+        status = rec.get("status", "")
+        sr, sg, sb = STATUS_COLORS.get(status, DEFAULT_STATUS_COLOR)
+
+        # Compact path display: e.g. "llm llm fallback" → "L L F"
+        path_abbrev = " ".join(
+            "L" if p == "llm" else "F" for p in rec["prescription_paths"][:10]
+        )
+        if len(rec["prescription_paths"]) > 10:
+            path_abbrev += "..."
+
+        values = [
+            _safe(rec["id"][-6:]),
+            _safe((rec["summary"] or "")[:55]),
+            status.upper()[:12],
+            str(rec["steward_cycles"]),
+            str(rec["llm_count"]),
+            str(rec["fallback_count"]),
+            _safe(path_abbrev),
+        ]
+        aligns = ["L", "L", "L", "C", "C", "C", "L"]
+
+        rx = MARGIN
+        for j, (w, val, align) in enumerate(zip(col_widths, values, aligns)):
+            pdf.set_xy(rx, row_y)
+            if j == 2:
+                pdf.set_text_color(sr, sg, sb)
+                pdf.set_font("Helvetica", "B", 7)
+            else:
+                pdf.set_text_color(*C_DARK)
+                pdf.set_font("Helvetica", "", 7)
+            pdf.cell(w, 5, val, border=0, align=align)
+            rx += w
+        pdf.ln(5)
+
+    pdf.set_text_color(*C_DARK)
+
+
 # ── PDF generation ────────────────────────────────────────────────────────────
 
 def generate_pdf(uows: list[dict], output_path: Path) -> Path:
@@ -841,6 +1013,7 @@ def generate_pdf(uows: list[dict], output_path: Path) -> Path:
                  new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
     else:
         _render_index_page(pdf, uows)
+        _render_prescription_quality_page(pdf)
         for uow in uows:
             pdf.add_uow_card(uow)
 
