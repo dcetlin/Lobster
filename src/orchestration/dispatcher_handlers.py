@@ -9,6 +9,8 @@ The dispatcher calls these handlers when it recognizes:
   /approve <uow-id>        → handle_approve(uow_id, registry)
   /wos status [status]     → handle_wos_status(status, registry)
   /wos unblock             → handle_wos_unblock()
+  /wos start               → handle_wos_start()
+  /wos stop                → handle_wos_stop()
   decide retry <uow-id>    → handle_decide_retry(uow_id, registry)
   decide close <uow-id>    → handle_decide_close(uow_id, registry)
   type: "wos_execute"      → handle_wos_execute(uow_id, instructions, output_ref)
@@ -16,6 +18,7 @@ The dispatcher calls these handlers when it recognizes:
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -33,6 +36,49 @@ from .registry import ApproveConfirmed, ApproveExpired, ApproveNotFound, Approve
 _GATE_CLEARED_FLAG: Path = Path(
     os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
 ) / "data" / "wos-gate-cleared"
+
+
+# ---------------------------------------------------------------------------
+# WOS execution config — runtime start/stop for executor dispatch
+# ---------------------------------------------------------------------------
+
+_WOS_CONFIG_PATH: Path = Path(
+    os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
+) / "data" / "wos-config.json"
+
+_DEFAULT_WOS_CONFIG: dict = {"execution_enabled": False}
+
+
+def read_wos_config() -> dict:
+    """Read wos-config.json from disk and return its contents as a dict.
+
+    Returns _DEFAULT_WOS_CONFIG if the file does not exist or cannot be parsed.
+    Reads from disk on every call so that runtime changes take effect immediately
+    on the next executor-heartbeat cycle without requiring a restart.
+    """
+    try:
+        with _WOS_CONFIG_PATH.open() as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return dict(_DEFAULT_WOS_CONFIG)
+
+
+def is_execution_enabled() -> bool:
+    """Return True if WOS execution is enabled in wos-config.json.
+
+    Reads from disk on every call — cron processes get a fresh value on each
+    invocation. Default is False (safe) when the file is absent or unreadable.
+    """
+    return bool(read_wos_config().get("execution_enabled", False))
+
+
+def _write_wos_config(config: dict) -> None:
+    """Write config dict to wos-config.json atomically (write-then-rename)."""
+    _WOS_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _WOS_CONFIG_PATH.with_suffix(".json.tmp")
+    with tmp.open("w") as fh:
+        json.dump(config, fh)
+    tmp.rename(_WOS_CONFIG_PATH)
 
 
 def handle_approve(uow_id: str, *, registry: "Registry") -> str:
@@ -256,4 +302,73 @@ def handle_wos_unblock() -> str:
         "All 27 bootup-candidate UoWs (#271-#298) will be processed on the next "
         "steward-heartbeat cycle (within 3 minutes).\n"
         f"Flag: `{_GATE_CLEARED_FLAG}`"
+    )
+
+
+def handle_wos_start() -> str:
+    """
+    Handle /wos start (or "wos start").
+
+    Sets execution_enabled: true in wos-config.json so that executor-heartbeat
+    dispatches UoWs on its next cycle (within ~90 seconds).
+
+    Idempotent: calling /wos start when already started returns a notice.
+
+    Returns a human-readable Telegram message describing the outcome.
+    """
+    config = read_wos_config()
+    if config.get("execution_enabled"):
+        return (
+            "WOS execution is already enabled.\n"
+            "executor-heartbeat is dispatching UoWs normally."
+        )
+
+    try:
+        _write_wos_config({**config, "execution_enabled": True})
+    except OSError as exc:
+        return (
+            f"Failed to write wos-config.json: {exc}\n"
+            f"Path: `{_WOS_CONFIG_PATH}`"
+        )
+
+    return (
+        "WOS execution enabled.\n"
+        "executor-heartbeat will dispatch ready-for-executor UoWs on its next cycle "
+        "(within ~90 seconds).\n"
+        f"Config: `{_WOS_CONFIG_PATH}`"
+    )
+
+
+def handle_wos_stop() -> str:
+    """
+    Handle /wos stop (or "wos stop").
+
+    Sets execution_enabled: false in wos-config.json so that executor-heartbeat
+    skips dispatch on its next cycle. UoWs already active are not affected —
+    TTL recovery will handle any that stall.
+
+    Idempotent: calling /wos stop when already stopped returns a notice.
+
+    Returns a human-readable Telegram message describing the outcome.
+    """
+    config = read_wos_config()
+    if not config.get("execution_enabled"):
+        return (
+            "WOS execution is already disabled.\n"
+            "executor-heartbeat is skipping dispatch."
+        )
+
+    try:
+        _write_wos_config({**config, "execution_enabled": False})
+    except OSError as exc:
+        return (
+            f"Failed to write wos-config.json: {exc}\n"
+            f"Path: `{_WOS_CONFIG_PATH}`"
+        )
+
+    return (
+        "WOS execution disabled.\n"
+        "executor-heartbeat will skip dispatch on its next cycle (within ~90 seconds).\n"
+        "UoWs already active will continue running; TTL recovery handles any that stall.\n"
+        f"Config: `{_WOS_CONFIG_PATH}`"
     )

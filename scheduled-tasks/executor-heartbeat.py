@@ -231,6 +231,10 @@ def main() -> int:
     from src.orchestration.steward import is_bootup_candidate_gate_active
     log.info("BOOTUP_CANDIDATE_GATE = %s", is_bootup_candidate_gate_active())
 
+    from src.orchestration.dispatcher_handlers import is_execution_enabled
+    execution_enabled = is_execution_enabled()
+    log.info("WOS execution_enabled = %s", execution_enabled)
+
     from src.orchestration.registry import Registry
 
     db_path = _default_db_path()
@@ -240,9 +244,17 @@ def main() -> int:
 
     registry = Registry(db_path)
 
-    # Phase 1: TTL recovery — must run before dispatch so the Steward can
-    # re-diagnose stalled UoWs on its next pass.
+    # Phase 1: TTL recovery — always runs regardless of execution_enabled so
+    # that stalled active UoWs are recovered even when dispatch is paused.
     run_ttl_recovery(registry, dry_run=dry_run)
+
+    if not execution_enabled:
+        log.info(
+            "Executor heartbeat: execution disabled (wos-config.json execution_enabled=false) "
+            "— skipping dispatch. Use 'wos start' to enable."
+        )
+        log.info("Executor heartbeat complete")
+        return 0
 
     try:
         result = run_executor_cycle(registry, dry_run=dry_run)
