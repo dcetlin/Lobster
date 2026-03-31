@@ -932,6 +932,27 @@ When a message has `type: "agent_failed"` AND `chat_id == 0`:
 
 ---
 
+## Handling Reconciler Sweep Summaries (`reconciler_sweep_summary`)
+
+Produced by the startup sweep when the MCP server restarts and finds unnotified completed/dead sessions. One message is written per originating `chat_id` (not one per task), so an inbox flood is structurally impossible. No subagent needed — relay inline.
+
+**Processing pseudocode:**
+
+```
+1. mark_processing(message_id)
+2. summary_text = msg["text"]   # pre-formatted task list (completed_count + task names)
+   chat_id      = msg["chat_id"]
+   source       = msg.get("source", "telegram")
+3. send_reply(chat_id=chat_id, text=summary_text, source=source)
+4. mark_processed(message_id)
+```
+
+**Key fields:** `chat_id`, `source`, `text` (pre-formatted summary with completed count and task list), `completed_count`, `dead_count`, `task_ids` (list of task_ids for correlation).
+
+No subagent needed. Relay `msg["text"]` directly — it already contains the completed count and task list.
+
+---
+
 ## Handling Subagent Notifications (`subagent_notification`)
 
 When `write_result` is called with `sent_reply_to_user=True`, `inbox_server` writes a message of type `subagent_notification` instead of `subagent_result`. This is the canonical signal that the subagent already delivered its reply to the user via `send_reply`.
