@@ -1501,3 +1501,300 @@ def _mock_github_client_open(issue_number: int) -> dict:
         "body": f"Issue #{issue_number}: implement this feature.\n\nAcceptance criteria:\n- Feature works",
         "title": f"Test issue {issue_number}",
     }
+
+
+# ---------------------------------------------------------------------------
+# Tests: LLM-class prescription path
+# ---------------------------------------------------------------------------
+
+class TestLlmPrescription:
+    """Tests for _llm_prescribe and _build_prescription_instructions LLM path."""
+
+    def _make_uow(
+        self,
+        summary: str = "Implement the widget feature",
+        success_criteria: str = "Widget renders correctly in all browsers",
+        steward_cycles: int = 0,
+        steward_log: str | None = None,
+        uow_type: str = "executable",
+    ):
+        """Build a minimal UoW dataclass for unit testing."""
+        from src.orchestration.registry import UoW, UoWStatus
+        return UoW(
+            id="uow_test_abc123",
+            status=UoWStatus.READY_FOR_STEWARD,
+            summary=summary,
+            source="github:issue/99",
+            source_issue_number=99,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+            type=uow_type,
+            success_criteria=success_criteria,
+            steward_cycles=steward_cycles,
+            steward_log=steward_log,
+        )
+
+    def test_llm_prescribe_skips_when_no_api_key(self, monkeypatch):
+        """_llm_prescribe returns None when ANTHROPIC_API_KEY is not set."""
+        steward = _import_steward()
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+        uow = self._make_uow()
+        result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
+        assert result is None
+
+    def test_build_prescription_uses_llm_result_when_available(self):
+        """_build_prescription_instructions uses the LLM result when llm_prescriber succeeds."""
+        steward = _import_steward()
+
+        def stub_prescriber(uow, posture, gap, issue_body=""):
+            return {
+                "instructions": "Write the widget module in src/widget.py.",
+                "success_criteria_check": "Check that src/widget.py exists and contains Widget class.",
+                "estimated_cycles": 1,
+            }
+
+        uow = self._make_uow()
+        result = steward._build_prescription_instructions(
+            uow,
+            reentry_posture="executor_orphan",
+            completion_gap="no prior output",
+            llm_prescriber=stub_prescriber,
+        )
+
+        assert "Write the widget module" in result
+        assert "Completion check:" in result
+        assert "Check that src/widget.py exists" in result
+
+    def test_build_prescription_falls_back_when_llm_returns_none(self):
+        """_build_prescription_instructions falls back to deterministic template when llm_prescriber returns None."""
+        steward = _import_steward()
+
+        def failing_prescriber(uow, posture, gap, issue_body=""):
+            return None
+
+        uow = self._make_uow(steward_cycles=0)
+        result = steward._build_prescription_instructions(
+            uow,
+            reentry_posture="executor_orphan",
+            completion_gap="no prior output",
+            llm_prescriber=failing_prescriber,
+        )
+
+        # Deterministic template output for cycles == 0
+        assert "Execute the following task:" in result
+        assert uow.summary in result
+
+    def test_build_prescription_falls_back_when_llm_prescriber_is_none(self):
+        """Passing llm_prescriber=None bypasses LLM and uses deterministic template directly."""
+        steward = _import_steward()
+
+        uow = self._make_uow(steward_cycles=1)
+        result = steward._build_prescription_instructions(
+            uow,
+            reentry_posture="execution_failed",
+            completion_gap="test suite failed with exit code 1",
+            llm_prescriber=None,
+        )
+
+        # Deterministic template for cycles > 0
+        assert "Re-execution pass" in result
+        assert "execution failed" in result.lower() or "Previous execution failed" in result
+
+    def test_build_prescription_no_completion_check_when_success_criteria_check_empty(self):
+        """Completion check is not appended when success_criteria_check is empty."""
+        steward = _import_steward()
+
+        def stub_prescriber(uow, posture, gap, issue_body=""):
+            return {
+                "instructions": "Write the widget module.",
+                "success_criteria_check": "",
+                "estimated_cycles": 1,
+            }
+
+        uow = self._make_uow()
+        result = steward._build_prescription_instructions(
+            uow,
+            reentry_posture="executor_orphan",
+            completion_gap="no prior output",
+            llm_prescriber=stub_prescriber,
+        )
+
+        assert "Write the widget module" in result
+        assert "Completion check:" not in result
+
+    def test_llm_prescribe_includes_prior_prescription_history(self, monkeypatch):
+        """_llm_prescribe extracts prior prescription events from steward_log."""
+        steward = _import_steward()
+
+        captured_prompts = []
+
+        class MockContent:
+            text = json.dumps({
+                "instructions": "Do the work again.",
+                "success_criteria_check": "File exists.",
+                "estimated_cycles": 1,
+            })
+
+        class MockResponse:
+            content = [MockContent()]
+
+        class MockMessages:
+            def create(self, **kwargs):
+                captured_prompts.append(kwargs)
+                return MockResponse()
+
+        class MockClient:
+            messages = MockMessages()
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-123")
+
+        import importlib
+        import sys
+        # Inject a mock anthropic module
+        mock_anthropic = type(sys)("anthropic")
+        mock_anthropic.Anthropic = lambda api_key=None: MockClient()
+        monkeypatch.setitem(sys.modules, "anthropic", mock_anthropic)
+
+        prior_log = json.dumps({
+            "event": "prescription",
+            "steward_cycles": 0,
+            "completion_assessment": "Initial implementation missing tests",
+        })
+        uow = self._make_uow(steward_cycles=1, steward_log=prior_log)
+
+        result = steward._llm_prescribe(uow, "execution_complete", "output lacks tests")
+
+        assert result is not None
+        assert len(captured_prompts) == 1
+        user_content = captured_prompts[0]["messages"][0]["content"]
+        # Prior prescription history should appear in the prompt
+        assert "Initial implementation missing tests" in user_content
+
+    def test_llm_prescribe_handles_malformed_json_response(self, monkeypatch):
+        """_llm_prescribe returns None when LLM returns non-JSON content."""
+        steward = _import_steward()
+
+        class MockContent:
+            text = "Sorry, I cannot help with that."
+
+        class MockResponse:
+            content = [MockContent()]
+
+        class MockMessages:
+            def create(self, **kwargs):
+                return MockResponse()
+
+        class MockClient:
+            messages = MockMessages()
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-123")
+        import sys
+        mock_anthropic = type(sys)("anthropic")
+        mock_anthropic.Anthropic = lambda api_key=None: MockClient()
+        monkeypatch.setitem(sys.modules, "anthropic", mock_anthropic)
+
+        uow = self._make_uow()
+        result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
+        assert result is None
+
+    def test_llm_prescribe_handles_api_exception(self, monkeypatch):
+        """_llm_prescribe returns None when the API call raises an exception."""
+        steward = _import_steward()
+
+        class MockMessages:
+            def create(self, **kwargs):
+                raise ConnectionError("API unreachable")
+
+        class MockClient:
+            messages = MockMessages()
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-123")
+        import sys
+        mock_anthropic = type(sys)("anthropic")
+        mock_anthropic.Anthropic = lambda api_key=None: MockClient()
+        monkeypatch.setitem(sys.modules, "anthropic", mock_anthropic)
+
+        uow = self._make_uow()
+        result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
+        assert result is None
+
+    def test_llm_prescribe_handles_markdown_fenced_json(self, monkeypatch):
+        """_llm_prescribe strips markdown code fences from the response."""
+        steward = _import_steward()
+
+        class MockContent:
+            text = "```json\n" + json.dumps({
+                "instructions": "Implement the feature.",
+                "success_criteria_check": "Feature works.",
+                "estimated_cycles": 2,
+            }) + "\n```"
+
+        class MockResponse:
+            content = [MockContent()]
+
+        class MockMessages:
+            def create(self, **kwargs):
+                return MockResponse()
+
+        class MockClient:
+            messages = MockMessages()
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-123")
+        import sys
+        mock_anthropic = type(sys)("anthropic")
+        mock_anthropic.Anthropic = lambda api_key=None: MockClient()
+        monkeypatch.setitem(sys.modules, "anthropic", mock_anthropic)
+
+        uow = self._make_uow()
+        result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
+
+        assert result is not None
+        assert result["instructions"] == "Implement the feature."
+        assert result["estimated_cycles"] == 2
+
+    def test_end_to_end_prescription_with_llm_stub(self, db_path, registry, tmp_path):
+        """Full _process_uow call uses LLM prescription stub and writes instructions to artifact."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        llm_calls = []
+
+        def stub_llm_prescriber(uow, posture, gap, issue_body=""):
+            llm_calls.append({"uow_id": uow.id, "posture": posture, "gap": gap})
+            return {
+                "instructions": "LLM-generated: implement the feature per spec.",
+                "success_criteria_check": "Feature branch merged with green CI.",
+                "estimated_cycles": 1,
+            }
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=0,
+            success_criteria="PR opened and merged",
+        )
+        conn.close()
+
+        artifact_dir = tmp_path / "artifacts"
+        artifact_dir.mkdir()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=artifact_dir,
+            llm_prescriber=stub_llm_prescriber,
+        )
+
+        # LLM prescriber should have been called once
+        assert len(llm_calls) == 1
+        assert llm_calls[0]["uow_id"] == uow_id
+
+        # Artifact file should contain the LLM-generated instructions
+        artifacts = list(artifact_dir.glob("*.json"))
+        assert len(artifacts) == 1
+        artifact_data = json.loads(artifacts[0].read_text())
+        assert "LLM-generated" in artifact_data["instructions"]
+        assert "Completion check:" in artifact_data["instructions"]
