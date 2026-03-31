@@ -1,20 +1,21 @@
 """
-GitHub Issue Cultivator — promotes qualifying GitHub issues into the WOS registry as UoWs.
+GitHub Issue Cultivator — promotes ALL open GitHub issues into the WOS registry as UoWs.
 
-Scoring heuristic (MVP, no LLM calls):
-  +2  issue has label "bug" or "urgent"
-  +1  issue has label "enhancement" or "feat"
-  +1  issue has been open > 7 days
-  +1  issue is assigned to someone
+Design: no scoring threshold. Every open issue is a candidate unless it matches a
+skip condition. The cultivator is a pure pipeline: fetch → classify → promote.
 
-Skip conditions (applied before scoring):
-  - Issue has label "wos-phase-2" (already tracked in WOS)
-  - Issue title or body contains "wos-phase-2" label sentinel
+Skip conditions (applied before promotion):
+  - Issue already in WOS as a non-terminal UoW (idempotency — handled by Registry.upsert)
+  - Issue has label "wos-phase-2" (meta-tracking issues, not work items)
+  - Issue has label "tracking" (meta-tracking issues, not work items)
 
-Issues scoring >= 2 are promoted to WOS as proposed UoWs.
+Priority classification (informational; stored in summary but not yet persisted to WOS schema):
+  - bug or urgent label → high
+  - enhancement or feat label → low
+  - anything else → medium
 
 Usage:
-    uv run src/orchestration/cultivator.py [--dry-run] [--limit N] [--threshold N]
+    uv run src/orchestration/cultivator.py [--dry-run] [--limit N]
 """
 
 from __future__ import annotations
@@ -44,10 +45,9 @@ class GitHubIssue:
 
 
 @dataclass(frozen=True)
-class ScoredIssue:
+class ClassifiedIssue:
     issue: GitHubIssue
-    score: int
-    reasons: tuple[str, ...]
+    priority: str  # "high" | "medium" | "low"
 
 
 @dataclass(frozen=True)
@@ -61,8 +61,7 @@ class PromotionResult:
 @dataclass(frozen=True)
 class SweepSummary:
     scanned: int
-    skipped_wos_tracked: int
-    below_threshold: int
+    skipped_meta: int
     promoted: int
     already_registered: int
     promotion_results: tuple[PromotionResult, ...]
@@ -90,7 +89,7 @@ def _parse_issue(raw: dict) -> GitHubIssue:
     )
 
 
-def fetch_open_issues(repo: str, limit: int = 200) -> list[GitHubIssue]:
+def fetch_open_issues(repo: str, limit: int = 300) -> list[GitHubIssue]:
     """Fetch open issues from GitHub via gh CLI. Returns list of GitHubIssue."""
     result = subprocess.run(
         [
@@ -109,14 +108,12 @@ def fetch_open_issues(repo: str, limit: int = 200) -> list[GitHubIssue]:
 
 
 # ---------------------------------------------------------------------------
-# Scoring — pure functions, no side effects
+# Classification — pure functions, no side effects
 # ---------------------------------------------------------------------------
 
-_SKIP_LABELS = frozenset({"wos-phase-2"})
-_BUG_LABELS = frozenset({"bug", "urgent"})
-_ENHANCEMENT_LABELS = frozenset({"enhancement", "feat"})
-_DAYS_OPEN_THRESHOLD = 7
-_DEFAULT_SCORE_THRESHOLD = 2
+_SKIP_LABELS = frozenset({"wos-phase-2", "tracking"})
+_HIGH_PRIORITY_LABELS = frozenset({"bug", "urgent"})
+_LOW_PRIORITY_LABELS = frozenset({"enhancement", "feat"})
 
 
 def _should_skip(issue: GitHubIssue) -> str | None:
@@ -126,57 +123,29 @@ def _should_skip(issue: GitHubIssue) -> str | None:
     return None
 
 
-def _compute_score(issue: GitHubIssue, now: datetime) -> ScoredIssue:
-    """Score an issue on 4 signals. Pure function — no I/O."""
-    reasons: list[str] = []
-    score = 0
-
-    if issue.label_names & _BUG_LABELS:
-        score += 2
-        matched = issue.label_names & _BUG_LABELS
-        reasons.append(f"label {matched} +2")
-
-    if issue.label_names & _ENHANCEMENT_LABELS:
-        score += 1
-        matched = issue.label_names & _ENHANCEMENT_LABELS
-        reasons.append(f"label {matched} +1")
-
-    days_open = (now - issue.created_at).days
-    if days_open > _DAYS_OPEN_THRESHOLD:
-        score += 1
-        reasons.append(f"open {days_open} days +1")
-
-    if issue.assignee_count > 0:
-        score += 1
-        reasons.append(f"assigned ({issue.assignee_count}) +1")
-
-    return ScoredIssue(issue=issue, score=score, reasons=tuple(reasons))
+def _classify_priority(issue: GitHubIssue) -> str:
+    """Map issue labels to a priority tier. Pure function — no I/O."""
+    if issue.label_names & _HIGH_PRIORITY_LABELS:
+        return "high"
+    if issue.label_names & _LOW_PRIORITY_LABELS:
+        return "low"
+    return "medium"
 
 
-def score_issues(issues: list[GitHubIssue]) -> tuple[list[ScoredIssue], int]:
+def classify_issues(issues: list[GitHubIssue]) -> tuple[list[ClassifiedIssue], int]:
     """
-    Score all issues. Returns (scored_issues, skipped_count).
-    Skipped issues (wos-phase-2 label) are excluded from the returned list.
+    Classify all issues. Returns (classified_issues, skipped_count).
+    Meta-tracking issues (wos-phase-2, tracking labels) are excluded.
     """
-    now = datetime.now(timezone.utc)
-    scored = []
+    classified = []
     skipped = 0
     for issue in issues:
         skip_reason = _should_skip(issue)
         if skip_reason:
             skipped += 1
             continue
-        scored.append(_compute_score(issue, now))
-    return scored, skipped
-
-
-def filter_qualifying(
-    scored: list[ScoredIssue], threshold: int = _DEFAULT_SCORE_THRESHOLD
-) -> tuple[list[ScoredIssue], int]:
-    """Partition into (qualifying, below_threshold_count)."""
-    qualifying = [s for s in scored if s.score >= threshold]
-    below = len(scored) - len(qualifying)
-    return qualifying, below
+        classified.append(ClassifiedIssue(issue=issue, priority=_classify_priority(issue)))
+    return classified, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -189,15 +158,18 @@ def _build_db_path() -> Path:
 
 
 def promote_to_wos(
-    qualifying: list[ScoredIssue],
+    candidates: list[ClassifiedIssue],
     dry_run: bool = False,
 ) -> tuple[list[PromotionResult], int]:
     """
-    Promote qualifying issues into the WOS registry.
+    Promote all candidate issues into the WOS registry.
 
     Returns (promotion_results, already_registered_count).
-    The Registry.upsert method handles dedup — if an issue is already
-    a non-terminal UoW, it returns UpsertSkipped.
+    Registry.upsert handles idempotency — issues already in WOS as non-terminal
+    UoWs return UpsertSkipped.
+
+    Note: source is written by Registry as "github:issue/{number}" which traces
+    back to dcetlin/Lobster since that is the only repo cultivator operates on.
     """
     # Import here so the module can be imported without WOS available
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -209,13 +181,13 @@ def promote_to_wos(
     results: list[PromotionResult] = []
     already_registered = 0
 
-    for scored in qualifying:
-        issue = scored.issue
+    for classified in candidates:
+        issue = classified.issue
 
         if dry_run:
             print(
                 f"  [dry-run] would promote #{issue.number}: {issue.title[:60]} "
-                f"(score={scored.score}, reasons={list(scored.reasons)})"
+                f"(priority={classified.priority})"
             )
             continue
 
@@ -248,8 +220,7 @@ def _render_summary(summary: SweepSummary, dry_run: bool) -> str:
     lines = [
         f"GitHub Issue Cultivator — {'DRY RUN ' if dry_run else ''}Sweep Complete",
         f"  Scanned:           {summary.scanned}",
-        f"  Skipped (wos):     {summary.skipped_wos_tracked}",
-        f"  Below threshold:   {summary.below_threshold}",
+        f"  Skipped (meta):    {summary.skipped_meta}",
         f"  Already in WOS:    {summary.already_registered}",
         f"  Promoted:          {summary.promoted}",
     ]
@@ -266,28 +237,25 @@ def _render_summary(summary: SweepSummary, dry_run: bool) -> str:
 
 def run_sweep(
     repo: str = "dcetlin/Lobster",
-    limit: int = 200,
-    threshold: int = _DEFAULT_SCORE_THRESHOLD,
+    limit: int = 300,
     dry_run: bool = False,
 ) -> SweepSummary:
     """
     Main sweep function. Composes the pure pipeline stages:
-    fetch → score → filter → promote.
+    fetch → classify → promote.
     Returns a SweepSummary value object.
     """
     issues = fetch_open_issues(repo=repo, limit=limit)
-    scored, skipped_wos = score_issues(issues)
-    qualifying, below_threshold = filter_qualifying(scored, threshold=threshold)
+    candidates, skipped_meta = classify_issues(issues)
 
     if dry_run:
-        print(f"Fetched {len(issues)} open issues, {len(qualifying)} qualify (score>={threshold}):")
+        print(f"Fetched {len(issues)} open issues, {len(candidates)} eligible (all non-meta):")
 
-    promotion_results, already_registered = promote_to_wos(qualifying, dry_run=dry_run)
+    promotion_results, already_registered = promote_to_wos(candidates, dry_run=dry_run)
 
     return SweepSummary(
         scanned=len(issues),
-        skipped_wos_tracked=skipped_wos,
-        below_threshold=below_threshold,
+        skipped_meta=skipped_meta,
         promoted=len(promotion_results),
         already_registered=already_registered,
         promotion_results=tuple(promotion_results),
@@ -297,15 +265,13 @@ def run_sweep(
 def main() -> None:
     parser = argparse.ArgumentParser(description="GitHub Issue Cultivator for WOS")
     parser.add_argument("--repo", default="dcetlin/Lobster", help="GitHub repo (owner/name)")
-    parser.add_argument("--limit", type=int, default=200, help="Max issues to fetch")
-    parser.add_argument("--threshold", type=int, default=2, help="Minimum score to promote")
-    parser.add_argument("--dry-run", action="store_true", help="Score but do not write to WOS")
+    parser.add_argument("--limit", type=int, default=300, help="Max issues to fetch")
+    parser.add_argument("--dry-run", action="store_true", help="Classify but do not write to WOS")
     args = parser.parse_args()
 
     summary = run_sweep(
         repo=args.repo,
         limit=args.limit,
-        threshold=args.threshold,
         dry_run=args.dry_run,
     )
     print(_render_summary(summary, dry_run=args.dry_run))
