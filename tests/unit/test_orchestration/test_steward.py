@@ -1998,3 +1998,306 @@ class TestLlmPrescription:
         artifact_data = json.loads(artifacts[0].read_text())
         assert "LLM-generated" in artifact_data["instructions"]
         assert "Completion check:" in artifact_data["instructions"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: Issue #425 — _assess_completion reads success field from result.json
+# (regression: stub keyword-matching must not be the live code path)
+# ---------------------------------------------------------------------------
+
+class TestAssessCompletionStructuralProxy:
+    """
+    Verify that _assess_completion uses the structured result.json written by
+    the Executor (outcome/success fields) rather than keyword-matching on
+    success_criteria text. Prevents false-positive done declarations.
+
+    Issue #425: fix(_assess_completion): replace stub keyword-matching with
+    deterministic structural proxy.
+    """
+
+    def _make_uow(self, tmp_path, uow_id=None, success_criteria="Output file exists"):
+        """Build a minimal UoW with output_ref pointing to a tmp file."""
+        from src.orchestration.registry import UoW, UoWStatus
+        if uow_id is None:
+            uow_id = f"uow_{uuid.uuid4().hex[:8]}"
+        output_file = tmp_path / f"{uow_id}.json"
+        output_file.write_text("task dispatched")
+        return UoW(
+            id=uow_id,
+            status=UoWStatus.READY_FOR_STEWARD,
+            summary="Test UoW",
+            source="github:issue/42",
+            source_issue_number=42,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+            type="executable",
+            success_criteria=success_criteria,
+            steward_cycles=1,
+            output_ref=str(output_file),
+        ), output_file
+
+    def test_success_false_in_result_json_prevents_done_declaration(self, tmp_path):
+        """
+        A result.json with success=false and outcome=failed must cause
+        _assess_completion to return is_complete=False, even if the
+        success_criteria text appears in the output file.
+
+        This is the core false-positive regression: the old keyword-matching
+        stub would return True because a word from success_criteria appears
+        in the output. The structural proxy reads outcome/success instead.
+        """
+        steward = _import_steward()
+        uow, output_file = self._make_uow(tmp_path, success_criteria="Output file exists")
+
+        # Output file contains the success_criteria keyword — old stub would match this
+        output_file.write_text("Output file exists with all results written.")
+
+        # Executor writes success=false / outcome=failed
+        result_file = output_file.with_suffix(".result.json")
+        result_file.write_text(json.dumps({
+            "uow_id": uow.id,
+            "outcome": "failed",
+            "success": False,
+            "reason": "subagent exited before completing all steps",
+        }))
+
+        is_complete, rationale, executor_outcome = steward._assess_completion(
+            uow=uow,
+            output_content=output_file.read_text(),
+            reentry_posture="execution_complete",
+        )
+
+        assert not is_complete, (
+            "_assess_completion must return is_complete=False when result.json reports "
+            "outcome=failed, even if success_criteria keywords appear in the output"
+        )
+        assert executor_outcome == "failed"
+
+    def test_success_true_in_result_json_declares_done(self, tmp_path):
+        """
+        A result.json with outcome=complete and success=true must cause
+        _assess_completion to return is_complete=True.
+        """
+        steward = _import_steward()
+        uow, output_file = self._make_uow(tmp_path)
+        output_file.write_text("PR #42 opened and tests passed.")
+
+        result_file = output_file.with_suffix(".result.json")
+        result_file.write_text(json.dumps({
+            "uow_id": uow.id,
+            "outcome": "complete",
+            "success": True,
+        }))
+
+        is_complete, rationale, executor_outcome = steward._assess_completion(
+            uow=uow,
+            output_content=output_file.read_text(),
+            reentry_posture="execution_complete",
+        )
+
+        assert is_complete, (
+            "_assess_completion must return is_complete=True when result.json has outcome=complete"
+        )
+        assert executor_outcome == "complete"
+
+    def test_no_result_json_with_success_criteria_returns_false(self, tmp_path):
+        """
+        When no result.json exists and success_criteria is set,
+        _assess_completion must return is_complete=False (conservative fallback).
+        The Executor is required to write a result file; without one the
+        Steward cannot verify completion.
+        """
+        steward = _import_steward()
+        uow, output_file = self._make_uow(tmp_path, success_criteria="PR merged")
+        output_file.write_text("PR merged successfully.")
+        # No result.json written
+
+        is_complete, rationale, executor_outcome = steward._assess_completion(
+            uow=uow,
+            output_content=output_file.read_text(),
+            reentry_posture="execution_complete",
+        )
+
+        assert not is_complete, (
+            "Without a result.json, _assess_completion must not declare done "
+            "when success_criteria is set — conservative fallback required"
+        )
+        assert executor_outcome is None
+
+    def test_outcome_blocked_routes_to_dan(self, tmp_path):
+        """
+        A result.json with outcome=blocked must return is_complete=False
+        with executor_outcome='blocked' so the caller routes to Dan.
+        """
+        steward = _import_steward()
+        uow, output_file = self._make_uow(tmp_path)
+        output_file.write_text("blocked: waiting for API credentials")
+
+        result_file = output_file.with_suffix(".result.json")
+        result_file.write_text(json.dumps({
+            "uow_id": uow.id,
+            "outcome": "blocked",
+            "success": False,
+            "reason": "API credentials not available in this environment",
+        }))
+
+        is_complete, rationale, executor_outcome = steward._assess_completion(
+            uow=uow,
+            output_content=output_file.read_text(),
+            reentry_posture="execution_complete",
+        )
+
+        assert not is_complete
+        assert executor_outcome == "blocked", (
+            "outcome=blocked in result.json must route to Dan — executor_outcome must be 'blocked'"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Issue #426 — _default_notify_dan writes to Lobster inbox on hard cap
+# (regression: WARNING log alone is not sufficient — inbox delivery required)
+# ---------------------------------------------------------------------------
+
+class TestDefaultNotifyDanInboxDelivery:
+    """
+    Verify that when the hard cap fires and a UoW moves to 'blocked',
+    _default_notify_dan writes a JSON message to ~/messages/inbox/ so Dan
+    is notified via Telegram.
+
+    Issue #426: fix(_default_notify_dan): write to Lobster inbox on hard cap.
+    """
+
+    def test_hard_cap_writes_json_file_to_inbox(self, tmp_path, monkeypatch):
+        """
+        _default_notify_dan with condition='hard_cap' must write a JSON file
+        to the inbox directory. The file must contain the uow_id, condition,
+        and a non-empty text body.
+        """
+        steward = _import_steward()
+        from src.orchestration.registry import UoW, UoWStatus
+
+        # Redirect inbox writes to tmp_path so we don't touch the live inbox
+        fake_inbox = tmp_path / "inbox"
+        fake_inbox.mkdir()
+        monkeypatch.setattr(
+            "os.path.expanduser",
+            lambda p: str(fake_inbox) if "messages/inbox" in p else os.path.expanduser(p),
+        )
+
+        uow = UoW(
+            id="uow_hardcap_001",
+            status=UoWStatus.BLOCKED,
+            summary="Test hard cap UoW",
+            source="github:issue/100",
+            source_issue_number=100,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+            type="executable",
+            success_criteria=None,
+            steward_cycles=5,
+        )
+
+        steward._default_notify_dan(uow=uow, condition="hard_cap", return_reason="execution_failed")
+
+        written = list(fake_inbox.glob("*.json"))
+        assert len(written) == 1, (
+            "_default_notify_dan must write exactly one JSON file to the inbox on hard_cap"
+        )
+
+        msg = json.loads(written[0].read_text())
+        assert msg.get("metadata", {}).get("uow_id") == "uow_hardcap_001", (
+            "Inbox message must include uow_id in metadata"
+        )
+        assert msg.get("metadata", {}).get("condition") == "hard_cap"
+        assert msg.get("text"), "Inbox message must have a non-empty text body"
+        assert "source" in msg, "Inbox message must include source field"
+
+    def test_hard_cap_inbox_message_includes_buttons(self, tmp_path, monkeypatch):
+        """
+        The hard-cap inbox message must include inline buttons so Dan can
+        resolve the stuck UoW (Retry / Close) without typing commands.
+        """
+        steward = _import_steward()
+        from src.orchestration.registry import UoW, UoWStatus
+
+        fake_inbox = tmp_path / "inbox"
+        fake_inbox.mkdir()
+        monkeypatch.setattr(
+            "os.path.expanduser",
+            lambda p: str(fake_inbox) if "messages/inbox" in p else os.path.expanduser(p),
+        )
+
+        uow = UoW(
+            id="uow_hardcap_002",
+            status=UoWStatus.BLOCKED,
+            summary="Buttons test UoW",
+            source="github:issue/101",
+            source_issue_number=101,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+            type="executable",
+            success_criteria=None,
+            steward_cycles=5,
+        )
+
+        steward._default_notify_dan(uow=uow, condition="hard_cap")
+
+        written = list(fake_inbox.glob("*.json"))
+        assert len(written) == 1
+        msg = json.loads(written[0].read_text())
+
+        buttons = msg.get("buttons")
+        assert buttons, "Hard-cap inbox message must include inline buttons for Retry/Close"
+        # Flatten buttons (list of rows, each a list of button dicts)
+        all_buttons = [btn for row in buttons for btn in row]
+        callback_data_values = [btn.get("callback_data", "") for btn in all_buttons]
+        assert any("decide_retry" in cb for cb in callback_data_values), (
+            "Must have a Retry button with decide_retry callback_data"
+        )
+        assert any("decide_close" in cb for cb in callback_data_values), (
+            "Must have a Close button with decide_close callback_data"
+        )
+
+    def test_run_steward_cycle_hard_cap_uses_real_notify(self, db_path, registry, tmp_path, monkeypatch):
+        """
+        Integration: when run_steward_cycle fires the hard cap with the default
+        notify_dan (not a mock), a JSON file is written to the inbox directory.
+        Verifies that the live code path (not just the injected mock) delivers
+        inbox messages.
+        """
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        fake_inbox = tmp_path / "inbox"
+        fake_inbox.mkdir()
+        monkeypatch.setattr(
+            "os.path.expanduser",
+            lambda p: str(fake_inbox) if "messages/inbox" in p else os.path.expanduser(p),
+        )
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=5,
+            output_ref=None,
+        )
+        conn.close()
+
+        # Run without injecting notify_dan — exercises the real _default_notify_dan
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            # notify_dan not passed — uses _default_notify_dan (the live path)
+        )
+
+        uow = _get_uow(db_path, uow_id)
+        assert uow["status"] == "blocked", "Hard cap must transition UoW to blocked"
+
+        written = list(fake_inbox.glob("*.json"))
+        assert len(written) >= 1, (
+            "_default_notify_dan must write a JSON file to the inbox when the hard cap fires "
+            "— WARNING log alone is not sufficient (Issue #426)"
+        )
