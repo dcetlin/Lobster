@@ -171,6 +171,7 @@ Never use cron for user-space jobs. Never use systemd tools for system-level inf
 
 - **Type A (LLM subagent tasks):** Run a prompt, do work, return output. The cron + jobs.json `enabled` field is the correct dispatch gate. Systemd was intentionally excluded — job dispatch is not process management. Jobs are prompts, not processes. Runtime enable/disable lives in jobs.json without touching cron.
 - **Type B (long-running services):** The dispatcher, MCP servers, Telegram bot, health daemons. These are processes. Systemd is the right tool here when/if Lobster moves to fully-automated operation.
+- **Type C (cron-direct non-LLM scripts):** Pure Python scripts invoked directly by cron — no inbox message written, no LLM round-trip. The script reads jobs.json itself to check the `enabled` gate and logs to `scheduled-jobs/logs/` directly. `dispatch: "cron-direct"` in jobs.json identifies these entries. Examples: `executor-heartbeat.py`, `steward-heartbeat.py`.
 
 ## Key Directories
 
