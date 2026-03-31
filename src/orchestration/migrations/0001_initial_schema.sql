@@ -7,7 +7,7 @@
 -- skip DDL that already exists but still record this migration as applied.
 --
 -- Tables created:
---   uow_registry — core UoW store with all Phase 2 fields
+--   uow_registry — core UoW store with all steward/executor fields
 --   executor_uow_view — view exposing only executor-accessible columns
 --   audit_log — append-only event log for status transitions
 
@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS uow_registry (
     trigger             TEXT    DEFAULT '{"type": "immediate"}',
     vision_ref          TEXT    DEFAULT NULL,
 
-    -- Phase 2 fields — Executor-accessible (included in executor_uow_view)
+    -- Steward/Executor fields — Executor-accessible (included in executor_uow_view)
     workflow_artifact   TEXT    NULL,
     success_criteria    TEXT    NOT NULL DEFAULT '',
     prescribed_skills   TEXT    NULL,
@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS uow_registry (
     timeout_at          TEXT    NULL,
     estimated_runtime   INTEGER NULL,
 
-    -- Phase 2 fields — Steward-private (excluded from executor_uow_view)
+    -- Steward-private fields (excluded from executor_uow_view)
     steward_agenda      TEXT    NULL,
     steward_log         TEXT    NULL,
 

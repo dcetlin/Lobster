@@ -1,4 +1,4 @@
--- WOS Phase 2 — Authoritative schema for the Unit-of-Work registry.
+-- WOS — Authoritative schema for the Unit-of-Work registry.
 --
 -- This file is the source of truth for all DDL. registry.py loads and
 -- applies it at init time via conn.executescript(). Do not duplicate
@@ -21,11 +21,11 @@
 --   INSERT OR REPLACE is explicitly not used — it would silently discard
 --   execution state already recorded on an existing row.
 --
--- Column visibility contract (Phase 2 standing convention):
+-- Column visibility contract:
 --   Every column must declare its executor visibility:
 --   - Executor-accessible: included in executor_uow_view.
 --   - Steward-private or system-only: explicitly excluded, with a comment.
---   Run scripts/migrate_add_steward_fields.py to apply Phase 2 fields
+--   Run scripts/migrate_add_steward_fields.py to apply steward/executor fields
 --   to existing databases.
 
 CREATE TABLE IF NOT EXISTS uow_registry (
@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS uow_registry (
     trigger             TEXT    DEFAULT '{"type": "immediate"}',
     vision_ref          TEXT    DEFAULT NULL,
 
-    -- Phase 2 fields — Executor-accessible (included in executor_uow_view)
+    -- Steward/Executor fields — Executor-accessible (included in executor_uow_view)
     workflow_artifact   TEXT    NULL,
     success_criteria    TEXT    NOT NULL DEFAULT '',
     prescribed_skills   TEXT    NULL,
@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS uow_registry (
     timeout_at          TEXT    NULL,
     estimated_runtime   INTEGER NULL,
 
-    -- Phase 2 fields — Steward-private (excluded from executor_uow_view)
+    -- Steward-private fields (excluded from executor_uow_view)
     -- steward_agenda: Steward writes its forward forecast here.
     --   Executor must never read this. Excluded from executor_uow_view.
     steward_agenda      TEXT    NULL,

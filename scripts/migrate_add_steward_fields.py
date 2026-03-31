@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-migrate_add_steward_fields.py — WOS Phase 2 PR0 schema migration.
+migrate_add_steward_fields.py — WOS steward/executor schema migration.
 
-Adds all Phase 2 fields to uow_registry and creates executor_uow_view.
+Adds steward/executor fields to uow_registry and creates executor_uow_view.
 
 This script is idempotent: it checks PRAGMA table_info(uow_registry) before
 each ALTER TABLE ADD COLUMN, so it is safe to run multiple times and safe to
@@ -16,9 +16,9 @@ Environment:
     REGISTRY_DB_PATH — override the default db path
                        (default: ~/lobster-workspace/orchestration/registry.db)
 
-Phase 2 concurrent-writer note:
-    Phase 2 introduces concurrent writers: Steward heartbeat, Executor, and
-    Observation Loop. All scripts that open the registry DB must set
+Concurrent-writer note:
+    The Steward heartbeat, Executor, and Observation Loop are concurrent
+    writers. All scripts that open the registry DB must set
     PRAGMA busy_timeout = 5000 immediately after sqlite3.connect() so that the
     second writer waits up to 5 seconds rather than failing immediately.
     This script sets busy_timeout = 5000 as required.
@@ -49,7 +49,7 @@ from pathlib import Path
 # executor_visible=True  → column appears in executor_uow_view SELECT list
 # executor_visible=False → column is intentionally excluded (comment explains why)
 
-_PHASE2_COLUMNS: list[tuple[str, str, bool]] = [
+_STEWARD_EXECUTOR_COLUMNS: list[tuple[str, str, bool]] = [
     # Absolute path to the workflow artifact JSON written by the Steward.
     # Executor reads this to find its instructions. Executor-accessible.
     ("workflow_artifact", "TEXT NULL", True),
@@ -92,9 +92,8 @@ _PHASE2_COLUMNS: list[tuple[str, str, bool]] = [
     ("steward_log", "TEXT NULL", False),
 ]
 
-# Fields visible to the Executor (included in executor_uow_view).
-# Phase 1 fields already present in the table are also included here.
-_EXECUTOR_VIEW_PHASE1_FIELDS = (
+# Base fields (already present in the table) that are also visible to the Executor.
+_EXECUTOR_VIEW_BASE_FIELDS = (
     "id", "status", "output_ref", "started_at", "completed_at",
     "source_issue_number", "summary",
 )
@@ -118,14 +117,14 @@ def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 def _add_missing_columns(conn: sqlite3.Connection) -> list[str]:
     """
-    Check each Phase 2 column individually and add only those that are absent.
+    Check each steward/executor column individually and add only those that are absent.
 
     Returns the list of column names that were added.
     """
     existing = _existing_columns(conn, "uow_registry")
     added: list[str] = []
 
-    for col_name, col_type, _ in _PHASE2_COLUMNS:
+    for col_name, col_type, _ in _STEWARD_EXECUTOR_COLUMNS:
         if col_name in existing:
             print(f"  [skip]  {col_name} — already present")
             continue
@@ -149,16 +148,16 @@ def _create_executor_uow_view(conn: sqlite3.Connection) -> None:
     steward_log: Steward-private — excluded from executor_uow_view.
         Steward writes decision-point log here; Executor must never read it.
 
-    All other Phase 2 columns are Executor-accessible and are included.
+    All other steward/executor columns are Executor-accessible and are included.
     """
-    # Build the executor-visible column list from Phase 1 fields + Phase 2 fields
+    # Build the executor-visible column list from base fields + steward/executor fields
     # marked executor_visible=True.
     phase2_executor_cols = [
         col_name
-        for col_name, _, executor_visible in _PHASE2_COLUMNS
+        for col_name, _, executor_visible in _STEWARD_EXECUTOR_COLUMNS
         if executor_visible
     ]
-    all_executor_cols = list(_EXECUTOR_VIEW_PHASE1_FIELDS) + phase2_executor_cols
+    all_executor_cols = list(_EXECUTOR_VIEW_BASE_FIELDS) + phase2_executor_cols
     select_cols = ",\n    ".join(all_executor_cols)
 
     # DROP and re-CREATE so the view is always up to date even on re-runs.
@@ -180,15 +179,15 @@ def _create_executor_uow_view(conn: sqlite3.Connection) -> None:
 
 
 def migrate(db_path: Path) -> None:
-    """Run the full Phase 2 schema migration against db_path."""
+    """Run the steward/executor schema migration against db_path."""
     if not db_path.parent.exists():
         print(f"ERROR: parent directory does not exist: {db_path.parent}", file=sys.stderr)
         sys.exit(1)
 
     print(f"Opening registry: {db_path}")
     conn = sqlite3.connect(str(db_path))
-    # Phase 2 has concurrent writers (Steward heartbeat + Executor + Observation
-    # Loop). Set busy_timeout so that the second writer waits rather than fails
+    # Concurrent writers (Steward heartbeat + Executor + Observation Loop).
+    # Set busy_timeout so that the second writer waits rather than fails
     # immediately with SQLITE_BUSY.
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA journal_mode=WAL")
@@ -209,7 +208,7 @@ def migrate(db_path: Path) -> None:
             )
             sys.exit(1)
 
-        print("Adding Phase 2 columns (idempotent per-column):")
+        print("Adding steward/executor columns (idempotent per-column):")
         added = _add_missing_columns(conn)
 
         print("Creating executor_uow_view:")

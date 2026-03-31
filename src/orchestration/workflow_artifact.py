@@ -5,8 +5,7 @@ This module defines the typed structure for the workflow artifact: the
 document a Steward writes and an Executor reads. It is the boundary
 between planning (Steward) and execution (Executor).
 
-All downstream Phase 2 modules (#303 Steward, #305 Executor) import from
-this canonical path:
+All Steward and Executor modules import from this canonical path:
 
     from orchestration.workflow_artifact import WorkflowArtifact, to_json, from_json
 
@@ -31,8 +30,7 @@ from typing import TypedDict
 # Tilde is expanded to an absolute path at access time via artifact_path().
 _ARTIFACT_DIR_TEMPLATE = "~/lobster-workspace/orchestration/artifacts"
 
-# The only valid executor_type in Phase 2.
-# Phase 3 may add: 'code-runner', 'file-writer', etc.
+# The only valid executor_type at present.
 EXECUTOR_TYPE_GENERAL = "general"
 
 # All fields that must be present in a valid WorkflowArtifact.
@@ -52,8 +50,7 @@ class WorkflowArtifact(TypedDict):
     uow_id : str
         Links to the UoWRegistry entry this artifact was produced for.
     executor_type : str
-        Which Executor handles this UoW. Phase 2 valid value: 'general'.
-        Reserved for Phase 3 specialised dispatch paths.
+        Which Executor handles this UoW. Currently only 'general' is valid.
     constraints : list[str]
         Hard constraints on execution (e.g. 'no-network-access').
         Use [] for no constraints.
@@ -61,8 +58,7 @@ class WorkflowArtifact(TypedDict):
         Skill IDs to activate at task start.
         None (NULL in registry) = Steward did not prescribe; use active skills.
         [] = Steward explicitly prescribes no skills; deactivate contextual skills.
-        Phase 2: both None and [] are treated as "no skill activation required".
-        The semantic distinction is preserved for Phase 3.
+        Both None and [] are treated as "no skill activation required".
     instructions : str
         Natural language guidance for the Executor's LLM dispatch.
     """
@@ -88,8 +84,7 @@ def from_json(json_str: str) -> WorkflowArtifact:
     Deserialize from JSON string.
 
     Raises ValueError on any parse or validation failure. Unknown extra
-    fields are silently ignored for forward compatibility (Phase 3 may add
-    optional fields without breaking Phase 2 readers).
+    fields are silently ignored for forward compatibility.
 
     Raises
     ------

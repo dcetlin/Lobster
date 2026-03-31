@@ -1,2 +1,2 @@
-# Work Orchestration System — Phase 1
+# Work Orchestration System
 # Registry, CLI, and dispatcher handler integration
