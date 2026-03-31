@@ -796,9 +796,10 @@ def _build_deterministic_prescription_instructions(
             assessment = entry.get("completion_assessment", "")
             rationale = entry.get("next_posture_rationale", "")
             cycle_num = entry.get("steward_cycles", "?")
+            return_reason = entry.get("return_reason", "")
             prior_lines.append(
                 f"  {i}. Cycle {cycle_num}: assessment={assessment!r}; "
-                f"rationale={rationale!r}"
+                f"rationale={rationale!r}; return_reason={return_reason!r}"
             )
         parts += prior_lines
 
