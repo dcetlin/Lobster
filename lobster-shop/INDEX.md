@@ -15,6 +15,7 @@ Browse available skills for your Lobster assistant. Install any skill with one c
 | [Engineering Sensibilities](./engineering-sensibilities/) | PR-review checklist enforcing four engineering principles: fractal structure, golden patterns, maximal elegance, and cognitive clarity — activates on PR reviews and WOS implementation work | Behavioral | Available |
 | [Hibernation](./hibernation/) | Dispatcher hibernation — idle timeout behavior, state file semantics, and how to break the hibernation loop cleanly | Behavioral | Available |
 | [Obsidian KM](./obsidian-km/) | Sync and access your Obsidian vault via Telegram — create, read, search, and manage notes from anywhere | Tool | In Dev |
+| [Footer Reset](./footer-reset/) | Re-inject canonical side-effects footer format and audit recent outbox messages for footer drift — triggered by `/footer-reset` | Behavioral | Available |
 
 ## Templates
 

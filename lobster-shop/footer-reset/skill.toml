@@ -1,0 +1,39 @@
+[skill]
+name = "footer-reset"
+version = "1.0.0"
+description = "Re-inject canonical side-effects footer format and audit recent outbox messages for footer drift"
+author = "Lobster"
+category = "behavioral"
+
+[activation]
+mode = "triggered"
+triggers = ["/footer-reset", "/reset-footer"]
+context_patterns = [
+    "when user mentions footer drift",
+    "when user mentions side-effects label confusion",
+    "when user asks about signal footer",
+    "when user asks about side-effects format",
+    "when user asks about missing footers",
+    "when user asks to audit outbox messages",
+]
+
+[layering]
+priority = 60
+merge_strategy = "append"
+
+[provides]
+mcp_tools = []
+bot_commands = ["/footer-reset", "/reset-footer"]
+
+[compatibility]
+enhances = []
+conflicts = []
+
+[dependencies]
+pip = []
+npm = []
+system = []
+api_keys = []
+
+[dependencies.runtime]
+python = ">=3.11"
