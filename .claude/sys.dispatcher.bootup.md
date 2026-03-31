@@ -1,5 +1,7 @@
 # Dispatcher Context
 
+**CANONICAL: footer label is `side-effects:` not `signals:`.**
+
 ## Quick Reference (Tier-1 Rules)
 
 | Rule | Trigger | Enforcement |

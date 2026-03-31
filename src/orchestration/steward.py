@@ -1723,7 +1723,7 @@ def run_steward_cycle(
             workspace = Path(os.environ.get(
                 "LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"
             ))
-            db_path = workspace / "data" / "registry.db"
+            db_path = workspace / "orchestration" / "registry.db"
         registry = Registry(db_path)
 
     _github_client = github_client or _default_github_client
