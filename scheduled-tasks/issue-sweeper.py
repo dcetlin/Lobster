@@ -64,7 +64,10 @@ def _now_iso() -> str:
 
 def _default_db_path() -> Path:
     workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-    return workspace / "data" / "registry.db"
+    env_override = os.environ.get("REGISTRY_DB_PATH")
+    if env_override:
+        return Path(env_override)
+    return workspace / "orchestration" / "registry.db"
 
 
 # ---------------------------------------------------------------------------

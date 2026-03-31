@@ -311,7 +311,7 @@ class TestActiveUowClassifications:
         assert entries[0]["event"] == "startup_sweep"
         assert entries[0]["from_status"] == "active"
         assert entries[0]["to_status"] == "ready-for-steward"
-        assert entries[0]["agent"] == "steward_startup"
+        assert entries[0]["agent"] == "steward"
 
         note = json.loads(entries[0]["note"])
         assert note["classification"] == "possibly_complete"
@@ -451,7 +451,7 @@ class TestDiagnosingUow:
         note = json.loads(entries[0]["note"])
         assert note["classification"] == "diagnosing_orphan"
         assert note["prior_status"] == "diagnosing"
-        assert note["actor"] == "steward_startup"
+        assert note["actor"] == "steward"
 
 
 class TestConcurrency:
@@ -616,7 +616,7 @@ class TestAuditEntryStructure:
         for field in ("event", "actor", "classification", "output_ref", "uow_id", "timestamp"):
             assert field in note, f"Missing field: {field}"
         assert note["event"] == "startup_sweep"
-        assert note["actor"] == "steward_startup"
+        assert note["actor"] == "steward"
         assert note["uow_id"] == uow_id
 
     def test_all_required_fields_present_in_executor_orphan_audit_entry(

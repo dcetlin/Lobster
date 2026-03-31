@@ -140,6 +140,42 @@ def cmd_gate_readiness(registry: Registry, args: argparse.Namespace) -> None:
     })
 
 
+def cmd_decide_retry(registry: Registry, args: argparse.Namespace) -> None:
+    """Handle decide-retry: reset a stuck UoW for a new Steward cycle."""
+    uow_id = args.id
+    rows = registry.decide_retry(uow_id)
+    if rows == 1:
+        _output({
+            "status": "ok",
+            "id": uow_id,
+            "message": f"UoW `{uow_id}` reset for retry — blocked \u2192 ready-for-steward (steward_cycles reset to 0)",
+        })
+    else:
+        _output({
+            "status": "not_blocked",
+            "id": uow_id,
+            "message": f"UoW `{uow_id}` could not be retried — it is not currently in `blocked` status",
+        })
+
+
+def cmd_decide_close(registry: Registry, args: argparse.Namespace) -> None:
+    """Handle decide-close: close a stuck UoW as user-requested failure."""
+    uow_id = args.id
+    rows = registry.decide_close(uow_id)
+    if rows == 1:
+        _output({
+            "status": "ok",
+            "id": uow_id,
+            "message": f"UoW `{uow_id}` closed — blocked \u2192 failed (reason: user_closed)",
+        })
+    else:
+        _output({
+            "status": "not_blocked",
+            "id": uow_id,
+            "message": f"UoW `{uow_id}` could not be closed — it is not currently in `blocked` status",
+        })
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -181,6 +217,20 @@ def _build_parser() -> argparse.ArgumentParser:
     # gate-readiness
     subparsers.add_parser("gate-readiness", help="Check Phase 1 → Phase 2 autonomy gate metric")
 
+    # decide-retry
+    p_decide_retry = subparsers.add_parser(
+        "decide-retry",
+        help="Reset a stuck UoW for a new Steward cycle (blocked → ready-for-steward)",
+    )
+    p_decide_retry.add_argument("--id", required=True, help="UoW id")
+
+    # decide-close
+    p_decide_close = subparsers.add_parser(
+        "decide-close",
+        help="Close a stuck UoW as user-requested failure (blocked → failed)",
+    )
+    p_decide_close.add_argument("--id", required=True, help="UoW id")
+
     return parser
 
 
@@ -192,6 +242,8 @@ _COMMAND_MAP = {
     "check-stale": cmd_check_stale,
     "expire-proposals": cmd_expire_proposals,
     "gate-readiness": cmd_gate_readiness,
+    "decide-retry": cmd_decide_retry,
+    "decide-close": cmd_decide_close,
 }
 
 
