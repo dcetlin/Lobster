@@ -196,3 +196,14 @@ class TestUpdateSourceTracking:
         assert uow_b_data.source_ref is None
         assert uow_b_data.source_last_seen_at is None
         assert uow_b_data.source_state is None
+
+    def test_nonexistent_uow_raises_value_error(self, db: Path) -> None:
+        """update_source_tracking raises ValueError when uow_id does not exist."""
+        registry = Registry(db)
+        with pytest.raises(ValueError, match="uow_id not found: nonexistent-id"):
+            registry.update_source_tracking(
+                uow_id="nonexistent-id",
+                source_ref="github:issue/1",
+                source_last_seen_at=_now_iso(),
+                source_state="open",
+            )

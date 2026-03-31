@@ -1297,12 +1297,13 @@ class Registry:
 
         Raises:
             sqlite3.OperationalError: If the migration has not been applied
-                (columns absent) or the uow_id does not exist.
+                (columns absent).
+            ValueError: If uow_id does not exist in the registry.
         """
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE uow_registry
                    SET source_ref          = ?,
@@ -1313,6 +1314,9 @@ class Registry:
                 """,
                 (source_ref, source_last_seen_at, source_state, _now_iso(), uow_id),
             )
+            rows_affected = cursor.rowcount
+            if rows_affected == 0:
+                raise ValueError(f"uow_id not found: {uow_id}")
             conn.commit()
         except Exception:
             conn.rollback()
