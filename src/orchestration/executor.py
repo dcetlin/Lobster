@@ -276,10 +276,13 @@ class Executor:
         """
         conn = self._connect()
         try:
-            # Step 1: Read UoW — verify existence (outside transaction is fine;
-            # the actual claim is the atomic step 2 UPDATE with WHERE guard).
+            # Step 1: Read UoW from executor_uow_view — enforces read-path
+            # isolation (no steward-private fields; only UoWs in
+            # 'ready-for-executor' state are visible via the view).
+            # The actual claim is the atomic step 2 UPDATE with WHERE guard
+            # on uow_registry; this is a pre-flight read only.
             row = conn.execute(
-                "SELECT * FROM uow_registry WHERE id = ?", (uow_id,)
+                "SELECT * FROM executor_uow_view WHERE id = ?", (uow_id,)
             ).fetchone()
 
             if row is None:

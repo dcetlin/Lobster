@@ -408,21 +408,31 @@ class TestBlockedExecution:
 
 class TestOptimisticLock:
     def test_rejects_if_not_in_ready_for_executor(self, registry: Registry, db_path: Path) -> None:
-        """Claim must be rejected if UoW status is not 'ready-for-executor'."""
+        """Claim must be rejected if UoW status is not 'ready-for-executor'.
+
+        With the status filter active on executor_uow_view, a UoW in 'active'
+        status is invisible to the view. Step 1 returns None → ClaimNotFound →
+        ValueError, not RuntimeError from the optimistic lock.
+        """
         uow_id = "uow_lock_001"
         _insert_uow(db_path, uow_id, status="active", workflow_artifact=_make_artifact(uow_id))
 
         executor = Executor(registry, dispatcher=_noop_dispatcher)
-        with pytest.raises(RuntimeError, match="optimistic lock failed"):
+        with pytest.raises(ValueError, match="not found in registry"):
             executor.execute_uow(uow_id)
 
     def test_rejects_if_status_is_pending(self, registry: Registry, db_path: Path) -> None:
-        """Claim must be rejected for 'pending' status."""
+        """Claim must be rejected for 'pending' status.
+
+        With the status filter active on executor_uow_view, a UoW in 'pending'
+        status is invisible to the view. Step 1 returns None → ClaimNotFound →
+        ValueError, not RuntimeError from the optimistic lock.
+        """
         uow_id = "uow_lock_002"
         _insert_uow(db_path, uow_id, status="pending", workflow_artifact=_make_artifact(uow_id))
 
         executor = Executor(registry, dispatcher=_noop_dispatcher)
-        with pytest.raises(RuntimeError, match="optimistic lock failed"):
+        with pytest.raises(ValueError, match="not found in registry"):
             executor.execute_uow(uow_id)
 
     def test_raises_value_error_for_unknown_uow(self, registry: Registry, db_path: Path) -> None:
@@ -443,9 +453,11 @@ class TestOptimisticLock:
         executor1 = Executor(registry, dispatcher=_noop_dispatcher)
         executor1.execute_uow(uow_id)  # transitions to ready-for-steward after success
 
-        # Now status is 'ready-for-steward', not 'ready-for-executor'
+        # Now status is 'ready-for-steward', not 'ready-for-executor'.
+        # With the view filter active, 'ready-for-steward' UoWs are invisible →
+        # Step 1 returns None → ClaimNotFound → ValueError (not RuntimeError).
         executor2 = Executor(registry, dispatcher=_noop_dispatcher)
-        with pytest.raises(RuntimeError, match="optimistic lock failed"):
+        with pytest.raises(ValueError, match="not found in registry"):
             executor2.execute_uow(uow_id)
 
     def test_truly_concurrent_claim_exactly_one_succeeds(

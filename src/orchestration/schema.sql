@@ -87,17 +87,26 @@ CREATE TABLE IF NOT EXISTS uow_registry (
 -- timeout_at: ISO timestamp computed as started_at + estimated_runtime (or +1800s).
 -- estimated_runtime: optional seconds estimate for timeout_at computation.
 
-CREATE VIEW IF NOT EXISTS executor_uow_view AS
+-- executor_uow_view: read-path isolation contract for the Executor.
+-- Only UoWs in 'ready-for-executor' state are visible; steward-private
+-- fields (steward_agenda, steward_log, notes) are excluded by design.
+-- The Executor must SELECT from this view, never from uow_registry directly.
+-- State-transition UPDATEs (ready-for-executor → active) still write to
+-- uow_registry directly — only the Executor's read path uses this view.
+DROP VIEW IF EXISTS executor_uow_view;
+CREATE VIEW executor_uow_view AS
 SELECT
     id, status, output_ref, started_at, completed_at,
     source_issue_number, summary,
     workflow_artifact, success_criteria, prescribed_skills,
     steward_cycles, timeout_at, estimated_runtime
-FROM uow_registry;
+FROM uow_registry
+WHERE status = 'ready-for-executor';
 -- steward_agenda: Steward-private, excluded from executor_uow_view.
 --   Steward writes forward forecast here; Executor must never read it.
 -- steward_log: Steward-private, excluded from executor_uow_view.
 --   Steward writes decision-point log here; Executor must never read it.
+-- notes: system-only scratch space, excluded from executor_uow_view.
 
 CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
