@@ -25,6 +25,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Callable
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +132,8 @@ def run_startup_sweep(
     registry,
     dry_run: bool = False,
     orphan_threshold_seconds: int = _EXECUTOR_ORPHAN_THRESHOLD_SECONDS,
+    bootup_candidate_gate: bool | None = None,
+    github_client: Callable[[int], dict[str, Any]] | None = None,
 ) -> StartupSweepResult:
     """
     Startup sweep — crash recovery for orphaned UoWs (#307).
@@ -153,11 +156,35 @@ def run_startup_sweep(
     - If rows_affected == 0: another process won the race — skip silently.
     - In dry_run mode: classify but do not write or transition.
 
+    BOOTUP_CANDIDATE_GATE (#342): when True, UoWs whose GitHub issue carries
+    the `bootup-candidate` label are skipped in all three populations,
+    consistent with the gate applied in run_steward_cycle.
+
+    bootup_candidate_gate: override for BOOTUP_CANDIDATE_GATE module constant.
+    github_client: callable(issue_number) → {labels, ...}. Defaults to the
+        production gh CLI client from steward.py.
+
     Periodic 15-minute sweep (design doc pattern) is deferred to Phase 3.
     The 3-minute heartbeat cadence achieves finer coverage.
 
     Returns StartupSweepResult with counts for each population swept.
     """
+    from src.orchestration.steward import BOOTUP_CANDIDATE_GATE, _default_github_client
+
+    _gate = bootup_candidate_gate if bootup_candidate_gate is not None else BOOTUP_CANDIDATE_GATE
+    _github = github_client or _default_github_client
+
+    def _is_bootup_candidate_gated(uow) -> bool:
+        """Return True if this UoW should be skipped due to BOOTUP_CANDIDATE_GATE."""
+        if not _gate:
+            return False
+        source_issue_number = getattr(uow, "source_issue_number", None)
+        if not source_issue_number:
+            return False
+        issue_info = _github(source_issue_number)
+        labels = issue_info.get("labels", [])
+        return "bootup-candidate" in labels
+
     try:
         active_uows = registry.list(status=_STATUS_ACTIVE)
     except Exception as e:
@@ -185,6 +212,14 @@ def run_startup_sweep(
     # --- Population 1: active UoWs (Executor crash during execution) ---
     for uow in active_uows:
         uow_id = uow.id
+
+        if _is_bootup_candidate_gated(uow):
+            log.debug(
+                "Startup sweep: skipping bootup-candidate UoW %s (gate=True)",
+                uow_id,
+            )
+            continue
+
         output_ref = uow.output_ref
         classification, extra = _classify_active_uow(output_ref)
 
@@ -220,6 +255,14 @@ def run_startup_sweep(
     # --- Population 2: ready-for-executor UoWs older than threshold ---
     for uow in rfe_uows:
         uow_id = uow.id
+
+        if _is_bootup_candidate_gated(uow):
+            log.debug(
+                "Startup sweep: skipping bootup-candidate UoW %s (gate=True)",
+                uow_id,
+            )
+            continue
+
         proposed_at = uow.created_at  # proposed_at proxy: conservative lower bound
 
         try:
@@ -273,6 +316,13 @@ def run_startup_sweep(
     # --- Population 3: diagnosing UoWs (Steward crash mid-diagnosis) ---
     for uow in diagnosing_uows:
         uow_id = uow.id
+
+        if _is_bootup_candidate_gated(uow):
+            log.debug(
+                "Startup sweep: skipping bootup-candidate UoW %s (gate=True)",
+                uow_id,
+            )
+            continue
 
         if dry_run:
             log.info(

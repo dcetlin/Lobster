@@ -136,7 +136,12 @@ def _default_db_path() -> Path:
     workspace = Path(os.environ.get(
         "LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"
     ))
-    return workspace / "data" / "registry.db"
+    # Primary: orchestration/registry.db (used by registry_cli.py and the Executor)
+    # Fallback: REGISTRY_DB_PATH env override (used in tests and alternate installs)
+    env_override = os.environ.get("REGISTRY_DB_PATH")
+    if env_override:
+        return Path(env_override)
+    return workspace / "orchestration" / "registry.db"
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +324,7 @@ def main() -> int:
     # Phase 1: Startup sweep
     log.info("--- Phase 1: Startup sweep ---")
     try:
-        sweep_result = run_startup_sweep(registry, dry_run=dry_run)
+        sweep_result = run_startup_sweep(registry, dry_run=dry_run, bootup_candidate_gate=BOOTUP_CANDIDATE_GATE)
         log.info(
             "Startup sweep complete: active_swept=%d executor_orphans=%d "
             "diagnosing=%d skipped_dry_run=%d",

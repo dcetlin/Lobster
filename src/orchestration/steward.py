@@ -887,11 +887,21 @@ def _default_notify_dan(
         ]
     if surface_log:
         body_lines.append(f"\nSteward log:\n{surface_log}")
+    # Inline buttons let Dan resolve the stuck UoW without typing commands.
+    # The dispatcher routes callback_data="decide_retry:<uow_id>" and
+    # callback_data="decide_close:<uow_id>" to handle_decide_retry/close.
+    buttons = [
+        [
+            {"text": "Retry", "callback_data": f"decide_retry:{uow_id}"},
+            {"text": "Close", "callback_data": f"decide_close:{uow_id}"},
+        ]
+    ]
     msg = {
         "id": msg_id,
         "source": "system",
         "chat_id": _DAN_CHAT_ID,
         "text": "\n".join(body_lines),
+        "buttons": buttons,
         "timestamp": time.time(),
         "metadata": {
             "type": "wos_surface",
@@ -1116,6 +1126,7 @@ def _process_uow(
                 "uow_id": uow_id,
                 "steward_cycles": cycles,
                 "surface_condition": stuck_condition,
+                "return_reason": return_reason,
                 "timestamp": _now_iso(),
             })
 
@@ -1227,6 +1238,19 @@ def _process_uow(
             prescribed_skills=prescribed_skills,
             artifact_dir=artifact_dir,
         )
+
+        # Audit-before-transition: write agenda_update audit entry BEFORE updating
+        # steward_agenda in the DB. Only on re-entry (cycles > 0) — the initial
+        # agenda_update is written in the cycles == 0 initialization block above.
+        if cycles > 0:
+            registry.append_audit_log(uow_id, {
+                "event": "agenda_update",
+                "actor": _ACTOR_STEWARD,
+                "uow_id": uow_id,
+                "steward_cycles": cycles,
+                "agenda_snapshot": updated_agenda,
+                "timestamp": _now_iso(),
+            })
 
         # Write all steward fields BEFORE status transition
         _write_steward_fields(

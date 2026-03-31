@@ -871,7 +871,7 @@ class Registry:
         now = _now_iso()
         note: dict[str, Any] = {
             "event": "startup_sweep",
-            "actor": "steward_startup",
+            "actor": "steward",
             "classification": classification,
             "output_ref": output_ref,
             "uow_id": uow_id,
@@ -899,7 +899,7 @@ class Registry:
                 conn.execute(
                     """
                     INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
-                    VALUES (?, ?, 'startup_sweep', 'active', 'ready-for-steward', 'steward_startup', ?)
+                    VALUES (?, ?, 'startup_sweep', 'active', 'ready-for-steward', 'steward', ?)
                     """,
                     (now, uow_id, note_json),
                 )
@@ -935,7 +935,7 @@ class Registry:
         now = _now_iso()
         note_json = json.dumps({
             "event": "startup_sweep",
-            "actor": "steward_startup",
+            "actor": "steward",
             "classification": "executor_orphan",
             "output_ref": None,
             "uow_id": uow_id,
@@ -965,7 +965,7 @@ class Registry:
                     """
                     INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
                     VALUES (?, ?, 'startup_sweep', 'ready-for-executor', 'ready-for-steward',
-                            'steward_startup', ?)
+                            'steward', ?)
                     """,
                     (now, uow_id, note_json),
                 )
@@ -995,7 +995,7 @@ class Registry:
         now = _now_iso()
         note_json = json.dumps({
             "event": "startup_sweep",
-            "actor": "steward_startup",
+            "actor": "steward",
             "classification": "diagnosing_orphan",
             "output_ref": None,
             "uow_id": uow_id,
@@ -1022,7 +1022,7 @@ class Registry:
                     """
                     INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
                     VALUES (?, ?, 'startup_sweep', 'diagnosing', 'ready-for-steward',
-                            'steward_startup', ?)
+                            'steward', ?)
                     """,
                     (now, uow_id, note_json),
                 )
@@ -1090,6 +1090,116 @@ class Registry:
                 (now, uow_id),
             )
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def decide_retry(self, uow_id: str) -> int:
+        """
+        Reset a stuck UoW so it re-enters the Steward queue.
+
+        Intended for use when Dan selects "Retry" after the Steward surfaces a
+        UoW that has hit the 5-cycle hard cap or another stuck condition.
+
+        Transitions: blocked → ready-for-steward (optimistic lock on blocked).
+        Also resets steward_cycles to 0 so the Steward treats it as a fresh start.
+
+        Returns rows_affected (1 on success, 0 if UoW is not in blocked status).
+        Writes audit entry atomically in the same transaction as the UPDATE.
+        """
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            conn.execute("BEGIN IMMEDIATE")
+
+            note_json = json.dumps({
+                "event": "decide_retry",
+                "actor": "user",
+                "uow_id": uow_id,
+                "timestamp": now,
+                "note": "user requested retry — steward_cycles reset to 0",
+            })
+
+            conn.execute(
+                """
+                INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                VALUES (?, ?, 'decide_retry', 'blocked', 'ready-for-steward', 'user', ?)
+                """,
+                (now, uow_id, note_json),
+            )
+
+            cursor = conn.execute(
+                """
+                UPDATE uow_registry
+                SET status = 'ready-for-steward',
+                    steward_cycles = 0,
+                    updated_at = ?
+                WHERE id = ? AND status = 'blocked'
+                """,
+                (now, uow_id),
+            )
+            rows_affected = cursor.rowcount
+
+            conn.commit()
+            return rows_affected
+
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def decide_close(self, uow_id: str) -> int:
+        """
+        Close a stuck UoW as user-requested failure.
+
+        Intended for use when Dan selects "Close" after the Steward surfaces a
+        UoW that has hit the 5-cycle hard cap or another stuck condition.
+
+        Transitions: blocked → failed (optimistic lock on blocked).
+        Sets route_reason to record the user closure decision.
+
+        Returns rows_affected (1 on success, 0 if UoW is not in blocked status).
+        Writes audit entry atomically in the same transaction as the UPDATE.
+        """
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            conn.execute("BEGIN IMMEDIATE")
+
+            note_json = json.dumps({
+                "event": "decide_close",
+                "actor": "user",
+                "uow_id": uow_id,
+                "timestamp": now,
+                "reason": "user_closed",
+            })
+
+            conn.execute(
+                """
+                INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                VALUES (?, ?, 'decide_close', 'blocked', 'failed', 'user', ?)
+                """,
+                (now, uow_id, note_json),
+            )
+
+            cursor = conn.execute(
+                """
+                UPDATE uow_registry
+                SET status = 'failed',
+                    route_reason = 'user_closed',
+                    updated_at = ?
+                WHERE id = ? AND status = 'blocked'
+                """,
+                (now, uow_id),
+            )
+            rows_affected = cursor.rowcount
+
+            conn.commit()
+            return rows_affected
+
         except Exception:
             conn.rollback()
             raise

@@ -412,6 +412,49 @@ REMINDER_ROUTING = {
 - Do NOT relay the result to the user: chat_id=0 is the silent-drop sentinel — the subagent_result handler drops it without relaying.
 - If the subagent fails to write the result file, the Observation Loop detects the stall at `timeout_at` and surfaces it to Dan.
 
+## Handling WOS Surface Messages (`type: "wos_surface"`) and Decide Callbacks
+
+`wos_surface` messages are written by the Steward when a UoW hits a stuck condition (hard_cap, crash_repeated, executor_blocked). The Steward writes the message to the inbox; the dispatcher delivers it to Dan with inline Retry/Close buttons.
+
+**When `wait_for_messages` returns a message with metadata `type: "wos_surface"`:**
+
+```
+1. mark_processing(message_id)
+2. Extract text and buttons from the message (msg["text"], msg.get("buttons"))
+3. send_reply(chat_id, text, buttons=msg.get("buttons"))
+4. mark_processed(message_id)
+```
+
+The message already has `buttons` set by the Steward:
+```
+[
+  [
+    {"text": "Retry", "callback_data": "decide_retry:<uow_id>"},
+    {"text": "Close", "callback_data": "decide_close:<uow_id>"}
+  ]
+]
+```
+
+**When `wait_for_messages` returns a callback (`type: "callback"`) with `callback_data` matching `decide_retry:<uow_id>` or `decide_close:<uow_id>`:**
+
+Inline button presses. Handle directly on the dispatcher thread (fast CLI call, <1 second -- no subagent):
+
+```
+1. mark_processing(message_id)
+2. Parse: action, uow_id = callback_data.split(":", 1)
+3. Run the appropriate CLI command:
+   - decide_retry: uv run ~/lobster/src/orchestration/registry_cli.py decide-retry --id <uow_id>
+   - decide_close: uv run ~/lobster/src/orchestration/registry_cli.py decide-close --id <uow_id>
+4. Parse JSON output; send_reply(chat_id, result_message)
+5. mark_processed(message_id)
+```
+
+The CLI commands return structured JSON:
+- Success: `{"status": "ok", "message": "UoW <id> reset for retry -- blocked to ready-for-steward"}`
+- Not blocked: `{"status": "not_blocked", "message": "UoW <id> could not be retried -- not in blocked status"}`
+
+No subagent needed -- these are fast synchronous DB writes.
+
 ## Handling Subagent Results (`subagent_result` / `subagent_error`)
 
 **When `wait_for_messages` returns a message with `type: "subagent_result"`:**
@@ -875,6 +918,8 @@ Status: `proposed → pending`"
   If no records: reply "(none)".
 
   Valid status values: `proposed`, `pending`, `active`, `blocked`, `done`, `failed`, `expired`
+
+**Note:** Decide actions (Retry / Close on stuck UoWs) are handled via inline button callbacks — see "Handling WOS Surface Messages" section above.
 
 These commands are handled directly in the dispatcher (no subagent — they are fast CLI calls).
 Reply immediately after running the CLI command.

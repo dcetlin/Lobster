@@ -8,6 +8,8 @@ Telegram. No MCP tools, no network calls — those belong in the dispatcher.
 The dispatcher calls these handlers when it recognizes:
   /approve <uow-id>        → handle_approve(uow_id, registry)
   /wos status [status]     → handle_wos_status(status, registry)
+  decide retry <uow-id>    → handle_decide_retry(uow_id, registry)
+  decide close <uow-id>    → handle_decide_close(uow_id, registry)
 """
 
 from __future__ import annotations
@@ -57,6 +59,49 @@ def handle_confirm(uow_id: str, *, registry: "Registry") -> str:
     compatibility while delegating to the renamed approve() method.
     """
     return handle_approve(uow_id, registry=registry)
+
+
+def handle_decide_retry(uow_id: str, *, registry: "Registry") -> str:
+    """
+    Handle a decide_retry action for a UoW.
+
+    Called when Dan selects "Retry" after the Steward surfaces a stuck UoW,
+    or sends a message matching "decide retry <uow-id>".
+
+    Resets steward_cycles to 0 and transitions blocked → ready-for-steward so
+    the Steward re-diagnoses the UoW on its next heartbeat cycle.
+    """
+    rows = registry.decide_retry(uow_id)
+    if rows == 1:
+        return (
+            f"UoW `{uow_id}` reset for retry.\n"
+            f"Status: `blocked \u2192 ready-for-steward` (steward_cycles reset to 0)"
+        )
+    return (
+        f"UoW `{uow_id}` could not be retried \u2014 it is not currently in `blocked` status.\n"
+        f"Run `/wos status blocked` to see blocked UoWs."
+    )
+
+
+def handle_decide_close(uow_id: str, *, registry: "Registry") -> str:
+    """
+    Handle a decide_close action for a UoW.
+
+    Called when Dan selects "Close" after the Steward surfaces a stuck UoW,
+    or sends a message matching "decide close <uow-id>".
+
+    Transitions blocked → failed with reason=user_closed.
+    """
+    rows = registry.decide_close(uow_id)
+    if rows == 1:
+        return (
+            f"UoW `{uow_id}` closed.\n"
+            f"Status: `blocked \u2192 failed` (reason: user_closed)"
+        )
+    return (
+        f"UoW `{uow_id}` could not be closed \u2014 it is not currently in `blocked` status.\n"
+        f"Run `/wos status blocked` to see blocked UoWs."
+    )
 
 
 def handle_wos_status(status: str | None, *, registry: "Registry") -> str:
