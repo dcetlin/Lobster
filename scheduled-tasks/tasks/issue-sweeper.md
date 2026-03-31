@@ -11,36 +11,6 @@ You are running as a scheduled task. The main Lobster instance created this job.
 
 ## Instructions
 
-# Issue Sweeper
-
-**Job**: issue-sweeper
-**Schedule**: Every 30 min, 22:00–06:00 UTC (`*/30 22-23,0-5 * * *`)
-**Created**: 2026-03-27 03:57 PM UTC
-**Updated**: 2026-03-29 (cadence change: nightly once → every 30 min overnight window; /confirm gate removed — UoWs auto-accepted on creation; age gate removed from ready-to-execute criterion — label alone is sufficient)
-
-## Context
-
-You are running as a scheduled task. The main Lobster instance created this job.
-
-## Instructions
-
-# Issue Sweeper — WOS Phase 1
-
-**Job**: issue-sweeper
-**Schedule**: Every 30 min, 22:00–06:00 UTC (`*/30 22-23,0-5 * * *`)
-**Created**: WOS Phase 1 — issue #167
-
-## Context
-
-You are the WOS Issue Sweeper running as a scheduled task. Your job is to scan
-the dcetlin/Lobster GitHub issue backlog and create proposed Units of Work (UoWs)
-in the Registry for issues that are ready-to-execute or need attention.
-
-The Registry CLI is at `~/lobster/src/orchestration/registry_cli.py`.
-The database lives at `~/lobster-workspace/orchestration/registry.db`.
-
-## Instructions
-
 ### 0. Load Vision Object
 
 Read `~/lobster-user-config/vision.yaml` at the start of each sweep. Extract:
