@@ -3,6 +3,7 @@
 
 from .issue_source import IssueSnapshot, IssueSource, SourceRef, source_ref_from_str, source_ref_to_str
 from .github_issue_source import GitHubIssueSource
+from .garden_caretaker import GardenCaretaker
 
 __all__ = [
     "IssueSnapshot",
@@ -11,4 +12,5 @@ __all__ = [
     "source_ref_from_str",
     "source_ref_to_str",
     "GitHubIssueSource",
+    "GardenCaretaker",
 ]
