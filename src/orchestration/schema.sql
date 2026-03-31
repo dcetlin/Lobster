@@ -71,6 +71,12 @@ CREATE TABLE IF NOT EXISTS uow_registry (
     --   Written via NoteAccessor. Excluded from executor_uow_view.
     notes               TEXT    NOT NULL DEFAULT '{}',
 
+    -- issue_url: canonical GitHub issue URL, e.g. "https://github.com/owner/repo/issues/42".
+    --   Populated at proposal time so UoWs are self-describing; eliminates hardcoded
+    --   repo references in Steward and Executor. NULL for pre-migration rows.
+    --   Executor-accessible (included in executor_uow_view).
+    issue_url           TEXT    DEFAULT NULL,
+
     UNIQUE(source_issue_number, sweep_date)
 );
 -- vision_ref: JSON {layer, field, statement, anchored_at}
@@ -99,7 +105,8 @@ SELECT
     id, status, output_ref, started_at, completed_at,
     source_issue_number, summary,
     workflow_artifact, success_criteria, prescribed_skills,
-    steward_cycles, timeout_at, estimated_runtime
+    steward_cycles, timeout_at, estimated_runtime,
+    issue_url
 FROM uow_registry
 WHERE status = 'ready-for-executor';
 -- steward_agenda: Steward-private, excluded from executor_uow_view.

@@ -109,7 +109,7 @@ def _seed_uow_at_ready_for_steward(
     Returns the uow_id.
     """
     # Insert as proposed
-    result = registry.upsert(issue_number=issue_number, title=title)
+    result = registry.upsert(issue_number=issue_number, title=title, success_criteria="Test completion.")
     assert isinstance(result, UpsertInserted), f"Expected UpsertInserted, got: {result}"
     uow_id = result.id
 

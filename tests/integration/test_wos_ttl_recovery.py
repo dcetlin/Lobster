@@ -116,6 +116,7 @@ def _seed_and_activate(registry: Registry, conn: sqlite3.Connection) -> str:
         issue_number=9901,
         title="TTL test: stalled execution",
         sweep_date="2026-03-31",
+        success_criteria="Test completion.",
     )
     assert isinstance(result, UpsertInserted), f"seed failed: {result}"
     uow_id = result.id
@@ -164,6 +165,7 @@ def _seed_ready_for_executor(registry: Registry) -> str:
         issue_number=9902,
         title="TTL test: executor_orphan",
         sweep_date="2026-03-31",
+        success_criteria="Test completion.",
     )
     assert isinstance(result, UpsertInserted), f"seed failed: {result}"
     uow_id = result.id

@@ -348,9 +348,25 @@ class TestPreMigrationUoWSurvival:
 
         today = "2026-01-01"
         from src.orchestration.registry import UpsertInserted
-        result = reg.upsert(issue_number=1001, title="Pre-migration UoW", sweep_date=today)
-        assert isinstance(result, UpsertInserted)
-        uow_id = result.id
+        # Pre-migration simulation: insert directly via SQL to bypass the
+        # success_criteria validation enforced by upsert() (this mimics rows
+        # that existed before issue_url and success_criteria enforcement).
+        import uuid
+        from datetime import datetime, timezone
+        uow_id = f"uow_{datetime.now(timezone.utc).strftime('%Y%m%d')}_{uuid.uuid4().hex[:6]}"
+        conn = reg._connect()
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO uow_registry (id, type, source, source_issue_number, sweep_date, "
+            "status, posture, created_at, updated_at, summary, success_criteria, "
+            "route_reason, route_evidence, trigger) "
+            "VALUES (?, 'executable', 'github:issue/1001', 1001, ?, 'proposed', 'solo', "
+            "?, ?, 'Pre-migration UoW', '', 'phase1-default: no classifier', '{}', '{\"type\": \"immediate\"}')",
+            (uow_id, today, now, now),
+        )
+        conn.commit()
+        conn.close()
 
         # Run migration
         migration_result = _run_migration(db_path)
@@ -363,7 +379,8 @@ class TestPreMigrationUoWSurvival:
         assert record is not None, f"get() returned None for id {uow_id}"
         assert record.id == uow_id
         assert record.workflow_artifact is None
-        # success_criteria is NOT NULL DEFAULT '' — pre-migration rows get '' after migration
+        # Pre-migration rows have empty success_criteria — the schema allows '' for legacy rows.
+        # New UoWs created via upsert() are now rejected if success_criteria is blank.
         assert record.success_criteria == ""
         assert record.prescribed_skills is None
         assert record.steward_cycles == 0
@@ -373,19 +390,23 @@ class TestPreMigrationUoWSurvival:
         assert record.steward_log is None
 
     def test_new_uow_after_migration_has_correct_defaults(self, migrated_db):
-        """New UoW created after migration has all Phase 2 fields with correct defaults."""
+        """New UoW created after migration stores supplied success_criteria."""
         from src.orchestration.registry import Registry, UpsertInserted
         reg = Registry(migrated_db)
-        result = reg.upsert(issue_number=1002, title="Post-migration UoW", sweep_date="2026-01-02")
+        result = reg.upsert(
+            issue_number=1002,
+            title="Post-migration UoW",
+            sweep_date="2026-01-02",
+            success_criteria="PR merged with all tests green.",
+        )
         assert isinstance(result, UpsertInserted)
         uow_id = result.id
 
         record = reg.get(uow_id)
         assert record is not None
         assert record.workflow_artifact is None
-        # success_criteria is NOT NULL DEFAULT '' — new UoWs default to ''
-        # (Application layer: UoW Registrar must reject empty success_criteria at germination)
-        assert record.success_criteria == ""
+        # success_criteria is enforced non-empty at upsert time (issue #488).
+        assert record.success_criteria == "PR merged with all tests green."
         assert record.prescribed_skills is None
         assert record.steward_cycles == 0
         assert record.timeout_at is None

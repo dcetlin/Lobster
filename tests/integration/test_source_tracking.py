@@ -38,7 +38,7 @@ def _now_iso() -> str:
 
 def _seed_uow(registry: Registry, issue_number: int = 1, title: str = "test uow") -> str:
     """Insert a proposed UoW and return its id."""
-    result = registry.upsert(issue_number=issue_number, title=title)
+    result = registry.upsert(issue_number=issue_number, title=title, success_criteria="Test completion.")
     assert isinstance(result, UpsertInserted), f"Expected UpsertInserted, got: {result}"
     return result.id
 

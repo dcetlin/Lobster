@@ -206,7 +206,7 @@ class TestScanDuplicatePrevention:
         self, registry: Registry
     ) -> None:
         """A non-terminal UoW for an issue must block re-seeding on the next scan."""
-        registry.upsert(issue_number=10, title="Existing")
+        registry.upsert(issue_number=10, title="Existing", success_criteria="Test completion.")
 
         source = StubIssueSource(scan_issues=[_snap(issue_number=10)])
         caretaker = GardenCaretaker(source=source, registry=registry)
@@ -275,7 +275,7 @@ class TestScanEmptySource:
 class TestTendNoChange:
     def test_open_source_proposed_uow_is_no_op(self, registry: Registry) -> None:
         """An open issue paired with a proposed UoW must produce no state change."""
-        registry.upsert(issue_number=42, title="Open and proposed")
+        registry.upsert(issue_number=42, title="Open and proposed", success_criteria="Test completion.")
         snap = _snap(issue_number=42, state="open")
         source = StubIssueSource(issue_map={"github:issue/42": snap})
         caretaker = GardenCaretaker(source=source, registry=registry)
@@ -290,7 +290,7 @@ class TestTendNoChange:
 
     def test_open_source_pending_uow_is_no_op(self, registry: Registry) -> None:
         """An open issue paired with a pending UoW must produce no state change."""
-        result = registry.upsert(issue_number=43, title="Pending open")
+        result = registry.upsert(issue_number=43, title="Pending open", success_criteria="Test completion.")
         registry.approve(result.id)
 
         snap = _snap(issue_number=43, state="open")
@@ -310,7 +310,7 @@ class TestTendNoChange:
 class TestTendArchiveOnClose:
     def test_closed_source_archives_proposed_uow(self, registry: Registry) -> None:
         """A closed issue with a proposed UoW must be archived (→ expired)."""
-        registry.upsert(issue_number=10, title="Will close")
+        registry.upsert(issue_number=10, title="Will close", success_criteria="Test completion.")
         snap = _snap(issue_number=10, state="closed")
         source = StubIssueSource(issue_map={"github:issue/10": snap})
         caretaker = GardenCaretaker(source=source, registry=registry)
@@ -324,7 +324,7 @@ class TestTendArchiveOnClose:
 
     def test_closed_source_archives_pending_uow(self, registry: Registry) -> None:
         """A closed issue with a pending UoW must also be archived."""
-        upsert = registry.upsert(issue_number=11, title="Pending close")
+        upsert = registry.upsert(issue_number=11, title="Pending close", success_criteria="Test completion.")
         registry.approve(upsert.id)
 
         snap = _snap(issue_number=11, state="closed")
@@ -339,7 +339,7 @@ class TestTendArchiveOnClose:
 
     def test_archive_writes_audit_entry(self, registry: Registry) -> None:
         """tend() archiving a UoW must write an 'archived_by_caretaker' audit entry."""
-        upsert = registry.upsert(issue_number=80, title="Audit on archive")
+        upsert = registry.upsert(issue_number=80, title="Audit on archive", success_criteria="Test completion.")
         snap = _snap(issue_number=80, state="closed")
         source = StubIssueSource(issue_map={"github:issue/80": snap})
         caretaker = GardenCaretaker(source=source, registry=registry)
@@ -356,7 +356,7 @@ class TestTendArchiveOnClose:
 class TestTendSurfaceOnClose:
     def test_closed_source_surfaces_active_uow(self, registry: Registry) -> None:
         """A closed issue with an active UoW must be surfaced to Steward."""
-        upsert = registry.upsert(issue_number=20, title="Active close")
+        upsert = registry.upsert(issue_number=20, title="Active close", success_criteria="Test completion.")
         registry.set_status_direct(upsert.id, "active")
 
         snap = _snap(issue_number=20, state="closed")
@@ -373,7 +373,7 @@ class TestTendSurfaceOnClose:
 
     def test_deleted_source_surfaces_active_uow(self, registry: Registry) -> None:
         """A deleted issue (get_issue returns None) with an active UoW must be surfaced."""
-        upsert = registry.upsert(issue_number=30, title="Active deleted")
+        upsert = registry.upsert(issue_number=30, title="Active deleted", success_criteria="Test completion.")
         registry.set_status_direct(upsert.id, "active")
 
         # Return None from get_issue → source deleted/not found
@@ -388,7 +388,7 @@ class TestTendSurfaceOnClose:
 
     def test_surface_writes_audit_entry(self, registry: Registry) -> None:
         """tend() surfacing a UoW must write a 'surfaced_to_steward' audit entry."""
-        upsert = registry.upsert(issue_number=90, title="Surface audit")
+        upsert = registry.upsert(issue_number=90, title="Surface audit", success_criteria="Test completion.")
         registry.set_status_direct(upsert.id, "active")
 
         snap = _snap(issue_number=90, state="closed")
@@ -409,7 +409,7 @@ class TestTendReactivate:
         self, registry: Registry
     ) -> None:
         """An open source issue paired with an expired UoW must be reactivated."""
-        upsert = registry.upsert(issue_number=50, title="Was expired")
+        upsert = registry.upsert(issue_number=50, title="Was expired", success_criteria="Test completion.")
         registry.set_status_direct(upsert.id, "expired")
 
         snap = _snap(issue_number=50, state="open")
@@ -427,7 +427,7 @@ class TestTendReactivate:
         self, registry: Registry
     ) -> None:
         """An open source issue paired with a failed UoW must also be reactivated."""
-        upsert = registry.upsert(issue_number=51, title="Was failed")
+        upsert = registry.upsert(issue_number=51, title="Was failed", success_criteria="Test completion.")
         registry.set_status_direct(upsert.id, "failed")
 
         snap = _snap(issue_number=51, state="open")
@@ -447,7 +447,7 @@ class TestTendReactivate:
 class TestTendDoneUoWIsExcluded:
     def test_done_uow_excluded_from_tend(self, registry: Registry) -> None:
         """Done UoWs are excluded from tend() entirely — get_issue must not be called."""
-        upsert = registry.upsert(issue_number=60, title="Done issue")
+        upsert = registry.upsert(issue_number=60, title="Done issue", success_criteria="Test completion.")
         registry.set_status_direct(upsert.id, "done")
 
         # The stub source has no entry for this ref — get_issue would return None
@@ -488,7 +488,7 @@ class TestSourceTracking:
         self, registry: Registry
     ) -> None:
         """The archived_by_caretaker audit note must include the source_ref."""
-        upsert = registry.upsert(issue_number=101, title="Source ref audit")
+        upsert = registry.upsert(issue_number=101, title="Source ref audit", success_criteria="Test completion.")
         snap = _snap(issue_number=101, state="closed")
         source = StubIssueSource(issue_map={"github:issue/101": snap})
         caretaker = GardenCaretaker(source=source, registry=registry)
@@ -516,7 +516,7 @@ class TestSourceTracking:
         self, registry: Registry
     ) -> None:
         """The surfaced_to_steward audit note must include the source_ref."""
-        upsert = registry.upsert(issue_number=102, title="Surface source ref")
+        upsert = registry.upsert(issue_number=102, title="Surface source ref", success_criteria="Test completion.")
         registry.set_status_direct(upsert.id, "active")
 
         snap = _snap(issue_number=102, state="closed")

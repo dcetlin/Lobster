@@ -236,7 +236,7 @@ class TestScan:
 
     def test_scan_skips_issue_already_in_registry(self, registry: Registry) -> None:
         # Pre-seed the registry so the issue already has a non-terminal UoW
-        registry.upsert(issue_number=10, title="Existing")
+        registry.upsert(issue_number=10, title="Existing", success_criteria="Test completion.")
 
         snap = _snapshot(source_ref="github:issue/10")
         source = _make_source(scan_issues=[snap])
@@ -322,7 +322,7 @@ class TestScan:
 class TestTend:
     def test_tend_noop_when_source_open(self, registry: Registry) -> None:
         # Seed a proposed UoW
-        upsert = registry.upsert(issue_number=42, title="Open issue")
+        upsert = registry.upsert(issue_number=42, title="Open issue", success_criteria="Test completion.")
         assert upsert
 
         snap = _snapshot(source_ref="github:issue/42", state="open")
@@ -338,7 +338,7 @@ class TestTend:
         assert len(proposed) == 1
 
     def test_tend_archives_proposed_uow_when_source_closed(self, registry: Registry) -> None:
-        registry.upsert(issue_number=10, title="Will close")
+        registry.upsert(issue_number=10, title="Will close", success_criteria="Test completion.")
 
         snap = _snapshot(source_ref="github:issue/10", state="closed")
         source = _make_source(issue_map={"github:issue/10": snap})
@@ -355,7 +355,7 @@ class TestTend:
         assert len(expired) == 1
 
     def test_tend_archives_pending_uow_when_source_closed(self, registry: Registry) -> None:
-        upsert_result = registry.upsert(issue_number=11, title="Pending issue")
+        upsert_result = registry.upsert(issue_number=11, title="Pending issue", success_criteria="Test completion.")
         # Move to pending via approve
         registry.approve(upsert_result.id)
 
@@ -371,7 +371,7 @@ class TestTend:
     def test_tend_surfaces_to_steward_when_source_closed_and_active(
         self, registry: Registry
     ) -> None:
-        upsert_result = registry.upsert(issue_number=20, title="Active issue")
+        upsert_result = registry.upsert(issue_number=20, title="Active issue", success_criteria="Test completion.")
         # Manually set to active (bypassing normal flow for test setup)
         registry.set_status_direct(upsert_result.id, "active")
 
@@ -391,7 +391,7 @@ class TestTend:
     def test_tend_surfaces_to_steward_when_source_deleted_and_active(
         self, registry: Registry
     ) -> None:
-        upsert_result = registry.upsert(issue_number=30, title="Active deleted")
+        upsert_result = registry.upsert(issue_number=30, title="Active deleted", success_criteria="Test completion.")
         registry.set_status_direct(upsert_result.id, "active")
 
         # source.get_issue returns None → deleted
@@ -407,7 +407,7 @@ class TestTend:
     def test_tend_reactivates_archived_uow_when_source_reopens(
         self, registry: Registry
     ) -> None:
-        upsert_result = registry.upsert(issue_number=50, title="Was expired")
+        upsert_result = registry.upsert(issue_number=50, title="Was expired", success_criteria="Test completion.")
         # Simulate archived (expired) UoW
         registry.set_status_direct(upsert_result.id, "expired")
 
@@ -425,7 +425,7 @@ class TestTend:
         assert proposed[0].id == upsert_result.id
 
     def test_tend_noop_for_done_uow_with_closed_source(self, registry: Registry) -> None:
-        upsert_result = registry.upsert(issue_number=60, title="Done issue")
+        upsert_result = registry.upsert(issue_number=60, title="Done issue", success_criteria="Test completion.")
         registry.set_status_direct(upsert_result.id, "done")
 
         # tend() does not fetch done UoWs — they are excluded from _fetch_active_uows
@@ -440,7 +440,7 @@ class TestTend:
         assert registry.query(status="done")[0].id == upsert_result.id
 
     def test_tend_handles_source_error_gracefully(self, registry: Registry) -> None:
-        registry.upsert(issue_number=70, title="Error case")
+        registry.upsert(issue_number=70, title="Error case", success_criteria="Test completion.")
 
         source = MagicMock()
         source.get_issue.side_effect = Exception("network error")
@@ -454,7 +454,7 @@ class TestTend:
 
     def test_tend_audit_log_written_on_archive(self, registry: Registry) -> None:
         import sqlite3
-        upsert_result = registry.upsert(issue_number=80, title="Audit check")
+        upsert_result = registry.upsert(issue_number=80, title="Audit check", success_criteria="Test completion.")
 
         snap = _snapshot(source_ref="github:issue/80", state="closed")
         source = _make_source(issue_map={"github:issue/80": snap})
@@ -474,7 +474,7 @@ class TestTend:
 
     def test_tend_audit_log_written_on_surface(self, registry: Registry) -> None:
         import sqlite3
-        upsert_result = registry.upsert(issue_number=90, title="Surface audit")
+        upsert_result = registry.upsert(issue_number=90, title="Surface audit", success_criteria="Test completion.")
         registry.set_status_direct(upsert_result.id, "active")
 
         snap = _snapshot(source_ref="github:issue/90", state="closed")
@@ -496,7 +496,7 @@ class TestTend:
     def test_tend_archives_proposed_uow_when_source_deleted(
         self, registry: Registry
     ) -> None:
-        registry.upsert(issue_number=100, title="Deleted source")
+        registry.upsert(issue_number=100, title="Deleted source", success_criteria="Test completion.")
 
         source = _make_source(issue_map={"github:issue/100": None})
         caretaker = GardenCaretaker(source=source, registry=registry)

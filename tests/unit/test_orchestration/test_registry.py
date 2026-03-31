@@ -80,8 +80,8 @@ class TestSchemaInit:
         conn.close()
         # Duplicate upsert with same issue+sweep_date should not create second row
         today = datetime.now(timezone.utc).date().isoformat()
-        uow_a = registry.upsert(issue_number=999, title="Test A", sweep_date=today)
-        uow_b = registry.upsert(issue_number=999, title="Test A again", sweep_date=today)
+        uow_a = registry.upsert(issue_number=999, title="Test A", sweep_date=today, success_criteria="Test completion.")
+        uow_b = registry.upsert(issue_number=999, title="Test A again", sweep_date=today, success_criteria="Test completion.")
         conn2 = _open_db(db_path)
         count = conn2.execute(
             "SELECT COUNT(*) as c FROM uow_registry WHERE source_issue_number = 999"
@@ -98,7 +98,7 @@ class TestUpsert:
     def test_insert_new_proposed_record(self, registry, db_path):
         from src.orchestration.registry import UpsertInserted
         today = datetime.now(timezone.utc).date().isoformat()
-        result = registry.upsert(issue_number=1, title="First issue", sweep_date=today)
+        result = registry.upsert(issue_number=1, title="First issue", sweep_date=today, success_criteria="Test completion.")
         assert isinstance(result, UpsertInserted)
         assert result.id.startswith("uow_")
 
@@ -144,7 +144,7 @@ class TestUpsert:
 
     def test_audit_entry_on_insert(self, registry, db_path):
         today = datetime.now(timezone.utc).date().isoformat()
-        result = registry.upsert(issue_number=2, title="Issue with audit", sweep_date=today)
+        result = registry.upsert(issue_number=2, title="Issue with audit", sweep_date=today, success_criteria="Test completion.")
         conn = _open_db(db_path)
         audit = conn.execute(
             "SELECT * FROM audit_log WHERE uow_id = ?", (result.id,)
@@ -158,17 +158,17 @@ class TestUpsert:
         today = datetime.now(timezone.utc).date().isoformat()
         yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date().isoformat()
         # First sweep: insert proposed
-        first = registry.upsert(issue_number=10, title="Issue 10", sweep_date=yesterday)
+        first = registry.upsert(issue_number=10, title="Issue 10", sweep_date=yesterday, success_criteria="Test completion.")
         assert isinstance(first, UpsertInserted)
         # Second sweep (different date): should skip since non-terminal exists
-        second = registry.upsert(issue_number=10, title="Issue 10", sweep_date=today)
+        second = registry.upsert(issue_number=10, title="Issue 10", sweep_date=today, success_criteria="Test completion.")
         assert isinstance(second, UpsertSkipped)
         assert "proposed" in second.reason
 
     def test_skip_if_pending_already_exists(self, registry, db_path):
         from src.orchestration.registry import UpsertSkipped
         today = datetime.now(timezone.utc).date().isoformat()
-        first = registry.upsert(issue_number=11, title="Issue 11", sweep_date=today)
+        first = registry.upsert(issue_number=11, title="Issue 11", sweep_date=today, success_criteria="Test completion.")
         # Manually set to pending
         conn = _open_db(db_path)
         conn.execute("UPDATE uow_registry SET status='pending' WHERE id=?", (first.id,))
@@ -176,64 +176,213 @@ class TestUpsert:
         conn.close()
         # Next sweep should skip
         tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
-        second = registry.upsert(issue_number=11, title="Issue 11", sweep_date=tomorrow)
+        second = registry.upsert(issue_number=11, title="Issue 11", sweep_date=tomorrow, success_criteria="Test completion.")
         assert isinstance(second, UpsertSkipped)
 
     def test_skip_if_active_already_exists(self, registry, db_path):
         from src.orchestration.registry import UpsertSkipped
         today = datetime.now(timezone.utc).date().isoformat()
-        first = registry.upsert(issue_number=12, title="Issue 12", sweep_date=today)
+        first = registry.upsert(issue_number=12, title="Issue 12", sweep_date=today, success_criteria="Test completion.")
         conn = _open_db(db_path)
         conn.execute("UPDATE uow_registry SET status='active' WHERE id=?", (first.id,))
         conn.commit()
         conn.close()
         tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
-        second = registry.upsert(issue_number=12, title="Issue 12", sweep_date=tomorrow)
+        second = registry.upsert(issue_number=12, title="Issue 12", sweep_date=tomorrow, success_criteria="Test completion.")
         assert isinstance(second, UpsertSkipped)
 
     def test_reinsert_after_done(self, registry):
         from src.orchestration.registry import UpsertInserted
         today = datetime.now(timezone.utc).date().isoformat()
         tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
-        first = registry.upsert(issue_number=20, title="Issue 20", sweep_date=today)
+        first = registry.upsert(issue_number=20, title="Issue 20", sweep_date=today, success_criteria="Test completion.")
         registry.set_status_direct(first.id, "done")
         # New sweep should create a fresh proposed record
-        second = registry.upsert(issue_number=20, title="Issue 20", sweep_date=tomorrow)
+        second = registry.upsert(issue_number=20, title="Issue 20", sweep_date=tomorrow, success_criteria="Test completion.")
         assert isinstance(second, UpsertInserted)
 
     def test_reinsert_after_failed(self, registry):
         from src.orchestration.registry import UpsertInserted
         today = datetime.now(timezone.utc).date().isoformat()
         tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
-        first = registry.upsert(issue_number=21, title="Issue 21", sweep_date=today)
+        first = registry.upsert(issue_number=21, title="Issue 21", sweep_date=today, success_criteria="Test completion.")
         registry.set_status_direct(first.id, "failed")
-        second = registry.upsert(issue_number=21, title="Issue 21", sweep_date=tomorrow)
+        second = registry.upsert(issue_number=21, title="Issue 21", sweep_date=tomorrow, success_criteria="Test completion.")
         assert isinstance(second, UpsertInserted)
 
     def test_reinsert_after_expired(self, registry):
         from src.orchestration.registry import UpsertInserted
         today = datetime.now(timezone.utc).date().isoformat()
         tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
-        first = registry.upsert(issue_number=22, title="Issue 22", sweep_date=today)
+        first = registry.upsert(issue_number=22, title="Issue 22", sweep_date=today, success_criteria="Test completion.")
         registry.set_status_direct(first.id, "expired")
-        second = registry.upsert(issue_number=22, title="Issue 22", sweep_date=tomorrow)
+        second = registry.upsert(issue_number=22, title="Issue 22", sweep_date=tomorrow, success_criteria="Test completion.")
         assert isinstance(second, UpsertInserted)
 
     def test_unique_conflict_does_not_overwrite_non_proposed(self, registry, db_path):
         """Same issue_number + sweep_date conflict must not overwrite pending/active."""
         today = datetime.now(timezone.utc).date().isoformat()
-        first = registry.upsert(issue_number=30, title="Issue 30", sweep_date=today)
+        first = registry.upsert(issue_number=30, title="Issue 30", sweep_date=today, success_criteria="Test completion.")
         # Transition to pending
         conn = _open_db(db_path)
         conn.execute("UPDATE uow_registry SET status='pending' WHERE id=?", (first.id,))
         conn.commit()
         conn.close()
         # Same sweep_date conflict — should leave status as pending
-        registry.upsert(issue_number=30, title="Issue 30 updated", sweep_date=today)
+        registry.upsert(issue_number=30, title="Issue 30 updated", sweep_date=today, success_criteria="Test completion.")
         conn2 = _open_db(db_path)
         row = conn2.execute("SELECT status FROM uow_registry WHERE id=?", (first.id,)).fetchone()
         conn2.close()
         assert row["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# Issue #488: success_criteria enforcement and issue_url population
+# ---------------------------------------------------------------------------
+
+class TestSuccessCriteriaEnforcement:
+    """upsert() must reject empty success_criteria (issue #488)."""
+
+    def test_empty_string_raises_value_error(self, registry):
+        """Calling upsert() with success_criteria='' raises ValueError."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        with pytest.raises(ValueError, match="success_criteria must not be empty"):
+            registry.upsert(
+                issue_number=8001,
+                title="Missing criteria",
+                sweep_date=today,
+                success_criteria="",
+            )
+
+    def test_whitespace_only_raises_value_error(self, registry):
+        """Calling upsert() with success_criteria='   ' raises ValueError."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        with pytest.raises(ValueError, match="success_criteria must not be empty"):
+            registry.upsert(
+                issue_number=8002,
+                title="Whitespace criteria",
+                sweep_date=today,
+                success_criteria="   ",
+            )
+
+    def test_non_empty_criteria_succeeds(self, registry, db_path):
+        """upsert() with a non-empty success_criteria stores it correctly."""
+        from src.orchestration.registry import UpsertInserted
+        today = datetime.now(timezone.utc).date().isoformat()
+        criteria = "Migration applied, tests green, PR merged."
+        result = registry.upsert(
+            issue_number=8003,
+            title="Valid criteria",
+            sweep_date=today,
+            success_criteria=criteria,
+        )
+        assert isinstance(result, UpsertInserted)
+        conn = _open_db(db_path)
+        row = conn.execute(
+            "SELECT success_criteria FROM uow_registry WHERE id = ?", (result.id,)
+        ).fetchone()
+        conn.close()
+        assert row["success_criteria"] == criteria
+
+
+class TestIssueUrlPopulation:
+    """issue_url is stored at proposal time (issue #488)."""
+
+    def test_explicit_issue_url_stored(self, registry, db_path):
+        """When issue_url is passed explicitly, it is persisted."""
+        from src.orchestration.registry import UpsertInserted
+        today = datetime.now(timezone.utc).date().isoformat()
+        url = "https://github.com/owner/repo/issues/42"
+        result = registry.upsert(
+            issue_number=42,
+            title="Issue with explicit URL",
+            sweep_date=today,
+            success_criteria="Widget works.",
+            issue_url=url,
+        )
+        assert isinstance(result, UpsertInserted)
+        conn = _open_db(db_path)
+        row = conn.execute(
+            "SELECT issue_url FROM uow_registry WHERE id = ?", (result.id,)
+        ).fetchone()
+        conn.close()
+        assert row["issue_url"] == url
+
+    def test_issue_url_derived_from_source_repo(self, registry, db_path):
+        """When source_repo is passed and issue_url is None, URL is derived."""
+        from src.orchestration.registry import UpsertInserted
+        today = datetime.now(timezone.utc).date().isoformat()
+        result = registry.upsert(
+            issue_number=99,
+            title="Issue with derived URL",
+            sweep_date=today,
+            success_criteria="Done.",
+            source_repo="myorg/myrepo",
+        )
+        assert isinstance(result, UpsertInserted)
+        conn = _open_db(db_path)
+        row = conn.execute(
+            "SELECT issue_url FROM uow_registry WHERE id = ?", (result.id,)
+        ).fetchone()
+        conn.close()
+        assert row["issue_url"] == "https://github.com/myorg/myrepo/issues/99"
+
+    def test_no_source_repo_no_issue_url_stored_null(self, registry, db_path):
+        """When neither source_repo nor issue_url is provided, issue_url is NULL."""
+        from src.orchestration.registry import UpsertInserted
+        today = datetime.now(timezone.utc).date().isoformat()
+        result = registry.upsert(
+            issue_number=100,
+            title="No URL",
+            sweep_date=today,
+            success_criteria="Done.",
+        )
+        assert isinstance(result, UpsertInserted)
+        conn = _open_db(db_path)
+        row = conn.execute(
+            "SELECT issue_url FROM uow_registry WHERE id = ?", (result.id,)
+        ).fetchone()
+        conn.close()
+        assert row["issue_url"] is None
+
+    def test_uow_value_object_carries_issue_url(self, registry):
+        """registry.get() returns a UoW with issue_url populated."""
+        from src.orchestration.registry import UpsertInserted
+        today = datetime.now(timezone.utc).date().isoformat()
+        url = "https://github.com/dcetlin/Lobster/issues/488"
+        result = registry.upsert(
+            issue_number=488,
+            title="Schema gaps",
+            sweep_date=today,
+            success_criteria="Migration applied.",
+            issue_url=url,
+        )
+        assert isinstance(result, UpsertInserted)
+        uow = registry.get(result.id)
+        assert uow is not None
+        assert uow.issue_url == url
+
+
+class TestRepoFromIssueUrl:
+    """_repo_from_issue_url pure function (issue #488)."""
+
+    def test_extracts_owner_repo_from_valid_url(self):
+        from src.orchestration.steward import _repo_from_issue_url
+        assert _repo_from_issue_url(
+            "https://github.com/dcetlin/Lobster/issues/42"
+        ) == "dcetlin/Lobster"
+
+    def test_returns_none_for_none_input(self):
+        from src.orchestration.steward import _repo_from_issue_url
+        assert _repo_from_issue_url(None) is None
+
+    def test_returns_none_for_non_github_url(self):
+        from src.orchestration.steward import _repo_from_issue_url
+        assert _repo_from_issue_url("https://gitlab.com/org/repo/issues/1") is None
+
+    def test_returns_none_for_empty_string(self):
+        from src.orchestration.steward import _repo_from_issue_url
+        assert _repo_from_issue_url("") is None
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +393,7 @@ class TestApprove:
     def test_approve_transitions_proposed_to_pending(self, registry):
         from src.orchestration.registry import ApproveConfirmed
         today = datetime.now(timezone.utc).date().isoformat()
-        result = registry.upsert(issue_number=50, title="Issue 50", sweep_date=today)
+        result = registry.upsert(issue_number=50, title="Issue 50", sweep_date=today, success_criteria="Test completion.")
         uow_id = result.id
         approve_result = registry.approve(uow_id)
         assert isinstance(approve_result, ApproveConfirmed)
@@ -252,7 +401,7 @@ class TestApprove:
 
     def test_approve_writes_audit_entry(self, registry, db_path):
         today = datetime.now(timezone.utc).date().isoformat()
-        result = registry.upsert(issue_number=51, title="Issue 51", sweep_date=today)
+        result = registry.upsert(issue_number=51, title="Issue 51", sweep_date=today, success_criteria="Test completion.")
         uow_id = result.id
         registry.approve(uow_id)
         conn = _open_db(db_path)
@@ -266,7 +415,7 @@ class TestApprove:
     def test_approve_idempotent_on_already_pending(self, registry):
         from src.orchestration.registry import ApproveSkipped
         today = datetime.now(timezone.utc).date().isoformat()
-        result = registry.upsert(issue_number=52, title="Issue 52", sweep_date=today)
+        result = registry.upsert(issue_number=52, title="Issue 52", sweep_date=today, success_criteria="Test completion.")
         uow_id = result.id
         registry.approve(uow_id)
         # Second approve returns ApproveSkipped, not an error
@@ -283,7 +432,7 @@ class TestApprove:
     def test_approve_returns_expired_on_expired(self, registry):
         from src.orchestration.registry import ApproveExpired
         today = datetime.now(timezone.utc).date().isoformat()
-        result = registry.upsert(issue_number=53, title="Issue 53", sweep_date=today)
+        result = registry.upsert(issue_number=53, title="Issue 53", sweep_date=today, success_criteria="Test completion.")
         uow_id = result.id
         registry.set_status_direct(uow_id, "expired")
         approve_result = registry.approve(uow_id)
@@ -298,9 +447,9 @@ class TestList:
     def test_list_by_status(self, registry):
         from src.orchestration.registry import UoW
         today = datetime.now(timezone.utc).date().isoformat()
-        r1 = registry.upsert(issue_number=60, title="Issue 60", sweep_date=today)
-        r2 = registry.upsert(issue_number=61, title="Issue 61", sweep_date=today)
-        r3 = registry.upsert(issue_number=62, title="Issue 62", sweep_date=today)
+        r1 = registry.upsert(issue_number=60, title="Issue 60", sweep_date=today, success_criteria="Test completion.")
+        r2 = registry.upsert(issue_number=61, title="Issue 61", sweep_date=today, success_criteria="Test completion.")
+        r3 = registry.upsert(issue_number=62, title="Issue 62", sweep_date=today, success_criteria="Test completion.")
         registry.approve(r2.id)
         proposed = registry.list(status="proposed")
         pending = registry.list(status="pending")
@@ -312,8 +461,8 @@ class TestList:
 
     def test_list_returns_all_when_no_filter(self, registry):
         today = datetime.now(timezone.utc).date().isoformat()
-        registry.upsert(issue_number=70, title="Issue 70", sweep_date=today)
-        registry.upsert(issue_number=71, title="Issue 71", sweep_date=today)
+        registry.upsert(issue_number=70, title="Issue 70", sweep_date=today, success_criteria="Test completion.")
+        registry.upsert(issue_number=71, title="Issue 71", sweep_date=today, success_criteria="Test completion.")
         all_records = registry.list()
         assert len(all_records) >= 2
 
@@ -330,7 +479,7 @@ class TestGet:
     def test_get_existing_record(self, registry):
         from src.orchestration.registry import UoW
         today = datetime.now(timezone.utc).date().isoformat()
-        inserted = registry.upsert(issue_number=80, title="Issue 80", sweep_date=today)
+        inserted = registry.upsert(issue_number=80, title="Issue 80", sweep_date=today, success_criteria="Test completion.")
         got = registry.get(inserted.id)
         assert isinstance(got, UoW)
         assert got.id == inserted.id
@@ -349,8 +498,8 @@ class TestExpireProposals:
     def test_expires_old_proposed_records(self, registry, db_path):
         old_date = (datetime.now(timezone.utc) - timedelta(days=15)).date().isoformat()
         recent_date = datetime.now(timezone.utc).date().isoformat()
-        old = registry.upsert(issue_number=90, title="Old issue", sweep_date=old_date)
-        recent = registry.upsert(issue_number=91, title="Recent issue", sweep_date=recent_date)
+        old = registry.upsert(issue_number=90, title="Old issue", sweep_date=old_date, success_criteria="Test completion.")
+        recent = registry.upsert(issue_number=91, title="Recent issue", sweep_date=recent_date, success_criteria="Test completion.")
         # Manually backdate the old record's created_at
         conn = _open_db(db_path)
         old_ts = (datetime.now(timezone.utc) - timedelta(days=15)).isoformat()
@@ -364,7 +513,7 @@ class TestExpireProposals:
 
     def test_does_not_expire_non_proposed(self, registry, db_path):
         old_date = (datetime.now(timezone.utc) - timedelta(days=15)).date().isoformat()
-        r = registry.upsert(issue_number=92, title="Active old", sweep_date=old_date)
+        r = registry.upsert(issue_number=92, title="Active old", sweep_date=old_date, success_criteria="Test completion.")
         # Backdate and set to active
         conn = _open_db(db_path)
         old_ts = (datetime.now(timezone.utc) - timedelta(days=15)).isoformat()
@@ -379,7 +528,7 @@ class TestExpireProposals:
 
     def test_expire_writes_audit_entries(self, registry, db_path):
         old_date = (datetime.now(timezone.utc) - timedelta(days=15)).date().isoformat()
-        r = registry.upsert(issue_number=93, title="Expiring", sweep_date=old_date)
+        r = registry.upsert(issue_number=93, title="Expiring", sweep_date=old_date, success_criteria="Test completion.")
         conn = _open_db(db_path)
         old_ts = (datetime.now(timezone.utc) - timedelta(days=15)).isoformat()
         conn.execute("UPDATE uow_registry SET created_at = ? WHERE id = ?", (old_ts, r.id))
@@ -402,7 +551,7 @@ class TestAuditLog:
     def test_audit_log_is_append_only(self, registry, db_path):
         """Approve entries cannot be deleted (test that entries accumulate)."""
         today = datetime.now(timezone.utc).date().isoformat()
-        r = registry.upsert(issue_number=100, title="Issue 100", sweep_date=today)
+        r = registry.upsert(issue_number=100, title="Issue 100", sweep_date=today, success_criteria="Test completion.")
         registry.approve(r.id)
         conn = _open_db(db_path)
         count = conn.execute("SELECT COUNT(*) as c FROM audit_log WHERE uow_id = ?", (r.id,)).fetchone()["c"]
@@ -411,7 +560,7 @@ class TestAuditLog:
 
     def test_all_fields_present_in_audit_entry(self, registry, db_path):
         today = datetime.now(timezone.utc).date().isoformat()
-        r = registry.upsert(issue_number=101, title="Audit fields test", sweep_date=today)
+        r = registry.upsert(issue_number=101, title="Audit fields test", sweep_date=today, success_criteria="Test completion.")
         conn = _open_db(db_path)
         entry = conn.execute("SELECT * FROM audit_log WHERE uow_id = ?", (r.id,)).fetchone()
         conn.close()
@@ -432,7 +581,7 @@ class TestCheckStale:
     def test_check_stale_returns_uow_when_issue_closed(self, registry, db_path):
         from src.orchestration.registry import UoW
         today = datetime.now(timezone.utc).date().isoformat()
-        r = registry.upsert(issue_number=110, title="Issue 110", sweep_date=today)
+        r = registry.upsert(issue_number=110, title="Issue 110", sweep_date=today, success_criteria="Test completion.")
         conn = _open_db(db_path)
         conn.execute("UPDATE uow_registry SET status='active' WHERE id=?", (r.id,))
         conn.commit()
@@ -445,7 +594,7 @@ class TestCheckStale:
 
     def test_check_stale_excludes_open_issues(self, registry, db_path):
         today = datetime.now(timezone.utc).date().isoformat()
-        r = registry.upsert(issue_number=111, title="Issue 111", sweep_date=today)
+        r = registry.upsert(issue_number=111, title="Issue 111", sweep_date=today, success_criteria="Test completion.")
         conn = _open_db(db_path)
         conn.execute("UPDATE uow_registry SET status='active' WHERE id=?", (r.id,))
         conn.commit()
@@ -494,7 +643,7 @@ class TestRegistryCompleteUow:
     def _make_active_uow(self, registry, db_path: Path) -> str:
         """Helper: create a UoW in 'active' status for transition tests."""
         from src.orchestration.registry import UpsertInserted
-        result = registry.upsert(issue_number=9001, title="Test active UoW")
+        result = registry.upsert(issue_number=9001, title="Test active UoW", success_criteria="Test completion.")
         assert isinstance(result, UpsertInserted)
         uow_id = result.id
         registry.approve(uow_id)
@@ -553,7 +702,7 @@ class TestRegistryCompleteUow:
 class TestNoteAccessor:
     def _make_uow_id(self, registry) -> str:
         from src.orchestration.registry import UpsertInserted
-        result = registry.upsert(issue_number=5555, title="NoteAccessor test UoW")
+        result = registry.upsert(issue_number=5555, title="NoteAccessor test UoW", success_criteria="Test completion.")
         assert isinstance(result, UpsertInserted)
         return result.id
 

@@ -165,6 +165,9 @@ class UoW:
     source_ref: str | None = None
     source_last_seen_at: str | None = None
     source_state: str | None = None
+    # Canonical GitHub issue URL (populated after migration 0005)
+    # Eliminates hardcoded repo references in Steward and Executor.
+    issue_url: str | None = None
 
 
 def _now_iso() -> str:
@@ -293,6 +296,7 @@ class Registry:
             source_ref=d.get("source_ref"),
             source_last_seen_at=d.get("source_last_seen_at"),
             source_state=d.get("source_state"),
+            issue_url=d.get("issue_url"),
         )
 
     def _write_audit(
@@ -325,6 +329,8 @@ class Registry:
         sweep_date: str | None = None,
         uow_type: str = "executable",
         success_criteria: str = "",
+        source_repo: str | None = None,
+        issue_url: str | None = None,
     ) -> UpsertResult:
         """
         Propose a UoW for a GitHub issue.
@@ -340,8 +346,28 @@ class Registry:
         - Existing done/failed/expired (any sweep_date) → INSERT new proposed record
         - UNIQUE(issue, sweep_date) conflict + existing is proposed → UPDATE fields
         - UNIQUE(issue, sweep_date) conflict + existing is non-proposed → no-op update (fields unchanged)
+
+        Args:
+            issue_number: GitHub issue number.
+            title: Issue title used as the UoW summary.
+            sweep_date: ISO date string; defaults to today (UTC).
+            uow_type: UoW type tag (default "executable").
+            success_criteria: Prose completion statement. Must not be an empty string;
+                raises ValueError if blank so that germination always has a verifiable goal.
+            source_repo: GitHub repo slug, e.g. "owner/repo". Used to derive issue_url
+                when issue_url is not supplied explicitly.
+            issue_url: Canonical GitHub issue URL. If omitted and source_repo is provided,
+                derived as "https://github.com/{source_repo}/issues/{issue_number}".
         """
-        return self._upsert_typed(issue_number, title, sweep_date, uow_type, success_criteria)
+        if not success_criteria or not success_criteria.strip():
+            raise ValueError(
+                f"success_criteria must not be empty for issue #{issue_number}. "
+                "Provide a prose completion statement that describes what 'done' means."
+            )
+        return self._upsert_typed(
+            issue_number, title, sweep_date, uow_type, success_criteria,
+            source_repo=source_repo, issue_url=issue_url,
+        )
 
     def _upsert_typed(
         self,
@@ -350,10 +376,18 @@ class Registry:
         sweep_date: str | None = None,
         uow_type: str = "executable",
         success_criteria: str = "",
+        source_repo: str | None = None,
+        issue_url: str | None = None,
     ) -> UpsertResult:
         """Core upsert logic returning typed UpsertResult."""
         if sweep_date is None:
             sweep_date = datetime.now(timezone.utc).date().isoformat()
+
+        # Derive issue_url from source_repo when not explicitly provided.
+        # Pure computation: no side effects, deterministic given inputs.
+        resolved_issue_url: str | None = issue_url
+        if resolved_issue_url is None and source_repo:
+            resolved_issue_url = f"https://github.com/{source_repo}/issues/{issue_number}"
 
         conn = self._connect()
         try:
@@ -422,8 +456,9 @@ class Registry:
                 INSERT INTO uow_registry (
                     id, type, source, source_issue_number, sweep_date,
                     status, posture, created_at, updated_at, summary,
-                    success_criteria, route_reason, route_evidence, trigger
-                ) VALUES (?, ?, ?, ?, ?, 'proposed', 'solo', ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}')
+                    success_criteria, route_reason, route_evidence, trigger,
+                    issue_url
+                ) VALUES (?, ?, ?, ?, ?, 'proposed', 'solo', ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}', ?)
                 """,
                 (
                     uow_id,
@@ -436,6 +471,7 @@ class Registry:
                     title,
                     success_criteria,
                     _LEGACY_ROUTE_REASON,
+                    resolved_issue_url,
                 ),
             )
             conn.commit()

@@ -589,7 +589,7 @@ System) pipeline. Your job is to implement the following prescription and open a
 Follow the functional-engineer protocol:
 1. Read the GitHub issue identified in the prescription (use gh issue view).
 2. Create a worktree branch and implement the changes.
-3. Run tests, then open a PR on dcetlin/Lobster.
+3. Run tests, then open a PR on the repo identified in the prescription's issue URL.
 4. Call write_result with the PR URL and outcome when done.
 
 Do NOT call send_reply. Do NOT call wait_for_messages.
