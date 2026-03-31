@@ -82,30 +82,22 @@ _STEWARD_EXECUTOR_COLUMNS: frozenset[str] = frozenset({
 
 
 @pytest.fixture
-def wos_db_path(tmp_path: Path) -> Path:
-    """Fresh SQLite DB path for each test, with all migrations applied."""
-    db_path = tmp_path / "wos_test.db"
-    run_migrations(db_path)
-    return db_path
-
-
-@pytest.fixture
-def phase2_registry(wos_db_path: Path) -> Registry:
+def phase2_registry(db: Path) -> Registry:
     """
     Registry on a fully-migrated DB.
 
     This is the fixture to use for any test that exercises pipeline behavior.
     """
-    return Registry(wos_db_path)
+    return Registry(db)
 
 
 @pytest.fixture
-def p2_conn(wos_db_path: Path, phase2_registry: Registry) -> Generator[sqlite3.Connection, None, None]:
+def p2_conn(db: Path, phase2_registry: Registry) -> Generator[sqlite3.Connection, None, None]:
     """
     Open connection to a fully-migrated DB, yielded for direct SQL assertions.
     Closed after the test.
     """
-    conn = sqlite3.connect(str(wos_db_path))
+    conn = sqlite3.connect(str(db))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
@@ -239,7 +231,7 @@ def seed_blocked(phase2_registry: Registry) -> SeedBundle:
 
 
 @pytest.fixture
-def seed_stall_candidate(phase2_registry: Registry, wos_db_path: Path) -> SeedBundle:
+def seed_stall_candidate(phase2_registry: Registry, db: Path) -> SeedBundle:
     """
     Seed an 'active' UoW with timeout_at in the past (simulates a stalled executor).
     The Observation Loop should detect this as a stall.
@@ -255,7 +247,7 @@ def seed_stall_candidate(phase2_registry: Registry, wos_db_path: Path) -> SeedBu
     # Simulate Executor claiming: set active + timeout_at in the past
     past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     now = _now()
-    conn = sqlite3.connect(str(wos_db_path))
+    conn = sqlite3.connect(str(db))
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
         """UPDATE uow_registry
@@ -527,12 +519,12 @@ def stub_observation_loop_pass(
 class TestSchemaHarness:
     """
     Verifies the migration runner produces the correct schema.
-    All tests use a fully-migrated DB (wos_db_path applies all real migrations).
+    All tests use a fully-migrated DB (the shared `db` fixture applies all real migrations).
     """
 
-    def test_steward_executor_columns_present(self, wos_db_path, phase2_registry):
+    def test_steward_executor_columns_present(self, db, phase2_registry):
         """All steward/executor columns are present after run_migrations."""
-        conn = sqlite3.connect(str(wos_db_path))
+        conn = sqlite3.connect(str(db))
         try:
             existing = {row[1] for row in conn.execute("PRAGMA table_info(uow_registry)").fetchall()}
             for col_name in _STEWARD_EXECUTOR_COLUMNS:
@@ -540,15 +532,15 @@ class TestSchemaHarness:
         finally:
             conn.close()
 
-    def test_migrations_are_idempotent(self, wos_db_path, phase2_registry):
+    def test_migrations_are_idempotent(self, db, phase2_registry):
         """Running run_migrations again on an already-migrated DB does not raise."""
         # run_migrations skips already-applied versions — calling it again must be safe
-        newly_applied = run_migrations(wos_db_path)
+        newly_applied = run_migrations(db)
         assert newly_applied == [], f"Expected no new migrations on second run, got: {newly_applied}"
 
-    def test_executor_uow_view_excludes_steward_private_fields(self, wos_db_path, phase2_registry):
+    def test_executor_uow_view_excludes_steward_private_fields(self, db, phase2_registry):
         """executor_uow_view cannot SELECT steward_agenda or steward_log."""
-        conn = sqlite3.connect(str(wos_db_path))
+        conn = sqlite3.connect(str(db))
         conn.row_factory = sqlite3.Row
         try:
             # Verify view exists
@@ -566,7 +558,7 @@ class TestSchemaHarness:
         finally:
             conn.close()
 
-    def test_executor_uow_view_includes_required_columns(self, wos_db_path, phase2_registry):
+    def test_executor_uow_view_includes_required_columns(self, db, phase2_registry):
         """executor_uow_view includes all Executor-accessible columns."""
         required_view_columns = {
             "id", "status", "workflow_artifact", "prescribed_skills",
@@ -574,7 +566,7 @@ class TestSchemaHarness:
             "started_at", "completed_at", "steward_cycles",
             "source_issue_number", "summary", "success_criteria",
         }
-        conn = sqlite3.connect(str(wos_db_path))
+        conn = sqlite3.connect(str(db))
         conn.row_factory = sqlite3.Row
         try:
             cursor = conn.execute("SELECT * FROM executor_uow_view LIMIT 0")
@@ -584,21 +576,21 @@ class TestSchemaHarness:
         finally:
             conn.close()
 
-    def test_validate_schema_passes_after_migration(self, wos_db_path, phase2_registry):
+    def test_validate_schema_passes_after_migration(self, db, phase2_registry):
         """validate_steward_executor_schema does not raise on a fully migrated DB."""
-        conn = sqlite3.connect(str(wos_db_path))
+        conn = sqlite3.connect(str(db))
         try:
             validate_steward_executor_schema(conn)  # must not raise
         finally:
             conn.close()
 
-    def test_new_uow_has_steward_executor_column_defaults(self, wos_db_path, phase2_registry):
+    def test_new_uow_has_steward_executor_column_defaults(self, db, phase2_registry):
         """New UoWs have correct NULL/0 defaults for steward/executor columns."""
         result = phase2_registry.upsert(issue_number=1001, title="Test record defaults")
         assert isinstance(result, UpsertInserted), f"Expected UpsertInserted, got: {result}"
         uow_id = result.id
 
-        conn = sqlite3.connect(str(wos_db_path))
+        conn = sqlite3.connect(str(db))
         conn.row_factory = sqlite3.Row
         try:
             row = conn.execute(
@@ -615,14 +607,14 @@ class TestSchemaHarness:
         assert row_dict["steward_agenda"] is None
         assert row_dict["steward_log"] is None
 
-    def test_success_criteria_not_null_for_new_uow(self, wos_db_path, phase2_registry):
+    def test_success_criteria_not_null_for_new_uow(self, db, phase2_registry):
         """New UoWs created after migration can store non-NULL success_criteria."""
         uow_id = _seed_uow(phase2_registry, 1002, "Post-migration UoW")
         _advance_to_ready_for_steward(
             phase2_registry, uow_id,
             success_criteria="Output file exists with expected content.",
         )
-        conn = sqlite3.connect(str(wos_db_path))
+        conn = sqlite3.connect(str(db))
         conn.row_factory = sqlite3.Row
         try:
             row = conn.execute(
@@ -640,9 +632,9 @@ class TestDBProvisioning:
     Fully functional now.
     """
 
-    def test_fresh_db_per_test(self, wos_db_path: Path):
+    def test_fresh_db_per_test(self, db: Path):
         """Each test gets an empty, isolated DB."""
-        reg = Registry(wos_db_path)
+        reg = Registry(db)
         assert reg.list() == []
 
     def test_seed_immediate_starts_in_ready_for_steward(
@@ -947,7 +939,7 @@ class TestConcurrentHeartbeat:
     def test_only_one_claimant_wins_per_uow(
         self,
         phase2_registry: Registry,
-        wos_db_path: Path,
+        db: Path,
         seed_immediate: SeedBundle,
     ):
         """
@@ -961,7 +953,7 @@ class TestConcurrentHeartbeat:
 
         def attempt_claim() -> None:
             try:
-                conn = sqlite3.connect(str(wos_db_path), timeout=10.0)
+                conn = sqlite3.connect(str(db), timeout=10.0)
                 conn.row_factory = sqlite3.Row
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA busy_timeout=5000")
@@ -997,7 +989,7 @@ class TestConcurrentHeartbeat:
     def test_two_heartbeats_do_not_double_process_any_uow(
         self,
         phase2_registry: Registry,
-        wos_db_path: Path,
+        db: Path,
     ):
         """
         Seed multiple UoWs. Two simulated heartbeats run simultaneously.
@@ -1012,7 +1004,7 @@ class TestConcurrentHeartbeat:
         claims_by_thread: dict[int, list[str]] = {0: [], 1: []}
 
         def heartbeat(thread_id: int) -> None:
-            conn = sqlite3.connect(str(wos_db_path), timeout=10.0)
+            conn = sqlite3.connect(str(db), timeout=10.0)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=5000")
