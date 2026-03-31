@@ -1591,12 +1591,15 @@ class TestFeedbackLoopIntegration:
         _make_uow_row(conn, status="ready-for-steward", steward_cycles=0)
         conn.close()
 
+        # Use llm_prescriber=None to force the deterministic template path so
+        # we can assert on exact phrase presence without invoking claude -p.
         steward.run_steward_cycle(
             registry=registry,
             dry_run=False,
             github_client=_mock_github_client_open,
             artifact_dir=tmp_path / "artifacts",
             notify_dan=lambda *a, **kw: None,
+            llm_prescriber=None,
         )
 
         # Read back the written workflow artifact and check instructions
@@ -1607,7 +1610,7 @@ class TestFeedbackLoopIntegration:
         assert "Prior prescription attempts" not in instructions
 
     def test_second_cycle_includes_prior_context(self, db_path, registry, tmp_path):
-        """cycle=1 (re-prescription) instructions must include prior prescription context."""
+        """cycle=1 (re-prescription) deterministic instructions must include prior prescription context."""
         _ensure_registry_has_phase2_methods(registry)
         steward = _import_steward()
 
@@ -1636,12 +1639,16 @@ class TestFeedbackLoopIntegration:
         )
         conn.close()
 
+        # Use llm_prescriber=None to force the deterministic template path so
+        # we can assert on exact phrase presence. The LLM path (claude -p) would
+        # generate its own phrasing, making phrase assertions non-deterministic.
         steward.run_steward_cycle(
             registry=registry,
             dry_run=False,
             github_client=_mock_github_client_open,
             artifact_dir=tmp_path / "artifacts",
             notify_dan=lambda *a, **kw: None,
+            llm_prescriber=None,
         )
 
         artifacts = list((tmp_path / "artifacts").glob("*.json"))
@@ -1673,12 +1680,15 @@ class TestFeedbackLoopIntegration:
         )
         conn.close()
 
+        # Use llm_prescriber=None to force the deterministic template path so
+        # we can assert on exact phrase presence without invoking claude -p.
         steward.run_steward_cycle(
             registry=registry,
             dry_run=False,
             github_client=_mock_github_client_open,
             artifact_dir=tmp_path / "artifacts",
             notify_dan=lambda *a, **kw: None,
+            llm_prescriber=None,
         )
 
         artifacts = list((tmp_path / "artifacts").glob("*.json"))
@@ -1734,10 +1744,16 @@ class TestLlmPrescription:
             steward_log=steward_log,
         )
 
-    def test_llm_prescribe_skips_when_no_api_key(self, monkeypatch):
-        """_llm_prescribe returns None when ANTHROPIC_API_KEY is not set."""
+    def test_llm_prescribe_returns_none_on_subprocess_nonzero_exit(self, monkeypatch):
+        """_llm_prescribe returns None when claude -p exits with a non-zero code."""
+        import subprocess as _subprocess
         steward = _import_steward()
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+        def mock_run(cmd, **kwargs):
+            result = _subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="error")
+            return result
+
+        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
 
         uow = self._make_uow()
         result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
@@ -1824,37 +1840,23 @@ class TestLlmPrescription:
         assert "Completion check:" not in result
 
     def test_llm_prescribe_includes_prior_prescription_history(self, monkeypatch):
-        """_llm_prescribe extracts prior prescription events from steward_log."""
+        """_llm_prescribe extracts prior prescription events from steward_log and includes them in the prompt."""
+        import subprocess as _subprocess
         steward = _import_steward()
 
         captured_prompts = []
 
-        class MockContent:
-            text = json.dumps({
+        def mock_run(cmd, **kwargs):
+            # cmd is [claude_bin, "-p", prompt, "--output-format", "text"]
+            captured_prompts.append(cmd[2])  # capture the prompt string
+            stdout = json.dumps({
                 "instructions": "Do the work again.",
                 "success_criteria_check": "File exists.",
                 "estimated_cycles": 1,
             })
+            return _subprocess.CompletedProcess(cmd, returncode=0, stdout=stdout, stderr="")
 
-        class MockResponse:
-            content = [MockContent()]
-
-        class MockMessages:
-            def create(self, **kwargs):
-                captured_prompts.append(kwargs)
-                return MockResponse()
-
-        class MockClient:
-            messages = MockMessages()
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-123")
-
-        import importlib
-        import sys
-        # Inject a mock anthropic module
-        mock_anthropic = type(sys)("anthropic")
-        mock_anthropic.Anthropic = lambda api_key=None: MockClient()
-        monkeypatch.setitem(sys.modules, "anthropic", mock_anthropic)
+        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
 
         prior_log = json.dumps({
             "event": "prescription",
@@ -1867,84 +1869,51 @@ class TestLlmPrescription:
 
         assert result is not None
         assert len(captured_prompts) == 1
-        user_content = captured_prompts[0]["messages"][0]["content"]
         # Prior prescription history should appear in the prompt
-        assert "Initial implementation missing tests" in user_content
+        assert "Initial implementation missing tests" in captured_prompts[0]
 
     def test_llm_prescribe_handles_malformed_json_response(self, monkeypatch):
-        """_llm_prescribe returns None when LLM returns non-JSON content."""
+        """_llm_prescribe returns None when claude -p returns non-JSON content."""
+        import subprocess as _subprocess
         steward = _import_steward()
 
-        class MockContent:
-            text = "Sorry, I cannot help with that."
+        def mock_run(cmd, **kwargs):
+            return _subprocess.CompletedProcess(cmd, returncode=0, stdout="Sorry, I cannot help with that.", stderr="")
 
-        class MockResponse:
-            content = [MockContent()]
-
-        class MockMessages:
-            def create(self, **kwargs):
-                return MockResponse()
-
-        class MockClient:
-            messages = MockMessages()
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-123")
-        import sys
-        mock_anthropic = type(sys)("anthropic")
-        mock_anthropic.Anthropic = lambda api_key=None: MockClient()
-        monkeypatch.setitem(sys.modules, "anthropic", mock_anthropic)
+        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
 
         uow = self._make_uow()
         result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
         assert result is None
 
-    def test_llm_prescribe_handles_api_exception(self, monkeypatch):
-        """_llm_prescribe returns None when the API call raises an exception."""
+    def test_llm_prescribe_handles_subprocess_exception(self, monkeypatch):
+        """_llm_prescribe returns None when subprocess.run raises an exception."""
         steward = _import_steward()
 
-        class MockMessages:
-            def create(self, **kwargs):
-                raise ConnectionError("API unreachable")
+        def mock_run(cmd, **kwargs):
+            raise FileNotFoundError("claude: command not found")
 
-        class MockClient:
-            messages = MockMessages()
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-123")
-        import sys
-        mock_anthropic = type(sys)("anthropic")
-        mock_anthropic.Anthropic = lambda api_key=None: MockClient()
-        monkeypatch.setitem(sys.modules, "anthropic", mock_anthropic)
+        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
 
         uow = self._make_uow()
         result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
         assert result is None
 
     def test_llm_prescribe_handles_markdown_fenced_json(self, monkeypatch):
-        """_llm_prescribe strips markdown code fences from the response."""
+        """_llm_prescribe strips markdown code fences from the claude -p response."""
+        import subprocess as _subprocess
         steward = _import_steward()
 
-        class MockContent:
-            text = "```json\n" + json.dumps({
-                "instructions": "Implement the feature.",
-                "success_criteria_check": "Feature works.",
-                "estimated_cycles": 2,
-            }) + "\n```"
+        fenced_output = "```json\n" + json.dumps({
+            "instructions": "Implement the feature.",
+            "success_criteria_check": "Feature works.",
+            "estimated_cycles": 2,
+        }) + "\n```"
 
-        class MockResponse:
-            content = [MockContent()]
+        def mock_run(cmd, **kwargs):
+            return _subprocess.CompletedProcess(cmd, returncode=0, stdout=fenced_output, stderr="")
 
-        class MockMessages:
-            def create(self, **kwargs):
-                return MockResponse()
-
-        class MockClient:
-            messages = MockMessages()
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-123")
-        import sys
-        mock_anthropic = type(sys)("anthropic")
-        mock_anthropic.Anthropic = lambda api_key=None: MockClient()
-        monkeypatch.setitem(sys.modules, "anthropic", mock_anthropic)
+        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
 
         uow = self._make_uow()
         result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
@@ -1998,6 +1967,57 @@ class TestLlmPrescription:
         artifact_data = json.loads(artifacts[0].read_text())
         assert "LLM-generated" in artifact_data["instructions"]
         assert "Completion check:" in artifact_data["instructions"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: _select_executor_type — maps UoW nature to executor type
+# ---------------------------------------------------------------------------
+
+class TestSelectExecutorType:
+    """Unit tests for _select_executor_type — pure function."""
+
+    def _make_uow(self, summary: str, source: str = "github:issue/42") -> "UoW":
+        from src.orchestration.registry import UoW, UoWStatus
+        return UoW(
+            id="uow_test_abc",
+            status=UoWStatus.READY_FOR_STEWARD,
+            summary=summary,
+            source=source,
+            source_issue_number=42,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+            type="executable",
+        )
+
+    def test_bug_in_summary_returns_functional_engineer(self):
+        steward = _import_steward()
+        uow = self._make_uow("fix: bug in login handler")
+        assert steward._select_executor_type(uow) == "functional-engineer"
+
+    def test_feature_in_summary_returns_functional_engineer(self):
+        steward = _import_steward()
+        uow = self._make_uow("feat: implement widget module")
+        assert steward._select_executor_type(uow) == "functional-engineer"
+
+    def test_install_in_summary_returns_lobster_ops(self):
+        steward = _import_steward()
+        uow = self._make_uow("install new cron dependency")
+        assert steward._select_executor_type(uow) == "lobster-ops"
+
+    def test_deploy_in_summary_returns_lobster_ops(self):
+        steward = _import_steward()
+        uow = self._make_uow("deploy updated config to server")
+        assert steward._select_executor_type(uow) == "lobster-ops"
+
+    def test_github_issue_source_without_code_keywords_returns_functional_engineer(self):
+        steward = _import_steward()
+        uow = self._make_uow("add new user preference endpoint", source="github:issue/99")
+        assert steward._select_executor_type(uow) == "functional-engineer"
+
+    def test_non_github_source_without_keywords_returns_general(self):
+        steward = _import_steward()
+        uow = self._make_uow("do a thing", source="manual")
+        assert steward._select_executor_type(uow) == "general"
 
 
 # ---------------------------------------------------------------------------

@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
 import sys
 import time
 import uuid
@@ -39,15 +40,15 @@ from src.orchestration.registry import UoW
 log = logging.getLogger("steward")
 
 # ---------------------------------------------------------------------------
-# LLM prescription model
+# LLM prescription dispatch
 # ---------------------------------------------------------------------------
 
-# Use haiku for cost efficiency — prescriptions are structured short outputs.
-_LLM_PRESCRIPTION_MODEL = "claude-haiku-4-5"
+# Hard timeout for the claude -p prescription call (seconds). If exceeded,
+# falls back to the deterministic template.
+_LLM_PRESCRIPTION_TIMEOUT_SECS = 60
 
-# Hard timeout for the LLM prescription call (seconds). If exceeded, falls
-# back to the deterministic template.
-_LLM_PRESCRIPTION_TIMEOUT_SECS = 30
+# claude binary — resolved from PATH at call time.
+_CLAUDE_BIN = "claude"
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +165,8 @@ _STEWARD_REQUIRED_FIELDS = frozenset({
 
 # Executor types
 _EXECUTOR_TYPE_GENERAL = "general"
+_EXECUTOR_TYPE_FUNCTIONAL_ENGINEER = "functional-engineer"
+_EXECUTOR_TYPE_LOBSTER_OPS = "lobster-ops"
 
 # Return reason classifications
 _CLASSIFICATION_NORMAL = "normal"
@@ -511,6 +514,43 @@ def _build_initial_agenda(uow: "UoW", issue_body: str) -> list[dict[str, Any]]:
         ]
 
 
+def _select_executor_type(uow: "UoW") -> str:
+    """
+    Select the executor type appropriate to the UoW's nature.
+
+    Mapping:
+    - GitHub issues about code bugs, features, or PRs → functional-engineer
+    - Infrastructure or ops issues → lobster-ops
+    - General or unclear → general
+
+    Returns one of the _EXECUTOR_TYPE_* constants.
+    """
+    summary_lower = uow.summary.lower()
+    source = (uow.source or "").lower()
+
+    # Infrastructure / ops signals
+    ops_keywords = (
+        "install", "deploy", "cron", "systemd", "migration", "upgrade",
+        "ops", "infra", "server", "config", "script", "setup", "lobster-ops",
+    )
+    if any(kw in summary_lower for kw in ops_keywords):
+        return _EXECUTOR_TYPE_LOBSTER_OPS
+
+    # Code / feature / bug signals — default for GitHub issues
+    code_keywords = (
+        "bug", "fix", "feat", "feature", "implement", "refactor", "test",
+        "pr", "pull request", "issue", "error", "crash", "regression",
+    )
+    if any(kw in summary_lower for kw in code_keywords):
+        return _EXECUTOR_TYPE_FUNCTIONAL_ENGINEER
+
+    # Default: functional-engineer for anything sourced from a GitHub issue
+    if "github:issue" in source:
+        return _EXECUTOR_TYPE_FUNCTIONAL_ENGINEER
+
+    return _EXECUTOR_TYPE_GENERAL
+
+
 def _select_prescribed_skills(uow: "UoW", reentry_posture: str) -> list[str]:
     """
     Select prescribed skills appropriate to the UoW type and posture.
@@ -540,30 +580,20 @@ def _llm_prescribe(
     """
     Call Claude to generate a tailored prescription for the given UoW.
 
+    Dispatches via `claude -p` subprocess (the Lobster-standard LLM call path).
+    No ANTHROPIC_API_KEY or anthropic SDK required — the claude CLI handles auth.
+
     Returns a dict with keys:
       - "instructions": str — full instruction block for the Executor
       - "success_criteria_check": str — how to verify completion
       - "estimated_cycles": int — expected execution passes needed
 
-    Returns None if the LLM call fails, is unavailable, or times out.
+    Returns None if the subprocess fails, times out, or returns unparseable output.
     The caller must fall back to the deterministic template on None.
 
     This function is a pure side-effect boundary: the only observable effect
-    is the Anthropic API call. All inputs are immutable value types.
+    is the claude -p subprocess call. All inputs are immutable value types.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        log.warning(
-            "LLM prescription unavailable: ANTHROPIC_API_KEY not set — using deterministic fallback"
-        )
-        return None
-
-    try:
-        import anthropic  # local import — optional dependency
-    except ImportError:
-        log.debug("_llm_prescribe: anthropic package not installed, skipping LLM call")
-        return None
-
     # Build prior prescription summary from steward_log if available
     prior_prescriptions: list[str] = []
     if uow.steward_log:
@@ -609,15 +639,9 @@ def _llm_prescribe(
 
     uow_context = "\n".join(context_parts)
 
-    system_prompt = (
-        "You are prescribing work instructions for a Lobster subagent that will execute "
-        "a Unit of Work (UoW) in a software development pipeline. "
-        "Your prescription must be concrete, actionable, and directly executable. "
-        "Avoid vague language. Use the success_criteria as your north star for what 'done' means. "
-        "The Executor is a capable autonomous coding agent — write instructions at that level."
-    )
+    prompt = f"""You are prescribing work instructions for a Lobster subagent that will execute a Unit of Work (UoW) in a software development pipeline. Your prescription must be concrete, actionable, and directly executable. Avoid vague language. Use the success_criteria as your north star for what 'done' means. The Executor is a capable autonomous coding agent — write instructions at that level.
 
-    user_prompt = f"""Given this Unit of Work, write a precise prescription for the Executor.
+Given this Unit of Work, write a precise prescription for the Executor.
 
 {uow_context}
 
@@ -629,15 +653,20 @@ Respond with a JSON object only (no markdown, no explanation outside the JSON):
 }}"""
 
     try:
-        client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
-            model=_LLM_PRESCRIPTION_MODEL,
-            max_tokens=1024,
+        proc = subprocess.run(
+            [_CLAUDE_BIN, "-p", prompt, "--output-format", "text"],
+            capture_output=True,
+            text=True,
             timeout=_LLM_PRESCRIPTION_TIMEOUT_SECS,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
         )
-        raw_text = response.content[0].text.strip()
+        if proc.returncode != 0:
+            log.warning(
+                "_llm_prescribe: claude -p exited %d for %s, falling back",
+                proc.returncode, uow.id,
+            )
+            return None
+
+        raw_text = proc.stdout.strip()
 
         # Strip markdown code fences if present
         if raw_text.startswith("```"):
@@ -667,6 +696,18 @@ Respond with a JSON object only (no markdown, no explanation outside the JSON):
             "estimated_cycles": max(1, min(3, estimated_cycles)),
         }
 
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "_llm_prescribe: claude -p timed out for %s after %ds, falling back",
+            uow.id, _LLM_PRESCRIPTION_TIMEOUT_SECS,
+        )
+        return None
+    except (json.JSONDecodeError, ValueError, KeyError) as exc:
+        log.warning(
+            "_llm_prescribe: failed to parse claude -p output for %s (%s: %s), falling back",
+            uow.id, type(exc).__name__, exc,
+        )
+        return None
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "_llm_prescribe: LLM call failed for %s (%s: %s), falling back to deterministic template",
@@ -1140,18 +1181,20 @@ def _write_workflow_artifact(
     instructions: str,
     prescribed_skills: list[str],
     artifact_dir: Path | None = None,
+    executor_type: str = _EXECUTOR_TYPE_GENERAL,
 ) -> str:
     """
     Write a WorkflowArtifact JSON file to disk.
 
     Returns the absolute path to the written file.
     artifact_dir: override for the artifact directory (used in tests).
+    executor_type: the executor type to embed in the artifact (defaults to general).
     """
     try:
         from src.orchestration.workflow_artifact import WorkflowArtifact, to_json
         artifact = WorkflowArtifact(
             uow_id=uow_id,
-            executor_type=_EXECUTOR_TYPE_GENERAL,
+            executor_type=executor_type,
             constraints=[],
             prescribed_skills=prescribed_skills,
             instructions=instructions,
@@ -1161,7 +1204,7 @@ def _write_workflow_artifact(
         # Fallback if workflow_artifact.py not yet on branch (pre-merge)
         artifact_data = {
             "uow_id": uow_id,
-            "executor_type": _EXECUTOR_TYPE_GENERAL,
+            "executor_type": executor_type,
             "constraints": [],
             "prescribed_skills": prescribed_skills,
             "instructions": instructions,
@@ -1514,6 +1557,7 @@ def _process_uow(
     # with `reason` as the primary input (already in completion_rationale).
     new_cycles = cycles + 1
     prescribed_skills = _select_prescribed_skills(uow, reentry_posture)
+    selected_executor_type = _select_executor_type(uow)
 
     partial_steps_context: str = ""
     if executor_outcome == "partial" and uow.output_ref:
@@ -1607,6 +1651,7 @@ def _process_uow(
             instructions=instructions,
             prescribed_skills=prescribed_skills,
             artifact_dir=artifact_dir,
+            executor_type=selected_executor_type,
         )
 
         # Audit-before-transition: write agenda_update audit entry BEFORE updating
@@ -1639,7 +1684,7 @@ def _process_uow(
             "actor": _ACTOR_STEWARD,
             "uow_id": uow_id,
             "steward_cycles": new_cycles,
-            "workflow_primitive": _EXECUTOR_TYPE_GENERAL,
+            "workflow_primitive": selected_executor_type,
             "prescribed_skills": prescribed_skills,
             "instructions_preview": instructions[:80],
             "timestamp": _now_iso(),
