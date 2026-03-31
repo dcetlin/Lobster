@@ -161,6 +161,10 @@ class UoW:
     steward_agenda: str | None = None
     steward_log: str | None = None
     proposed_at: str | None = None
+    # GardenCaretaker source tracking fields (populated after migration 0004)
+    source_ref: str | None = None
+    source_last_seen_at: str | None = None
+    source_state: str | None = None
 
 
 def _now_iso() -> str:
@@ -286,6 +290,9 @@ class Registry:
             estimated_runtime=d.get("estimated_runtime"),
             steward_agenda=d.get("steward_agenda"),
             steward_log=d.get("steward_log"),
+            source_ref=d.get("source_ref"),
+            source_last_seen_at=d.get("source_last_seen_at"),
+            source_state=d.get("source_state"),
         )
 
     def _write_audit(
@@ -1267,6 +1274,55 @@ class Registry:
         finally:
             conn.close()
 
+    def update_source_tracking(
+        self,
+        uow_id: str,
+        source_ref: str,
+        source_last_seen_at: str,
+        source_state: str,
+    ) -> None:
+        """
+        Write source tracking fields for a UoW.
+
+        Called by GardenCaretaker.tend() after each successful source.get_issue()
+        call. All three fields are written together — they represent a single
+        consistent snapshot of the source at one point in time.
+
+        Args:
+            uow_id: The UoW identifier.
+            source_ref: Canonical SourceRef string, e.g. "github:issue/42".
+            source_last_seen_at: ISO 8601 timestamp of the get_issue() call.
+            source_state: Last known state from source: "open", "closed",
+                          "deleted", or another substrate-defined value.
+
+        Raises:
+            sqlite3.OperationalError: If the migration has not been applied
+                (columns absent).
+            ValueError: If uow_id does not exist in the registry.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE uow_registry
+                   SET source_ref          = ?,
+                       source_last_seen_at = ?,
+                       source_state        = ?,
+                       updated_at          = ?
+                 WHERE id = ?
+                """,
+                (source_ref, source_last_seen_at, source_state, _now_iso(), uow_id),
+            )
+            rows_affected = cursor.rowcount
+            if rows_affected == 0:
+                raise ValueError(f"uow_id not found: {uow_id}")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
