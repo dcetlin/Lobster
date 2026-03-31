@@ -819,6 +819,12 @@ def _build_deterministic_prescription_instructions(
     It is also the implementation called by _build_prescription_instructions
     when llm_prescriber returns None.
 
+    NOTE: This path does not inject _DISPATCH_CONVENTIONS (YAML frontmatter,
+    Minimum viable output, Boundary, agent type, run_in_background, two-step
+    output delivery). The deterministic template produces minimal instructions
+    only. Executors dispatched via this path may not conform to Lobster's
+    subagent dispatch protocol without additional scaffolding at the call site.
+
     Args:
         uow: The Unit of Work being prescribed.
         reentry_posture: Categorized executor state from diagnosis.
