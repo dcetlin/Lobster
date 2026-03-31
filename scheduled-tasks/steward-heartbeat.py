@@ -50,7 +50,7 @@ _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from src.orchestration.steward import BOOTUP_CANDIDATE_GATE, run_steward_cycle
+from src.orchestration.steward import is_bootup_candidate_gate_active, run_steward_cycle
 
 # ---------------------------------------------------------------------------
 # Startup sweep — imported from startup-sweep.py (Phase 1 concern)
@@ -310,7 +310,8 @@ def main() -> int:
     else:
         log.info("Steward heartbeat starting")
 
-    log.info("BOOTUP_CANDIDATE_GATE = %s", BOOTUP_CANDIDATE_GATE)
+    gate_active = is_bootup_candidate_gate_active()
+    log.info("BOOTUP_CANDIDATE_GATE = %s", gate_active)
 
     from src.orchestration.registry import Registry
 
@@ -324,7 +325,7 @@ def main() -> int:
     # Phase 1: Startup sweep
     log.info("--- Phase 1: Startup sweep ---")
     try:
-        sweep_result = run_startup_sweep(registry, dry_run=dry_run, bootup_candidate_gate=BOOTUP_CANDIDATE_GATE)
+        sweep_result = run_startup_sweep(registry, dry_run=dry_run, bootup_candidate_gate=gate_active)
         log.info(
             "Startup sweep complete: active_swept=%d executor_orphans=%d "
             "diagnosing=%d skipped_dry_run=%d",
@@ -354,6 +355,7 @@ def main() -> int:
         result = run_steward_cycle(
             registry=registry,
             dry_run=dry_run,
+            bootup_candidate_gate=gate_active,
         )
         log.info(
             "Steward cycle complete: evaluated=%d prescribed=%d done=%d "

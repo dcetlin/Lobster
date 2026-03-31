@@ -1,5 +1,5 @@
 """
-Tests for dispatcher command handlers for /approve and /wos status.
+Tests for dispatcher command handlers for /approve, /wos status, and /wos unblock.
 
 These test the pure handler functions in isolation — no Telegram or MCP required.
 The handlers receive parsed command arguments and a Registry instance, and return
@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import pytest
 
-from src.orchestration.dispatcher_handlers import handle_approve, handle_confirm, handle_wos_status
+from src.orchestration.dispatcher_handlers import handle_approve, handle_confirm, handle_wos_status, handle_wos_unblock
 
 
 @pytest.fixture
@@ -90,3 +90,61 @@ class TestHandleWosStatus:
         response = handle_wos_status(None, registry=registry)
         assert r1.id in response
         assert r2.id in response
+
+
+class TestHandleWosUnblock:
+    """Tests for handle_wos_unblock — BOOTUP_CANDIDATE_GATE file-flag clearing."""
+
+    def test_creates_flag_file_when_not_present(self, tmp_path, monkeypatch):
+        """Calling unblock when flag absent creates the flag and returns success."""
+        from src.orchestration import dispatcher_handlers
+        flag = tmp_path / "wos-gate-cleared"
+        monkeypatch.setattr(dispatcher_handlers, "_GATE_CLEARED_FLAG", flag)
+
+        assert not flag.exists()
+        response = handle_wos_unblock()
+        assert flag.exists()
+        assert "cleared" in response.lower()
+
+    def test_idempotent_when_already_cleared(self, tmp_path, monkeypatch):
+        """Calling unblock when flag already exists returns a notice, not an error."""
+        from src.orchestration import dispatcher_handlers
+        flag = tmp_path / "wos-gate-cleared"
+        flag.touch()
+        monkeypatch.setattr(dispatcher_handlers, "_GATE_CLEARED_FLAG", flag)
+
+        response = handle_wos_unblock()
+        assert "already" in response.lower() or "cleared" in response.lower()
+        # Flag should still exist
+        assert flag.exists()
+
+    def test_creates_parent_directory_if_missing(self, tmp_path, monkeypatch):
+        """Flag file parent directory is created if it does not exist."""
+        from src.orchestration import dispatcher_handlers
+        flag = tmp_path / "nonexistent" / "subdir" / "wos-gate-cleared"
+        monkeypatch.setattr(dispatcher_handlers, "_GATE_CLEARED_FLAG", flag)
+
+        assert not flag.parent.exists()
+        response = handle_wos_unblock()
+        assert flag.exists()
+        assert "cleared" in response.lower()
+
+    def test_response_mentions_flag_path(self, tmp_path, monkeypatch):
+        """Success response includes the flag path so Dan can verify."""
+        from src.orchestration import dispatcher_handlers
+        flag = tmp_path / "wos-gate-cleared"
+        monkeypatch.setattr(dispatcher_handlers, "_GATE_CLEARED_FLAG", flag)
+
+        response = handle_wos_unblock()
+        assert str(flag) in response
+
+    def test_is_bootup_candidate_gate_active_reflects_flag(self, tmp_path, monkeypatch):
+        """After unblock, is_bootup_candidate_gate_active() returns False."""
+        from src.orchestration import dispatcher_handlers, steward
+        flag = tmp_path / "wos-gate-cleared"
+        monkeypatch.setattr(dispatcher_handlers, "_GATE_CLEARED_FLAG", flag)
+        monkeypatch.setattr(steward, "_GATE_CLEARED_FLAG", flag)
+
+        assert steward.is_bootup_candidate_gate_active() is True
+        handle_wos_unblock()
+        assert steward.is_bootup_candidate_gate_active() is False
