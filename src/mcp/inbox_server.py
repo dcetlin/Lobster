@@ -9421,28 +9421,205 @@ def _enqueue_reconciler_notification(session: dict, outcome: str) -> None:
         # Do NOT mark notified — next cycle will retry (at-least-once guarantee)
 
 
+# Maximum sessions to enqueue individually during a startup sweep (defense-in-depth
+# per issue #464). Beyond this cap, sessions are still marked notified but are
+# included only in the summary rather than individual messages. This cap is only
+# relevant when the summary grouping produces a single chat_id with many sessions —
+# in normal operation the summary approach makes it structurally impossible to flood.
+_STARTUP_SWEEP_BATCH_CAP = 20
+
+
+def _build_startup_sweep_summary(
+    chat_id: str,
+    sessions: list[dict],
+    now: datetime,
+) -> dict:
+    """Return a single inbox summary message for all unnotified sessions for one chat_id.
+
+    Groups all completed/dead sessions into a single 'reconciler_sweep_summary'
+    message so a restart with N in-flight tasks produces 1 inbox message, not N.
+
+    Args:
+        chat_id: The originating chat (user) to route this summary to.
+        sessions: All unnotified sessions for this chat_id (completed or dead).
+        now:      Current UTC datetime (injected for testability).
+
+    Returns:
+        A structured inbox message dict.
+    """
+    completed = [s for s in sessions if s.get("status") == "completed"]
+    dead = [s for s in sessions if s.get("status") != "completed"]
+
+    lines: list[str] = []
+    if completed:
+        lines.append(f"{len(completed)} task(s) completed while Lobster was compacted:")
+        for s in completed:
+            desc = s.get("description", "unknown task")
+            task_id = s.get("task_id") or s.get("id", "")
+            elapsed_raw = s.get("elapsed_seconds")
+            try:
+                elapsed_min = int(elapsed_raw) // 60 if elapsed_raw is not None else 0
+            except (TypeError, ValueError):
+                elapsed_min = 0
+            lines.append(f"  - {desc} (task_id={task_id}, {elapsed_min}m)")
+    if dead:
+        lines.append(f"{len(dead)} task(s) disappeared (no output):")
+        for s in dead:
+            desc = s.get("description", "unknown task")
+            task_id = s.get("task_id") or s.get("id", "")
+            lines.append(f"  - {desc} (task_id={task_id})")
+
+    # Use the source from the first session; fall back to "system"
+    source = next(
+        (s.get("source") for s in sessions if s.get("source") not in (None, "")),
+        "system",
+    )
+
+    ts_ms = int(now.timestamp() * 1000)
+    message_id = f"{ts_ms}_reconciler_sweep_{str(chat_id)[:20]}"
+
+    # Collect all task_ids so the dispatcher can correlate with write_result calls
+    task_ids = [s.get("task_id") or s.get("id", "") for s in sessions]
+
+    return {
+        "id": message_id,
+        "type": "reconciler_sweep_summary",
+        "source": source,
+        "chat_id": chat_id,
+        "text": "\n".join(lines),
+        "task_ids": task_ids,
+        "completed_count": len(completed),
+        "dead_count": len(dead),
+        "sent_reply_to_user": False,
+        "timestamp": now.isoformat(),
+    }
+
+
+def _enqueue_startup_sweep_summaries(sessions: list[dict]) -> None:
+    """Group unnotified sessions by chat_id and write one summary per user.
+
+    Implements the fix for issues #459 and #469: the startup sweep produces
+    one inbox message per originating chat, not one per task.  This makes the
+    N-task → N-message flood structurally impossible.
+
+    Sessions with chat_id=0/empty are silently dropped (no real user to notify;
+    they are already logged by the caller).  All sessions are marked notified
+    regardless of whether a summary was written, so no stale sessions persist.
+
+    Args:
+        sessions: All unnotified completed/dead sessions from the last 24 hours.
+    """
+    from collections import defaultdict
+
+    now = datetime.now(timezone.utc)
+
+    # Group by chat_id, excluding internal agents (chat_id=0/empty)
+    by_chat: dict[str, list[dict]] = defaultdict(list)
+    skipped_internal = 0
+    for session in sessions:
+        raw = session.get("chat_id")
+        chat_id_str = str(raw).strip() if raw is not None else ""
+        if chat_id_str in ("0", "", "None"):
+            skipped_internal += 1
+            # Mark notified so these don't accumulate across restarts
+            agent_id = session.get("id", "")
+            try:
+                _session_store.set_notified(agent_id)
+            except Exception as exc:
+                log.warning(
+                    "[reconciler] Failed to mark internal session %r notified: %s",
+                    agent_id, exc,
+                )
+            continue
+        by_chat[chat_id_str].append(session)
+
+    if skipped_internal:
+        log.debug(
+            "[reconciler] Startup sweep: skipped %d internal sessions (chat_id=0) — "
+            "no inbox notification needed",
+            skipped_internal,
+        )
+
+    total_sessions = sum(len(v) for v in by_chat.values())
+    log.info(
+        "[reconciler] Startup sweep: %d session(s) across %d chat(s) → "
+        "writing %d summary message(s)",
+        total_sessions, len(by_chat), len(by_chat),
+    )
+
+    for chat_id, chat_sessions in by_chat.items():
+        # Defense-in-depth (#464): cap how many sessions feed into a single summary.
+        # Beyond the cap, sessions are still marked notified to prevent accumulation,
+        # but only the first _STARTUP_SWEEP_BATCH_CAP sessions appear in the summary.
+        if len(chat_sessions) > _STARTUP_SWEEP_BATCH_CAP:
+            log.warning(
+                "[reconciler] Startup sweep: chat_id=%r has %d unnotified sessions "
+                "(cap=%d) — truncating summary, marking all as notified",
+                chat_id, len(chat_sessions), _STARTUP_SWEEP_BATCH_CAP,
+            )
+            overflow = chat_sessions[_STARTUP_SWEEP_BATCH_CAP:]
+            chat_sessions = chat_sessions[:_STARTUP_SWEEP_BATCH_CAP]
+            # Mark overflow sessions notified without including them in the summary
+            for s in overflow:
+                agent_id = s.get("id", "")
+                try:
+                    _session_store.set_notified(agent_id)
+                except Exception as exc:
+                    log.warning(
+                        "[reconciler] Failed to mark overflow session %r notified: %s",
+                        agent_id, exc,
+                    )
+
+        message = _build_startup_sweep_summary(chat_id, chat_sessions, now)
+        try:
+            inbox_file = INBOX_DIR / f"{message['id']}.json"
+            atomic_write_json(inbox_file, message)
+            # Mark all sessions in this group notified
+            for s in chat_sessions:
+                agent_id = s.get("id", "")
+                _session_store.set_notified(agent_id)
+            log.info(
+                "[reconciler] Startup sweep summary written for chat_id=%r "
+                "(%d completed, %d dead, inbox=%r)",
+                chat_id,
+                message["completed_count"],
+                message["dead_count"],
+                message["id"],
+            )
+        except Exception as exc:
+            log.error(
+                "[reconciler] Failed to write startup sweep summary for chat_id=%r: %s",
+                chat_id, exc,
+                exc_info=True,
+            )
+            # Do NOT mark sessions notified — next restart will retry (at-least-once)
+
+
 async def _startup_sweep() -> None:
     """Send missed notifications for sessions that completed while server was down.
 
     Queries for completed/dead sessions where notified_at IS NULL and enqueues
-    a synthetic inbox message for each. Called once at server startup before
-    entering the reconciler loop.
+    ONE summary message per originating chat_id (not one message per task).
 
     This implements the restart-safety guarantee: if the server was killed between
     marking a session completed and writing notified_at, the notification is
     re-sent on the next startup. The at-most-once property is upheld by
     set_notified() being called immediately after enqueueing.
+
+    Fix (#459, #469): Previously produced one inbox message per completed task,
+    causing inbox floods of 500+ messages after busy sessions. Now groups all
+    unnotified sessions by chat_id and writes a single summary per user.
+    Defense-in-depth (#464): Caps at _STARTUP_SWEEP_BATCH_CAP sessions per chat.
     """
     try:
         unnotified = _session_store.get_unnotified_completed(since_hours=24)
-        if unnotified:
-            log.info(
-                f"[reconciler] Startup sweep: found {len(unnotified)} unnotified "
-                f"completed/dead session(s) — re-enqueuing notifications"
-            )
-        for session in unnotified:
-            outcome = session.get("status", "completed")
-            _enqueue_reconciler_notification(session, outcome=outcome)
+        if not unnotified:
+            return
+        log.info(
+            f"[reconciler] Startup sweep: found {len(unnotified)} unnotified "
+            f"completed/dead session(s) — grouping into per-chat summaries"
+        )
+        _enqueue_startup_sweep_summaries(unnotified)
     except Exception as exc:
         log.error(f"[reconciler] Startup sweep error: {exc}", exc_info=True)
 
