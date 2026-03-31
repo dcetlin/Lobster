@@ -173,6 +173,36 @@ The `artifacts` field is accepted by the inbox server and surfaced in the `subag
 
 **Never put large content in `text` directly.** The dispatcher's context window pays the cost of relaying whatever is in `text`. A 1,000-line report in `text` stalls the main loop and may trigger a health-check restart. Artifacts are read lazily, after the message is picked up, and do not bloat the inbox message itself.
 
+## Signal Footer (Required for Replies with Side Effects)
+
+**Canonical label: `side-effects:`** — this is the only accepted label. Do not use `signals:`, `effects:`, or any other variant.
+
+Every `send_reply` that references completed work (created, merged, built, deployed, wrote, fixed, implemented, etc.) **must end with a `side-effects:` code block** listing the relevant emoji signals. The hook `hooks/signal-footer-check.py` enforces this and will block the call if it is missing.
+
+Correct format:
+
+````
+Your reply text here.
+
+```side-effects:
+✅ 🐙 📝
+```
+````
+
+Signal legend (10-signal set):
+- `🤖` spawned — subagent or background task launched
+- `✅` done — task completed
+- `🐙` PR — pull request opened or updated
+- `🔀` merged — PR or branch merged
+- `🗑️` closed — issue or PR closed
+- `⚠️` blocked — work is blocked
+- `📝` wrote — file or doc written
+- `🔍` read — file or data read
+- `🔧` config — configuration changed
+- `💬` decide — decision made or surfaced
+
+**The label `side-effects:` is authoritative.** The hook validates on code block presence, but the label must be `side-effects:` exactly — any other label is wrong and will cause drift across compaction.
+
 ## Surfacing Observations (`write_observation`)
 
 Use `write_observation` to send structured side-channel information to the dispatcher — things you noticed that are separate from your primary result. This is distinct from `write_result`, which delivers the final answer to the user. Observations go to the dispatcher for routing (to the user, to memory, or to a log), not directly to the user.

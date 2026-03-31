@@ -33,31 +33,12 @@ ACTION_KEYWORDS = [
     r"\binstalled\b",
 ]
 
-# Emoji signals from the legend (used in signal footers)
-SIGNAL_EMOJIS = [
-    "\U0001f916",  # 🤖
-    "\u2705",      # ✅
-    "\U0001f419",  # 🐙
-    "\U0001f500",  # 🔀
-    "\U0001f5d1",  # 🗑️
-    "\u26a0",      # ⚠️
-    "\U0001f4dd",  # 📝
-    "\U0001f50d",  # 🔍
-    "\U0001f527",  # 🔧
-    "\U0001f4ac",  # 💬
-]
-
 ACTION_RES = [re.compile(p, re.IGNORECASE) for p in ACTION_KEYWORDS]
 
-# Match a closing code fence (``` possibly with trailing whitespace/newline)
-CODE_BLOCK_END_RE = re.compile(r"```\s*$", re.MULTILINE)
-
-# Match a line that contains only emoji signal characters and optional multipliers like "x2"
-# This line must be at or near the end of the message
-SIGNAL_LINE_RE = re.compile(
-    r"^[" + "".join(re.escape(e) for e in SIGNAL_EMOJIS) + r"\s️xX\d]+$",
-    re.MULTILINE,
-)
+# Match a side-effects code block with the canonical label.
+# Only "side-effects:" is accepted — no other label is valid.
+# This enforces the canonical format from sys.subagent.bootup.md.
+SIDE_EFFECTS_BLOCK_RE = re.compile(r"```side-effects:[^`]*```", re.DOTALL)
 
 
 def has_action_keywords(text: str) -> bool:
@@ -66,28 +47,13 @@ def has_action_keywords(text: str) -> bool:
 
 def has_signal_footer(text: str) -> bool:
     """
-    Returns True if the message ends with either:
-    1. A markdown code block (``` ... ```)
-    2. A trailing line containing only emoji signal characters
+    Returns True if the message contains a ```side-effects: ... ``` code block.
+    The label must be exactly "side-effects:" — no other label is accepted.
+    This matches the canonical format enforced by sys.subagent.bootup.md and
+    sys.dispatcher.bootup.md.
     """
-    stripped = text.strip()
-
-    # Check for closing code block at the end
-    if stripped.endswith("```"):
+    if SIDE_EFFECTS_BLOCK_RE.search(text):
         return True
-
-    # Check for a code block anywhere near the end (last 200 chars)
-    tail = stripped[-200:]
-    if CODE_BLOCK_END_RE.search(tail):
-        return True
-
-    # Check last non-empty line for emoji-only signal line
-    lines = stripped.splitlines()
-    non_empty_lines = [l for l in lines if l.strip()]
-    if non_empty_lines:
-        last_line = non_empty_lines[-1].strip()
-        if SIGNAL_LINE_RE.match(last_line):
-            return True
 
     return False
 
@@ -113,7 +79,8 @@ def main():
     if has_action_keywords(text) and not has_signal_footer(text):
         print(
             "BLOCKED: Message references completed work but has no signal footer. "
-            "Add a code block at the end listing your side-effect signals (🤖 ✅ 🐙 🔀 etc.).",
+            "Add a ```side-effects: ... ``` code block at the end. "
+            "Example: ```side-effects:\n✅ 🐙\n``` — label must be exactly 'side-effects:' (not 'signals:' or anything else).",
             file=sys.stderr,
         )
         sys.exit(2)
