@@ -1,0 +1,37 @@
+[skill]
+name = "footer-reset"
+version = "1.1.0"
+description = "Scan recent outbox messages for side-effects footer drift and report findings"
+author = "Lobster"
+category = "behavioral"
+
+[activation]
+mode = "triggered"
+triggers = ["/footer-reset", "/reset-footer"]
+context_patterns = [
+    "when user asks to audit outbox messages for footer drift",
+    "when user mentions side-effects label confusion",
+    "when user asks about missing footers",
+    "when user asks which recent messages had wrong footer labels",
+]
+
+[layering]
+priority = 60
+merge_strategy = "append"
+
+[provides]
+mcp_tools = []
+bot_commands = ["/footer-reset", "/reset-footer"]
+
+[compatibility]
+enhances = []
+conflicts = []
+
+[dependencies]
+pip = []
+npm = []
+system = []
+api_keys = []
+
+[dependencies.runtime]
+python = ">=3.11"
