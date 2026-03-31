@@ -3,7 +3,12 @@
 Signal footer enforcement hook for send_reply.
 
 Fires before mcp__lobster-inbox__send_reply tool calls.
-Blocks messages that reference completed work but have no signal footer code block.
+
+Convention:
+- When a message has side effects: end with a ```side-effects: ... ``` code block.
+- When a message has no side effects: omit the footer entirely — write nothing.
+- `side-effects: none` in any form is BANNED. Omit the footer instead.
+- Any footer-like code block with a wrong label (signals:, effects:, etc.) is blocked.
 
 Exit codes:
   0 - Allow the tool call
@@ -15,34 +20,17 @@ import re
 import sys
 
 
-# Keywords indicating completed actions (case-insensitive)
-ACTION_KEYWORDS = [
-    r"\bmerged\b",
-    r"\bmerge\b",
-    r" PR #\d+",
-    r"\bpull request\b",
-    r"\bspawned\b",
-    r"\bbuilt\b",
-    r"\bwrote\b",
-    r"\bscheduled\b",
-    r"\bdeleted\b",
-    r"\bcreated\b",
-    r"\bfixed\b",
-    r"\bimplemented\b",
-    r"\bdeployed\b",
-    r"\binstalled\b",
-]
-
-ACTION_RES = [re.compile(p, re.IGNORECASE) for p in ACTION_KEYWORDS]
-
 # Match a side-effects code block with the canonical label.
 # Only "side-effects:" is accepted — no other label is valid.
 # This enforces the canonical format from sys.subagent.bootup.md.
 SIDE_EFFECTS_BLOCK_RE = re.compile(r"```side-effects:[^`]*```", re.DOTALL)
 
-# Match the explicit null case: a bare "side-effects: none" line (not a code block).
-# This is the canonical way to declare that a message has no side effects.
-SIDE_EFFECTS_NONE_RE = re.compile(r"^side-effects:\s*none\s*$", re.MULTILINE | re.IGNORECASE)
+# Match "side-effects: none" in any form:
+# 1. As a bare line: "side-effects: none"
+# 2. As a code block: ```side-effects:\nnone\n```
+# Both forms are banned — omit the footer entirely instead.
+SIDE_EFFECTS_NONE_BARE_RE = re.compile(r"^side-effects:\s*none\s*$", re.MULTILINE | re.IGNORECASE)
+SIDE_EFFECTS_NONE_BLOCK_RE = re.compile(r"```side-effects:\s*\nnone\s*\n```", re.DOTALL | re.IGNORECASE)
 
 # Wrong-label patterns: fenced code blocks that look like footers but use the wrong label.
 # Ordered from most specific to most general to return the most useful error message.
@@ -63,26 +51,12 @@ WRONG_NULL_PATTERNS = [
 ]
 
 
-def has_action_keywords(text: str) -> bool:
-    return any(r.search(text) for r in ACTION_RES)
-
-
-def has_signal_footer(text: str) -> bool:
-    """
-    Returns True if the message contains either:
-    1. A ```side-effects: ... ``` code block (for messages with side effects)
-    2. A bare "side-effects: none" line (explicit null — for messages with no side effects)
-
-    The label must be exactly "side-effects:" — no other label is accepted.
-    This matches the canonical format enforced by sys.subagent.bootup.md and
-    sys.dispatcher.bootup.md.
-    """
-    if SIDE_EFFECTS_BLOCK_RE.search(text):
+def has_side_effects_none(text: str) -> bool:
+    """Returns True if the message contains a banned 'side-effects: none' in any form."""
+    if SIDE_EFFECTS_NONE_BARE_RE.search(text):
         return True
-
-    if SIDE_EFFECTS_NONE_RE.search(text):
+    if SIDE_EFFECTS_NONE_BLOCK_RE.search(text):
         return True
-
     return False
 
 
@@ -91,7 +65,7 @@ def detect_wrong_label(text: str) -> str | None:
     Returns a human-readable description of the wrong label found, or None if
     no wrong-label footer is detected.
 
-    Only fires when has_signal_footer() is False — i.e., no canonical footer is present.
+    Only fires when no canonical side-effects block is present.
     """
     for pattern, override_label in WRONG_LABEL_PATTERNS:
         m = pattern.search(text)
@@ -125,24 +99,29 @@ def main():
     if not text:
         sys.exit(0)
 
-    if has_action_keywords(text) and not has_signal_footer(text):
+    # Check 1: "side-effects: none" in any form is banned.
+    # The canonical convention is to omit the footer entirely when there are no side effects.
+    if has_side_effects_none(text):
+        print(
+            "BLOCKED: `side-effects: none` is no longer valid. "
+            "Omit the footer entirely when there are no side effects.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # Check 2: If a footer-like code block is present, its label must be exactly "side-effects:".
+    # A canonical side-effects block is valid — allow it.
+    # A wrong-label block is blocked.
+    if not SIDE_EFFECTS_BLOCK_RE.search(text):
         wrong_label = detect_wrong_label(text)
         if wrong_label is not None:
             print(
                 f"BLOCKED: Wrong footer label — must be exactly `side-effects:` (got `{wrong_label}`). "
-                "Use ```side-effects:\\n<signals>\\n``` for messages with side effects, "
-                "or `side-effects: none` on its own line for messages with no side effects.",
+                "Use ```side-effects:\\n<signals>\\n``` for messages with side effects. "
+                "Omit the footer entirely when there are no side effects.",
                 file=sys.stderr,
             )
-        else:
-            print(
-                "BLOCKED: Message references completed work but has no signal footer. "
-                "Either add a ```side-effects: ... ``` code block listing emoji signals, "
-                "or write 'side-effects: none' on its own line if there are truly no side effects. "
-                "Label must be exactly 'side-effects:' (not 'signals:' or anything else).",
-                file=sys.stderr,
-            )
-        sys.exit(2)
+            sys.exit(2)
 
     sys.exit(0)
 
