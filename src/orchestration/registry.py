@@ -317,6 +317,7 @@ class Registry:
         title: str,
         sweep_date: str | None = None,
         uow_type: str = "executable",
+        success_criteria: str = "",
     ) -> UpsertResult:
         """
         Propose a UoW for a GitHub issue.
@@ -333,7 +334,7 @@ class Registry:
         - UNIQUE(issue, sweep_date) conflict + existing is proposed → UPDATE fields
         - UNIQUE(issue, sweep_date) conflict + existing is non-proposed → no-op update (fields unchanged)
         """
-        return self._upsert_typed(issue_number, title, sweep_date, uow_type)
+        return self._upsert_typed(issue_number, title, sweep_date, uow_type, success_criteria)
 
     def _upsert_typed(
         self,
@@ -341,6 +342,7 @@ class Registry:
         title: str,
         sweep_date: str | None = None,
         uow_type: str = "executable",
+        success_criteria: str = "",
     ) -> UpsertResult:
         """Core upsert logic returning typed UpsertResult."""
         if sweep_date is None:
@@ -413,8 +415,8 @@ class Registry:
                 INSERT INTO uow_registry (
                     id, type, source, source_issue_number, sweep_date,
                     status, posture, created_at, updated_at, summary,
-                    route_reason, route_evidence, trigger
-                ) VALUES (?, ?, ?, ?, ?, 'proposed', 'solo', ?, ?, ?, ?, '{}', '{"type": "immediate"}')
+                    success_criteria, route_reason, route_evidence, trigger
+                ) VALUES (?, ?, ?, ?, ?, 'proposed', 'solo', ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}')
                 """,
                 (
                     uow_id,
@@ -425,6 +427,7 @@ class Registry:
                     now,
                     now,
                     title,
+                    success_criteria,
                     _LEGACY_ROUTE_REASON,
                 ),
             )
