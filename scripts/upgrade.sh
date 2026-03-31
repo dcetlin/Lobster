@@ -2397,6 +2397,50 @@ if [ "${has_block_claude_p:-0}" = "0" ] || [ "${has_block_claude_p:-0}" = "" ]; 
         fi
     fi
 
+
+    # Migration 47: Seed ifttt-rules.yaml in lobster-user-config/memory/canonical/
+    # Introduces the IFTTT-style behavioral rules store (issue #853). The file is
+    # machine-readable YAML, bounded to 100 rules, and managed autonomously by Lobster.
+    # Existing installs that predate this change need the file seeded so the dispatcher
+    # can load rules at startup without errors. The file starts empty (rules: []) so
+    # no behavioral change occurs on upgrade — rules accumulate over time.
+    local ifttt_src="$LOBSTER_DIR/memory/canonical-templates/ifttt-rules.yaml"
+    local ifttt_dst="$USER_CONFIG_DIR/memory/canonical/ifttt-rules.yaml"
+    if [ -f "$ifttt_src" ] && [ ! -f "$ifttt_dst" ]; then
+        cp "$ifttt_src" "$ifttt_dst"
+        substep "Seeded ifttt-rules.yaml into $USER_CONFIG_DIR/memory/canonical/"
+        migrated=$((migrated + 1))
+    fi
+
+    # Migration 48: Add idempotency column to agent_sessions.
+    # The idempotency column enables safe orphan recovery after restarts (#866).
+    # Sessions classified as 'safe' can be re-run automatically; 'unsafe'/'unknown'
+    # sessions surface a user notification instead. The column is also used by the
+    # session_start and register_agent MCP tools so the dispatcher can classify
+    # tasks at spawn time. Migration is a no-op on fresh installs (column already
+    # in CREATE TABLE DDL). On existing installs it adds the column with DEFAULT 'unknown'.
+    # The Python session_store migration list also handles this idempotently — this
+    # upgrade.sh entry is the documentation anchor and ensures crontab/service
+    # restarts don't miss the schema change on minimal installs without uv.
+    if command -v uv &>/dev/null; then
+        uv run python -c "
+import sqlite3, os
+db_path = os.path.expanduser('~/messages/config/agent_sessions.db')
+if os.path.exists(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(\"ALTER TABLE agent_sessions ADD COLUMN idempotency TEXT DEFAULT 'unknown'\")
+        conn.commit()
+        print('idempotency column added')
+    except sqlite3.OperationalError:
+        print('idempotency column already exists')
+    finally:
+        conn.close()
+else:
+    print('agent_sessions.db not found — will be created on next server start')
+" 2>/dev/null && substep "agent_sessions.idempotency column present (fresh or migrated)" && migrated=$((migrated + 1)) || true
+    fi
+
     # Migration 52: Add LOBSTER-GHOST-DETECTOR cron entry.
     # agent-monitor.py runs every 5 minutes and calls --alert --mark-failed directly,
     # sending Telegram alerts when ghost agents are found. No LLM subagent is needed.
@@ -2747,6 +2791,22 @@ conn.close()
             migrated=$((migrated + 1))
         fi
     fi
+
+    # Migration 55: Add inbox-staleness-warn.sh cron entry
+    # Injects a scheduled_reminder into the inbox when the oldest unprocessed
+    # user message has been waiting for 3+ minutes. Gives the dispatcher an
+    # in-band nudge to call wait_for_messages or delegate, complementing the
+    # health-check restart path (which only fires at 8+ minutes). Dedup prevents
+    # multiple warnings per staleness event.
+    local STALENESS_WARN_MARKER="# LOBSTER-INBOX-STALENESS-WARN"
+    if ! crontab -l 2>/dev/null | grep -q "$STALENESS_WARN_MARKER"; then
+        chmod +x "$LOBSTER_DIR/scripts/inbox-staleness-warn.sh" 2>/dev/null || true
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$STALENESS_WARN_MARKER" \
+            "*/1 * * * * $LOBSTER_DIR/scripts/inbox-staleness-warn.sh $STALENESS_WARN_MARKER"
+        substep "Added inbox-staleness-warn.sh cron entry (runs every minute, warns at 3-minute staleness)"
+        migrated=$((migrated + 1))
+    fi
+
 
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
