@@ -446,14 +446,17 @@ class TestOptimisticLock:
         uow_id = "uow_lock_003"
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
+        def _noop_dispatcher(instructions: str, uid: str) -> str:
+            return "task-noop"
+
         # First executor claims successfully
-        executor1 = Executor(registry)
+        executor1 = Executor(registry, dispatcher=_noop_dispatcher)
         executor1.execute_uow(uow_id)  # transitions to ready-for-steward after success
 
         # Now status is 'ready-for-steward', not 'ready-for-executor'.
         # With the view filter active, 'ready-for-steward' UoWs are invisible →
         # Step 1 returns None → ClaimNotFound → ValueError (not RuntimeError).
-        executor2 = Executor(registry)
+        executor2 = Executor(registry, dispatcher=_noop_dispatcher)
         with pytest.raises(ValueError, match="not found in registry"):
             executor2.execute_uow(uow_id)
 
@@ -486,8 +489,11 @@ class TestOptimisticLock:
                 results.append(type(exc).__name__)
                 errors.append(exc)
 
-        executor_a = Executor(registry)
-        executor_b = Executor(registry)
+        def _noop_dispatcher(instructions: str, uid: str) -> str:
+            return "task-noop"
+
+        executor_a = Executor(registry, dispatcher=_noop_dispatcher)
+        executor_b = Executor(registry, dispatcher=_noop_dispatcher)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             fut_a = pool.submit(try_run, executor_a)
