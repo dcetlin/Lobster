@@ -20,9 +20,10 @@ Dispatch protocol:
   transitioned to 'failed' with return_reason='ttl_exceeded'. Call
   recover_ttl_exceeded_uows(registry) at heartbeat startup before the dispatch
   cycle so the Steward can re-diagnose stalled UoWs on its next pass.
-- Fallback: _dispatch_via_inbox is retained for environments without a live
-  functional-engineer (development, CI). Pass dispatcher=_dispatch_via_inbox to
-  Executor(...) to restore the ghost-message behaviour.
+- Default: Executor(...) defaults to _dispatch_via_inbox for backward
+  compatibility (tests, CI, development). The heartbeat explicitly passes
+  _dispatch_via_claude_p to enable real agent dispatch. Both are public and
+  injectable — callers choose the dispatch strategy.
 
 Imports:
     from orchestration.executor import Executor, ExecutorOutcome, ExecutorResult
@@ -37,7 +38,6 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import sqlite3
 import subprocess
 import uuid
@@ -226,14 +226,14 @@ class Executor:
             skill_activator: Callable that activates a skill by ID. Defaults to
                 _noop_skill_activator. Injectable for tests.
             dispatcher: Callable that dispatches the LLM subagent task. Defaults
-                to _dispatch_via_claude_p (spawns a functional-engineer subagent
-                via `claude -p` subprocess). Pass _dispatch_via_inbox to restore
-                ghost-message behaviour for environments without a live
-                functional-engineer. Injectable for tests.
+                to _dispatch_via_inbox (writes a wos_execute ghost message) for
+                backward compatibility. In production, executor-heartbeat.py passes
+                _dispatch_via_claude_p to spawn a real functional-engineer subagent
+                via `claude -p`. Injectable for tests.
         """
         self.registry = registry
         self._skill_activator = skill_activator or _noop_skill_activator
-        self._dispatcher = dispatcher or _dispatch_via_claude_p
+        self._dispatcher = dispatcher or _dispatch_via_inbox
 
     # -----------------------------------------------------------------------
     # Public API
