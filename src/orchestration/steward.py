@@ -1,5 +1,5 @@
 """
-Steward — WOS Phase 2 core diagnosis and prescription engine.
+Steward — WOS core diagnosis and prescription engine.
 
 The Steward runs every 3 minutes (via steward-heartbeat.py). On each
 invocation it processes all `ready-for-steward` UoWs through the
@@ -11,7 +11,7 @@ Design constraints enforced here:
 - Optimistic lock: `UPDATE ... WHERE status = 'ready-for-steward'` checks
   rows affected. If 0, another Steward instance claimed it — skip silently.
 - BOOTUP_CANDIDATE_GATE: when True, UoWs whose GitHub issue carries the
-  `bootup-candidate` label are skipped. Default is True until the Phase 2
+  `bootup-candidate` label are skipped. Default is True until the WOS
   validation sequence passes.
 - Dry-run mode: diagnose without writing artifacts or transitioning state.
 - All DB writes through Registry methods or direct connection (steward-private
@@ -118,7 +118,7 @@ def is_bootup_candidate_gate_active() -> bool:
     """Return True if BOOTUP_CANDIDATE_GATE is active (blocking bootup-candidates).
 
     Returns False when the wos-gate-cleared file flag exists, indicating the
-    Phase 2 validation sequence has passed and all UoWs should be processed.
+    WOS validation sequence has passed and all UoWs should be processed.
 
     This function reads from disk on every call so that the gate state is always
     current — cron processes get a fresh read on every invocation.
@@ -150,8 +150,8 @@ _EARLY_WARNING_CYCLES = 4
 # Crash surface threshold: surface if crashed_no_output and cycles >= this value
 _CRASH_SURFACE_CYCLES = 2
 
-# Phase 2 fields required by the Steward
-_PHASE2_REQUIRED_FIELDS = frozenset({
+# Fields required by the Steward for operation
+_STEWARD_REQUIRED_FIELDS = frozenset({
     "workflow_artifact",
     "success_criteria",
     "prescribed_skills",
@@ -460,7 +460,7 @@ def _assess_completion(
             f"cannot verify success_criteria without Executor confirmation: {success_criteria[:80]}"
         ), None
     else:
-        # Phase 1 / legacy fallback: no success_criteria and no result file.
+        # Legacy fallback: no success_criteria and no result file.
         # Trust the output_ref + execution_complete posture.
         return True, f"success_criteria is NULL — output_ref present with execution_complete posture: {uow.summary[:80]}", None
 
@@ -859,29 +859,33 @@ def _build_prescription_instructions(
 # Schema validation
 # ---------------------------------------------------------------------------
 
-def validate_phase2_schema(conn: sqlite3.Connection) -> None:
+def validate_steward_schema(conn: sqlite3.Connection) -> None:
     """
-    Validate that all Phase 2 fields are present in uow_registry.
+    Validate that all fields required for Steward operation are present in uow_registry.
 
-    Raises RuntimeError with a specific message if any Phase 2 field is absent.
+    Raises RuntimeError with a specific message if any required field is absent.
     Call this at Steward startup before processing any UoW.
 
     Args:
         conn: An open SQLite connection to the registry database.
 
     Raises:
-        RuntimeError: If any Phase 2 field is missing. Message includes
+        RuntimeError: If any required field is missing. Message includes
             "schema migration not applied" and the list of missing fields.
     """
     rows = conn.execute("PRAGMA table_info(uow_registry)").fetchall()
     existing_cols = {row[1] for row in rows}
-    missing = _PHASE2_REQUIRED_FIELDS - existing_cols
+    missing = _STEWARD_REQUIRED_FIELDS - existing_cols
     if missing:
         missing_sorted = sorted(missing)
         raise RuntimeError(
             f"schema migration not applied — run scripts/migrate_add_steward_fields.py first. "
             f"Missing fields: {missing_sorted}"
         )
+
+
+# Keep the old name as an alias so any existing callers continue to work.
+validate_phase2_schema = validate_steward_schema
 
 
 # ---------------------------------------------------------------------------
@@ -1728,7 +1732,7 @@ def run_steward_cycle(
     # Step 0: Schema validation
     conn = registry._connect()
     try:
-        validate_phase2_schema(conn)
+        validate_steward_schema(conn)
     finally:
         conn.close()
 

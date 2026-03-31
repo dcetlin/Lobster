@@ -17,8 +17,8 @@ Two scenarios:
    - Assert UoW transitions to 'ready-for-steward' with audit entry
      classification='executor_orphan'.
 
-Both tests use an in-memory SQLite DB (via tmp_path) with Phase 2 schema
-applied. No network calls, no subprocess spawning.
+Both tests use a SQLite DB (via tmp_path) with all real migrations applied.
+No network calls, no subprocess spawning.
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ _SRC = _REPO_ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from orchestration.migrate import run_migrations
 from orchestration.registry import Registry, UpsertInserted, ApproveConfirmed
 from orchestration.executor import (
     TTL_EXCEEDED_HOURS,
@@ -57,36 +58,6 @@ sys.modules["startup_sweep"] = _startup_sweep_mod
 _spec.loader.exec_module(_startup_sweep_mod)  # type: ignore[union-attr]
 
 from startup_sweep import run_startup_sweep, StartupSweepResult  # noqa: E402
-
-
-# ---------------------------------------------------------------------------
-# Phase 2 schema helpers (mirrors test_wos_pipeline.py)
-# ---------------------------------------------------------------------------
-
-_PHASE2_COLUMNS: list[tuple[str, str]] = [
-    ("workflow_artifact",  "TEXT NULL"),
-    ("success_criteria",   "TEXT NULL"),
-    ("prescribed_skills",  "TEXT NULL"),
-    ("steward_cycles",     "INTEGER NOT NULL DEFAULT 0"),
-    ("timeout_at",         "TEXT NULL"),
-    ("estimated_runtime",  "INTEGER NULL"),
-    ("steward_agenda",     "TEXT NULL"),
-    ("steward_log",        "TEXT NULL"),
-]
-
-
-def _apply_phase2_migration(conn: sqlite3.Connection) -> None:
-    """Apply Phase 2 schema columns idempotently."""
-    existing = {
-        row[1]
-        for row in conn.execute("PRAGMA table_info(uow_registry)").fetchall()
-    }
-    for col_name, col_def in _PHASE2_COLUMNS:
-        if col_name not in existing:
-            conn.execute(
-                f"ALTER TABLE uow_registry ADD COLUMN {col_name} {col_def}"
-            )
-    conn.commit()
 
 
 def _now_iso() -> str:
@@ -111,15 +82,9 @@ def db_path(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def registry(db_path: Path) -> Registry:
-    """Phase 2-migrated Registry on a fresh DB."""
-    reg = Registry(db_path)
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    try:
-        _apply_phase2_migration(conn)
-    finally:
-        conn.close()
-    return reg
+    """Fully-migrated Registry on a fresh DB."""
+    run_migrations(db_path)
+    return Registry(db_path)
 
 
 @pytest.fixture

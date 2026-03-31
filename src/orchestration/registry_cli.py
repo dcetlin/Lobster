@@ -140,7 +140,7 @@ def cmd_gate_readiness(registry: Registry, args: argparse.Namespace) -> None:
     gs = registry.registry_health()
     _output({
         "gate_met": gs.gate_met,
-        "phase": "phase_1_complete_phase_2_active",
+        "phase": "wos_active",
         "days_running": gs.days_running,
         "proposed_to_confirmed_ratio_7d": gs.approval_rate,
         "reason": gs.reason,
@@ -224,7 +224,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("expire-proposals", help="Expire proposed records older than 14 days")
 
     # gate-readiness
-    subparsers.add_parser("gate-readiness", help="Check Phase 1 → Phase 2 autonomy gate metric")
+    subparsers.add_parser("gate-readiness", help="Check WOS autonomy gate metric")
 
     # decide-retry
     p_decide_retry = subparsers.add_parser(

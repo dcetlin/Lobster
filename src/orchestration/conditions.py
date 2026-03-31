@@ -1,5 +1,5 @@
 """
-UoW trigger condition evaluator — Phase 2 polling implementation.
+UoW trigger condition evaluator.
 
 evaluate_condition(uow) is called by the Registrar sweep for each `pending`
 UoW to determine whether the UoW's trigger condition has been met.
