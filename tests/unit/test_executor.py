@@ -287,10 +287,10 @@ class TestFailedExecution:
         output_ref = _get_output_ref(db_path, uow_id)
         result_data = _read_result_json(output_ref)
 
-        assert result_data["uow_id"] == uow_id
         assert result_data["outcome"] == "failed"
         assert result_data["success"] is False
-        assert "reason" in result_data
+        assert result_data["status"] == "failed"
+        assert "summary" in result_data
 
     def test_exception_writes_result_json_before_reraise(self, registry: Registry, db_path: Path) -> None:
         """Exception during execution must still write result.json (no orphaned UoW)."""
