@@ -173,13 +173,13 @@ The `artifacts` field is accepted by the inbox server and surfaced in the `subag
 
 **Never put large content in `text` directly.** The dispatcher's context window pays the cost of relaying whatever is in `text`. A 1,000-line report in `text` stalls the main loop and may trigger a health-check restart. Artifacts are read lazily, after the message is picked up, and do not bloat the inbox message itself.
 
-## Signal Footer (Required for Replies with Side Effects)
+## Signal Footer (Required on All Replies Referencing Completed Work)
 
 **Canonical label: `side-effects:`** — this is the only accepted label. Do not use `signals:`, `effects:`, or any other variant.
 
-Every `send_reply` that references completed work (created, merged, built, deployed, wrote, fixed, implemented, etc.) **must end with a `side-effects:` code block** listing the relevant emoji signals. The hook `hooks/signal-footer-check.py` enforces this and will block the call if it is missing.
+Every `send_reply` that references completed work (created, merged, built, deployed, wrote, fixed, implemented, etc.) **must include a signal footer**. The hook `hooks/signal-footer-check.py` enforces this and will block the call if it is missing. Do NOT omit the footer entirely — use the explicit null form when there are no side effects.
 
-Correct format:
+**When you have side effects:** end the message with a `side-effects:` code block listing the relevant emoji signals.
 
 ````
 Your reply text here.
@@ -188,6 +188,14 @@ Your reply text here.
 ✅ 🐙 📝
 ```
 ````
+
+**When you have NO side effects:** write `side-effects: none` on its own line (not a code block).
+
+```
+Your reply text here.
+
+side-effects: none
+```
 
 Signal legend (10-signal set):
 - `🤖` spawned — subagent or background task launched
@@ -201,7 +209,7 @@ Signal legend (10-signal set):
 - `🔧` config — configuration changed
 - `💬` decide — decision made or surfaced
 
-**The label `side-effects:` is authoritative.** The hook validates on code block presence, but the label must be `side-effects:` exactly — any other label is wrong and will cause drift across compaction.
+**The label `side-effects:` is authoritative.** The hook validates on code block presence or the explicit null line, but the label must be `side-effects:` exactly — any other label is wrong and will cause drift across compaction.
 
 ## Surfacing Observations (`write_observation`)
 

@@ -117,10 +117,11 @@ mark_processed(message_id)
 ```
 **Emoji side-effect legend (v4):** see `~/lobster-workspace/design/dispatcher-emoji-legend.md`. Append a `side-effects:` code block at the END of each message (not inline) when there are meaningful side effects. Use the 10-signal set: `🤖 spawned`, `✅ done`, `🐙 PR`, `🔀 merged`, `🗑️ closed`, `⚠️ blocked`, `📝 wrote`, `🔍 read`, `🔧 config`, `💬 decide`.
 
-**COMPACTION-STABLE CANONICAL:** Every subagent reply that has side effects MUST end with a signal footer code block using label `side-effects:` — not `signals:`, not `effects:`, not any other label. The canonical label is `side-effects:` and this must be injected verbatim into every subagent prompt that involves user-facing work with side effects. Example:
-```side-effects:
-✅ 🐙
-```
+**COMPACTION-STABLE CANONICAL:** Every subagent reply that references completed work MUST include a signal footer using label `side-effects:` — not `signals:`, not `effects:`, not any other label. Two valid forms:
+- **With side effects:** end with a `side-effects:` code block — e.g. ` ```side-effects:\n✅ 🐙\n``` `
+- **No side effects:** write `side-effects: none` on its own line (not a code block)
+
+Do NOT omit the footer entirely. Silent omission is wrong; `side-effects: none` is the canonical explicit null.
 
 If you find yourself reaching for `Read`, `Bash`, `mcp__github__*`, `WebFetch`, or any tool not in the core loop list, stop. Write "On it.", spawn a subagent, and return to the loop.
 

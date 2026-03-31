@@ -40,6 +40,10 @@ ACTION_RES = [re.compile(p, re.IGNORECASE) for p in ACTION_KEYWORDS]
 # This enforces the canonical format from sys.subagent.bootup.md.
 SIDE_EFFECTS_BLOCK_RE = re.compile(r"```side-effects:[^`]*```", re.DOTALL)
 
+# Match the explicit null case: a bare "side-effects: none" line (not a code block).
+# This is the canonical way to declare that a message has no side effects.
+SIDE_EFFECTS_NONE_RE = re.compile(r"^side-effects:\s*none\s*$", re.MULTILINE | re.IGNORECASE)
+
 
 def has_action_keywords(text: str) -> bool:
     return any(r.search(text) for r in ACTION_RES)
@@ -47,12 +51,18 @@ def has_action_keywords(text: str) -> bool:
 
 def has_signal_footer(text: str) -> bool:
     """
-    Returns True if the message contains a ```side-effects: ... ``` code block.
+    Returns True if the message contains either:
+    1. A ```side-effects: ... ``` code block (for messages with side effects)
+    2. A bare "side-effects: none" line (explicit null — for messages with no side effects)
+
     The label must be exactly "side-effects:" — no other label is accepted.
     This matches the canonical format enforced by sys.subagent.bootup.md and
     sys.dispatcher.bootup.md.
     """
     if SIDE_EFFECTS_BLOCK_RE.search(text):
+        return True
+
+    if SIDE_EFFECTS_NONE_RE.search(text):
         return True
 
     return False
@@ -79,8 +89,9 @@ def main():
     if has_action_keywords(text) and not has_signal_footer(text):
         print(
             "BLOCKED: Message references completed work but has no signal footer. "
-            "Add a ```side-effects: ... ``` code block at the end. "
-            "Example: ```side-effects:\n✅ 🐙\n``` — label must be exactly 'side-effects:' (not 'signals:' or anything else).",
+            "Either add a ```side-effects: ... ``` code block listing emoji signals, "
+            "or write 'side-effects: none' on its own line if there are truly no side effects. "
+            "Label must be exactly 'side-effects:' (not 'signals:' or anything else).",
             file=sys.stderr,
         )
         sys.exit(2)
