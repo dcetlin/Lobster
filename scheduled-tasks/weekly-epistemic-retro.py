@@ -81,15 +81,15 @@ def call_mcp(mcp_call_description: str) -> str:
             ],
             capture_output=True,
             text=True,
+            check=True,
             timeout=120,
         )
-        if result.returncode != 0:
-            print(f"WARNING: claude -p exited with code {result.returncode}")
-            if result.stderr:
-                print(f"  stderr: {result.stderr[:200]}")
         return result.stdout.strip()
-    except (subprocess.TimeoutExpired, OSError, subprocess.SubprocessError) as exc:
-        print(f"ERROR: claude -p subprocess failed: {exc}")
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: claude -p failed (exit {e.returncode}): {e.stderr or e.stdout or 'no output'}")
+        return ""
+    except Exception as e:
+        print(f"ERROR: Unexpected error running claude -p subprocess: {e}")
         return ""
 
 
@@ -231,15 +231,15 @@ def generate_retro(
             ],
             capture_output=True,
             text=True,
+            check=True,
             timeout=300,
         )
-        if result.returncode != 0:
-            print(f"WARNING: retro generation exited with code {result.returncode}")
-            if result.stderr:
-                print(f"  stderr: {result.stderr[:200]}")
         return result.stdout.strip()
-    except (subprocess.TimeoutExpired, OSError, subprocess.SubprocessError) as exc:
-        print(f"ERROR: retro generation subprocess failed: {exc}")
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: retro generation failed (exit {e.returncode}): {e.stderr or e.stdout or 'no output'}")
+        return ""
+    except Exception as e:
+        print(f"ERROR: Unexpected error running retro generation subprocess: {e}")
         return ""
 
 
@@ -361,50 +361,59 @@ def run() -> int:
     Execute the weekly epistemic retro pipeline.
     Returns exit code: 0 for success, 1 for failure.
     """
-    paths = resolve_paths()
-    date = today_iso()
+    try:
+        paths = resolve_paths()
+        date = today_iso()
 
-    print(f"[{date}] Starting weekly epistemic retro")
+        print(f"[{date}] Starting weekly epistemic retro")
 
-    # Load reference documents
-    epistemic_md = load_file(paths["epistemic_md"])
-    bootup_md = load_file(paths["bootup_md"])
+        # Load reference documents
+        epistemic_md = load_file(paths["epistemic_md"])
+        bootup_md = load_file(paths["bootup_md"])
 
-    if not epistemic_md:
-        print("WARNING: user.epistemic.md not found — retro will proceed with empty principles")
-    if not bootup_md:
-        print("WARNING: user.base.bootup.md not found — retro will proceed with empty behavioral context")
+        if not epistemic_md:
+            print("WARNING: user.epistemic.md not found — retro will proceed with empty principles")
+        if not bootup_md:
+            print("WARNING: user.base.bootup.md not found — retro will proceed with empty behavioral context")
 
-    # Fetch conversation history
-    print("Fetching conversation history (past 7 days)...")
-    conversation_history = fetch_conversation_history()
-    if not conversation_history:
-        print("ERROR: Could not fetch conversation history")
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        write_task_output_record("Failed: could not fetch conversation history.", "failed", timestamp)
+        # Fetch conversation history
+        print("Fetching conversation history (past 7 days)...")
+        conversation_history = fetch_conversation_history()
+        if not conversation_history:
+            print("ERROR: Could not fetch conversation history")
+            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            write_task_output_record("Failed: could not fetch conversation history.", "error", timestamp)
+            return 1
+
+        # Generate retro artifact
+        print("Generating retro artifact...")
+        artifact = generate_retro(epistemic_md, bootup_md, conversation_history, date)
+        if not artifact:
+            print("ERROR: Retro generation returned empty output")
+            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            write_task_output_record("Failed: retro generation returned empty output.", "error", timestamp)
+            return 1
+
+        # Write artifact to disk
+        art_path = artifact_path(paths["retros_dir"])
+        write_artifact(paths["retros_dir"], art_path, artifact)
+        print(f"Artifact written to: {art_path}")
+
+        # Extract summary and deliver
+        summary = extract_telegram_summary(artifact, date)
+        print("Delivering Telegram summary...")
+        deliver_and_log(summary, str(art_path))
+
+        print(f"[{date}] Weekly epistemic retro complete")
+        return 0
+    except Exception as e:
+        print(f"ERROR: Unhandled exception in weekly epistemic retro: {e}")
+        try:
+            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            write_task_output_record(f"Unhandled error: {e}", "error", timestamp)
+        except Exception:
+            pass  # Last resort — don't mask the original error
         return 1
-
-    # Generate retro artifact
-    print("Generating retro artifact...")
-    artifact = generate_retro(epistemic_md, bootup_md, conversation_history, date)
-    if not artifact:
-        print("ERROR: Retro generation returned empty output")
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        write_task_output_record("Failed: retro generation returned empty output.", "failed", timestamp)
-        return 1
-
-    # Write artifact to disk
-    art_path = artifact_path(paths["retros_dir"])
-    write_artifact(paths["retros_dir"], art_path, artifact)
-    print(f"Artifact written to: {art_path}")
-
-    # Extract summary and deliver
-    summary = extract_telegram_summary(artifact, date)
-    print("Delivering Telegram summary...")
-    deliver_and_log(summary, str(art_path))
-
-    print(f"[{date}] Weekly epistemic retro complete")
-    return 0
 
 
 if __name__ == "__main__":
