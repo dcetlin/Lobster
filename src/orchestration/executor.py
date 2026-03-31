@@ -1,5 +1,5 @@
 """
-WOS Phase 2 Executor — picks up UoWs in 'ready-for-executor' state, performs
+WOS Executor — picks up UoWs in 'ready-for-executor' state, performs
 the 6-step atomic claim sequence, dispatches via LLM subagent, writes results,
 and returns the UoW to the Steward for evaluation.
 

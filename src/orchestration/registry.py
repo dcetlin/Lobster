@@ -152,7 +152,7 @@ class UoW:
     # trigger: deserialized from JSON. dict for structured triggers, str if malformed JSON,
     # None for NULL rows. evaluate_condition handles all three cases.
     trigger: dict | str | None = None
-    # Phase 2 fields (populated after schema migration)
+    # Steward/Executor fields (populated after schema migration)
     workflow_artifact: str | None = None
     prescribed_skills: list | None = None
     steward_cycles: int = 0
@@ -1270,13 +1270,13 @@ class Registry:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 schema validation
+# Steward/Executor schema validation
 # ---------------------------------------------------------------------------
 
-# The seven Phase 2 fields that must be present for Steward/Executor operation.
+# Fields required for Steward/Executor operation.
 # If any are absent, the Steward must exit with a clear error rather than
 # silently failing mid-execution.
-_PHASE2_REQUIRED_FIELDS = frozenset({
+_STEWARD_EXECUTOR_REQUIRED_FIELDS = frozenset({
     "workflow_artifact",
     "success_criteria",
     "prescribed_skills",
@@ -1288,30 +1288,34 @@ _PHASE2_REQUIRED_FIELDS = frozenset({
 })
 
 
-def validate_phase2_schema(conn: sqlite3.Connection) -> None:
+def validate_steward_executor_schema(conn: sqlite3.Connection) -> None:
     """
-    Validate that all Phase 2 fields are present in uow_registry.
+    Validate that all fields required for Steward/Executor operation are present
+    in uow_registry.
 
-    Raises RuntimeError with a specific message if any of the seven Phase 2
-    fields is absent from the table. Call this at Steward startup before
-    processing any UoW.
+    Raises RuntimeError with a specific message if any required field is absent
+    from the table. Call this at Steward startup before processing any UoW.
 
     Args:
         conn: An open SQLite connection to the registry database.
 
     Raises:
-        RuntimeError: If any Phase 2 field is missing. Message includes
+        RuntimeError: If any required field is missing. Message includes
             "schema migration not applied" and the list of missing fields.
     """
     rows = conn.execute("PRAGMA table_info(uow_registry)").fetchall()
     existing_cols = {row[1] for row in rows}
-    missing = _PHASE2_REQUIRED_FIELDS - existing_cols
+    missing = _STEWARD_EXECUTOR_REQUIRED_FIELDS - existing_cols
     if missing:
         missing_sorted = sorted(missing)
         raise RuntimeError(
             f"schema migration not applied — run scripts/migrate_add_steward_fields.py first. "
             f"Missing fields: {missing_sorted}"
         )
+
+
+# Keep the old name as an alias so any existing callers continue to work.
+validate_phase2_schema = validate_steward_executor_schema
 
 
 # ---------------------------------------------------------------------------

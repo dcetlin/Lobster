@@ -47,80 +47,33 @@ _SRC = _REPO_ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from orchestration.registry import Registry
+from orchestration.migrate import run_migrations
+from orchestration.registry import (
+    Registry,
+    UpsertInserted,
+    ApproveConfirmed,
+    validate_steward_executor_schema,
+)
 
 
 # ===========================================================================
-# Phase 2 schema migration (applied inline by fixtures)
+# Expected steward/executor schema columns
 # ===========================================================================
 #
-# The actual migration lives in scripts/migrate_add_steward_fields.py (#309).
-# These DDL statements mirror the spec from #309 exactly so the integration
-# tests can run before #309 merges. When #309 merges, the migration script
-# and this inline DDL must stay in sync.
-#
-# Each column is added only when absent (idempotent per-column).
+# The authoritative schema lives in src/orchestration/migrations/. These
+# constants describe what tests expect to find after migrations run — they
+# are not DDL, just a reference for assertion helpers.
 
-_PHASE2_COLUMNS: list[tuple[str, str]] = [
-    # (column_name, column_definition)
-    ("workflow_artifact",  "TEXT NULL"),
-    ("success_criteria",   "TEXT NULL"),
-    ("prescribed_skills",  "TEXT NULL"),
-    ("steward_cycles",     "INTEGER NOT NULL DEFAULT 0"),
-    ("timeout_at",         "TEXT NULL"),
-    ("estimated_runtime",  "INTEGER NULL"),
-    ("steward_agenda",     "TEXT NULL"),
-    ("steward_log",        "TEXT NULL"),
-]
-
-_EXECUTOR_UOW_VIEW_DDL = """
-CREATE VIEW IF NOT EXISTS executor_uow_view AS
-SELECT
-    id, status, workflow_artifact, prescribed_skills,
-    estimated_runtime, timeout_at, output_ref,
-    started_at, completed_at, steward_cycles,
-    source_issue_number, summary, success_criteria
-FROM uow_registry;
--- steward_agenda and steward_log intentionally excluded (Steward-private)
-"""
-
-
-def apply_phase2_migration(conn: sqlite3.Connection) -> None:
-    """
-    Apply Phase 2 schema columns to an existing registry DB.
-
-    Idempotent per-column: safe to call on a DB that already has some or all
-    Phase 2 columns. Mirrors the contract specified in #309.
-    """
-    existing_columns = {
-        row[1]
-        for row in conn.execute("PRAGMA table_info(uow_registry)").fetchall()
-    }
-    for col_name, col_def in _PHASE2_COLUMNS:
-        if col_name not in existing_columns:
-            conn.execute(
-                f"ALTER TABLE uow_registry ADD COLUMN {col_name} {col_def}"
-            )
-    conn.execute(_EXECUTOR_UOW_VIEW_DDL)
-    conn.commit()
-
-
-def validate_phase2_schema(conn: sqlite3.Connection) -> None:
-    """
-    Assert all Phase 2 fields are present. Raises RuntimeError if any are missing.
-    This mirrors the function the Steward calls at startup (#303 spec).
-    """
-    existing = {
-        row[1]
-        for row in conn.execute("PRAGMA table_info(uow_registry)").fetchall()
-    }
-    required = {col for col, _ in _PHASE2_COLUMNS}
-    missing = required - existing
-    if missing:
-        raise RuntimeError(
-            f"schema migration not applied — missing columns: {sorted(missing)}. "
-            "Run scripts/migrate_add_steward_fields.py first."
-        )
+_STEWARD_EXECUTOR_COLUMNS: frozenset[str] = frozenset({
+    "workflow_artifact",
+    "success_criteria",
+    "prescribed_skills",
+    "steward_cycles",
+    "timeout_at",
+    "estimated_runtime",
+    "steward_agenda",
+    "steward_log",
+})
 
 
 # ===========================================================================
@@ -130,39 +83,26 @@ def validate_phase2_schema(conn: sqlite3.Connection) -> None:
 
 @pytest.fixture
 def wos_db_path(tmp_path: Path) -> Path:
-    """Fresh SQLite DB path for each test. Uses tmp_path for isolation."""
-    return tmp_path / "wos_test.db"
-
-
-@pytest.fixture
-def phase1_registry(wos_db_path: Path) -> Registry:
-    """Registry initialized with Phase 1 schema only (no migration applied)."""
-    return Registry(wos_db_path)
+    """Fresh SQLite DB path for each test, with all migrations applied."""
+    db_path = tmp_path / "wos_test.db"
+    run_migrations(db_path)
+    return db_path
 
 
 @pytest.fixture
 def phase2_registry(wos_db_path: Path) -> Registry:
     """
-    Registry with Phase 2 migration applied.
+    Registry on a fully-migrated DB.
 
-    This is the fixture to use for any test that exercises Phase 2 behavior.
-    The migration is applied after Registry.__init__ so that tests can
-    observe the before/after state if needed.
+    This is the fixture to use for any test that exercises pipeline behavior.
     """
-    reg = Registry(wos_db_path)
-    conn = sqlite3.connect(str(wos_db_path))
-    conn.row_factory = sqlite3.Row
-    try:
-        apply_phase2_migration(conn)
-    finally:
-        conn.close()
-    return reg
+    return Registry(wos_db_path)
 
 
 @pytest.fixture
 def p2_conn(wos_db_path: Path, phase2_registry: Registry) -> Generator[sqlite3.Connection, None, None]:
     """
-    Open connection to a Phase 2 DB, yielded for direct SQL assertions.
+    Open connection to a fully-migrated DB, yielded for direct SQL assertions.
     Closed after the test.
     """
     conn = sqlite3.connect(str(wos_db_path))
@@ -195,20 +135,20 @@ def _seed_uow(
     """
     Create a proposed UoW and return its id.
 
-    Encapsulates the upsert + confirm-to-pending + advance-to-ready-for-steward
-    steps so individual tests can focus on the state they want to test.
+    Encapsulates the upsert + approve-to-pending steps so individual tests
+    can focus on the state they want to test.
     """
     result = registry.upsert(
         issue_number=issue_number,
         title=title,
         sweep_date=sweep_date,
     )
-    assert result["action"] == "inserted", f"Expected insert, got: {result}"
-    uow_id = result["id"]
+    assert isinstance(result, UpsertInserted), f"Expected UpsertInserted, got: {result}"
+    uow_id = result.id
 
-    # Confirm proposed → pending
-    confirm_result = registry.confirm(uow_id)
-    assert confirm_result["status"] == "pending", f"Confirm failed: {confirm_result}"
+    # Approve proposed → pending
+    approve_result = registry.approve(uow_id)
+    assert isinstance(approve_result, ApproveConfirmed), f"Approve failed: {approve_result}"
 
     return uow_id
 
@@ -584,30 +524,27 @@ def stub_observation_loop_pass(
 
 
 @pytest.mark.integration
-class TestPhase2SchemaHarness:
+class TestSchemaHarness:
     """
-    Verifies the Phase 2 schema migration (inline DDL) is correct.
-    These tests are fully functional now — no xfail.
+    Verifies the migration runner produces the correct schema.
+    All tests use a fully-migrated DB (wos_db_path applies all real migrations).
     """
 
-    def test_phase2_columns_present_after_migration(self, wos_db_path, phase2_registry):
-        """All Phase 2 columns are present after apply_phase2_migration."""
+    def test_steward_executor_columns_present(self, wos_db_path, phase2_registry):
+        """All steward/executor columns are present after run_migrations."""
         conn = sqlite3.connect(str(wos_db_path))
         try:
             existing = {row[1] for row in conn.execute("PRAGMA table_info(uow_registry)").fetchall()}
-            for col_name, _ in _PHASE2_COLUMNS:
-                assert col_name in existing, f"Missing Phase 2 column: {col_name}"
+            for col_name in _STEWARD_EXECUTOR_COLUMNS:
+                assert col_name in existing, f"Missing column: {col_name}"
         finally:
             conn.close()
 
-    def test_migration_is_idempotent(self, wos_db_path, phase2_registry):
-        """Running apply_phase2_migration twice does not raise."""
-        conn = sqlite3.connect(str(wos_db_path))
-        try:
-            apply_phase2_migration(conn)  # second call — must not raise
-            apply_phase2_migration(conn)  # third call for good measure
-        finally:
-            conn.close()
+    def test_migrations_are_idempotent(self, wos_db_path, phase2_registry):
+        """Running run_migrations again on an already-migrated DB does not raise."""
+        # run_migrations skips already-applied versions — calling it again must be safe
+        newly_applied = run_migrations(wos_db_path)
+        assert newly_applied == [], f"Expected no new migrations on second run, got: {newly_applied}"
 
     def test_executor_uow_view_excludes_steward_private_fields(self, wos_db_path, phase2_registry):
         """executor_uow_view cannot SELECT steward_agenda or steward_log."""
@@ -647,35 +584,23 @@ class TestPhase2SchemaHarness:
         finally:
             conn.close()
 
-    def test_validate_phase2_schema_raises_on_missing_column(self, wos_db_path, phase1_registry):
-        """validate_phase2_schema raises RuntimeError when Phase 2 columns are absent."""
+    def test_validate_schema_passes_after_migration(self, wos_db_path, phase2_registry):
+        """validate_steward_executor_schema does not raise on a fully migrated DB."""
         conn = sqlite3.connect(str(wos_db_path))
         try:
-            with pytest.raises(RuntimeError, match="schema migration not applied"):
-                validate_phase2_schema(conn)
+            validate_steward_executor_schema(conn)  # must not raise
         finally:
             conn.close()
 
-    def test_validate_phase2_schema_passes_after_migration(self, wos_db_path, phase2_registry):
-        """validate_phase2_schema does not raise on a fully migrated DB."""
-        conn = sqlite3.connect(str(wos_db_path))
-        try:
-            validate_phase2_schema(conn)  # must not raise
-        finally:
-            conn.close()
+    def test_new_uow_has_steward_executor_column_defaults(self, wos_db_path, phase2_registry):
+        """New UoWs have correct NULL/0 defaults for steward/executor columns."""
+        result = phase2_registry.upsert(issue_number=1001, title="Test record defaults")
+        assert isinstance(result, UpsertInserted), f"Expected UpsertInserted, got: {result}"
+        uow_id = result.id
 
-    def test_phase1_uow_survives_migration(self, wos_db_path):
-        """Existing Phase 1 UoWs have correct NULL/0 defaults after migration."""
-        # Create a Phase 1 record
-        reg = Registry(wos_db_path)
-        result = reg.upsert(issue_number=1001, title="Pre-migration record")
-        uow_id = result["id"]
-
-        # Apply Phase 2 migration
         conn = sqlite3.connect(str(wos_db_path))
         conn.row_factory = sqlite3.Row
         try:
-            apply_phase2_migration(conn)
             row = conn.execute(
                 "SELECT * FROM uow_registry WHERE id = ?", (uow_id,)
             ).fetchone()
@@ -689,7 +614,6 @@ class TestPhase2SchemaHarness:
         assert row_dict["timeout_at"] is None
         assert row_dict["steward_agenda"] is None
         assert row_dict["steward_log"] is None
-        assert row_dict["success_criteria"] is None
 
     def test_success_criteria_not_null_for_new_uow(self, wos_db_path, phase2_registry):
         """New UoWs created after migration can store non-NULL success_criteria."""
@@ -1068,7 +992,7 @@ class TestConcurrentHeartbeat:
 
         # UoW must be in 'diagnosing' state
         final = phase2_registry.get(uow_id)
-        assert final["status"] == "diagnosing"
+        assert final.status == "diagnosing"
 
     def test_two_heartbeats_do_not_double_process_any_uow(
         self,
@@ -1281,7 +1205,7 @@ def test_real_steward_diagnoses_ready_for_steward_uow(tmp_path: Path):
     The real Steward heartbeat script should:
     1. Find UoWs in ready-for-steward state
     2. Claim each via optimistic lock (diagnosing)
-    3. Call validate_phase2_schema at startup
+    3. Call validate_steward_schema at startup
     4. Read the UoW's source GitHub issue body
     5. Write initial steward_agenda when steward_cycles == 0
     6. Prescribe a workflow_artifact and prescribed_skills

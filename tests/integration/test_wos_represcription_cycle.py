@@ -51,6 +51,7 @@ _SRC = _REPO_ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from orchestration.migrate import run_migrations
 from orchestration.registry import Registry, UpsertInserted, ApproveConfirmed
 from orchestration.steward import (
     run_steward_cycle,
@@ -58,47 +59,6 @@ from orchestration.steward import (
     _EARLY_WARNING_CYCLES,
 )
 from orchestration.executor import Executor, ExecutorOutcome, _result_json_path
-
-
-# ---------------------------------------------------------------------------
-# Phase 2 schema migration helper (mirrors test_wos_pipeline.py pattern)
-# ---------------------------------------------------------------------------
-
-_PHASE2_COLUMNS: list[tuple[str, str]] = [
-    ("workflow_artifact",  "TEXT NULL"),
-    ("success_criteria",   "TEXT NULL"),
-    ("prescribed_skills",  "TEXT NULL"),
-    ("steward_cycles",     "INTEGER NOT NULL DEFAULT 0"),
-    ("timeout_at",         "TEXT NULL"),
-    ("estimated_runtime",  "INTEGER NULL"),
-    ("steward_agenda",     "TEXT NULL"),
-    ("steward_log",        "TEXT NULL"),
-]
-
-_EXECUTOR_UOW_VIEW_DDL = """
-CREATE VIEW IF NOT EXISTS executor_uow_view AS
-SELECT
-    id, status, workflow_artifact, prescribed_skills,
-    estimated_runtime, timeout_at, output_ref,
-    started_at, completed_at, steward_cycles,
-    source_issue_number, summary, success_criteria
-FROM uow_registry;
-"""
-
-
-def _apply_phase2_migration(conn: sqlite3.Connection) -> None:
-    """Apply Phase 2 schema columns — idempotent."""
-    existing_columns = {
-        row[1]
-        for row in conn.execute("PRAGMA table_info(uow_registry)").fetchall()
-    }
-    for col_name, col_def in _PHASE2_COLUMNS:
-        if col_name not in existing_columns:
-            conn.execute(
-                f"ALTER TABLE uow_registry ADD COLUMN {col_name} {col_def}"
-            )
-    conn.execute(_EXECUTOR_UOW_VIEW_DDL)
-    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -246,16 +206,10 @@ def _simulate_executor_fail(
 
 @pytest.fixture
 def registry(tmp_path: Path) -> Registry:
-    """Phase 2 Registry in a temp directory."""
+    """Fully-migrated Registry in a temp directory."""
     db_path = tmp_path / "wos_represcription_test.db"
-    reg = Registry(db_path)
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    try:
-        _apply_phase2_migration(conn)
-    finally:
-        conn.close()
-    return reg
+    run_migrations(db_path)
+    return Registry(db_path)
 
 
 @pytest.fixture

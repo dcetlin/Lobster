@@ -1662,9 +1662,29 @@ Status: `proposed → pending`"
   Reply with the returned string. No confirmation prompt needed — the command is
   intentional and the effect is visible on the next steward-heartbeat cycle (~3 min).
 
+- `/wos start` (or "wos start") — Enable WOS execution by setting `execution_enabled: true`
+  in `~/lobster-workspace/data/wos-config.json`. executor-heartbeat will begin dispatching
+  ready-for-executor UoWs on its next cycle (~90 seconds).
+  Handle directly (no subagent — fast config write). Call:
+  ```python
+  from src.orchestration.dispatcher_handlers import handle_wos_start
+  reply = handle_wos_start()
+  ```
+  Reply with the returned string.
+
+- `/wos stop` (or "wos stop") — Disable WOS execution by setting `execution_enabled: false`
+  in `~/lobster-workspace/data/wos-config.json`. executor-heartbeat will skip dispatch on
+  its next cycle. UoWs already active continue running; TTL recovery handles stalls.
+  Handle directly (no subagent — fast config write). Call:
+  ```python
+  from src.orchestration.dispatcher_handlers import handle_wos_stop
+  reply = handle_wos_stop()
+  ```
+  Reply with the returned string.
+
 **Note:** Decide actions (Retry / Close on stuck UoWs) are handled via inline button callbacks — see "Handling WOS Surface Messages" section above.
 
-`/wos status`, `/wos unblock`, and `/confirm` are handled directly in the dispatcher (no subagent — fast CLI calls).
+`/wos status`, `/wos unblock`, `/wos start`, `/wos stop`, and `/confirm` are handled directly in the dispatcher (no subagent — fast CLI calls).
 `/wos pdf` requires a subagent — dispatch it and reply "Generating WOS PDF..." immediately.
 
 
