@@ -18,7 +18,11 @@ transitioning the UoW to 'ready-for-steward' or 'failed'. The Steward picks
 up the result on its next heartbeat cycle.
 
 Cron schedule (every 3 minutes, offset by 90s from steward-heartbeat):
-    */3 * * * * sleep 90 && uv run ~/lobster/scheduled-tasks/executor-heartbeat.py
+    */3 * * * * sleep 90 && cd ~/lobster && uv run scheduled-tasks/executor-heartbeat.py >> ~/lobster-workspace/scheduled-jobs/logs/executor-heartbeat.log 2>&1
+
+Type B dispatch: cron calls this script directly (no inbox/ message, no dispatcher
+involvement). The jobs.json enabled gate is checked at the top of main() so that
+runtime enable/disable (wos start/stop) is respected without touching cron.
 
 Run standalone:
     uv run ~/lobster/scheduled-tasks/executor-heartbeat.py [--dry-run]
@@ -29,6 +33,7 @@ Design reference: docs/wos-v2-design.md § Executor, § Phase 2 build plan PR4 (
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -56,6 +61,31 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
 log = logging.getLogger("executor-heartbeat")
+
+
+# ---------------------------------------------------------------------------
+# jobs.json enabled gate — Type B dispatch path
+# ---------------------------------------------------------------------------
+
+def _is_job_enabled(job_name: str) -> bool:
+    """
+    Return True if the job is enabled in jobs.json, False if explicitly disabled.
+
+    Defaults to True when:
+    - jobs.json is absent
+    - the job entry is missing
+    - the file is unreadable or malformed
+
+    This mirrors the gate logic in dispatch-job.sh so Type B (cron → script)
+    jobs respect the same runtime enable/disable toggle as Type A jobs.
+    """
+    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+    jobs_file = workspace / "scheduled-jobs" / "jobs.json"
+    try:
+        data = json.loads(jobs_file.read_text())
+        return bool(data.get("jobs", {}).get(job_name, {}).get("enabled", True))
+    except Exception:
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +257,12 @@ def main() -> int:
         log.info("Executor heartbeat starting (DRY RUN)")
     else:
         log.info("Executor heartbeat starting")
+
+    # jobs.json enabled gate — respect runtime enable/disable toggled via
+    # the dispatcher 'wos start/stop' commands or direct jobs.json edits.
+    if not _is_job_enabled("executor-heartbeat"):
+        log.info("Executor heartbeat: skipped (disabled in jobs.json)")
+        return 0
 
     from src.orchestration.steward import is_bootup_candidate_gate_active
     log.info("BOOTUP_CANDIDATE_GATE = %s", is_bootup_candidate_gate_active())
