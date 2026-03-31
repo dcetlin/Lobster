@@ -553,7 +553,9 @@ def _llm_prescribe(
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        log.debug("_llm_prescribe: ANTHROPIC_API_KEY not set, skipping LLM call")
+        log.warning(
+            "LLM prescription unavailable: ANTHROPIC_API_KEY not set — using deterministic fallback"
+        )
         return None
 
     try:
@@ -1472,10 +1474,30 @@ def _process_uow(
         route_reason = f"steward: {reentry_posture} — {completion_rationale[:120]}"
 
     issue_body = issue_info.get("body", "") if issue_info else ""
+
+    # Wrap llm_prescriber to capture which path was taken (llm vs fallback).
+    # The sentinel records a non-None return, indicating the LLM path succeeded.
+    _llm_path_taken: list[bool] = [False]
+
+    def _capturing_prescriber(
+        uow_arg: UoW,
+        reentry_posture_arg: str,
+        completion_gap_arg: str,
+        issue_body_arg: str = "",
+    ) -> dict[str, Any] | None:
+        result = llm_prescriber(uow_arg, reentry_posture_arg, completion_gap_arg, issue_body_arg)  # type: ignore[misc]
+        if result is not None:
+            _llm_path_taken[0] = True
+        return result
+
+    effective_prescriber = _capturing_prescriber if llm_prescriber is not None else None
+
     instructions = _build_prescription_instructions(
         uow, reentry_posture, completion_gap_for_prescription, issue_body,
-        llm_prescriber=llm_prescriber,
+        llm_prescriber=effective_prescriber,
     )
+
+    prescription_path = "llm" if _llm_path_taken[0] else "fallback"
 
     # Update agenda: mark current pending node as prescribed
     updated_agenda = _mark_current_agenda_node_prescribed(agenda)
@@ -1486,6 +1508,7 @@ def _process_uow(
         "steward_cycles": cycles,
         "return_reason": return_reason,
         "completion_assessment": completion_rationale,
+        "prescription_path": prescription_path,
         "dod_revised": False,
         "agenda_revised": False,
         "next_posture_rationale": route_reason,
