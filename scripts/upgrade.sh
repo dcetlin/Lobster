@@ -2727,6 +2727,27 @@ conn.close()
         migrated=$((migrated + 1))
     fi
 
+    # Migration 57: Register signal-footer-check PreToolUse hook in settings.json
+    # Blocks send_reply calls that reference completed work (merged, created, built, etc.)
+    # but have no signal footer code block at the end of the message. Ensures the
+    # dispatcher always annotates side-effect signals so users can scan what happened.
+    if [ -f "$CLAUDE_SETTINGS" ]; then
+        if ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | contains("signal-footer-check"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
+            chmod +x "$LOBSTER_DIR/hooks/signal-footer-check.py" 2>/dev/null || true
+            TMP_SETTINGS=$(mktemp)
+            jq '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
+                "matcher": "mcp__lobster-inbox__send_reply",
+                "hooks": [{
+                    "type": "command",
+                    "command": "python3 '"$LOBSTER_DIR"'/hooks/signal-footer-check.py",
+                    "timeout": 5
+                }]
+            }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+            substep "Registered signal-footer-check PreToolUse hook in settings.json"
+            migrated=$((migrated + 1))
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
