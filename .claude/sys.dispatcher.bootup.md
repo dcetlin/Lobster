@@ -554,6 +554,8 @@ REMINDER_ROUTING = {
 
 ## Handling WOS Execute Messages (`type: "wos_execute"`)
 
+**Python handler:** `src/orchestration/dispatcher_handlers.py::handle_wos_execute(uow_id, instructions, output_ref)` — builds the Task prompt; dispatcher spawns the subagent using it.
+
 `wos_execute` messages are written by the Executor (`_dispatch_via_inbox`) when it needs to launch an LLM subagent to carry out a UoW's prescribed instructions. The Executor does not block — it writes the message and returns immediately. The dispatcher spawns the subagent.
 
 **Never call `send_reply` for these — this is a system-to-system handoff, not a user request.**
@@ -566,6 +568,7 @@ REMINDER_ROUTING = {
 3. instructions = msg["instructions"]
 4. result_path = f"~/lobster-workspace/orchestration/outputs/{uow_id}.result.json"
    # output_ref ({uow_id}.json) is pre-written by the Python Executor before dispatch — do not write it here
+   # Pass output_ref as the .result.json path (not .json) — this is where the Steward reads completion.
 5. task_id = f"wos-{uow_id}"
 6. Spawn lobster-generalist (run_in_background=True) with prompt:
    ---

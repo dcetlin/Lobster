@@ -11,6 +11,7 @@ The dispatcher calls these handlers when it recognizes:
   /wos unblock             → handle_wos_unblock()
   decide retry <uow-id>    → handle_decide_retry(uow_id, registry)
   decide close <uow-id>    → handle_decide_close(uow_id, registry)
+  type: "wos_execute"      → handle_wos_execute(uow_id, instructions, output_ref)
 """
 
 from __future__ import annotations
@@ -145,6 +146,78 @@ def handle_wos_status(status: str | None, *, registry: "Registry") -> str:
         lines.append(f"`{r.id}` | {summary} | source: {source} | created: {created}")
 
     return "\n".join(lines)
+
+
+def handle_wos_execute(uow_id: str, instructions: str, output_ref: str) -> str:
+    """
+    Build the Task prompt for a wos_execute inbox message.
+
+    Called by the dispatcher when it receives a message with type="wos_execute".
+    Returns the prompt string to pass to the background functional-engineer subagent
+    via the Task tool. The dispatcher is responsible for the actual Task spawn and
+    the mark_processing / mark_processed bookkeeping — this function is pure.
+
+    The dispatched subagent must write a result file at output_ref with the schema:
+        {
+            "uow_id": "<uow_id>",
+            "outcome": "complete" | "partial" | "failed" | "blocked",
+            "success": true | false,       # true iff outcome == "complete"
+            "reason": "<optional explanation>"   # required when success is false
+        }
+    Outcome semantics:
+        "complete"  — all prescribed steps finished without error
+        "partial"   — some steps completed; subagent stopped intentionally before finishing
+        "failed"    — execution could not proceed; reason explains what went wrong
+        "blocked"   — an external dependency prevents progress; reason names the blocker
+
+    Dispatch is fire-and-forget: the Executor does not block waiting for the subagent.
+    The Steward detects completion on its next heartbeat cycle by reading output_ref.
+    If the subagent fails to write the result file before timeout_at, the Observation
+    Loop detects the stall and surfaces it to the user.
+
+    Args:
+        uow_id:       The Unit of Work identifier (used as task_id and in the result file).
+        instructions: The prescribed instructions from the WorkflowArtifact — what the
+                      subagent must do to execute this UoW.
+        output_ref:   Absolute path where the subagent must write its result file.
+                      This must be the result file path (`{uow_id}.result.json`), NOT the
+                      artifact path (`{uow_id}.json`). The Executor computes it as:
+                      `_result_json_path(_output_ref_path(uow_id))` before dispatch.
+                      Conventionally: ~/lobster-workspace/orchestration/outputs/{uow_id}.result.json
+                      This is the path the Steward reads on its next heartbeat to detect completion.
+
+    Returns:
+        A prompt string for the functional-engineer subagent Task call.
+    """
+    return (
+        f"---\n"
+        f"task_id: wos-{uow_id}\n"
+        f"chat_id: 0\n"
+        f"source: system\n"
+        f"---\n\n"
+        f"You are executing a Work Order System (WOS) unit of work on behalf of the Steward.\n"
+        f"UoW ID: {uow_id}\n\n"
+        f"## Instructions\n\n"
+        f"{instructions}\n\n"
+        f"## Result contract (REQUIRED)\n\n"
+        f"After completing the instructions (or on any error that prevents completion),\n"
+        f"write the result file to: {output_ref}\n\n"
+        f"The file must be valid JSON matching one of these shapes:\n"
+        f'  {{"uow_id": "{uow_id}", "outcome": "complete", "success": true}}\n'
+        f'  {{"uow_id": "{uow_id}", "outcome": "failed", "success": false, "reason": "<why>"}}\n'
+        f'  {{"uow_id": "{uow_id}", "outcome": "partial", "success": false, "reason": "<what was done and what was not>"}}\n'
+        f'  {{"uow_id": "{uow_id}", "outcome": "blocked", "success": false, "reason": "<what is blocking and why>"}}\n\n'
+        f"Outcome values: \"complete\" | \"partial\" | \"failed\" | \"blocked\"\n"
+        f"\"success\" must be true if and only if outcome == \"complete\".\n\n"
+        f"Steps to write the file:\n"
+        f"  1. mkdir -p {'/'.join(output_ref.split('/')[:-1])}\n"
+        f"  2. Write JSON to {output_ref}.tmp, then rename to {output_ref}\n\n"
+        f"After writing the result file:\n"
+        f'  write_result(task_id="wos-{uow_id}", chat_id=0, source="system",\n'
+        f'               text="WOS UoW {uow_id}: outcome=<outcome>")\n\n'
+        f"Minimum viable output: {output_ref} with uow_id, outcome, and success fields.\n"
+        f"Boundary: do not modify executor.py, registry.py, or any WOS source files.\n"
+    )
 
 
 def handle_wos_unblock() -> str:
