@@ -67,3 +67,10 @@ Neither register colonizes the other. A design document that says "the Cultivato
 ---
 
 The names are the constitution. When in doubt, ask what the name demands.
+
+---
+
+## See Also
+
+- [wos-v2-design.md](wos-v2-design.md) — the full WOS v2 specification: actors, lifecycle, vocabulary, and open decisions
+- [wos-golden-pattern.md](wos-golden-pattern.md) — canonical Python patterns for WOS implementation code

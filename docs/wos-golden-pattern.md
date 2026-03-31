@@ -2,6 +2,8 @@
 
 Reference sketch for new WOS implementation code. When in doubt about how to model a piece of the Work Orchestration System in Python, this document is the baseline.
 
+**Related docs:** [wos-constitution.md](wos-constitution.md) — the founding metaphor and naming constraints that govern all WOS design decisions | [wos-v2-design.md](wos-v2-design.md) — the full WOS v2 specification
+
 ---
 
 ## The Pattern
