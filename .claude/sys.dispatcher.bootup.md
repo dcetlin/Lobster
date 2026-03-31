@@ -919,10 +919,18 @@ Status: `proposed → pending`"
 
   Valid status values: `proposed`, `pending`, `active`, `blocked`, `done`, `failed`, `expired`
 
+- `/wos pdf [status]` -- Generate a PDF snapshot of the WOS Registry and send it to Telegram.
+  This command requires a subagent (PDF generation + file send can take 5-15 seconds).
+  Dispatch to a subagent: run `uv run ~/lobster/src/wos_report.py [--status <status>] --chat-id <chat_id>`.
+  The script writes a PDF to /tmp/, then drops a JSON file in ~/messages/outbox/ with
+  `type: "document"` so lobster_bot picks it up and sends it as a Telegram document.
+  Reply immediately: "Generating WOS PDF..." then let the bot deliver the file.
+  If `[status]` is provided (e.g. `/wos pdf active`), pass `--status <status>` to the script.
+
 **Note:** Decide actions (Retry / Close on stuck UoWs) are handled via inline button callbacks — see "Handling WOS Surface Messages" section above.
 
-These commands are handled directly in the dispatcher (no subagent — they are fast CLI calls).
-Reply immediately after running the CLI command.
+`/wos status` and `/confirm` are handled directly in the dispatcher (no subagent — fast CLI calls).
+`/wos pdf` requires a subagent — dispatch it and reply "Generating WOS PDF..." immediately.
 
 
 ## Meta-Thread Context
