@@ -37,6 +37,8 @@ from orchestration.executor import (
     ExecutorResult,
     _result_json_path,
     _dispatch_via_inbox,
+    _dispatch_via_claude_p,
+    _noop_dispatcher,
 )
 
 
@@ -178,7 +180,7 @@ class TestSuccessfulExecution:
         uow_id = "uow_test_002"
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
-        executor = Executor(registry)
+        executor = Executor(registry, dispatcher=_noop_dispatcher)
         result = executor.execute_uow(uow_id)
 
         output_ref = _get_output_ref(db_path, uow_id)
@@ -192,7 +194,7 @@ class TestSuccessfulExecution:
         uow_id = "uow_test_003"
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
-        executor = Executor(registry)
+        executor = Executor(registry, dispatcher=_noop_dispatcher)
         executor.execute_uow(uow_id)
 
         assert _get_uow_status(db_path, uow_id) == "ready-for-steward"
@@ -202,7 +204,7 @@ class TestSuccessfulExecution:
         uow_id = "uow_test_004"
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
-        executor = Executor(registry)
+        executor = Executor(registry, dispatcher=_noop_dispatcher)
         executor.execute_uow(uow_id)
 
         status = _get_uow_status(db_path, uow_id)
@@ -213,7 +215,7 @@ class TestSuccessfulExecution:
         uow_id = "uow_test_005"
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
-        executor = Executor(registry)
+        executor = Executor(registry, dispatcher=_noop_dispatcher)
         executor.execute_uow(uow_id)
 
         events = _get_audit_events(db_path, uow_id)
@@ -224,7 +226,7 @@ class TestSuccessfulExecution:
         uow_id = "uow_test_006"
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
-        executor = Executor(registry)
+        executor = Executor(registry, dispatcher=_noop_dispatcher)
         executor.execute_uow(uow_id)
 
         output_ref = _get_output_ref(db_path, uow_id)
@@ -235,7 +237,7 @@ class TestSuccessfulExecution:
         uow_id = "uow_test_007"
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
-        executor = Executor(registry)
+        executor = Executor(registry, dispatcher=_noop_dispatcher)
         executor.execute_uow(uow_id)
 
         started_at = _get_uow_field(db_path, uow_id, "started_at")
@@ -246,7 +248,7 @@ class TestSuccessfulExecution:
         uow_id = "uow_test_008"
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id), estimated_runtime=600)
 
-        executor = Executor(registry)
+        executor = Executor(registry, dispatcher=_noop_dispatcher)
         executor.execute_uow(uow_id)
 
         timeout_at = _get_uow_field(db_path, uow_id, "timeout_at")
@@ -257,7 +259,7 @@ class TestSuccessfulExecution:
         uow_id = "uow_test_009"
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
-        executor = Executor(registry)
+        executor = Executor(registry, dispatcher=_noop_dispatcher)
         executor.execute_uow(uow_id)
 
         events = _get_audit_events(db_path, uow_id)
@@ -367,7 +369,7 @@ class TestBlockedExecution:
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
         # Claim the UoW first, then report blocked
-        executor = Executor(registry)
+        executor = Executor(registry, dispatcher=_noop_dispatcher)
         claim = executor._claim(uow_id)
 
         assert hasattr(claim, "output_ref"), "Claim should succeed"
@@ -390,7 +392,7 @@ class TestBlockedExecution:
         uow_id = "uow_blocked_002"
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
-        executor = Executor(registry)
+        executor = Executor(registry, dispatcher=_noop_dispatcher)
         claim = executor._claim(uow_id)
         output_ref = claim.output_ref  # type: ignore[union-attr]
         executor.report_blocked(uow_id, output_ref, reason="needs Dan's /decide")
@@ -410,7 +412,7 @@ class TestOptimisticLock:
         uow_id = "uow_lock_001"
         _insert_uow(db_path, uow_id, status="active", workflow_artifact=_make_artifact(uow_id))
 
-        executor = Executor(registry)
+        executor = Executor(registry, dispatcher=_noop_dispatcher)
         with pytest.raises(RuntimeError, match="optimistic lock failed"):
             executor.execute_uow(uow_id)
 
@@ -419,13 +421,13 @@ class TestOptimisticLock:
         uow_id = "uow_lock_002"
         _insert_uow(db_path, uow_id, status="pending", workflow_artifact=_make_artifact(uow_id))
 
-        executor = Executor(registry)
+        executor = Executor(registry, dispatcher=_noop_dispatcher)
         with pytest.raises(RuntimeError, match="optimistic lock failed"):
             executor.execute_uow(uow_id)
 
     def test_raises_value_error_for_unknown_uow(self, registry: Registry, db_path: Path) -> None:
         """Running an unknown UoW ID must raise ValueError."""
-        executor = Executor(registry)
+        executor = Executor(registry, dispatcher=_noop_dispatcher)
         with pytest.raises(ValueError, match="not found in registry"):
             executor.execute_uow("nonexistent-uow-id")
 
@@ -543,7 +545,7 @@ class TestSkillActivation:
         def tracking_activator(skill_id: str) -> None:
             activated_skills.append(skill_id)
 
-        executor = Executor(registry, skill_activator=tracking_activator)
+        executor = Executor(registry, skill_activator=tracking_activator, dispatcher=_noop_dispatcher)
         executor.execute_uow(uow_id)
 
         assert activated_skills == [], "activate_skill must not be called when prescribed_skills is None"
@@ -559,7 +561,7 @@ class TestSkillActivation:
         def tracking_activator(skill_id: str) -> None:
             activated_skills.append(skill_id)
 
-        executor = Executor(registry, skill_activator=tracking_activator)
+        executor = Executor(registry, skill_activator=tracking_activator, dispatcher=_noop_dispatcher)
         executor.execute_uow(uow_id)
 
         assert activated_skills == [], "activate_skill must not be called for empty prescribed_skills"
@@ -576,7 +578,7 @@ class TestSkillActivation:
         def tracking_activator(skill_id: str) -> None:
             activated_skills.append(skill_id)
 
-        executor = Executor(registry, skill_activator=tracking_activator)
+        executor = Executor(registry, skill_activator=tracking_activator, dispatcher=_noop_dispatcher)
         executor.execute_uow(uow_id)
 
         assert set(activated_skills) == set(skills)
@@ -605,7 +607,7 @@ class TestCrashRecoveryProperties:
         uow_id = "uow_crash_001"
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
-        executor = Executor(registry)
+        executor = Executor(registry, dispatcher=_noop_dispatcher)
         executor.execute_uow(uow_id)
 
         started_at = _get_uow_field(db_path, uow_id, "started_at")
@@ -619,7 +621,7 @@ class TestCrashRecoveryProperties:
         # NULL workflow_artifact — Executor cannot proceed
         _insert_uow(db_path, uow_id, workflow_artifact=None)
 
-        executor = Executor(registry)
+        executor = Executor(registry, dispatcher=_noop_dispatcher)
         with pytest.raises(RuntimeError, match="claim rejected"):
             executor.execute_uow(uow_id)
 
@@ -647,7 +649,7 @@ class TestCrashRecoveryProperties:
         monkeypatch.setattr(_executor_mod, "_OUTPUT_DIR_TEMPLATE", str(nonexistent_dir))
 
         try:
-            executor = Executor(registry)
+            executor = Executor(registry, dispatcher=_noop_dispatcher)
             result = executor.execute_uow(uow_id)
         finally:
             monkeypatch.setattr(_executor_mod, "_OUTPUT_DIR_TEMPLATE", original_template)
@@ -862,65 +864,43 @@ class TestDispatchViaInbox:
 
         assert deep_inbox.exists(), "inbox dir must be created even when deeply nested"
 
-    def test_executor_run_uses_dispatch_via_inbox_by_default(
-        self, registry: Registry, db_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    def test_executor_defaults_to_dispatch_via_inbox(
+        self, registry: Registry
     ) -> None:
         """
-        When no dispatcher is injected, Executor.run() must use _dispatch_via_inbox
-        (not the no-op stub). Verified by checking that a wos_execute file appears
-        in the inbox directory after a successful run.
+        When no dispatcher is injected, Executor._dispatcher must be
+        _dispatch_via_inbox (backward-compatible default). The heartbeat
+        explicitly passes _dispatch_via_claude_p for production use.
         """
-        import orchestration.executor as _executor_mod
-        inbox_dir = tmp_path / "inbox"
-        monkeypatch.setattr(_executor_mod, "_INBOX_DIR_TEMPLATE", str(inbox_dir))
-
-        uow_id = "uow_default_dispatch_001"
-        _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
-
-        # No dispatcher injected — should default to _dispatch_via_inbox
         executor = Executor(registry)
-        result = executor.execute_uow(uow_id)
-
-        assert result.outcome == ExecutorOutcome.COMPLETE
-
-        # Inbox must have exactly one wos_execute message
-        inbox_files = list(inbox_dir.glob("*.json"))
-        assert len(inbox_files) == 1, (
-            f"Expected exactly one inbox message, got {len(inbox_files)}"
+        assert executor._dispatcher is _dispatch_via_inbox, (
+            f"Default dispatcher must be _dispatch_via_inbox (backward compat), "
+            f"got {executor._dispatcher!r}"
         )
-        msg = json.loads(inbox_files[0].read_text(encoding="utf-8"))
-        assert msg["type"] == "wos_execute"
-        assert msg["uow_id"] == uow_id
 
-    def test_executor_id_in_result_is_message_id(
-        self, registry: Registry, db_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    def test_executor_id_in_result_is_dispatcher_return_value(
+        self, registry: Registry, db_path: Path
     ) -> None:
         """
-        The executor_id in ExecutorResult and result.json must match the
-        message_id written to the inbox (for audit trail correlation).
+        The executor_id in ExecutorResult and result.json must be the value
+        returned by the dispatcher (for audit trail correlation).
         """
-        import orchestration.executor as _executor_mod
-        inbox_dir = tmp_path / "inbox"
-        monkeypatch.setattr(_executor_mod, "_INBOX_DIR_TEMPLATE", str(inbox_dir))
+        expected_run_id = "uow_exec_id_correlation_001-20240101T000000Z"
+
+        def fake_dispatcher(instructions: str, uow_id: str) -> str:
+            return expected_run_id
 
         uow_id = "uow_exec_id_correlation_001"
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
 
-        executor = Executor(registry)
+        executor = Executor(registry, dispatcher=fake_dispatcher)
         result = executor.execute_uow(uow_id)
 
-        # Read the inbox message to get the message_id
-        inbox_files = list(inbox_dir.glob("*.json"))
-        assert len(inbox_files) == 1
-        msg = json.loads(inbox_files[0].read_text(encoding="utf-8"))
-        msg_id = msg["id"]
-
-        # executor_id in result must equal the inbox message_id
-        assert result.executor_id == msg_id, (
-            f"executor_id {result.executor_id!r} must match inbox message_id {msg_id!r}"
+        assert result.executor_id == expected_run_id, (
+            f"executor_id {result.executor_id!r} must equal the dispatcher return value"
         )
 
         # Also verify it's in the result.json file
         output_ref = _get_output_ref(db_path, uow_id)
         result_data = _read_result_json(output_ref)
-        assert result_data.get("executor_id") == msg_id
+        assert result_data.get("executor_id") == expected_run_id
