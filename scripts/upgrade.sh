@@ -2963,6 +2963,27 @@ conn.close()
         fi
     fi
 
+    # Migration 65: Remove ghost cron entries for issue-sweeper and github-issue-cultivator.
+    # These two entries exist in crontab but have no corresponding jobs.json entries and
+    # no runtime task files in ~/lobster-workspace/scheduled-jobs/tasks/. The
+    # dispatch-job.sh self-heal (which would disable the job) only activates when the job
+    # exists in jobs.json, so it never fires for these orphans. The entries accumulate log
+    # noise on every cron cycle. Fix: filter the specific lines by job name, preserving
+    # all other # LOBSTER-SCHEDULED entries unchanged.
+    local _ghost_cron_changed=false
+    if crontab -l 2>/dev/null | grep -q "dispatch-job.sh issue-sweeper"; then
+        (crontab -l 2>/dev/null | grep -v "dispatch-job.sh issue-sweeper" || true) | crontab -
+        substep "Removed ghost cron entry: issue-sweeper (no jobs.json entry, no task file)"
+        _ghost_cron_changed=true
+        migrated=$((migrated + 1))
+    fi
+    if crontab -l 2>/dev/null | grep -q "dispatch-job.sh github-issue-cultivator"; then
+        (crontab -l 2>/dev/null | grep -v "dispatch-job.sh github-issue-cultivator" || true) | crontab -
+        substep "Removed ghost cron entry: github-issue-cultivator (no jobs.json entry, no task file)"
+        _ghost_cron_changed=true
+        migrated=$((migrated + 1))
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
