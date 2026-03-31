@@ -180,8 +180,11 @@ def handle_wos_execute(uow_id: str, instructions: str, output_ref: str) -> str:
         instructions: The prescribed instructions from the WorkflowArtifact — what the
                       subagent must do to execute this UoW.
         output_ref:   Absolute path where the subagent must write its result file.
+                      This must be the result file path (`{uow_id}.result.json`), NOT the
+                      artifact path (`{uow_id}.json`). The Executor computes it as:
+                      `_result_json_path(_output_ref_path(uow_id))` before dispatch.
                       Conventionally: ~/lobster-workspace/orchestration/outputs/{uow_id}.result.json
-                      (derived from executor._result_json_path(output_ref)).
+                      This is the path the Steward reads on its next heartbeat to detect completion.
 
     Returns:
         A prompt string for the functional-engineer subagent Task call.

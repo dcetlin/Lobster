@@ -365,6 +365,7 @@ REMINDER_ROUTING = {
 3. instructions = msg["instructions"]
 4. result_path = f"~/lobster-workspace/orchestration/outputs/{uow_id}.result.json"
    # output_ref ({uow_id}.json) is pre-written by the Python Executor before dispatch — do not write it here
+   # Pass output_ref as the .result.json path (not .json) — this is where the Steward reads completion.
 5. task_id = f"wos-{uow_id}"
 6. Spawn lobster-generalist (run_in_background=True) with prompt:
    ---
