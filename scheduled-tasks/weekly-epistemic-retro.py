@@ -23,6 +23,7 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -71,17 +72,25 @@ def call_mcp(mcp_call_description: str) -> str:
     the result as plain text.  This lets the Python script remain pure — all
     Lobster I/O goes through Claude's tool layer.
     """
-    result = subprocess.run(
-        [
-            "claude", "-p", mcp_call_description,
-            "--dangerously-skip-permissions",
-            "--max-turns", "5",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    return result.stdout.strip()
+    try:
+        result = subprocess.run(
+            [
+                "claude", "-p", mcp_call_description,
+                "--dangerously-skip-permissions",
+                "--max-turns", "5",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            print(f"WARNING: claude -p exited with code {result.returncode}")
+            if result.stderr:
+                print(f"  stderr: {result.stderr[:200]}")
+        return result.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError, subprocess.SubprocessError) as exc:
+        print(f"ERROR: claude -p subprocess failed: {exc}")
+        return ""
 
 
 def fetch_conversation_history() -> str:
@@ -213,17 +222,25 @@ def generate_retro(
         conversation_history=conversation_history,
     )
 
-    result = subprocess.run(
-        [
-            "claude", "-p", prompt,
-            "--dangerously-skip-permissions",
-            "--max-turns", "3",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    return result.stdout.strip()
+    try:
+        result = subprocess.run(
+            [
+                "claude", "-p", prompt,
+                "--dangerously-skip-permissions",
+                "--max-turns", "3",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            print(f"WARNING: retro generation exited with code {result.returncode}")
+            if result.stderr:
+                print(f"  stderr: {result.stderr[:200]}")
+        return result.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError, subprocess.SubprocessError) as exc:
+        print(f"ERROR: retro generation subprocess failed: {exc}")
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -264,37 +281,74 @@ def write_artifact(retros_dir: Path, path: Path, content: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Deliver Telegram summary and write task output
+# Direct I/O helpers (no claude -p dependency)
 # ---------------------------------------------------------------------------
+
+JOB_NAME = "weekly-epistemic-retro"
+
+
+def _inbox_dir() -> Path:
+    messages_base = os.environ.get("LOBSTER_MESSAGES", str(Path.home() / "messages"))
+    inbox = Path(messages_base) / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    return inbox
+
+
+def _task_outputs_dir() -> Path:
+    messages_base = os.environ.get("LOBSTER_MESSAGES", str(Path.home() / "messages"))
+    task_outputs = Path(messages_base) / "task-outputs"
+    task_outputs.mkdir(parents=True, exist_ok=True)
+    return task_outputs
+
+
+def write_inbox_message(chat_id: int, text: str, timestamp: str) -> None:
+    inbox = _inbox_dir()
+    msg_id = f"{JOB_NAME}_{uuid.uuid4().hex}"
+    msg = {
+        "id": msg_id,
+        "type": "subagent_result",
+        "task_id": msg_id,
+        "chat_id": chat_id,
+        "source": "telegram",
+        "text": text,
+        "status": "success",
+        "sent_reply_to_user": False,
+        "timestamp": timestamp,
+    }
+    out_path = inbox / f"{msg_id}.json"
+    tmp_path = Path(str(out_path) + ".tmp")
+    tmp_path.write_text(json.dumps(msg, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(out_path)
+
+
+def write_task_output_record(output: str, status: str, timestamp: str) -> None:
+    task_outputs = _task_outputs_dir()
+    date_prefix = timestamp[:19].replace(":", "").replace("-", "").replace("T", "-")
+    filename = f"{date_prefix}-{JOB_NAME}.json"
+    record = {
+        "job_name": JOB_NAME,
+        "timestamp": timestamp,
+        "status": status,
+        "output": output,
+    }
+    out_path = task_outputs / filename
+    tmp_path = Path(str(out_path) + ".tmp")
+    tmp_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(out_path)
+
 
 def deliver_and_log(summary: str, artifact_path_str: str) -> None:
     """
-    Send the Telegram summary and write task output via a Claude subagent.
-    Kept as a single MCP call to avoid partial delivery.
+    Send the Telegram summary and write task output.
+    Both operations are direct filesystem writes — no subprocess dependency.
     """
     chat_id = int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586"))
-    prompt = f"""
-You are delivering a weekly epistemic retro summary. Make exactly these two calls:
-
-1. Call send_reply with:
-   - chat_id: {chat_id}
-   - source: "telegram"
-   - text: {json.dumps(summary)}
-
-2. Call write_task_output with:
-   - job_name: "weekly-epistemic-retro"
-   - output: "Retro completed. Artifact written to {artifact_path_str}. Summary delivered to Telegram."
-   - status: "success"
-
-Make both calls, then stop. No commentary.
-"""
-    subprocess.run(
-        [
-            "claude", "-p", prompt,
-            "--dangerously-skip-permissions",
-            "--max-turns", "5",
-        ],
-        timeout=120,
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    write_inbox_message(chat_id, summary, timestamp)
+    write_task_output_record(
+        f"Retro completed. Artifact written to {artifact_path_str}. Summary delivered to Telegram.",
+        "success",
+        timestamp,
     )
 
 
@@ -326,6 +380,8 @@ def run() -> int:
     conversation_history = fetch_conversation_history()
     if not conversation_history:
         print("ERROR: Could not fetch conversation history")
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        write_task_output_record("Failed: could not fetch conversation history.", "failed", timestamp)
         return 1
 
     # Generate retro artifact
@@ -333,6 +389,8 @@ def run() -> int:
     artifact = generate_retro(epistemic_md, bootup_md, conversation_history, date)
     if not artifact:
         print("ERROR: Retro generation returned empty output")
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        write_task_output_record("Failed: retro generation returned empty output.", "failed", timestamp)
         return 1
 
     # Write artifact to disk

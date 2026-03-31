@@ -28,8 +28,8 @@ Run standalone:
 import json
 import os
 import re
-import subprocess
 import sys
+import uuid
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -281,21 +281,67 @@ def write_artifact(sweeps_dir: Path, path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+JOB_NAME = "pattern-candidate-sweep"
+
+
+def _inbox_dir() -> Path:
+    messages_base = os.environ.get("LOBSTER_MESSAGES", str(Path.home() / "messages"))
+    inbox = Path(messages_base) / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    return inbox
+
+
+def _task_outputs_dir() -> Path:
+    messages_base = os.environ.get("LOBSTER_MESSAGES", str(Path.home() / "messages"))
+    task_outputs = Path(messages_base) / "task-outputs"
+    task_outputs.mkdir(parents=True, exist_ok=True)
+    return task_outputs
+
+
+def write_inbox_message(chat_id: int, text: str, timestamp: str) -> None:
+    inbox = _inbox_dir()
+    msg_id = f"{JOB_NAME}_{uuid.uuid4().hex}"
+    msg = {
+        "id": msg_id,
+        "type": "subagent_result",
+        "task_id": msg_id,
+        "chat_id": chat_id,
+        "source": "telegram",
+        "text": text,
+        "status": "success",
+        "sent_reply_to_user": False,
+        "timestamp": timestamp,
+    }
+    out_path = inbox / f"{msg_id}.json"
+    tmp_path = Path(str(out_path) + ".tmp")
+    tmp_path.write_text(json.dumps(msg, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(out_path)
+
+
+def write_task_output_record(output: str, status: str, timestamp: str) -> None:
+    task_outputs = _task_outputs_dir()
+    date_prefix = timestamp[:19].replace(":", "").replace("-", "").replace("T", "-")
+    filename = f"{date_prefix}-{JOB_NAME}.json"
+    record = {
+        "job_name": JOB_NAME,
+        "timestamp": timestamp,
+        "status": status,
+        "output": output,
+    }
+    out_path = task_outputs / filename
+    tmp_path = Path(str(out_path) + ".tmp")
+    tmp_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(out_path)
+
+
 def deliver_and_log(summary: str, artifact_path_str: str) -> None:
     chat_id = int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586"))
-    prompt = f"""Make exactly these two calls:
-
-1. send_reply with chat_id={chat_id}, source="telegram", text={json.dumps(summary)}
-
-2. write_task_output with job_name="pattern-candidate-sweep",
-   output="Sweep complete. Artifact: {artifact_path_str}. Summary sent to Telegram.",
-   status="success"
-
-Make both calls, then stop. No commentary.
-"""
-    subprocess.run(
-        ["claude", "-p", prompt, "--dangerously-skip-permissions", "--max-turns", "5"],
-        timeout=120,
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    write_inbox_message(chat_id, summary, timestamp)
+    write_task_output_record(
+        f"Sweep complete. Artifact: {artifact_path_str}. Summary sent to Telegram.",
+        "success",
+        timestamp,
     )
 
 
@@ -316,12 +362,11 @@ def run() -> int:
 
     if len(messages) < 3:
         print("  Insufficient data (<3 messages). Skipping.")
-        subprocess.run(
-            ["claude", "-p",
-             'Call write_task_output with job_name="pattern-candidate-sweep", '
-             f'output="Skipped: only {len(messages)} messages in window.", status="success". Stop.',
-             "--dangerously-skip-permissions", "--max-turns", "3"],
-            timeout=60,
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        write_task_output_record(
+            f"Skipped: only {len(messages)} messages in window.",
+            "success",
+            timestamp,
         )
         return 0
 
