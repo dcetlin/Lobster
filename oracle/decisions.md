@@ -52,3 +52,49 @@ reads the result file to determine whether the work succeeded.
 - BOOTUP_CANDIDATE_GATE interaction (tested in test_wos_pipeline.py)
 
 **Decision: all in-scope requirements from Tier 6 Item 14 are covered.**
+
+---
+
+## [2026-03-31] Steward Feedback Loop (WOS Tier 5 Item 12)
+
+### Stage 1: Is this solving the right problem?
+
+**Question: does the steward_log actually store prescription text in a retrievable way?**
+
+Finding: `steward_log` is a TEXT column in `uow_registry` (newline-delimited JSON entries).
+It does NOT store full prescription text. Prescription log entries (`event: "prescription"` /
+`event: "reentry_prescription"`) store metadata: `completion_assessment`, `next_posture_rationale`,
+`return_reason`, and `steward_cycles`. Full instructions are written to the workflow artifact
+file on disk.
+
+Decision: Use the prescription metadata from `steward_log` rather than reading artifact files.
+The metadata is sufficient to show the Steward what gap was identified (`completion_assessment`)
+and what routing rationale was used (`next_posture_rationale`) — exactly enough to avoid
+repeating the same approach. This also keeps the implementation self-contained within the
+existing text field with no new DB reads.
+
+**Question: Is N=3 the right limit?**
+
+Finding: Each prescription entry is a short JSON dict (under 200 chars). At N=3, the injected
+context adds roughly 300–600 characters to the instructions — well within prompt budget.
+N=3 balances recency (avoids padding with old cycles) with coverage (enough to detect a loop).
+APPROVED: N=3.
+
+### Stage 2: Is the implementation well-made?
+
+**Check: does it handle the case where steward_log has no entries gracefully?**
+
+Finding: `_fetch_prior_prescriptions` returns `[]` for `None`, empty string, and logs with
+no prescription events. The call site uses `prior_prescriptions = [] if cycles == 0` and
+conditionally calls `_fetch_prior_prescriptions` only when `cycles > 0`. Even when called
+with a log that has no prescription entries, it returns `[]`. The `_build_prescription_instructions`
+function only appends the prior context block when `prior_prescriptions` is truthy. No crash
+path exists for absent data. APPROVED.
+
+**Check: does it read posture only (not prior prescriptions from a separate store)?**
+
+Confirmed: the implementation reads from `current_log_str` (the steward_log already loaded
+in `_process_uow` at the start of the function). No extra DB read. No new fields. The helper
+is a pure function over the already-loaded text. APPROVED.
+
+**Verdict: APPROVE — proceed to PR**
