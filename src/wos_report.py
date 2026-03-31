@@ -7,7 +7,7 @@ Usage:
 
 Options:
     --chat-id   Telegram chat ID to send to (default: 8075091586)
-    --output    Output file path (default: /tmp/wos-report-<timestamp>.pdf)
+    --output    Output file path (default: ~/messages/documents/wos-report-<timestamp>.pdf)
     --no-send   Generate PDF but do not queue for sending
     --status    Filter by status (default: all)
 """
@@ -19,7 +19,6 @@ import json
 import os
 import sqlite3
 import sys
-import tempfile
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,22 +52,40 @@ STATUS_COLORS: dict[str, tuple[int, int, int]] = {
     "active":             ( 40, 140, 200),
     "diagnosing":         (180, 100,  50),
     "blocked":            (200,  60,  60),
-    "done":               (100, 170,  90),
+    "done":               ( 70, 160,  90),
     "failed":             (200,  60,  60),
     "expired":            (140, 120, 100),
 }
 DEFAULT_STATUS_COLOR = (120, 120, 120)
 
+# Canonical lifecycle state ordering for timeline display
+LIFECYCLE_STATES = [
+    "proposed", "pending", "ready-for-steward", "diagnosing",
+    "ready-for-executor", "active", "done", "failed", "expired", "blocked",
+]
+
 PAGE_W = 210          # A4 mm
 MARGIN = 14           # mm left/right/top
 CONTENT_W = PAGE_W - MARGIN * 2
 CARD_PAD = 5          # mm inner padding
-LABEL_W = 32          # mm for field labels
+LABEL_W = 34          # mm for field labels
+
+# ── colour palette ─────────────────────────────────────────────────────────────
+C_HEADING_BG   = (235, 240, 250)   # light blue for section headings
+C_HEADING_TEXT = (50,  80, 140)    # dark blue for section heading text
+C_GRID_LINE    = (210, 215, 225)   # subtle grid line
+C_MUTED        = (120, 120, 130)   # muted labels
+C_DARK         = (25,  25,  35)    # near-black body text
+C_LINK         = (30,  80, 180)    # hyperlink blue
+C_STEWARD_BG   = (235, 245, 255)   # steward section tint
+C_EXECUTOR_BG  = (235, 250, 240)   # executor section tint
+C_DONE_NODE    = ( 70, 160,  90)   # completed lifecycle node
+C_PENDING_NODE = (190, 195, 210)   # future/unreached lifecycle node
+C_ACTIVE_NODE  = ( 40, 140, 200)   # current-status lifecycle node
 
 
 # ── text helpers ──────────────────────────────────────────────────────────────
 
-# Unicode replacements that keep text readable when forced through latin-1
 _UNICODE_MAP = str.maketrans({
     "\u2014": "--",   # em dash
     "\u2013": "-",    # en dash
@@ -91,7 +108,6 @@ _UNICODE_MAP = str.maketrans({
 def _safe(text: str) -> str:
     """Replace non-latin-1 characters with ASCII equivalents."""
     text = text.translate(_UNICODE_MAP)
-    # For anything still outside latin-1, replace with ?
     return "".join(
         c if ord(c) < 256 else "?"
         for c in unicodedata.normalize("NFKD", text)
@@ -111,8 +127,8 @@ def _source_url(source: str | None, issue_number: int | None) -> str:
     return source or ""
 
 
-def _fmt_ts(ts: str | None) -> str:
-    """Format a timestamp string to YYYY-MM-DD HH:MM UTC, or return empty string."""
+def _fmt_ts(ts: str | None, short: bool = False) -> str:
+    """Format a timestamp string. short=True returns MM-DD HH:MM."""
     if not ts:
         return ""
     try:
@@ -123,34 +139,87 @@ def _fmt_ts(ts: str | None) -> str:
             dt = datetime.fromisoformat(ts_clean[:-1]).replace(tzinfo=timezone.utc)
         else:
             dt = datetime.fromisoformat(ts_clean).replace(tzinfo=timezone.utc)
+        if short:
+            return dt.strftime("%m-%d %H:%M")
         return dt.strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
         return ts[:16] if ts else ""
 
 
-def _fmt_audit_event(row: dict) -> str:
-    """Format a single audit row into a concise one-liner."""
-    ts = _fmt_ts(row.get("ts"))
-    event = row.get("event", "")
-    from_s = row.get("from_status") or ""
-    to_s = row.get("to_status") or ""
-    note = row.get("note") or ""
-
-    if note and note.startswith("{"):
+def _parse_steward_log(raw: str | None) -> list[dict]:
+    """Parse newline-delimited JSON steward_log into a list of event dicts."""
+    if not raw:
+        return []
+    events = []
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
         try:
-            n = json.loads(note)
-            note = n.get("assessment") or n.get("return_reason") or n.get("reason") or ""
+            events.append(json.loads(line))
         except Exception:
             pass
-    note = note[:60] + "..." if len(note) > 60 else note
+    return events
 
-    if from_s and to_s:
-        line = f"{ts}  {event}: {from_s} -> {to_s}"
-    else:
-        line = f"{ts}  {event}"
-    if note:
-        line += f"  ({note})"
-    return _safe(line)
+
+def _parse_steward_agenda(raw: str | None) -> list[dict]:
+    """Parse steward_agenda JSON array."""
+    if not raw:
+        return []
+    try:
+        val = json.loads(raw)
+        return val if isinstance(val, list) else []
+    except Exception:
+        return []
+
+
+def _extract_lifecycle_from_audit(audit_events: list[dict]) -> list[dict]:
+    """
+    Build an ordered list of {status, ts} pairs from audit log events,
+    deduplicated so each status appears only once (first occurrence).
+    """
+    transitions = []
+    seen: set[str] = set()
+
+    for ev in audit_events:
+        event_type = ev.get("event", "")
+        to_s = ev.get("to_status") or ""
+        ts = ev.get("ts", "")
+
+        if event_type == "created" and to_s and to_s not in seen:
+            transitions.append({"status": to_s, "ts": ts})
+            seen.add(to_s)
+        elif event_type == "status_change" and to_s and to_s not in seen:
+            transitions.append({"status": to_s, "ts": ts})
+            seen.add(to_s)
+
+    return transitions
+
+
+def _build_steward_exchange(log_events: list[dict]) -> list[dict]:
+    """
+    Extract the steward-executor back-and-forth from steward_log events.
+    Returns list of {event, cycle, ts, posture, assessment, return_reason, ...}.
+    """
+    exchange = []
+    for ev in log_events:
+        event_type = ev.get("event", "")
+        if event_type in ("diagnosis", "prescription", "reentry_prescription",
+                          "steward_closure", "agenda_update"):
+            exchange.append({
+                "event": event_type,
+                "cycle": ev.get("steward_cycles", 0),
+                "ts": ev.get("timestamp", ""),
+                "posture": ev.get("re_entry_posture") or "",
+                "assessment": (ev.get("completion_rationale")
+                               or ev.get("completion_assessment")
+                               or ev.get("assessment")
+                               or ""),
+                "rationale": ev.get("next_posture_rationale") or "",
+                "is_complete": ev.get("is_complete", False),
+                "return_reason": ev.get("return_reason") or "",
+            })
+    return exchange
 
 
 def fetch_uows(status_filter: str | None = None) -> list[dict]:
@@ -173,12 +242,25 @@ def fetch_uows(status_filter: str | None = None) -> list[dict]:
         uows = []
         for row in rows:
             d = dict(row)
+
+            # All audit events (chronological) for lifecycle reconstruction
             audits = conn.execute(
                 "SELECT ts, event, from_status, to_status, note "
-                "FROM audit_log WHERE uow_id=? ORDER BY ts DESC LIMIT 4",
+                "FROM audit_log WHERE uow_id=? ORDER BY ts ASC",
                 (d["id"],)
             ).fetchall()
-            d["_audit_events"] = [dict(a) for a in reversed(audits)]
+            d["_audit_events"] = [dict(a) for a in audits]
+
+            # Parse steward data
+            d["_steward_log_events"] = _parse_steward_log(d.get("steward_log"))
+            d["_steward_agenda_list"] = _parse_steward_agenda(d.get("steward_agenda"))
+
+            # Parse prescribed skills
+            try:
+                d["_prescribed_skills"] = json.loads(d.get("prescribed_skills") or "[]")
+            except Exception:
+                d["_prescribed_skills"] = []
+
             uows.append(d)
         return uows
     finally:
@@ -188,7 +270,7 @@ def fetch_uows(status_filter: str | None = None) -> list[dict]:
 # ── PDF builder ───────────────────────────────────────────────────────────────
 
 class WoSReport(FPDF):
-    """A4 PDF report of WOS Registry UoWs."""
+    """A4 PDF report of WOS Registry UoWs — rich visual layout."""
 
     def __init__(self, total: int, generated_at: str):
         super().__init__()
@@ -197,15 +279,15 @@ class WoSReport(FPDF):
 
     def header(self):
         self.set_font("Helvetica", "B", 14)
-        self.set_text_color(30, 30, 30)
+        self.set_text_color(*C_DARK)
         self.cell(0, 10, "WOS Registry",
                   new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="L")
         self.set_font("Helvetica", "", 9)
-        self.set_text_color(100, 100, 100)
+        self.set_text_color(*C_MUTED)
         self.cell(0, 5, f"Generated {self._generated_at}  |  {self._total} unit(s)",
                   new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="L")
         self.ln(3)
-        self.set_draw_color(200, 200, 200)
+        self.set_draw_color(*C_GRID_LINE)
         self.set_line_width(0.3)
         self.line(MARGIN, self.get_y(), PAGE_W - MARGIN, self.get_y())
         self.ln(4)
@@ -213,114 +295,533 @@ class WoSReport(FPDF):
     def footer(self):
         self.set_y(-12)
         self.set_font("Helvetica", "", 8)
-        self.set_text_color(160, 160, 160)
+        self.set_text_color(*C_MUTED)
         self.cell(0, 5, f"WOS Registry  |  {self._generated_at}  |  Page {self.page_no()}",
                   align="C")
+
+    # ── section heading ────────────────────────────────────────────────────────
+
+    def _section_heading(self, card_x: float, label: str,
+                         bg_color: tuple = C_HEADING_BG):
+        """Render a tinted full-width section heading bar."""
+        x = card_x + CARD_PAD
+        w = CONTENT_W - CARD_PAD * 2
+        y = self.get_y() + 2
+        self.set_fill_color(*bg_color)
+        self.rect(x, y, w, 5.5, style="F")
+        self.set_xy(x + 2, y + 0.5)
+        self.set_font("Helvetica", "B", 7.5)
+        self.set_text_color(*C_HEADING_TEXT)
+        self.cell(w - 4, 4.5, label.upper(),
+                  new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        self.set_text_color(*C_DARK)
+        self.ln(1)
 
     # ── field row ──────────────────────────────────────────────────────────────
 
     def _label_value(self, card_x: float, label: str, value: str, url: str = ""):
-        """Render a label + value row with proper indentation."""
+        """Render a label + value row."""
         self.set_x(card_x + CARD_PAD)
         self.set_font("Helvetica", "B", 8)
-        self.set_text_color(100, 100, 100)
+        self.set_text_color(*C_MUTED)
         self.cell(LABEL_W, 5, label + ":",
                   new_x=XPos.RIGHT, new_y=YPos.TOP)
         self.set_font("Helvetica", "", 8)
         val_w = CONTENT_W - CARD_PAD * 2 - LABEL_W
         if url:
-            self.set_text_color(30, 80, 180)
+            self.set_text_color(*C_LINK)
             disp = _safe(value)
             while disp and self.get_string_width(disp) > val_w - 4:
                 disp = disp[:-4] + "..."
             self.cell(val_w, 5, disp, link=url,
                       new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            self.set_text_color(30, 30, 30)
+            self.set_text_color(*C_DARK)
         else:
-            self.set_text_color(30, 30, 30)
+            self.set_text_color(*C_DARK)
             self.multi_cell(val_w, 5, _safe(value),
                             new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-    def _render_audit_line(self, card_x: float, line: str):
-        self.set_x(card_x + CARD_PAD + 3)
-        self.set_font("Courier", "", 7)
-        self.set_text_color(80, 80, 80)
-        self.multi_cell(CONTENT_W - CARD_PAD * 2 - 3, 4.5, line,
-                        new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    # ── lifecycle timeline ─────────────────────────────────────────────────────
+
+    def _render_lifecycle_timeline(self, card_x: float, uow: dict):
+        """
+        Render a visual timeline of status transitions as a row of labelled nodes.
+        Reached states are coloured; unreached states are greyed out.
+        Current status node uses the status badge colour.
+        """
+        audit_events = uow.get("_audit_events", [])
+        transitions = _extract_lifecycle_from_audit(audit_events)
+        current_status = uow.get("status", "")
+
+        # Build reached set (status -> ts)
+        reached: dict[str, str] = {t["status"]: t["ts"] for t in transitions}
+        if current_status and current_status not in reached:
+            reached[current_status] = uow.get("updated_at", "")
+
+        # Determine node sequence: canonical order, then any extra states
+        node_states = [s for s in LIFECYCLE_STATES
+                       if s in reached or s == current_status]
+        for s in reached:
+            if s not in node_states:
+                node_states.append(s)
+
+        if not node_states:
+            return
+
+        self._section_heading(card_x, "Lifecycle Timeline")
+
+        x_start = card_x + CARD_PAD + 4
+        avail_w = CONTENT_W - CARD_PAD * 2 - 8
+        y_base = self.get_y()
+
+        n = len(node_states)
+        spacing = min(avail_w / max(n, 1), 22)
+        node_r = 2.0
+
+        # Connecting line
+        if n > 1:
+            line_y = y_base + node_r + 0.5
+            self.set_draw_color(*C_PENDING_NODE)
+            self.set_line_width(0.5)
+            self.line(x_start + node_r,
+                      line_y,
+                      x_start + (n - 1) * spacing + node_r,
+                      line_y)
+
+        for i, state in enumerate(node_states):
+            nx = x_start + i * spacing
+            ny = y_base
+
+            is_current = (state == current_status)
+            is_terminal_current = is_current and state in ("done", "failed", "expired")
+            is_reached = state in reached
+
+            if is_terminal_current:
+                r, g, b = STATUS_COLORS.get(state, C_DONE_NODE)
+            elif is_current:
+                r, g, b = C_ACTIVE_NODE
+            elif is_reached:
+                r, g, b = C_DONE_NODE
+            else:
+                r, g, b = C_PENDING_NODE
+
+            self.set_fill_color(r, g, b)
+            self.set_draw_color(r, g, b)
+            self.ellipse(nx, ny, node_r * 2, node_r * 2, style="F")
+
+            # Abbreviated label (max 5 chars)
+            abbrev = {
+                "proposed": "prop",
+                "pending": "pend",
+                "ready-for-steward": "rfs",
+                "ready-for-executor": "rfe",
+                "active": "actv",
+                "diagnosing": "diag",
+                "blocked": "blkd",
+                "done": "done",
+                "failed": "fail",
+                "expired": "expd",
+            }.get(state, state[:4])
+
+            self.set_font("Helvetica", "", 5.5)
+            if is_reached or is_current:
+                self.set_text_color(*C_DARK)
+            else:
+                self.set_text_color(*C_PENDING_NODE)
+
+            lw = self.get_string_width(abbrev)
+            self.set_xy(nx + node_r - lw / 2, ny + node_r * 2 + 0.5)
+            self.cell(lw + 1, 3.5, abbrev)
+
+            # Timestamp under label for reached states
+            if is_reached and reached.get(state):
+                ts_short = _fmt_ts(reached[state], short=True)
+                self.set_font("Helvetica", "", 4.5)
+                self.set_text_color(*C_MUTED)
+                tsw = self.get_string_width(ts_short)
+                self.set_xy(nx + node_r - tsw / 2, ny + node_r * 2 + 4.2)
+                self.cell(tsw + 1, 3, ts_short)
+
+        self.set_y(y_base + node_r * 2 + 10)
+        self.set_text_color(*C_DARK)
+
+    # ── prescription ──────────────────────────────────────────────────────────
+
+    def _render_prescription(self, card_x: float, uow: dict):
+        """
+        Render what the steward prescribed to the executor:
+        agenda posture entries and the instructions written to the workflow artifact.
+        """
+        agenda_list = uow.get("_steward_agenda_list", [])
+        workflow_artifact_path = uow.get("workflow_artifact")
+        instructions = ""
+
+        if workflow_artifact_path:
+            try:
+                artifact = json.loads(Path(workflow_artifact_path).read_text())
+                instructions = artifact.get("instructions", "")
+            except Exception:
+                pass
+
+        agenda_lines = []
+        for i, entry in enumerate(agenda_list):
+            posture = entry.get("posture", "")
+            context = entry.get("context", "")
+            entry_status = entry.get("status", "")
+            if posture and context:
+                agenda_lines.append(
+                    f"Step {i + 1} [{posture}]: {context[:120]}"
+                    + (f" ({entry_status})" if entry_status else "")
+                )
+
+        if not instructions and not agenda_lines:
+            return
+
+        self._section_heading(card_x, "Steward Prescription", bg_color=C_STEWARD_BG)
+
+        inner_x = card_x + CARD_PAD + 2
+        inner_w = CONTENT_W - CARD_PAD * 2 - 4
+
+        if agenda_lines:
+            self.set_x(inner_x)
+            self.set_font("Helvetica", "B", 7)
+            self.set_text_color(*C_MUTED)
+            self.cell(inner_w, 4, "Agenda:",
+                      new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            for line in agenda_lines:
+                self.set_x(inner_x + 2)
+                self.set_font("Helvetica", "", 7.5)
+                self.set_text_color(*C_DARK)
+                self.multi_cell(inner_w - 2, 4.5, _safe(line),
+                                new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+        if instructions:
+            self.ln(1)
+            self.set_x(inner_x)
+            self.set_font("Helvetica", "B", 7)
+            self.set_text_color(*C_MUTED)
+            self.cell(inner_w, 4, "Instructions to executor:",
+                      new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            instr_display = (instructions[:400]
+                             + ("..." if len(instructions) > 400 else ""))
+            self.set_x(inner_x + 2)
+            self.set_font("Courier", "", 7)
+            self.set_text_color(55, 65, 90)
+            self.multi_cell(inner_w - 2, 4.2, _safe(instr_display),
+                            new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+        self.set_text_color(*C_DARK)
+        self.ln(1)
+
+    # ── steward-executor exchange ──────────────────────────────────────────────
+
+    def _render_exchange(self, card_x: float, uow: dict):
+        """
+        Render the steward-executor back-and-forth per steward_cycles:
+        diagnosis -> prescription -> executor -> re-diagnosis.
+        """
+        log_events = uow.get("_steward_log_events", [])
+        exchange = _build_steward_exchange(log_events)
+
+        if not exchange:
+            return
+
+        self._section_heading(card_x, "Steward <-> Executor Exchange")
+
+        inner_x = card_x + CARD_PAD + 2
+        inner_w = CONTENT_W - CARD_PAD * 2 - 4
+
+        # Group by cycle number
+        cycles: dict[int, list[dict]] = {}
+        for ev in exchange:
+            c = ev.get("cycle", 0)
+            cycles.setdefault(c, []).append(ev)
+
+        for cycle_num in sorted(cycles.keys()):
+            events = cycles[cycle_num]
+
+            self.set_x(inner_x)
+            self.set_font("Helvetica", "B", 7.5)
+            self.set_text_color(*C_HEADING_TEXT)
+            self.cell(inner_w, 4.5, f"Cycle {cycle_num + 1}",
+                      new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            self.set_text_color(*C_DARK)
+
+            for ev in events:
+                etype = ev.get("event", "")
+                ts_short = _fmt_ts(ev.get("ts"), short=True)
+                posture = ev.get("posture", "")
+                assessment = ev.get("assessment", "")
+                return_reason = ev.get("return_reason", "")
+
+                if etype == "diagnosis":
+                    prefix = "[DIAG]"
+                    color = (75, 100, 165)
+                elif etype in ("prescription", "reentry_prescription"):
+                    prefix = "[PRSC]"
+                    color = (75, 140, 75)
+                elif etype == "steward_closure":
+                    prefix = "[CLOS]"
+                    color = (55, 145, 75)
+                elif etype == "agenda_update":
+                    prefix = "[AGND]"
+                    color = (130, 85, 160)
+                else:
+                    prefix = f"[{etype[:4].upper()}]"
+                    color = C_MUTED
+
+                parts = []
+                if posture:
+                    parts.append(f"posture={posture[:35]}")
+                if return_reason and return_reason != posture:
+                    parts.append(f"reason={return_reason[:30]}")
+                if assessment:
+                    parts.append(assessment[:65])
+
+                detail = "  ".join(parts)[:110]
+                line = f"{prefix} {ts_short}  {detail}"
+
+                self.set_x(inner_x + 3)
+                self.set_font("Courier", "", 6.5)
+                self.set_text_color(*color)
+                self.multi_cell(inner_w - 3, 4, _safe(line),
+                                new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+            self.ln(0.5)
+
+        self.set_text_color(*C_DARK)
+        self.ln(1)
+
+    # ── agenda stability & executor posture ────────────────────────────────────
+
+    def _render_agenda_stability(self, card_x: float, uow: dict):
+        """
+        Show steward cycle count, agenda posture evolution, prescribed skills,
+        and inferred executor posture.
+        """
+        steward_cycles = uow.get("steward_cycles", 0)
+        prescribed_skills = uow.get("_prescribed_skills", [])
+        agenda_list = uow.get("_steward_agenda_list", [])
+
+        postures_seen = [a.get("posture", "") for a in agenda_list if a.get("posture")]
+        unique_postures = list(dict.fromkeys(postures_seen))  # ordered dedup
+
+        if len(unique_postures) <= 1:
+            stability = "stable"
+        elif len(unique_postures) <= 2:
+            stability = "evolved"
+        else:
+            stability = "highly evolved"
+
+        # Executor posture from workflow artifact first, then agenda inference
+        executor_posture = ""
+        workflow_artifact_path = uow.get("workflow_artifact")
+        if workflow_artifact_path:
+            try:
+                artifact = json.loads(Path(workflow_artifact_path).read_text())
+                executor_posture = artifact.get("executor_type", "")
+            except Exception:
+                pass
+        if not executor_posture:
+            for p in unique_postures:
+                if p not in ("pending_evaluation",):
+                    executor_posture = p
+                    break
+
+        # Skip section if no meaningful data beyond the default
+        has_data = (steward_cycles > 0 or prescribed_skills or
+                    executor_posture or len(unique_postures) > 1)
+        if not has_data:
+            # Still show skills if present even on cycle-0 UoWs
+            if not prescribed_skills:
+                return
+
+        self._section_heading(card_x, "Executor Posture & Agenda", bg_color=C_EXECUTOR_BG)
+
+        inner_x = card_x + CARD_PAD + 2
+        inner_w = CONTENT_W - CARD_PAD * 2 - 4
+
+        def _row(label: str, value: str, value_color: tuple = C_DARK):
+            self.set_x(inner_x)
+            self.set_font("Helvetica", "B", 7.5)
+            self.set_text_color(*C_MUTED)
+            self.cell(32, 4.5, label,
+                      new_x=XPos.RIGHT, new_y=YPos.TOP)
+            self.set_font("Helvetica", "", 7.5)
+            self.set_text_color(*value_color)
+            self.cell(inner_w - 32, 4.5, _safe(value),
+                      new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            self.set_text_color(*C_DARK)
+
+        _row("Steward cycles:", str(steward_cycles))
+
+        if unique_postures:
+            stab_color = C_DONE_NODE if stability == "stable" else (180, 100, 40)
+            posture_display = f"{stability}  ({' -> '.join(unique_postures[:5])})"
+            _row("Agenda stability:", posture_display, value_color=stab_color)
+
+        if executor_posture:
+            _row("Executor posture:", executor_posture)
+
+        if prescribed_skills:
+            _row("Skills loaded:", ", ".join(prescribed_skills))
+
+        self.ln(1)
 
     # ── card ───────────────────────────────────────────────────────────────────
 
     def add_uow_card(self, uow: dict):
-        """Add one UoW card. Starts a new page if needed."""
-        ESTIMATED_CARD_H = 72
-        if self.get_y() + ESTIMATED_CARD_H > self.h - 20:
-            self.add_page()
+        """Render one UoW on its own page with all rich sections."""
+        self.add_page()
 
         card_x = MARGIN
-        card_y = self.get_y()
-        card_w = CONTENT_W
 
-        # Light background rectangle (height estimated; redrawn as outline after)
-        self.set_fill_color(248, 249, 250)
-        self.set_draw_color(220, 220, 220)
-        self.set_line_width(0.3)
-        self.rect(card_x, card_y, card_w, ESTIMATED_CARD_H, style="F")
-
-        # ── Title row ──────────────────────────────────────────────────────────
-        self.set_xy(card_x + CARD_PAD, card_y + CARD_PAD)
+        # ── Title + badge ─────────────────────────────────────────────────────
         summary = _safe(uow.get("summary") or uow.get("id", ""))
-        title_w = card_w - CARD_PAD * 2 - 42   # leave room for badge
+        title_w = CONTENT_W - 46  # leave room for badge
 
-        self.set_font("Helvetica", "B", 10)
-        self.set_text_color(20, 20, 20)
+        self.set_font("Helvetica", "B", 11)
+        self.set_text_color(*C_DARK)
+        self.set_x(card_x)
         while summary and self.get_string_width(summary) > title_w:
             summary = summary[:-4] + "..."
-        self.cell(title_w, 7, summary,
+        self.cell(title_w, 8, summary,
                   new_x=XPos.RIGHT, new_y=YPos.TOP)
 
-        # Status badge (right side of title row)
         status = uow.get("status", "unknown")
         r, g, b = STATUS_COLORS.get(status, DEFAULT_STATUS_COLOR)
         self.set_fill_color(r, g, b)
         self.set_text_color(255, 255, 255)
         self.set_font("Helvetica", "B", 7.5)
         badge_text = status.upper()
-        badge_w = max(self.get_string_width(badge_text) + 6, 26)
-        self.cell(badge_w, 7, badge_text, fill=True, align="C",
+        badge_w = max(self.get_string_width(badge_text) + 8, 28)
+        self.cell(badge_w, 8, badge_text, fill=True, align="C",
                   new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        self.set_text_color(30, 30, 30)
+        self.set_text_color(*C_DARK)
+        self.ln(2)
 
-        self.ln(1)
+        # Separator under title
+        self.set_draw_color(*C_GRID_LINE)
+        self.set_line_width(0.2)
+        self.line(card_x, self.get_y(), card_x + CONTENT_W, self.get_y())
+        self.ln(3)
 
-        # ── Fields ─────────────────────────────────────────────────────────────
+        # ── Identity fields ────────────────────────────────────────────────────
         self._label_value(card_x, "ID", uow.get("id", ""))
 
         source_url = _source_url(uow.get("source"), uow.get("source_issue_number"))
         source_display = uow.get("source") or source_url
         self._label_value(card_x, "Source", source_display or "(none)", url=source_url)
 
-        self._label_value(card_x, "Steward cycles", str(uow.get("steward_cycles", 0)))
         self._label_value(card_x, "Created", _fmt_ts(uow.get("created_at")))
-        self._label_value(card_x, "Updated", _fmt_ts(uow.get("updated_at")))
+        if uow.get("started_at"):
+            self._label_value(card_x, "Started", _fmt_ts(uow.get("started_at")))
+        if uow.get("completed_at"):
+            self._label_value(card_x, "Completed", _fmt_ts(uow.get("completed_at")))
+        else:
+            self._label_value(card_x, "Updated", _fmt_ts(uow.get("updated_at")))
 
-        # ── Lifecycle ──────────────────────────────────────────────────────────
-        audit_events = uow.get("_audit_events", [])
-        if audit_events:
-            self.ln(1.5)
-            self.set_x(card_x + CARD_PAD)
-            self.set_font("Helvetica", "B", 7.5)
-            self.set_text_color(100, 100, 100)
-            self.cell(0, 4.5, "Lifecycle (last events):",
-                      new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            for ev in audit_events[-4:]:
-                self._render_audit_line(card_x, _fmt_audit_event(ev))
+        success_criteria = (uow.get("success_criteria") or "").strip()
+        if success_criteria:
+            self._label_value(card_x, "Success criteria", success_criteria)
 
-        # ── Outline over background rect ───────────────────────────────────────
-        actual_h = self.get_y() + CARD_PAD - card_y
-        self.set_draw_color(210, 210, 220)
-        self.set_line_width(0.4)
-        self.rect(card_x, card_y, card_w, actual_h, style="D")
-        self.set_y(card_y + actual_h + 4)
+        self.ln(2)
+
+        # ── Rich sections ──────────────────────────────────────────────────────
+        self._render_lifecycle_timeline(card_x, uow)
+        self._render_agenda_stability(card_x, uow)
+        self._render_prescription(card_x, uow)
+        self._render_exchange(card_x, uow)
+
+
+# ── summary index page ─────────────────────────────────────────────────────────
+
+def _render_index_page(pdf: WoSReport, uows: list[dict]) -> None:
+    """Render a status-summary bar and index table on the first page."""
+    # Status pill summary
+    status_counts: dict[str, int] = {}
+    for u in uows:
+        s = u.get("status", "unknown")
+        status_counts[s] = status_counts.get(s, 0) + 1
+
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_text_color(*C_HEADING_TEXT)
+    pdf.cell(0, 6, "Status Summary",
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(1)
+
+    x = MARGIN
+    y = pdf.get_y()
+    for status_name, count in sorted(status_counts.items()):
+        sr, sg, sb = STATUS_COLORS.get(status_name, DEFAULT_STATUS_COLOR)
+        label = f"{status_name}: {count}"
+        pdf.set_font("Helvetica", "B", 7.5)
+        pill_w = pdf.get_string_width(label) + 8
+        if x + pill_w > PAGE_W - MARGIN:
+            x = MARGIN
+            y += 7
+        pdf.set_fill_color(sr, sg, sb)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_xy(x, y)
+        pdf.cell(pill_w, 5.5, label, fill=True, align="C")
+        x += pill_w + 3
+
+    pdf.ln(10)
+
+    # Column layout
+    col_widths = [12, 66, 22, 22, 14, 20]
+    col_headers = ["ID", "Summary", "Status", "Created", "Cyles", "Skills"]
+
+    # Header row
+    pdf.set_fill_color(*C_HEADING_BG)
+    pdf.set_font("Helvetica", "B", 7.5)
+    pdf.set_text_color(*C_HEADING_TEXT)
+    hx = MARGIN
+    hy = pdf.get_y() + 2
+    for w, h in zip(col_widths, col_headers):
+        pdf.set_xy(hx, hy)
+        pdf.cell(w, 5.5, h, border=0, fill=True, align="L")
+        hx += w
+    pdf.ln(7)
+
+    # Data rows
+    for i, uow in enumerate(uows):
+        row_y = pdf.get_y()
+        row_bg = (250, 250, 252) if i % 2 == 0 else (255, 255, 255)
+        pdf.set_fill_color(*row_bg)
+        pdf.rect(MARGIN, row_y, sum(col_widths), 5, style="F")
+
+        status = uow.get("status", "")
+        sr, sg, sb = STATUS_COLORS.get(status, DEFAULT_STATUS_COLOR)
+        skills = uow.get("_prescribed_skills", [])
+
+        values = [
+            _safe(uow.get("id", "")[-6:]),
+            _safe((uow.get("summary") or "")[:62]),
+            status.upper()[:12],
+            _fmt_ts(uow.get("created_at"), short=True),
+            str(uow.get("steward_cycles", 0)),
+            ",".join(skills)[:18] or "-",
+        ]
+        aligns = ["L", "L", "L", "L", "C", "L"]
+
+        rx = MARGIN
+        for j, (w, val, align) in enumerate(zip(col_widths, values, aligns)):
+            pdf.set_xy(rx, row_y)
+            if j == 2:
+                pdf.set_text_color(sr, sg, sb)
+                pdf.set_font("Helvetica", "B", 7)
+            else:
+                pdf.set_text_color(*C_DARK)
+                pdf.set_font("Helvetica", "", 7)
+            pdf.cell(w, 5, val, border=0, align=align)
+            rx += w
+        pdf.ln(5)
+
+    pdf.ln(3)
+    pdf.set_draw_color(*C_GRID_LINE)
+    pdf.set_line_width(0.3)
+    pdf.line(MARGIN, pdf.get_y(), PAGE_W - MARGIN, pdf.get_y())
 
 
 # ── PDF generation ────────────────────────────────────────────────────────────
@@ -335,10 +836,11 @@ def generate_pdf(uows: list[dict], output_path: Path) -> Path:
 
     if not uows:
         pdf.set_font("Helvetica", "I", 11)
-        pdf.set_text_color(120, 120, 120)
+        pdf.set_text_color(*C_MUTED)
         pdf.cell(0, 10, "No units of work found.",
                  new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
     else:
+        _render_index_page(pdf, uows)
         for uow in uows:
             pdf.add_uow_card(uow)
 
@@ -350,7 +852,7 @@ def generate_pdf(uows: list[dict], output_path: Path) -> Path:
 # ── Telegram delivery ─────────────────────────────────────────────────────────
 
 def queue_for_telegram(pdf_path: Path, chat_id: int, caption: str = "") -> Path:
-    """Write an outbox JSON file that instructs lobster_bot to send this PDF."""
+    """Write an outbox JSON file that instructs the bot to send this PDF."""
     import uuid
     OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
     msg_id = uuid.uuid4().hex[:12]
@@ -376,7 +878,7 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--chat-id", type=int, default=DEFAULT_CHAT_ID,
                         help="Telegram chat ID to send to")
     parser.add_argument("--output", type=Path,
-                        help="Output PDF path (default: auto-named in /tmp)")
+                        help="Output PDF path (default: auto-named in ~/messages/documents/)")
     parser.add_argument("--no-send", action="store_true",
                         help="Generate PDF but do not queue for Telegram delivery")
     parser.add_argument("--status", type=str, default=None,
@@ -387,7 +889,10 @@ def main(argv: list[str] | None = None):
         output_path = args.output
     else:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        output_path = Path(tempfile.gettempdir()) / f"wos-report-{ts}.pdf"
+        pdf_dir = Path(os.environ.get(
+            "LOBSTER_MESSAGES", Path.home() / "messages")) / "documents"
+        pdf_dir.mkdir(parents=True, exist_ok=True)
+        output_path = pdf_dir / f"wos-report-{ts}.pdf"
 
     print(f"Loading registry from {REGISTRY_DB}...")
     uows = fetch_uows(status_filter=args.status)
