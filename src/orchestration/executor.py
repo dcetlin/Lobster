@@ -362,8 +362,33 @@ class Executor:
                     reason="workflow_artifact field is NULL or empty",
                 )
 
+            # The Steward writes the artifact JSON to a file and stores the
+            # absolute path in the workflow_artifact column. Detect a path
+            # value (starts with '/') and read the file; otherwise treat the
+            # field value as inline JSON (legacy / test path).
+            artifact_json_str = workflow_artifact_raw
+            if workflow_artifact_raw.startswith("/"):
+                artifact_file = Path(workflow_artifact_raw)
+                if not artifact_file.exists():
+                    missing_reason = (
+                        f"workflow_artifact file not found: {workflow_artifact_raw}"
+                    )
+                    missing_result = ExecutorResult(
+                        uow_id=uow_id,
+                        outcome=ExecutorOutcome.FAILED,
+                        success=False,
+                        reason=missing_reason,
+                    )
+                    _write_result_json(output_ref, missing_result)
+                    self.registry.fail_uow(uow_id, missing_reason)
+                    return ClaimRejected(
+                        uow_id=uow_id,
+                        reason=missing_reason,
+                    )
+                artifact_json_str = artifact_file.read_text(encoding="utf-8")
+
             try:
-                artifact = from_json(workflow_artifact_raw)
+                artifact = from_json(artifact_json_str)
             except ValueError as e:
                 deser_reason = f"workflow_artifact deserialization failed: {e}"
                 deser_result = ExecutorResult(
