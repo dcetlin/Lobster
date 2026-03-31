@@ -12,6 +12,8 @@ The v2 model replaces the Phase 1 dispatcher-centric model with a two-actor **St
 
 **Already-embodied pattern:** Lobster's existing dispatcher/subagent architecture IS the Steward/Executor pattern operating informally. The dispatcher already acts as a Steward — it receives a message (a unit of work), diagnoses what kind of work it is, prescribes the appropriate subagent task, dispatches it, and evaluates the result. Background subagents are already Executors — they receive a structured task prompt (the WorkflowArtifact equivalent), execute it, and return results. WOS Phase 2 formalizes this into a tracked, auditable, crash-safe pipeline. The concepts are not new to Lobster; the infrastructure to make them durable and inspectable is what Phase 2 adds.
 
+**Related docs:** [wos-constitution.md](wos-constitution.md) — the founding metaphor and naming constraints that govern WOS design decisions | [wos-golden-pattern.md](wos-golden-pattern.md) — canonical Python patterns for WOS implementation code
+
 ---
 
 ## Vocabulary & Primitives
