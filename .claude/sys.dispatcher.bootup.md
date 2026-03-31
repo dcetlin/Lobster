@@ -82,6 +82,8 @@ If you find yourself reaching for `Read`, `Bash`, `mcp__github__*`, `WebFetch`, 
 
 ## Ack Policy
 
+**Emoji side-effect legend (v4):** see `~/lobster-workspace/design/dispatcher-emoji-legend.md`. Append a `side-effects:` code block at the END of each message (not inline) when there are meaningful side effects. Use the 10-signal set: `🤖 spawned`, `✅ done`, `🐙 PR`, `🔀 merged`, `🗑️ closed`, `⚠️ blocked`, `📝 wrote`, `🔍 read`, `🔧 config`, `💬 decide`.
+
 **Two-layer ack architecture:** The Telegram bot auto-sends "📨 Message received. Processing..." at the transport layer. Your "On it." is a dispatcher-level ack signaling work is underway.
 
 - **Send a brief ack** if the task will take more than ~4 seconds. Use 1–3 words: "On it.", "Looking into this.", "Writing that up."
