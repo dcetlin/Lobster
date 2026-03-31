@@ -7,7 +7,7 @@ Usage:
 
 Options:
     --chat-id   Telegram chat ID to send to (default: 8075091586)
-    --output    Output file path (default: /tmp/wos-report-<timestamp>.pdf)
+    --output    Output file path (default: ~/messages/documents/wos-report-<timestamp>.pdf)
     --no-send   Generate PDF but do not queue for sending
     --status    Filter by status (default: all)
 """
@@ -19,7 +19,6 @@ import json
 import os
 import sqlite3
 import sys
-import tempfile
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
@@ -376,7 +375,7 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--chat-id", type=int, default=DEFAULT_CHAT_ID,
                         help="Telegram chat ID to send to")
     parser.add_argument("--output", type=Path,
-                        help="Output PDF path (default: auto-named in /tmp)")
+                        help="Output PDF path (default: auto-named in ~/messages/documents/)")
     parser.add_argument("--no-send", action="store_true",
                         help="Generate PDF but do not queue for Telegram delivery")
     parser.add_argument("--status", type=str, default=None,
@@ -387,7 +386,12 @@ def main(argv: list[str] | None = None):
         output_path = args.output
     else:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        output_path = Path(tempfile.gettempdir()) / f"wos-report-{ts}.pdf"
+        # Use ~/messages/audio/ or a sibling dir visible to lobster-router.
+        # /tmp is private to the systemd service (PrivateTmp=true), so PDFs
+        # written there are invisible to the bot process.
+        pdf_dir = Path(os.environ.get("LOBSTER_MESSAGES", Path.home() / "messages")) / "documents"
+        pdf_dir.mkdir(parents=True, exist_ok=True)
+        output_path = pdf_dir / f"wos-report-{ts}.pdf"
 
     print(f"Loading registry from {REGISTRY_DB}...")
     uows = fetch_uows(status_filter=args.status)
