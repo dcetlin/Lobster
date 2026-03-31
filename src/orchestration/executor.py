@@ -12,17 +12,21 @@ Design constraints enforced here:
 - Executor NEVER transitions to 'done' — only the Steward declares closure.
 
 Dispatch protocol:
-- The production dispatcher (_dispatch_via_inbox) writes a structured JSON
-  message to ~/messages/inbox/ so the Lobster dispatcher (main Claude loop)
-  can read it and spawn a subagent via the Task tool.
-- The message type is 'wos_execute'. The dispatcher routes this type to a
-  subagent that runs the prescribed instructions and writes the result file.
-- The Executor does NOT block waiting for the subagent — it writes timeout_at
-  at claim time and returns. The Observation Loop (#306) detects stalls.
-- The message_id is returned as executor_id for audit correlation.
+- The production dispatcher (_dispatch_via_claude_p) spawns a functional-engineer
+  subagent via `claude -p` (subprocess, synchronous). The subagent reads the
+  GitHub issue, implements the prescription, opens a PR, and calls write_result.
+  The executor waits for the subprocess to complete before transitioning the UoW.
+- TTL recovery: UoWs stuck in 'active' state for more than TTL_EXCEEDED_HOURS are
+  transitioned to 'failed' with return_reason='ttl_exceeded'. Call
+  recover_ttl_exceeded_uows(registry) at heartbeat startup before the dispatch
+  cycle so the Steward can re-diagnose stalled UoWs on its next pass.
+- Fallback: _dispatch_via_inbox is retained for environments without a live
+  functional-engineer (development, CI). Pass dispatcher=_dispatch_via_inbox to
+  Executor(...) to restore the ghost-message behaviour.
 
 Imports:
     from orchestration.executor import Executor, ExecutorOutcome, ExecutorResult
+    from orchestration.executor import recover_ttl_exceeded_uows
 
 Canonical output path convention (from executor-contract.md):
     {output_ref}.result.json  (replace extension)
@@ -33,10 +37,12 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import sqlite3
+import subprocess
 import uuid
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
@@ -53,6 +59,10 @@ LOBSTER_ADMIN_CHAT_ID: str = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586
 
 # Output directory for executor result and work files
 _OUTPUT_DIR_TEMPLATE = "~/lobster-workspace/orchestration/outputs"
+
+# UoWs stuck in 'active' state longer than this are considered TTL-exceeded
+# and marked 'failed' by recover_ttl_exceeded_uows() at heartbeat startup.
+TTL_EXCEEDED_HOURS: int = 4
 
 
 # ---------------------------------------------------------------------------
@@ -216,13 +226,14 @@ class Executor:
             skill_activator: Callable that activates a skill by ID. Defaults to
                 _noop_skill_activator. Injectable for tests.
             dispatcher: Callable that dispatches the LLM subagent task. Defaults
-                to _dispatch_via_inbox (writes a wos_execute message to the Lobster
-                inbox so the dispatcher spawns a subagent via the Task tool).
-                Injectable for tests.
+                to _dispatch_via_claude_p (spawns a functional-engineer subagent
+                via `claude -p` subprocess). Pass _dispatch_via_inbox to restore
+                ghost-message behaviour for environments without a live
+                functional-engineer. Injectable for tests.
         """
         self.registry = registry
         self._skill_activator = skill_activator or _noop_skill_activator
-        self._dispatcher = dispatcher or _dispatch_via_inbox
+        self._dispatcher = dispatcher or _dispatch_via_claude_p
 
     # -----------------------------------------------------------------------
     # Public API
@@ -311,7 +322,6 @@ class Executor:
             estimated_runtime = row["estimated_runtime"]
             timeout_seconds = int(estimated_runtime) if estimated_runtime is not None else 1800
             started_dt = datetime.fromisoformat(now)
-            from datetime import timedelta
             timeout_dt = started_dt + timedelta(seconds=timeout_seconds)
             timeout_at = timeout_dt.isoformat()
             conn.execute(
@@ -552,7 +562,77 @@ class Executor:
 
 
 # ---------------------------------------------------------------------------
-# Production dispatcher — inbox-based agent launch
+# Production dispatcher — functional-engineer agent via claude -p
+# ---------------------------------------------------------------------------
+
+#: Timeout for the claude -p subprocess in seconds. Matched to the default
+#: UoW estimated_runtime ceiling (30 minutes) plus a generous buffer.
+_CLAUDE_P_TIMEOUT_SECONDS: int = int(os.environ.get("WOS_EXECUTOR_TIMEOUT", "7200"))
+
+#: claude binary — resolved from PATH at call time so tests can override via
+#: a mock binary on PATH without patching the module.
+_CLAUDE_BIN = "claude"
+
+#: Functional-engineer agent prompt preamble — sets context before the
+#: prescription body. The subagent receives the full prescription as the
+#: prompt body and is responsible for reading the issue, implementing,
+#: opening a PR, and calling write_result.
+_FUNCTIONAL_ENGINEER_PREAMBLE = """\
+You are a functional-engineer subagent operating inside the WOS (Work Orchestration
+System) pipeline. Your job is to implement the following prescription and open a PR.
+
+Follow the functional-engineer protocol:
+1. Read the GitHub issue identified in the prescription (use gh issue view).
+2. Create a worktree branch and implement the changes.
+3. Run tests, then open a PR on dcetlin/Lobster.
+4. Call write_result with the PR URL and outcome when done.
+
+Do NOT call send_reply. Do NOT call wait_for_messages.
+Write result via: mcp__lobster-inbox__write_result
+
+Prescription:
+"""
+
+
+def _dispatch_via_claude_p(instructions: str, uow_id: str) -> str:
+    """
+    Production dispatcher: spawn a functional-engineer subagent via `claude -p`.
+
+    Builds a prompt from the prescription instructions and launches a
+    synchronous subprocess. The executor blocks until the subprocess exits,
+    then inspects the return code to determine success or failure.
+
+    Returns a run_id string for audit correlation (uow_id + timestamp).
+
+    Raises subprocess.CalledProcessError on non-zero exit — the caller's
+    exception handler writes result.json with outcome=failed and transitions
+    the UoW to 'failed' so the Steward can re-diagnose.
+    Raises subprocess.TimeoutExpired if the agent exceeds _CLAUDE_P_TIMEOUT_SECONDS
+    — same failure path applies.
+    Raises FileNotFoundError if the claude binary is not on PATH — caught by
+    the caller's exception handler.
+    """
+    run_id = f"{uow_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    prompt = _FUNCTIONAL_ENGINEER_PREAMBLE + instructions
+
+    proc = subprocess.run(
+        [
+            _CLAUDE_BIN,
+            "-p", prompt,
+            "--dangerously-skip-permissions",
+            "--max-turns", "40",
+        ],
+        capture_output=False,   # inherit stdout/stderr so logs flow to heartbeat log
+        text=True,
+        timeout=_CLAUDE_P_TIMEOUT_SECONDS,
+        check=True,             # raises CalledProcessError on non-zero exit
+    )
+
+    return run_id
+
+
+# ---------------------------------------------------------------------------
+# Fallback dispatcher — inbox-based ghost message (dev / CI environments)
 # ---------------------------------------------------------------------------
 
 #: Inbox directory — where dispatch messages are written for the Lobster
@@ -567,21 +647,21 @@ _DISPATCH_CHAT_ID: str = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
 
 def _dispatch_via_inbox(instructions: str, uow_id: str) -> str:
     """
-    Production dispatcher: write a wos_execute message to the Lobster inbox.
+    Fallback dispatcher: write a wos_execute message to the Lobster inbox.
+
+    This is the original ghost-message path retained for environments without
+    a live functional-engineer (development, CI). No subprocess is spawned;
+    the message is fire-and-forget. Use this by passing dispatcher=_dispatch_via_inbox
+    to Executor(...) when a real claude -p execution is not desired.
 
     The Lobster dispatcher (main Claude loop) reads ~/messages/inbox/ on each
     cycle. When it sees a message with type='wos_execute', it spawns a
     background subagent via the Task tool with the prescribed instructions.
 
-    This is fire-and-forget: the Executor does NOT block waiting for the
-    subagent. Completion is detected by the Steward on its next heartbeat
-    cycle, via the result.json file the subagent writes (executor-contract.md).
-
     The message_id is returned as the executor_id for audit correlation.
 
     Raises OSError if the inbox directory cannot be created or the message
-    file cannot be written — the caller's exception handler will write
-    result.json with outcome=failed.
+    file cannot be written.
     """
     msg_id = str(uuid.uuid4())
     inbox_dir = Path(os.path.expanduser(_INBOX_DIR_TEMPLATE))
@@ -614,6 +694,62 @@ def _dispatch_via_inbox(instructions: str, uow_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# TTL recovery — mark stuck 'active' UoWs as failed
+# ---------------------------------------------------------------------------
+
+def recover_ttl_exceeded_uows(registry: "Registry") -> list[str]:
+    """
+    Scan for UoWs in 'active' state that have exceeded TTL_EXCEEDED_HOURS and
+    transition them to 'failed' with return_reason='ttl_exceeded'.
+
+    Call this at executor-heartbeat startup, before the dispatch cycle, so
+    the Steward can re-diagnose stalled UoWs on its next pass.
+
+    Returns the list of uow_ids that were recovered (may be empty).
+
+    Design: uses optimistic lock on fail_uow — if another process already
+    transitioned the UoW, the update silently skips (rowcount=0 path in
+    fail_uow's WHERE clause). This is safe for concurrent heartbeat runs.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=TTL_EXCEEDED_HOURS)
+    cutoff_iso = cutoff.isoformat()
+
+    conn = sqlite3.connect(str(registry.db_path), timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT id FROM uow_registry
+            WHERE status = 'active'
+              AND started_at IS NOT NULL
+              AND started_at < ?
+            """,
+            (cutoff_iso,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    recovered: list[str] = []
+    for row in rows:
+        uow_id = row["id"]
+        try:
+            registry.fail_uow(
+                uow_id,
+                f"ttl_exceeded: UoW was in active state for more than {TTL_EXCEEDED_HOURS}h",
+            )
+            recovered.append(uow_id)
+        except Exception:
+            # Non-fatal: log at call site. The UoW remains active and will be
+            # caught on the next heartbeat cycle.
+            pass
+
+    return recovered
+
+
+# ---------------------------------------------------------------------------
 # No-op implementations — for tests and environments without a live inbox
 # ---------------------------------------------------------------------------
 
@@ -623,5 +759,5 @@ def _noop_skill_activator(skill_id: str) -> None:
 
 
 def _noop_dispatcher(instructions: str, uow_id: str) -> str:
-    """No-op dispatcher for tests. In production, _dispatch_via_inbox is used."""
+    """No-op dispatcher for tests. In production, _dispatch_via_claude_p is used."""
     return f"dispatched:{uow_id}"

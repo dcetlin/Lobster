@@ -2,18 +2,20 @@
 """
 Executor Heartbeat — WOS Phase 2 cron-driven Executor agent.
 
-Runs every 3 minutes. On each invocation, claims and dispatches all UoWs
-in `ready-for-executor` state via the 6-step atomic claim sequence defined
-in src/orchestration/executor.py.
+Runs every 3 minutes. On each invocation:
+1. Recovers UoWs stuck in 'active' state for more than TTL_EXCEEDED_HOURS (4h)
+   by marking them 'failed' so the Steward can re-diagnose.
+2. Claims and dispatches all UoWs in `ready-for-executor` state via the
+   6-step atomic claim sequence defined in src/orchestration/executor.py.
 
 Each UoW is processed independently. A claim rejection (optimistic lock
 failure) or runtime error on one UoW is logged and skipped — processing
 continues for remaining UoWs.
 
-Dispatch is fire-and-forget: the Executor writes a `wos_execute` message to
-~/messages/inbox/ so the Lobster dispatcher (main Claude loop) spawns a
-subagent. The subagent executes and writes a result.json. The Steward
-picks up the result on its next heartbeat cycle.
+Dispatch spawns a functional-engineer subagent via `claude -p` (subprocess,
+synchronous). The Executor waits for the subprocess to complete before
+transitioning the UoW to 'ready-for-steward' or 'failed'. The Steward picks
+up the result on its next heartbeat cycle.
 
 Cron schedule (every 3 minutes, offset by 90s from steward-heartbeat):
     */3 * * * * sleep 90 && uv run ~/lobster/scheduled-tasks/executor-heartbeat.py
@@ -73,6 +75,62 @@ def _default_db_path() -> Path:
 # ---------------------------------------------------------------------------
 # Executor cycle — claim and dispatch all ready-for-executor UoWs
 # ---------------------------------------------------------------------------
+
+def run_ttl_recovery(registry, dry_run: bool = False) -> list[str]:
+    """
+    Recover UoWs stuck in 'active' state for more than TTL_EXCEEDED_HOURS.
+
+    In dry_run mode: queries but does NOT transition any UoW.
+    Returns the list of recovered uow_ids (empty on dry_run or nothing to recover).
+    """
+    from src.orchestration.executor import TTL_EXCEEDED_HOURS, recover_ttl_exceeded_uows
+    import sqlite3
+    from datetime import datetime, timezone, timedelta
+
+    if dry_run:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=TTL_EXCEEDED_HOURS)
+        cutoff_iso = cutoff.isoformat()
+        try:
+            conn = sqlite3.connect(str(registry.db_path), timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT id FROM uow_registry
+                    WHERE status = 'active'
+                      AND started_at IS NOT NULL
+                      AND started_at < ?
+                    """,
+                    (cutoff_iso,),
+                ).fetchall()
+                stalled = [r["id"] for r in rows]
+            finally:
+                conn.close()
+        except Exception as e:
+            log.warning("TTL recovery (DRY RUN): query failed — %s", e)
+            return []
+        if stalled:
+            log.info(
+                "TTL recovery (DRY RUN): %d stalled UoWs would be recovered — %s",
+                len(stalled), stalled,
+            )
+        else:
+            log.info("TTL recovery (DRY RUN): no stalled UoWs found")
+        return []
+
+    try:
+        recovered = recover_ttl_exceeded_uows(registry)
+    except Exception as e:
+        log.warning("TTL recovery: unexpected error — %s", e)
+        return []
+
+    if recovered:
+        log.info("TTL recovery: marked %d stalled UoW(s) as failed — %s", len(recovered), recovered)
+    else:
+        log.debug("TTL recovery: no stalled UoWs found")
+
+    return recovered
+
 
 def run_executor_cycle(registry, dry_run: bool = False) -> dict:
     """
@@ -178,6 +236,10 @@ def main() -> int:
         return 1
 
     registry = Registry(db_path)
+
+    # Phase 1: TTL recovery — must run before dispatch so the Steward can
+    # re-diagnose stalled UoWs on its next pass.
+    run_ttl_recovery(registry, dry_run=dry_run)
 
     try:
         result = run_executor_cycle(registry, dry_run=dry_run)
