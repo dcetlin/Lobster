@@ -78,13 +78,13 @@ Philosophy session
     -> seeds -> GitHub issues
                -> UoW Registrar   [Phase 1 — operational]
                  -> UoWRegistry   [Phase 1 — operational]
-                   -> Steward/Executor loop  [Phase 2 — not yet built]
+                   -> Steward/Executor loop  [Phase 2 — operational]
                      -> artifacts / done
 ```
 
 This pipeline applies beyond philosophy sessions: any source of seeds (Telegram observations, nightly health scans, direct requests) flows through the same funnel — GitHub issue as the universal entry point, UoW Registrar as the gate into the execution substrate.
 
-**Operational status note:** The Cultivator is not yet built. Until it is, philosophy session outputs (bootup candidates, seeds) reach GitHub via manual filing — the Cultivator stage is bypassed entirely. The pipeline diagram above is the design target; the `ASPIRATIONAL` label marks stages that are not yet operational. Do not read the diagram as a description of current system behavior.
+**Operational status note:** The Cultivator is not yet built. Until it is, philosophy session outputs (bootup candidates, seeds) reach GitHub via manual filing — the Cultivator stage is bypassed entirely. The Steward/Executor loop (Phase 2) is operational as of 2026-03-31. The pipeline diagram above reflects current system behavior at Phase 2; the `ASPIRATIONAL` label marks stages that remain unbuilt.
 
 ---
 
@@ -467,22 +467,18 @@ Steward cycle 2:
 
 **Phase 1 to Phase 2 transition:** Both pre-Phase-2 blocking gates are now resolved (2026-03-30). (1) Workflow artifact format — Option C: structured envelope + instructions field. (2) Trigger evaluation mode — polling via `evaluate_condition(uow)`. See Resolved Decisions for full rationale. Steward MVP build can begin.
 
-### Phase 2: Steward + Executor [next]
+### Phase 2: Steward + Executor [complete]
 
-**Pre-Phase-2 gates: CLEARED as of 2026-03-30.** Both blocking gates are resolved:
-1. Workflow artifact format — Option C: structured envelope + instructions field. See Resolved Decisions.
-2. Trigger evaluation mode — polling via `evaluate_condition(uow)`. See Resolved Decisions.
+**Phase 2 completion status: COMPLETE as of 2026-03-31.** All seven PRs merged (see #301 umbrella):
+- PR0 (#309): schema migration — Phase 2 fields + `executor_uow_view` — MERGED
+- PR1 (#302): WorkflowArtifact struct (`src/orchestration/workflow_artifact.py`) — MERGED
+- PR2 (#303): Steward heartbeat script (`scheduled-tasks/steward-heartbeat.py`) — MERGED
+- PR3 (#304): `evaluate_condition(uow)` callable + Registrar sweep wiring — MERGED
+- PR4 (#305): Executor MVP — 6-step atomic claim, LLM dispatch, `output_ref`, return to Steward — MERGED
+- PR5 (#306): Observation Loop — stall detection for `active` UoWs within steward heartbeat — MERGED
+- PR6 (#307): Startup sweep (crash recovery) — classify orphaned `active` and `ready-for-executor` UoWs — MERGED
 
-**Phase 2 build can begin.**
-
-**What to build:** Seven PRs in sequence (see #301 umbrella):
-- PR0 (#309): schema migration — add all Phase 2 fields (`workflow_artifact`, `prescribed_skills`, `steward_cycles`, `timeout_at`, `estimated_runtime`, `steward_agenda`, `steward_log`) + `executor_uow_view`
-- PR1 (#302): WorkflowArtifact struct (`src/orchestration/workflow_artifact.py`) with `to_json()` / `from_json()`
-- PR2 (#303): Steward heartbeat script (`scheduled-tasks/steward-heartbeat.py`) — diagnose/prescribe/re-entry loop
-- PR3 (#304): `evaluate_condition(uow)` callable + Registrar sweep wiring (`pending → ready-for-steward`)
-- PR4 (#305): Executor MVP — 6-step atomic claim, execute via LLM dispatch, write `output_ref`, return to Steward
-- PR5 (#306): Observation Loop — stall detection for `active` UoWs within steward heartbeat
-- PR6 (#307): Startup sweep (crash recovery) — classify orphaned `active` and `ready-for-executor` UoWs
+**Runtime execution control (PR #428):** Executor dispatch is gated by `~/lobster-workspace/data/wos-config.json` (`execution_enabled: true/false`). Enabled via `wos start` / `wos stop` dispatcher commands. Default is `false` (safe) when the file is absent. This replaced the prior `BOOTUP_CANDIDATE_GATE` hardcoded constant for executor dispatch. Note: `BOOTUP_CANDIDATE_GATE` (bootup-candidate label filtering) remains active in the Steward and is a separate concern from executor dispatch.
 
 **Note on Routing Classifier, Hook System, and Cultivator:** These are NOT Phase 2 deliverables. The Routing Classifier and Conditional Hook System are defined in issue #168 and are Phase 3 scope. The `route_reason` field exists in the schema and the Steward writes it as free text in Phase 2; the Routing Classifier that parses and assigns postures systematically is Phase 3. The Cultivator (philosophy pipeline classification agent) is aspirational and not in any current phase scope.
 
