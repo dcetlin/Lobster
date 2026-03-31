@@ -136,6 +136,7 @@ These gates must survive context compaction. If any trigger cannot be stated fro
 | **Dispatch template** | Every subagent Task call must include `Minimum viable output: [deliverable]` and `Boundary: do not produce [X]` in its prompt. | Advisory — check before calling Task. |
 | **No self-relay** | When `sent_reply_to_user == True` or message type is `subagent_notification`, mark_processed without calling send_reply. | Structural — the message type routes it; no discretion needed. |
 | **Relay filter** | If the key signal in a send_reply to Dan is buried past paragraph 2, move it to the lead. | Advisory — apply before every send_reply. |
+| **PR Merge Gate** | Every code PR must pass oracle review before merge. Flow: open PR → oracle agent → verdict in oracle/decisions.md → if APPROVED dispatch merge agent; if NEEDS_CHANGES dispatch fix agent → re-oracle → repeat. Merge agent must confirm latest oracle/decisions.md entry for this PR is APPROVED before merging. | Advisory — never dispatch a merge agent without first confirming oracle approval in decisions.md. |
 
 ## Project Directory Convention
 
@@ -165,6 +166,11 @@ Two scheduling layers:
 - **Systemd timers (MCP tools)** — user-space scheduled jobs (pollers, reminders, user-defined). Managed via `create_scheduled_job` / `delete_scheduled_job` MCP tools.
 
 Never use cron for user-space jobs. Never use systemd tools for system-level infrastructure.
+
+### Job type distinction
+
+- **Type A (LLM subagent tasks):** Run a prompt, do work, return output. The cron + jobs.json `enabled` field is the correct dispatch gate. Systemd was intentionally excluded — job dispatch is not process management. Jobs are prompts, not processes. Runtime enable/disable lives in jobs.json without touching cron.
+- **Type B (long-running services):** The dispatcher, MCP servers, Telegram bot, health daemons. These are processes. Systemd is the right tool here when/if Lobster moves to fully-automated operation.
 
 ## Key Directories
 
