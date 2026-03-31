@@ -69,7 +69,7 @@ def _default_db_path() -> Path:
     env_override = os.environ.get("REGISTRY_DB_PATH")
     if env_override:
         return Path(env_override)
-    return workspace / "orchestration" / "registry.db"
+    return workspace / "data" / "wos.db"
 
 
 # ---------------------------------------------------------------------------
