@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -209,8 +210,14 @@ def classify_issues(issues: list[GitHubIssue]) -> tuple[list[ClassifiedIssue], i
 # ---------------------------------------------------------------------------
 
 def _build_db_path() -> Path:
-    """Resolve the WOS database path."""
-    return Path.home() / "lobster-workspace" / "data" / "wos.db"
+    """Resolve the WOS database path.
+
+    Uses LOBSTER_WORKSPACE env var when set (consistent with registry_cli,
+    audit_queries, and wos_dashboard). Falls back to the default workspace path.
+    The canonical registry DB lives at orchestration/registry.db.
+    """
+    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+    return workspace / "orchestration" / "registry.db"
 
 
 def promote_to_wos(
