@@ -69,9 +69,50 @@ fi
 echo "[$START_ISO] Posting dispatch for job: $JOB_NAME" | tee "$LOG_FILE"
 
 # --- Check task file exists ---
+# If the task file is missing, self-heal by disabling the job rather than
+# looping on error every cron fire.
 if [ ! -f "$TASK_FILE" ]; then
-    echo "[$START_ISO] Error: Task file not found: $TASK_FILE" | tee -a "$LOG_FILE"
-    exit 1
+    echo "[$START_ISO] Task file not found: $TASK_FILE — disabling job '$JOB_NAME'" | tee -a "$LOG_FILE"
+    if [ -f "$JOBS_FILE" ]; then
+        JOBS_LOCK="${JOBS_FILE}.lock"
+        (
+            flock -x 9
+            if command -v jq &> /dev/null; then
+                TMP_FILE=$(mktemp)
+                jq --arg name "$JOB_NAME" \
+                   'if .jobs[$name] then .jobs[$name].enabled = false else . end' \
+                   "$JOBS_FILE" > "$TMP_FILE" && mv "$TMP_FILE" "$JOBS_FILE"
+            else
+                uv run - \
+                    "$JOBS_FILE" \
+                    "$JOB_NAME" \
+                    << 'PYEOF'
+import json, os, sys
+jobs_file = sys.argv[1]
+job_name  = sys.argv[2]
+with open(jobs_file) as f:
+    data = json.load(f)
+if job_name in data.get('jobs', {}):
+    data['jobs'][job_name]['enabled'] = False
+    tmp = jobs_file + '.tmp.' + str(os.getpid())
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, jobs_file)
+PYEOF
+            fi
+        ) 9>"$JOBS_LOCK" 2>/dev/null || true
+    fi
+    exit 0
+fi
+
+# --- Inbox dedup guard ---
+# If a pending dispatch for this job already exists in the inbox (e.g. a
+# previous run is still being processed), skip writing and exit cleanly.
+# This prevents inbox flooding when a subagent outruns its schedule interval.
+EXISTING=$(grep -rl "\"job_name\": \"${JOB_NAME}\"" "$INBOX_DIR" 2>/dev/null | head -1)
+if [ -n "$EXISTING" ]; then
+    echo "[$START_ISO] Pending dispatch already exists for '$JOB_NAME' ($EXISTING) — skipping" | tee -a "$LOG_FILE"
+    exit 0
 fi
 
 # --- Write scheduled_reminder to inbox ---
