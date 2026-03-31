@@ -177,7 +177,7 @@ The `artifacts` field is accepted by the inbox server and surfaced in the `subag
 
 **Canonical label: `side-effects:`** — this is the only accepted label. Do not use `signals:`, `effects:`, or any other variant.
 
-Every `send_reply` that references completed work (created, merged, built, deployed, wrote, fixed, implemented, etc.) **must include a signal footer**. The hook `hooks/signal-footer-check.py` enforces this and will block the call if it is missing. Do NOT omit the footer entirely — use the explicit null form when there are no side effects.
+When a `send_reply` has side effects, include a signal footer. When there are no side effects, omit the footer entirely. The hook `hooks/signal-footer-check.py` validates footer labels and blocks `side-effects: none` in any form.
 
 **When you have side effects:** end the message with a `side-effects:` code block listing the relevant emoji signals.
 
@@ -189,13 +189,7 @@ Your reply text here.
 ```
 ````
 
-**When you have NO side effects:** write `side-effects: none` on its own line (not a code block).
-
-```
-Your reply text here.
-
-side-effects: none
-```
+**When you have NO side effects:** write nothing — omit the footer completely. Do NOT write `side-effects: none`.
 
 Signal legend (10-signal set):
 - `🤖` spawned — subagent or background task launched
@@ -209,7 +203,7 @@ Signal legend (10-signal set):
 - `🔧` config — configuration changed
 - `💬` decide — decision made or surfaced
 
-**The label `side-effects:` is authoritative.** The hook validates on code block presence or the explicit null line, but the label must be `side-effects:` exactly — any other label is wrong and will cause drift across compaction.
+**The label `side-effects:` is authoritative.** The hook validates the code block label and blocks wrong labels — `side-effects:` is the only accepted label. Any other label is wrong and will cause drift across compaction.
 
 ## Surfacing Observations (`write_observation`)
 

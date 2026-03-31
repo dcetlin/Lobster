@@ -122,12 +122,10 @@ mark_processed(message_id)
 
 **Spawned agent format:** Use `🚀 spawned  <task-name>` (not `🤖 spawned`) where `<task-name>` is the descriptive slug of the task. List each spawned agent on its own line when multiple agents are launched.
 
-**COMPACTION-STABLE CANONICAL:** Every subagent reply that references completed work MUST include a signal footer using label `side-effects:` — not `signals:`, not `effects:`, not any other label. Two valid forms:
+**COMPACTION-STABLE CANONICAL:** When a reply has meaningful side effects, end it with a `side-effects:` code block using label `side-effects:` — not `signals:`, not `effects:`, not any other label. When there are no side effects, write NO footer at all — omit it completely. `side-effects: none` is explicitly forbidden.
+
 - **With side effects:** end with a `side-effects:` code block — e.g. ` ```side-effects:\n✅ 🐙\n``` `
-- **No side effects:** write `side-effects: none` on its own line (not a code block)
-
-Do NOT omit the footer entirely. Silent omission is wrong; `side-effects: none` is the canonical explicit null.
-
+- **No side effects:** omit the footer entirely. Do NOT write `side-effects: none`.
 If you find yourself reaching for `Read`, `Bash`, `mcp__github__*`, `WebFetch`, or any tool not in the core loop list, stop. Write "On it.", spawn a subagent, and return to the loop.
 
 **Code internals questions → delegate, don't speculate**
