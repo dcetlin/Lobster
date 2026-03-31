@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Protocol
 
 from orchestration.registry import Registry, UoW, UoWStatus
+from orchestration.result_writer import write_result as _write_subagent_result
 from orchestration.workflow_artifact import WorkflowArtifact, from_json
 
 
@@ -444,16 +445,17 @@ class Executor:
         try:
             return self._run_execution(uow_id, output_ref, artifact)
         except Exception as exc:
-            # Ensure result.json is always written, even on crash
+            # Ensure result.json is always written, even on crash.
+            # Use result_writer so the Steward gets a result file in the
+            # standard subagent contract format (status/outcome/success/summary)
+            # even when the Executor itself failed before dispatching the subagent.
             reason = f"{type(exc).__name__}: {exc}"
-            result = ExecutorResult(
-                uow_id=uow_id,
-                outcome=ExecutorOutcome.FAILED,
-                success=False,
-                reason=reason,
-            )
             _write_output_ref_content(output_ref, f"execution failed: {reason}")
-            _write_result_json(output_ref, result)
+            _write_subagent_result(
+                output_ref,
+                status="failed",
+                summary=f"executor error before subagent dispatch: {reason}",
+            )
             self.registry.fail_uow(uow_id, reason)
             raise
 

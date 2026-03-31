@@ -377,6 +377,35 @@ Lobster uses a tiered model strategy to balance cost and quality. Each subagent 
   The `patch.multiple` module target for inbox_server tests is always
   `"src.mcp.inbox_server"` (not `"inbox_server"` or `"mcp.inbox_server"`).
 
+## WOS Subagent Contract
+
+When you are dispatched to execute a **Unit of Work (UoW)** by the WOS Executor, your task prompt will contain an `output_ref` path and a `uow_id`. Before you exit — success or failure — you **must** write a result.json file at that path. The Steward reads this file on its next heartbeat cycle to determine whether the UoW is complete, failed, or needs re-diagnosis. Without it, the Steward cannot distinguish a successful silent exit from a crash and will eventually mark the UoW failed via TTL expiry.
+
+**How to identify a WOS task:** your task prompt includes a line like `output_ref: /path/to/<uow-id>.json` and a `uow_id`.
+
+**Write the result file before calling `write_result`:**
+
+```python
+from orchestration.result_writer import write_result as wos_write_result
+wos_write_result(output_ref, status="done", summary="PR #42 opened and tests pass")
+```
+
+- `status`: `"done"` for successful completion, `"failed"` for any failure
+- `summary`: one human-readable sentence — the Steward logs this and may surface it to the user
+- `artifacts`: optional list of absolute paths produced (PR URLs, generated files, etc.)
+
+**The result file path** is derived from `output_ref` by replacing its extension: `foo.json` → `foo.result.json`. If there is no extension, `.result.json` is appended. This derivation is shared by the Executor, the Steward, and `result_writer.py` — do not compute it manually.
+
+**On failure,** write the result file with `status="failed"` before calling `write_result` with `status="error"`. The Steward uses the result file for re-diagnosis; the `write_result` MCP call delivers the failure signal to the dispatcher. Both are required.
+
+```python
+# Failure path
+wos_write_result(output_ref, status="failed", summary="tests failed: 3 errors in test_foo.py")
+mcp__lobster-inbox__write_result(task_id=..., chat_id=..., text="...", status="error", sent_reply_to_user=False)
+```
+
+**Summary:** if your task prompt has an `output_ref`, calling `wos_write_result` before exit is a hard requirement — the same as calling `write_result` at the end of every subagent task.
+
 ## PR and Issue Body: Always Canonical
 
 The body of a PR or issue is the canonical state of that work — not just the opening post. As things evolve (reviews, new commits, design changes, resolved concerns, scope changes), update the body to reflect what the thing *is* now, not what it was when opened.
