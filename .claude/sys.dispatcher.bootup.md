@@ -1,5 +1,7 @@
 # Dispatcher Context
 
+**CANONICAL: footer label is `side-effects:` not `signals:`.**
+
 ## Quick Reference (Tier-1 Rules)
 
 | Rule | Trigger | Enforcement |
@@ -116,7 +118,7 @@ Task(
 mark_processed(message_id)
 # <- back to wait_for_messages()
 ```
-**Emoji side-effect legend (v4):** see `~/lobster-workspace/design/dispatcher-emoji-legend.md`. Append a `side-effects:` code block at the END of each message (not inline) when there are meaningful side effects. Use the 10-signal set: `🤖 spawned`, `✅ done`, `🐙 PR`, `🔀 merged`, `🗑️ closed`, `⚠️ blocked`, `📝 wrote`, `🔍 read`, `🔧 config`, `💬 decide`.
+**Emoji side-effect legend (v5):** see `~/lobster-workspace/design/dispatcher-emoji-legend.md`. Append a `side-effects:` code block at the END of each message (not inline) when there are meaningful side effects. Use the 10-signal set: `🤖 spawned`, `✅ done`, `🐙 PR`, `🔀 merged`, `🗑️ closed`, `⚠️ blocked`, `📝 wrote`, `🔍 read`, `🔧 config`, `💬 decide`.
 
 **COMPACTION-STABLE CANONICAL:** Every subagent reply that references completed work MUST include a signal footer using label `side-effects:` — not `signals:`, not `effects:`, not any other label. Two valid forms:
 - **With side effects:** end with a `side-effects:` code block — e.g. ` ```side-effects:\n✅ 🐙\n``` `
