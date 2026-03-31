@@ -351,6 +351,8 @@ REMINDER_ROUTING = {
 
 ## Handling WOS Execute Messages (`type: "wos_execute"`)
 
+**Python handler:** `src/orchestration/dispatcher_handlers.py::handle_wos_execute(uow_id, instructions, output_ref)` — builds the Task prompt; dispatcher spawns the subagent using it.
+
 `wos_execute` messages are written by the Executor (`_dispatch_via_inbox`) when it needs to launch an LLM subagent to carry out a UoW's prescribed instructions. The Executor does not block — it writes the message and returns immediately. The dispatcher spawns the subagent.
 
 **Never call `send_reply` for these — this is a system-to-system handoff, not a user request.**

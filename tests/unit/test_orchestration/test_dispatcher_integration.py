@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import pytest
 
-from src.orchestration.dispatcher_handlers import handle_approve, handle_confirm, handle_wos_status, handle_wos_unblock
+from src.orchestration.dispatcher_handlers import handle_approve, handle_confirm, handle_wos_execute, handle_wos_status, handle_wos_unblock
 
 
 @pytest.fixture
@@ -24,6 +24,79 @@ def uow_id(registry) -> str:
     today = datetime.now(timezone.utc).date().isoformat()
     result = registry.upsert(issue_number=200, title="Test issue for dispatcher", sweep_date=today)
     return result.id
+
+
+class TestHandleWosExecute:
+    """Tests for handle_wos_execute — pure prompt-builder for the wos_execute message type."""
+
+    _UOW_ID = "abc-123"
+    _INSTRUCTIONS = "Run the linter and fix any errors."
+    _OUTPUT_REF = "/home/lobster/lobster-workspace/orchestration/outputs/abc-123.result.json"
+
+    def _prompt(self) -> str:
+        return handle_wos_execute(self._UOW_ID, self._INSTRUCTIONS, self._OUTPUT_REF)
+
+    def test_returns_string(self):
+        """handle_wos_execute is a pure function — no side effects, returns str."""
+        result = self._prompt()
+        assert isinstance(result, str)
+
+    def test_prompt_includes_uow_id(self):
+        """The UoW ID must appear in the prompt so the subagent can correlate results."""
+        assert self._UOW_ID in self._prompt()
+
+    def test_prompt_includes_instructions(self):
+        """The prescribed instructions must be embedded verbatim."""
+        assert self._INSTRUCTIONS in self._prompt()
+
+    def test_prompt_includes_output_ref(self):
+        """The subagent must know the exact path to write the result file."""
+        assert self._OUTPUT_REF in self._prompt()
+
+    def test_prompt_includes_task_id_header(self):
+        """The task_id frontmatter must use the wos- prefix for dispatcher correlation."""
+        assert f"task_id: wos-{self._UOW_ID}" in self._prompt()
+
+    def test_prompt_includes_chat_id_zero(self):
+        """chat_id: 0 is the silent-drop sentinel — result must not be relayed to user."""
+        assert "chat_id: 0" in self._prompt()
+
+    def test_prompt_includes_result_contract_section(self):
+        """The result contract section must be present so the subagent knows what to write."""
+        assert "Result contract" in self._prompt()
+
+    def test_prompt_embeds_all_four_outcome_values(self):
+        """All four valid outcome values must appear in the result contract."""
+        prompt = self._prompt()
+        for outcome in ("complete", "partial", "failed", "blocked"):
+            assert outcome in prompt
+
+    def test_prompt_includes_write_result_instruction(self):
+        """The subagent must call write_result after writing the result file."""
+        assert "write_result" in self._prompt()
+
+    def test_prompt_includes_boundary_constraint(self):
+        """The Boundary constraint must prevent the subagent from touching WOS source files."""
+        assert "Boundary" in self._prompt()
+
+    def test_pure_function_same_inputs_same_output(self):
+        """Pure function contract: identical inputs always produce identical outputs."""
+        p1 = handle_wos_execute(self._UOW_ID, self._INSTRUCTIONS, self._OUTPUT_REF)
+        p2 = handle_wos_execute(self._UOW_ID, self._INSTRUCTIONS, self._OUTPUT_REF)
+        assert p1 == p2
+
+    def test_different_uow_ids_produce_different_prompts(self):
+        """Each UoW must produce a distinct prompt — no cross-contamination."""
+        p1 = handle_wos_execute("uow-001", self._INSTRUCTIONS, self._OUTPUT_REF)
+        p2 = handle_wos_execute("uow-002", self._INSTRUCTIONS, self._OUTPUT_REF)
+        assert p1 != p2
+
+    def test_uow_id_appears_in_task_id_and_body(self):
+        """UoW ID must appear in the frontmatter task_id AND in the body (for result correlation)."""
+        uow_id = "xyz-789"
+        prompt = handle_wos_execute(uow_id, self._INSTRUCTIONS, self._OUTPUT_REF)
+        assert f"wos-{uow_id}" in prompt   # frontmatter task_id
+        assert uow_id in prompt            # body (UoW ID line or result contract)
 
 
 class TestHandleApprove:
