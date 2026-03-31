@@ -228,6 +228,9 @@ def main() -> int:
     else:
         log.info("Executor heartbeat starting")
 
+    from src.orchestration.steward import is_bootup_candidate_gate_active
+    log.info("BOOTUP_CANDIDATE_GATE = %s", is_bootup_candidate_gate_active())
+
     from src.orchestration.registry import Registry
 
     db_path = _default_db_path()

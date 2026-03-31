@@ -929,9 +929,19 @@ Status: `proposed → pending`"
   Reply immediately: "Generating WOS PDF..." then let the bot deliver the file.
   If `[status]` is provided (e.g. `/wos pdf active`), pass `--status <status>` to the script.
 
+- `/wos unblock` — Clear BOOTUP_CANDIDATE_GATE so the Steward processes all UoWs,
+  including those with the `bootup-candidate` label (#271–#298).
+  Handle directly (no subagent — fast file write). Call:
+  ```python
+  from src.orchestration.dispatcher_handlers import handle_wos_unblock
+  reply = handle_wos_unblock()
+  ```
+  Reply with the returned string. No confirmation prompt needed — the command is
+  intentional and the effect is visible on the next steward-heartbeat cycle (~3 min).
+
 **Note:** Decide actions (Retry / Close on stuck UoWs) are handled via inline button callbacks — see "Handling WOS Surface Messages" section above.
 
-`/wos status` and `/confirm` are handled directly in the dispatcher (no subagent — fast CLI calls).
+`/wos status`, `/wos unblock`, and `/confirm` are handled directly in the dispatcher (no subagent — fast CLI calls).
 `/wos pdf` requires a subagent — dispatch it and reply "Generating WOS PDF..." immediately.
 
 

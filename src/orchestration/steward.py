@@ -95,9 +95,30 @@ StewardOutcome = Prescribed | Done | Surfaced | RaceSkipped
 # Module-level constants
 # ---------------------------------------------------------------------------
 
+# Path to the file-flag that clears BOOTUP_CANDIDATE_GATE.
+# When this file exists, the gate is cleared and bootup-candidate UoWs are
+# processed normally. Create via `/wos unblock` dispatcher command.
+_GATE_CLEARED_FLAG: Path = Path(
+    os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
+) / "data" / "wos-gate-cleared"
+
+
+def is_bootup_candidate_gate_active() -> bool:
+    """Return True if BOOTUP_CANDIDATE_GATE is active (blocking bootup-candidates).
+
+    Returns False when the wos-gate-cleared file flag exists, indicating the
+    Phase 2 validation sequence has passed and all UoWs should be processed.
+
+    This function reads from disk on every call so that the gate state is always
+    current — cron processes get a fresh read on every invocation.
+    """
+    return not _GATE_CLEARED_FLAG.exists()
+
+
 # When True, the Steward skips UoWs with the `bootup-candidate` label.
-# This gate is True by default until the Phase 2 validation sequence passes.
-BOOTUP_CANDIDATE_GATE: bool = True
+# Evaluated at module load; re-evaluated on each cron process start.
+# To clear: create ~/lobster-workspace/data/wos-gate-cleared (or /wos unblock).
+BOOTUP_CANDIDATE_GATE: bool = is_bootup_candidate_gate_active()
 
 # Status values — use UoWStatus StrEnum (kept as aliases for backward compat)
 _STATUS_READY_FOR_STEWARD = UoWStatus.READY_FOR_STEWARD
