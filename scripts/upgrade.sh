@@ -2926,6 +2926,43 @@ conn.close()
         substep "nightly-consolidation crontab entry already present"
     fi
 
+    # Migration 62: Add LOBSTER-GARDEN-CARETAKER cron entry and jobs.json registration
+    # (GardenCaretaker PR4, WOS Phase 2).
+    # Replaces cultivator.py + issue-sweeper.py with a unified scan-and-tend loop.
+    # Runs every 15 minutes as a Type B cron-direct script (not LLM-dispatched).
+    # jobs.json registration records it as Type B (dispatch=cron-direct) so the
+    # enabled gate in garden-caretaker.py can be toggled at runtime without touching cron.
+    local GARDEN_CARETAKER_MARKER="# LOBSTER-GARDEN-CARETAKER"
+    if ! crontab -l 2>/dev/null | grep -q "$GARDEN_CARETAKER_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$GARDEN_CARETAKER_MARKER" \
+            "*/15 * * * * cd $HOME && uv run $LOBSTER_DIR/scheduled-tasks/garden-caretaker.py >> $WORKSPACE_DIR/logs/garden-caretaker.log 2>&1 $GARDEN_CARETAKER_MARKER"
+        substep "Added garden-caretaker cron entry (garden-caretaker.py, every 15 min)"
+        migrated=$((migrated + 1))
+    else
+        substep "garden-caretaker crontab entry already present"
+    fi
+    local GARDEN_JOBS_FILE="$WORKSPACE_DIR/scheduled-jobs/jobs.json"
+    if [ -f "$GARDEN_JOBS_FILE" ] && command -v jq >/dev/null 2>&1; then
+        if ! jq -e '.jobs["garden-caretaker"]' "$GARDEN_JOBS_FILE" > /dev/null 2>&1; then
+            local gc_now_iso
+            gc_now_iso=$(date -u +"%Y-%m-%dT%H:%M:%S.%6N+00:00")
+            TMP_JOBS=$(mktemp)
+            jq --arg now "$gc_now_iso" '.jobs["garden-caretaker"] = {
+                "name": "garden-caretaker",
+                "schedule": "*/15 * * * *",
+                "schedule_human": "Every 15 minutes",
+                "task_file": null,
+                "created_at": $now,
+                "updated_at": $now,
+                "enabled": true,
+                "type": "C",
+                "dispatch": "cron-direct"
+            }' "$GARDEN_JOBS_FILE" > "$TMP_JOBS" && mv "$TMP_JOBS" "$GARDEN_JOBS_FILE"
+            substep "Registered garden-caretaker in jobs.json (Type B, every 15 min)"
+            migrated=$((migrated + 1))
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
