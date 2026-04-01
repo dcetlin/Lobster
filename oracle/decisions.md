@@ -1,5 +1,26 @@
 # Oracle: Decisions
 
+## [2026-04-01] PR #537 (dcetlin fork) — fix(inbox_server): replace hardcoded /home/admin/ path in bisque connection URL handler
+
+### Stage 1: Is this solving the right problem?
+
+The bug: `handle_get_bisque_connection_url` returns an error message with hardcoded `/home/admin/lobster/` paths when the dashboard token file is missing. This is wrong for any install where the user is not `admin`. The correct fix is to use the existing `_REPO_DIR` module-level constant (line 784), which already respects `LOBSTER_INSTALL_DIR` env var and falls back to `Path.home() / "lobster"`. STAGE 1: APPROVED.
+
+### Stage 2: Is the implementation well-made?
+
+Changes: 3 lines in the error-message-only branch (token file missing). Adds 2 local variables (`venv_python`, `dashboard_server`) constructed from `_REPO_DIR` and uses an f-string to render the command. The fix is inside the `if not token_file.exists():` branch — only executes when token is missing, which is an error path.
+
+Checks:
+- `_REPO_DIR` is defined at module scope (line 784) — no import or lazy-init needed.
+- Path construction: `_REPO_DIR / ".venv" / "bin" / "python3"` mirrors the actual venv layout from `install.sh`.
+- No behavioral change for the success path.
+- String conversion: Python's f-string on a `Path` object calls `__str__()` which renders the absolute path — correct.
+- Diff quality: +3/-2 lines. Surgical.
+
+**Verdict: APPROVED — merge.**
+
+---
+
 ## [2026-04-01] PR #536 — fix(surface-queue-delivery): correct oracle source key in SOURCE_WEIGHT and _SOURCE_LABELS (issue #263)
 
 ### Stage 1: Is this solving the right problem?
