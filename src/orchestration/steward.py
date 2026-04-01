@@ -500,6 +500,130 @@ def _assess_completion(
         return True, f"success_criteria is NULL — output_ref present with execution_complete posture: {uow.summary[:80]}", None
 
 
+# ---------------------------------------------------------------------------
+# Per-cycle trace entry builder (pure functions — no DB writes)
+# ---------------------------------------------------------------------------
+
+def _posture_rationale(diagnosis: dict) -> str:
+    """
+    Return a 1-sentence rationale for the current posture.
+
+    Pure function: derives the string deterministically from diagnosis fields.
+    No LLM, no DB reads. Called by _build_trace_entry().
+    """
+    posture = diagnosis.get("reentry_posture", "unknown")
+    cycles = diagnosis.get("_cycles", 0)
+
+    if posture == "first_execution":
+        return "No prior audit entries — first steward contact, dispatching executor."
+    elif posture == "execution_complete":
+        return "Executor result file present and valid — assessing completion."
+    elif posture == "crashed_output_ref_missing":
+        return "Startup sweep detected missing output_ref — executor may have crashed."
+    elif posture == "executor_orphan":
+        return "UoW stuck in ready-for-executor beyond threshold — executor never claimed."
+    elif posture == "diagnosing_orphan":
+        return "Steward crashed mid-diagnosis — re-diagnosing from current state."
+    elif posture == "steward_cycle_cap":
+        return f"Steward cycle cap reached ({cycles} cycles) — surfacing to Dan."
+    else:
+        return f"Posture: {posture}."
+
+
+def _extract_criteria_checks(diagnosis: dict) -> list[dict]:
+    """
+    Extract success criteria check results from the diagnosis dict.
+
+    Pure function: maps is_complete + completion_rationale to a list of
+    check dicts with {name, passed, evidence}. Always returns a list.
+    """
+    is_complete = diagnosis.get("is_complete", False)
+    completion_rationale = diagnosis.get("completion_rationale", "")
+    return [
+        {
+            "name": "completion_check",
+            "passed": bool(is_complete),
+            "evidence": completion_rationale,
+        }
+    ]
+
+
+def _posture_prediction(diagnosis: dict) -> str | None:
+    """
+    Return a forward prediction string based on the diagnosis.
+
+    Pure function: deterministic based on posture and completion state.
+    Returns None only when there is genuinely nothing to predict (done).
+    """
+    posture = diagnosis.get("reentry_posture", "unknown")
+    is_complete = diagnosis.get("is_complete", False)
+    stuck_condition = diagnosis.get("stuck_condition")
+
+    if stuck_condition:
+        return "Will be surfaced to Dan — stuck condition detected."
+    if is_complete:
+        return "Closure will be declared — completion criteria satisfied."
+    if posture == "first_execution":
+        return "Executor will be dispatched for first execution pass."
+    if posture == "execution_complete":
+        return "Completion check will determine next action (prescribe or close)."
+    if posture in ("crashed_no_output", "execution_failed"):
+        return "Re-prescription will be issued after failure analysis."
+    if posture == "executor_orphan":
+        return "Re-prescription will be issued — executor never claimed UoW."
+    return "Next prescription will be determined from diagnosis output."
+
+
+def _build_trace_entry(diagnosis: dict, cycles: int) -> dict:
+    """
+    Build a single steward_agenda trace entry from a completed diagnosis.
+
+    Pure function — no side effects, no DB writes. Called pre-branch in
+    _process_uow() after diagnosis and before the stuck/done/prescribe split.
+
+    Args:
+        diagnosis: dict returned by _diagnose_uow().
+        cycles: current uow.steward_cycles (pre-increment).
+
+    Returns:
+        Trace entry dict conforming to the v2 cycle trace entry schema.
+    """
+    # Inject cycles so _posture_rationale can access it for the cycle-cap case
+    diagnosis_with_cycles = {**diagnosis, "_cycles": cycles}
+
+    return {
+        "cycle": cycles,
+        "posture": diagnosis.get("reentry_posture", "unknown"),
+        "posture_rationale": _posture_rationale(diagnosis_with_cycles),
+        "success_criteria_checked": _extract_criteria_checks(diagnosis),
+        "anomalies": (
+            [diagnosis["stuck_condition"]]
+            if diagnosis.get("stuck_condition")
+            else []
+        ),
+        "prediction": _posture_prediction(diagnosis),
+        "dispatch_instruction": None,  # filled in by prescribe branch if applicable
+        "external_dependency": None,
+        "discoveries": [],
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+def _parse_steward_agenda(steward_agenda_str: str | None) -> list[dict]:
+    """
+    Parse steward_agenda JSON string into a list of dicts.
+
+    Pure function. Returns [] on None, empty string, or parse failure.
+    """
+    if not steward_agenda_str:
+        return []
+    try:
+        result = json.loads(steward_agenda_str)
+        return result if isinstance(result, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 def _build_initial_agenda(uow: "UoW", issue_body: str) -> list[dict[str, Any]]:
     """
     Build the initial steward_agenda for a new UoW (steward_cycles == 0).
@@ -1797,6 +1921,23 @@ def _process_uow(
             audit_note["note"] = "evaluating against summary field as fallback"
         registry.append_audit_log(uow_id, audit_note)
 
+    # Pre-branch trace write — unconditional, fires before stuck/done/prescribe split.
+    # The agenda list at this point contains the initial agenda nodes (from the
+    # initialization ritual above). We append one trace entry per cycle so
+    # steward_agenda accumulates a full cycle history. Branch-level writes that
+    # follow (done: mark nodes complete; prescribe: mark node prescribed) will
+    # overwrite steward_agenda with the trace entry already present in the list.
+    trace_entry = _build_trace_entry(diagnosis, cycles)
+    trace_agenda = _parse_steward_agenda(uow.steward_agenda)
+    # On cycle 0, the initial agenda was already written in the initialization
+    # ritual above; re-read it from the in-memory `agenda` variable to avoid
+    # an extra DB round-trip and to pick up that write's content.
+    if cycles == 0:
+        trace_agenda = list(agenda)
+    trace_agenda.append(trace_entry)
+    if not dry_run:
+        _write_steward_fields(registry, uow_id, steward_agenda=json.dumps(trace_agenda))
+
     # Step 4: Convergence or prescription
 
     # 4a: Stuck condition check (fires before completion/prescription)
@@ -1835,8 +1976,8 @@ def _process_uow(
 
     # 4b: Declare done
     if is_complete:
-        # Mark all agenda nodes complete
-        completed_agenda = _update_agenda_node_status(agenda, "complete")
+        # Mark all agenda nodes complete (including the trace entry just appended)
+        completed_agenda = _update_agenda_node_status(trace_agenda, "complete")
 
         closure_entry = {
             "event": "steward_closure",
@@ -1945,7 +2086,9 @@ def _process_uow(
     prescription_path = "llm" if _llm_path_taken[0] else "fallback"
 
     # Update agenda: mark current pending node as prescribed
-    updated_agenda = _mark_current_agenda_node_prescribed(agenda)
+    # Use trace_agenda (which includes the trace entry we just wrote) as the base
+    # so the prescription status update is applied on top of the full trace.
+    updated_agenda = _mark_current_agenda_node_prescribed(trace_agenda)
 
     prescription_log_entry = {
         "event": "reentry_prescription" if cycles > 0 else "prescription",

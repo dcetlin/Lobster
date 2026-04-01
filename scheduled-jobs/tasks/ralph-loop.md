@@ -454,6 +454,15 @@ conn.close()
 
 Expected posture sequence for a healthy first-execution UoW: `first_execution → [dispatch] → execution_complete`. Any unexpected posture (`crashed_output_ref_missing`, `steward_cycle_cap`, `executor_orphan`) appearing in the audit trail or as the final posture is a `bad_posture_transition` anomaly.
 
+**Audit 5 — Steward agenda trace completeness**
+
+For each RALPH test UoW that reached done or failed:
+- Parse `steward_agenda` JSON
+- Assert: count of entries with `"cycle"` key == `steward_cycles` for that UoW
+- Assert: each trace entry has `posture` (non-empty string), `posture_rationale` (non-empty string), `success_criteria_checked` (list), `anomalies` (list), `prediction` (string or None), `timestamp` (non-empty string)
+- Flag anomaly type `agenda_trace_missing` if trace count < `steward_cycles`
+- Flag anomaly type `agenda_trace_malformed` if any entry fails field validation
+
 **Build `anomalies_this_run`** — construct a list of anomaly dicts from both the basic checklist above AND the four deep audit checks. This list is written to `last_anomalies` in Step 7 and is used by the next cycle's reproducibility gate in Step 6. Each entry should be a dict:
 
 ```python
@@ -482,7 +491,7 @@ A **clean run** is defined as:
 - All injected UoWs reached `done` or `failed` within the polling timeout (10 min standard, 15 min for type-D cycles)
 - No posture anomalies (no stalled UoWs)
 - No errors in heartbeat logs during the window
-- All four deep exchange audits from Step 3 are clean: `steward_cycles <= 2` per UoW, no bad PRSC reasons for first-execution UoWs, no duplicate dispatches, no unexpected posture transitions
+- All five deep exchange audits from Step 3 are clean: `steward_cycles <= 2` per UoW, no bad PRSC reasons for first-execution UoWs, no duplicate dispatches, no unexpected posture transitions, and steward_agenda trace count equals steward_cycles with all entries passing field validation
 
 **Note**: A UoW reaching `failed` is acceptable if the failure reason is expected (e.g., the executor correctly identified an unsolvable task). A `failed` outcome with a recorded `return_reason` counts as clean. A timeout or a UoW with `steward_cycles = 0` after the polling timeout is NOT clean.
 

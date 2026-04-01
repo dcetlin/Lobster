@@ -344,3 +344,330 @@ def test_steward_picks_up_ready_for_steward_uow(registry: Registry, tmp_path: Pa
     assert cycle_result.get("evaluated", 0) >= 1, (
         f"Steward cycle reported 0 UoWs evaluated. Result: {cycle_result}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Helper shared by steward trace tests
+# ---------------------------------------------------------------------------
+
+def _seed_ready_for_steward_uow(
+    registry: Registry,
+    issue_number: int,
+    title: str,
+    success_criteria: str = "Test completion.",
+) -> str:
+    """Create a UoW and advance it to ready-for-steward. Returns uow_id."""
+    from orchestration.registry import UpsertInserted, ApproveConfirmed
+
+    result = registry.upsert(
+        issue_number=issue_number,
+        title=title,
+        success_criteria=success_criteria,
+    )
+    assert isinstance(result, UpsertInserted)
+    uow_id = result.id
+    approve = registry.approve(uow_id)
+    assert isinstance(approve, ApproveConfirmed), f"Approve failed: {approve!r}"
+    return uow_id
+
+
+def _null_notify(*_args, **_kwargs) -> None:
+    """No-op notification stub — tests must not send Telegram messages."""
+    pass
+
+
+def _stub_github_open(issue_number: int) -> dict:
+    """Stub GitHub client: open issue, no labels."""
+    return {
+        "status_code": 200,
+        "state": "open",
+        "labels": [],
+        "body": "Test UoW.",
+        "title": "Test",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Steward writes a trace entry on first execution
+# ---------------------------------------------------------------------------
+
+def test_steward_trace_entry_written_on_first_execution(registry: Registry, tmp_path: Path) -> None:
+    """run_steward_cycle() must append a trace entry to steward_agenda on first contact.
+
+    The trace entry must have cycle=0, posture="first_execution",
+    success_criteria_checked as a list, anomalies==[], and a non-empty
+    posture_rationale.
+    """
+    from src.orchestration.steward import run_steward_cycle
+
+    uow_id = _seed_ready_for_steward_uow(
+        registry,
+        issue_number=8001,
+        title="Trace entry first execution test",
+    )
+
+    run_steward_cycle(
+        registry=registry,
+        dry_run=False,
+        github_client=_stub_github_open,
+        artifact_dir=tmp_path / "artifacts",
+        notify_dan=_null_notify,
+        notify_dan_early_warning=_null_notify,
+        bootup_candidate_gate=False,
+        llm_prescriber=None,
+    )
+
+    uow_after = registry.get(uow_id)
+    assert uow_after is not None
+    assert uow_after.steward_agenda is not None, "steward_agenda is None after cycle"
+
+    agenda = json.loads(uow_after.steward_agenda)
+    assert isinstance(agenda, list), f"steward_agenda is not a list: {agenda!r}"
+
+    # Find the trace entry (has "cycle" key)
+    trace_entries = [e for e in agenda if "cycle" in e]
+    assert len(trace_entries) >= 1, (
+        f"No trace entries found in agenda. Full agenda: {agenda}"
+    )
+
+    entry = trace_entries[0]
+    assert entry["cycle"] == 0, f"Expected cycle=0, got {entry['cycle']!r}"
+    assert entry["posture"] == "first_execution", (
+        f"Expected posture='first_execution', got {entry['posture']!r}"
+    )
+    assert isinstance(entry["success_criteria_checked"], list), (
+        f"success_criteria_checked is not a list: {entry['success_criteria_checked']!r}"
+    )
+    assert entry["anomalies"] == [], (
+        f"Expected anomalies=[], got {entry['anomalies']!r}"
+    )
+    assert isinstance(entry.get("posture_rationale"), str) and entry["posture_rationale"], (
+        f"posture_rationale is empty or missing: {entry.get('posture_rationale')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 6: Steward trace entries accumulate across cycles
+# ---------------------------------------------------------------------------
+
+def test_steward_trace_entry_accumulates_per_cycle(registry: Registry, tmp_path: Path) -> None:
+    """steward_agenda must accumulate one trace entry per steward cycle.
+
+    After the first cycle the agenda has 1 trace entry; after a second cycle
+    (simulated by advancing UoW back to ready-for-steward) it has 2.
+    """
+    from src.orchestration.steward import run_steward_cycle
+
+    uow_id = _seed_ready_for_steward_uow(
+        registry,
+        issue_number=8002,
+        title="Trace accumulation test",
+    )
+
+    # Cycle 1
+    run_steward_cycle(
+        registry=registry,
+        dry_run=False,
+        github_client=_stub_github_open,
+        artifact_dir=tmp_path / "artifacts",
+        notify_dan=_null_notify,
+        notify_dan_early_warning=_null_notify,
+        bootup_candidate_gate=False,
+        llm_prescriber=None,
+    )
+
+    uow_after_1 = registry.get(uow_id)
+    assert uow_after_1 is not None
+    agenda_1 = json.loads(uow_after_1.steward_agenda or "[]")
+    trace_entries_1 = [e for e in agenda_1 if "cycle" in e]
+    assert len(trace_entries_1) == 1, (
+        f"Expected 1 trace entry after cycle 1, got {len(trace_entries_1)}: {agenda_1}"
+    )
+
+    # Advance UoW back to ready-for-steward to simulate executor return
+    # (set status directly so we can run a second Steward pass)
+    registry.set_status_direct(uow_id, "ready-for-steward")
+
+    # Cycle 2
+    run_steward_cycle(
+        registry=registry,
+        dry_run=False,
+        github_client=_stub_github_open,
+        artifact_dir=tmp_path / "artifacts",
+        notify_dan=_null_notify,
+        notify_dan_early_warning=_null_notify,
+        bootup_candidate_gate=False,
+        llm_prescriber=None,
+    )
+
+    uow_after_2 = registry.get(uow_id)
+    assert uow_after_2 is not None
+    agenda_2 = json.loads(uow_after_2.steward_agenda or "[]")
+    trace_entries_2 = [e for e in agenda_2 if "cycle" in e]
+    assert len(trace_entries_2) == 2, (
+        f"Expected 2 trace entries after cycle 2, got {len(trace_entries_2)}: {agenda_2}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 7: Trace entry shows completion_check passed on a done UoW
+# ---------------------------------------------------------------------------
+
+def test_steward_trace_completion_check_passes_on_done(registry: Registry, tmp_path: Path) -> None:
+    """When the executor signals completion, the trace entry must show passed=True.
+
+    Simulated by writing a result file with outcome=complete and advancing the
+    UoW through an execution cycle before the steward re-enters.
+    """
+    import uuid
+    from src.orchestration.steward import run_steward_cycle
+    from orchestration.registry import UpsertInserted, ApproveConfirmed
+
+    # Seed and advance UoW
+    result = registry.upsert(
+        issue_number=8003,
+        title="Completion check trace test",
+        success_criteria="Output must report outcome=complete.",
+    )
+    assert isinstance(result, UpsertInserted)
+    uow_id = result.id
+    approve = registry.approve(uow_id)
+    assert isinstance(approve, ApproveConfirmed)
+
+    # Cycle 1: first_execution — steward dispatches executor
+    run_steward_cycle(
+        registry=registry,
+        dry_run=False,
+        github_client=_stub_github_open,
+        artifact_dir=tmp_path / "artifacts",
+        notify_dan=_null_notify,
+        notify_dan_early_warning=_null_notify,
+        bootup_candidate_gate=False,
+        llm_prescriber=None,
+    )
+
+    # Simulate executor completing: set output_ref + result file + audit entry
+    output_ref = str(tmp_path / f"{uow_id}.output.md")
+    Path(output_ref).write_text("Execution output — complete.", encoding="utf-8")
+
+    result_file = Path(output_ref + ".result.json")
+    result_file.write_text(
+        json.dumps({"uow_id": uow_id, "outcome": "complete", "reason": "all steps done"}),
+        encoding="utf-8",
+    )
+
+    # Write output_ref to the UoW record and write an execution_complete audit entry
+    conn = sqlite3.connect(str(registry.db_path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        "UPDATE uow_registry SET output_ref = ?, status = 'ready-for-steward' WHERE id = ?",
+        (output_ref, uow_id),
+    )
+    conn.commit()
+    conn.close()
+    registry.append_audit_log(uow_id, {
+        "event": "execution_complete",
+        "actor": "executor",
+        "uow_id": uow_id,
+        "timestamp": _now_iso(),
+    })
+
+    # Cycle 2: steward re-enters and should find execution_complete posture
+    run_steward_cycle(
+        registry=registry,
+        dry_run=False,
+        github_client=_stub_github_open,
+        artifact_dir=tmp_path / "artifacts",
+        notify_dan=_null_notify,
+        notify_dan_early_warning=_null_notify,
+        bootup_candidate_gate=False,
+        llm_prescriber=None,
+    )
+
+    uow_after = registry.get(uow_id)
+    assert uow_after is not None
+    agenda = json.loads(uow_after.steward_agenda or "[]")
+    trace_entries = [e for e in agenda if "cycle" in e]
+    assert len(trace_entries) >= 2, (
+        f"Expected at least 2 trace entries, got {len(trace_entries)}: {agenda}"
+    )
+
+    # The cycle 1 trace entry (index depends on initial agenda nodes before traces)
+    # Find the trace entry with cycle==1 (second pass)
+    cycle_1_entry = next((e for e in trace_entries if e["cycle"] == 1), None)
+    assert cycle_1_entry is not None, (
+        f"No trace entry with cycle=1 found. Trace entries: {trace_entries}"
+    )
+    checks = cycle_1_entry.get("success_criteria_checked", [])
+    assert len(checks) >= 1, (
+        f"success_criteria_checked is empty in cycle 1 trace entry: {cycle_1_entry}"
+    )
+    assert checks[0]["passed"] is True, (
+        f"Expected passed=True for execution_complete posture, got {checks[0]!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Trace entry captures anomaly on stuck condition
+# ---------------------------------------------------------------------------
+
+def test_steward_trace_anomaly_captured_on_stuck(registry: Registry, tmp_path: Path) -> None:
+    """When a stuck condition fires, the trace entry anomalies list must be non-empty.
+
+    Simulated by forcing the hard-cap condition (steward_cycles >= _HARD_CAP_CYCLES)
+    via direct SQL — the Steward will diagnose hard_cap as stuck_condition and
+    write a trace entry with anomalies=[hard_cap].
+    """
+    from src.orchestration.steward import run_steward_cycle, _HARD_CAP_CYCLES
+
+    uow_id = _seed_ready_for_steward_uow(
+        registry,
+        issue_number=8004,
+        title="Anomaly trace capture test",
+    )
+
+    # Directly set steward_cycles to _HARD_CAP_CYCLES so the Steward
+    # immediately hits the hard_cap stuck condition on next diagnosis.
+    conn = sqlite3.connect(str(registry.db_path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        "UPDATE uow_registry SET steward_cycles = ? WHERE id = ?",
+        (_HARD_CAP_CYCLES, uow_id),
+    )
+    conn.commit()
+    conn.close()
+
+    captured_notifications: list[tuple] = []
+
+    def _capturing_notify(uow, condition, **_kwargs) -> None:
+        captured_notifications.append((uow.id, condition))
+
+    run_steward_cycle(
+        registry=registry,
+        dry_run=False,
+        github_client=_stub_github_open,
+        artifact_dir=tmp_path / "artifacts",
+        notify_dan=_capturing_notify,
+        notify_dan_early_warning=_null_notify,
+        bootup_candidate_gate=False,
+        llm_prescriber=None,
+    )
+
+    uow_after = registry.get(uow_id)
+    assert uow_after is not None
+    agenda = json.loads(uow_after.steward_agenda or "[]")
+    trace_entries = [e for e in agenda if "cycle" in e]
+    assert len(trace_entries) >= 1, (
+        f"No trace entries found in agenda after stuck cycle: {agenda}"
+    )
+
+    # Find the trace entry for this cycle (cycle == _HARD_CAP_CYCLES)
+    stuck_entry = next((e for e in trace_entries if e["cycle"] == _HARD_CAP_CYCLES), None)
+    assert stuck_entry is not None, (
+        f"No trace entry with cycle={_HARD_CAP_CYCLES} found. Entries: {trace_entries}"
+    )
+    assert len(stuck_entry.get("anomalies", [])) > 0, (
+        f"Expected non-empty anomalies for hard_cap stuck condition, got: {stuck_entry!r}"
+    )
+    # Also verify the notification was fired (confirms the stuck branch was hit)
+    assert len(captured_notifications) >= 1, "Stuck condition did not fire a Dan notification"
