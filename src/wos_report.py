@@ -1068,25 +1068,52 @@ def _load_bot_token() -> str:
 
 
 def send_document_direct(pdf_path: Path, chat_id: int, caption: str = "") -> None:
-    """Send the PDF directly to Telegram via the Bot API (sendDocument)."""
-    import subprocess
+    """Send the PDF directly to Telegram via the Bot API (sendDocument).
+
+    Uses urllib multipart/form-data upload — no subprocess or external binary required.
+    The bot token stays in-process and is never exposed in command arguments.
+    """
+    import mimetypes
+    import urllib.request
+
     token = _load_bot_token()
     url = f"https://api.telegram.org/bot{token}/sendDocument"
-    result = subprocess.run(
-        [
-            "curl", "-s",
-            "-F", f"document=@{pdf_path}",
-            "-F", f"chat_id={chat_id}",
-            "-F", f"caption={caption}",
-            url,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=60,
+
+    boundary = "lobster-wos-report-boundary"
+    file_bytes = pdf_path.read_bytes()
+    mime_type = mimetypes.guess_type(str(pdf_path))[0] or "application/pdf"
+
+    def _field(name: str, value: str) -> bytes:
+        return (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f"{value}\r\n"
+        ).encode()
+
+    body = (
+        _field("chat_id", str(chat_id))
+        + _field("caption", caption)
+        + (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="document"; filename="{pdf_path.name}"\r\n'
+            f"Content-Type: {mime_type}\r\n\r\n"
+        ).encode()
+        + file_bytes
+        + f"\r\n--{boundary}--\r\n".encode()
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"curl failed (exit {result.returncode}): {result.stderr}")
-    response = json.loads(result.stdout)
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        raw = resp.read().decode()
+    try:
+        response = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Telegram API returned non-JSON response: {raw!r}") from exc
     if not response.get("ok"):
         raise RuntimeError(f"Telegram API error: {response}")
 
