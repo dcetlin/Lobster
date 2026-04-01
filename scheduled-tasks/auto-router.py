@@ -28,12 +28,22 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+# ---------------------------------------------------------------------------
+# Path setup — allow running as a script or via importlib (tests)
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from src.orchestration.paths import SURFACE_QUEUE  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-QUEUE_PATH = Path.home() / "lobster-workspace" / "meta" / "reflective-surface-queue.json"
+QUEUE_PATH = SURFACE_QUEUE
 
 ADMIN_CHAT_ID = int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586"))
 
