@@ -8,7 +8,7 @@ Usage:
 Options:
     --chat-id           Telegram chat ID to send to (default: 8075091586)
     --output PATH       Output PDF path (default: ~/messages/documents/wos-report-<timestamp>.pdf)
-    --no-send           Generate PDF but do not queue for Telegram delivery
+    --no-send           Generate PDF but do not send to Telegram (default: send directly via Bot API)
     --status STATUS     Filter by status (e.g. active, done, proposed; default: all)
     --since YYYY-MM-DD  Include only UoWs created on or after this date
     --ids id1,id2,...   Include only the specified UoW IDs (comma-separated)
@@ -1051,24 +1051,71 @@ def generate_pdf(uows: list[dict], output_path: Path) -> Path:
 
 # ── Telegram delivery ─────────────────────────────────────────────────────────
 
-def queue_for_telegram(pdf_path: Path, chat_id: int, caption: str = "") -> Path:
-    """Write an outbox JSON file that instructs the bot to send this PDF."""
-    import uuid
-    OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
-    msg_id = uuid.uuid4().hex[:12]
-    outbox_file = OUTBOX_DIR / f"wos-report-{msg_id}.json"
-    payload = {
-        "chat_id": chat_id,
-        "type": "document",
-        "document_path": str(pdf_path),
-        "filename": pdf_path.name,
-        "caption": caption,
-        "mime_type": "application/pdf",
-    }
-    tmp = outbox_file.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload))
-    tmp.rename(outbox_file)
-    return outbox_file
+def _load_bot_token() -> str:
+    """Load TELEGRAM_BOT_TOKEN from the environment or ~/lobster-config/config.env."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if token:
+        return token
+    config_file = Path.home() / "lobster-config" / "config.env"
+    if config_file.exists():
+        for line in config_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("TELEGRAM_BOT_TOKEN="):
+                return line.split("=", 1)[1].strip()
+    raise RuntimeError(
+        "TELEGRAM_BOT_TOKEN not found in environment or ~/lobster-config/config.env"
+    )
+
+
+def send_document_direct(pdf_path: Path, chat_id: int, caption: str = "") -> None:
+    """Send the PDF directly to Telegram via the Bot API (sendDocument).
+
+    Uses urllib multipart/form-data upload — no subprocess or external binary required.
+    The bot token stays in-process and is never exposed in command arguments.
+    """
+    import mimetypes
+    import urllib.request
+
+    token = _load_bot_token()
+    url = f"https://api.telegram.org/bot{token}/sendDocument"
+
+    boundary = "lobster-wos-report-boundary"
+    file_bytes = pdf_path.read_bytes()
+    mime_type = mimetypes.guess_type(str(pdf_path))[0] or "application/pdf"
+
+    def _field(name: str, value: str) -> bytes:
+        return (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f"{value}\r\n"
+        ).encode()
+
+    body = (
+        _field("chat_id", str(chat_id))
+        + _field("caption", caption)
+        + (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="document"; filename="{pdf_path.name}"\r\n'
+            f"Content-Type: {mime_type}\r\n\r\n"
+        ).encode()
+        + file_bytes
+        + f"\r\n--{boundary}--\r\n".encode()
+    )
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        raw = resp.read().decode()
+    try:
+        response = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Telegram API returned non-JSON response: {raw!r}") from exc
+    if not response.get("ok"):
+        raise RuntimeError(f"Telegram API error: {response}")
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
@@ -1083,7 +1130,7 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--output", type=Path,
                         help="Output PDF path (default: auto-named in ~/messages/documents/)")
     parser.add_argument("--no-send", action="store_true",
-                        help="Generate PDF but do not queue for Telegram delivery")
+                        help="Generate PDF but do not send to Telegram")
     parser.add_argument("--status", type=str, default=None,
                         help="Filter by status (e.g. active, done, proposed; default: all)")
     parser.add_argument("--since", type=str, default=None,
@@ -1137,8 +1184,8 @@ def main(argv: list[str] | None = None):
         if filter_str:
             caption += f", {filter_str}"
         caption += f") -- {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-        outbox_file = queue_for_telegram(output_path, args.chat_id, caption)
-        print(f"Queued for Telegram delivery: {outbox_file}")
+        send_document_direct(output_path, args.chat_id, caption)
+        print(f"Sent PDF directly to Telegram chat {args.chat_id}")
     else:
         print("--no-send: skipping Telegram delivery")
 
