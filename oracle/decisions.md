@@ -1,5 +1,29 @@
 # Oracle: Decisions
 
+## [2026-04-01] PR #536 — fix(surface-queue-delivery): correct oracle source key in SOURCE_WEIGHT and _SOURCE_LABELS (issue #263)
+
+### Stage 1: Is this solving the right problem?
+
+Adversarial prior: the wrong fix would be to rename the queue's source_file values from "oracle/decisions.md" to "meta/oracle/learnings.md" — that would require changing all producers that write to the queue and would break any items already in the queue.
+
+Finding: the reflective-surface-queue.json queue stores oracle items with `source_file: "oracle/decisions.md"`. The `SOURCE_WEIGHT` and `_SOURCE_LABELS` dicts both used `"meta/oracle/learnings.md"` as the key — a path that does not exist. The fix aligns the dicts to the actual key value produced by queue writers.
+
+Decision: change the dict keys to match the actual `source_file` value that appears in queue items. This is surgical and correct. STAGE 1: APPROVED.
+
+### Stage 2: Is the implementation well-made?
+
+Changes: two string literals replaced in `SOURCE_WEIGHT` and `_SOURCE_LABELS` dicts. No logic changes. Human-readable label "Oracle Learnings" preserved in `_GROUP_ORDER`.
+
+Checks:
+- `priority_score()` calls `SOURCE_WEIGHT.get(source_file, DEFAULT_SOURCE_WEIGHT)` — after fix, oracle items receive weight 20 instead of falling through to 5.
+- `_source_label()` calls `_SOURCE_LABELS.get(...)` — after fix, oracle items display "Oracle Learnings" correctly instead of showing the raw path.
+- Regression risk: none — the old key was never matched; the fix promotes items from DEFAULT_SOURCE_WEIGHT (5) to their intended weight (20).
+- Diff quality: 2 lines changed, net 0. Fully surgical.
+
+**Verdict: APPROVED — merge.**
+
+---
+
 ## [2026-04-01] PR #499 — fix(auto-router): correct QUEUE_PATH to live meta/ path (issue #260)
 
 ### Stage 1: Is this solving the right problem?
