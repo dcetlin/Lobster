@@ -2220,6 +2220,20 @@ else:
         migrated=$((migrated + 1))
     fi
 
+    # Migration 66: Add LOBSTER-FILE-SIZE-MONITOR cron entry.
+    # Runs weekly (Monday 07:00 UTC) to check key bootup/config files against
+    # line-count thresholds and file GitHub issues when any file exceeds its
+    # threshold. Addresses bug #9 (sys.dispatcher.bootup.md grew to 2,403 lines
+    # with no alert, silently hiding the last 403 lines from the Read tool).
+    local _fsm_marker="# LOBSTER-FILE-SIZE-MONITOR"
+    local _fsm_script="$LOBSTER_DIR/scheduled-tasks/file-size-monitor.py"
+    if ! crontab -l 2>/dev/null | grep -qF "$_fsm_marker"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$_fsm_marker" \
+            "0 7 * * 1 cd $LOBSTER_DIR && $HOME/.local/bin/uv run scheduled-tasks/file-size-monitor.py >> $WORKSPACE_DIR/scheduled-jobs/logs/file-size-monitor.log 2>&1 $_fsm_marker"
+        substep "Added file-size-monitor cron entry (weekly Mon 07:00 UTC)"
+        migrated=$((migrated + 1))
+    fi
+
     # Source instance-specific migration steps if user-update.sh exists
     local _user_update_sh
     _user_update_sh="$(dirname "$0")/user-update.sh"
