@@ -94,7 +94,7 @@ uv run ~/lobster/src/orchestration/registry_cli.py upsert \
 After upserting, immediately confirm the UoW so it goes directly to `pending` status:
 
 ```bash
-uv run ~/lobster/src/orchestration/registry_cli.py confirm --id <uow-id>
+uv run ~/lobster/src/orchestration/registry_cli.py approve --id <uow-id>
 ```
 
 The /confirm gate is removed. UoWs are accepted on creation. No manual confirmation from Dan is required.
@@ -146,7 +146,7 @@ Order by created_at (oldest first). All items are labeled "awaiting execution".
 
 Note: The /confirm gate has been removed. UoWs go directly from upsert → confirm → pending.
 If any items appear with status `proposed`, that indicates a sweep ran before this change —
-confirm them manually with `registry_cli.py confirm --id <uow-id>`.
+approve them manually with `registry_cli.py approve --id <uow-id>`.
 
 ### 6b. Build the design visibility list
 
