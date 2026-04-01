@@ -33,10 +33,7 @@ from pathlib import Path
 # Constants
 # ---------------------------------------------------------------------------
 
-QUEUE_PATH = Path.home() / "lobster-workspace" / "hygiene" / "meta" / "reflective-surface-queue.json"
-
-# Fall back to the old path if the new one doesn't exist
-_OLD_QUEUE_PATH = Path.home() / "lobster-workspace" / "meta" / "reflective-surface-queue.json"
+QUEUE_PATH = Path.home() / "lobster-workspace" / "meta" / "reflective-surface-queue.json"
 
 ADMIN_CHAT_ID = int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586"))
 
@@ -246,20 +243,6 @@ def format_design_surface_message(item: dict) -> str:
 # Queue I/O
 # ---------------------------------------------------------------------------
 
-def _resolve_queue_path() -> Path:
-    """Return the queue path that exists, preferring the new hygiene/meta location."""
-    if QUEUE_PATH.exists():
-        return QUEUE_PATH
-    if _OLD_QUEUE_PATH.exists():
-        logging.warning(
-            "Using legacy queue path %s — migrate to %s",
-            _OLD_QUEUE_PATH,
-            QUEUE_PATH,
-        )
-        return _OLD_QUEUE_PATH
-    # Return the canonical new path even if it doesn't exist yet — callers handle missing
-    return QUEUE_PATH
-
 
 def load_queue(path: Path) -> list[dict]:
     """Load and parse queue JSON. Returns empty list if missing or malformed."""
@@ -414,7 +397,7 @@ def run() -> int:
 
     print(f"[{timestamp_iso}] Starting auto-router")
 
-    queue_path = _resolve_queue_path()
+    queue_path = QUEUE_PATH
     print(f"  Queue path: {queue_path}")
 
     items = load_queue(queue_path)
