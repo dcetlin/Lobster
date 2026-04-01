@@ -528,21 +528,23 @@ def _select_executor_type(uow: "UoW") -> str:
     summary_lower = uow.summary.lower()
     source = (uow.source or "").lower()
 
-    # Infrastructure / ops signals
-    ops_keywords = (
-        "install", "deploy", "cron", "systemd", "migration", "upgrade",
-        "ops", "infra", "server", "config", "script", "setup", "lobster-ops",
-    )
-    if any(kw in summary_lower for kw in ops_keywords):
-        return _EXECUTOR_TYPE_LOBSTER_OPS
-
-    # Code / feature / bug signals — default for GitHub issues
+    # Code / feature / bug signals checked first — these are strong indicators
+    # that win over incidental ops-adjacent terms (e.g. "fix: setup script fails"
+    # should route to functional-engineer, not lobster-ops).
     code_keywords = (
         "bug", "fix", "feat", "feature", "implement", "refactor", "test",
         "pr", "pull request", "issue", "error", "crash", "regression",
     )
     if any(kw in summary_lower for kw in code_keywords):
         return _EXECUTOR_TYPE_FUNCTIONAL_ENGINEER
+
+    # Infrastructure / ops signals — checked after code keywords
+    ops_keywords = (
+        "install", "deploy", "cron", "systemd", "migration", "upgrade",
+        "ops", "infra", "server", "config", "script", "setup", "lobster-ops",
+    )
+    if any(kw in summary_lower for kw in ops_keywords):
+        return _EXECUTOR_TYPE_LOBSTER_OPS
 
     # Default: functional-engineer for anything sourced from a GitHub issue
     if "github:issue" in source:
