@@ -107,6 +107,7 @@ Cron → script → done  (no inbox write, no subagent)
 | `lobstertalk-incoming-check.sh` | Layer 1 API poll | Polls bot-talk API for messages addressed to SaharLobster; skips dispatch if none |
 | `sync-crontab.sh` | Mode C (local-code) | Syncs crontab from config; no LLM, no inbox write |
 | `export-logs.py` | Mode C (local-code) | Exports log data; no LLM, no inbox write |
+| `file-size-monitor.py` | Mode C (local-code) | Checks bootup/config file line counts; files GitHub issue if threshold exceeded; no LLM, no inbox write |
 | `transcription-monitor.py` | Mode C (local-code) | Progress pings during transcription; writes to outbox directly (see Delivery Convention Exception) |
 | `pattern-candidate-sweep.py` | Mode B task executor | Called by the `pattern-candidate-sweep` subagent; not a cron script |
 | `weekly-epistemic-retro.py` | Mode B task executor | Called by the `weekly-epistemic-retro` subagent; not a cron script |
