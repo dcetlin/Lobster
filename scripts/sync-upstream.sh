@@ -6,9 +6,11 @@
 #
 # Behavior:
 #   1. Fetch upstream/main
+#   1b. Hot-zone pre-diff: log upstream changes to known sensitive files
 #   2. Attempt git merge
 #   3. Clean merge → push to origin, log silently
 #   4. Conflicts → abort merge, write an inbox message for Dan to review
+#       (false-conflict detection: log net-zero resolved files as false positives)
 #
 # Usage:
 #   ./sync-upstream.sh [--chat-id <id>] [--dry-run]
@@ -21,6 +23,12 @@
 #   0 - Success (clean merge or already up to date)
 #   1 - Conflict alert sent (merge aborted, human judgment needed)
 #   2 - General error
+#
+# Merge cadence:
+#   Configured via cron in crontab. Current default: twice daily (8am, 8pm).
+#   To change frequency, run: cron-manage.sh edit upstream-sync
+#   or update the cron expression in: scripts/install.sh (search MERGE_CADENCE)
+#   MERGE_CADENCE="0 8,20 * * *"  # twice daily — edit this to change schedule
 #===============================================================================
 
 set -euo pipefail
@@ -36,6 +44,13 @@ LOG_FILE="$WORKSPACE_DIR/logs/upstream-sync.log"
 CHAT_ID="8075091586"
 DRY_RUN=false
 LOCK_FILE="/tmp/lobster-upstream-sync.lock"
+
+# Hot-zone files: upstream changes to these are always logged before merge
+# because they contain fork-specific additions that are prone to conflicts.
+HOT_ZONE_FILES=(
+    ".claude/sys.dispatcher.bootup.md"
+    "src/bot/lobster_bot.py"
+)
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -154,6 +169,58 @@ file_conflict_block() {
     echo "$local_log" | sed 's/^/    /'
 }
 
+# Log upstream diff for hot-zone files before attempting merge.
+# Pure function: reads git state, emits log lines, no side effects on repo.
+log_hot_zone_diff() {
+    local any_changes=false
+    for file in "${HOT_ZONE_FILES[@]}"; do
+        local diff_stat
+        diff_stat=$(git -C "$LOBSTER_DIR" diff HEAD upstream/main -- "$file" 2>/dev/null | head -40 || true)
+        if [ -n "$diff_stat" ]; then
+            if ! $any_changes; then
+                log INFO "--- Hot-zone pre-diff (files with upstream changes) ---"
+                any_changes=true
+            fi
+            log INFO "Hot-zone changed: $file"
+            echo "$diff_stat" | sed 's/^/  /' | tee -a "$LOG_FILE"
+        fi
+    done
+    if $any_changes; then
+        log INFO "--- End hot-zone pre-diff ---"
+    else
+        log INFO "Hot-zone files unchanged in upstream/main — no pre-diff needed"
+    fi
+}
+
+# Check if a conflicting file is a false conflict: upstream's version of the
+# file is identical to what we have in HEAD. If so, accepting either side
+# produces no net change and the "conflict" is spurious.
+# Returns 0 (true/is false conflict) if upstream's blob == HEAD's blob.
+# Must be called while MERGE_HEAD is still valid (before git merge --abort).
+is_false_conflict() {
+    local file="$1"
+    local our_blob upstream_blob
+    our_blob=$(git -C "$LOBSTER_DIR" show "HEAD:$file" 2>/dev/null || true)
+    upstream_blob=$(git -C "$LOBSTER_DIR" show "MERGE_HEAD:$file" 2>/dev/null || true)
+    [ "$our_blob" = "$upstream_blob" ]
+}
+
+# Scan conflicting files for false positives (net-zero diffs) while MERGE_HEAD
+# is still valid. Logs candidates so they can be promoted to Tier 1 in future.
+detect_false_conflicts() {
+    local conflicting="$1"
+    local false_positives=()
+    while IFS= read -r file; do
+        if is_false_conflict "$file"; then
+            false_positives+=("$file")
+            log INFO "False-conflict candidate (identical content vs upstream): $file"
+        fi
+    done <<< "$conflicting"
+    if [ "${#false_positives[@]}" -gt 0 ]; then
+        log INFO "False-conflict summary: ${false_positives[*]} — consider promoting to Tier 1 auto-resolution"
+    fi
+}
+
 # Build the full conflict report as a plain string
 build_conflict_report() {
     local conflicting="$1"
@@ -247,6 +314,16 @@ main() {
         log INFO "upstream/main is $behind commit(s) ahead — merging"
     fi
 
+    # Step 2b: Hot-zone pre-diff
+    # Diff known sensitive files against upstream before the merge so that any
+    # fork-specific additions in those files are visible in the log before git
+    # starts producing conflict markers.
+    if $DRY_RUN; then
+        log INFO "[dry-run] Would: log_hot_zone_diff"
+    else
+        log_hot_zone_diff
+    fi
+
     # Step 3: Attempt merge
     log INFO "Attempting merge of upstream/main..."
     local merge_exit=0
@@ -290,6 +367,10 @@ main() {
     fi
 
     log WARN "Conflicting files: $(echo "$conflicting" | tr '\n' ' ')"
+
+    # Detect false conflicts (net-zero files) before aborting — MERGE_HEAD is
+    # still valid here, and is_false_conflict compares staged resolution to HEAD.
+    detect_false_conflicts "$conflicting"
 
     # Build conflict report before aborting (we need MERGE_HEAD for git log)
     local report
