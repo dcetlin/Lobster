@@ -3,13 +3,17 @@
 wos_report.py — Generate a PDF of the WOS Registry and send it to Telegram.
 
 Usage:
-    uv run ~/lobster/src/wos_report.py [--chat-id CHAT_ID] [--output PATH] [--no-send]
+    uv run ~/lobster/src/wos_report.py [OPTIONS]
 
 Options:
-    --chat-id   Telegram chat ID to send to (default: 8075091586)
-    --output    Output file path (default: ~/messages/documents/wos-report-<timestamp>.pdf)
-    --no-send   Generate PDF but do not queue for sending
-    --status    Filter by status (default: all)
+    --chat-id           Telegram chat ID to send to (default: 8075091586)
+    --output PATH       Output PDF path (default: ~/messages/documents/wos-report-<timestamp>.pdf)
+    --no-send           Generate PDF but do not queue for Telegram delivery
+    --status STATUS     Filter by status (e.g. active, done, proposed; default: all)
+    --since YYYY-MM-DD  Include only UoWs created on or after this date
+    --ids id1,id2,...   Include only the specified UoW IDs (comma-separated)
+
+Filters combine: --since and --ids are applied after --status.
 """
 
 from __future__ import annotations
@@ -224,26 +228,49 @@ def _build_steward_exchange(log_events: list[dict]) -> list[dict]:
     return exchange
 
 
-def fetch_uows(status_filter: str | None = None) -> list[dict]:
-    """Load UoWs from the registry DB, sorted by created_at descending."""
+def fetch_uows(
+    status_filter: str | None = None,
+    since: str | None = None,
+    ids: list[str] | None = None,
+) -> list[dict]:
+    """Load UoWs from the registry DB, sorted by created_at descending.
+
+    Args:
+        status_filter: If given, only UoWs with this exact status are returned.
+        since:         If given (ISO date string YYYY-MM-DD), only UoWs whose
+                       created_at is >= this date are returned.
+        ids:           If given, only UoWs whose id is in this list are returned.
+                       Applied after status_filter and since.
+    """
     if not REGISTRY_DB.exists():
         raise FileNotFoundError(f"Registry DB not found: {REGISTRY_DB}")
     conn = sqlite3.connect(str(REGISTRY_DB))
     conn.row_factory = sqlite3.Row
     try:
+        conditions: list[str] = []
+        params: list[str] = []
+
         if status_filter:
-            rows = conn.execute(
-                "SELECT * FROM uow_registry WHERE status=? ORDER BY created_at DESC",
-                (status_filter,)
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM uow_registry ORDER BY created_at DESC"
-            ).fetchall()
+            conditions.append("status = ?")
+            params.append(status_filter)
+        if since:
+            # Normalize to ISO datetime so string comparison works regardless of
+            # whether the DB stores timestamps with or without the time component.
+            conditions.append("created_at >= ?")
+            params.append(since)
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        rows = conn.execute(
+            f"SELECT * FROM uow_registry {where} ORDER BY created_at DESC",
+            params,
+        ).fetchall()
 
         uows = []
         for row in rows:
             d = dict(row)
+            # Apply --ids filter in Python (simpler than a parameterised IN clause)
+            if ids is not None and d["id"] not in ids:
+                continue
 
             # All audit events (chronological) for lifecycle reconstruction
             audits = conn.execute(
@@ -1047,30 +1074,49 @@ def queue_for_telegram(pdf_path: Path, chat_id: int, caption: str = "") -> Path:
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None):
-    parser = argparse.ArgumentParser(description="Generate WOS Registry PDF report")
+    parser = argparse.ArgumentParser(
+        description="Generate WOS Registry PDF report",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--chat-id", type=int, default=DEFAULT_CHAT_ID,
-                        help="Telegram chat ID to send to")
+                        help="Telegram chat ID to send to (default: %(default)s)")
     parser.add_argument("--output", type=Path,
                         help="Output PDF path (default: auto-named in ~/messages/documents/)")
     parser.add_argument("--no-send", action="store_true",
                         help="Generate PDF but do not queue for Telegram delivery")
     parser.add_argument("--status", type=str, default=None,
-                        help="Filter by status (e.g. active, done, proposed)")
+                        help="Filter by status (e.g. active, done, proposed; default: all)")
+    parser.add_argument("--since", type=str, default=None,
+                        metavar="YYYY-MM-DD",
+                        help="Include only UoWs created on or after this date")
+    parser.add_argument("--ids", type=str, default=None,
+                        metavar="ID1,ID2,...",
+                        help="Include only the specified UoW IDs (comma-separated)")
     args = parser.parse_args(argv)
 
+    # Resolve output path
     if args.output:
-        output_path = args.output
+        output_path = Path(args.output)
     else:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        # Use ~/messages/audio/ or a sibling dir visible to lobster-router.
+        # Use ~/messages/documents/ visible to lobster-router.
         # /tmp is private to the systemd service (PrivateTmp=true), so PDFs
         # written there are invisible to the bot process.
         pdf_dir = Path(os.environ.get("LOBSTER_MESSAGES", Path.home() / "messages")) / "documents"
         pdf_dir.mkdir(parents=True, exist_ok=True)
         output_path = pdf_dir / f"wos-report-{ts}.pdf"
 
+    # Parse --ids into a list (None means no ID filter)
+    ids_filter: list[str] | None = None
+    if args.ids:
+        ids_filter = [i.strip() for i in args.ids.split(",") if i.strip()]
+
     print(f"Loading registry from {REGISTRY_DB}...")
-    uows = fetch_uows(status_filter=args.status)
+    uows = fetch_uows(
+        status_filter=args.status,
+        since=args.since,
+        ids=ids_filter,
+    )
     print(f"Found {len(uows)} unit(s) of work")
 
     print(f"Generating PDF: {output_path}")
@@ -1078,9 +1124,18 @@ def main(argv: list[str] | None = None):
     print(f"PDF written: {output_path} ({output_path.stat().st_size:,} bytes)")
 
     if not args.no_send:
-        caption = f"WOS Registry ({len(uows)} UoWs"
+        # Build a descriptive caption
+        filters: list[str] = []
         if args.status:
-            caption += f", status={args.status}"
+            filters.append(f"status={args.status}")
+        if args.since:
+            filters.append(f"since={args.since}")
+        if ids_filter:
+            filters.append(f"ids={len(ids_filter)}")
+        filter_str = ", ".join(filters)
+        caption = f"WOS Registry ({len(uows)} UoWs"
+        if filter_str:
+            caption += f", {filter_str}"
         caption += f") -- {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
         outbox_file = queue_for_telegram(output_path, args.chat_id, caption)
         print(f"Queued for Telegram delivery: {outbox_file}")
