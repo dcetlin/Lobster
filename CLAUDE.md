@@ -159,6 +159,8 @@ All Lobster-managed projects live in `$LOBSTER_WORKSPACE/projects/[project-name]
 
 For changes that affect existing installs (new cron entries, new directories, config renames, new service files), add a numbered migration to `scripts/upgrade.sh` — not just `install.sh`. See `.claude/agents/lobster-ops.md` for the migration format and upgrade procedure.
 
+**Instance-specific migrations** (steps containing hardcoded `chat_id`s, dcetlin-specific issue refs, or WOS orchestration content) go in `scripts/user-update.sh` instead. That file is sourced automatically at the end of `upgrade.sh` if it exists, and inherits all logging functions and variables. Number instance-specific steps `d1`, `d2`, … to avoid collisions with the core migration numbering in `upgrade.sh`.
+
 ## Scheduling Architecture
 
 Two scheduling layers:
