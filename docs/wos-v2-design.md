@@ -155,7 +155,7 @@ Each UoW entry in the UoWRegistry has the following fields. Fields are written a
 | `prescribed_skills` | `TEXT` (JSON array) \| `NULL` | Steward prescription | Skill IDs to be loaded by the Executor at task start. |
 | `success_criteria` | `TEXT NOT NULL` (new UoWs) / `TEXT NULL` (Phase 2 migration) | creation (germination) | Required for new UoWs. Prose description of what completion looks like for this UoW. Written at germination time; immutable thereafter. The Steward evaluates output against this field at every re-entry — it is the anchor that prevents premature termination and endless refinement. A new UoW without `success_criteria` is invalid and is rejected at germination time. **Phase 1→2 migration note:** The #309 migration adds this as `TEXT NULL` to preserve existing Phase 1 records. For pre-existing UoWs with `success_criteria = NULL`: the Steward falls back to evaluating against the `summary` field and writes a `success_criteria_missing` audit entry to flag the gap. |
 | `steward_cycles` | `INTEGER NOT NULL DEFAULT 0` | Steward re-entry | Count of Steward diagnosis/prescription cycles completed on this UoW. Surface condition 3 (hard cap) fires at 5. |
-| `steward_agenda` | `TEXT NULL` (JSON) | Steward only | Oracle-style forward forecast written by the Steward at first contact (`steward_cycles == 0`). List/tree of anticipated prescription nodes, each: `{posture, context, constraints, status: pending\|prescribed\|complete}`. Updated on each re-entry as new information arrives. **Steward-private — never read by the Executor.** |
+| `steward_agenda` | `TEXT NULL` (JSON) | Steward only | Oracle-style forward forecast written by the Steward at first contact (`steward_cycles == 0`). JSON array of cycle trace entries, one per Steward pass. Each entry schema (v2): `{cycle, mode, posture, posture_rationale, external_dependency, prediction, dispatch_instruction, success_criteria_checked, anomalies, discoveries, timestamp}`. Fields: `mode` mirrors `uow_mode` at this cycle (can evolve if criteria stabilize mid-run); `prediction` is the Steward's forward forecast of what happens next; `dispatch_instruction` is what the executor is asked to do (null on terminal cycles); `external_dependency` is null if unblocked or a string naming the blocking actor; `discoveries` is a list of typed observations outside original scope (empty list if clean). Updated on each re-entry. **Steward-private — never read by the Executor.** |
 | `steward_log` | `TEXT NULL` | Steward only | Append-only newline-delimited JSON log of every Steward decision point — diagnosis rationale, prescription decisions, surface-to-Dan trigger fires, agenda updates. Steward-to-future-self. **Steward-private — never read by the Executor.** |
 | `audit_log` | JSON array \| external table | every event | Ordered audit entries. Each entry: `{event, actor, timestamp, note}`. Every state transition is appended here before the transition is considered complete. |
 | `route_reason` | `TEXT` \| `NULL` | Classifier | Human-readable rationale for the posture assigned by the Routing Classifier. |
@@ -250,6 +250,24 @@ For each `ready-for-steward` UoW, the Steward:
 
 **Initialization ritual:** On first contact with a new UoW (`steward_cycles == 0` at the start of a diagnosis pass), the Steward's first act is to write an initial `steward_agenda` before any prescription decision is made. Forecast depth is calibrated by the Steward: well-defined UoWs (concrete deliverable, clear scope) get a full agenda upfront; open-ended UoWs (exploratory, ill-defined scope) get 1-2 steps with a `"pending evaluation"` marker for the remainder. The agenda is a structured forecast, not a contract.
 
+**Cycle trace entry schema (v2):** Each entry appended to `steward_agenda` on every Steward pass:
+
+```json
+{
+  "cycle": 0,
+  "mode": "posture_driven",
+  "posture": "orienting",
+  "posture_rationale": "First contact. No stable success_criteria. Entering negotiation loop.",
+  "external_dependency": null,
+  "prediction": "Criteria will stabilize after scope confirmation from Dan.",
+  "dispatch_instruction": "Ask Dan: is the goal a full redesign or API surface only?",
+  "success_criteria_checked": [],
+  "anomalies": [],
+  "discoveries": [],
+  "timestamp": "2026-04-01T17:00:00Z"
+}
+```
+
 **Re-entry decision protocol (summary):** On every Executor return, the Steward reads all inputs (Seed, `steward_agenda`, `steward_log`, Executor's structured return, `output_ref` contents, `steward_cycles`) before writing anything. Decision sequence: (1) parse the `return_reason` and classify (Normal / Blocked / Abnormal / Error / Orphan); (2) assess completion against the Seed and `success_criteria` — this is the primary gate, not `return_reason` alone; (3a) if complete: write closure, mark agenda nodes, set `completed_at`, transition to `done`; (3b) if incomplete: update `steward_agenda`, write next prescription, append `steward_log` entry, transition to `ready-for-executor`. Full re-entry spec lives in #303.
 
 The Steward surfaces to Dan under three conditions: (1) something is severely wrong and outside confident operating range; (2) Dan's perspective would materially change the prescription; (3) `steward_cycles >= 5` — hard cap, surface unconditionally. (The prior surface condition 3 was "same primitive twice, no new input." The hard cap at 5 replaces this as the convergence-velocity proxy — it is externally measurable without requiring the Steward to classify its own state.)
@@ -299,6 +317,7 @@ Minimum required fields in the result file:
 | `outcome` | yes | `"complete"` \| `"partial"` \| `"failed"` \| `"blocked"` |
 | `success` | yes | `true` iff `outcome == "complete"` |
 | `reason` | for non-complete | Human-readable explanation |
+| `side_effects` | yes (empty list if none) | Typed list of side effects produced during execution. Schema: `[{"type": "<type>", ...}]`. Known types: `github_issue_filed` (`ref`), `uow_spawned` (`uow_id`), `file_modified` (`path`), `external_api_call` (`service`, `operation`). Enforcement and aggregation are future infrastructure; schema reserved now to avoid retroactive surgery. Example: `[{"type": "github_issue_filed", "ref": "#123"}, {"type": "uow_spawned", "uow_id": "uow_20260401_abc_a"}]` |
 
 The Steward's `_assess_completion` reads this file to route the UoW. If the file is absent and `success_criteria` is set, the Steward cannot declare done — it will cycle to the hard cap (5 retries) and surface to Dan. **Absence of the result file is a contract violation, not an ambiguous state.**
 
