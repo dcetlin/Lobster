@@ -100,21 +100,28 @@ class TestHandleWosExecute:
 
 
 class TestHandleApprove:
-    def test_success_message_contains_status_transition(self, registry, uow_id):
+    def test_success_message_contains_ready_for_steward(self, registry, uow_id):
+        """approve now goes proposed → ready-for-steward; response reflects that."""
+        response = handle_approve(uow_id, registry=registry)
+        assert "ready-for-steward" in response.lower()
+        assert uow_id in response
+
+    def test_success_message_notes_pending_via(self, registry, uow_id):
+        """Response mentions 'via pending' so the user knows the intermediate step."""
         response = handle_approve(uow_id, registry=registry)
         assert "pending" in response.lower()
-        assert uow_id in response
 
     def test_not_found_message(self, registry):
         response = handle_approve("nonexistent-id", registry=registry)
         assert "not found" in response.lower()
         assert "/wos status proposed" in response
 
-    def test_already_pending_message(self, registry, uow_id):
+    def test_already_ready_for_steward_message(self, registry, uow_id):
+        """After approve, second approve returns ApproveSkipped with current ready-for-steward status."""
         registry.approve(uow_id)
         response = handle_approve(uow_id, registry=registry)
-        # Should mention current status, not raise
-        assert "pending" in response.lower()
+        # Should mention current status (ready-for-steward), not raise
+        assert "ready-for-steward" in response.lower()
 
     def test_expired_message(self, registry):
         today = datetime.now(timezone.utc).date().isoformat()
@@ -129,7 +136,7 @@ class TestHandleConfirmAlias:
 
     def test_confirm_alias_delegates_to_approve(self, registry, uow_id):
         response = handle_confirm(uow_id, registry=registry)
-        assert "pending" in response.lower()
+        assert "ready-for-steward" in response.lower()
         assert uow_id in response
 
 
@@ -153,13 +160,14 @@ class TestHandleWosStatus:
         assert r.id in response
         assert "Status test issue" in response
 
-    def test_defaults_to_active_and_pending(self, registry):
+    def test_defaults_to_active_and_queued(self, registry):
+        """Default /wos status shows active + ready-for-steward (+ pending for backward compat)."""
         today = datetime.now(timezone.utc).date().isoformat()
         r1 = registry.upsert(issue_number=230, title="Active issue", sweep_date=today, success_criteria="Test completion.")
         registry.set_status_direct(r1.id, "active")
-        r2 = registry.upsert(issue_number=231, title="Pending issue", sweep_date=today, success_criteria="Test completion.")
-        registry.approve(r2.id)
-        # No status arg → returns active + pending
+        r2 = registry.upsert(issue_number=231, title="Approved issue", sweep_date=today, success_criteria="Test completion.")
+        registry.approve(r2.id)  # now lands on ready-for-steward, not pending
+        # No status arg → returns active + ready-for-steward + pending
         response = handle_wos_status(None, registry=registry)
         assert r1.id in response
         assert r2.id in response

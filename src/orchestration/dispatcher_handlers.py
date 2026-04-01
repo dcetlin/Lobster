@@ -94,7 +94,7 @@ def handle_approve(uow_id: str, *, registry: "Registry") -> str:
         case ApproveConfirmed():
             return (
                 f"UoW `{uow_id}` confirmed.\n"
-                f"Status: `proposed \u2192 pending`"
+                f"Status: `proposed \u2192 ready-for-steward` (via pending)"
             )
         case ApproveNotFound():
             return (
@@ -167,16 +167,19 @@ def handle_wos_status(status: str | None, *, registry: "Registry") -> str:
     """
     Handle /wos status [status].
 
-    When status is None, returns active + pending records (the useful default
-    for "what's running and what's queued?").
+    When status is None, returns active + ready-for-steward + pending records
+    (the useful default for "what's running and what's queued?"). Pending is
+    included for backward compatibility with any UoWs that were written before
+    the auto-advance change; in normal operation pending is never a resting state.
 
     Format per record: <id> | <summary> | source: <source> | created: <date>
     """
     if status is None:
         active = registry.list(status="active")
+        ready_for_steward = registry.list(status="ready-for-steward")
         pending = registry.list(status="pending")
-        records = active + pending
-        header = "Active + pending UoWs:"
+        records = active + ready_for_steward + pending
+        header = "Active + queued UoWs:"
     else:
         records = registry.list(status=status)
         header = f"UoWs with status `{status}`:"
