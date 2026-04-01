@@ -11,7 +11,7 @@ De-duplication: if a GitHub issue with the same warning title is already open,
 the script skips filing a new one to avoid issue spam.
 
 Mode: Type C (cron-direct, local-code). No inbox write, no LLM round-trip.
-Cron schedule (weekly, Monday 07:00 UTC):
+Cron schedule (weekly, Monday 07:00 UTC) — managed via upgrade.sh migration 66:
     0 7 * * 1  cd ~/lobster && uv run scheduled-tasks/file-size-monitor.py >> ~/lobster-workspace/scheduled-jobs/logs/file-size-monitor.log 2>&1 # LOBSTER-FILE-SIZE-MONITOR
 
 Run standalone:
@@ -45,7 +45,39 @@ if str(_REPO_ROOT) not in sys.path:
 _WORKSPACE = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
 _LOGS_DIR = _WORKSPACE / "scheduled-jobs" / "logs"
 
-REPO = "SiderealPress/lobster"
+def _resolve_repo(repo_root: Path) -> str:
+    """
+    Derive the GitHub repo (owner/name) from the git remote, or fall back to
+    the LOBSTER_GITHUB_REPO env var.  Raises RuntimeError if neither works.
+    """
+    env_repo = os.environ.get("LOBSTER_GITHUB_REPO", "").strip()
+    if env_repo:
+        return env_repo
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=repo_root,
+        )
+        if result.returncode == 0:
+            url = result.stdout.strip()
+            # Handle SSH (git@github.com:owner/repo.git) and HTTPS forms.
+            if url.startswith("git@"):
+                # git@github.com:owner/repo.git -> owner/repo
+                path_part = url.split(":", 1)[-1]
+            else:
+                # https://github.com/owner/repo.git -> owner/repo
+                path_part = url.split("github.com/", 1)[-1]
+            return path_part.removesuffix(".git")
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    raise RuntimeError(
+        "Cannot determine GitHub repo. Set LOBSTER_GITHUB_REPO env var "
+        "(e.g. export LOBSTER_GITHUB_REPO=owner/repo)."
+    )
+
 
 # Files to monitor and their line-count thresholds.
 # The Read tool's default limit is 2,000 lines. Files approaching that limit
@@ -55,7 +87,9 @@ FILE_THRESHOLDS: dict[str, int] = {
     ".claude/sys.subagent.bootup.md": 2000,
     "CLAUDE.md": 1500,
     "oracle/decisions.md": 500,
-    "oracle/learnings.md": 300,
+    # oracle/learnings.md is expected to grow — threshold set at 500 (not 300)
+    # to avoid firing on the first run after a healthy accumulation period.
+    "oracle/learnings.md": 500,
 }
 
 GITHUB_LABEL = "observability"
@@ -93,8 +127,20 @@ def count_lines(path: Path) -> int | None:
         return None
 
 
+def build_dedup_title(rel_path: str, threshold: int) -> str:
+    """
+    Return the file-stable deduplication key used to check for an existing open issue.
+
+    Excludes the actual line count so that the title is stable across runs even
+    when the file oscillates around the threshold. If we included the count, a
+    file fluctuating between e.g. 505 and 498 lines would produce a new issue
+    every time it crosses back above the threshold.
+    """
+    return f"warn: {rel_path} exceeds {threshold}-line threshold"
+
+
 def build_issue_title(rel_path: str, threshold: int, actual: int) -> str:
-    """Return the canonical warning title for a threshold violation."""
+    """Return the full issue title (includes actual count for human readability)."""
     return f"warn: {rel_path} exceeds {threshold}-line threshold ({actual} lines)"
 
 
@@ -118,6 +164,11 @@ def check_files(repo_root: Path, thresholds: dict[str, int]) -> list[dict]:
                 "rel_path": rel_path,
                 "threshold": threshold,
                 "actual": actual,
+                # dedup_title is the stable key (no line count) used to check
+                # whether an open issue already exists for this file+threshold.
+                "dedup_title": build_dedup_title(rel_path, threshold),
+                # title includes the actual count for human readability in the
+                # filed issue.
                 "title": build_issue_title(rel_path, threshold, actual),
             })
     return violations
@@ -233,9 +284,15 @@ def main() -> int:
     args = parse_args()
     repo_root = _REPO_ROOT
 
+    try:
+        repo = _resolve_repo(repo_root)
+    except RuntimeError as exc:
+        log.error("Could not resolve GitHub repo: %s", exc)
+        return 1
+
     log.info(
-        "file-size-monitor start | repo_root=%s dry_run=%s",
-        repo_root, args.dry_run,
+        "file-size-monitor start | repo_root=%s repo=%s dry_run=%s",
+        repo_root, repo, args.dry_run,
     )
 
     violations = check_files(repo_root, FILE_THRESHOLDS)
@@ -252,21 +309,24 @@ def main() -> int:
             log.info("[dry-run] Would file: %s", v["title"])
         return 0
 
-    open_titles = fetch_open_issue_titles(REPO)
-    ensure_label_exists(REPO, GITHUB_LABEL)
+    open_titles = fetch_open_issue_titles(repo)
+    ensure_label_exists(repo, GITHUB_LABEL)
 
     filed = 0
     skipped = 0
     failed = 0
 
     for violation in violations:
+        dedup_title = violation["dedup_title"]
         title = violation["title"]
-        if title in open_titles:
-            log.info("Issue already open, skipping: %s", title)
+        # Dedup on the stable key (no line count) so oscillation around the
+        # threshold does not generate a new issue on every run.
+        if any(t.startswith(dedup_title) for t in open_titles):
+            log.info("Issue already open, skipping: %s", dedup_title)
             skipped += 1
             continue
         body = build_issue_body(violation, repo_root)
-        success = file_github_issue(REPO, title, body, GITHUB_LABEL)
+        success = file_github_issue(repo, title, body, GITHUB_LABEL)
         if success:
             filed += 1
         else:

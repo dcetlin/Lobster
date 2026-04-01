@@ -2229,7 +2229,7 @@ else:
     local _fsm_script="$LOBSTER_DIR/scheduled-tasks/file-size-monitor.py"
     if ! crontab -l 2>/dev/null | grep -qF "$_fsm_marker"; then
         "$LOBSTER_DIR/scripts/cron-manage.sh" add "$_fsm_marker" \
-            "0 7 * * 1 cd $LOBSTER_DIR && $HOME/.local/bin/uv run scheduled-tasks/file-size-monitor.py >> $WORKSPACE_DIR/scheduled-jobs/logs/file-size-monitor.log 2>&1 $_fsm_marker"
+            "0 7 * * 1 cd $LOBSTER_DIR && uv run scheduled-tasks/file-size-monitor.py >> $WORKSPACE_DIR/scheduled-jobs/logs/file-size-monitor.log 2>&1 $_fsm_marker"
         substep "Added file-size-monitor cron entry (weekly Mon 07:00 UTC)"
         migrated=$((migrated + 1))
     fi
