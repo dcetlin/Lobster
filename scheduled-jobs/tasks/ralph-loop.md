@@ -542,7 +542,30 @@ Create the reports directory and write a markdown report:
 mkdir -p /home/lobster/lobster-workspace/data/ralph-reports/
 ```
 
-Write a report to `/home/lobster/lobster-workspace/data/ralph-reports/ralph-<YYYY-MM-DD-HHMMSS>.md`:
+**Generate WOS reports** — after the RALPH markdown report is written, run wos_report.py on the injected UoW IDs to generate:
+1. A summary PDF (sent to Dan via Telegram)
+2. A full markdown investigation report (saved locally for deep debugging)
+
+```bash
+# Substitute actual UoW IDs from Step 1 (comma-separated, no spaces)
+UOW_IDS="uow_<date>_<run_id>_a,uow_<date>_<run_id>_b,uow_<date>_<run_id>_c"
+# If type-D was injected, add it: UOW_IDS="${UOW_IDS},uow_<date>_<run_id>_d"
+
+REPORT_TS=$(date +%Y%m%d-%H%M%S)
+SUMMARY_PDF="/home/lobster/messages/documents/wos-ralph-${REPORT_TS}.pdf"
+FULL_MD="/home/lobster/lobster-workspace/data/ralph-reports/wos-full-${REPORT_TS}.md"
+
+cd /home/lobster/lobster && uv run src/wos_report.py \
+  --ids "${UOW_IDS}" \
+  --output "${SUMMARY_PDF}" \
+  --full-output "${FULL_MD}"
+```
+
+The summary PDF is automatically sent to Dan (chat_id 8075091586) with caption "WOS Registry (N UoWs, ids=N) -- timestamp". The full markdown report is saved to `ralph-reports/` for investigation.
+
+If `wos_report.py` fails (e.g., DB not found), log the error and continue — report failure is not a pipeline anomaly.
+
+Write a RALPH cycle report to `/home/lobster/lobster-workspace/data/ralph-reports/ralph-<YYYY-MM-DD-HHMMSS>.md`:
 
 ```markdown
 # RALPH Cycle Report — <timestamp ET>
