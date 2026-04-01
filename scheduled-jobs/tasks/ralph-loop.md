@@ -229,14 +229,173 @@ tail -30 /home/lobster/lobster-workspace/scheduled-jobs/logs/executor-heartbeat.
 - Errors in steward or executor logs during the window
 - `wos-config.json` `execution_enabled = false` (executor paused — note this, do not treat as anomaly)
 
-**Build `anomalies_this_run`** — construct a list of anomaly dicts from the above checklist. This list is written to `last_anomalies` in Step 7 and is used by the next cycle's reproducibility gate in Step 6. Each entry should be a dict:
+**Deep exchange audit** — after checking terminal states, run these four additional checks. "Checking did it complete" is not sufficient; the exchange quality must also be audited.
+
+**Audit 1 — Steward cycle count:**
+
+```python
+import sqlite3, json
+
+db = '/home/lobster/lobster-workspace/orchestration/registry.db'
+run_id = "<run_id from Step 1>"  # substitute actual run_id
+uow_ids = [f"uow_{date}_{run_id}_a", f"uow_{date}_{run_id}_b", f"uow_{date}_{run_id}_c"]
+
+conn = sqlite3.connect(db)
+cur = conn.cursor()
+cur.execute(
+    f"SELECT id, steward_cycles FROM uow_registry WHERE id IN ({','.join('?'*len(uow_ids))})",
+    uow_ids
+)
+for uow_id, cycles in cur.fetchall():
+    print(f"{uow_id}: steward_cycles={cycles}")
+    if cycles >= 3:
+        print(f"  ANOMALY: steward_cycles={cycles} >= 3 (clean run expects <= 2)")
+conn.close()
+```
+
+A clean first-execution run should have `steward_cycles <= 2` (1 to prescribe, 1 to close). If any UoW has `steward_cycles >= 3`, flag as anomaly type `steward_cycle_excess` with detail including the actual cycle count.
+
+**Audit 2 — PRSC reasons from steward_log:**
+
+```python
+import sqlite3, json
+
+db = '/home/lobster/lobster-workspace/orchestration/registry.db'
+run_id = "<run_id from Step 1>"  # substitute actual run_id
+uow_ids = [f"uow_{date}_{run_id}_a", f"uow_{date}_{run_id}_b", f"uow_{date}_{run_id}_c"]
+
+conn = sqlite3.connect(db)
+cur = conn.cursor()
+cur.execute(
+    f"SELECT id, steward_log FROM uow_registry WHERE id IN ({','.join('?'*len(uow_ids))})",
+    uow_ids
+)
+
+ACCEPTABLE_FIRST_EXEC_PRSC = {"first_execution", "never dispatched", "not yet dispatched"}
+BAD_FIRST_EXEC_PRSC_PATTERNS = ["output_ref is null", "file does not exist", "is empty"]
+
+for uow_id, steward_log_raw in cur.fetchall():
+    if not steward_log_raw:
+        continue
+    try:
+        log_entries = json.loads(steward_log_raw) if isinstance(steward_log_raw, str) else steward_log_raw
+        if not isinstance(log_entries, list):
+            log_entries = [log_entries]
+    except Exception:
+        log_entries = []
+
+    for entry in log_entries:
+        reason = str(entry.get("reason", entry.get("prsc_reason", ""))).lower()
+        posture = str(entry.get("posture", entry.get("from_posture", ""))).lower()
+        tag = str(entry.get("tag", "")).upper()
+
+        if "[PRSC]" in str(entry) or tag == "PRSC":
+            is_bad = any(pat in reason for pat in BAD_FIRST_EXEC_PRSC_PATTERNS)
+            is_first_exec_posture = "first_execution" in posture
+            if is_bad and is_first_exec_posture:
+                print(f"  ANOMALY [{uow_id}]: first_execution UoW has bad PRSC reason: '{reason}'")
+                print(f"    This means the steward conflates first_execution with crashed_output_ref")
+            else:
+                print(f"  OK [{uow_id}]: PRSC reason='{reason}' posture='{posture}'")
+
+conn.close()
+```
+
+Acceptable PRSC reasons for a first-execution UoW: "first_execution", "never dispatched", or similar new-work reasons. NOT acceptable for a first-execution UoW: "output_ref is null or file does not exist or is empty" — this means the steward misread posture, treating a fresh UoW as a crashed one. Flag as anomaly type `prsc_first_exec_conflation`.
+
+**Audit 3 — Duplicate dispatches:**
+
+```python
+import sqlite3, json
+
+db = '/home/lobster/lobster-workspace/orchestration/registry.db'
+run_id = "<run_id from Step 1>"  # substitute actual run_id
+uow_ids = [f"uow_{date}_{run_id}_a", f"uow_{date}_{run_id}_b", f"uow_{date}_{run_id}_c"]
+
+conn = sqlite3.connect(db)
+cur = conn.cursor()
+cur.execute(
+    f"""SELECT uow_id, COUNT(*) as dispatch_count
+        FROM audit_log
+        WHERE uow_id IN ({','.join('?'*len(uow_ids))})
+          AND event IN ('dispatched', 'executor_dispatched', 'dispatch')
+        GROUP BY uow_id
+        HAVING COUNT(*) > 1""",
+    uow_ids
+)
+duplicates = cur.fetchall()
+for uow_id, count in duplicates:
+    print(f"  ANOMALY [{uow_id}]: dispatched {count} times (expected 1)")
+conn.close()
+```
+
+Any UoW appearing in `audit_log` with a dispatch event more than once is a duplicate dispatch anomaly. Flag as anomaly type `duplicate_dispatch`.
+
+**Audit 4 — Posture transitions:**
+
+```python
+import sqlite3, json
+
+db = '/home/lobster/lobster-workspace/orchestration/registry.db'
+run_id = "<run_id from Step 1>"  # substitute actual run_id
+uow_ids = [f"uow_{date}_{run_id}_a", f"uow_{date}_{run_id}_b", f"uow_{date}_{run_id}_c"]
+
+conn = sqlite3.connect(db)
+cur = conn.cursor()
+cur.execute(
+    f"""SELECT uow_id, event, from_status, to_status, ts, note
+        FROM audit_log
+        WHERE uow_id IN ({','.join('?'*len(uow_ids))})
+        ORDER BY uow_id, ts""",
+    uow_ids
+)
+rows = cur.fetchall()
+conn.close()
+
+BAD_POSTURES = {"crashed_output_ref_missing", "steward_cycle_cap", "executor_orphan"}
+
+for row in rows:
+    uow_id, event, from_status, to_status, ts, note = row
+    note_str = str(note or "").lower()
+    # Check if any bad posture appears in the audit trail
+    for bad in BAD_POSTURES:
+        if bad in note_str or bad == from_status or bad == to_status:
+            print(f"  ANOMALY [{uow_id}]: bad posture '{bad}' observed in audit trail at {ts}")
+            print(f"    event={event} from={from_status} to={to_status}")
+
+# Also check final posture in uow_registry
+conn = sqlite3.connect(db)
+cur = conn.cursor()
+cur.execute(
+    f"SELECT id, posture, status FROM uow_registry WHERE id IN ({','.join('?'*len(uow_ids))})",
+    uow_ids
+)
+for uow_id, posture, status in cur.fetchall():
+    if posture in BAD_POSTURES:
+        print(f"  ANOMALY [{uow_id}]: final posture='{posture}' (expected first_execution or execution_complete)")
+    else:
+        print(f"  OK [{uow_id}]: final posture='{posture}' status='{status}'")
+conn.close()
+```
+
+Expected posture sequence for a healthy first-execution UoW: `first_execution → [dispatch] → execution_complete`. Any unexpected posture (`crashed_output_ref_missing`, `steward_cycle_cap`, `executor_orphan`) appearing in the audit trail or as the final posture is a `bad_posture_transition` anomaly.
+
+**Build `anomalies_this_run`** — construct a list of anomaly dicts from both the basic checklist above AND the four deep audit checks. This list is written to `last_anomalies` in Step 7 and is used by the next cycle's reproducibility gate in Step 6. Each entry should be a dict:
 
 ```python
 anomalies_this_run = []
 # For each anomaly found, append a dict like:
-# {"uow_id": "<id>", "anomaly_type": "stalled|steward_cycles_zero|missing_artifact|log_error", "detail": "<brief description>"}
-# Example:
+# {
+#   "uow_id": "<id>",
+#   "anomaly_type": "stalled|steward_cycles_zero|missing_artifact|log_error|steward_cycle_excess|prsc_first_exec_conflation|duplicate_dispatch|bad_posture_transition",
+#   "detail": "<brief description including observed values>"
+# }
+# Examples:
 # anomalies_this_run.append({"uow_id": "uow_20260401_abc123_a", "anomaly_type": "stalled", "detail": "still in ready-for-steward after 10 min"})
+# anomalies_this_run.append({"uow_id": "uow_20260401_abc123_b", "anomaly_type": "steward_cycle_excess", "detail": "steward_cycles=4, expected <= 2"})
+# anomalies_this_run.append({"uow_id": "uow_20260401_abc123_a", "anomaly_type": "prsc_first_exec_conflation", "detail": "[PRSC] output_ref is null or file does not exist for first_execution UoW"})
+# anomalies_this_run.append({"uow_id": "uow_20260401_abc123_c", "anomaly_type": "duplicate_dispatch", "detail": "dispatched 2 times"})
+# anomalies_this_run.append({"uow_id": "uow_20260401_abc123_b", "anomaly_type": "bad_posture_transition", "detail": "posture crashed_output_ref_missing observed in audit trail"})
 # If no anomalies were found, anomalies_this_run remains [].
 ```
 
@@ -248,6 +407,7 @@ A **clean run** is defined as:
 - All injected UoWs reached `done` or `failed` within 10 minutes
 - No posture anomalies (no stalled UoWs)
 - No errors in heartbeat logs during the window
+- All four deep exchange audits from Step 3 are clean: `steward_cycles <= 2` per UoW, no bad PRSC reasons for first-execution UoWs, no duplicate dispatches, no unexpected posture transitions
 
 **Note**: A UoW reaching `failed` is acceptable if the failure reason is expected (e.g., the executor correctly identified an unsolvable task). A `failed` outcome with a recorded `return_reason` counts as clean. A timeout or a UoW with `steward_cycles = 0` after 10 minutes is NOT clean.
 
@@ -278,8 +438,13 @@ Write a report to `/home/lobster/lobster-workspace/data/ralph-reports/ralph-<YYY
 |--------|------|-------------|----------------|--------------|
 | ...    | ...  | ...         | ...            | ...          |
 
+## Exchange Audit
+| UoW ID | Steward Cycles OK? | PRSC Reason OK? | Duplicate Dispatch? | Posture Sequence OK? |
+|--------|--------------------|-----------------|--------------------|-----------------------|
+| ...    | yes/no (N cycles)  | yes/no (reason) | yes/no             | yes/no (posture)     |
+
 ## Anomalies
-<list anomalies or "none">
+<list anomalies or "none" — include anomalies from both basic checklist and deep exchange audit>
 
 ## Pipeline Signals
 - Steward: <last log line with timestamp>
@@ -338,7 +503,10 @@ state["last_run_ts"] = datetime.now(timezone.utc).isoformat()
 # Populate last_anomalies from the anomalies observed in Step 3.
 # Each entry should be a dict with at minimum: {"uow_id": ..., "anomaly_type": ..., "detail": ...}
 # Example anomaly types: "stalled" (non-terminal after 10 min), "steward_cycles_zero",
-# "missing_artifact" (done but no workflow_artifact), "log_error"
+# "missing_artifact" (done but no workflow_artifact), "log_error",
+# "steward_cycle_excess" (steward_cycles >= 3), "prsc_first_exec_conflation"
+# (steward treated first_execution UoW as crashed), "duplicate_dispatch",
+# "bad_posture_transition" (unexpected posture in audit trail)
 # Use the stalled list and outcome data from Step 3 to build this.
 # If is_clean_run is True, this should be [].
 state["last_anomalies"] = anomalies_this_run  # list of anomaly dicts from Step 3
