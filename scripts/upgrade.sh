@@ -2220,6 +2220,56 @@ else:
         migrated=$((migrated + 1))
     fi
 
+    # Migration 66: Register RALPH loop — pipeline health autonomous loop.
+    # ralph-loop.py runs every 3 hours as a Type A LLM subagent job. It reads
+    # jobs.json for the enabled gate, writes an inbox trigger message, and the
+    # dispatcher spawns a subagent with the ralph-loop.md task definition.
+    # The subagent performs the full RALPH cycle: inject → execute → observe →
+    # report → fix → track. State is persisted in data/ralph-state.json.
+    local RALPH_LOOP_MARKER="# LOBSTER-RALPH-LOOP"
+    if ! crontab -l 2>/dev/null | grep -q "$RALPH_LOOP_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$RALPH_LOOP_MARKER" \
+            "0 */3 * * * cd $HOME && $HOME/.local/bin/uv run $LOBSTER_DIR/scheduled-tasks/ralph-loop.py >> $WORKSPACE_DIR/scheduled-jobs/logs/ralph-loop.log 2>&1 $RALPH_LOOP_MARKER"
+        substep "Added RALPH loop cron entry (ralph-loop.py, every 3 hours)"
+        migrated=$((migrated + 1))
+    fi
+    # Upsert the ralph-loop entry into jobs.json if not present.
+    local _jobs_file="$WORKSPACE_DIR/scheduled-jobs/jobs.json"
+    if [ -f "$_jobs_file" ] && ! python3 -c "import json,sys; d=json.load(open('$_jobs_file')); sys.exit(0 if 'ralph-loop' in d.get('jobs',{}) else 1)" 2>/dev/null; then
+        python3 - <<'PYEOF'
+import json, os
+from datetime import datetime, timezone
+from pathlib import Path
+
+workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+jobs_file = workspace / "scheduled-jobs" / "jobs.json"
+try:
+    data = json.loads(jobs_file.read_text())
+except Exception:
+    data = {"jobs": {}}
+
+data.setdefault("jobs", {})
+if "ralph-loop" not in data["jobs"]:
+    data["jobs"]["ralph-loop"] = {
+        "name": "ralph-loop",
+        "schedule": "0 */3 * * *",
+        "schedule_human": "Every 3 hours",
+        "task_file": "tasks/ralph-loop.md",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "enabled": True,
+        "last_run": None,
+        "last_status": None,
+        "dispatch": "subagent",
+    }
+    jobs_file.write_text(json.dumps(data, indent=2))
+    print("Added ralph-loop entry to jobs.json")
+else:
+    print("ralph-loop already in jobs.json — skipped")
+PYEOF
+        migrated=$((migrated + 1))
+    fi
+
     # Source instance-specific migration steps if user-update.sh exists
     local _user_update_sh
     _user_update_sh="$(dirname "$0")/user-update.sh"
