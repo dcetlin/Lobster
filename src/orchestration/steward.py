@@ -1831,6 +1831,7 @@ def _process_uow(
             "steward_cycles": new_cycles,
             "workflow_primitive": selected_executor_type,
             "prescribed_skills": prescribed_skills,
+            "prescription_source": "llm" if _llm_path_taken[0] else "deterministic",
             "instructions_preview": instructions[:80],
             "timestamp": _now_iso(),
         })
