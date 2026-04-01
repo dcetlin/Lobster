@@ -35,24 +35,21 @@ if TYPE_CHECKING:
     from .registry import Registry
 
 from .registry import ApproveConfirmed, ApproveExpired, ApproveNotFound, ApproveSkipped
+from .paths import LOBSTER_WORKSPACE as _LOBSTER_WORKSPACE, WOS_CONFIG as _WOS_CONFIG_PATH_FROM_PATHS
 
 
 # ---------------------------------------------------------------------------
 # Gate-cleared flag path — mirrors _GATE_CLEARED_FLAG in steward.py
 # ---------------------------------------------------------------------------
 
-_GATE_CLEARED_FLAG: Path = Path(
-    os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
-) / "data" / "wos-gate-cleared"
+_GATE_CLEARED_FLAG: Path = _LOBSTER_WORKSPACE / "data" / "wos-gate-cleared"
 
 
 # ---------------------------------------------------------------------------
 # WOS execution config — runtime start/stop for executor dispatch
 # ---------------------------------------------------------------------------
 
-_WOS_CONFIG_PATH: Path = Path(
-    os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
-) / "data" / "wos-config.json"
+_WOS_CONFIG_PATH: Path = _WOS_CONFIG_PATH_FROM_PATHS
 
 _DEFAULT_WOS_CONFIG: dict = {"execution_enabled": False}
 
