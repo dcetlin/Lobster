@@ -485,7 +485,13 @@ class Registry:
 
     def approve(self, uow_id: str) -> ApproveResult:
         """
-        Transition a UoW from proposed → pending.
+        Transition a UoW from proposed → ready-for-steward (atomically, via pending).
+
+        The pending status is no longer a resting state: on /approve, the UoW
+        transitions proposed → pending → ready-for-steward in a single transaction.
+        Both audit entries are written in the same transaction so the full history
+        is preserved without leaving the UoW stranded in pending awaiting the
+        6am GardenCaretaker run.
 
         Returns a typed ApproveResult:
         - ApproveConfirmed: transition succeeded
@@ -513,6 +519,8 @@ class Registry:
                     return ApproveExpired(id=uow_id)
                 case UoWStatus.PROPOSED:
                     now = _now_iso()
+                    # Write two audit entries — proposed→pending then pending→ready-for-steward —
+                    # so the full history is preserved even though pending is never a resting state.
                     self._write_audit(
                         conn,
                         uow_id=uow_id,
@@ -520,8 +528,16 @@ class Registry:
                         from_status=UoWStatus.PROPOSED,
                         to_status=UoWStatus.PENDING,
                     )
+                    self._write_audit(
+                        conn,
+                        uow_id=uow_id,
+                        event="status_change",
+                        from_status=UoWStatus.PENDING,
+                        to_status=UoWStatus.READY_FOR_STEWARD,
+                        note="auto-advanced: pending is not a resting state",
+                    )
                     conn.execute(
-                        "UPDATE uow_registry SET status = 'pending', updated_at = ? WHERE id = ?",
+                        "UPDATE uow_registry SET status = 'ready-for-steward', updated_at = ? WHERE id = ?",
                         (now, uow_id),
                     )
                     conn.commit()

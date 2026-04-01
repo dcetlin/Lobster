@@ -390,7 +390,8 @@ class TestRepoFromIssueUrl:
 # ---------------------------------------------------------------------------
 
 class TestApprove:
-    def test_approve_transitions_proposed_to_pending(self, registry):
+    def test_approve_transitions_proposed_to_ready_for_steward(self, registry):
+        """approve() now skips pending as a resting state — goes straight to ready-for-steward."""
         from src.orchestration.registry import ApproveConfirmed
         today = datetime.now(timezone.utc).date().isoformat()
         result = registry.upsert(issue_number=50, title="Issue 50", sweep_date=today, success_criteria="Test completion.")
@@ -398,21 +399,30 @@ class TestApprove:
         approve_result = registry.approve(uow_id)
         assert isinstance(approve_result, ApproveConfirmed)
         assert approve_result.id == uow_id
+        uow = registry.get(uow_id)
+        assert uow.status.value == "ready-for-steward"
 
-    def test_approve_writes_audit_entry(self, registry, db_path):
+    def test_approve_writes_audit_entries_for_both_transitions(self, registry, db_path):
+        """approve() writes two audit entries: proposed→pending and pending→ready-for-steward."""
         today = datetime.now(timezone.utc).date().isoformat()
         result = registry.upsert(issue_number=51, title="Issue 51", sweep_date=today, success_criteria="Test completion.")
         uow_id = result.id
         registry.approve(uow_id)
         conn = _open_db(db_path)
-        audit = conn.execute(
+        pending_entry = conn.execute(
             "SELECT * FROM audit_log WHERE uow_id = ? AND event = 'status_change' AND to_status = 'pending'",
             (uow_id,)
         ).fetchone()
+        ready_entry = conn.execute(
+            "SELECT * FROM audit_log WHERE uow_id = ? AND event = 'status_change' AND to_status = 'ready-for-steward'",
+            (uow_id,)
+        ).fetchone()
         conn.close()
-        assert audit is not None
+        assert pending_entry is not None, "audit entry for proposed→pending must exist"
+        assert ready_entry is not None, "audit entry for pending→ready-for-steward must exist"
 
-    def test_approve_idempotent_on_already_pending(self, registry):
+    def test_approve_idempotent_on_already_ready_for_steward(self, registry):
+        """After approve, second approve returns ApproveSkipped with current_status=ready-for-steward."""
         from src.orchestration.registry import ApproveSkipped
         today = datetime.now(timezone.utc).date().isoformat()
         result = registry.upsert(issue_number=52, title="Issue 52", sweep_date=today, success_criteria="Test completion.")
@@ -421,7 +431,7 @@ class TestApprove:
         # Second approve returns ApproveSkipped, not an error
         approve_result = registry.approve(uow_id)
         assert isinstance(approve_result, ApproveSkipped)
-        assert approve_result.current_status == "pending"
+        assert approve_result.current_status == "ready-for-steward"
         assert "already" in approve_result.reason.lower()
 
     def test_approve_returns_not_found_on_nonexistent(self, registry):
@@ -445,6 +455,7 @@ class TestApprove:
 
 class TestList:
     def test_list_by_status(self, registry):
+        """approve() lands on ready-for-steward, not pending (pending is no longer a resting state)."""
         from src.orchestration.registry import UoW
         today = datetime.now(timezone.utc).date().isoformat()
         r1 = registry.upsert(issue_number=60, title="Issue 60", sweep_date=today, success_criteria="Test completion.")
@@ -452,12 +463,13 @@ class TestList:
         r3 = registry.upsert(issue_number=62, title="Issue 62", sweep_date=today, success_criteria="Test completion.")
         registry.approve(r2.id)
         proposed = registry.list(status="proposed")
+        ready_for_steward = registry.list(status="ready-for-steward")
         pending = registry.list(status="pending")
         assert len(proposed) == 2
-        assert len(pending) == 1
+        assert len(ready_for_steward) == 1
+        assert len(pending) == 0  # pending is never a resting state after approve()
         assert all(isinstance(u, UoW) for u in proposed)
-        assert all(isinstance(u, UoW) for u in pending)
-        assert pending[0].id == r2.id
+        assert ready_for_steward[0].id == r2.id
 
     def test_list_returns_all_when_no_filter(self, registry):
         today = datetime.now(timezone.utc).date().isoformat()
