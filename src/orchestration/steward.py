@@ -212,6 +212,7 @@ _RETURN_REASON_CLASSIFICATIONS: dict[str, str] = {
     "crashed_zero_bytes": _CLASSIFICATION_ERROR,
     "crashed_output_ref_missing": _CLASSIFICATION_ERROR,
     "executor_orphan": _CLASSIFICATION_ORPHAN,
+    "diagnosing_orphan": _CLASSIFICATION_ORPHAN,
 }
 
 
@@ -377,6 +378,8 @@ def _determine_reentry_posture(
                     return clf
                 elif clf == "executor_orphan":
                     return "executor_orphan"
+                elif clf == "diagnosing_orphan":
+                    return "diagnosing_orphan"
             elif event == "execution_failed":
                 return "execution_failed"
 
@@ -1034,6 +1037,7 @@ def _build_deterministic_prescription_instructions(
         "crashed_no_output": "Previous execution crashed without producing output. Re-execute, adding error handling.",
         "execution_failed": "Previous execution failed. Diagnose the failure and re-execute.",
         "executor_orphan": "Executor never ran on this UoW. Execute fresh.",
+        "diagnosing_orphan": "Steward crashed mid-diagnosis. Re-diagnosing from current state.",
     }
 
     posture_msg = posture_context.get(reentry_posture, "Continue from previous attempt.")
