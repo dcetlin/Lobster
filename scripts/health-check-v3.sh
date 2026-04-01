@@ -80,6 +80,7 @@ MAINTENANCE_EXPIRY_SECONDS=3600      # 1 hour - stale maintenance flag is auto-c
 
 COMPACTION_SUPPRESS_SECONDS=300      # 5 minutes - skip stale-inbox check after a compaction event
 COMPACT_GRACE_SECONDS=600            # 10 minutes - skip stale-inbox check after a compaction (last-compact.ts)
+
 CATCHUP_SUPPRESS_SECONDS=900         # 15 minutes - skip WFM freshness check while catchup subagent is running
 RESTART_COOLDOWN_SUPPRESS_SECONDS=240 # 4 minutes - suppress stale-inbox RED after a recent restart
 

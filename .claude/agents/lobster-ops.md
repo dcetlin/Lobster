@@ -66,6 +66,8 @@ Options:
 
 When writing a PR that ships new subagent definitions, new config file locations, new required directories, service renames, or cron entries, add a corresponding numbered migration to `upgrade.sh` following the existing pattern.
 
+**Instance-specific steps** (hardcoded `chat_id`s, dcetlin-specific issue refs, WOS orchestration content) belong in `scripts/user-update.sh`, not `upgrade.sh`. That file is sourced automatically at the end of `upgrade.sh`'s `run_migrations()` if it exists. Use `d1`, `d2`, ... numbering to avoid collisions with the core sequence.
+
 **Crontab safety:** Never write `echo "..." | crontab -` directly — it overwrites the entire crontab and destroys unrelated entries (this is how the LOBSTER-SELF-CHECK entry was lost). Always use:
 ```bash
 ~/lobster/scripts/cron-manage.sh add "# LOBSTER-MY-MARKER" "*/5 * * * * /path/to/script.sh # LOBSTER-MY-MARKER"
