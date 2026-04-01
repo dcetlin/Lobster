@@ -1,5 +1,29 @@
 # Oracle: Decisions
 
+## [2026-04-01] PR #499 — fix(auto-router): correct QUEUE_PATH to live meta/ path (issue #260)
+
+### Stage 1: Is this solving the right problem?
+
+Adversarial prior: the wrong fix would be to create the `hygiene/meta/` directory and migrate — this requires synchronizing two scripts and introducing a migration step. The correct fix depends on whether `hygiene/meta/` organization was intentional (executed) or aspirational (never executed).
+
+Finding: `~/lobster-workspace/hygiene/meta/` does not exist and has never been created. `surface-queue-delivery.py` (the companion script) already uses `~/lobster-workspace/meta/reflective-surface-queue.json`. No migration was ever run. The canonical path was never inhabited.
+
+Decision: Option 2 is correct — make `meta/` the canonical path in auto-router.py, aligning it with surface-queue-delivery.py. This removes the dead path, removes the fallback logic that was always firing, and makes both scripts consistent. Creating `hygiene/meta/` would be new structure with no data migration plan. STAGE 1: APPROVED.
+
+### Stage 2: Is the implementation well-made?
+
+Changes: removes `QUEUE_PATH` pointing to non-existent `hygiene/meta/` path, removes `_OLD_QUEUE_PATH` constant, removes `_resolve_queue_path()` 14-line fallback function, sets `QUEUE_PATH` directly to `meta/reflective-surface-queue.json`, changes `_resolve_queue_path()` call to `QUEUE_PATH`.
+
+Checks:
+- `load_queue()` handles missing file: returns `[]` if `not path.exists()` — no crash on first run.
+- `surface-queue-delivery.py` consistency: both scripts now reference `meta/reflective-surface-queue.json` — consistent.
+- Regression risk: none — the fallback was always firing (hygiene/meta/ never existed), so we are replacing a broken constant with the path that was always being used.
+- Diff quality: net -17 lines (19 deleted, 2 added). Minimal. Surgical.
+
+**Verdict: APPROVED — merge.**
+
+---
+
 ## [2026-04-01] PR #383 — real executor via `claude -p` + TTL recovery
 
 ### Stage 1: Is this solving the right problem?
