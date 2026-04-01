@@ -155,13 +155,15 @@ Each UoW entry in the UoWRegistry has the following fields. Fields are written a
 | `prescribed_skills` | `TEXT` (JSON array) \| `NULL` | Steward prescription | Skill IDs to be loaded by the Executor at task start. |
 | `success_criteria` | `TEXT NOT NULL` (new UoWs) / `TEXT NULL` (Phase 2 migration) | creation (germination) | Required for new UoWs. Prose description of what completion looks like for this UoW. Written at germination time; immutable thereafter. The Steward evaluates output against this field at every re-entry — it is the anchor that prevents premature termination and endless refinement. A new UoW without `success_criteria` is invalid and is rejected at germination time. **Phase 1→2 migration note:** The #309 migration adds this as `TEXT NULL` to preserve existing Phase 1 records. For pre-existing UoWs with `success_criteria = NULL`: the Steward falls back to evaluating against the `summary` field and writes a `success_criteria_missing` audit entry to flag the gap. |
 | `steward_cycles` | `INTEGER NOT NULL DEFAULT 0` | Steward re-entry | Count of Steward diagnosis/prescription cycles completed on this UoW. Surface condition 3 (hard cap) fires at 5. |
-| `steward_agenda` | `TEXT NULL` (JSON) | Steward only | Oracle-style forward forecast written by the Steward at first contact (`steward_cycles == 0`). List/tree of anticipated prescription nodes, each: `{posture, context, constraints, status: pending\|prescribed\|complete}`. Updated on each re-entry as new information arrives. **Steward-private — never read by the Executor.** |
+| `steward_agenda` | `TEXT NULL` (JSON) | Steward only | Oracle-style forward forecast written by the Steward at first contact (`steward_cycles == 0`). JSON array of cycle trace entries, one per Steward pass. Each entry schema (v2): `{cycle, mode, posture, posture_rationale, external_dependency, prediction, dispatch_instruction, success_criteria_checked, anomalies, discoveries, timestamp}`. Fields: `mode` mirrors `uow_mode` at this cycle (can evolve if criteria stabilize mid-run); `prediction` is the Steward's forward forecast of what happens next; `dispatch_instruction` is what the executor is asked to do (null on terminal cycles); `external_dependency` is null if unblocked or a string naming the blocking actor; `discoveries` is a list of typed observations outside original scope (empty list if clean). Updated on each re-entry. **Steward-private — never read by the Executor.** |
 | `steward_log` | `TEXT NULL` | Steward only | Append-only newline-delimited JSON log of every Steward decision point — diagnosis rationale, prescription decisions, surface-to-Dan trigger fires, agenda updates. Steward-to-future-self. **Steward-private — never read by the Executor.** |
 | `audit_log` | JSON array \| external table | every event | Ordered audit entries. Each entry: `{event, actor, timestamp, note}`. Every state transition is appended here before the transition is considered complete. |
 | `route_reason` | `TEXT` \| `NULL` | Classifier | Human-readable rationale for the posture assigned by the Routing Classifier. |
 | `hooks_applied` | `TEXT` (JSON array) \| `NULL` | hook execution | Hook IDs that fired on this UoW. |
 | `closed_at` | `TEXT` (ISO-8601) \| `NULL` | Steward closure | When the Steward declared `done`. |
 | `parent_id` | `TEXT` \| `NULL` | creation | Parent UoW ID for sub-UoWs spawned by spec-breakdown. `NULL` for root UoWs. |
+| `uow_mode` | `TEXT NULL` | Steward cycle 0 | Execution mode assigned by the Steward at first contact. Two values: `execution_driven` (success_criteria stable at intake; 1-2 cycles expected; evaluation loop applies immediately) or `posture_driven` (success_criteria absent or unstable at intake; negotiation loop precedes evaluation loop). NULL rows treated as `execution_driven` for legacy compatibility. Immutable once set. |
+| `parent_uow_id` | `TEXT NULL` | creation | Set when this UoW was spawned as a side effect of another UoW (distinct from spec-breakdown `parent_id`). Enables causal tree traversal for side-effect chains. |
 
 **IMPORTANT — Field naming:** The schema table above uses conceptual names. The actual SQLite schema uses different names. **All Phase 2 code must use the actual schema names:**
 
@@ -248,7 +250,25 @@ For each `ready-for-steward` UoW, the Steward:
 3. **Evaluates** (on re-entry after execution) — reads execution results (from `output_ref` and `audit_log`), re-diagnoses fresh, decides: loop again or declare closure. Increments `steward_cycles`.
 4. **Closes** — writes a closing diagnosis when convergence conditions are met. Transitions to `done`. Sets `completed_at`.
 
-**Initialization ritual:** On first contact with a new UoW (`steward_cycles == 0` at the start of a diagnosis pass), the Steward's first act is to write an initial `steward_agenda` before any prescription decision is made. Forecast depth is calibrated by the Steward: well-defined UoWs (concrete deliverable, clear scope) get a full agenda upfront; open-ended UoWs (exploratory, ill-defined scope) get 1-2 steps with a `"pending evaluation"` marker for the remainder. The agenda is a structured forecast, not a contract.
+**Initialization ritual:** On first contact with a new UoW (`steward_cycles == 0` at the start of a diagnosis pass), the Steward's first act is to write an initial `steward_agenda` before any prescription decision is made. The Steward also sets `uow_mode` at this point — `execution_driven` if `success_criteria` is stable and the scope is well-defined, `posture_driven` if criteria are absent or contested. `uow_mode` is immutable once set. Forecast depth is calibrated by the Steward: well-defined UoWs get a full agenda upfront; open-ended UoWs get 1-2 steps with a `"pending evaluation"` marker for the remainder. The agenda is a structured forecast, not a contract.
+
+**Cycle trace entry schema (v2):** Each entry appended to `steward_agenda` on every Steward pass:
+
+```json
+{
+  "cycle": 0,
+  "mode": "posture_driven",
+  "posture": "orienting",
+  "posture_rationale": "First contact. No stable success_criteria. Entering negotiation loop.",
+  "external_dependency": null,
+  "prediction": "Criteria will stabilize after scope confirmation from Dan.",
+  "dispatch_instruction": "Ask Dan: is the goal a full redesign or API surface only?",
+  "success_criteria_checked": [],
+  "anomalies": [],
+  "discoveries": [],
+  "timestamp": "2026-04-01T17:00:00Z"
+}
+```
 
 **Re-entry decision protocol (summary):** On every Executor return, the Steward reads all inputs (Seed, `steward_agenda`, `steward_log`, Executor's structured return, `output_ref` contents, `steward_cycles`) before writing anything. Decision sequence: (1) parse the `return_reason` and classify (Normal / Blocked / Abnormal / Error / Orphan); (2) assess completion against the Seed and `success_criteria` — this is the primary gate, not `return_reason` alone; (3a) if complete: write closure, mark agenda nodes, set `completed_at`, transition to `done`; (3b) if incomplete: update `steward_agenda`, write next prescription, append `steward_log` entry, transition to `ready-for-executor`. Full re-entry spec lives in #303.
 
@@ -299,6 +319,7 @@ Minimum required fields in the result file:
 | `outcome` | yes | `"complete"` \| `"partial"` \| `"failed"` \| `"blocked"` |
 | `success` | yes | `true` iff `outcome == "complete"` |
 | `reason` | for non-complete | Human-readable explanation |
+| `side_effects` | yes (empty list if none) | Typed list of side effects produced during execution. Schema: `[{"type": "<type>", ...}]`. Known types: `github_issue_filed` (`ref`), `uow_spawned` (`uow_id`), `file_modified` (`path`), `external_api_call` (`service`, `operation`). Enforcement and aggregation are future infrastructure; schema reserved now to avoid retroactive surgery. Example: `[{"type": "github_issue_filed", "ref": "#123"}, {"type": "uow_spawned", "uow_id": "uow_20260401_abc_a"}]` |
 
 The Steward's `_assess_completion` reads this file to route the UoW. If the file is absent and `success_criteria` is set, the Steward cannot declare done — it will cycle to the hard cap (5 retries) and surface to Dan. **Absence of the result file is a contract violation, not an ambiguous state.**
 
@@ -370,6 +391,40 @@ For each: write `{event: "startup_sweep", classification: <value>}` to audit_log
 Creating a UoW proposal for a GitHub issue that already has a UoW in the Registry is a no-op — the UoW Registrar checks `issue_id` before creating new records and returns the existing record without modification. This prevents duplicate UoWs from accumulating across sweep re-runs, restarts, or manual triggers. The check is the first operation in the nightly sweep loop (see UoW Registrar algorithm above).
 
 > **Golden patterns reference:** Items 1–4 above are directly sourced from Lobster's battle-tested agent lifecycle implementation in `~/lobster/src/agents/tracker.py` and `~/lobster/src/mcp/inbox_server.py`. The `register_agent` / `session_store` system implements the same four properties — liveness detection via `timeout_minutes` + mtime polling, `output_file` as ground-truth artifact pointer, startup sweep over stale active sessions, and idempotent session creation. WOS adopts these patterns at the UoW level.
+
+---
+
+### Steward Posture Vocabulary
+
+The Steward selects a posture on each cycle to describe its current operating mode. Posture is recorded in the `steward_agenda` trace entry and drives dispatch decisions.
+
+**Postures for `execution_driven` UoWs** (stable criteria, evaluation loop active from cycle 0):
+
+| Posture | Trigger | Action |
+|---------|---------|--------|
+| `scope_challenged` | Artifact complete but a discovery was surfaced this cycle. | Steward records discovery in `discoveries`; does not close; asks whether to file follow-on or absorb into current UoW. |
+| `closing_with_discovery` | Terminal state: UoW done on original artifact, but discoveries exist. | Steward writes all discoveries (Pearls — things that formed during execution, outside original scope) to trace before transitioning to `done`. |
+
+**Postures for `posture_driven` UoWs** (unstable or absent criteria, negotiation loop precedes evaluation):
+
+| Posture | Trigger | Action |
+|---------|---------|--------|
+| `orienting` | First touch on a `posture_driven` UoW with no stable `success_criteria`. | Steward surfaces ambiguity to Dan; does NOT dispatch executor until criteria are established. |
+| `clarifying` | Criteria partially formed, negotiation open. | Steward summarizes known/unknown and drafts candidate scope for confirmation. |
+| `waiting_for_signal` (Dan-facing alias: `dormant`) | Blocked on external actor (human confirmation, another UoW). | Steward sets `external_dependency` string in trace; skips executor dispatch; sends Dan a direct Telegram message with one specific question (see Steward→Dan Direct Consultation below). |
+
+**Universal postures** (apply to both modes):
+
+| Posture | Trigger | Action |
+|---------|---------|--------|
+| `scope_challenged` | Discovery surfaced mid-cycle on any UoW type. | See above. |
+| `closing_with_discovery` | Terminal with discoveries. | See above. |
+
+---
+
+### Steward→Dan Direct Consultation
+
+When the Steward enters `waiting_for_signal` due to a human dependency, it sends Dan a Telegram message directly — no triage queue hop. Message format: UoW ID, one specific question, one line of context. Dan's reply routes back through the dispatcher to the Steward. This is a direct channel, not a queued surface event.
 
 ---
 
