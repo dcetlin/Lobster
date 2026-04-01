@@ -193,7 +193,7 @@ Never use cron for user-space jobs. Never use systemd tools for system-level inf
   - `projects/` - All Lobster-managed projects (`$LOBSTER_PROJECTS`)
   - `assessments/` - Assessment documents (audits, retros, design reviews). Maintenance logs only → `hygiene/`.
   - `data/memory.db` - Vector memory SQLite DB
-  - `data/events.jsonl` - Event log
+  - `data/memory-events.jsonl` - StaticMemory event log (JSONL fallback backend)
   - `scheduled-jobs/jobs.json` - Job registry state
   - `scheduled-jobs/tasks/` - Task definition markdown files
   - `scheduled-jobs/logs/` - Execution logs
