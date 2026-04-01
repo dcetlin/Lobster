@@ -1,5 +1,37 @@
 # Oracle: Decisions
 
+## [2026-04-01] PR #551 — feat(monitoring): file-size-monitor for bootup/config files
+
+### Stage 1: Vision alignment (formed before reading implementation)
+
+**Vision alignment:** The PR addresses a documented production bug — `sys.dispatcher.bootup.md` silently exceeded the Read tool's 2,000-line limit by 403 lines, making Voice Note Brain Dumps, Google Calendar, and Context Recovery sections invisible on every agent startup. The theory of change is observability-first: detect size drift via a weekly cron-direct script, file a GitHub issue, let the operator prune. The vision tension is real: `principle-1` ("Proactive resilience over reactive recovery — structural prevention is preferred over better correction mechanisms") points toward compression of the bootup docs themselves rather than a monitor. The golden pattern "compression as architectural response to accumulation critique" (golden-patterns.md, 2026-03-23) names the structurally correct intervention: compress encoding, do not add monitoring infrastructure. The learnings.md pattern "absorption-ceiling response via context-expansion" (2026-03-23) is a near-relative: adding a safety net below a growing document does not address the growth. The monitor normalizes operating near the threshold rather than enforcing structural limits at write time. That said, the adversarial prior is not confirmed: the underlying bug is real, the monitor does not foreclose compression (the harder fix remains open), and it introduces no LLM cost, inbox writes, or screen dependency. It is a lightweight symptom-layer response to a cause-layer problem that has not yet been addressed. The cause-layer fix (compression) is not foreclosed but is also not prompted by this PR.
+
+**Alignment verdict:** Questioned
+
+### Stage 2: Quality review
+
+- **Does it do what it claims?** Yes. `check_files()` walks `FILE_THRESHOLDS`, counts lines via binary read (correct — no encoding ambiguity), logs each result, and builds violation dicts. `fetch_open_issue_titles()` fetches the first 200 open issues by title and uses set membership for deduplication — correct for the expected volume. `file_github_issue()` calls `gh issue create` with proper timeout and error degradation. Dry-run mode is a clean code path.
+- **Issue title deduplication has a fragility:** The deduplication key is the exact issue title string `"warn: {rel_path} exceeds {threshold}-line threshold ({actual} lines)"`. If the file oscillates around the threshold between runs, the actual line count will differ across weeks and the title will not match — a new issue is filed even if a prior one is open for the same file. The correct deduplication key should be file-stable (e.g., `warn: {rel_path} exceeds {threshold}-line threshold`) without the actual count. This is a concrete defect that will produce issue spam under normal fluctuation conditions.
+- **REPO constant points to SiderealPress/lobster, not dcetlin/Lobster.** This is the upstream repo. For a dcetlin fork install, the `gh` CLI's default remote may or may not be SiderealPress; if it is dcetlin/Lobster, issues will be filed to the wrong repo. This should be derived from the git remote or made configurable via env var, consistent with the `LOBSTER_WORKSPACE` env var pattern already used in the script.
+- **Cron entry in upgrade.sh uses `$HOME/.local/bin/uv` directly** rather than the `uv` path resolved via PATH. If uv is installed elsewhere, the cron entry silently fails. The pattern used elsewhere in the system is `command -v uv` or the `uv` wrapper — this should follow the same convention.
+- **Threshold for `oracle/learnings.md` is 300 lines.** The file is already over 300 lines (it was over 100 lines in just the first 100 lines read). This will fire immediately on the first live run, which may or may not be intentional. If intentional (backlog of existing issues to clear), the issue body should say so; if not, the threshold needs recalibration.
+
+**Patterns introduced:** cron-direct observability scripts that file GitHub issues on threshold breach; deduplication by exact-title set membership; `--dry-run` mode as first-class script behavior.
+
+**What this forecloses:** Nothing structural. The compression path (golden pattern) remains open. Future operators may develop tolerance for "approaching-but-not-exceeding" thresholds because the monitor exists — this is a soft foreclosure of compression urgency, not a hard architectural one.
+
+**Opportunity cost note:** The structurally correct intervention — applying table-as-compaction-resistant encoding to compress the bootup docs — was not built instead. That work remains in the backlog. This PR creates monitoring without addressing growth discipline.
+
+**Verdict: NEEDS_CHANGES**
+
+Issues requiring resolution before merge:
+1. Deduplication key includes the actual line count, causing issue spam when a file oscillates around the threshold. Remove the count from the title used for dedup (keep it in the issue body).
+2. `REPO = "SiderealPress/lobster"` is hardcoded. Should be derived from git remote or overridable via env var (e.g., `LOBSTER_GITHUB_REPO`) consistent with other env-var patterns in the script.
+3. Cron entry hardcodes `$HOME/.local/bin/uv` — should use `$(command -v uv)` or the system's canonical uv path convention used elsewhere in upgrade.sh.
+4. `oracle/learnings.md` threshold of 300 lines is already exceeded. Recalibrate or document that the first run is expected to fire.
+
+---
+
 ## [2026-04-01] PR #537 (dcetlin fork) — fix(inbox_server): replace hardcoded /home/admin/ path in bisque connection URL handler
 
 ### Stage 1: Is this solving the right problem?
@@ -494,3 +526,91 @@ in `_process_uow` at the start of the function). No extra DB read. No new fields
 is a pure function over the already-loaded text. APPROVED.
 
 **Verdict: APPROVE — proceed to PR**
+
+---
+
+## [2026-04-01] PR #550 — fix(wos-report): send PDF as Telegram document directly (first review)
+
+### Stage 1: Is this solving the right problem?
+
+**Q: Is replacing the outbox queue with a direct Bot API call the correct direction?**
+
+The outbox queue approach (`queue_for_telegram`) writes a JSON file to `~/messages/outbox/` and relies on the Telegram bot process to pick it up later. This creates a hidden dependency: if the bot is not running when `wos_report.py` is invoked, the PDF is silently queued and never delivered. The fix eliminates this intermediary by calling the Telegram Bot API directly from `wos_report.py`.
+
+Decision: the direction is correct. The script already knows the bot token and chat ID; calling the API directly removes the delivery dependency without adding new external coupling (the Telegram API is already a boundary this system crosses). STAGE 1: APPROVED.
+
+---
+
+### Stage 2: Is the implementation well-made?
+
+**Q: Is using `curl` via subprocess the right transport mechanism?**
+
+Finding — wrong abstraction at the HTTP transport boundary:
+`send_document_direct` shells out to `curl` to perform the multipart/form-data POST. This introduces a hard runtime dependency on `curl` being installed and available on PATH. Python's stdlib provides `urllib.request` and `http.client`, which can perform the same multipart upload without shelling out. The rest of the Lobster codebase does not use subprocess for HTTP calls — this is an inconsistency.
+
+Additionally: the Telegram Bot API token appears in the URL string (`https://api.telegram.org/bot{token}/sendDocument`), which is passed as an argument to the `curl` subprocess. The token is visible in `/proc/*/cmdline` and `ps aux` output for the duration of the subprocess call. Using `urllib.request` keeps the token entirely in-process.
+
+This is a NEEDS_CHANGES item: replace the `curl` subprocess with a pure-Python `urllib.request` multipart upload.
+
+**Q: Is `import subprocess` inside the function body correct style?**
+
+Finding — deferred import that should be at module level (moot if subprocess is removed):
+`import subprocess` is placed inside `send_document_direct()` rather than at module scope. Standard convention for this codebase is top-level imports. This is a minor style issue that becomes irrelevant if `subprocess` is removed entirely (as required by the finding above).
+
+**Q: Is the JSON parse guarded against malformed output?**
+
+Finding — bare `json.loads(result.stdout)` has no guard:
+If `curl` returns empty stdout or non-JSON content (e.g., a network error page), `json.loads` raises `JSONDecodeError` with no contextual information. The error handler only catches `result.returncode != 0`. This gap means certain failure modes (curl exits 0 but returns non-JSON) produce uninformative errors. This is a secondary issue that also becomes moot when subprocess+curl is replaced with `urllib.request`, whose response handling can be structured correctly.
+
+**Q: Are the token-loading and document-sending functions well-decomposed?**
+
+Finding: `_load_bot_token()` is a clean pure function with clear fallback logic. The decomposition between token loading and sending is correct. The logic inside `send_document_direct()` (build URL, post file, check response) is the right scope for one function. The structural decomposition is sound. APPROVED.
+
+---
+
+### Overall verdict: NEEDS_CHANGES
+
+**Required before merge:**
+1. Replace `curl` subprocess with `urllib.request` multipart upload — eliminates the external binary dependency and keeps the token in-process (not visible in `/proc`/`ps`).
+2. Remove `import subprocess` (made unnecessary by fix 1).
+3. Add a JSON parse guard in the response handler: catch `json.JSONDecodeError` and re-raise as `RuntimeError` with the raw response text included.
+
+No other files need to change. The `_load_bot_token()` function and the overall structure are correct.
+
+---
+
+## [2026-04-01] PR #550 — fix(wos-report): send PDF as Telegram document directly (re-review after fixes)
+
+### Changes reviewed
+
+The follow-up commit replaces the `curl` subprocess with a `urllib.request` multipart/form-data upload:
+- `subprocess` import removed entirely
+- `mimetypes` and `urllib.request` imported (deferred inside function — consistent with precedent in this file)
+- Multipart body assembled as bytes using a fixed boundary string
+- `urllib.request.urlopen` performs the POST with a 60-second timeout
+- `json.JSONDecodeError` caught and re-raised as `RuntimeError` with the raw response included
+
+### Stage 2 re-check
+
+**Q: Is the multipart encoding correct?**
+
+Finding: The body assembles three parts — `chat_id`, `caption`, and `document` (binary). Each field part uses `\r\n` line endings per RFC 2046. The file part correctly sets `Content-Type` to the guessed MIME type (fallback `application/pdf`). The closing delimiter `--{boundary}--\r\n` is correct. The `Content-Type` header on the request includes the boundary parameter. APPROVED.
+
+**Q: Does `urlopen` raise on HTTP errors?**
+
+Finding: `urllib.request.urlopen` raises `urllib.error.HTTPError` (a subclass of `IOError`) for HTTP 4xx/5xx responses. This propagates naturally to the caller. The success path checks `response.get("ok")` — Telegram always returns 200 OK even for logical errors (e.g., wrong chat_id), so the `ok` check is the correct semantic gate. Both transport errors (HTTPError) and API logical errors (ok=false) are handled. APPROVED.
+
+**Q: Is the deferred import style consistent with the file?**
+
+Finding: The file already has function-level deferred imports in another section. The style is established precedent here. APPROVED.
+
+**Q: Are all three NEEDS_CHANGES items resolved?**
+
+1. curl replaced with urllib — YES.
+2. subprocess import removed — YES.
+3. JSONDecodeError guard added — YES.
+
+### Overall verdict: APPROVED
+
+**PR #550** is approved for merge. All three NEEDS_CHANGES items are addressed. The urllib multipart implementation is structurally correct, keeps the token in-process, and handles both transport and API-level errors.
+
