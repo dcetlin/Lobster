@@ -177,10 +177,10 @@ def run_startup_sweep(
     the `bootup-candidate` label are skipped in all three populations,
     consistent with the gate applied in run_steward_cycle.
 
-    active_sweep_threshold_seconds: minimum age (from started_at, or
-        created_at as fallback) before an `active` UoW is swept as a crash
-        candidate. Default: 300 s. Pass 0 to disable the guard (original
-        behavior, not recommended in production).
+    active_sweep_threshold_seconds: minimum age (measured from updated_at,
+        which is set atomically when status changes to `active`) before an
+        `active` UoW is swept as a crash candidate. Default: 300 s. Pass 0
+        to disable the guard (original behavior, not recommended in production).
     orphan_threshold_seconds: minimum age before a `ready-for-executor` UoW
         is classified as executor_orphan. Default: 3600 s.
     bootup_candidate_gate: override for BOOTUP_CANDIDATE_GATE module constant.
