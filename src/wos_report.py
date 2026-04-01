@@ -772,7 +772,7 @@ def _render_index_page(pdf: WoSReport, uows: list[dict]) -> None:
 
     # Column layout
     col_widths = [12, 66, 22, 22, 14, 20]
-    col_headers = ["ID", "Summary", "Status", "Created", "Cyles", "Skills"]
+    col_headers = ["ID", "Summary", "Status", "Created", "Cycles", "Skills"]
 
     # Header row
     pdf.set_fill_color(*C_HEADING_BG)
