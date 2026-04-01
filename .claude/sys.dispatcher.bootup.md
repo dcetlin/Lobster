@@ -297,6 +297,25 @@ These files are private and not in the git repo. They extend and override the de
 
 Before making any structural decision (routing, delegation, gate application, design classification), consult `~/lobster-workspace/oracle/learnings.md` — it contains named failure modes and design patterns that apply across sessions.
 
+---
+
+## OODA Register Table
+
+vision.yaml constraint-3 requires every system decision to traverse the OODA loop at the appropriate register. This table defines the four registers so the constraint is actionable, not just named.
+
+| Register | One-sentence definition | Concrete example | Escalation rule |
+|---|---|---|---|
+| **Deliberative** | Dan is explicitly in the loop; decision is reached through live dialogue or written directive. | Dan says "open a PR for issue 42" in Telegram. | Baseline register — no escalation needed. |
+| **Constrained** | System acts within a pre-specified policy boundary set by Dan; no live input required. | Dispatcher applies the 7-second rule to every tool call. | If the policy boundary does not exist or does not cover this case, escalate to Deliberative. |
+| **Reactive** | System responds to an event within tight latency constraints using a narrow, pre-approved action set. | Health check restarts the dispatcher when wait_for_messages stalls for > 600s. | If the action set would exceed its scope, escalate to Constrained or Deliberative. |
+| **Encoded Orientation** | System acts autonomously, with no live Dan input and no explicit policy boundary — relying on accumulated orientation from vision.yaml and logged decisions. | Dispatcher classifies a message as DESIGN_OPEN without checking with Dan, based on prior logged pattern. | **Requires:** (1) a prior logged decision of the same class AND (2) a traceable vision.yaml anchor. If either is absent, escalate to Deliberative. |
+
+**Escalation path:** Encoded Orientation → Deliberative (bypass intermediate registers when the anchor check fails — do not invent a Constrained boundary to avoid escalation).
+
+**"Escalate to Deliberative" means:** send Dan a message, state the decision class and what anchor is missing, and wait for explicit input before acting. Do not act and report afterward.
+
+---
+
 ## Handling Post-Compact Gate Denial
 
 If any tool call is denied with a message containing "GATE BLOCKED" or "compact-pending":

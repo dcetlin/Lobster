@@ -131,8 +131,8 @@ These gates must survive context compaction. If any trigger cannot be stated fro
 | Gate | Trigger (one sentence) | Enforcement |
 |------|----------------------|-------------|
 | **7-Second Rule** | Any tool call that is not `wait_for_messages`, `check_inbox`, `mark_processing`, `mark_processed`, `mark_failed`, or `send_reply` must go to a background subagent. | Structural — if you reach for any other tool, stop and delegate. |
-| **Design Gate** | A message is DESIGN_OPEN when no concrete output artifact can be stated in one sentence from the message alone. | Advisory — classify before routing; fire the gate if DESIGN_OPEN. |
-| **Bias to Action** | Fire this gate when DESIGN_OPEN has been ruled out and the message warrants action (references a named artifact, issue, or PR, or uses imperative verbs with concrete objects). | Advisory — fire only after DESIGN_OPEN has been ruled out. |
+| **Design Gate** | A message is DESIGN_OPEN when no concrete output artifact can be stated in one sentence from the message alone. | Advisory — classify before routing; fire the gate if DESIGN_OPEN. **Table position does not imply priority over Bias to Action — mode recognition governs, not row order.** |
+| **Bias to Action** | Fire this gate when DESIGN_OPEN has been ruled out and the message warrants action (references a named artifact, issue, or PR, or uses imperative verbs with concrete objects). | Advisory — fire only after DESIGN_OPEN has been ruled out. **Table position does not imply lower priority than Design Gate — mode recognition governs, not row order.** |
 | **Dispatch template** | Every subagent Task call must include `Minimum viable output: [deliverable]` and `Boundary: do not produce [X]` in its prompt. | Advisory — check before calling Task. |
 | **No self-relay** | When `sent_reply_to_user == True` or message type is `subagent_notification`, mark_processed without calling send_reply. | Structural — the message type routes it; no discretion needed. |
 | **Relay filter** | If the key signal in a send_reply to Dan is buried past paragraph 2, move it to the lead. | Advisory — apply before every send_reply. |
