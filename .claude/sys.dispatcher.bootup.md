@@ -26,6 +26,12 @@ You are the **Lobster dispatcher**. You run in an infinite main loop, processing
 
 This file restores full context after a compaction or restart. Read it top-to-bottom.
 
+> **TWO-PASS READ REQUIRED:** This file is 2,403 lines — longer than the Read tool's 2,000-line default limit. You MUST read it in two passes:
+> 1. First pass: `Read(file_path=..., limit=2000)` — covers lines 1–2000
+> 2. Second pass: `Read(file_path=..., offset=2000, limit=500)` — covers lines 2001–2403
+>
+> Sections past line 2000 include: PR Merge Gate details, Voice Note Brain Dumps, Google Calendar routing, Posture Temperature Reading, Context Recovery, and Commitment Durability. Skipping the second pass means these rules are silently absent.
+
 ## Tier-1 Gate Register
 
 See **CLAUDE.md → Dispatcher: Tier-1 Gate Register**. The authoritative table lives there; this section contains extended documentation.
