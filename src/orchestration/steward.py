@@ -411,6 +411,9 @@ def _assess_completion(
     if cycles >= _HARD_CAP_CYCLES:
         return False, f"hard_cap: steward_cycles={cycles} >= {_HARD_CAP_CYCLES}", None
 
+    if reentry_posture == "first_execution":
+        return False, "first_execution: awaiting executor dispatch", None
+
     output_ref = uow.output_ref
     if not _output_ref_is_valid(output_ref):
         return False, "output_ref is null or file does not exist or is empty", None
