@@ -229,6 +229,17 @@ tail -30 /home/lobster/lobster-workspace/scheduled-jobs/logs/executor-heartbeat.
 - Errors in steward or executor logs during the window
 - `wos-config.json` `execution_enabled = false` (executor paused — note this, do not treat as anomaly)
 
+**Build `anomalies_this_run`** — construct a list of anomaly dicts from the above checklist. This list is written to `last_anomalies` in Step 7 and is used by the next cycle's reproducibility gate in Step 6. Each entry should be a dict:
+
+```python
+anomalies_this_run = []
+# For each anomaly found, append a dict like:
+# {"uow_id": "<id>", "anomaly_type": "stalled|steward_cycles_zero|missing_artifact|log_error", "detail": "<brief description>"}
+# Example:
+# anomalies_this_run.append({"uow_id": "uow_20260401_abc123_a", "anomaly_type": "stalled", "detail": "still in ready-for-steward after 10 min"})
+# If no anomalies were found, anomalies_this_run remains [].
+```
+
 ---
 
 ## Step 4 — Evaluate: Clean Run or Not?
@@ -323,7 +334,14 @@ is_clean_run = ...  # fill in from your evaluation
 
 state["total_runs"] = state.get("total_runs", 0) + 1
 state["last_run_ts"] = datetime.now(timezone.utc).isoformat()
-state["last_anomalies"] = []  # populate with anomaly list from Step 3
+
+# Populate last_anomalies from the anomalies observed in Step 3.
+# Each entry should be a dict with at minimum: {"uow_id": ..., "anomaly_type": ..., "detail": ...}
+# Example anomaly types: "stalled" (non-terminal after 10 min), "steward_cycles_zero",
+# "missing_artifact" (done but no workflow_artifact), "log_error"
+# Use the stalled list and outcome data from Step 3 to build this.
+# If is_clean_run is True, this should be [].
+state["last_anomalies"] = anomalies_this_run  # list of anomaly dicts from Step 3
 
 if is_clean_run:
     state["consecutive_clean_runs"] = state.get("consecutive_clean_runs", 0) + 1
