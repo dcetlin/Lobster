@@ -1265,6 +1265,79 @@ class TestObservability:
                 "prescription event must be in audit_log"
             )
 
+    def test_prescription_audit_includes_prescription_source_deterministic(self, db_path, registry, tmp_path):
+        """steward_prescription audit entry has prescription_source='deterministic' when LLM path is bypassed."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=0,
+            output_ref=None,
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            llm_prescriber=None,  # Force deterministic path
+        )
+
+        if _get_uow(db_path, uow_id)["status"] == "ready-for-executor":
+            entries = _audit_entries(db_path, uow_id)
+            presc_entry = next(
+                (e for e in entries if e.get("event") == "steward_prescription"), None
+            )
+            assert presc_entry is not None, "steward_prescription audit entry must exist"
+            # The audit payload is stored as JSON in the 'note' column
+            import json as _json
+            note_data = _json.loads(presc_entry["note"])
+            assert note_data.get("prescription_source") == "deterministic", (
+                f"prescription_source must be 'deterministic' when LLM is bypassed, got {note_data.get('prescription_source')!r}"
+            )
+
+    def test_prescription_audit_includes_prescription_source_llm(self, db_path, registry, tmp_path):
+        """steward_prescription audit entry has prescription_source='llm' when LLM prescriber succeeds."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=0,
+            output_ref=None,
+        )
+        conn.close()
+
+        def stub_llm_prescriber(uow, posture, gap, issue_body=""):
+            return {"instructions": "Do the thing.", "success_criteria_check": ""}
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            llm_prescriber=stub_llm_prescriber,
+        )
+
+        if _get_uow(db_path, uow_id)["status"] == "ready-for-executor":
+            entries = _audit_entries(db_path, uow_id)
+            presc_entry = next(
+                (e for e in entries if e.get("event") == "steward_prescription"), None
+            )
+            assert presc_entry is not None, "steward_prescription audit entry must exist"
+            # The audit payload is stored as JSON in the 'note' column
+            import json as _json
+            note_data = _json.loads(presc_entry["note"])
+            assert note_data.get("prescription_source") == "llm", (
+                f"prescription_source must be 'llm' when LLM prescriber succeeds, got {note_data.get('prescription_source')!r}"
+            )
+
 
 # ---------------------------------------------------------------------------
 # Test: BOOTUP_CANDIDATE_GATE constant defined at module level
