@@ -2019,6 +2019,26 @@ class TestSelectExecutorType:
         uow = self._make_uow("do a thing", source="manual")
         assert steward._select_executor_type(uow) == "general"
 
+    def test_fix_prefix_with_ops_terms_returns_functional_engineer(self):
+        # Regression: "fix: setup script fails" contains both code keyword ("fix")
+        # and ops keywords ("setup", "script"). Code keywords must win.
+        steward = _import_steward()
+        uow = self._make_uow("fix: setup script fails")
+        assert steward._select_executor_type(uow) == "functional-engineer"
+
+    def test_fix_prefix_with_migration_term_returns_functional_engineer(self):
+        # Regression: "fix: migration script fails on upgrade" contains "fix"
+        # (code) and "migration", "script" (ops). Code keyword must win.
+        steward = _import_steward()
+        uow = self._make_uow("fix: migration script fails on upgrade")
+        assert steward._select_executor_type(uow) == "functional-engineer"
+
+    def test_pure_ops_term_no_code_keyword_returns_lobster_ops(self):
+        # Pure ops summary with no code keyword should still route to lobster-ops.
+        steward = _import_steward()
+        uow = self._make_uow("upgrade server config and systemd unit", source="manual")
+        assert steward._select_executor_type(uow) == "lobster-ops"
+
 
 # ---------------------------------------------------------------------------
 # Tests: Issue #425 — _assess_completion reads success field from result.json
