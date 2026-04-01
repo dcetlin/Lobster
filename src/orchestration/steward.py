@@ -639,18 +639,69 @@ def _llm_prescribe(
 
     uow_context = "\n".join(context_parts)
 
-    prompt = f"""You are prescribing work instructions for a Lobster subagent that will execute a Unit of Work (UoW) in a software development pipeline. Your prescription must be concrete, actionable, and directly executable. Avoid vague language. Use the success_criteria as your north star for what 'done' means. The Executor is a capable autonomous coding agent — write instructions at that level.
+    system_prompt = (
+        "You are prescribing work instructions for a Lobster subagent that will execute "
+        "a Unit of Work (UoW) in a software development pipeline. "
+        "Your prescription must be concrete, actionable, and directly executable. "
+        "Avoid vague language. Use the success_criteria as your north star for what 'done' means. "
+        "The Executor is a capable autonomous coding agent — write instructions at that level. "
+        "The instructions you produce will be handed directly to a Lobster subagent dispatch call; "
+        "they must conform to Lobster's subagent dispatch conventions so the executor can act on them correctly."
+    )
 
-Given this Unit of Work, write a precise prescription for the Executor.
+    # Golden dispatch conventions injected into every prescription so the executor
+    # agent that receives the prescription knows how to structure its own work.
+    # uow.source is injected at generation time so the subagent prompt carries the
+    # correct source value rather than a hardcoded platform assumption.
+    _uow_source = uow.source or "telegram"
+    _DISPATCH_CONVENTIONS = f"""\
+## Lobster Subagent Dispatch Conventions
+
+### Prompt YAML Frontmatter (required at top of every prompt)
+---
+task_id: <short-slug>
+chat_id: <user's chat_id>
+source: {_uow_source}
+---
+
+### Required fields in every subagent Task call
+- run_in_background=True for user-facing subagents (required — violating this breaks the 7-second rule)
+  Note: WOS executor tasks are already spawned as background claude -p processes; they use
+  write_result with sent_reply_to_user=False instead of send_reply.
+- subagent_type: see table below
+
+### Agent type selection
+- GitHub issue implementation, feature work, bug fix: functional-engineer
+- Lobster system ops, infra, deploy, install tasks: lobster-ops
+- General background tasks (default): lobster-generalist
+- Default when uncertain: lobster-generalist
+
+### Required prompt structure
+Every prompt must include:
+  Minimum viable output: <one concrete deliverable>
+  Boundary: do not <X>
+
+### Output delivery (subagent two-step)
+1. send_reply(chat_id=<id>, text="<result>", task_id="<slug>")
+2. write_result(task_id="<slug>", sent_reply_to_user=True)
+For internal tasks (no user reply): write_result only with sent_reply_to_user=False
+"""
+
+    user_prompt = f"""Given this Unit of Work, write a precise prescription for the Executor.
 
 {uow_context}
 
+{_DISPATCH_CONVENTIONS}
 Respond with a JSON object only (no markdown, no explanation outside the JSON):
 {{
-  "instructions": "<complete, actionable instructions for the Executor — include the specific steps, what to produce, where to write output, and any constraints from the success criteria>",
+  "instructions": "<complete, actionable instructions for the Executor — include the specific steps, what to produce, where to write output, and any constraints from the success criteria; embed the YAML frontmatter, Minimum viable output, Boundary, and agent_type lines as described above>",
   "success_criteria_check": "<one or two sentences describing exactly how to verify the work is complete — what to check, what file exists, what content to confirm>",
   "estimated_cycles": <integer 1-3 — how many Executor passes this is expected to need>
 }}"""
+
+    # Combine system and user prompts into a single string for claude -p,
+    # which does not accept a separate --system flag in basic invocation mode.
+    prompt = f"{system_prompt}\n\n{user_prompt}"
 
     try:
         proc = subprocess.run(
@@ -767,6 +818,12 @@ def _build_deterministic_prescription_instructions(
     This is the fallback path used when the LLM call fails or is unavailable.
     It is also the implementation called by _build_prescription_instructions
     when llm_prescriber returns None.
+
+    NOTE: This path does not inject _DISPATCH_CONVENTIONS (YAML frontmatter,
+    Minimum viable output, Boundary, agent type, run_in_background, two-step
+    output delivery). The deterministic template produces minimal instructions
+    only. Executors dispatched via this path may not conform to Lobster's
+    subagent dispatch protocol without additional scaffolding at the call site.
 
     Args:
         uow: The Unit of Work being prescribed.
@@ -1282,6 +1339,10 @@ def _default_notify_dan(
     Writes a structured JSON message to ~/messages/inbox/ so the Lobster
     dispatcher surfaces it to Dan via Telegram. In tests this is replaced
     by a capturing mock via the `notify_dan` parameter.
+
+    For hard_cap notifications, the body includes steward_log (diagnosis
+    history across all cycles) and steward_agenda (what the Steward was
+    trying to accomplish) so Dan can triage without leaving the inbox thread.
     """
     uow_id = uow.id
     cycles = uow.steward_cycles
@@ -1291,17 +1352,62 @@ def _default_notify_dan(
     )
     msg_id = str(uuid.uuid4())
     if condition == "hard_cap":
+        # Hard cap: exhaustive context so Dan can triage and act without
+        # digging through logs. Include summary, agenda, log, and reason.
         body_lines = [
-            f"🚨 WOS: UoW `{uow_id}` hit cycle cap ({_HARD_CAP_CYCLES}). "
-            f"return_reason: {return_reason}. Surfacing for Dan review.",
+            f"WOS: UoW `{uow_id}` hit hard cap ({_HARD_CAP_CYCLES} cycles). "
+            f"return_reason: {return_reason}.",
         ]
+
+        # UoW summary — what was this trying to accomplish?
+        summary = uow.summary
+        if summary:
+            body_lines.append(f"\nSummary: {summary}")
+
+        # Success criteria — what would done look like?
+        success_criteria = uow.success_criteria
+        if success_criteria:
+            body_lines.append(f"\nSuccess criteria: {success_criteria}")
+
+        # Steward agenda — the structured forecast of what was planned
+        steward_agenda_raw = uow.steward_agenda
+        if steward_agenda_raw:
+            try:
+                agenda = json.loads(steward_agenda_raw)
+                # Render agenda nodes as a compact list for readability
+                agenda_lines: list[str] = []
+                nodes = agenda if isinstance(agenda, list) else [agenda]
+                for node in nodes:
+                    posture = node.get("posture", "?")
+                    status = node.get("status", "?")
+                    context = node.get("context", "")
+                    agenda_lines.append(f"  [{status}] {posture}: {context[:120]}")
+                body_lines.append("\nSteward agenda:\n" + "\n".join(agenda_lines))
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                # If agenda is not valid JSON or not a list, include raw text
+                body_lines.append(f"\nSteward agenda (raw):\n{steward_agenda_raw[:500]}")
+
+        # Steward log — full diagnosis history across all cycles (surface_log == current_log_str)
+        if surface_log:
+            # Show last N log lines to keep the message readable
+            log_lines = [ln for ln in surface_log.strip().splitlines() if ln.strip()]
+            _MAX_LOG_LINES = 20
+            if len(log_lines) > _MAX_LOG_LINES:
+                omitted = len(log_lines) - _MAX_LOG_LINES
+                displayed = log_lines[-_MAX_LOG_LINES:]
+                body_lines.append(
+                    f"\nSteward log (last {_MAX_LOG_LINES} of {len(log_lines)} entries, "
+                    f"{omitted} omitted):\n" + "\n".join(displayed)
+                )
+            else:
+                body_lines.append(f"\nSteward log:\n" + "\n".join(log_lines))
     else:
         body_lines = [
             f"WOS SURFACE: UoW {uow_id} hit condition={condition} "
             f"(steward_cycles={cycles}). Needs human review.",
         ]
-    if surface_log:
-        body_lines.append(f"\nSteward log:\n{surface_log}")
+        if surface_log:
+            body_lines.append(f"\nSteward log:\n{surface_log}")
     # Inline buttons let Dan resolve the stuck UoW without typing commands.
     # The dispatcher routes callback_data="decide_retry:<uow_id>" and
     # callback_data="decide_close:<uow_id>" to handle_decide_retry/close.
@@ -1325,6 +1431,7 @@ def _default_notify_dan(
             "steward_cycles": cycles,
             "return_reason": return_reason,
             "steward_log": surface_log,
+            "steward_agenda": uow.steward_agenda,
         },
     }
     inbox_dir = Path(os.path.expanduser("~/messages/inbox"))

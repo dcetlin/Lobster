@@ -327,6 +327,25 @@ These files are private and not in the git repo. They extend and override the de
 
 Before making any structural decision (routing, delegation, gate application, design classification), consult `~/lobster-workspace/oracle/learnings.md` — it contains named failure modes and design patterns that apply across sessions.
 
+---
+
+## OODA Register Table
+
+vision.yaml constraint-3 requires every system decision to traverse the OODA loop at the appropriate register. This table defines the four registers so the constraint is actionable, not just named.
+
+| Register | One-sentence definition | Concrete example | Escalation rule |
+|---|---|---|---|
+| **Deliberative** | Dan is explicitly in the loop; decision is reached through live dialogue or written directive. | Dan says "open a PR for issue 42" in Telegram. | Baseline register — no escalation needed. |
+| **Constrained** | System acts within a pre-specified policy boundary set by Dan; no live input required. | Dispatcher applies the 7-second rule to every tool call. | If the policy boundary does not exist or does not cover this case, escalate to Deliberative. |
+| **Reactive** | System responds to an event within tight latency constraints using a narrow, pre-approved action set. | Health check restarts the dispatcher when wait_for_messages stalls for > 600s. | If the action set would exceed its scope, escalate to Constrained or Deliberative. |
+| **Encoded Orientation** | System acts autonomously, with no live Dan input and no explicit policy boundary — relying on accumulated orientation from vision.yaml and logged decisions. | Dispatcher classifies a message as DESIGN_OPEN without checking with Dan, based on prior logged pattern. | **Requires:** (1) a prior logged decision of the same class AND (2) a traceable vision.yaml anchor. If either is absent, escalate to Deliberative. |
+
+**Escalation path:** Encoded Orientation → Deliberative (bypass intermediate registers when the anchor check fails — do not invent a Constrained boundary to avoid escalation).
+
+**"Escalate to Deliberative" means:** send Dan a message, state the decision class and what anchor is missing, and wait for explicit input before acting. Do not act and report afterward.
+
+---
+
 ## Handling Post-Compact Gate Denial
 
 If any tool call is denied with a message containing "GATE BLOCKED" or "compact-pending":
@@ -991,6 +1010,27 @@ When a message has `type: "agent_failed"` AND `chat_id == 0`:
 - `original_chat_id` — the user's chat_id from when the task was spawned (use this for escalation)
 - `original_prompt` — first 500 chars of the agent's prompt (may be None for legacy rows)
 - `last_output` — last 500 chars of the agent's output file (may be None if file missing)
+
+---
+
+## Handling Reconciler Sweep Summaries (`reconciler_sweep_summary`)
+
+Produced by the startup sweep when the MCP server restarts and finds unnotified completed/dead sessions. One message is written per originating `chat_id` (not one per task), so an inbox flood is structurally impossible. No subagent needed — relay inline.
+
+**Processing pseudocode:**
+
+```
+1. mark_processing(message_id)
+2. summary_text = msg["text"]   # pre-formatted task list (completed_count + task names)
+   chat_id      = msg["chat_id"]
+   source       = msg.get("source", "telegram")
+3. send_reply(chat_id=chat_id, text=summary_text, source=source)
+4. mark_processed(message_id)
+```
+
+**Key fields:** `chat_id`, `source`, `text` (pre-formatted summary with completed count and task list), `completed_count`, `dead_count`, `task_ids` (list of task_ids for correlation).
+
+No subagent needed. Relay `msg["text"]` directly — it already contains the completed count and task list.
 
 ---
 
@@ -1798,9 +1838,24 @@ Status: `proposed → pending`"
   ```
   Reply with the returned string.
 
-**Note:** Decide actions (Retry / Close on stuck UoWs) are handled via inline button callbacks — see "Handling WOS Surface Messages" section above.
+- `/decide <uow-id> <proceed|abandon|retry>` — Resolve a blocked UoW from the command line.
+  Handle directly (no subagent — fast CLI call). Call:
+  ```python
+  from src.orchestration.dispatcher_handlers import handle_decide
+  from src.orchestration.registry import Registry
+  registry = Registry()
+  reply = handle_decide(uow_id, action, registry=registry)
+  ```
+  Action semantics:
+  - `proceed` — unblock and re-queue to `ready-for-steward` (steward_cycles preserved)
+  - `retry` — reset steward_cycles to 0 and re-queue to `ready-for-steward` (full retry)
+  - `abandon` — close the UoW as user-requested failure (`blocked → failed`)
+  All three actions operate only on UoWs in `blocked` status. Reply with the returned string.
+  If the UoW is not found or not blocked, the handler returns a descriptive error message.
 
-`/wos status`, `/wos unblock`, `/wos start`, `/wos stop`, and `/confirm` are handled directly in the dispatcher (no subagent — fast CLI calls).
+**Note:** Decide actions (Retry / Close on stuck UoWs) are also available via inline button callbacks — see "Handling WOS Surface Messages" section above. `/decide` is the slash-command equivalent for when buttons are not available.
+
+`/wos status`, `/wos unblock`, `/wos start`, `/wos stop`, `/confirm`, and `/decide` are handled directly in the dispatcher (no subagent — fast CLI calls).
 `/wos pdf` requires a subagent — dispatch it and reply "Generating WOS PDF..." immediately.
 
 

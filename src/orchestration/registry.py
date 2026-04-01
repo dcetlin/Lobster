@@ -485,7 +485,13 @@ class Registry:
 
     def approve(self, uow_id: str) -> ApproveResult:
         """
-        Transition a UoW from proposed → pending.
+        Transition a UoW from proposed → ready-for-steward (atomically, via pending).
+
+        The pending status is no longer a resting state: on /approve, the UoW
+        transitions proposed → pending → ready-for-steward in a single transaction.
+        Both audit entries are written in the same transaction so the full history
+        is preserved without leaving the UoW stranded in pending awaiting the
+        6am GardenCaretaker run.
 
         Returns a typed ApproveResult:
         - ApproveConfirmed: transition succeeded
@@ -513,6 +519,8 @@ class Registry:
                     return ApproveExpired(id=uow_id)
                 case UoWStatus.PROPOSED:
                     now = _now_iso()
+                    # Write two audit entries — proposed→pending then pending→ready-for-steward —
+                    # so the full history is preserved even though pending is never a resting state.
                     self._write_audit(
                         conn,
                         uow_id=uow_id,
@@ -520,8 +528,16 @@ class Registry:
                         from_status=UoWStatus.PROPOSED,
                         to_status=UoWStatus.PENDING,
                     )
+                    self._write_audit(
+                        conn,
+                        uow_id=uow_id,
+                        event="status_change",
+                        from_status=UoWStatus.PENDING,
+                        to_status=UoWStatus.READY_FOR_STEWARD,
+                        note="auto-advanced: pending is not a resting state",
+                    )
                     conn.execute(
-                        "UPDATE uow_registry SET status = 'pending', updated_at = ? WHERE id = ?",
+                        "UPDATE uow_registry SET status = 'ready-for-steward', updated_at = ? WHERE id = ?",
                         (now, uow_id),
                     )
                     conn.commit()
@@ -1181,6 +1197,64 @@ class Registry:
                 UPDATE uow_registry
                 SET status = 'ready-for-steward',
                     steward_cycles = 0,
+                    updated_at = ?
+                WHERE id = ? AND status = 'blocked'
+                """,
+                (now, uow_id),
+            )
+            rows_affected = cursor.rowcount
+
+            conn.commit()
+            return rows_affected
+
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def decide_proceed(self, uow_id: str) -> int:
+        """
+        Unblock a stuck UoW and re-queue it to the Steward without resetting cycles.
+
+        Used when Dan sends `/decide <uow-id> proceed` after the Steward surfaces
+        a blocked UoW. Unlike decide_retry, this preserves steward_cycles so the
+        Steward knows how many attempts have already been made.
+
+        Use case: external blocker was resolved and the UoW should resume where it
+        left off. Use decide_retry when a full fresh start is needed.
+
+        Transitions: blocked → ready-for-steward (optimistic lock on blocked).
+        Does NOT reset steward_cycles.
+
+        Returns rows_affected (1 on success, 0 if UoW is not in blocked status).
+        Writes audit entry atomically in the same transaction as the UPDATE.
+        """
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            conn.execute("BEGIN IMMEDIATE")
+
+            note_json = json.dumps({
+                "event": "decide_proceed",
+                "actor": "user",
+                "uow_id": uow_id,
+                "timestamp": now,
+                "note": "user requested proceed — steward_cycles preserved",
+            })
+
+            conn.execute(
+                """
+                INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                VALUES (?, ?, 'decide_proceed', 'blocked', 'ready-for-steward', 'user', ?)
+                """,
+                (now, uow_id, note_json),
+            )
+
+            cursor = conn.execute(
+                """
+                UPDATE uow_registry
+                SET status = 'ready-for-steward',
                     updated_at = ?
                 WHERE id = ? AND status = 'blocked'
                 """,

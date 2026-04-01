@@ -37,6 +37,7 @@ Canonical output path convention (from executor-contract.md):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import subprocess
@@ -46,6 +47,8 @@ from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
+
+log = logging.getLogger("executor")
 
 from orchestration.registry import Registry, UoW, UoWStatus
 from orchestration.result_writer import write_result as _write_subagent_result
@@ -193,6 +196,28 @@ def _write_output_ref_content(output_ref: str, content: str) -> None:
     p = Path(output_ref)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content)
+
+
+def _validate_result_json_written(uow_id: str, output_ref: str) -> None:
+    """
+    Warn if result.json was not written at an intentional exit point.
+
+    This is a contract violation guard (executor-contract.md): every intentional
+    exit (complete, partial, failed, blocked) must produce a result file. This
+    function logs a WARNING — it does not raise — so the UoW transition still
+    proceeds. The Steward will detect the missing file and surface to Dan if needed.
+
+    Called after every _write_result_json() call at intentional exit points.
+    """
+    result_path = _result_json_path(output_ref)
+    if not result_path.exists():
+        log.warning(
+            "Executor contract violation: result.json not found after write for UoW %s "
+            "(expected: %s). Steward will be unable to assess completion deterministically. "
+            "See docs/executor-contract.md.",
+            uow_id,
+            result_path,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -492,8 +517,9 @@ class Executor:
             executor_id=executor_id or None,
         )
 
-        # Step 5: Write result.json
+        # Step 5: Write result.json (executor-contract.md: required at every intentional exit)
         _write_result_json(output_ref, result)
+        _validate_result_json_written(uow_id, output_ref)
 
         # Step 6: Transition to ready-for-steward (audit before status update, single transaction)
         self.registry.complete_uow(uow_id, output_ref)
@@ -528,6 +554,7 @@ class Executor:
         )
         _write_output_ref_content(output_ref, f"partial: {reason}")
         _write_result_json(output_ref, result)
+        _validate_result_json_written(uow_id, output_ref)
         self.registry.complete_uow(uow_id, output_ref)
         return result
 
@@ -551,6 +578,7 @@ class Executor:
         )
         _write_output_ref_content(output_ref, f"blocked: {reason}")
         _write_result_json(output_ref, result)
+        _validate_result_json_written(uow_id, output_ref)
         self.registry.complete_uow(uow_id, output_ref)
         return result
 

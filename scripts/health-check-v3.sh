@@ -1368,9 +1368,14 @@ except Exception as e:
 # check_usage_limit — inspect the last 50 lines of claude-session.log for the
 # Anthropic rate-limit message ("You've hit your limit").
 #
+# Recency guard: if claude-session.log was not modified within the last 10
+# minutes, the function returns 1 immediately without scanning the file.  This
+# prevents a stale limit event from a prior session from suppressing crash
+# recovery in a fresh session indefinitely.
+#
 # Returns:
-#   0  — usage limit detected (caller should NOT escalate to BLACK/restart)
-#   1  — no limit signal found (caller should proceed with normal crash logic)
+#   0  — usage limit detected in a recent (< 10 min) log (caller should NOT escalate to BLACK/restart)
+#   1  — no limit signal found, or log is stale (caller should proceed with normal crash logic)
 #
 # Side effects on detection:
 #   - Writes $LIMIT_WAIT_STATE_FILE with epoch timestamp and optional reset time
@@ -1378,6 +1383,17 @@ except Exception as e:
 #   - Logs at INFO level
 check_usage_limit() {
     if [[ ! -f "$CLAUDE_SESSION_LOG" ]]; then
+        return 1
+    fi
+
+    # Recency guard: only treat a log match as a current event if the file was
+    # modified within the last 10 minutes.  A stale file means the limit message
+    # is from a prior session and must not block crash recovery now.
+    local _now _file_mtime _age
+    _now=$(date +%s)
+    _file_mtime=$(stat -c %Y "$CLAUDE_SESSION_LOG" 2>/dev/null) || return 1
+    _age=$(( _now - _file_mtime ))
+    if (( _age > 600 )); then
         return 1
     fi
 
@@ -1411,9 +1427,10 @@ check_usage_limit() {
 }
 
 # is_limit_wait — returns 0 if a recent usage-limit event was recorded and
-# the limit-wait window has not yet expired.  Conservatively uses a 4-hour
-# guard since reset times are hard to parse reliably.
-LIMIT_WAIT_MAX_SECONDS=14400  # 4 hours
+# the limit-wait window has not yet expired.  Uses a 10-minute retry interval
+# so the system recovers quickly on false positives rather than sitting dead
+# for 4 hours.
+LIMIT_WAIT_MAX_SECONDS=600  # 10 minutes
 
 is_limit_wait() {
     [[ -f "$LIMIT_WAIT_STATE_FILE" ]] || return 1

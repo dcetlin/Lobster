@@ -6,14 +6,22 @@ instance, and return a formatted string response suitable for sending back to
 Telegram. No MCP tools, no network calls — those belong in the dispatcher.
 
 The dispatcher calls these handlers when it recognizes:
-  /approve <uow-id>        → handle_approve(uow_id, registry)
-  /wos status [status]     → handle_wos_status(status, registry)
-  /wos unblock             → handle_wos_unblock()
-  /wos start               → handle_wos_start()
-  /wos stop                → handle_wos_stop()
-  decide retry <uow-id>    → handle_decide_retry(uow_id, registry)
-  decide close <uow-id>    → handle_decide_close(uow_id, registry)
-  type: "wos_execute"      → handle_wos_execute(uow_id, instructions, output_ref)
+  /approve <uow-id>                    → handle_approve(uow_id, registry)
+  /decide <uow-id> <proceed|abandon|retry> → handle_decide(uow_id, action, registry)
+  /wos status [status]                 → handle_wos_status(status, registry)
+  /wos unblock                         → handle_wos_unblock()
+  /wos start                           → handle_wos_start()
+  /wos stop                            → handle_wos_stop()
+  decide retry <uow-id>                → handle_decide_retry(uow_id, registry)
+  decide close <uow-id>                → handle_decide_close(uow_id, registry)
+  type: "wos_execute"                  → handle_wos_execute(uow_id, instructions, output_ref)
+
+## Compaction-resilient dispatch
+
+WOS_MESSAGE_TYPE_DISPATCH maps inbox message types to handler descriptors.
+The dispatcher calls route_wos_message(msg) to dispatch type-routed messages
+instead of relying on prose instructions that can be lost under context compaction.
+Import and call this table unconditionally — Python imports survive compaction.
 """
 
 from __future__ import annotations
@@ -21,7 +29,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .registry import Registry
@@ -94,7 +102,7 @@ def handle_approve(uow_id: str, *, registry: "Registry") -> str:
         case ApproveConfirmed():
             return (
                 f"UoW `{uow_id}` confirmed.\n"
-                f"Status: `proposed \u2192 pending`"
+                f"Status: `proposed \u2192 ready-for-steward` (via pending)"
             )
         case ApproveNotFound():
             return (
@@ -163,20 +171,72 @@ def handle_decide_close(uow_id: str, *, registry: "Registry") -> str:
     )
 
 
+_VALID_DECIDE_ACTIONS = frozenset({"proceed", "abandon", "retry"})
+
+
+def handle_decide(uow_id: str, action: str, *, registry: "Registry") -> str:
+    """
+    Handle /decide <uow-id> <proceed|abandon|retry>.
+
+    Provides a single unified command for resolving blocked UoWs from Telegram.
+    Action semantics:
+      proceed  — unblock and re-queue to ready-for-steward (preserves steward_cycles)
+      retry    — reset steward_cycles to 0 and re-queue to ready-for-steward (full retry)
+      abandon  — close the UoW as user-requested failure (blocked → failed)
+
+    All three actions operate only on UoWs in `blocked` status — optimistic lock
+    prevents accidental double-writes if the UoW has already been advanced.
+
+    Returns a human-readable Telegram message describing the outcome.
+    """
+    action = action.lower().strip()
+
+    if action not in _VALID_DECIDE_ACTIONS:
+        valid = ", ".join(sorted(_VALID_DECIDE_ACTIONS))
+        return (
+            f"Unknown action `{action}`.\n"
+            f"Valid actions: {valid}\n"
+            f"Usage: `/decide {uow_id} <{valid}>`"
+        )
+
+    match action:
+        case "proceed":
+            rows = registry.decide_proceed(uow_id)
+            if rows == 1:
+                return (
+                    f"UoW `{uow_id}` unblocked.\n"
+                    f"Status: `blocked \u2192 ready-for-steward` (steward_cycles preserved)"
+                )
+            return (
+                f"UoW `{uow_id}` could not be unblocked \u2014 it is not currently in `blocked` status.\n"
+                f"Run `/wos status blocked` to see blocked UoWs."
+            )
+        case "retry":
+            return handle_decide_retry(uow_id, registry=registry)
+        case "abandon":
+            return handle_decide_close(uow_id, registry=registry)
+        case _:
+            # Unreachable — guarded by frozenset check above — but satisfies mypy exhaustiveness
+            return f"Unhandled action `{action}`."
+
+
 def handle_wos_status(status: str | None, *, registry: "Registry") -> str:
     """
     Handle /wos status [status].
 
-    When status is None, returns active + pending records (the useful default
-    for "what's running and what's queued?").
+    When status is None, returns active + ready-for-steward + pending records
+    (the useful default for "what's running and what's queued?"). Pending is
+    included for backward compatibility with any UoWs that were written before
+    the auto-advance change; in normal operation pending is never a resting state.
 
     Format per record: <id> | <summary> | source: <source> | created: <date>
     """
     if status is None:
         active = registry.list(status="active")
+        ready_for_steward = registry.list(status="ready-for-steward")
         pending = registry.list(status="pending")
-        records = active + pending
-        header = "Active + pending UoWs:"
+        records = active + ready_for_steward + pending
+        header = "Active + queued UoWs:"
     else:
         records = registry.list(status=status)
         header = f"UoWs with status `{status}`:"
@@ -372,3 +432,113 @@ def handle_wos_stop() -> str:
         "UoWs already active will continue running; TTL recovery handles any that stall.\n"
         f"Config: `{_WOS_CONFIG_PATH}`"
     )
+
+
+# ---------------------------------------------------------------------------
+# Compaction-resilient message-type dispatch table
+#
+# Maps inbox message `type` values to handler descriptors.  The dispatcher
+# calls route_wos_message(msg) instead of embedding routing logic in prose
+# instructions — prose can be lost under context compaction, Python imports
+# cannot.
+#
+# Dispatcher integration (add to main loop):
+#
+#     from src.orchestration.dispatcher_handlers import route_wos_message
+#
+#     if msg.get("type") in WOS_MESSAGE_TYPE_DISPATCH:
+#         result = route_wos_message(msg)
+#         # result["action"] tells the dispatcher what to do next
+#         # See route_wos_message docstring for the result schema.
+# ---------------------------------------------------------------------------
+
+WOS_MESSAGE_TYPE_DISPATCH: dict[str, str] = {
+    # message type → handler name (used as a stable, compaction-safe key)
+    "wos_execute": "handle_wos_execute",
+}
+
+
+def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Route an inbox message whose `type` is listed in WOS_MESSAGE_TYPE_DISPATCH.
+
+    This is the compaction-resilient entry point for WOS message routing.  The
+    dispatcher should call this function rather than conditionally re-reading
+    prose documentation that may not survive context compaction.
+
+    For ``type: "wos_execute"`` the function extracts the required fields and
+    builds the subagent prompt via ``handle_wos_execute``.  The dispatcher is
+    still responsible for spawning the subagent Task and for all
+    mark_processing / mark_processed bookkeeping — this function is pure.
+
+    Args:
+        msg: The raw inbox message dict as returned by ``wait_for_messages``.
+             Must contain ``type`` and the type-specific payload fields.
+
+    Returns:
+        A dict with the following keys:
+
+        ``action`` (str):
+            What the dispatcher must do.  Currently always ``"spawn_subagent"``
+            for ``wos_execute`` messages.
+
+        ``task_id`` (str):
+            The ``task_id`` to pass to the Task tool (e.g. ``"wos-<uow_id>"``).
+
+        ``prompt`` (str):
+            The prompt string to pass to the background subagent Task call.
+
+        ``message_type`` (str):
+            Echo of ``msg["type"]`` — lets callers confirm which branch fired.
+
+    Raises:
+        KeyError: if a required field is missing from ``msg``.
+        ValueError: if ``msg["type"]`` is not in ``WOS_MESSAGE_TYPE_DISPATCH``.
+
+    Example dispatcher integration::
+
+        from src.orchestration.dispatcher_handlers import (
+            route_wos_message,
+            WOS_MESSAGE_TYPE_DISPATCH,
+        )
+
+        msg_type = msg.get("type", "")
+        if msg_type in WOS_MESSAGE_TYPE_DISPATCH:
+            routing = route_wos_message(msg)
+            # routing["action"] == "spawn_subagent"
+            # spawn Task(routing["prompt"], run_in_background=True,
+            #             task_id=routing["task_id"])
+            mark_processed(message_id)
+    """
+    msg_type: str = msg.get("type", "")
+
+    if msg_type not in WOS_MESSAGE_TYPE_DISPATCH:
+        raise ValueError(
+            f"route_wos_message: unrecognised message type {msg_type!r}. "
+            f"Known types: {sorted(WOS_MESSAGE_TYPE_DISPATCH)}"
+        )
+
+    if msg_type == "wos_execute":
+        uow_id: str = msg["uow_id"]
+        instructions: str = msg["instructions"]
+        # output_ref may be supplied by the Executor, or derived from uow_id
+        output_ref: str = msg.get(
+            "output_ref",
+            str(
+                Path.home()
+                / "lobster-workspace"
+                / "orchestration"
+                / "outputs"
+                / f"{uow_id}.result.json"
+            ),
+        )
+        prompt = handle_wos_execute(uow_id, instructions, output_ref)
+        return {
+            "action": "spawn_subagent",
+            "task_id": f"wos-{uow_id}",
+            "prompt": prompt,
+            "message_type": msg_type,
+        }
+
+    # Unreachable given the guard above, but satisfies exhaustiveness checkers
+    raise ValueError(f"route_wos_message: no branch for type {msg_type!r}")

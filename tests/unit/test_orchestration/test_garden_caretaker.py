@@ -355,12 +355,38 @@ class TestTend:
         assert len(expired) == 1
 
     def test_tend_archives_pending_uow_when_source_closed(self, registry: Registry) -> None:
+        """pending is no longer a resting state — approve() lands on ready-for-steward.
+        A UoW that has been approved (ready-for-steward) and whose source closes is
+        surfaced to the Steward (not archived) because in-flight work is involved.
+        """
         upsert_result = registry.upsert(issue_number=11, title="Pending issue", success_criteria="Test completion.")
-        # Move to pending via approve
+        # approve() now lands on ready-for-steward, not pending
         registry.approve(upsert_result.id)
+        uow = registry.get(upsert_result.id)
+        assert uow.status.value == "ready-for-steward"
 
         snap = _snapshot(source_ref="github:issue/11", state="closed")
         source = _make_source(issue_map={"github:issue/11": snap})
+        caretaker = GardenCaretaker(source=source, registry=registry)
+
+        result = caretaker.tend()
+
+        # ready-for-steward + source closed → surface (not archive), per reconciliation table.
+        # The UoW remains in ready-for-steward (the surface action writes an audit entry and
+        # keeps the status; the Steward will close it on its next cycle).
+        assert result["surfaced_to_steward"] == 1
+        assert result["archived"] == 0
+        uow_after = registry.get(upsert_result.id)
+        assert uow_after.status.value == "ready-for-steward"
+
+    def test_tend_archives_pending_uow_set_directly_when_source_closed(self, registry: Registry) -> None:
+        """Legacy: a UoW manually set to pending (pre-auto-advance) is archived when source closes."""
+        upsert_result = registry.upsert(issue_number=111, title="Legacy pending issue", success_criteria="Test completion.")
+        # Bypass approve() to simulate a legacy pending UoW
+        registry.set_status_direct(upsert_result.id, "pending")
+
+        snap = _snapshot(source_ref="github:issue/111", state="closed")
+        source = _make_source(issue_map={"github:issue/111": snap})
         caretaker = GardenCaretaker(source=source, registry=registry)
 
         result = caretaker.tend()

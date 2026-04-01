@@ -283,6 +283,29 @@ Begin executing the prescribed workflow only after the transaction commits.
 
 > **Atomicity lineage:** This claim sequence inherits the same atomic-claim pattern that Lobster's inbox uses to prevent concurrent double-processing. In Lobster's inbox, a message is claimed via an atomic filesystem move (`inbox/` → `processing/`); no two agents can claim the same file because the move is atomic at the OS level. WOS uses the equivalent mechanism at the database layer: the status transition from `ready-for-executor` to `active` is executed inside a SQLite transaction with optimistic locking — if two Executors race, only one wins the transition. The recovery equivalence also holds: Lobster's `processing/` sweep on startup (finding abandoned in-flight messages) maps directly to WOS's startup sweep over stale `active` records. Same pattern, different substrate.
 
+**Executor Output Contract — required for every Executor implementation:**
+
+Every Executor **must** write `{output_ref}.result.json` before transitioning the UoW to `ready-for-steward`. This applies to all exit paths: complete, partial, failed, and blocked. An Executor that transitions without writing this file is in contract violation.
+
+Path derivation (mirrors `executor-contract.md §Schema`):
+- Primary: replace extension → `foo.json` becomes `foo.result.json`
+- Fallback (no extension): append suffix → `/path/to/artifact` becomes `/path/to/artifact.result.json`
+
+Minimum required fields in the result file:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `uow_id` | yes | Must match the UoW's `id` field |
+| `outcome` | yes | `"complete"` \| `"partial"` \| `"failed"` \| `"blocked"` |
+| `success` | yes | `true` iff `outcome == "complete"` |
+| `reason` | for non-complete | Human-readable explanation |
+
+The Steward's `_assess_completion` reads this file to route the UoW. If the file is absent and `success_criteria` is set, the Steward cannot declare done — it will cycle to the hard cap (5 retries) and surface to Dan. **Absence of the result file is a contract violation, not an ambiguous state.**
+
+Full schema, outcome enum, Steward interpretation table, and failure taxonomy: **[`docs/executor-contract.md`](executor-contract.md)**.
+
+The Lobster `Executor` class (`src/orchestration/executor.py`) implements this contract: `_write_result_json()` is called at every intentional exit point, and the exception handler writes a `failed` result before re-raising. New Executor implementations (custom executor types, test doubles) must replicate this pattern.
+
 The Steward/Executor loop continues until the Steward declares convergence:
 
 ```
