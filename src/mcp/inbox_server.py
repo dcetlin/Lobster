@@ -9348,6 +9348,20 @@ def _build_reconciler_message(
         }
 
 
+def _is_internal_agent(session: dict) -> bool:
+    """Return True when the session belongs to a system/internal agent (chat_id=0/empty).
+
+    Internal agents (chat_id=0) have no real user to notify.  Reconciler
+    notifications for these sessions would land in the inbox as no-ops —
+    the dispatcher must read each one only to discover there is nothing to relay.
+
+    Pure function: reads session dict, no side effects.
+    """
+    raw = session.get("chat_id")
+    chat_id_str = str(raw).strip() if raw is not None else ""
+    return chat_id_str in ("0", "", "None")
+
+
 def _enqueue_reconciler_notification(session: dict, outcome: str) -> None:
     """Write a structured inbox message for a reconciler-detected session transition.
 
@@ -9359,6 +9373,10 @@ def _enqueue_reconciler_notification(session: dict, outcome: str) -> None:
     the user's Telegram — the dispatcher decides whether to re-queue, escalate,
     or drop silently.
 
+    Internal/system agents (chat_id=0) are silently dropped for both outcomes —
+    no real user exists to notify, and writing a no-op inbox message forces the
+    dispatcher to read and discard it on every cycle.
+
     Also marks the session as notified_at to prevent duplicate notifications
     on the next reconciler cycle.
 
@@ -9366,39 +9384,21 @@ def _enqueue_reconciler_notification(session: dict, outcome: str) -> None:
         session: Session dict from get_active_sessions() or get_unnotified_completed().
         outcome: 'completed' or 'dead'.
     """
-    # Dead sessions with no real user don't need dispatcher action — route to
-    # debug log only, not the inbox. The dispatcher cannot notify a user
-    # (no chat_id) or take any meaningful action. Logging preserves observability.
-    if outcome == "dead":
+    # System agents (chat_id=0/empty) have no real user — skip inbox for all outcomes.
+    # Logging preserves observability without polluting the dispatcher inbox.
+    if _is_internal_agent(session):
+        _agent_id = session.get("id", "")
         _chat_id = session.get("chat_id")
-        _chat_id_str = str(_chat_id).strip() if _chat_id is not None else ""
-        if _chat_id_str in ("0", "", "None"):
-            _agent_id = session.get("id", "")
-            log.debug(
-                "[reconciler] Dead session %r has no real user (chat_id=%r) — "
-                "skipping inbox notification (logged to debug only)",
-                _agent_id, _chat_id,
-            )
-            return
+        log.debug(
+            "[reconciler] Session %r is internal (chat_id=%r, outcome=%r) — "
+            "skipping inbox notification",
+            _agent_id, _chat_id, outcome,
+        )
+        return
 
     # Idempotency guard — if already notified, skip
     if session.get("notified_at"):
         return
-
-    # Dead sessions with no real user don't need dispatcher action — route to
-    # debug log only, not the inbox. The dispatcher cannot notify a user
-    # (no chat_id) or take any meaningful action. Logging preserves observability.
-    if outcome == "dead":
-        _chat_id = session.get("chat_id")
-        _chat_id_str = str(_chat_id).strip() if _chat_id is not None else ""
-        if _chat_id_str in ("0", "", "None"):
-            _agent_id = session.get("id", "")
-            log.debug(
-                "[reconciler] Dead session %r has no real user (chat_id=%r) — "
-                "skipping inbox notification (logged to debug only)",
-                _agent_id, _chat_id,
-            )
-            return
 
     agent_id = session.get("id", "")
     now = datetime.now(timezone.utc)

@@ -9,10 +9,12 @@ Two bugs caused cascading WFM stale restarts:
 
 This module tests the fix:
 
-  Fix 1 (restored, scoped): _enqueue_reconciler_notification() now skips inbox
-         write for dead sessions where chat_id is 0, "", or None. These have no
-         real user — the dispatcher cannot notify anyone or take meaningful action.
-         Completed sessions are unaffected (they always write to inbox).
+  Fix 1 (restored, extended in #462): _enqueue_reconciler_notification() now
+         skips inbox write for sessions where chat_id is 0, "", or None — for
+         ALL outcomes (completed and dead). These have no real user — the
+         dispatcher cannot notify anyone or take meaningful action.  Before #462,
+         only dead sessions were suppressed; completed ghost notifications produced
+         no-op inbox reads.
          The `should_drop` field has been removed from _build_reconciler_message()
          in favor of this pre-write guard.
 
@@ -353,26 +355,26 @@ class TestGhostSessionCascadePrevented:
 def _should_skip_dead_no_user(session: dict, outcome: str) -> bool:
     """Pure function mirroring the early-return guard in _enqueue_reconciler_notification().
 
-    Dead sessions with chat_id 0, "", or None have no real user — the
-    dispatcher cannot notify anyone or take meaningful action. Route to debug
-    log only, not the inbox.
+    Sessions with chat_id 0, "", or None have no real user — the dispatcher
+    cannot notify anyone or take meaningful action.  Route to debug log only,
+    not the inbox.  This applies to ALL outcomes (completed AND dead) as of
+    issue #462: completed ghost notifications were no-op reads for the dispatcher.
 
-    Completed sessions always write to inbox regardless of chat_id, because
-    completed agent results need to be processed even for cron subagents.
+    Note: the function name is retained for backward-compat with the test suite;
+    the scope now covers all outcomes, not just dead.
     """
-    if outcome != "dead":
-        return False
     _chat_id = session.get("chat_id")
     _chat_id_str = str(_chat_id).strip() if _chat_id is not None else ""
     return _chat_id_str in ("0", "", "None")
 
 
 class TestGhostChatIdNoInboxNotification:
-    """Dead sessions with no real user must not write to the inbox.
+    """Internal/system sessions (chat_id=0) must not write to the inbox for any outcome.
 
     The guard in _enqueue_reconciler_notification() returns early (logging to
-    debug only) when outcome=='dead' and chat_id is 0, empty, or None.
-    Completed sessions and dead sessions with real users are unaffected.
+    debug only) when chat_id is 0, empty, or None — regardless of whether the
+    outcome is 'dead' or 'completed' (issue #462).  Sessions with a real user
+    chat_id are unaffected.
     """
 
     @pytest.mark.parametrize("chat_id,should_skip", [
@@ -393,15 +395,17 @@ class TestGhostChatIdNoInboxNotification:
         )
 
     @pytest.mark.parametrize("chat_id", ["0", 0, "", None, "None"])
-    def test_completed_outcome_never_skipped(self, chat_id):
-        """Completed sessions with ghost chat_ids still write to inbox.
+    def test_completed_outcome_internal_agent_skipped(self, chat_id):
+        """Completed sessions with ghost chat_ids are skipped (issue #462).
 
-        Completed agent results need to be processed even when there's no user
-        to notify directly — the dispatcher handles them.
+        Before #462, only dead sessions with chat_id=0 were suppressed.
+        Completed ghost sessions still wrote no-op inbox messages that the
+        dispatcher had to read and discard.  The fix extends the filter to
+        all outcomes.
         """
         session = dict(_GHOST_SESSION, chat_id=chat_id)
-        assert _should_skip_dead_no_user(session, "completed") is False, (
-            f"completed sessions must never be skipped, chat_id={chat_id!r}"
+        assert _should_skip_dead_no_user(session, "completed") is True, (
+            f"completed internal sessions must be skipped, chat_id={chat_id!r}"
         )
 
     def test_dead_real_user_not_skipped(self):
@@ -455,21 +459,19 @@ class TestGhostChatIdNoInboxNotification:
             f"Expected 1 inbox file for dead real-user session, got {len(files)}: {files}"
         )
 
-    def test_integration_enqueue_writes_completed_ghost(self, inbox_server_module, tmp_path):
-        """Integration: completed ghost session (chat_id=0) DOES write to inbox.
+    def test_integration_enqueue_skips_completed_ghost(self, inbox_server_module, tmp_path):
+        """Integration: completed ghost session (chat_id=0) does NOT write to inbox (issue #462).
 
-        Completed results are always forwarded — only dead+no-user is suppressed.
+        Before #462, only dead sessions with chat_id=0 were suppressed.  Completed
+        ghost sessions produced no-op inbox messages the dispatcher had to read and
+        discard.  The fix extends the filter to both outcomes.
         """
-        import os
-
         inbox_dir = tmp_path / "inbox"
         inbox_dir.mkdir()
 
         original_inbox_dir = inbox_server_module.INBOX_DIR
-        inbox_server_module.INBOX_DIR = original_inbox_dir
+        inbox_server_module.INBOX_DIR = inbox_dir
         try:
-            # Patch INBOX_DIR for the call
-            inbox_server_module.INBOX_DIR = inbox_dir
             inbox_server_module._enqueue_reconciler_notification(
                 dict(_GHOST_SESSION, notified_at=None), outcome="completed"
             )
@@ -477,6 +479,6 @@ class TestGhostChatIdNoInboxNotification:
             inbox_server_module.INBOX_DIR = original_inbox_dir
 
         files = list(inbox_dir.iterdir())
-        assert len(files) == 1, (
-            f"Expected 1 inbox file for completed ghost session, got {len(files)}: {files}"
+        assert files == [], (
+            f"Expected no inbox files for completed ghost session (issue #462), got: {files}"
         )
