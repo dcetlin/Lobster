@@ -37,7 +37,7 @@ ARCHIVE_AGE_DAYS = 14
 
 SOURCE_WEIGHT: dict[str, int] = {
     "meta/premise-review.md": 30,
-    "meta/oracle/learnings.md": 20,
+    "oracle/decisions.md": 20,
     "meta/hygiene-review.md": 10,
 }
 
@@ -201,7 +201,7 @@ def apply_updates(
 _SOURCE_LABELS: dict[str, str] = {
     "meta/premise-review.md": "Premise Review",
     "meta/hygiene-review.md": "Hygiene Review",
-    "meta/oracle/learnings.md": "Oracle Learnings",
+    "oracle/decisions.md": "Oracle Learnings",
 }
 
 _GROUP_ORDER = ["Premise Review", "Hygiene Review", "Oracle Learnings"]
