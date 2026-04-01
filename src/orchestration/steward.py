@@ -630,6 +630,8 @@ def _llm_prescribe(
                 if not line.strip():
                     continue
                 entry = json.loads(line)
+                if not isinstance(entry, dict):
+                    continue
                 event = entry.get("event", "")
                 if event in ("prescription", "reentry_prescription"):
                     assessment = entry.get("completion_assessment", "")
@@ -869,6 +871,8 @@ def _fetch_prior_prescriptions(
         try:
             entry = json.loads(line)
         except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(entry, dict):
             continue
         if entry.get("event") in ("prescription", "reentry_prescription"):
             prescriptions.append(entry)
