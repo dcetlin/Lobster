@@ -65,15 +65,16 @@ Rotate the UoW type based on `total_runs % 3`:
 
 **Type A — simple-doc-write**: Write a short markdown file.
 
-**Type D — long-running timing validation** (injected only when `cycle_number % 3 == 0`): A multi-step task that naturally takes 5–7 minutes to complete, designed to exercise the 300-second startup-sweep threshold from PR #555. The executor must complete this UoW without the startup sweep interrupting it.
+**Type D — long-running timing validation** (injected only when `cycle_number % 3 == 0`): A multi-step task that naturally takes 7–9 minutes to complete, designed to exercise the 300-second startup-sweep threshold from PR #555. The executor must complete this UoW without the startup sweep interrupting it. The task MUST run longer than 300 seconds so that the startup sweep fires during execution — only then can suppression be validated.
 
 The type-D task must instruct the executor to:
-1. Read and summarize 20 markdown files from `/home/lobster/lobster/` (recurse into subdirectories, pick the first 20 `.md` files found)
-2. For each file, write a one-paragraph summary to `/tmp/ralph-test-{run_id}-d-summaries.txt`, appending after each read
-3. After all 20 summaries, query the WOS registry DB: for each table, read its schema and row count, and append a brief table report to the same file
-4. Write a final line "RALPH type-D complete: <timestamp>" to the file
+1. Recursively find ALL `.md` files in `/home/lobster/lobster/` and `/home/lobster/lobster-workspace/design/` (expected: 100+ files)
+2. For each file: read it, count its words, and write a one-line summary (filename + word count + first sentence) to `/tmp/ralph-test-{run_id}-d-summaries.txt`, appending after each file
+3. Pause 2 seconds between each file read
+4. After all files, query the WOS registry DB for the full schema (all tables, all columns) and row counts, and append a complete table report to the same file
+5. Write a final line "RALPH type-D complete: <ISO timestamp>" to the file
 
-This is intentionally multi-step and IO-heavy. The executor subprocess should run for roughly 5–7 minutes. Brief pauses between file reads (1–2 seconds each) are acceptable and expected.
+This is intentionally multi-step and IO-heavy. The executor subprocess should run for roughly 7–9 minutes. The 2-second pause per file is required — do not skip it.
 
 ```python
 import sqlite3, uuid, json
@@ -136,18 +137,22 @@ if inject_type_d:
         "id": f"uow_{date.replace('-','')}_{run_id}_d",
         "source": "ralph-test",
         "summary": (
-            f"RALPH type-D: read and summarize 20 markdown files from /home/lobster/lobster/, "
-            f"then query each WOS registry table schema and row count, "
-            f"appending all output to /tmp/ralph-test-{run_id}-d-summaries.txt. "
-            f"Add a 1-2 second pause between each file read. "
-            f"This task is expected to take 5-7 minutes. "
+            f"RALPH type-D: recursively find ALL .md files in /home/lobster/lobster/ and "
+            f"/home/lobster/lobster-workspace/design/, then for each file read it, count its words, "
+            f"and write a one-line summary (filename + word count + first sentence) to "
+            f"/tmp/ralph-test-{run_id}-d-summaries.txt with a 2-second pause between each file. "
+            f"After all files, query the full WOS registry DB schema (all tables, all columns) and "
+            f"row counts, and append the complete table report. "
+            f"This task is expected to take 7-9 minutes — the 2-second pause per file is required. "
             f"Finish by writing 'RALPH type-D complete: <ISO timestamp>' as the final line."
         ),
         "success_criteria": (
             f"File /tmp/ralph-test-{run_id}-d-summaries.txt exists, "
-            f"contains at least 20 paragraph summaries, "
-            f"contains a WOS table schema report, "
-            f"and ends with 'RALPH type-D complete:'"
+            f"contains one-line summaries for all discovered .md files (expected 100+), "
+            f"contains a full WOS registry DB schema report with all tables and columns, "
+            f"and ends with 'RALPH type-D complete:'. "
+            f"VALIDATED only counts if UoW runtime exceeded 300s — check start/end timestamps "
+            f"in registry DB (created_at vs updated_at for the type-D UoW record)."
         ),
         "status": "ready-for-steward",
         "type": "executable",
@@ -191,7 +196,7 @@ print(f"Type-D injected this cycle: {inject_type_d} (cycle_number={cycle_number}
 
 Poll every 60 seconds until all injected UoWs reach terminal state (`done`, `failed`, `expired`), or timeout.
 
-**Timeout**: Use **15 minutes** if a type-D UoW was injected this cycle (`inject_type_d == True`); otherwise use the standard **10 minutes**. Type-D UoWs are designed to run for 5–7 minutes, so the extended window is required.
+**Timeout**: Use **15 minutes** if a type-D UoW was injected this cycle (`inject_type_d == True`); otherwise use the standard **10 minutes**. Type-D UoWs are designed to run for 7–9 minutes, so the extended window is required.
 
 ```python
 import sqlite3, time, json
@@ -205,7 +210,7 @@ if inject_type_d:
     uow_ids.append(f"uow_{date}_{run_id}_d")
 
 terminal = {'done', 'failed', 'expired'}
-timeout_seconds = 900 if inject_type_d else 600  # 15 min for type-D cycles, 10 min otherwise
+timeout_seconds = 900 if inject_type_d else 600  # 15 min for type-D cycles (7-9 min runtime), 10 min otherwise
 deadline = time.time() + timeout_seconds
 
 while time.time() < deadline:
@@ -282,7 +287,7 @@ tail -30 /home/lobster/lobster-workspace/scheduled-jobs/logs/executor-heartbeat.
 - `has_artifact = 0` for a UoW that reached `done` (executor did not produce output)
 - Errors in steward or executor logs during the window
 - `wos-config.json` `execution_enabled = false` (executor paused — note this, do not treat as anomaly)
-- **Type-D timing validation**: if a type-D UoW was injected and `steward_cycles > 2` for that UoW, flag as `pr_555_timing_fix_validation_failed` (the startup sweep re-prescribed while the subprocess was still running — see Step 4 for evaluation logic)
+- **Type-D timing validation**: if a type-D UoW was injected and `steward_cycles > 2` for that UoW, flag as `pr_555_timing_fix_validation_failed` (the startup sweep re-prescribed while the subprocess was still running — see Step 4 for evaluation logic). Also verify UoW runtime exceeded 300s by comparing `created_at` to `updated_at` in registry DB — if runtime was under 300s, the sweep never fired during execution and VALIDATED is meaningless.
 
 **Deep exchange audit** — after checking terminal states, run these four additional checks. "Checking did it complete" is not sufficient; the exchange quality must also be audited.
 
@@ -483,33 +488,47 @@ A **clean run** is defined as:
 
 **Type-D timing validation outcome** (only applies on cycles where `inject_type_d == True`):
 
-Check the type-D UoW's `steward_cycles` from the Step 3 Audit 1 query:
+**VALIDATED only counts if UoW runtime exceeded 300s.** First confirm the type-D UoW actually ran long enough to trigger a startup-sweep cycle. If it completed in under 300s, the sweep never fired during execution and no suppression was exercised — report as INCONCLUSIVE, not VALIDATED.
+
+Check both runtime and `steward_cycles`:
 
 ```python
 type_d_id = f"uow_{date}_{run_id}_d"
-# Query steward_cycles for type-D from the Audit 1 results
-# (use the conn/cur established in Audit 1, or re-query)
+# Query steward_cycles and timestamps for type-D
 conn = sqlite3.connect(db)
 cur = conn.cursor()
-cur.execute("SELECT steward_cycles FROM uow_registry WHERE id = ?", (type_d_id,))
+cur.execute("SELECT steward_cycles, created_at, updated_at FROM uow_registry WHERE id = ?", (type_d_id,))
 row = cur.fetchone()
 conn.close()
 
 if row is not None:
-    type_d_steward_cycles = row[0]
-    if type_d_steward_cycles <= 2:
-        print(f"PR #555 timing fix validated for this cycle: type-D completed with steward_cycles={type_d_steward_cycles} (<= 2, sweep did not interrupt)")
+    type_d_steward_cycles, created_at, updated_at = row
+    # Compute runtime in seconds
+    from datetime import datetime, timezone
+    try:
+        t_start = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+        t_end = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+        runtime_seconds = (t_end - t_start).total_seconds()
+    except Exception:
+        runtime_seconds = None
+
+    runtime_exceeded_300s = runtime_seconds is not None and runtime_seconds > 300
+
+    if not runtime_exceeded_300s:
+        print(f"PR #555 timing fix validation INCONCLUSIVE: type-D runtime={runtime_seconds}s (<= 300s). The startup sweep never fired during execution — suppression was not exercised. Increase task workload.")
+        # Do NOT add to anomalies_this_run — this is a test-design gap, not a pipeline failure.
+    elif type_d_steward_cycles <= 2:
+        print(f"PR #555 timing fix VALIDATED: type-D completed with steward_cycles={type_d_steward_cycles} (<= 2) and runtime={runtime_seconds:.0f}s (> 300s). Sweep fired but correctly suppressed re-prescription.")
     else:
-        print(f"PR #555 timing fix validation FAILED: type-D UoW steward_cycles={type_d_steward_cycles} (> 2, sweep re-prescribed during active execution)")
-        # Add to anomalies_this_run:
+        print(f"PR #555 timing fix validation FAILED: type-D UoW steward_cycles={type_d_steward_cycles} (> 2) and runtime={runtime_seconds:.0f}s. Startup sweep re-prescribed during active execution.")
         anomalies_this_run.append({
             "uow_id": type_d_id,
             "anomaly_type": "pr_555_timing_fix_validation_failed",
-            "detail": f"steward_cycles={type_d_steward_cycles} for type-D UoW: startup sweep re-prescribed while subprocess was still active"
+            "detail": f"steward_cycles={type_d_steward_cycles} for type-D UoW (runtime={runtime_seconds:.0f}s): startup sweep re-prescribed while subprocess was still active"
         })
 ```
 
-Log the outcome in the Step 5 report under a dedicated "PR #555 Timing Validation" section.
+Log the outcome in the Step 5 report under a dedicated "PR #555 Timing Validation" section. Include the runtime in seconds and whether the 300s threshold was exceeded.
 
 Determine: `is_clean_run = True` or `False`.
 
@@ -547,8 +566,10 @@ Write a report to `/home/lobster/lobster-workspace/data/ralph-reports/ralph-<YYY
 ## PR #555 Timing Validation
 <!-- Only present when type-D was injected -->
 - Type-D UoW: <uow_id>
+- Runtime: <N>s (created_at to updated_at)
+- Runtime exceeded 300s: <yes/no>
 - Steward cycles: <N>
-- Outcome: VALIDATED (steward_cycles <= 2, sweep did not interrupt) | FAILED (steward_cycles > 2, sweep re-prescribed during active execution)
+- Outcome: VALIDATED (runtime > 300s AND steward_cycles <= 2, sweep fired and was correctly suppressed) | FAILED (runtime > 300s AND steward_cycles > 2, sweep re-prescribed during active execution) | INCONCLUSIVE (runtime <= 300s, sweep never fired during execution — task did not run long enough)
 
 ## Anomalies
 <list anomalies or "none" — include anomalies from both basic checklist and deep exchange audit>
