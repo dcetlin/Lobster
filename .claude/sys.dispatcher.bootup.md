@@ -430,71 +430,9 @@ After a context compaction you lose situational awareness of the last ~30 minute
 - Run `~/lobster/scripts/record-catchup-state.sh finish`
 - `mark_processed`
 
-**Prompt to pass to compact_catchup:**
-
-```
----
-task_id: compact-catchup
-chat_id: 0
-source: system
 ---
 
-Recover dispatcher context after compaction. Read ~/lobster-workspace/data/compaction-state.json,
-compute the catch-up window (prefer last_catchup_ts if present; otherwise max(last_compaction_ts,
-last_restart_ts); default to 30 minutes ago if absent), call check_inbox(since_ts=<window_start>,
-limit=100), summarise what happened (user messages, subagent results, notable system events), read
-session notes in tiers from ~/lobster-user-config/memory/canonical/sessions/ (full read: 2 most
-recent; header-only: previous 5; skip older), update last_catchup_ts in compaction-state.json,
-then call write_result.
-```
-
-**When the compact_catchup `subagent_result` arrives:**
-
-```
-1. mark_processing(message_id)
-2. Read msg["text"] — it is a structured summary of recent activity (user messages,
-   subagent results, system events). Use it to restore situational awareness.
-3. Do NOT send_reply — this is internal context, not a user message.
-4. Run: ~/lobster/scripts/record-catchup-state.sh finish
-   (tells health check catchup is complete — lifts WFM suppression immediately)
-5. mark_processed(message_id)
-```
-
-**Rules:**
-- Never send the catch-up summary to the user unless you spot something urgent (e.g. a failed subagent that was never acknowledged).
-- The catch-up result arrives as a normal `subagent_result` with `task_id: "compact-catchup"` and `chat_id: 0`. The `chat_id: 0` signals it is internal — do not relay.
-- If the catch-up window has no messages, that is valid — the subagent reports "Nothing to report."
-
-**Pre-compaction session note polish prompt** (pass to `lobster-generalist`, `run_in_background=True`):
-
-```
----
-task_id: session-note-polish
-chat_id: 0
-source: system
----
-
-Polish the current session note before context compaction.
-
-1. Read the current session file at {current_session_file}.
-   If the path is not in your working context, list ~/lobster-user-config/memory/canonical/sessions/
-   and pick the most recently modified .md file (excluding session.template.md).
-2. Rewrite the file in place as a clean, dense handoff summary:
-   - Condense the Summary to 1-3 sentences covering the session's main outcomes.
-   - Remove in-progress noise from Open Threads — keep only what is genuinely unresolved.
-   - Consolidate Open Tasks to only what is actually in-flight (not completed).
-   - List Open Subagents concisely (task_id + one-line description).
-   - Trim Notable Events to the 3-5 most significant entries.
-   - Set the Ended field to the current UTC timestamp.
-   Keep all five section headings. Do not delete any section.
-3. Write the polished content back to the same file path.
-4. Call write_result(task_id='session-note-polish', chat_id=0, source='system',
-   text='Session note polished: {current_session_file}', status='success').
-```
-
-Replace `{current_session_file}` with the value from your working context before spawning.
-
-## Handling Scheduled Reminders (`type: "scheduled_reminder"`)
+### scheduled_reminder (`type: "scheduled_reminder"`)
 
 Scheduled reminders arrive from `scheduled-tasks/dispatch-job.sh` (user-created jobs) and produce `type: "scheduled_reminder"`.
 
@@ -1606,6 +1544,8 @@ then call write_result.
 | Delivery | Internal context only — never relay | Internal context only — never relay |
 | Purpose | Dispatcher recovers situational awareness after restart gap | Dispatcher recovers situational awareness after compaction |
 | `handoff.md` update | Yes — if anything notable changed (failed subagents, open threads, etc.), update `handoff.md` before resuming the loop | No — post-compaction handler does not update `handoff.md` |
+
+**Periodic snapshots:** Triggered by `session_note_reminder` (every 20 user messages). Spawn `session-note-appender` (see `.claude/agents/session-note-appender.md`) with `current_session_file`, a list of recent activity visible in working context, `in_flight` (running subagents with elapsed time), and `pending_responses` (claimed but unanswered messages).
 
 **Pre-compaction polish:** On `compact-reminder`, spawn `session-note-polish` (see `.claude/agents/session-note-polish.md`) with `current_session_file` before spawning compact_catchup. When passing context to `session-note-polish`, include:
 - All currently in-flight subagents (task_id, subagent type, brief description, and elapsed time since started_at) — these are the entries most at risk of being lost across compaction
