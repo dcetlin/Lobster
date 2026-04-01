@@ -1922,6 +1922,234 @@ class TestLlmPrescription:
         assert result["instructions"] == "Implement the feature."
         assert result["estimated_cycles"] == 2
 
+    # --- New tests for issue #506: timeout observability and JSON classification ---
+
+    def test_llm_prescribe_timeout_configurable_via_env(self, monkeypatch):
+        """_llm_prescribe uses LOBSTER_LLM_PRESCRIPTION_TIMEOUT_SECS env var for timeout."""
+        import subprocess as _subprocess
+        steward = _import_steward()
+
+        captured_timeouts = []
+
+        def mock_run(cmd, **kwargs):
+            captured_timeouts.append(kwargs.get("timeout"))
+            stdout = json.dumps({
+                "instructions": "Do the work.",
+                "success_criteria_check": "Work done.",
+                "estimated_cycles": 1,
+            })
+            return _subprocess.CompletedProcess(cmd, returncode=0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
+        monkeypatch.setenv("LOBSTER_LLM_PRESCRIPTION_TIMEOUT_SECS", "300")
+
+        uow = self._make_uow()
+        result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
+
+        assert result is not None
+        assert len(captured_timeouts) == 1
+        assert captured_timeouts[0] == 300
+
+    def test_llm_prescribe_timeout_defaults_to_600(self, monkeypatch):
+        """_llm_prescribe uses 600s default timeout when env var is not set."""
+        import subprocess as _subprocess
+        steward = _import_steward()
+
+        captured_timeouts = []
+
+        def mock_run(cmd, **kwargs):
+            captured_timeouts.append(kwargs.get("timeout"))
+            raise _subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+
+        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
+        monkeypatch.delenv("LOBSTER_LLM_PRESCRIPTION_TIMEOUT_SECS", raising=False)
+
+        uow = self._make_uow()
+        result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
+
+        assert result is None
+        assert captured_timeouts[0] == 600
+
+    def test_llm_prescribe_empty_stdout_returns_none(self, monkeypatch):
+        """_llm_prescribe returns None when claude -p exits 0 but stdout is empty."""
+        import subprocess as _subprocess
+        steward = _import_steward()
+
+        def mock_run(cmd, **kwargs):
+            return _subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
+
+        uow = self._make_uow()
+        result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
+        assert result is None
+
+    def test_llm_prescribe_wrong_json_schema_non_dict(self, monkeypatch):
+        """_llm_prescribe returns None when claude -p returns a JSON array (not a dict)."""
+        import subprocess as _subprocess
+        steward = _import_steward()
+
+        def mock_run(cmd, **kwargs):
+            # Valid JSON but wrong schema — list instead of dict
+            return _subprocess.CompletedProcess(cmd, returncode=0, stdout='["a", "b"]', stderr="")
+
+        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
+
+        uow = self._make_uow()
+        result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
+        assert result is None
+
+    def test_llm_prescribe_schema_mismatch_estimated_cycles_defaults(self, monkeypatch):
+        """_llm_prescribe defaults estimated_cycles to 1 when the field is a non-integer."""
+        import subprocess as _subprocess
+        steward = _import_steward()
+
+        def mock_run(cmd, **kwargs):
+            stdout = json.dumps({
+                "instructions": "Do the work.",
+                "success_criteria_check": "Work done.",
+                "estimated_cycles": "several",  # wrong type — should be int
+            })
+            return _subprocess.CompletedProcess(cmd, returncode=0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
+
+        uow = self._make_uow()
+        result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
+
+        assert result is not None
+        assert result["estimated_cycles"] == 1
+
+    def test_count_consecutive_llm_fallbacks_empty_log(self):
+        """_count_consecutive_llm_fallbacks returns 0 for None or empty log."""
+        steward = _import_steward()
+        assert steward._count_consecutive_llm_fallbacks(None) == 0
+        assert steward._count_consecutive_llm_fallbacks("") == 0
+
+    def test_count_consecutive_llm_fallbacks_all_fallback(self):
+        """_count_consecutive_llm_fallbacks counts consecutive fallbacks at log tail."""
+        steward = _import_steward()
+
+        log_entries = [
+            json.dumps({"event": "prescription", "prescription_path": "fallback"}),
+            json.dumps({"event": "reentry_prescription", "prescription_path": "fallback"}),
+            json.dumps({"event": "reentry_prescription", "prescription_path": "fallback"}),
+        ]
+        log_str = "\n".join(log_entries)
+
+        assert steward._count_consecutive_llm_fallbacks(log_str) == 3
+
+    def test_count_consecutive_llm_fallbacks_reset_after_llm_success(self):
+        """_count_consecutive_llm_fallbacks resets count when an LLM success appears."""
+        steward = _import_steward()
+
+        log_entries = [
+            json.dumps({"event": "prescription", "prescription_path": "fallback"}),
+            json.dumps({"event": "reentry_prescription", "prescription_path": "llm"}),
+            json.dumps({"event": "reentry_prescription", "prescription_path": "fallback"}),
+            json.dumps({"event": "reentry_prescription", "prescription_path": "fallback"}),
+        ]
+        log_str = "\n".join(log_entries)
+
+        # Only the 2 fallbacks at the tail count — the earlier fallback is preceded
+        # by an LLM success which resets the streak.
+        assert steward._count_consecutive_llm_fallbacks(log_str) == 2
+
+    def test_count_consecutive_llm_fallbacks_last_was_llm(self):
+        """_count_consecutive_llm_fallbacks returns 0 when the last prescription used LLM."""
+        steward = _import_steward()
+
+        log_entries = [
+            json.dumps({"event": "prescription", "prescription_path": "fallback"}),
+            json.dumps({"event": "reentry_prescription", "prescription_path": "llm"}),
+        ]
+        log_str = "\n".join(log_entries)
+
+        assert steward._count_consecutive_llm_fallbacks(log_str) == 0
+
+    def test_llm_fallback_warning_fires_at_threshold(self, db_path, registry, tmp_path, monkeypatch):
+        """_notify_llm_fallback_warning is called when consecutive fallbacks reach threshold."""
+        steward = _import_steward()
+        _ensure_registry_has_phase2_methods(registry)
+
+        warning_calls = []
+
+        def mock_notify(uow, consecutive_fallbacks):
+            warning_calls.append({"uow_id": uow.id, "count": consecutive_fallbacks})
+
+        monkeypatch.setattr("src.orchestration.steward._notify_llm_fallback_warning", mock_notify)
+
+        # Prepopulate steward_log with (threshold-1) fallback entries so this
+        # cycle becomes the Nth consecutive fallback and trips the threshold.
+        threshold = steward._LLM_FALLBACK_WARNING_THRESHOLD
+        prior_fallbacks = "\n".join(
+            json.dumps({"event": "prescription" if i == 0 else "reentry_prescription",
+                        "prescription_path": "fallback"})
+            for i in range(threshold - 1)
+        )
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=threshold - 1,
+            success_criteria="PR opened",
+            steward_log=prior_fallbacks,
+        )
+        conn.close()
+
+        artifact_dir = tmp_path / "artifacts"
+        artifact_dir.mkdir()
+
+        # Prescriber always returns None → deterministic fallback
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=artifact_dir,
+            llm_prescriber=lambda *a, **kw: None,
+        )
+
+        assert len(warning_calls) == 1
+        assert warning_calls[0]["uow_id"] == uow_id
+        assert warning_calls[0]["count"] == threshold
+
+    def test_llm_fallback_audit_entry_written_on_fallback(self, db_path, registry, tmp_path):
+        """An llm_prescribe_fallback audit entry is written when LLM prescription falls back."""
+        steward = _import_steward()
+        _ensure_registry_has_phase2_methods(registry)
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=0,
+            success_criteria="PR opened",
+        )
+        conn.close()
+
+        artifact_dir = tmp_path / "artifacts"
+        artifact_dir.mkdir()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=artifact_dir,
+            llm_prescriber=lambda *a, **kw: None,
+        )
+
+        audit_entries = steward._fetch_audit_entries(registry, uow_id)
+        # audit_log stores the full entry dict as JSON in the `note` column.
+        fallback_notes = [
+            json.loads(e["note"])
+            for e in audit_entries
+            if e.get("event") == "llm_prescribe_fallback"
+        ]
+        assert len(fallback_notes) == 1
+        assert fallback_notes[0]["uow_id"] == uow_id
+        assert fallback_notes[0]["consecutive_llm_fallbacks"] == 1
+
     def test_end_to_end_prescription_with_llm_stub(self, db_path, registry, tmp_path):
         """Full _process_uow call uses LLM prescription stub and writes instructions to artifact."""
         _ensure_registry_has_phase2_methods(registry)

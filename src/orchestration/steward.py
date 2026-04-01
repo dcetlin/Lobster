@@ -43,12 +43,38 @@ log = logging.getLogger("steward")
 # LLM prescription dispatch
 # ---------------------------------------------------------------------------
 
-# Hard timeout for the claude -p prescription call (seconds). If exceeded,
-# falls back to the deterministic template.
-_LLM_PRESCRIPTION_TIMEOUT_SECS = 60
+# Default timeout for the claude -p prescription call (seconds). Override
+# via LOBSTER_LLM_PRESCRIPTION_TIMEOUT_SECS env var for installs where
+# functional-engineer subagents need more time (typical: 2-10 minutes).
+_LLM_PRESCRIPTION_TIMEOUT_SECS_DEFAULT = 600
+
+def _get_llm_prescription_timeout() -> int:
+    """Return the LLM prescription timeout in seconds.
+
+    Reads LOBSTER_LLM_PRESCRIPTION_TIMEOUT_SECS from the environment.
+    Falls back to _LLM_PRESCRIPTION_TIMEOUT_SECS_DEFAULT (600s) if absent
+    or non-integer.  Pure function with respect to state — env reads are
+    isolated here so the rest of the module stays deterministic in tests
+    (monkeypatch os.environ as needed).
+    """
+    raw = os.environ.get("LOBSTER_LLM_PRESCRIPTION_TIMEOUT_SECS", "")
+    if raw.strip():
+        try:
+            return int(raw.strip())
+        except ValueError:
+            log.warning(
+                "_get_llm_prescription_timeout: invalid env value %r, using default %d",
+                raw, _LLM_PRESCRIPTION_TIMEOUT_SECS_DEFAULT,
+            )
+    return _LLM_PRESCRIPTION_TIMEOUT_SECS_DEFAULT
 
 # claude binary — resolved from PATH at call time.
 _CLAUDE_BIN = "claude"
+
+# Number of consecutive LLM prescription fallbacks that trigger an early-warning
+# inbox message.  Each cycle that falls back to deterministic increments the
+# consecutive count.  A successful LLM call resets it to zero.
+_LLM_FALLBACK_WARNING_THRESHOLD = 3
 
 
 # ---------------------------------------------------------------------------
@@ -705,21 +731,36 @@ Respond with a JSON object only (no markdown, no explanation outside the JSON):
     # which does not accept a separate --system flag in basic invocation mode.
     prompt = f"{system_prompt}\n\n{user_prompt}"
 
+    timeout_secs = _get_llm_prescription_timeout()
+
     try:
         proc = subprocess.run(
             [_CLAUDE_BIN, "-p", prompt, "--output-format", "text"],
             capture_output=True,
             text=True,
-            timeout=_LLM_PRESCRIPTION_TIMEOUT_SECS,
+            timeout=timeout_secs,
         )
         if proc.returncode != 0:
             log.warning(
-                "_llm_prescribe: claude -p exited %d for %s, falling back",
+                "_llm_prescribe: claude -p exited %d for %s, falling back "
+                "(stderr: %s)",
                 proc.returncode, uow.id,
+                proc.stderr.strip()[:200] if proc.stderr else "<none>",
             )
             return None
 
         raw_text = proc.stdout.strip()
+
+        # Classify empty-output case separately: claude exited 0 but returned
+        # nothing.  This typically means the binary is unavailable, the model
+        # refused, or stdout was silently discarded.
+        if not raw_text:
+            log.warning(
+                "_llm_prescribe: claude -p returned empty stdout for %s "
+                "(exit 0), falling back",
+                uow.id,
+            )
+            return None
 
         # Strip markdown code fences if present
         if raw_text.startswith("```"):
@@ -729,14 +770,48 @@ Respond with a JSON object only (no markdown, no explanation outside the JSON):
                 if not line.startswith("```")
             ).strip()
 
-        parsed = json.loads(raw_text)
+        # Classify parse failures: distinguish non-JSON (refusal / error prose)
+        # from structurally-valid JSON that doesn't match the expected schema.
+        try:
+            parsed = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            log.warning(
+                "_llm_prescribe: non-JSON output from claude -p for %s "
+                "(JSONDecodeError: %s) — output preview: %r, falling back",
+                uow.id, exc, raw_text[:200],
+            )
+            return None
+
+        if not isinstance(parsed, dict):
+            log.warning(
+                "_llm_prescribe: unexpected JSON type %s for %s "
+                "(expected dict), falling back",
+                type(parsed).__name__, uow.id,
+            )
+            return None
 
         instructions = str(parsed.get("instructions", "")).strip()
         success_criteria_check = str(parsed.get("success_criteria_check", "")).strip()
-        estimated_cycles = int(parsed.get("estimated_cycles", 1))
+
+        # Validate estimated_cycles; wrong schema (e.g. string instead of int)
+        # is logged as a schema mismatch rather than a generic parse failure.
+        raw_cycles = parsed.get("estimated_cycles", 1)
+        try:
+            estimated_cycles = int(raw_cycles)
+        except (TypeError, ValueError):
+            log.warning(
+                "_llm_prescribe: schema mismatch for %s — "
+                "estimated_cycles=%r is not an integer, defaulting to 1",
+                uow.id, raw_cycles,
+            )
+            estimated_cycles = 1
 
         if not instructions:
-            log.warning("_llm_prescribe: LLM returned empty instructions, falling back")
+            log.warning(
+                "_llm_prescribe: LLM returned empty instructions field for %s, "
+                "falling back",
+                uow.id,
+            )
             return None
 
         log.debug(
@@ -751,19 +826,15 @@ Respond with a JSON object only (no markdown, no explanation outside the JSON):
 
     except subprocess.TimeoutExpired:
         log.warning(
-            "_llm_prescribe: claude -p timed out for %s after %ds, falling back",
-            uow.id, _LLM_PRESCRIPTION_TIMEOUT_SECS,
-        )
-        return None
-    except (json.JSONDecodeError, ValueError, KeyError) as exc:
-        log.warning(
-            "_llm_prescribe: failed to parse claude -p output for %s (%s: %s), falling back",
-            uow.id, type(exc).__name__, exc,
+            "_llm_prescribe: claude -p timed out for %s after %ds "
+            "(LOBSTER_LLM_PRESCRIPTION_TIMEOUT_SECS=%d), falling back",
+            uow.id, timeout_secs, timeout_secs,
         )
         return None
     except Exception as exc:  # noqa: BLE001
         log.warning(
-            "_llm_prescribe: LLM call failed for %s (%s: %s), falling back to deterministic template",
+            "_llm_prescribe: LLM call failed for %s (%s: %s), "
+            "falling back to deterministic template",
             uow.id, type(exc).__name__, exc,
         )
         return None
@@ -804,6 +875,93 @@ def _fetch_prior_prescriptions(
 
     # Return the last `limit` entries (oldest-first ordering preserved).
     return prescriptions[-limit:] if prescriptions else []
+
+
+def _count_consecutive_llm_fallbacks(current_log_str: str | None) -> int:
+    """
+    Count how many consecutive prescription events at the tail of steward_log
+    used the deterministic fallback path (prescription_path == "fallback").
+
+    Scans prescription and reentry_prescription events in reverse order and
+    stops at the first event that used the LLM path or at the beginning of the
+    log.  Returns 0 when the log is absent, empty, or the last prescription
+    used the LLM path.
+
+    Pure function — reads only current_log_str; no side effects.
+    """
+    if not current_log_str:
+        return 0
+
+    prescription_events: list[dict[str, Any]] = []
+    for line in current_log_str.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if entry.get("event") in ("prescription", "reentry_prescription"):
+            prescription_events.append(entry)
+
+    # Count consecutive fallbacks from the most recent prescription backwards.
+    consecutive = 0
+    for event in reversed(prescription_events):
+        if event.get("prescription_path") == "fallback":
+            consecutive += 1
+        else:
+            break
+
+    return consecutive
+
+
+def _notify_llm_fallback_warning(
+    uow: UoW,
+    consecutive_fallbacks: int,
+) -> None:
+    """
+    Write an inbox message to Dan when _llm_prescribe has fallen back to the
+    deterministic template for _LLM_FALLBACK_WARNING_THRESHOLD consecutive
+    cycles on the same UoW.
+
+    Uses the same inbox path as _default_notify_dan_early_warning.  In tests,
+    the caller can skip this function entirely by checking the threshold before
+    calling — or monkeypatch it to capture the call.
+    """
+    uow_id = uow.id
+    admin_chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", _DAN_CHAT_ID)
+    log.warning(
+        "WOS LLM FALLBACK: UoW %s has fallen back to deterministic prescription "
+        "%d consecutive times — LLM prescription path may be broken",
+        uow_id, consecutive_fallbacks,
+    )
+    msg_id = str(uuid.uuid4())
+    msg = {
+        "id": msg_id,
+        "source": "system",
+        "chat_id": admin_chat_id,
+        "text": (
+            f"WOS: `{uow_id}` LLM prescription has fallen back to deterministic "
+            f"for {consecutive_fallbacks} consecutive cycles. "
+            "Check `LOBSTER_LLM_PRESCRIPTION_TIMEOUT_SECS` and `claude -p` availability. "
+            "Prescription quality is degraded until LLM path recovers."
+        ),
+        "timestamp": time.time(),
+        "metadata": {
+            "type": "wos_llm_fallback_warning",
+            "uow_id": uow_id,
+            "consecutive_llm_fallbacks": consecutive_fallbacks,
+        },
+    }
+    inbox_dir = Path(os.path.expanduser("~/messages/inbox"))
+    try:
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        (inbox_dir / f"{msg_id}.json").write_text(
+            json.dumps(msg, indent=2), encoding="utf-8"
+        )
+        log.info("WOS LLM fallback warning written to inbox: %s", msg_id)
+    except OSError as exc:
+        log.error("Failed to write WOS LLM fallback warning to inbox: %s", exc)
 
 
 def _build_deterministic_prescription_instructions(
@@ -1791,6 +1949,32 @@ def _process_uow(
     }
     current_log_str = _append_steward_log_entry(registry, uow_id, current_log_str, prescription_log_entry)
 
+    # LLM fallback observability: count consecutive fallbacks from the updated
+    # steward_log (which already includes this cycle's prescription_path) and
+    # write an audit entry when falling back.  The consecutive count is computed
+    # after appending so this cycle's fallback is included in the tally.
+    if prescription_path == "fallback":
+        consecutive_fallbacks = _count_consecutive_llm_fallbacks(current_log_str)
+        log.warning(
+            "_llm_prescribe fallback: UoW %s using deterministic template "
+            "(consecutive fallbacks: %d)",
+            uow_id, consecutive_fallbacks,
+        )
+        if not dry_run:
+            registry.append_audit_log(uow_id, {
+                "event": "llm_prescribe_fallback",
+                "actor": _ACTOR_STEWARD,
+                "uow_id": uow_id,
+                "steward_cycles": cycles,
+                "consecutive_llm_fallbacks": consecutive_fallbacks,
+                "timestamp": _now_iso(),
+            })
+        # Fire early-warning inbox message at threshold (exact match so we
+        # notify once per threshold crossing, not on every subsequent fallback).
+        # Fires regardless of dry_run so tests can capture it.
+        if consecutive_fallbacks == _LLM_FALLBACK_WARNING_THRESHOLD:
+            _notify_llm_fallback_warning(uow, consecutive_fallbacks)
+
     if not dry_run:
         # Write workflow artifact to disk first
         artifact_path = _write_workflow_artifact(
@@ -1834,6 +2018,7 @@ def _process_uow(
             "workflow_primitive": selected_executor_type,
             "prescribed_skills": prescribed_skills,
             "instructions_preview": instructions[:80],
+            "prescription_path": prescription_path,
             "timestamp": _now_iso(),
         })
 
