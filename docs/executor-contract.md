@@ -226,6 +226,59 @@ When the startup sweep runs, it assigns classification labels to UoWs it recover
 
 ---
 
+## Functional-Engineer Dispatch: write_result vs. result.json
+
+**Cross-reference:** `src/orchestration/executor.py` → `_dispatch_via_claude_p`
+
+When the production dispatcher (`_dispatch_via_claude_p`) is used, the executor spawns a
+functional-engineer subagent via `claude -p`. That subagent does not write the
+`{output_ref}.result.json` file described above. Instead, it calls
+`mcp__lobster-inbox__write_result` — the inbox delivery tool — to report back to the
+dispatcher.
+
+This means the result.json that the Steward reads is written by the Executor itself,
+not by the functional-engineer subagent. The Executor writes the result.json after the
+subprocess exits:
+
+- **Subprocess exit 0** → Executor writes `outcome=complete`, transitions UoW to
+  `ready-for-steward`. The Steward sees `outcome=COMPLETE` meaning "the claude -p
+  subprocess exited cleanly." It does NOT mean "a PR was actually opened and merged."
+- **Subprocess non-zero exit, timeout, or binary not found** → Executor writes
+  `outcome=failed`, transitions UoW to `failed` via the exception handler in
+  `_run_step_sequence`. The Steward re-diagnoses.
+
+### Why "complete" does not mean "PR opened"
+
+The re-prescription loop is the intended fallback for silent failures. A functional-engineer
+subagent may exit 0 (subprocess success) without having opened a PR — for example, if it
+encountered an error late in execution that it handled internally without propagating a
+non-zero exit code. In this case:
+
+- The Executor writes `outcome=complete` because the subprocess exited cleanly.
+- The Steward evaluates the UoW's `success_criteria` against the available artifacts.
+- If the success criteria are not met (no PR URL in the expected location, no artifact
+  written), the Steward re-prescribes with context from the prior cycle.
+- This re-prescription cycle is the designed recovery mechanism, not a gap.
+
+### Why this is a coherent design choice
+
+Requiring the functional-engineer subagent to write `{output_ref}.result.json` directly
+would tightly couple it to the Executor's internal file path conventions. The subagent
+already reports completion via `write_result` (the standard subagent protocol). Duplicating
+that into a file write would require the subagent to know its own `output_ref` path and
+construct the result.json schema manually — fragile and redundant.
+
+Instead, the two signals are kept at their natural boundaries:
+- **Inbox signal** (`write_result`): the subagent reports what it did to the dispatcher.
+- **Executor signal** (`result.json`): the Executor reports subprocess exit status to the
+  Steward.
+
+The Steward's `success_criteria` check is the reconciliation layer: it determines whether
+the work product (PR, artifact, or other output) actually satisfies the UoW's original
+intent, independent of whether the subprocess claimed success.
+
+---
+
 ## Contract Version
 
 This document specifies contract v1, corresponding to WOS Phase 2. Future versions will be noted here with their effective date and the PRs that introduce changes.
@@ -233,3 +286,4 @@ This document specifies contract v1, corresponding to WOS Phase 2. Future versio
 | Version | Effective | Changes |
 |---------|-----------|---------|
 | v1 | 2026-03-30 | Initial formal contract. Adds `outcome` enum over the Phase 1 `success: bool` minimal schema. Backward-compatible: `success` field retained. |
+| v1.1 | 2026-04-01 | Added section: Functional-Engineer Dispatch divergence between `write_result` (inbox) and `result.json` (Steward). Clarifies that `outcome=complete` means subprocess exit 0, not PR opened. See PRs #383/#388 oracle follow-ups. |
