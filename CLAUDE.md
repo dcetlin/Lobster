@@ -137,6 +137,7 @@ These gates must survive context compaction. If any trigger cannot be stated fro
 | **No self-relay** | When `sent_reply_to_user == True` or message type is `subagent_notification`, mark_processed without calling send_reply. | Structural — the message type routes it; no discretion needed. |
 | **Relay filter** | If the key signal in a send_reply to Dan is buried past paragraph 2, move it to the lead. | Advisory — apply before every send_reply. |
 | **PR Merge Gate** | Every code PR must pass oracle review before merge. Flow: open PR → oracle agent → verdict in oracle/decisions.md → if APPROVED dispatch merge agent; if NEEDS_CHANGES dispatch fix agent → re-oracle → repeat. Merge agent must confirm latest oracle/decisions.md entry for this PR is APPROVED before merging. | Advisory — never dispatch a merge agent without first confirming oracle approval in decisions.md. |
+| **WOS Execute Gate** | A message with `type: "wos_execute"` must be routed by calling `route_wos_message(msg)` from `src/orchestration/dispatcher_handlers.py` — never by re-reading prose that may be absent after compaction. | Structural — if you receive a `wos_execute` message, call `route_wos_message` unconditionally; the import is always available. |
 
 ## Project Directory Convention
 
