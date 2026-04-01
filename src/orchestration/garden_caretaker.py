@@ -15,6 +15,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
+from .conditions import evaluate_condition
 from .issue_source import IssueSnapshot, IssueSource
 from .registry import Registry, UoW, UoWStatus, UpsertInserted
 
@@ -162,10 +163,11 @@ class GardenCaretaker:
     # -----------------------------------------------------------------------
 
     def run(self) -> dict[str, Any]:
-        """Main entry point. Returns merged summary of scan and tend actions."""
+        """Main entry point. Returns merged summary of scan, tend, and trigger-check actions."""
         seed_results = self.scan()
         tend_results = self.tend()
-        return {**seed_results, **tend_results}
+        trigger_results = self._check_pending_triggers()
+        return {**seed_results, **tend_results, **trigger_results}
 
     def scan(self) -> dict[str, int]:
         """Discover new issues from source and seed UoWs.
@@ -306,6 +308,52 @@ class GardenCaretaker:
     # -----------------------------------------------------------------------
     # Private helpers — pure-ish operations that write to registry
     # -----------------------------------------------------------------------
+
+    def _check_pending_triggers(self) -> dict[str, int]:
+        """Evaluate trigger conditions for all pending UoWs.
+
+        For each UoW in 'pending' state, calls evaluate_condition(). If the
+        condition is met, transitions the UoW to 'ready-for-steward'.
+
+        This replaces the sweep logic that was previously in issue-sweeper.py
+        (deleted in b4c12be). See GitHub issue #531.
+
+        Returns:
+            {"triggers_fired": int}
+        """
+        fired = 0
+        pending_uows = self.registry.query(str(UoWStatus.PENDING))
+        for uow in pending_uows:
+            try:
+                condition_met = evaluate_condition(uow, registry=self.registry)
+            except Exception as exc:
+                logger.warning(
+                    "_check_pending_triggers: evaluate_condition raised for UoW %s: %s — skipping",
+                    uow.id, exc,
+                )
+                continue
+
+            if condition_met:
+                rows = self.registry.transition(
+                    uow_id=uow.id,
+                    to_status=UoWStatus.READY_FOR_STEWARD,
+                    where_status=UoWStatus.PENDING,
+                )
+                if rows == 1:
+                    self.registry.append_audit_log(uow.id, {
+                        "event": "trigger_fired",
+                        "actor": "garden_caretaker",
+                        "from_status": "pending",
+                        "to_status": "ready-for-steward",
+                        "timestamp": _now_iso(),
+                    })
+                    fired += 1
+                    logger.info(
+                        "_check_pending_triggers: trigger fired for UoW %s → ready-for-steward",
+                        uow.id,
+                    )
+
+        return {"triggers_fired": fired}
 
     def _fetch_active_uows(self) -> list[UoW]:
         """Return all UoWs that tend() must inspect.
