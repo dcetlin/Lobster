@@ -1401,9 +1401,10 @@ check_usage_limit() {
 }
 
 # is_limit_wait — returns 0 if a recent usage-limit event was recorded and
-# the limit-wait window has not yet expired.  Conservatively uses a 4-hour
-# guard since reset times are hard to parse reliably.
-LIMIT_WAIT_MAX_SECONDS=14400  # 4 hours
+# the limit-wait window has not yet expired.  Uses a 10-minute retry interval
+# so the system recovers quickly on false positives rather than sitting dead
+# for 4 hours.
+LIMIT_WAIT_MAX_SECONDS=600  # 10 minutes
 
 is_limit_wait() {
     [[ -f "$LIMIT_WAIT_STATE_FILE" ]] || return 1
