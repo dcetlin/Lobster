@@ -22,17 +22,19 @@ Executor. Look for it in the prescription block under ``output_ref:``.
 Schema written to ``<output_ref>.result.json``:
 
     {
-        "status":     "done" | "failed",
-        "outcome":    "complete" | "failed",   # Steward-compatible alias for status
+        "status":     "complete" | "failed",
+        "outcome":    "complete" | "failed",   # Steward routing signal — always matches status
         "success":    true | false,             # Steward-compatible convenience field
         "summary":    "<human-readable one-line summary>",
         "artifacts":  ["<path1>", "<path2>", ...],   # optional
         "written_at": "<ISO-8601 UTC timestamp>"
     }
 
-``status`` is the subagent-facing API; ``outcome`` and ``success`` are written
-for backward compatibility with the Steward's result-file parser, which reads
-``outcome`` as its primary routing signal (executor-contract.md §Schema).
+Both ``status`` and ``outcome`` use identical vocabulary (``"complete"`` /
+``"failed"``) so that any future Steward code reading either field sees a
+consistent value. The Steward's primary routing signal remains ``outcome``
+(executor-contract.md §Schema). ``status="done"`` is still accepted as a
+convenience alias for ``"complete"`` and is normalized before writing.
 """
 
 from __future__ import annotations
@@ -51,7 +53,7 @@ from typing import Literal
 
 def write_result(
     output_ref: str,
-    status: Literal["done", "failed"],
+    status: Literal["done", "complete", "failed"],
     summary: str,
     artifacts: list[str] | None = None,
 ) -> Path:
@@ -69,8 +71,11 @@ def write_result(
             ``<stem>.result.json`` (replacing the extension) or
             ``<output_ref>.result.json`` (suffix appended) when the path has
             no extension.
-        status: ``"done"`` for successful completion, ``"failed"`` for any
-            failure that prevents the prescription from being fulfilled.
+        status: ``"done"`` or ``"complete"`` for successful completion;
+            ``"failed"`` for any failure that prevents the prescription from
+            being fulfilled. ``"done"`` is normalized to ``"complete"`` before
+            writing so that the written ``status`` field always matches the
+            Steward's ``outcome`` vocabulary.
         summary: A single human-readable sentence describing what happened.
             The Steward surfaces this in its diagnosis log and to the user
             when a surface condition fires. Keep it factual and concise.
@@ -90,14 +95,16 @@ def write_result(
     result_path = _result_json_path(output_ref)
     result_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Map status to Steward-compatible outcome/success fields so the Steward
-    # can read this file without changes (executor-contract.md §Schema).
-    outcome = "complete" if status == "done" else "failed"
-    success = status == "done"
+    # Normalize "done" → "complete" so status and outcome use identical
+    # vocabulary. The Steward reads `outcome` as its primary routing signal
+    # (executor-contract.md §Schema), and any future code reading `status`
+    # would also expect "complete", not "done".
+    normalized_status = "complete" if status == "done" else status
+    success = normalized_status == "complete"
 
     payload: dict = {
-        "status": status,
-        "outcome": outcome,
+        "status": normalized_status,
+        "outcome": normalized_status,
         "success": success,
         "summary": summary,
         "written_at": _now_iso(),

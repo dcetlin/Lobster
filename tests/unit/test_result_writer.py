@@ -2,8 +2,10 @@
 Tests for orchestration.result_writer.
 
 Coverage:
-- write_result("done") writes status="done", outcome="complete", success=True
+- write_result("done") writes status="complete", outcome="complete", success=True
+- write_result("complete") writes status="complete", outcome="complete", success=True
 - write_result("failed") writes status="failed", outcome="failed", success=False
+- status and outcome fields always use identical vocabulary ("complete"/"failed")
 - result.json path derived by replacing extension (primary convention)
 - result.json path appends .result.json when output_ref has no extension (fallback)
 - artifacts included when provided; absent when not provided
@@ -17,7 +19,6 @@ Coverage:
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 
 import pytest
@@ -39,13 +40,30 @@ def output_ref(tmp_path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 class TestWriteResultSchema:
-    def test_done_status_writes_complete_outcome(self, output_ref: str) -> None:
+    def test_done_alias_normalizes_to_complete(self, output_ref: str) -> None:
         write_result(output_ref, status="done", summary="PR opened")
         result_path = _result_json_path(output_ref)
         data = json.loads(result_path.read_text())
-        assert data["status"] == "done"
+        assert data["status"] == "complete"
         assert data["outcome"] == "complete"
         assert data["success"] is True
+
+    def test_complete_status_writes_complete_outcome(self, output_ref: str) -> None:
+        write_result(output_ref, status="complete", summary="PR opened")
+        result_path = _result_json_path(output_ref)
+        data = json.loads(result_path.read_text())
+        assert data["status"] == "complete"
+        assert data["outcome"] == "complete"
+        assert data["success"] is True
+
+    def test_status_and_outcome_always_match(self, output_ref: str) -> None:
+        """status and outcome must use identical vocabulary — no divergence."""
+        for val in ("done", "complete", "failed"):
+            write_result(output_ref, status=val, summary="test")  # type: ignore[arg-type]
+            data = json.loads(_result_json_path(output_ref).read_text())
+            assert data["status"] == data["outcome"], (
+                f"status={data['status']!r} != outcome={data['outcome']!r} for input {val!r}"
+            )
 
     def test_failed_status_writes_failed_outcome(self, output_ref: str) -> None:
         write_result(output_ref, status="failed", summary="tests failed")
