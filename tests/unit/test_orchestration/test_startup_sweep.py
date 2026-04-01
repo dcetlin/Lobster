@@ -127,21 +127,30 @@ def _make_uow(
     status: str,
     output_ref: str | None = None,
     created_at: str | None = None,
+    updated_at: str | None = None,
+    started_at: str | None = None,
     source_issue_number: int = 42,
 ) -> str:
     if uow_id is None:
         uow_id = f"uow_test_{uuid.uuid4().hex[:6]}"
+    # For `active` UoWs, default updated_at to 10 minutes ago so the
+    # active_sweep_threshold_seconds (300 s) does not suppress the sweep.
+    # Tests that need to verify the threshold behaviour can pass explicit
+    # updated_at / started_at values.
+    if status == "active" and updated_at is None and started_at is None:
+        updated_at = _iso_ago(600)
     now = created_at or _now_iso()
+    _updated_at = updated_at or now
     conn.execute(
         """
         INSERT INTO uow_registry
             (id, type, source, source_issue_number, sweep_date, status, posture,
-             created_at, updated_at, summary, output_ref, route_evidence, trigger)
+             created_at, updated_at, started_at, summary, output_ref, route_evidence, trigger)
         VALUES (?, 'executable', ?, ?, '2026-01-01', ?, 'solo',
-                ?, ?, 'Test UoW', ?, '{}', '{"type": "immediate"}')
+                ?, ?, ?, 'Test UoW', ?, '{}', '{"type": "immediate"}')
         """,
         (uow_id, f"github:issue/{source_issue_number}", source_issue_number,
-         status, now, now, output_ref),
+         status, now, _updated_at, started_at, output_ref),
     )
     conn.commit()
     return uow_id
@@ -369,6 +378,115 @@ class TestActiveUowClassifications:
 
         note = json.loads(_audit_entries(tmp_db, uow_id)[0]["note"])
         assert note["classification"] == "crashed_no_output_ref"
+
+
+class TestActiveSweepThreshold:
+    """
+    Tests for the active-UoW minimum-age guard added to fix the timing race
+    where the startup sweep misclassifies a running executor subprocess as
+    crashed_output_ref_missing.
+
+    The guard is active_sweep_threshold_seconds (default 300 s). A UoW in
+    `active` status that is younger than the threshold is skipped; only UoWs
+    older than the threshold are swept.
+    """
+
+    def test_young_active_uow_is_not_swept(self, registry, tmp_db):
+        """A freshly-claimed UoW (< threshold) must not be swept."""
+        conn = _open_conn(tmp_db)
+        uow_id = _make_uow(
+            conn,
+            status="active",
+            output_ref=None,
+            updated_at=_iso_ago(30),  # 30 seconds ago — well inside threshold
+        )
+        conn.close()
+
+        result = run_startup_sweep(registry, active_sweep_threshold_seconds=300)
+
+        assert result.active_swept == 0
+        assert _get_status(tmp_db, uow_id) == "active"
+        assert len(_audit_entries(tmp_db, uow_id)) == 0
+
+    def test_old_active_uow_is_swept_after_threshold(self, registry, tmp_db):
+        """A UoW older than the threshold must still be swept as a crash candidate."""
+        conn = _open_conn(tmp_db)
+        uow_id = _make_uow(
+            conn,
+            status="active",
+            output_ref=None,
+            updated_at=_iso_ago(600),  # 10 minutes ago — past default 300s threshold
+        )
+        conn.close()
+
+        result = run_startup_sweep(registry, active_sweep_threshold_seconds=300)
+
+        assert result.active_swept == 1
+        assert _get_status(tmp_db, uow_id) == "ready-for-steward"
+        note = json.loads(_audit_entries(tmp_db, uow_id)[0]["note"])
+        assert note["classification"] == "crashed_no_output_ref"
+
+    def test_updated_at_is_age_anchor_for_active_uow(self, registry, tmp_db):
+        """
+        updated_at is the age anchor used by the guard (started_at is not
+        exposed on the UoW dataclass per design).  A UoW with an old
+        updated_at must be swept even if it was created recently.
+        """
+        conn = _open_conn(tmp_db)
+        uow_id = _make_uow(
+            conn,
+            status="active",
+            output_ref=None,
+            created_at=_iso_ago(10),    # created very recently
+            updated_at=_iso_ago(600),   # updated_at old enough for the guard
+        )
+        conn.close()
+
+        result = run_startup_sweep(registry, active_sweep_threshold_seconds=300)
+
+        # updated_at (600s) > threshold (300s) → must be swept
+        assert result.active_swept == 1
+        assert _get_status(tmp_db, uow_id) == "ready-for-steward"
+
+    def test_threshold_zero_disables_guard(self, registry, tmp_db):
+        """
+        Passing active_sweep_threshold_seconds=0 disables the guard and sweeps
+        all active UoWs regardless of age (original behaviour).
+        """
+        conn = _open_conn(tmp_db)
+        uow_id = _make_uow(
+            conn,
+            status="active",
+            output_ref=None,
+            updated_at=_iso_ago(5),  # very young
+        )
+        conn.close()
+
+        result = run_startup_sweep(registry, active_sweep_threshold_seconds=0)
+
+        assert result.active_swept == 1
+        assert _get_status(tmp_db, uow_id) == "ready-for-steward"
+
+    def test_dry_run_with_young_active_uow_skips_correctly(self, registry, tmp_db):
+        """
+        In dry_run mode, a young UoW should be skipped by the threshold guard
+        (not counted as skipped_dry_run, since the guard fires before the
+        dry_run check).
+        """
+        conn = _open_conn(tmp_db)
+        _make_uow(
+            conn,
+            status="active",
+            output_ref=None,
+            updated_at=_iso_ago(30),  # young
+        )
+        conn.close()
+
+        result = run_startup_sweep(registry, dry_run=True, active_sweep_threshold_seconds=300)
+
+        # Young UoW was suppressed by the age guard — not counted as dry-run skip
+        assert result.skipped_dry_run == 0
+        assert result.active_swept == 0
 
 
 class TestExecutorOrphan:

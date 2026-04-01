@@ -378,6 +378,27 @@ class Executor:
 
             conn.commit()
 
+            # Sentinel file — written immediately after the claim commits so
+            # the output_ref path exists on disk while the subprocess runs.
+            # This prevents the startup sweep from misclassifying a live
+            # executor as `crashed_output_ref_missing` during the window
+            # between commit and subprocess completion.
+            # The subprocess (or _run_execution) overwrites this sentinel with
+            # real content when done; the startup sweep reads only size, not
+            # content, so a non-empty sentinel is classified `possibly_complete`
+            # rather than `crashed_output_ref_missing`.
+            try:
+                _sentinel_path = Path(output_ref)
+                _sentinel_path.parent.mkdir(parents=True, exist_ok=True)
+                _sentinel_path.write_text("executor_claimed")
+            except OSError as _e:
+                log.warning(
+                    "Executor: could not write sentinel to output_ref %s — %s. "
+                    "Proceeding; startup sweep may misclassify if heartbeat fires "
+                    "before subprocess completes.",
+                    output_ref, _e,
+                )
+
             # Deserialize workflow_artifact (after transaction commits)
             # Post-claim validation: these are planned stops, not crashes.
             # The atomic claim (steps 2-6) has already committed; output_ref is
