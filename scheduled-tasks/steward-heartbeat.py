@@ -56,6 +56,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from src.orchestration.steward import is_bootup_candidate_gate_active, run_steward_cycle
+from src.orchestration.github_sync import run_post_completion_sync
 
 # ---------------------------------------------------------------------------
 # Startup sweep — imported from startup-sweep.py (Phase 1 concern)
@@ -410,6 +411,22 @@ def main() -> int:
     except Exception:
         log.exception("Steward main loop failed")
         return 1
+
+    # Phase 4: Post-completion GitHub sync
+    log.info("--- Phase 4: Post-completion GitHub sync ---")
+    try:
+        sync_result = run_post_completion_sync(registry, dry_run=dry_run)
+        log.info(
+            "GitHub sync complete: synced=%d skipped_no_url=%d failed=%d",
+            sync_result.synced,
+            sync_result.skipped_no_url,
+            sync_result.failed,
+        )
+        if sync_result.errors:
+            for err in sync_result.errors:
+                log.warning("GitHub sync error: %s", err)
+    except Exception:
+        log.exception("Post-completion GitHub sync failed — continuing")
 
     log.info("Steward heartbeat complete")
     return 0
