@@ -15,6 +15,13 @@ The dispatcher calls these handlers when it recognizes:
   decide retry <uow-id>                → handle_decide_retry(uow_id, registry)
   decide close <uow-id>                → handle_decide_close(uow_id, registry)
   type: "wos_execute"                  → handle_wos_execute(uow_id, instructions, output_ref)
+
+## Compaction-resilient dispatch
+
+WOS_MESSAGE_TYPE_DISPATCH maps inbox message types to handler descriptors.
+The dispatcher calls route_wos_message(msg) to dispatch type-routed messages
+instead of relying on prose instructions that can be lost under context compaction.
+Import and call this table unconditionally — Python imports survive compaction.
 """
 
 from __future__ import annotations
@@ -22,7 +29,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .registry import Registry
@@ -425,3 +432,113 @@ def handle_wos_stop() -> str:
         "UoWs already active will continue running; TTL recovery handles any that stall.\n"
         f"Config: `{_WOS_CONFIG_PATH}`"
     )
+
+
+# ---------------------------------------------------------------------------
+# Compaction-resilient message-type dispatch table
+#
+# Maps inbox message `type` values to handler descriptors.  The dispatcher
+# calls route_wos_message(msg) instead of embedding routing logic in prose
+# instructions — prose can be lost under context compaction, Python imports
+# cannot.
+#
+# Dispatcher integration (add to main loop):
+#
+#     from src.orchestration.dispatcher_handlers import route_wos_message
+#
+#     if msg.get("type") in WOS_MESSAGE_TYPE_DISPATCH:
+#         result = route_wos_message(msg)
+#         # result["action"] tells the dispatcher what to do next
+#         # See route_wos_message docstring for the result schema.
+# ---------------------------------------------------------------------------
+
+WOS_MESSAGE_TYPE_DISPATCH: dict[str, str] = {
+    # message type → handler name (used as a stable, compaction-safe key)
+    "wos_execute": "handle_wos_execute",
+}
+
+
+def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Route an inbox message whose `type` is listed in WOS_MESSAGE_TYPE_DISPATCH.
+
+    This is the compaction-resilient entry point for WOS message routing.  The
+    dispatcher should call this function rather than conditionally re-reading
+    prose documentation that may not survive context compaction.
+
+    For ``type: "wos_execute"`` the function extracts the required fields and
+    builds the subagent prompt via ``handle_wos_execute``.  The dispatcher is
+    still responsible for spawning the subagent Task and for all
+    mark_processing / mark_processed bookkeeping — this function is pure.
+
+    Args:
+        msg: The raw inbox message dict as returned by ``wait_for_messages``.
+             Must contain ``type`` and the type-specific payload fields.
+
+    Returns:
+        A dict with the following keys:
+
+        ``action`` (str):
+            What the dispatcher must do.  Currently always ``"spawn_subagent"``
+            for ``wos_execute`` messages.
+
+        ``task_id`` (str):
+            The ``task_id`` to pass to the Task tool (e.g. ``"wos-<uow_id>"``).
+
+        ``prompt`` (str):
+            The prompt string to pass to the background subagent Task call.
+
+        ``message_type`` (str):
+            Echo of ``msg["type"]`` — lets callers confirm which branch fired.
+
+    Raises:
+        KeyError: if a required field is missing from ``msg``.
+        ValueError: if ``msg["type"]`` is not in ``WOS_MESSAGE_TYPE_DISPATCH``.
+
+    Example dispatcher integration::
+
+        from src.orchestration.dispatcher_handlers import (
+            route_wos_message,
+            WOS_MESSAGE_TYPE_DISPATCH,
+        )
+
+        msg_type = msg.get("type", "")
+        if msg_type in WOS_MESSAGE_TYPE_DISPATCH:
+            routing = route_wos_message(msg)
+            # routing["action"] == "spawn_subagent"
+            # spawn Task(routing["prompt"], run_in_background=True,
+            #             task_id=routing["task_id"])
+            mark_processed(message_id)
+    """
+    msg_type: str = msg.get("type", "")
+
+    if msg_type not in WOS_MESSAGE_TYPE_DISPATCH:
+        raise ValueError(
+            f"route_wos_message: unrecognised message type {msg_type!r}. "
+            f"Known types: {sorted(WOS_MESSAGE_TYPE_DISPATCH)}"
+        )
+
+    if msg_type == "wos_execute":
+        uow_id: str = msg["uow_id"]
+        instructions: str = msg["instructions"]
+        # output_ref may be supplied by the Executor, or derived from uow_id
+        output_ref: str = msg.get(
+            "output_ref",
+            str(
+                Path.home()
+                / "lobster-workspace"
+                / "orchestration"
+                / "outputs"
+                / f"{uow_id}.result.json"
+            ),
+        )
+        prompt = handle_wos_execute(uow_id, instructions, output_ref)
+        return {
+            "action": "spawn_subagent",
+            "task_id": f"wos-{uow_id}",
+            "prompt": prompt,
+            "message_type": msg_type,
+        }
+
+    # Unreachable given the guard above, but satisfies exhaustiveness checkers
+    raise ValueError(f"route_wos_message: no branch for type {msg_type!r}")
