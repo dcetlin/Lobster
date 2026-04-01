@@ -1213,6 +1213,64 @@ class Registry:
         finally:
             conn.close()
 
+    def decide_proceed(self, uow_id: str) -> int:
+        """
+        Unblock a stuck UoW and re-queue it to the Steward without resetting cycles.
+
+        Used when Dan sends `/decide <uow-id> proceed` after the Steward surfaces
+        a blocked UoW. Unlike decide_retry, this preserves steward_cycles so the
+        Steward knows how many attempts have already been made.
+
+        Use case: external blocker was resolved and the UoW should resume where it
+        left off. Use decide_retry when a full fresh start is needed.
+
+        Transitions: blocked → ready-for-steward (optimistic lock on blocked).
+        Does NOT reset steward_cycles.
+
+        Returns rows_affected (1 on success, 0 if UoW is not in blocked status).
+        Writes audit entry atomically in the same transaction as the UPDATE.
+        """
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            conn.execute("BEGIN IMMEDIATE")
+
+            note_json = json.dumps({
+                "event": "decide_proceed",
+                "actor": "user",
+                "uow_id": uow_id,
+                "timestamp": now,
+                "note": "user requested proceed — steward_cycles preserved",
+            })
+
+            conn.execute(
+                """
+                INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                VALUES (?, ?, 'decide_proceed', 'blocked', 'ready-for-steward', 'user', ?)
+                """,
+                (now, uow_id, note_json),
+            )
+
+            cursor = conn.execute(
+                """
+                UPDATE uow_registry
+                SET status = 'ready-for-steward',
+                    updated_at = ?
+                WHERE id = ? AND status = 'blocked'
+                """,
+                (now, uow_id),
+            )
+            rows_affected = cursor.rowcount
+
+            conn.commit()
+            return rows_affected
+
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def decide_close(self, uow_id: str) -> int:
         """
         Close a stuck UoW as user-requested failure.

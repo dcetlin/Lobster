@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import pytest
 
-from src.orchestration.dispatcher_handlers import handle_approve, handle_confirm, handle_wos_execute, handle_wos_status, handle_wos_unblock
+from src.orchestration.dispatcher_handlers import handle_approve, handle_confirm, handle_decide, handle_wos_execute, handle_wos_status, handle_wos_unblock
 
 
 @pytest.fixture
@@ -229,3 +229,92 @@ class TestHandleWosUnblock:
         assert steward.is_bootup_candidate_gate_active() is True
         handle_wos_unblock()
         assert steward.is_bootup_candidate_gate_active() is False
+
+
+# ---------------------------------------------------------------------------
+# /decide command tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def blocked_uow_id(registry) -> str:
+    """A UoW set to blocked status for decide command tests."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    result = registry.upsert(issue_number=300, title="Blocked issue", sweep_date=today, success_criteria="Test done.")
+    registry.set_status_direct(result.id, "blocked")
+    return result.id
+
+
+class TestHandleDecide:
+    """Tests for /decide <uow-id> <proceed|abandon|retry>."""
+
+    def test_proceed_transitions_blocked_to_ready_for_steward(self, registry, blocked_uow_id):
+        """proceed unblocks a UoW and re-queues it without resetting steward_cycles."""
+        response = handle_decide(blocked_uow_id, "proceed", registry=registry)
+        assert "ready-for-steward" in response.lower()
+        assert blocked_uow_id in response
+        uow = registry.get(blocked_uow_id)
+        assert uow.status.value == "ready-for-steward"
+
+    def test_retry_transitions_blocked_to_ready_for_steward_and_resets_cycles(self, registry, blocked_uow_id):
+        """retry is equivalent to /decide retry — transitions blocked→ready-for-steward, cycles=0."""
+        response = handle_decide(blocked_uow_id, "retry", registry=registry)
+        assert "ready-for-steward" in response.lower()
+        assert blocked_uow_id in response
+        uow = registry.get(blocked_uow_id)
+        assert uow.status.value == "ready-for-steward"
+
+    def test_abandon_transitions_blocked_to_failed(self, registry, blocked_uow_id):
+        """abandon closes the UoW as user-requested failure."""
+        response = handle_decide(blocked_uow_id, "abandon", registry=registry)
+        assert "failed" in response.lower()
+        assert blocked_uow_id in response
+        uow = registry.get(blocked_uow_id)
+        assert uow.status.value == "failed"
+
+    def test_unknown_action_returns_error_message(self, registry, blocked_uow_id):
+        """Invalid action returns an informative error, not a crash."""
+        response = handle_decide(blocked_uow_id, "frobnicate", registry=registry)
+        assert "unknown action" in response.lower()
+        assert "proceed" in response.lower()
+        assert "abandon" in response.lower()
+        assert "retry" in response.lower()
+
+    def test_proceed_on_non_blocked_uow_returns_error(self, registry):
+        """proceed on a UoW not in blocked status returns a diagnostic message."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        result = registry.upsert(issue_number=301, title="Active issue", sweep_date=today, success_criteria="Test done.")
+        registry.set_status_direct(result.id, "active")
+        response = handle_decide(result.id, "proceed", registry=registry)
+        assert "not currently in" in response.lower() or "could not be" in response.lower()
+
+    def test_action_is_case_insensitive(self, registry, blocked_uow_id):
+        """Action matching is case-insensitive — PROCEED, Retry, ABANDON all work."""
+        response = handle_decide(blocked_uow_id, "PROCEED", registry=registry)
+        assert "ready-for-steward" in response.lower()
+
+    def test_proceed_preserves_steward_cycles(self, registry):
+        """proceed does not reset steward_cycles — retry is the full-reset action."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        result = registry.upsert(issue_number=302, title="Cycles issue", sweep_date=today, success_criteria="Test done.")
+        # Manually set cycles and blocked status
+        import sqlite3
+        conn = sqlite3.connect(str(registry.db_path))
+        conn.execute("UPDATE uow_registry SET status='blocked', steward_cycles=3 WHERE id=?", (result.id,))
+        conn.commit()
+        conn.close()
+        handle_decide(result.id, "proceed", registry=registry)
+        uow = registry.get(result.id)
+        assert uow.steward_cycles == 3  # preserved
+
+    def test_retry_resets_steward_cycles(self, registry):
+        """retry resets steward_cycles to 0 — full fresh start."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        result = registry.upsert(issue_number=303, title="Reset cycles issue", sweep_date=today, success_criteria="Test done.")
+        import sqlite3
+        conn = sqlite3.connect(str(registry.db_path))
+        conn.execute("UPDATE uow_registry SET status='blocked', steward_cycles=3 WHERE id=?", (result.id,))
+        conn.commit()
+        conn.close()
+        handle_decide(result.id, "retry", registry=registry)
+        uow = registry.get(result.id)
+        assert uow.steward_cycles == 0  # reset

@@ -1678,9 +1678,24 @@ Status: `proposed → pending`"
   ```
   Reply with the returned string.
 
-**Note:** Decide actions (Retry / Close on stuck UoWs) are handled via inline button callbacks — see "Handling WOS Surface Messages" section above.
+- `/decide <uow-id> <proceed|abandon|retry>` — Resolve a blocked UoW from the command line.
+  Handle directly (no subagent — fast CLI call). Call:
+  ```python
+  from src.orchestration.dispatcher_handlers import handle_decide
+  from src.orchestration.registry import Registry
+  registry = Registry()
+  reply = handle_decide(uow_id, action, registry=registry)
+  ```
+  Action semantics:
+  - `proceed` — unblock and re-queue to `ready-for-steward` (steward_cycles preserved)
+  - `retry` — reset steward_cycles to 0 and re-queue to `ready-for-steward` (full retry)
+  - `abandon` — close the UoW as user-requested failure (`blocked → failed`)
+  All three actions operate only on UoWs in `blocked` status. Reply with the returned string.
+  If the UoW is not found or not blocked, the handler returns a descriptive error message.
 
-`/wos status`, `/wos unblock`, `/wos start`, `/wos stop`, and `/confirm` are handled directly in the dispatcher (no subagent — fast CLI calls).
+**Note:** Decide actions (Retry / Close on stuck UoWs) are also available via inline button callbacks — see "Handling WOS Surface Messages" section above. `/decide` is the slash-command equivalent for when buttons are not available.
+
+`/wos status`, `/wos unblock`, `/wos start`, `/wos stop`, `/confirm`, and `/decide` are handled directly in the dispatcher (no subagent — fast CLI calls).
 `/wos pdf` requires a subagent — dispatch it and reply "Generating WOS PDF..." immediately.
 
 

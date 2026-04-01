@@ -6,14 +6,15 @@ instance, and return a formatted string response suitable for sending back to
 Telegram. No MCP tools, no network calls — those belong in the dispatcher.
 
 The dispatcher calls these handlers when it recognizes:
-  /approve <uow-id>        → handle_approve(uow_id, registry)
-  /wos status [status]     → handle_wos_status(status, registry)
-  /wos unblock             → handle_wos_unblock()
-  /wos start               → handle_wos_start()
-  /wos stop                → handle_wos_stop()
-  decide retry <uow-id>    → handle_decide_retry(uow_id, registry)
-  decide close <uow-id>    → handle_decide_close(uow_id, registry)
-  type: "wos_execute"      → handle_wos_execute(uow_id, instructions, output_ref)
+  /approve <uow-id>                    → handle_approve(uow_id, registry)
+  /decide <uow-id> <proceed|abandon|retry> → handle_decide(uow_id, action, registry)
+  /wos status [status]                 → handle_wos_status(status, registry)
+  /wos unblock                         → handle_wos_unblock()
+  /wos start                           → handle_wos_start()
+  /wos stop                            → handle_wos_stop()
+  decide retry <uow-id>                → handle_decide_retry(uow_id, registry)
+  decide close <uow-id>                → handle_decide_close(uow_id, registry)
+  type: "wos_execute"                  → handle_wos_execute(uow_id, instructions, output_ref)
 """
 
 from __future__ import annotations
@@ -161,6 +162,55 @@ def handle_decide_close(uow_id: str, *, registry: "Registry") -> str:
         f"UoW `{uow_id}` could not be closed \u2014 it is not currently in `blocked` status.\n"
         f"Run `/wos status blocked` to see blocked UoWs."
     )
+
+
+_VALID_DECIDE_ACTIONS = frozenset({"proceed", "abandon", "retry"})
+
+
+def handle_decide(uow_id: str, action: str, *, registry: "Registry") -> str:
+    """
+    Handle /decide <uow-id> <proceed|abandon|retry>.
+
+    Provides a single unified command for resolving blocked UoWs from Telegram.
+    Action semantics:
+      proceed  — unblock and re-queue to ready-for-steward (preserves steward_cycles)
+      retry    — reset steward_cycles to 0 and re-queue to ready-for-steward (full retry)
+      abandon  — close the UoW as user-requested failure (blocked → failed)
+
+    All three actions operate only on UoWs in `blocked` status — optimistic lock
+    prevents accidental double-writes if the UoW has already been advanced.
+
+    Returns a human-readable Telegram message describing the outcome.
+    """
+    action = action.lower().strip()
+
+    if action not in _VALID_DECIDE_ACTIONS:
+        valid = ", ".join(sorted(_VALID_DECIDE_ACTIONS))
+        return (
+            f"Unknown action `{action}`.\n"
+            f"Valid actions: {valid}\n"
+            f"Usage: `/decide {uow_id} <{valid}>`"
+        )
+
+    match action:
+        case "proceed":
+            rows = registry.decide_proceed(uow_id)
+            if rows == 1:
+                return (
+                    f"UoW `{uow_id}` unblocked.\n"
+                    f"Status: `blocked \u2192 ready-for-steward` (steward_cycles preserved)"
+                )
+            return (
+                f"UoW `{uow_id}` could not be unblocked \u2014 it is not currently in `blocked` status.\n"
+                f"Run `/wos status blocked` to see blocked UoWs."
+            )
+        case "retry":
+            return handle_decide_retry(uow_id, registry=registry)
+        case "abandon":
+            return handle_decide_close(uow_id, registry=registry)
+        case _:
+            # Unreachable — guarded by frozenset check above — but satisfies mypy exhaustiveness
+            return f"Unhandled action `{action}`."
 
 
 def handle_wos_status(status: str | None, *, registry: "Registry") -> str:
