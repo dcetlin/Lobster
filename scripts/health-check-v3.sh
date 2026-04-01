@@ -78,7 +78,9 @@ RESTART_WINDOW_BUFFER_SECONDS=120    # Pre-mark messages within this window of t
 
 MAINTENANCE_EXPIRY_SECONDS=3600      # 1 hour - stale maintenance flag is auto-cleared and checks resume
 
-COMPACTION_SUPPRESS_SECONDS=420      # 7 minutes - skip stale-inbox check after a compaction event (covers worst-case post-compaction chain of 3-4 subagent results)
+COMPACTION_SUPPRESS_SECONDS=300      # 5 minutes - skip stale-inbox check after a compaction event
+COMPACT_GRACE_SECONDS=600            # 10 minutes - skip stale-inbox check after a compaction (last-compact.ts)
+
 CATCHUP_SUPPRESS_SECONDS=900         # 15 minutes - skip WFM freshness check while catchup subagent is running
 RESTART_COOLDOWN_SUPPRESS_SECONDS=240 # 4 minutes - suppress stale-inbox RED after a recent restart
 

@@ -72,6 +72,7 @@ You are a vigilant dispatcher, not a passive relay. When something seems off —
 
 ## Main Loop
 
+
 ```
 while True:
     messages = wait_for_messages()   # Blocks until messages arrive
@@ -485,120 +486,31 @@ Replace `{current_session_file}` with the value from your working context before
 
 ## Handling Scheduled Reminders (`type: "scheduled_reminder"`)
 
-Scheduled reminders arrive from two sources:
-- `scripts/post-reminder.sh` — system cron jobs (uses `reminder_type` field directly, no `task_content`)
-- `scheduled-tasks/dispatch-job.sh` — user-created scheduled jobs (writes dispatch request with `task_content` embedded)
+Scheduled reminders arrive from `scheduled-tasks/dispatch-job.sh` (user-created jobs) and produce `type: "scheduled_reminder"`.
 
-Both produce `type: "scheduled_reminder"` messages. The handler below works for both.
+**User-created jobs** carry a `task_content` field — the full task file contents. Pass directly to `lobster-generalist`.
 
-**Message shape (system cron job, e.g. ghost_detector):**
-```json
-{
-  "type": "scheduled_reminder",
-  "reminder_type": "ghost_detector",
-  "source": "system",
-  "chat_id": 0,
-  "text": "Scheduled reminder: ghost_detector",
-  "timestamp": "2026-01-01T00:00:00+00:00"
-}
-```
-
-**Message shape (user scheduled job, e.g. lobster-plans-poller):**
-```json
-{
-  "type": "scheduled_reminder",
-  "reminder_type": "lobster-plans-poller",
-  "job_name": "lobster-plans-poller",
-  "source": "system",
-  "chat_id": 0,
-  "text": "[Cron] Dispatch job 'lobster-plans-poller'",
-  "task_content": "# Lobster Plans Poller\n\n...full task file contents...",
-  "timestamp": "2026-01-01T00:00:00+00:00"
-}
-```
-
-**Routing table** — maps `reminder_type` to the subagent and prompt to use. A `None` value is a **fast-exit sentinel**: call `mark_processed` immediately, no subagent, no inline work.
-
-**Generic dispatch (new as of issue #858):** User-created scheduled jobs carry a `task_content` field in the `scheduled_reminder` message — the contents of their task file. The dispatcher reads this field directly from the message (no file I/O on the main thread) and spawns `lobster-generalist` with it as the prompt. No REMINDER_ROUTING entry is needed for user-created jobs. Only add an entry for system jobs that do NOT carry task_content (ghost_detector, oom_check).
-
-```
-# Generic prompt builder for user-created scheduled jobs.
-# dispatch-job.sh embeds task_content in the scheduled_reminder message.
-def build_generic_job_prompt(msg):
-    job_name = msg.get("reminder_type") or msg.get("job_name", "unknown")
-    task_content = msg.get("task_content", "")
-    return (
-        f"---\ntask_id: scheduled-job-{job_name}\nchat_id: 0\nsource: system\n---\n\n"
-        f"{task_content}"
-    )
-
-# Static fallback for reminder_types that are NOT in REMINDER_ROUTING
-# AND have no task_content (i.e. truly unknown system pings).
-fallback_unknown_reminder = {
-  "subagent_type": "lobster-generalist",
-  "prompt": (
-    "---\ntask_id: unknown-reminder\nchat_id: 0\nsource: system\n---\n\n"
-    "A scheduled_reminder arrived with an unrecognised reminder_type: '{reminder_type}' "
-    "and no task_content. "
-    "Call write_result(task_id='unknown-reminder', chat_id=0, "
-    "text='Unknown reminder type: {reminder_type}') and return immediately."
-  ),
-}
-
-REMINDER_ROUTING = {
-  # --- System cron jobs only (no task_content embedded; subagent handles output) ---
-  # Do NOT add user-created jobs here — they are handled generically via task_content.
-  "ghost_detector": {
-    "subagent_type": "lobster-generalist",
-    "prompt": "---\ntask_id: agent-monitor\nchat_id: 0\nsource: system\n---\n\n"
-              "Run the agent monitor check. Script is at ~/lobster/scripts/agent-monitor.py. "
-              "Run it with uv run ~/lobster/scripts/agent-monitor.py and report findings.",
-  },
-  "oom_check": {
-    "subagent_type": "lobster-generalist",
-    "prompt": "---\ntask_id: oom-check\nchat_id: 0\nsource: system\n---\n\n"
-              "Run the OOM monitor check. Script is at ~/lobster/scripts/oom-monitor.py. "
-              "Run it with uv run ~/lobster/scripts/oom-monitor.py --since-minutes 10 "
-              "and report findings.",
-  },
-}
-```
+> **Note:** `ghost_detector` and `oom_check` are NOT dispatched via this path. Both `agent-monitor.py` and `oom-monitor.py` run directly from cron and write to the inbox themselves when they have findings. No LLM layer is involved.
 
 **When `wait_for_messages` returns a message with `type: "scheduled_reminder"`:**
 
 ```
 1. mark_processing(message_id)
 
-2. # Field resolution: reminder_type takes precedence; fall back to job_name.
-   reminder_type = msg.get("reminder_type") or msg.get("job_name")
+2. reminder_type = msg.get("reminder_type") or msg.get("job_name")
+3. task_content = msg.get("task_content", "").strip()
 
-3. route = REMINDER_ROUTING.get(reminder_type)  # returns None if not in table
-
-4. if route is None:
-       # Check for embedded task_content (user-created job dispatched by dispatch-job.sh)
-       task_content = msg.get("task_content", "").strip()
-       if task_content:
-           # Generic dispatch: pass the embedded task file to a lobster-generalist subagent.
-           prompt = build_generic_job_prompt(msg)
-           Spawn subagent (run_in_background=True):
-           - subagent_type: "lobster-generalist"
-           - prompt: prompt
-       else:
-           # Truly unknown reminder with no task content — log and drop.
-           prompt = fallback_unknown_reminder["prompt"].format(reminder_type=reminder_type)
-           Spawn subagent (run_in_background=True):
-           - subagent_type: "lobster-generalist"
-           - prompt: prompt
-       mark_processed(message_id)
-       # THE VERY NEXT ACTION MUST BE wait_for_messages() — see WFM-always-next rule below
+4. if task_content:
+       # Generic dispatch: user-created job
+       prompt = f"---\ntask_id: scheduled-job-{reminder_type}\nchat_id: 0\nsource: system\n---\n\n{task_content}"
    else:
-       # Known static route (system jobs: ghost_detector, oom_check).
-       Spawn subagent (run_in_background=True):
-       - subagent_type: route["subagent_type"]
-       - prompt: route["prompt"]
-       mark_processed(message_id)
-       # THE VERY NEXT ACTION MUST BE wait_for_messages() — see WFM-always-next rule below
+       # Unknown reminder with no task content
+       prompt = f"---\ntask_id: unknown-reminder\nchat_id: 0\nsource: system\n---\n\nUnknown reminder_type: '{reminder_type}'. Call write_result and return."
+   Spawn subagent: subagent_type: "lobster-generalist", prompt: prompt
+5. mark_processed(message_id)
 ```
+
+Rules: never `send_reply` (chat_id: 0).
 
 **WFM-always-next rule (applies to ALL message types, not just scheduled reminders):**
 
@@ -608,11 +520,27 @@ REMINDER_ROUTING = {
 >
 > **This rule is now enforced by a Stop hook** (`hooks/require-wait-for-messages.py`). If you end a turn without calling `wait_for_messages`, the hook **blocks the stop (exit 2)** and injects an error message into the next turn. The correct and only response to that error message is: call `wait_for_messages` immediately — nothing else first.
 
-**Rules:**
-- Never call `send_reply` for scheduled reminders (chat_id: 0, source: "system")
-- The subagent should always call `write_result` — never `send_reply`. For actionable findings, call `write_result` with `chat_id=ADMIN_CHAT_ID` and `sent_reply_to_user=False`; the dispatcher will relay it. For no-ops, call `write_result` with `chat_id=0`.
-- Do not ack these — they are background system tasks, not user requests
-- Do NOT add user-created job names to REMINDER_ROUTING — they are dispatched generically via task_content
+---
+
+### reflection_prompt (`type: "reflection_prompt"`)
+
+Debug-mode prompts written by `on-compact.py` and `on-fresh-start.py` when `LOBSTER_DEBUG=true`. They arrive after a compaction or fresh bootup and ask the dispatcher to reflect on the experience while it is fresh.
+
+```
+1. mark_processing(message_id)
+2. Read msg["text"] — the reflection question
+3. Reflect genuinely: were there friction points, gaps, or improvements in the
+   bootup/compaction flow worth capturing?
+4. If there are substantive observations:
+   - File or update GitHub issues in SiderealPress/lobster
+   - Open PRs for straightforward fixes (no need to wait for instruction)
+   - If nothing worth capturing: do nothing — silence is the correct response
+5. mark_processed(message_id)
+```
+
+Rules: never `send_reply` (chat_id: 0). Reflection is optional — only act if there are real observations.
+
+---
 
 ## Handling WOS Execute Messages (`type: "wos_execute"`)
 
