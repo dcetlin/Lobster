@@ -42,6 +42,7 @@ from src.orchestration.error_capture import (
     classify_error,
     has_repeated_error,
 )
+from src.orchestration.config import TimeoutConfig
 
 log = logging.getLogger("steward")
 
@@ -49,30 +50,15 @@ log = logging.getLogger("steward")
 # LLM prescription dispatch
 # ---------------------------------------------------------------------------
 
-# Default timeout for the claude -p prescription call (seconds). Override
-# via LOBSTER_LLM_PRESCRIPTION_TIMEOUT_SECS env var for installs where
-# functional-engineer subagents need more time (typical: 2-10 minutes).
-_LLM_PRESCRIPTION_TIMEOUT_SECS_DEFAULT = 600
-
 def _get_llm_prescription_timeout() -> int:
     """Return the LLM prescription timeout in seconds.
 
-    Reads LOBSTER_LLM_PRESCRIPTION_TIMEOUT_SECS from the environment.
-    Falls back to _LLM_PRESCRIPTION_TIMEOUT_SECS_DEFAULT (600s) if absent
-    or non-integer.  Pure function with respect to state — env reads are
-    isolated here so the rest of the module stays deterministic in tests
-    (monkeypatch os.environ as needed).
+    Uses centralized TimeoutConfig to read LOBSTER_LLM_PRESCRIPTION_TIMEOUT_SECS
+    from the environment. Falls back to default (600s) if absent or non-integer.
+    Pure function with respect to state — env reads are isolated here so the
+    rest of the module stays deterministic in tests (monkeypatch os.environ as needed).
     """
-    raw = os.environ.get("LOBSTER_LLM_PRESCRIPTION_TIMEOUT_SECS", "")
-    if raw.strip():
-        try:
-            return int(raw.strip())
-        except ValueError:
-            log.warning(
-                "_get_llm_prescription_timeout: invalid env value %r, using default %d",
-                raw, _LLM_PRESCRIPTION_TIMEOUT_SECS_DEFAULT,
-            )
-    return _LLM_PRESCRIPTION_TIMEOUT_SECS_DEFAULT
+    return TimeoutConfig.llm_prescription_timeout_secs()
 
 # claude binary — resolved from PATH at call time.
 _CLAUDE_BIN = "claude"
