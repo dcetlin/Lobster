@@ -195,9 +195,9 @@ def run_executor_cycle(registry, dry_run: bool = False) -> dict:
         )
         return {"evaluated": evaluated, "dispatched": 0, "skipped": evaluated, "errors": 0}
 
-    from src.orchestration.executor import Executor, _dispatch_via_claude_p
+    from src.orchestration.executor import Executor, _dispatch_via_inbox
 
-    executor = Executor(registry, dispatcher=_dispatch_via_claude_p)
+    executor = Executor(registry, dispatcher=_dispatch_via_inbox)
 
     for uow in ready_uows:
         uow_id = uow.id
