@@ -1855,24 +1855,25 @@ class TestLlmPrescription:
         assert "Completion check:" in result
         assert "Check that src/widget.py exists" in result
 
-    def test_build_prescription_falls_back_when_llm_returns_none(self):
-        """_build_prescription_instructions falls back to deterministic template when llm_prescriber returns None."""
+    def test_build_prescription_fails_hard_when_llm_returns_none(self):
+        """_build_prescription_instructions raises LLMPrescriptionError when llm_prescriber returns None (fail-hard behavior)."""
         steward = _import_steward()
 
         def failing_prescriber(uow, posture, gap, issue_body=""):
             return None
 
         uow = self._make_uow(steward_cycles=0)
-        result = steward._build_prescription_instructions(
-            uow,
-            reentry_posture="executor_orphan",
-            completion_gap="no prior output",
-            llm_prescriber=failing_prescriber,
-        )
 
-        # Deterministic template output for cycles == 0
-        assert "Execute the following task:" in result
-        assert uow.summary in result
+        with pytest.raises(steward.LLMPrescriptionError) as exc_info:
+            steward._build_prescription_instructions(
+                uow,
+                reentry_posture="executor_orphan",
+                completion_gap="no prior output",
+                llm_prescriber=failing_prescriber,
+            )
+
+        assert "LLM prescription failed" in str(exc_info.value)
+        assert uow.id in str(exc_info.value)
 
     def test_build_prescription_falls_back_when_llm_prescriber_is_none(self):
         """Passing llm_prescriber=None bypasses LLM and uses deterministic template directly."""
@@ -2140,41 +2141,24 @@ class TestLlmPrescription:
 
         assert steward._count_consecutive_llm_fallbacks(log_str) == 0
 
-    def test_llm_fallback_warning_fires_at_threshold(self, db_path, registry, tmp_path, monkeypatch):
-        """_notify_llm_fallback_warning is called when consecutive fallbacks reach threshold."""
+    def test_llm_prescription_error_raises_and_transitions_back(self, db_path, registry, tmp_path, monkeypatch):
+        """When LLM prescriber returns None (fails), LLMPrescriptionError is raised and UoW transitions back to ready-for-steward."""
         steward = _import_steward()
         _ensure_registry_has_phase2_methods(registry)
-
-        warning_calls = []
-
-        def mock_notify(uow, consecutive_fallbacks):
-            warning_calls.append({"uow_id": uow.id, "count": consecutive_fallbacks})
-
-        monkeypatch.setattr("src.orchestration.steward._notify_llm_fallback_warning", mock_notify)
-
-        # Prepopulate steward_log with (threshold-1) fallback entries so this
-        # cycle becomes the Nth consecutive fallback and trips the threshold.
-        threshold = steward._LLM_FALLBACK_WARNING_THRESHOLD
-        prior_fallbacks = "\n".join(
-            json.dumps({"event": "prescription" if i == 0 else "reentry_prescription",
-                        "prescription_path": "fallback"})
-            for i in range(threshold - 1)
-        )
 
         conn = _open_db(db_path)
         uow_id = _make_uow_row(
             conn,
             status="ready-for-steward",
-            steward_cycles=threshold - 1,
+            steward_cycles=0,
             success_criteria="PR opened",
-            steward_log=prior_fallbacks,
         )
         conn.close()
 
         artifact_dir = tmp_path / "artifacts"
         artifact_dir.mkdir()
 
-        # Prescriber always returns None → deterministic fallback
+        # Prescriber always returns None → raises LLMPrescriptionError
         steward.run_steward_cycle(
             registry=registry,
             dry_run=False,
@@ -2183,12 +2167,17 @@ class TestLlmPrescription:
             llm_prescriber=lambda *a, **kw: None,
         )
 
-        assert len(warning_calls) == 1
-        assert warning_calls[0]["uow_id"] == uow_id
-        assert warning_calls[0]["count"] == threshold
+        # UoW should remain in ready-for-steward (was transitioned back after error)
+        uow = _get_uow(db_path, uow_id)
+        assert uow["status"] == "ready-for-steward"
 
-    def test_llm_fallback_audit_entry_written_on_fallback(self, db_path, registry, tmp_path):
-        """An llm_prescribe_fallback audit entry is written when LLM prescription falls back."""
+        # Audit log should have an llm_prescription_error entry
+        entries = _audit_entries(db_path, uow_id)
+        error_entries = [e for e in entries if e.get("event") == "llm_prescription_error"]
+        assert len(error_entries) >= 1, "llm_prescription_error audit entry must exist"
+
+    def test_llm_prescription_error_audit_entry_written(self, db_path, registry, tmp_path):
+        """An llm_prescription_error audit entry is written when LLM prescription fails."""
         steward = _import_steward()
         _ensure_registry_has_phase2_methods(registry)
 
@@ -2214,14 +2203,14 @@ class TestLlmPrescription:
 
         audit_entries = steward._fetch_audit_entries(registry, uow_id)
         # audit_log stores the full entry dict as JSON in the `note` column.
-        fallback_notes = [
+        error_notes = [
             json.loads(e["note"])
             for e in audit_entries
-            if e.get("event") == "llm_prescribe_fallback"
+            if e.get("event") == "llm_prescription_error"
         ]
-        assert len(fallback_notes) == 1
-        assert fallback_notes[0]["uow_id"] == uow_id
-        assert fallback_notes[0]["consecutive_llm_fallbacks"] == 1
+        assert len(error_notes) >= 1, "llm_prescription_error audit entry must exist"
+        assert error_notes[0]["uow_id"] == uow_id
+        assert "LLM prescription failed" in error_notes[0]["error_message"]
 
     def test_end_to_end_prescription_with_llm_stub(self, db_path, registry, tmp_path):
         """Full _process_uow call uses LLM prescription stub and writes instructions to artifact."""

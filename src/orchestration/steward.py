@@ -46,6 +46,15 @@ from src.orchestration.config import TimeoutConfig
 
 log = logging.getLogger("steward")
 
+
+# ---------------------------------------------------------------------------
+# Custom exceptions
+# ---------------------------------------------------------------------------
+
+class LLMPrescriptionError(Exception):
+    """Raised when LLM prescription fails and no fallback is permitted."""
+    pass
+
 # ---------------------------------------------------------------------------
 # LLM prescription dispatch
 # ---------------------------------------------------------------------------
@@ -1206,9 +1215,9 @@ def _build_prescription_instructions(
     """
     Build natural language prescription instructions for the Executor.
 
-    Tries the LLM-class prescription path first (via llm_prescriber). If that
-    returns None (API unavailable, timeout, parse failure), falls back to the
-    deterministic keyword-matching template.
+    Uses the LLM-based prescription path via llm_prescriber. If the LLM prescription
+    fails (API unavailable, timeout, parse failure), raises LLMPrescriptionError
+    instead of falling back to deterministic.
 
     Args:
         uow: The Unit of Work being prescribed.
@@ -1219,29 +1228,38 @@ def _build_prescription_instructions(
             issue_body) and returns a dict or None. Inject None or a stub in tests
             to bypass the LLM call. Defaults to _llm_prescribe.
         prior_prescriptions: List of prior steward_log prescription entries
-            (from _fetch_prior_prescriptions). Passed to the deterministic fallback
-            to inject re-prescription context. Ignored on the LLM path (LLM reads
-            steward_log directly via uow). Pass None or [] for the first cycle.
-    """
-    if llm_prescriber is not None:
-        llm_result = llm_prescriber(uow, reentry_posture, completion_gap, issue_body)
-        if llm_result is not None:
-            instructions = llm_result["instructions"]
-            success_check = llm_result.get("success_criteria_check", "")
-            # Append the success_criteria_check as a verification note so the
-            # Executor has an explicit completion signal alongside the instructions.
-            if success_check:
-                instructions = (
-                    instructions.rstrip()
-                    + f"\n\nCompletion check: {success_check}"
-                )
-            return instructions
+            (from _fetch_prior_prescriptions). No longer used since deterministic
+            fallback is removed. Kept for backward compatibility.
 
-    # Deterministic fallback
-    return _build_deterministic_prescription_instructions(
-        uow, reentry_posture, completion_gap, issue_body,
-        prior_prescriptions=prior_prescriptions,
-    )
+    Raises:
+        LLMPrescriptionError: If the LLM prescriber returns None (failure, not bypass).
+    """
+    if llm_prescriber is None:
+        # If llm_prescriber is explicitly None, this is a test/stub scenario
+        # Fall back to deterministic only in this case
+        return _build_deterministic_prescription_instructions(
+            uow, reentry_posture, completion_gap, issue_body,
+            prior_prescriptions=prior_prescriptions,
+        )
+
+    llm_result = llm_prescriber(uow, reentry_posture, completion_gap, issue_body)
+    if llm_result is None:
+        # LLM prescription failed — fail hard instead of falling back
+        raise LLMPrescriptionError(
+            f"LLM prescription failed for UoW {uow.id}. "
+            "Check steward logs for details. No deterministic fallback is performed."
+        )
+
+    instructions = llm_result["instructions"]
+    success_check = llm_result.get("success_criteria_check", "")
+    # Append the success_criteria_check as a verification note so the
+    # Executor has an explicit completion signal alongside the instructions.
+    if success_check:
+        instructions = (
+            instructions.rstrip()
+            + f"\n\nCompletion check: {success_check}"
+        )
+    return instructions
 
 
 # ---------------------------------------------------------------------------
@@ -2082,13 +2100,42 @@ def _process_uow(
 
     effective_prescriber = _capturing_prescriber if llm_prescriber is not None else None
 
-    instructions = _build_prescription_instructions(
-        uow, reentry_posture, completion_gap_for_prescription, issue_body,
-        llm_prescriber=effective_prescriber,
-        prior_prescriptions=prior_prescriptions,
-    )
+    try:
+        instructions = _build_prescription_instructions(
+            uow, reentry_posture, completion_gap_for_prescription, issue_body,
+            llm_prescriber=effective_prescriber,
+            prior_prescriptions=prior_prescriptions,
+        )
+    except LLMPrescriptionError as e:
+        # LLM prescription failed hard — do not fall back, raise error
+        log.error(
+            "_process_uow: LLM prescription failed for %s — %s",
+            uow_id, str(e),
+        )
+        # Write error audit entry
+        if not dry_run:
+            registry.append_audit_log(uow_id, {
+                "event": "llm_prescription_error",
+                "actor": _ACTOR_STEWARD,
+                "uow_id": uow_id,
+                "steward_cycles": cycles,
+                "error_message": str(e),
+                "timestamp": _now_iso(),
+            })
+            # Transition back to ready-for-steward to allow retry
+            # (or remain in diagnosing if transition fails)
+            try:
+                registry.transition(uow_id, _STATUS_READY_FOR_STEWARD, _STATUS_DIAGNOSING)
+            except Exception as transition_err:
+                log.error(
+                    "_process_uow: failed to transition UoW %s back to ready-for-steward: %s",
+                    uow_id, transition_err,
+                )
+        raise
 
-    prescription_path = "llm" if _llm_path_taken[0] else "fallback"
+    # Prescription always comes from LLM now; fallback path has been removed.
+    # If LLM prescription fails, an exception is raised (fail-hard behavior).
+    prescription_path = "llm"
 
     # Update agenda: mark current pending node as prescribed
     # Use trace_agenda (which includes the trace entry we just wrote) as the base
@@ -2107,32 +2154,6 @@ def _process_uow(
         "next_posture_rationale": route_reason,
     }
     current_log_str = _append_steward_log_entry(registry, uow_id, current_log_str, prescription_log_entry)
-
-    # LLM fallback observability: count consecutive fallbacks from the updated
-    # steward_log (which already includes this cycle's prescription_path) and
-    # write an audit entry when falling back.  The consecutive count is computed
-    # after appending so this cycle's fallback is included in the tally.
-    if prescription_path == "fallback":
-        consecutive_fallbacks = _count_consecutive_llm_fallbacks(current_log_str)
-        log.warning(
-            "_llm_prescribe fallback: UoW %s using deterministic template "
-            "(consecutive fallbacks: %d)",
-            uow_id, consecutive_fallbacks,
-        )
-        if not dry_run:
-            registry.append_audit_log(uow_id, {
-                "event": "llm_prescribe_fallback",
-                "actor": _ACTOR_STEWARD,
-                "uow_id": uow_id,
-                "steward_cycles": cycles,
-                "consecutive_llm_fallbacks": consecutive_fallbacks,
-                "timestamp": _now_iso(),
-            })
-        # Fire early-warning inbox message at threshold (exact match so we
-        # notify once per threshold crossing, not on every subsequent fallback).
-        # Fires regardless of dry_run so tests can capture it.
-        if consecutive_fallbacks == _LLM_FALLBACK_WARNING_THRESHOLD:
-            _notify_llm_fallback_warning(uow, consecutive_fallbacks)
 
     if not dry_run:
         # Write workflow artifact to disk first
