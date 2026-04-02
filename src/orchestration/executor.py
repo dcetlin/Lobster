@@ -48,6 +48,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
+from orchestration.config import TimeoutConfig
+
 log = logging.getLogger("executor")
 
 from orchestration.registry import Registry, UoW, UoWStatus
@@ -630,7 +632,10 @@ class Executor:
 
 #: Timeout for the claude -p subprocess in seconds. Matched to the default
 #: UoW estimated_runtime ceiling (30 minutes) plus a generous buffer.
-_CLAUDE_P_TIMEOUT_SECONDS: int = int(os.environ.get("WOS_EXECUTOR_TIMEOUT", "7200"))
+#: Uses centralized TimeoutConfig instead of direct env read.
+def _get_claude_p_timeout() -> int:
+    """Return the claude -p subprocess timeout in seconds."""
+    return TimeoutConfig.claude_dispatch_timeout_secs()
 
 #: claude binary — resolved from PATH at call time so tests can override via
 #: a mock binary on PATH without patching the module.
@@ -690,7 +695,7 @@ def _dispatch_via_claude_p(instructions: str, uow_id: str) -> str:
         component="executor",
         uow_id=uow_id,
         command=command,
-        timeout_seconds=_CLAUDE_P_TIMEOUT_SECONDS,
+        timeout_seconds=_get_claude_p_timeout(),
         check=True,  # Log errors at ERROR level for fatal issues
     )
 

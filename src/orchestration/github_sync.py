@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -124,7 +125,7 @@ def _close_github_issue(
     _run: type = subprocess,  # injectable for tests
 ) -> None:
     """
-    Close a GitHub issue and post a summary comment.
+    Close a GitHub issue and post a summary comment with exponential backoff retry.
 
     This is the only function in this module that invokes subprocess.
     All other functions are pure or delegate here.
@@ -132,6 +133,9 @@ def _close_github_issue(
     The issue is closed with --comment so the closure and summary arrive
     in a single API call. If the issue is already closed, gh returns a
     non-zero exit code; we treat this as a success (idempotent close).
+
+    Retries with exponential backoff (1s, 2s, 4s) on transient errors
+    (500, 403, 429). Non-transient errors are raised immediately.
 
     Args:
         repo: GitHub repo slug, e.g. "dcetlin/Lobster".
@@ -141,29 +145,60 @@ def _close_github_issue(
     Raises:
         GitHubSyncError: If the gh CLI call fails unexpectedly (not "already closed").
     """
-    try:
-        _run.run(
-            [
-                "gh", "issue", "close", issue_number,
-                "--repo", repo,
-                "--comment", comment,
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        stderr = exc.stderr or ""
-        # gh exits 1 when the issue is already closed — treat as success.
-        if "already closed" in stderr.lower() or "issue was already closed" in stderr.lower():
-            log.debug(
-                "github_sync: issue #%s in %s is already closed — no-op",
-                issue_number, repo,
+    max_attempts = 3
+
+    for attempt in range(max_attempts):
+        try:
+            _run.run(
+                [
+                    "gh", "issue", "close", issue_number,
+                    "--repo", repo,
+                    "--comment", comment,
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
             )
-            return
-        raise GitHubSyncError(
-            f"gh issue close failed for {repo}#{issue_number}: {stderr.strip()}"
-        ) from exc
+            return  # Success
+
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr or ""
+            returncode = exc.returncode or 1
+
+            # "Already closed" is idempotent success
+            if "already closed" in stderr.lower() or "issue was already closed" in stderr.lower():
+                log.debug(
+                    "github_sync: issue #%s in %s is already closed — no-op",
+                    issue_number, repo,
+                )
+                return
+
+            # Transient errors: 500 (server error), 403 (rate limit), 429 (too many requests)
+            # Retry with exponential backoff (1s, 2s, 4s)
+            if returncode in {500, 403, 429}:
+                if attempt < max_attempts - 1:
+                    wait_time = 2 ** attempt  # 1s, 2s, 4s
+                    log.warning(
+                        "github_sync: GitHub API returned %d for %s#%s, "
+                        "retrying in %ds (attempt %d/%d)",
+                        returncode, repo, issue_number, wait_time, attempt + 1, max_attempts,
+                    )
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # Max retries exhausted
+                    log.error(
+                        "github_sync: GitHub API returned %d for %s#%s after %d attempts",
+                        returncode, repo, issue_number, max_attempts,
+                    )
+                    raise GitHubSyncError(
+                        f"gh issue close failed for {repo}#{issue_number} after {max_attempts} attempts: {stderr.strip()}"
+                    ) from exc
+
+            # Non-transient errors: raise immediately without retry
+            raise GitHubSyncError(
+                f"gh issue close failed for {repo}#{issue_number}: {stderr.strip()}"
+            ) from exc
 
 
 # ---------------------------------------------------------------------------
