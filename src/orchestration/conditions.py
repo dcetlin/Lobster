@@ -18,8 +18,11 @@ Design constraints:
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from typing import TYPE_CHECKING, Any, Callable
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .registry import UoW
@@ -68,8 +71,10 @@ def _default_github_client(issue_number: int) -> dict[str, Any]:
             return {"status_code": 403, "state": None}
         return {"status_code": 500, "state": None}
     except subprocess.TimeoutExpired:
-        return {"status_code": 408, "state": None}
-    except Exception:
+        logger.warning(f"Condition check timeout after {15}s")
+        return {"status_code": 504, "state": None}
+    except Exception as e:
+        logger.error(f"Condition check error: {e}")
         return {"status_code": 500, "state": None}
 
 
