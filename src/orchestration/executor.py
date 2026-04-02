@@ -475,8 +475,11 @@ class Executor:
         except Exception:
             try:
                 conn.rollback()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    f"Rollback failed during exception handling: {type(e).__name__}: {e}",
+                    exc_info=True,
+                )
             raise
         finally:
             conn.close()
@@ -782,6 +785,10 @@ def _dispatch_via_inbox(instructions: str, uow_id: str) -> str:
 # ---------------------------------------------------------------------------
 # TTL recovery — mark stuck 'active' UoWs as failed
 # ---------------------------------------------------------------------------
+# TODO: Remove after PR #584 merge (executor subprocess → inbox pattern).
+# TTL recovery is a post-hoc band-aid for subprocess fragility. Once the executor
+# uses the MCP inbox pattern instead of subprocess dispatch, long-lived UoWs will
+# have natural heartbeat presence and won't need TTL-based recovery.
 
 def recover_ttl_exceeded_uows(registry: "Registry") -> list[str]:
     """
@@ -827,10 +834,12 @@ def recover_ttl_exceeded_uows(registry: "Registry") -> list[str]:
                 f"ttl_exceeded: UoW was in active state for more than {TTL_EXCEEDED_HOURS}h",
             )
             recovered.append(uow_id)
-        except Exception:
-            # Non-fatal: log at call site. The UoW remains active and will be
-            # caught on the next heartbeat cycle.
-            pass
+        except Exception as e:
+            logger.debug(
+                f"TTL recovery failed for UoW {uow_id}: {type(e).__name__}: {e}",
+                exc_info=True,
+            )
+            # Non-fatal: the UoW remains active and will be caught on the next heartbeat cycle.
 
     return recovered
 
