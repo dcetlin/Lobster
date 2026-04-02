@@ -705,6 +705,55 @@ def generate_pdf(uows: list[dict], output_path: Path) -> Path:
     return output_path
 
 
+# ── Execution side effects extraction ──────────────────────────────────────────
+
+def _extract_side_effects(uow: dict) -> dict | None:
+    """
+    Extract side_effects from workflow_artifact.
+    Returns a dict with status (present, empty, mismatch) and content.
+    """
+    status = uow.get("status", "")
+    if status != "done":
+        return None
+
+    artifact_raw = uow.get("workflow_artifact")
+    if not artifact_raw:
+        return None
+
+    try:
+        artifact = json.loads(artifact_raw) if isinstance(artifact_raw, str) else artifact_raw
+        result = artifact.get("result", {})
+        side_effects = result.get("side_effects")
+
+        if side_effects is None:
+            return {"status": "missing", "content": None}
+        elif not side_effects:
+            return {"status": "empty", "content": side_effects}
+        else:
+            return {"status": "present", "content": side_effects}
+    except Exception:
+        return {"status": "error", "content": None}
+
+
+def _extract_dan_interrupts(uow: dict) -> list[dict]:
+    """
+    Extract Dan Interrupt entries from steward_agenda.
+    Returns a list of interrupt dicts, or empty list if none found.
+    """
+    agenda_raw = uow.get("steward_agenda")
+    if not agenda_raw:
+        return []
+
+    try:
+        agenda_entries = json.loads(agenda_raw) if isinstance(agenda_raw, str) else agenda_raw
+        if not isinstance(agenda_entries, list):
+            agenda_entries = [agenda_entries]
+
+        return [e for e in agenda_entries if e.get("external_dependency") == "dan"]
+    except Exception:
+        return []
+
+
 # ── Full markdown report ───────────────────────────────────────────────────────
 
 def generate_full_report(uows: list[dict], output_path: Path) -> Path:
@@ -733,6 +782,47 @@ def generate_full_report(uows: list[dict], output_path: Path) -> Path:
     for status, count in sorted(status_counts.items()):
         lines.append(f"- **{status}**: {count}")
     lines.append("")
+
+    # Execution summary: side_effects and interrupts
+    lines.append("## Execution Summary")
+    lines.append("")
+
+    side_effects_gaps = []
+    dan_interrupt_uows = []
+    for u in uows:
+        uow_id = u.get("id", "unknown")
+        se_info = _extract_side_effects(u)
+        if se_info and se_info["status"] in ("missing", "empty"):
+            side_effects_gaps.append((uow_id, se_info["status"]))
+
+        dan_ints = _extract_dan_interrupts(u)
+        if dan_ints:
+            dan_interrupt_uows.append((uow_id, len(dan_ints)))
+
+    if side_effects_gaps:
+        lines.append("### Execution Side Effects — Gaps Found")
+        lines.append("")
+        for uow_id, gap_type in side_effects_gaps:
+            lines.append(f"- **{uow_id}**: side_effects {gap_type}")
+        lines.append("")
+    else:
+        lines.append("### Execution Side Effects")
+        lines.append("")
+        lines.append("All done UoWs have populated side_effects.")
+        lines.append("")
+
+    if dan_interrupt_uows:
+        lines.append("### Human Input Moments")
+        lines.append("")
+        for uow_id, count in dan_interrupt_uows:
+            lines.append(f"- **{uow_id}**: {count} Dan Interrupt(s)")
+        lines.append("")
+    else:
+        lines.append("### Human Input Moments")
+        lines.append("")
+        lines.append("No Dan Interrupts recorded.")
+        lines.append("")
+
     lines.append("---")
     lines.append("")
 
@@ -898,6 +988,41 @@ def generate_full_report(uows: list[dict], output_path: Path) -> Path:
             else:
                 lines.append(f"_Path: `{workflow_artifact}` — file does not exist_")
             lines.append("")
+
+        # ── Execution side effects ────────────────────────────────────────────
+        side_effects_info = _extract_side_effects(uow)
+        if side_effects_info:
+            lines.append("### Execution Side Effects")
+            lines.append("")
+            if side_effects_info["status"] == "missing":
+                lines.append("> **WARNING**: side_effects is missing from workflow_artifact.result")
+            elif side_effects_info["status"] == "empty":
+                lines.append("> **WARNING**: side_effects is empty (expected populated for done UoW)")
+            elif side_effects_info["status"] == "present":
+                lines.append(f"**Side effects recorded**:")
+                lines.append("")
+                lines.append("```json")
+                lines.append(json.dumps(side_effects_info["content"], indent=2))
+                lines.append("```")
+            else:
+                lines.append("> **ERROR**: Could not parse side_effects from workflow_artifact")
+            lines.append("")
+
+        # ── Human input moments (Dan Interrupts) ───────────────────────────────
+        dan_interrupts = _extract_dan_interrupts(uow)
+        if dan_interrupts:
+            lines.append("### Human Input Moments")
+            lines.append("")
+            lines.append(f"**Dan Interrupts recorded**: {len(dan_interrupts)}")
+            lines.append("")
+            for i, interrupt in enumerate(dan_interrupts, 1):
+                lines.append(f"**Interrupt #{i}**:")
+                lines.append(f"- **Timestamp**: {interrupt.get('timestamp', '(missing)')}")
+                lines.append(f"- **Diagnosis**: {interrupt.get('diagnosis', '(missing)')}")
+                lines.append(f"- **Interrupt Source**: {interrupt.get('interrupt_source', '(missing)')}")
+                if "response" in interrupt:
+                    lines.append(f"- **Response**: {interrupt.get('response', '')}")
+                lines.append("")
 
         lines.append("---")
         lines.append("")

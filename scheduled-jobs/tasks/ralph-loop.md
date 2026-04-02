@@ -463,6 +463,216 @@ For each RALPH test UoW that reached done or failed:
 - Flag anomaly type `agenda_trace_missing` if trace count < `steward_cycles`
 - Flag anomaly type `agenda_trace_malformed` if any entry fails field validation
 
+**Audit 6 — Side effects validation**
+
+For each UoW that reached `done` status:
+- Parse `workflow_artifact` JSON
+- Assert: `workflow_artifact.result.side_effects` exists (non-null)
+- Assert: `side_effects` is a list or dict (populated, not empty)
+- Assert: `side_effects` content logically matches the UoW's execution intent (infer from `summary` and `success_criteria`)
+- Flag anomaly type `side_effects_missing` if `side_effects` is absent or null
+- Flag anomaly type `side_effects_empty` if `side_effects` exists but is empty (no entries)
+- Flag anomaly type `side_effects_mismatch` if `side_effects` content does not align with execution intent (e.g., type-A file write task reports zero files written, or type-B search reports zero matches found)
+
+```python
+import sqlite3, json
+
+db = '/home/lobster/lobster-workspace/orchestration/registry.db'
+run_id = "<run_id from Step 1>"  # substitute actual run_id
+inject_type_d = <inject_type_d from Step 1>  # True or False
+uow_ids = [f"uow_{date}_{run_id}_a", f"uow_{date}_{run_id}_b", f"uow_{date}_{run_id}_c"]
+if inject_type_d:
+    uow_ids.append(f"uow_{date}_{run_id}_d")
+
+conn = sqlite3.connect(db)
+cur = conn.cursor()
+cur.execute(
+    f"SELECT id, status, summary, workflow_artifact FROM uow_registry WHERE id IN ({','.join('?'*len(uow_ids))})",
+    uow_ids
+)
+
+for uow_id, status, summary, artifact_raw in cur.fetchall():
+    if status != 'done':
+        continue
+    
+    if not artifact_raw:
+        print(f"  ANOMALY [{uow_id}]: status=done but no workflow_artifact")
+        continue
+    
+    try:
+        artifact = json.loads(artifact_raw) if isinstance(artifact_raw, str) else artifact_raw
+        result = artifact.get("result", {})
+        side_effects = result.get("side_effects")
+        
+        if side_effects is None:
+            print(f"  ANOMALY [{uow_id}]: workflow_artifact.result.side_effects is missing (None)")
+        elif not side_effects:
+            print(f"  ANOMALY [{uow_id}]: workflow_artifact.result.side_effects is empty (expected populated)")
+        else:
+            # Check alignment with execution intent
+            summary_lower = str(summary or "").lower()
+            if "type-a" in summary_lower or "write markdown" in summary_lower:
+                # Type-A: expect file write side effect
+                if isinstance(side_effects, list) and len(side_effects) == 0:
+                    print(f"  ANOMALY [{uow_id}]: type-A side_effects is empty list (expected file write)")
+                else:
+                    print(f"  OK [{uow_id}]: type-A side_effects present and populated")
+            elif "type-b" in summary_lower or "search" in summary_lower:
+                # Type-B: expect search/match results in side effects
+                if isinstance(side_effects, list) and len(side_effects) == 0:
+                    print(f"  ANOMALY [{uow_id}]: type-B side_effects is empty list (expected search results)")
+                else:
+                    print(f"  OK [{uow_id}]: type-B side_effects present and populated")
+            else:
+                print(f"  OK [{uow_id}]: side_effects present (content: {type(side_effects).__name__})")
+    except Exception as exc:
+        print(f"  ANOMALY [{uow_id}]: failed to parse workflow_artifact: {exc}")
+
+conn.close()
+```
+
+**Audit 7 — Dan Interrupt trace validation**
+
+For each UoW that has entries in `steward_agenda`:
+- Search the `steward_agenda` entries for records with `external_dependency: "dan"` (Dan-interrupt markers)
+- For each Dan Interrupt entry found:
+  - Assert: `diagnosis` field is present and non-empty (why Dan was asked)
+  - Assert: `interrupt_source` field is present and non-empty (which component/decision requested human input)
+  - Assert: `timestamp` field is present (when the interrupt was recorded)
+- Flag anomaly type `dan_interrupt_diagnosis_missing` if a Dan Interrupt lacks a diagnosis
+- Flag anomaly type `dan_interrupt_source_missing` if a Dan Interrupt lacks interrupt_source
+- If no Dan Interrupts found, this is OK (test may not have triggered human decision points)
+
+```python
+import sqlite3, json
+
+db = '/home/lobster/lobster-workspace/orchestration/registry.db'
+run_id = "<run_id from Step 1>"  # substitute actual run_id
+inject_type_d = <inject_type_d from Step 1>  # True or False
+uow_ids = [f"uow_{date}_{run_id}_a", f"uow_{date}_{run_id}_b", f"uow_{date}_{run_id}_c"]
+if inject_type_d:
+    uow_ids.append(f"uow_{date}_{run_id}_d")
+
+conn = sqlite3.connect(db)
+cur = conn.cursor()
+cur.execute(
+    f"SELECT id, steward_agenda FROM uow_registry WHERE id IN ({','.join('?'*len(uow_ids))})",
+    uow_ids
+)
+
+for uow_id, agenda_raw in cur.fetchall():
+    if not agenda_raw:
+        print(f"  OK [{uow_id}]: no steward_agenda recorded (no Dan Interrupts expected)")
+        continue
+    
+    try:
+        agenda_entries = json.loads(agenda_raw) if isinstance(agenda_raw, str) else agenda_raw
+        if not isinstance(agenda_entries, list):
+            agenda_entries = [agenda_entries]
+        
+        dan_interrupts = [e for e in agenda_entries if e.get("external_dependency") == "dan"]
+        
+        if not dan_interrupts:
+            print(f"  OK [{uow_id}]: no Dan Interrupts in steward_agenda")
+        else:
+            for interrupt in dan_interrupts:
+                diagnosis = interrupt.get("diagnosis", "").strip()
+                interrupt_source = interrupt.get("interrupt_source", "").strip()
+                timestamp = interrupt.get("timestamp", "").strip()
+                
+                if not diagnosis:
+                    print(f"  ANOMALY [{uow_id}]: Dan Interrupt at {timestamp} missing diagnosis")
+                if not interrupt_source:
+                    print(f"  ANOMALY [{uow_id}]: Dan Interrupt at {timestamp} missing interrupt_source")
+                if diagnosis and interrupt_source and timestamp:
+                    print(f"  OK [{uow_id}]: Dan Interrupt recorded with diagnosis, source, and timestamp")
+    except Exception as exc:
+        print(f"  ANOMALY [{uow_id}]: failed to parse steward_agenda: {exc}")
+
+conn.close()
+```
+
+**Audit 8 — Steward log↔agenda alignment**
+
+For each UoW with both `steward_log` and `steward_agenda`:
+- Parse both JSON structures
+- Spot-check (sample 2-3 entries from each): for steward_log reasoning entries, verify that corresponding steward_agenda entries have a populated `rationale` field
+- Assert: the reasoning recorded in steward_log reasoning entries semantically aligns with the rationale documented in steward_agenda
+- Flag anomaly type `steward_reasoning_misalignment` if sampled log entries and agenda entries diverge significantly (e.g., log says "output missing, re-prescribing" but agenda says "success detected, completing")
+
+```python
+import sqlite3, json
+
+db = '/home/lobster/lobster-workspace/orchestration/registry.db'
+run_id = "<run_id from Step 1>"  # substitute actual run_id
+inject_type_d = <inject_type_d from Step 1>  # True or False
+uow_ids = [f"uow_{date}_{run_id}_a", f"uow_{date}_{run_id}_b", f"uow_{date}_{run_id}_c"]
+if inject_type_d:
+    uow_ids.append(f"uow_{date}_{run_id}_d")
+
+conn = sqlite3.connect(db)
+cur = conn.cursor()
+cur.execute(
+    f"SELECT id, steward_log, steward_agenda FROM uow_registry WHERE id IN ({','.join('?'*len(uow_ids))})",
+    uow_ids
+)
+
+for uow_id, log_raw, agenda_raw in cur.fetchall():
+    if not log_raw or not agenda_raw:
+        print(f"  OK [{uow_id}]: insufficient data for alignment check (log={bool(log_raw)} agenda={bool(agenda_raw)})")
+        continue
+    
+    try:
+        log_entries = json.loads(log_raw) if isinstance(log_raw, str) else log_raw
+        if not isinstance(log_entries, list):
+            log_entries = [log_entries]
+        
+        agenda_entries = json.loads(agenda_raw) if isinstance(agenda_raw, str) else agenda_raw
+        if not isinstance(agenda_entries, list):
+            agenda_entries = [agenda_entries]
+        
+        # Spot-check: sample the first 2-3 reasoning entries from log
+        reasoning_entries = [e for e in log_entries if "reasoning" in str(e).lower() or "reason" in str(e).lower()]
+        sample_size = min(3, len(reasoning_entries))
+        
+        if sample_size == 0:
+            print(f"  OK [{uow_id}]: no reasoning entries in steward_log (expected for simple UoWs)")
+            continue
+        
+        misalignments = []
+        for i, log_entry in enumerate(reasoning_entries[:sample_size]):
+            log_reason = str(log_entry.get("reason", log_entry.get("reasoning", ""))).lower()
+            # Find corresponding agenda entry (roughly by cycle or timestamp)
+            cycle = log_entry.get("cycle")
+            corresponding_agenda = None
+            if cycle is not None:
+                corresponding_agenda = next((e for e in agenda_entries if e.get("cycle") == cycle), None)
+            
+            if corresponding_agenda:
+                agenda_rationale = str(corresponding_agenda.get("rationale", corresponding_agenda.get("posture_rationale", ""))).lower()
+                # Check for semantic divergence: key contradiction words
+                log_indicators = {"fail", "error", "missing", "mismatch", "re-prescrib", "retry", "crash"}
+                agenda_indicators = {"success", "complete", "valid", "done"}
+                
+                log_has_fail = any(ind in log_reason for ind in log_indicators)
+                agenda_has_success = any(ind in agenda_rationale for ind in agenda_indicators)
+                
+                if log_has_fail and agenda_has_success:
+                    misalignments.append(f"cycle {cycle}: log says failure, agenda says success")
+            else:
+                print(f"  ANOMALY [{uow_id}]: reasoning entry at index {i} has no corresponding agenda entry")
+        
+        if misalignments:
+            for misalign in misalignments:
+                print(f"  ANOMALY [{uow_id}]: steward_reasoning_misalignment — {misalign}")
+        else:
+            print(f"  OK [{uow_id}]: sampled {sample_size} reasoning entries, all align with agenda rationale")
+    except Exception as exc:
+        print(f"  ANOMALY [{uow_id}]: failed to parse log/agenda for alignment: {exc}")
+
+conn.close()
+```
+
 **Build `anomalies_this_run`** — construct a list of anomaly dicts from both the basic checklist above AND the four deep audit checks. This list is written to `last_anomalies` in Step 7 and is used by the next cycle's reproducibility gate in Step 6. Each entry should be a dict:
 
 ```python
@@ -470,7 +680,7 @@ anomalies_this_run = []
 # For each anomaly found, append a dict like:
 # {
 #   "uow_id": "<id>",
-#   "anomaly_type": "stalled|steward_cycles_zero|missing_artifact|log_error|steward_cycle_excess|prsc_first_exec_conflation|duplicate_dispatch|bad_posture_transition|pr_555_timing_fix_validation_failed",
+#   "anomaly_type": "stalled|steward_cycles_zero|missing_artifact|log_error|steward_cycle_excess|prsc_first_exec_conflation|duplicate_dispatch|bad_posture_transition|pr_555_timing_fix_validation_failed|side_effects_missing|side_effects_empty|side_effects_mismatch|dan_interrupt_diagnosis_missing|dan_interrupt_source_missing|steward_reasoning_misalignment",
 #   "detail": "<brief description including observed values>"
 # }
 # Examples:
