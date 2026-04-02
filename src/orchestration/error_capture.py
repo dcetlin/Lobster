@@ -85,18 +85,31 @@ def classify_error(err: SubprocessError) -> ErrorClassification:
     - Timeouts after retries
 
     Returns an ErrorClassification with guidance.
+
+    Design: Uses actual exception frames and exit codes as primary signals,
+    not generic "error" keywords that appear in benign output.
     """
     stderr = err.stderr.lower()
 
-    # Detect build/dependency errors
+    # Primary signal: exit code (non-zero indicates failure)
+    is_nonzero_exit = err.exit_code is not None and err.exit_code != 0
+
+    # Detect actual Python exceptions by frame markers
+    has_traceback = "traceback" in stderr or "error:" in stderr
+    is_exception = has_traceback or "exception" in stderr
+
+    # Detect build/dependency errors — only if actual exception frames or specific errors
     is_build_error = (
-        "error" in stderr or
-        "failed" in stderr or
-        "permission denied" in stderr
+        is_exception and (
+            "error" in stderr or
+            "failed" in stderr or
+            "permission denied" in stderr
+        )
     )
 
     is_uv_error = (
-        "error" in stderr and ("uv" in err.command[0] or "uv run" in " ".join(err.command))
+        is_exception and
+        ("uv" in err.command[0] or "uv run" in " ".join(err.command))
     )
 
     is_missing_binary = (
@@ -106,7 +119,7 @@ def classify_error(err: SubprocessError) -> ErrorClassification:
     )
 
     # Determine if fatal
-    is_fatal = is_build_error or is_uv_error or is_missing_binary
+    is_fatal = is_build_error or is_uv_error or is_missing_binary or is_nonzero_exit
     if err.error_type == ErrorType.TIMEOUT:
         # Timeouts are usually transient, but repeated ones are fatal
         is_fatal = False
@@ -126,6 +139,9 @@ def classify_error(err: SubprocessError) -> ErrorClassification:
     elif err.error_type == ErrorType.TIMEOUT:
         classification = "timeout"
         recovery_hint = "Subprocess exceeded time limit; may indicate hung process or resource contention"
+    elif is_nonzero_exit:
+        classification = "subprocess exit failure"
+        recovery_hint = "Subprocess exited with non-zero code; review logs and command arguments"
     else:
         classification = "subprocess error"
         recovery_hint = "Review subprocess output and logs"

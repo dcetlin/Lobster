@@ -315,7 +315,8 @@ def _output_ref_is_valid(output_ref: str | None) -> bool:
     try:
         p = Path(output_ref)
         return p.exists() and p.stat().st_size > 0
-    except Exception:
+    except Exception as e:
+        log.debug(f"Error checking output_ref {output_ref}: {type(e).__name__}: {e}", exc_info=True)
         return False
 
 
@@ -325,7 +326,8 @@ def _read_output_ref(output_ref: str | None) -> str:
         return ""
     try:
         return Path(output_ref).read_text(encoding="utf-8")
-    except Exception:
+    except Exception as e:
+        log.debug(f"Error reading output_ref {output_ref}: {type(e).__name__}: {e}", exc_info=True)
         return ""
 
 
