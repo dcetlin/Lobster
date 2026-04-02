@@ -36,6 +36,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from src.orchestration.registry import UoW
+from src.orchestration.error_capture import (
+    run_subprocess_with_error_capture,
+    log_subprocess_error,
+    classify_error,
+    has_repeated_error,
+)
 
 log = logging.getLogger("steward")
 
@@ -865,111 +871,113 @@ Respond with a JSON object only (no markdown, no explanation outside the JSON):
 
     timeout_secs = _get_llm_prescription_timeout()
 
+    command = [_CLAUDE_BIN, "-p", prompt, "--output-format", "text"]
+
+    # Use error capture to detect and log subprocess failures with context
+    proc, error = run_subprocess_with_error_capture(
+        component="steward_prescription",
+        uow_id=uow.id,
+        command=command,
+        timeout_seconds=timeout_secs,
+        check=False,  # Don't auto-log; we handle errors gracefully with fallback
+    )
+
+    if error:
+        log.warning(
+            "_llm_prescribe: prescription failed for %s — %s (falling back to deterministic)",
+            uow.id, error.summary(),
+        )
+
+        # Check for repeated failures (same error 3+ times in 5 min)
+        if has_repeated_error("steward_prescription", uow.id, str(error.error_type), threshold=3):
+            log.error(
+                "_llm_prescribe: repeated prescription errors for %s — may need manual intervention",
+                uow.id,
+            )
+
+        return None
+
+    if proc is None or proc.returncode != 0:
+        log.warning(
+            "_llm_prescribe: claude -p exited %d for %s, falling back",
+            proc.returncode if proc else None, uow.id,
+        )
+        return None
+
+    raw_text = proc.stdout.strip()
+
+    # Classify empty-output case separately: claude exited 0 but returned
+    # nothing.  This typically means the binary is unavailable, the model
+    # refused, or stdout was silently discarded.
+    if not raw_text:
+        log.warning(
+            "_llm_prescribe: claude -p returned empty stdout for %s "
+            "(exit 0), falling back",
+            uow.id,
+        )
+        return None
+
+    # Strip markdown code fences if present
+    if raw_text.startswith("```"):
+        lines = raw_text.splitlines()
+        raw_text = "\n".join(
+            line for line in lines
+            if not line.startswith("```")
+        ).strip()
+
+    # Classify parse failures: distinguish non-JSON (refusal / error prose)
+    # from structurally-valid JSON that doesn't match the expected schema.
     try:
-        proc = subprocess.run(
-            [_CLAUDE_BIN, "-p", prompt, "--output-format", "text"],
-            capture_output=True,
-            text=True,
-            timeout=timeout_secs,
-        )
-        if proc.returncode != 0:
-            log.warning(
-                "_llm_prescribe: claude -p exited %d for %s, falling back "
-                "(stderr: %s)",
-                proc.returncode, uow.id,
-                proc.stderr.strip()[:200] if proc.stderr else "<none>",
-            )
-            return None
-
-        raw_text = proc.stdout.strip()
-
-        # Classify empty-output case separately: claude exited 0 but returned
-        # nothing.  This typically means the binary is unavailable, the model
-        # refused, or stdout was silently discarded.
-        if not raw_text:
-            log.warning(
-                "_llm_prescribe: claude -p returned empty stdout for %s "
-                "(exit 0), falling back",
-                uow.id,
-            )
-            return None
-
-        # Strip markdown code fences if present
-        if raw_text.startswith("```"):
-            lines = raw_text.splitlines()
-            raw_text = "\n".join(
-                line for line in lines
-                if not line.startswith("```")
-            ).strip()
-
-        # Classify parse failures: distinguish non-JSON (refusal / error prose)
-        # from structurally-valid JSON that doesn't match the expected schema.
-        try:
-            parsed = json.loads(raw_text)
-        except json.JSONDecodeError as exc:
-            log.warning(
-                "_llm_prescribe: non-JSON output from claude -p for %s "
-                "(JSONDecodeError: %s) — output preview: %r, falling back",
-                uow.id, exc, raw_text[:200],
-            )
-            return None
-
-        if not isinstance(parsed, dict):
-            log.warning(
-                "_llm_prescribe: unexpected JSON type %s for %s "
-                "(expected dict), falling back",
-                type(parsed).__name__, uow.id,
-            )
-            return None
-
-        instructions = str(parsed.get("instructions", "")).strip()
-        success_criteria_check = str(parsed.get("success_criteria_check", "")).strip()
-
-        # Validate estimated_cycles; wrong schema (e.g. string instead of int)
-        # is logged as a schema mismatch rather than a generic parse failure.
-        raw_cycles = parsed.get("estimated_cycles", 1)
-        try:
-            estimated_cycles = int(raw_cycles)
-        except (TypeError, ValueError):
-            log.warning(
-                "_llm_prescribe: schema mismatch for %s — "
-                "estimated_cycles=%r is not an integer, defaulting to 1",
-                uow.id, raw_cycles,
-            )
-            estimated_cycles = 1
-
-        if not instructions:
-            log.warning(
-                "_llm_prescribe: LLM returned empty instructions field for %s, "
-                "falling back",
-                uow.id,
-            )
-            return None
-
-        log.debug(
-            "_llm_prescribe: LLM prescription generated for %s (estimated_cycles=%d)",
-            uow.id, estimated_cycles,
-        )
-        return {
-            "instructions": instructions,
-            "success_criteria_check": success_criteria_check,
-            "estimated_cycles": max(1, min(3, estimated_cycles)),
-        }
-
-    except subprocess.TimeoutExpired:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
         log.warning(
-            "_llm_prescribe: claude -p timed out for %s after %ds "
-            "(LOBSTER_LLM_PRESCRIPTION_TIMEOUT_SECS=%d), falling back",
-            uow.id, timeout_secs, timeout_secs,
+            "_llm_prescribe: non-JSON output from claude -p for %s "
+            "(JSONDecodeError: %s) — output preview: %r, falling back",
+            uow.id, exc, raw_text[:200],
         )
         return None
-    except Exception as exc:  # noqa: BLE001
+
+    if not isinstance(parsed, dict):
         log.warning(
-            "_llm_prescribe: LLM call failed for %s (%s: %s), "
-            "falling back to deterministic template",
-            uow.id, type(exc).__name__, exc,
+            "_llm_prescribe: unexpected JSON type %s for %s "
+            "(expected dict), falling back",
+            type(parsed).__name__, uow.id,
         )
         return None
+
+    instructions = str(parsed.get("instructions", "")).strip()
+    success_criteria_check = str(parsed.get("success_criteria_check", "")).strip()
+
+    # Validate estimated_cycles; wrong schema (e.g. string instead of int)
+    # is logged as a schema mismatch rather than a generic parse failure.
+    raw_cycles = parsed.get("estimated_cycles", 1)
+    try:
+        estimated_cycles = int(raw_cycles)
+    except (TypeError, ValueError):
+        log.warning(
+            "_llm_prescribe: schema mismatch for %s — "
+            "estimated_cycles=%r is not an integer, defaulting to 1",
+            uow.id, raw_cycles,
+        )
+        estimated_cycles = 1
+
+    if not instructions:
+        log.warning(
+            "_llm_prescribe: LLM returned empty instructions field for %s, "
+            "falling back",
+            uow.id,
+        )
+        return None
+
+    log.debug(
+        "_llm_prescribe: LLM prescription generated for %s (estimated_cycles=%d)",
+        uow.id, estimated_cycles,
+    )
+    return {
+        "instructions": instructions,
+        "success_criteria_check": success_criteria_check,
+        "estimated_cycles": max(1, min(3, estimated_cycles)),
+    }
 
 
 def _fetch_prior_prescriptions(
@@ -1519,20 +1527,29 @@ def _fetch_github_issue(issue_number: int, repo: str) -> dict[str, Any]:
     Returns dict with keys: status_code, state, labels (list), body, title.
     On any error, returns status_code=0 with empty fields.
     """
-    import subprocess
+    command = [
+        "gh", "issue", "view", str(issue_number),
+        "--repo", repo,
+        "--json", "state,labels,body,title",
+    ]
+
+    # Use error capture to detect and log subprocess failures with context
+    result, error = run_subprocess_with_error_capture(
+        component="steward_github",
+        uow_id=f"{repo}#{issue_number}",
+        command=command,
+        timeout_seconds=15,
+        check=False,  # Don't auto-log; handle gracefully
+    )
+
+    if error:
+        log.warning("GitHub fetch error for %s#%s: %s", repo, issue_number, error.summary())
+        return {"status_code": 0, "state": None, "labels": [], "body": "", "title": ""}
+
+    if result is None or result.returncode != 0:
+        return {"status_code": 1, "state": None, "labels": [], "body": "", "title": ""}
+
     try:
-        result = subprocess.run(
-            [
-                "gh", "issue", "view", str(issue_number),
-                "--repo", repo,
-                "--json", "state,labels,body,title",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        if result.returncode != 0:
-            return {"status_code": 1, "state": None, "labels": [], "body": "", "title": ""}
         data = json.loads(result.stdout)
         labels = [l.get("name", "") for l in data.get("labels", [])]
         return {
@@ -1543,7 +1560,7 @@ def _fetch_github_issue(issue_number: int, repo: str) -> dict[str, Any]:
             "title": data.get("title", ""),
         }
     except Exception as e:
-        log.warning("GitHub client error for issue %s (repo=%s): %s", issue_number, repo, e)
+        log.warning("GitHub parse error for issue %s (repo=%s): %s", issue_number, repo, e)
         return {"status_code": 0, "state": None, "labels": [], "body": "", "title": ""}
 
 
