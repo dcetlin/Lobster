@@ -69,6 +69,36 @@ def _get_llm_prescription_timeout() -> int:
     """
     return TimeoutConfig.llm_prescription_timeout_secs()
 
+
+def _get_prescription_model() -> str:
+    """Return the model to use for prescription dispatch.
+
+    Resolves in order of precedence:
+    1. LOBSTER_PRESCRIPTION_MODEL environment variable
+    2. prescription_model field in wos-config.json
+    3. Default: "opus"
+
+    Supports budget flexibility by allowing non-Sonnet models (e.g., haiku)
+    when available.
+    """
+    # Check environment variable first
+    env_model = os.environ.get("LOBSTER_PRESCRIPTION_MODEL")
+    if env_model:
+        return env_model.strip()
+
+    # Check wos-config.json
+    try:
+        from src.orchestration.dispatcher_handlers import read_wos_config
+        config = read_wos_config()
+        if "prescription_model" in config and config["prescription_model"]:
+            return config["prescription_model"].strip()
+    except Exception:
+        # If config read fails, continue to default
+        pass
+
+    # Default fallback
+    return "opus"
+
 # claude binary — resolved from PATH at call time.
 _CLAUDE_BIN = "claude"
 
@@ -867,8 +897,9 @@ Respond with a JSON object only (no markdown, no explanation outside the JSON):
     prompt = f"{system_prompt}\n\n{user_prompt}"
 
     timeout_secs = _get_llm_prescription_timeout()
+    model = _get_prescription_model()
 
-    command = [_CLAUDE_BIN, "-p", prompt, "--output-format", "text"]
+    command = [_CLAUDE_BIN, "-p", prompt, "--output-format", "text", "--model", model]
 
     # Use error capture to detect and log subprocess failures with context
     proc, error = run_subprocess_with_error_capture(
@@ -966,9 +997,9 @@ Respond with a JSON object only (no markdown, no explanation outside the JSON):
         )
         return None
 
-    log.debug(
-        "_llm_prescribe: LLM prescription generated for %s (estimated_cycles=%d)",
-        uow.id, estimated_cycles,
+    log.info(
+        "_llm_prescribe: LLM prescription generated for %s (model=%s, estimated_cycles=%d)",
+        uow.id, model, estimated_cycles,
     )
     return {
         "instructions": instructions,

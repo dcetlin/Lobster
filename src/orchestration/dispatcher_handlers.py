@@ -51,7 +51,10 @@ _GATE_CLEARED_FLAG: Path = _LOBSTER_WORKSPACE / "data" / "wos-gate-cleared"
 
 _WOS_CONFIG_PATH: Path = _WOS_CONFIG_PATH_FROM_PATHS
 
-_DEFAULT_WOS_CONFIG: dict = {"execution_enabled": False}
+_DEFAULT_WOS_CONFIG: dict = {
+    "execution_enabled": False,
+    "prescription_model": "opus",  # Default to opus; can be overridden by env var or user config
+}
 
 
 def read_wos_config() -> dict:
