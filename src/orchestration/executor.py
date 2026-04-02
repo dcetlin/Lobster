@@ -53,6 +53,12 @@ log = logging.getLogger("executor")
 from orchestration.registry import Registry, UoW, UoWStatus
 from orchestration.result_writer import write_result as _write_subagent_result
 from orchestration.workflow_artifact import WorkflowArtifact, from_json
+from orchestration.error_capture import (
+    run_subprocess_with_error_capture,
+    log_subprocess_error,
+    classify_error,
+    has_repeated_error,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -669,18 +675,44 @@ def _dispatch_via_claude_p(instructions: str, uow_id: str) -> str:
     run_id = f"{uow_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     prompt = _FUNCTIONAL_ENGINEER_PREAMBLE + instructions
 
-    proc = subprocess.run(
-        [
-            _CLAUDE_BIN,
-            "-p", prompt,
-            "--dangerously-skip-permissions",
-            "--max-turns", "40",
-        ],
-        capture_output=False,   # inherit stdout/stderr so logs flow to heartbeat log
-        text=True,
-        timeout=_CLAUDE_P_TIMEOUT_SECONDS,
-        check=True,             # raises CalledProcessError on non-zero exit
+    command = [
+        _CLAUDE_BIN,
+        "-p", prompt,
+        "--dangerously-skip-permissions",
+        "--max-turns", "40",
+    ]
+
+    # Use error capture to detect and log subprocess failures with context
+    proc, error = run_subprocess_with_error_capture(
+        component="executor",
+        uow_id=uow_id,
+        command=command,
+        timeout_seconds=_CLAUDE_P_TIMEOUT_SECONDS,
+        check=True,  # Log errors at ERROR level for fatal issues
     )
+
+    # If error occurred, classify and decide whether to raise
+    if error:
+        classification = classify_error(error)
+        log.error(
+            "Executor(%s): %s dispatch failed — %s (fatal=%s)",
+            uow_id, classification.classification, error.summary(), classification.is_fatal,
+        )
+
+        # Check for repeated failures (same error 3+ times in 5 min)
+        if has_repeated_error("executor", uow_id, str(error.error_type), threshold=3):
+            log.critical(
+                "Executor(%s): repeated %s errors detected — manual intervention likely needed",
+                uow_id, error.error_type,
+            )
+
+        # Re-raise for the caller to catch and mark UoW as failed
+        raise subprocess.CalledProcessError(
+            error.exit_code or 1,
+            error.command,
+            stderr=error.stderr,
+            stdout=error.stdout,
+        )
 
     return run_id
 
