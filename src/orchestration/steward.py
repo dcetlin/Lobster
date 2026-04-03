@@ -43,6 +43,10 @@ from src.orchestration.error_capture import (
     has_repeated_error,
 )
 from src.orchestration.config import TimeoutConfig
+from src.orchestration.prescription_parser import (
+    parse_prescription_json,
+    validate_prescription_schema,
+)
 
 log = logging.getLogger("steward")
 
@@ -839,7 +843,12 @@ def _llm_prescribe(
         "Avoid vague language. Use the success_criteria as your north star for what 'done' means. "
         "The Executor is a capable autonomous coding agent — write instructions at that level. "
         "The instructions you produce will be handed directly to a Lobster subagent dispatch call; "
-        "they must conform to Lobster's subagent dispatch conventions so the executor can act on them correctly."
+        "they must conform to Lobster's subagent dispatch conventions so the executor can act on them correctly. "
+        "CRITICAL: Return ONLY valid JSON. Do not wrap it in markdown code fences. "
+        "Do not include any explanation, commentary, or text outside the JSON object. "
+        "The output will be parsed by a machine, not read by a human. "
+        "If you cannot generate a prescription, explain your concern INSIDE the instructions field, "
+        "not outside the JSON."
     )
 
     # Golden dispatch conventions injected into every prescription so the executor
@@ -885,12 +894,25 @@ For internal tasks (no user reply): write_result only with sent_reply_to_user=Fa
 {uow_context}
 
 {_DISPATCH_CONVENTIONS}
-Respond with a JSON object only (no markdown, no explanation outside the JSON):
+
+## JSON Response Format
+
+You MUST respond with ONLY a valid JSON object. No markdown. No explanation. No preamble. No code fences.
+The first character must be {{ and the last character must }}.
+
+Required fields (all three must be present):
+- "instructions" (string): Complete, actionable instructions for the Executor. Include the specific steps, what to produce, where to write output, and any constraints from the success criteria. Embed the YAML frontmatter, Minimum viable output, Boundary, and agent_type lines as described above.
+- "success_criteria_check" (string): One or two sentences describing exactly how to verify the work is complete — what to check, what file exists, what content to confirm.
+- "estimated_cycles" (integer): An integer between 1 and 3 indicating how many Executor passes this is expected to need.
+
+Example structure:
 {{
-  "instructions": "<complete, actionable instructions for the Executor — include the specific steps, what to produce, where to write output, and any constraints from the success criteria; embed the YAML frontmatter, Minimum viable output, Boundary, and agent_type lines as described above>",
-  "success_criteria_check": "<one or two sentences describing exactly how to verify the work is complete — what to check, what file exists, what content to confirm>",
-  "estimated_cycles": <integer 1-3 — how many Executor passes this is expected to need>
-}}"""
+  "instructions": "Step 1: Read the file at /path/to/file. Step 2: Make the required changes. Step 3: Write output to /path/to/output.",
+  "success_criteria_check": "Verify that the output file exists and contains the expected content.",
+  "estimated_cycles": 2
+}}
+
+NOW RESPOND WITH VALID JSON ONLY:"""
 
     # Combine system and user prompts into a single string for claude -p,
     # which does not accept a separate --system flag in basic invocation mode.
@@ -934,77 +956,44 @@ Respond with a JSON object only (no markdown, no explanation outside the JSON):
 
     raw_text = proc.stdout.strip()
 
-    # Classify empty-output case separately: claude exited 0 but returned
-    # nothing.  This typically means the binary is unavailable, the model
-    # refused, or stdout was silently discarded.
-    if not raw_text:
+    # Use robust multi-level JSON parser with fallback resilience
+    parse_result = parse_prescription_json(raw_text, uow.id)
+
+    if not parse_result.success or not parse_result.data:
         log.warning(
-            "_llm_prescribe: claude -p returned empty stdout for %s "
-            "(exit 0), falling back",
-            uow.id,
+            "_llm_prescribe: prescription parsing failed for %s — %s "
+            "(fallback_level=%d), using deterministic template",
+            uow.id, parse_result.error_message, parse_result.fallback_level,
         )
         return None
 
-    # Strip markdown code fences if present
-    if raw_text.startswith("```"):
-        lines = raw_text.splitlines()
-        raw_text = "\n".join(
-            line for line in lines
-            if not line.startswith("```")
-        ).strip()
-
-    # Classify parse failures: distinguish non-JSON (refusal / error prose)
-    # from structurally-valid JSON that doesn't match the expected schema.
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError as exc:
+    # Validate schema of parsed data
+    is_valid, error_msg = validate_prescription_schema(parse_result.data)
+    if not is_valid:
         log.warning(
-            "_llm_prescribe: non-JSON output from claude -p for %s "
-            "(JSONDecodeError: %s) — output preview: %r, falling back",
-            uow.id, exc, raw_text[:200],
+            "_llm_prescribe: schema validation failed for %s — %s, "
+            "falling back to deterministic",
+            uow.id, error_msg,
         )
         return None
 
-    if not isinstance(parsed, dict):
-        log.warning(
-            "_llm_prescribe: unexpected JSON type %s for %s "
-            "(expected dict), falling back",
-            type(parsed).__name__, uow.id,
-        )
-        return None
+    # Extract and normalize fields
+    instructions = str(parse_result.data.get("instructions", "")).strip()
+    success_criteria_check = str(parse_result.data.get("success_criteria_check", "")).strip()
+    estimated_cycles = int(parse_result.data.get("estimated_cycles", 1))
 
-    instructions = str(parsed.get("instructions", "")).strip()
-    success_criteria_check = str(parsed.get("success_criteria_check", "")).strip()
-
-    # Validate estimated_cycles; wrong schema (e.g. string instead of int)
-    # is logged as a schema mismatch rather than a generic parse failure.
-    raw_cycles = parsed.get("estimated_cycles", 1)
-    try:
-        estimated_cycles = int(raw_cycles)
-    except (TypeError, ValueError):
-        log.warning(
-            "_llm_prescribe: schema mismatch for %s — "
-            "estimated_cycles=%r is not an integer, defaulting to 1",
-            uow.id, raw_cycles,
-        )
-        estimated_cycles = 1
-
-    if not instructions:
-        log.warning(
-            "_llm_prescribe: LLM returned empty instructions field for %s, "
-            "falling back",
-            uow.id,
-        )
-        return None
+    # Clamp cycles to valid range [1, 3]
+    estimated_cycles = max(1, min(3, estimated_cycles))
 
     log.info(
-        "_llm_prescribe: LLM prescription generated for %s (model=%s, estimated_cycles=%d)",
-        uow.id, model, estimated_cycles,
+        "_llm_prescribe: LLM prescription generated for %s "
+        "(model=%s, estimated_cycles=%d, fallback_level=%d)",
+        uow.id, model, estimated_cycles, parse_result.fallback_level,
     )
     return {
         "instructions": instructions,
         "success_criteria_check": success_criteria_check,
-        "estimated_cycles": max(1, min(3, estimated_cycles)),
+        "estimated_cycles": estimated_cycles,
     }
 
 
