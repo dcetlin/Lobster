@@ -45,7 +45,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, Sequence
 
 # ---------------------------------------------------------------------------
 # Path setup — allow running as a script or via importlib (tests)
@@ -122,6 +122,15 @@ _DEFAULT_STALL_SECONDS = 1800  # 30 minutes fallback when timeout_at is NULL
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _now_iso() -> str:
+    """Return current UTC time in ISO 8601 format."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
 # Stall reason constants — canonical strings recognized by the Steward's
 # re-entry classification table (#303).
 # ---------------------------------------------------------------------------
@@ -173,6 +182,134 @@ def _default_db_path() -> Path:
     if env_override:
         return Path(env_override)
     return workspace / "orchestration" / "registry.db"
+
+
+# ---------------------------------------------------------------------------
+# Agent cleanup — prevent backlog accumulation (Phase 1)
+# ---------------------------------------------------------------------------
+
+STALE_AGENT_THRESHOLD_SECONDS: int = 7200  # 2 hours
+
+
+def run_stale_agent_cleanup(dry_run: bool = False) -> dict:
+    """
+    Unregister agents older than STALE_AGENT_THRESHOLD_SECONDS with no recent
+    output activity.
+
+    Scans the agent_sessions table for running agents whose spawned_at timestamp
+    is older than the threshold and whose output files (if specified) haven't been
+    updated recently. These agents are presumed dead or stuck and are unregistered
+    to prevent indefinite backlog accumulation.
+
+    In dry_run mode: queries agents but does NOT unregister any.
+
+    Returns a dict with keys: evaluated, cleaned, skipped, running_total.
+    """
+    from src.agents.session_store import _get_connection, _DEFAULT_DB_PATH
+
+    try:
+        conn = _get_connection(_DEFAULT_DB_PATH)
+        now_iso = _now_iso()
+        now_timestamp = datetime.now(timezone.utc).timestamp()
+
+        # Get total running agent count for metrics
+        total_running = conn.execute(
+            "SELECT COUNT(*) as count FROM agent_sessions WHERE status = 'running'"
+        ).fetchone()
+        running_total = total_running["count"] if total_running else 0
+
+        # Query all running agents with spawned_at older than threshold
+        cutoff_seconds = now_timestamp - STALE_AGENT_THRESHOLD_SECONDS
+        cutoff_iso = datetime.fromtimestamp(cutoff_seconds, timezone.utc).isoformat()
+
+        rows = conn.execute(
+            """
+            SELECT id, spawned_at, output_file
+            FROM agent_sessions
+            WHERE status = 'running'
+              AND spawned_at < ?
+            ORDER BY spawned_at ASC
+            """,
+            (cutoff_iso,),
+        ).fetchall()
+
+        evaluated = len(rows)
+        cleaned = 0
+        skipped_dry_run = 0
+
+        if dry_run:
+            if evaluated > 0:
+                log.info(
+                    "Stale agent cleanup (DRY RUN): %d running agents older than %.0f hours "
+                    "would be unregistered (total running=%d)",
+                    evaluated,
+                    STALE_AGENT_THRESHOLD_SECONDS / 3600.0,
+                    running_total,
+                )
+            else:
+                log.debug("Stale agent cleanup (DRY RUN): no stale agents found (total running=%d)", running_total)
+            return {"evaluated": evaluated, "cleaned": 0, "skipped": evaluated, "running_total": running_total}
+
+        # Process each stale agent
+        from src.agents.session_store import session_end
+
+        for row in rows:
+            agent_id = row["id"]
+            spawned_at_str = row["spawned_at"]
+            output_file = row["output_file"]
+
+            # Check if output_file exists and has recent activity
+            is_stale = True
+            if output_file:
+                try:
+                    mtime = Path(output_file).stat().st_mtime
+                    mtime_age_seconds = now_timestamp - mtime
+                    if mtime_age_seconds < STALE_AGENT_THRESHOLD_SECONDS:
+                        # File was updated recently — agent may still be working
+                        is_stale = False
+                except (OSError, FileNotFoundError):
+                    # File doesn't exist or can't be stat'd — treat as stale
+                    is_stale = True
+
+            if not is_stale:
+                log.debug(
+                    "Stale agent cleanup: skipping agent %s "
+                    "(output file recently updated)",
+                    agent_id,
+                )
+                skipped_dry_run += 1
+                continue
+
+            # Unregister the stale agent
+            try:
+                session_end(
+                    id_or_task_id=agent_id,
+                    status="dead",
+                    result_summary="Agent unregistered after inactivity threshold exceeded",
+                )
+                cleaned += 1
+                log.info(
+                    "Stale agent cleanup: unregistered agent %s "
+                    "(spawned_at=%s, no recent output activity)",
+                    agent_id,
+                    spawned_at_str,
+                )
+            except Exception as e:
+                log.warning(
+                    "Stale agent cleanup: failed to unregister agent %s — %s",
+                    agent_id, e,
+                )
+
+        return {
+            "evaluated": evaluated,
+            "cleaned": cleaned,
+            "skipped": skipped_dry_run,
+            "running_total": running_total,
+        }
+
+    except Exception as e:
+        log.warning("Stale agent cleanup: query failed — %s", e)
+        return {"evaluated": 0, "cleaned": 0, "skipped": 0, "running_total": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +495,21 @@ def main() -> int:
         return 1
 
     registry = Registry(db_path)
+
+    # Phase 0: Stale agent cleanup
+    log.info("--- Phase 0: Stale agent cleanup ---")
+    cleanup_result = {"evaluated": 0, "cleaned": 0, "skipped": 0, "running_total": 0}
+    try:
+        cleanup_result = run_stale_agent_cleanup(dry_run=dry_run)
+        log.info(
+            "Stale agent cleanup complete: evaluated=%d cleaned=%d skipped=%d (running_agents=%d)",
+            cleanup_result["evaluated"],
+            cleanup_result["cleaned"],
+            cleanup_result["skipped"],
+            cleanup_result["running_total"],
+        )
+    except Exception:
+        log.exception("Stale agent cleanup failed — continuing to startup sweep")
 
     # Phase 1: Startup sweep
     log.info("--- Phase 1: Startup sweep ---")

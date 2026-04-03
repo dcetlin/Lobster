@@ -210,6 +210,31 @@ def run_executor_cycle(registry, dry_run: bool = False) -> dict:
                 result.outcome,
                 result.executor_id,
             )
+            # Cleanup: unregister the agent after successful dispatch to prevent
+            # the "completed but still registered" state that causes agent backlog.
+            # The agent is responsible for calling write_result on completion;
+            # this cleanup removes the registration to prevent indefinite accumulation.
+            if result.executor_id:
+                try:
+                    from src.agents.session_store import session_end
+                    session_end(
+                        id_or_task_id=result.executor_id,
+                        status="completed",
+                        result_summary=f"UoW {uow_id} dispatched successfully",
+                    )
+                    log.info(
+                        "Executor cycle: unregistered agent %s (UoW %s completed)",
+                        result.executor_id,
+                        uow_id,
+                    )
+                except Exception as cleanup_err:
+                    log.warning(
+                        "Executor cycle: failed to unregister agent %s — %s "
+                        "(UoW %s may be visible in agent backlog)",
+                        result.executor_id,
+                        cleanup_err,
+                        uow_id,
+                    )
         except RuntimeError as e:
             # ClaimRejected — optimistic lock lost (another executor claimed first,
             # or status changed since we listed). Not an error — skip silently.
