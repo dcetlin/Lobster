@@ -692,6 +692,3 @@ All three NEEDS_CHANGES items are resolved. Residual quality observations:
 ### Overall verdict: APPROVED
 
 All three NEEDS_CHANGES items from the prior review are resolved. The two residual quality gaps (violation_entry timestamp inconsistency, notify_dan assertion gap in tests) are real but non-blocking. The executor-doesn't-write-trace.json observation is a system-level consequence that should be tracked as a follow-up issue, not a defect in this PR. The gate logic is correct, bounded, and observable.
-
----
-
