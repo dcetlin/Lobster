@@ -14,6 +14,8 @@ The WOS system is built on the same structural logic. The Steward does not execu
 
 This document encodes eight structural isomorphisms between mitochondrial biology and the WOS system. These are not metaphors. A metaphor points to similarity of surface. An isomorphism points to identity of structure operating at different scales. Where the biology and the system are doing the same thing on the same logic, the isomorphism holds exactly. Where the substrate differs — and it does — the document notes this and asks what reinvention is required.
 
+> *Note: This document encodes sweep-level understanding, not precision prescriptions. The isomorphisms point at structural patterns, not implementation recipes. Where the analogy breaks down or requires translation to a different substrate, that translation is part of the work.*
+
 ---
 
 ## Isomorphism 1: Steward as Governor
@@ -110,20 +112,27 @@ The substrate translation principle: when an isomorphism holds exactly, implemen
 
 ---
 
-### 9. Dispatcher hibernation as governor reset
+### 9. Rhythmic governance: cycles at multiple timescales
 
-When the larger ecosystem sleeps — when the dispatcher calls `wait_for_messages(hibernate_on_timeout=True)` — mitochondrial demand is globally reduced: execution is disallowed, repair is permitted, termination is enforced. Nothing replaces sleep.
+When Dan named "sleep" as a governor reset, he was speaking in sweep language — pointing at a structural principle, not at `hibernate_on_timeout=True`. The dispatcher's hibernation mode is one signal in a larger rhythm. Mapping the whole principle to that one configuration flag misses what the principle actually requires.
 
-This is why:
-- Stimulants can age you — they override the governor reset, forcing execution during the repair window
-- High metabolism can be pathological — the governor stuck open
-- Labs can look normal while life falls apart — chemistry intact, timing broken; health checks pass, MCP server running, pipeline still failing
-- Energy increases can worsen disease — more substrate through a broken gate makes things worse
-- Recovery requires permission, not force
+Biological health requires **designed rhythmic cycles at multiple timescales operating simultaneously**. The mitochondrion doesn't have a single rest mode. It participates in cellular oscillations that span milliseconds, circadian rhythms that span hours, repair-and-division cycles that span days. Each cycle has its own permission conditions, its own governor logic, its own relationship to what the other cycles are doing at the same moment. Health is not the absence of activity during any single window. It is coherent rhythm across scales.
 
-In the system: WOS `execution_enabled=false` is not a failure state — it is the scheduled governor reset. The nightly consolidation is repair permitted. Ghost agents that can't terminate are the sleep-deprived mitochondria. Forcing `wos start` without the register classification and closure gates in place is the stimulant.
+In the WOS system as it currently exists, these cycles grew organically and are not yet named or designed as rhythmic governance:
 
-The dispatcher's hibernation mode was already mitochondrial before it had a name.
+- **Nightly (~24h):** nightly consolidation — memory repair, digest archiving, rolling summary update. Repair is permitted; new UoW dispatch is paused. This is the most obvious rest window, but it is one cycle among several.
+- **Weekly:** weekly retro and negentropic hygiene sweep — pruning, signal extraction, pattern recognition across accumulated output. This is the slower repair cycle, operating at a timescale where daily noise has averaged out.
+- **RALPH cycle cadence:** structured iterative digestion — run → evaluate → gap-identify → next cycle. Each RALPH cycle is a mitochondrial breath: action, then the mandatory pause in which the trace is read before the next prescription fires. The corrective trace is the dwell time.
+- **WOS execution cycle:** UoW → steward → executor → corrective trace → next pass. The corrective trace is the rest window before re-prescription. Without it, re-dispatch happens immediately on completion — the exactly-wrong thing, at the timescale where ghost agents are born.
+- **Dispatcher hibernation:** the obvious one — `wait_for_messages(hibernate_on_timeout=True)` silencing the intake channel. This is a real cycle. But it is only one timescale of a larger rhythm, not the rhythm itself.
+
+What's missing is not any of these cycles individually — the system already instantiates all of them. What's missing is that they are **ad hoc**: they arrived through engineering decisions, not through a first-class notion of rhythmic governance. A rhythmically coherent system would make these cycles explicit and named, would sequence them so they don't collide (a weekly sweep should not fire in the middle of a nightly consolidation pass), and would gate execution during repair windows across all timescales simultaneously.
+
+The multi-register reality is important here: "sleep" is not a single thing, and different registers operate differently in the same temporal window. During a nightly cycle, some things stop (new UoW dispatch), others accelerate (consolidation, archiving), others happen only then (hygiene sweep). There is no single "sleep mode" — there is a structured window in which different governors are in different states. The design challenge is making that structure visible and intentional rather than emergent and invisible.
+
+What this does **not** mean: that `hibernate_on_timeout=True` is the design goal. Hibernation is one signal. Forcing explicit rhythms via configuration flags misses the principle — what matters is that the timing structure is owned by a layer that knows which cycle is due, not scattered across cron jobs and configuration states that don't know about each other.
+
+The dispatcher's hibernation was already mitochondrial before it had a name. What hasn't yet been named is the circadian layer above it.
 
 ---
 
