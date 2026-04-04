@@ -133,6 +133,7 @@ class ClaimSucceeded:
     uow_id: str
     output_ref: str
     artifact: WorkflowArtifact
+    register: str = "operational"
 
 
 @dataclass(frozen=True)
@@ -197,6 +198,101 @@ def _write_result_json(output_ref: str, result: ExecutorResult) -> None:
     result_path = _result_json_path(output_ref)
     result_path.parent.mkdir(parents=True, exist_ok=True)
     result_path.write_text(json.dumps(result.to_dict(), indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Trace helpers — V3 corrective trace contract
+# ---------------------------------------------------------------------------
+
+def _trace_json_path(output_ref: str) -> Path:
+    """
+    Derive trace.json path from output_ref.
+
+    Mirrors _result_json_path: replace extension (foo.json → foo.trace.json).
+    Fallback: append .trace.json when output_ref has no extension.
+    """
+    p = Path(output_ref)
+    if p.suffix:
+        return p.with_suffix(".trace.json")
+    return Path(output_ref + ".trace.json")
+
+
+def _build_trace(
+    uow_id: str,
+    register: str,
+    outcome: ExecutorOutcome,
+    execution_summary: str,
+    surprises: list[str] | None = None,
+    prescription_delta: str = "",
+    gate_score: dict | None = None,
+) -> dict:
+    """
+    Pure constructor for the V3 trace dict.
+
+    All fields required; surprises defaults to [] (not None) per schema contract.
+    gate_score defaults to None for PR A — iterative-convergent gate scoring is PR B.
+    """
+    return {
+        "uow_id": uow_id,
+        "register": register,
+        "execution_summary": execution_summary,
+        "surprises": surprises or [],
+        "prescription_delta": prescription_delta,
+        "gate_score": gate_score,
+        "timestamp": _now_iso(),
+    }
+
+
+def _write_trace_json(output_ref: str, trace: dict) -> None:
+    """
+    Write trace.json atomically (tmp → rename). Creates parent dir if needed.
+
+    Mirrors _write_result_json but uses tmp→rename for atomicity, consistent
+    with the _dispatch_via_inbox pattern. The Steward reads this file at
+    diagnosis time; partial writes must not be visible.
+    """
+    trace_path = _trace_json_path(output_ref)
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = trace_path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(trace, indent=2))
+    tmp_path.rename(trace_path)
+
+
+def _insert_corrective_trace(registry_db_path: Path, trace: dict) -> None:
+    """
+    Best-effort INSERT into corrective_traces table.
+
+    Does not raise on failure — logs a warning and returns. This matches the
+    V3 non-blocking contract: trace absence is logged as a contract violation
+    but does not block Steward re-entry.
+    """
+    try:
+        conn = sqlite3.connect(str(registry_db_path), timeout=5.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """
+            INSERT INTO corrective_traces
+                (uow_id, register, execution_summary, surprises, prescription_delta, gate_score, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                trace["uow_id"],
+                trace["register"],
+                trace["execution_summary"],
+                json.dumps(trace.get("surprises") or []),
+                trace.get("prescription_delta") or "",
+                json.dumps(trace.get("gate_score")) if trace.get("gate_score") else None,
+                trace.get("timestamp", _now_iso()),
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning(
+            "Executor: failed to insert corrective_trace for %s — %s",
+            trace.get("uow_id"),
+            e,
+        )
 
 
 def _write_output_ref_content(output_ref: str, content: str) -> None:
@@ -277,9 +373,9 @@ class Executor:
         """
         Claim and execute a single UoW.
 
-        Returns an ExecutorResult. The result.json file is always written
-        before this method returns (success or failure). On exception, the
-        result.json is written with outcome='failed' and the exception is re-raised.
+        Returns an ExecutorResult. The result.json and trace.json files are
+        always written before this method returns (success or failure). On
+        exception, both files are written with outcome='failed' before re-raising.
         """
         claim = self._claim(uow_id)
 
@@ -290,8 +386,8 @@ class Executor:
             case ClaimRejected(reason=reason):
                 # Optimistic lock failed or artifact missing — caller may retry or skip.
                 raise RuntimeError(f"Executor: claim rejected for {uow_id!r} — {reason}")
-            case ClaimSucceeded(uow_id=uid, output_ref=output_ref, artifact=artifact):
-                return self._run_step_sequence(uid, output_ref, artifact)
+            case ClaimSucceeded(uow_id=uid, output_ref=output_ref, artifact=artifact, register=register):
+                return self._run_step_sequence(uid, output_ref, artifact, register)
 
     # -----------------------------------------------------------------------
     # Claim sequence (6 steps, single transaction)
@@ -424,6 +520,16 @@ class Executor:
                     reason=null_reason,
                 )
                 _write_result_json(output_ref, null_result)
+                null_trace = _build_trace(
+                    uow_id=uow_id,
+                    register=row["register"] if row["register"] else "operational",
+                    outcome=ExecutorOutcome.FAILED,
+                    execution_summary=null_reason,
+                    surprises=[null_reason],
+                    prescription_delta="workflow_artifact must be non-null before executor can run",
+                )
+                _write_trace_json(output_ref, null_trace)
+                _insert_corrective_trace(self.registry.db_path, null_trace)
                 self.registry.fail_uow(uow_id, null_reason)
                 return ClaimRejected(
                     uow_id=uow_id,
@@ -448,6 +554,16 @@ class Executor:
                         reason=missing_reason,
                     )
                     _write_result_json(output_ref, missing_result)
+                    missing_trace = _build_trace(
+                        uow_id=uow_id,
+                        register=row["register"] if row["register"] else "operational",
+                        outcome=ExecutorOutcome.FAILED,
+                        execution_summary=missing_reason,
+                        surprises=[missing_reason],
+                        prescription_delta="workflow_artifact file path must exist on disk before executor can run",
+                    )
+                    _write_trace_json(output_ref, missing_trace)
+                    _insert_corrective_trace(self.registry.db_path, missing_trace)
                     self.registry.fail_uow(uow_id, missing_reason)
                     return ClaimRejected(
                         uow_id=uow_id,
@@ -466,20 +582,33 @@ class Executor:
                     reason=deser_reason,
                 )
                 _write_result_json(output_ref, deser_result)
+                deser_trace = _build_trace(
+                    uow_id=uow_id,
+                    register=row["register"] if row["register"] else "operational",
+                    outcome=ExecutorOutcome.FAILED,
+                    execution_summary=deser_reason,
+                    surprises=[str(e)],
+                    prescription_delta="workflow_artifact JSON must be valid and match WorkflowArtifact schema",
+                )
+                _write_trace_json(output_ref, deser_trace)
+                _insert_corrective_trace(self.registry.db_path, deser_trace)
                 self.registry.fail_uow(uow_id, deser_reason)
                 return ClaimRejected(
                     uow_id=uow_id,
                     reason=f"workflow_artifact deserialization failed: {e}",
                 )
 
-            return ClaimSucceeded(uow_id=uow_id, output_ref=output_ref, artifact=artifact)
+            register = row["register"] if row["register"] else "operational"
+            return ClaimSucceeded(uow_id=uow_id, output_ref=output_ref, artifact=artifact, register=register)
 
         except Exception:
             try:
                 conn.rollback()
             except Exception as e:
-                logger.debug(
-                    f"Rollback failed during exception handling: {type(e).__name__}: {e}",
+                log.debug(
+                    "Rollback failed during exception handling: %s: %s",
+                    type(e).__name__,
+                    e,
                     exc_info=True,
                 )
             raise
@@ -495,15 +624,17 @@ class Executor:
         uow_id: str,
         output_ref: str,
         artifact: WorkflowArtifact,
+        register: str = "operational",
     ) -> ExecutorResult:
         """
         Execute a claimed UoW through its full step sequence.
 
-        On any unhandled exception: write result.json with outcome='failed',
-        transition to 'failed' status via the Registry, then re-raise.
+        On any unhandled exception: write result.json and trace.json with
+        outcome='failed', transition to 'failed' status via the Registry,
+        then re-raise.
         """
         try:
-            return self._run_execution(uow_id, output_ref, artifact)
+            return self._run_execution(uow_id, output_ref, artifact, register)
         except Exception as exc:
             # Ensure result.json is always written, even on crash.
             # Use result_writer so the Steward gets a result file in the
@@ -516,6 +647,19 @@ class Executor:
                 status="failed",
                 summary=f"executor error before subagent dispatch: {reason}",
             )
+            # V3: write trace.json alongside result.json at the crash exit path.
+            # register defaults to "operational" — the crash handler has no access
+            # to the register value if it was never passed in from ClaimSucceeded.
+            trace = _build_trace(
+                uow_id=uow_id,
+                register=register,
+                outcome=ExecutorOutcome.FAILED,
+                execution_summary=f"Executor crashed: {type(exc).__name__}: {exc}",
+                surprises=[str(exc)],
+                prescription_delta="exception before subagent dispatch — check executor logs",
+            )
+            _write_trace_json(output_ref, trace)
+            _insert_corrective_trace(self.registry.db_path, trace)
             self.registry.fail_uow(uow_id, reason)
             raise
 
@@ -524,6 +668,7 @@ class Executor:
         uow_id: str,
         output_ref: str,
         artifact: WorkflowArtifact,
+        register: str = "operational",
     ) -> ExecutorResult:
         """
         Inner execution: activate skills, dispatch subagent, write results.
@@ -552,6 +697,19 @@ class Executor:
         # Step 5: Write result.json (executor-contract.md: required at every intentional exit)
         _write_result_json(output_ref, result)
         _validate_result_json_written(uow_id, output_ref)
+
+        # Step 5b: Write trace.json (V3 corrective trace contract — required alongside result.json)
+        trace = _build_trace(
+            uow_id=uow_id,
+            register=register,
+            outcome=ExecutorOutcome.COMPLETE,
+            execution_summary=f"Executor dispatched subagent {executor_id}, subprocess exit 0.",
+            surprises=[],
+            prescription_delta="",
+            gate_score=None,  # operational; iterative-convergent gate_score handled in PR B
+        )
+        _write_trace_json(output_ref, trace)
+        _insert_corrective_trace(self.registry.db_path, trace)
 
         # Step 6: Transition to ready-for-steward (audit before status update, single transaction)
         self.registry.complete_uow(uow_id, output_ref)
@@ -587,6 +745,26 @@ class Executor:
         _write_output_ref_content(output_ref, f"partial: {reason}")
         _write_result_json(output_ref, result)
         _validate_result_json_written(uow_id, output_ref)
+
+        # V3: write trace.json alongside result.json.
+        # register is not available here without refactoring the public API; use "operational"
+        # as the default for PR A. The field will be enriched in a later PR.
+        steps_desc = (
+            f"partial completion — {steps_completed}/{steps_total} steps done"
+            if steps_completed is not None
+            else "partial completion"
+        )
+        trace = _build_trace(
+            uow_id=uow_id,
+            register="operational",
+            outcome=ExecutorOutcome.PARTIAL,
+            execution_summary=reason,
+            surprises=[reason],
+            prescription_delta=steps_desc,
+        )
+        _write_trace_json(output_ref, trace)
+        _insert_corrective_trace(self.registry.db_path, trace)
+
         self.registry.complete_uow(uow_id, output_ref)
         return result
 
@@ -611,6 +789,21 @@ class Executor:
         _write_output_ref_content(output_ref, f"blocked: {reason}")
         _write_result_json(output_ref, result)
         _validate_result_json_written(uow_id, output_ref)
+
+        # V3: write trace.json alongside result.json.
+        # register is not available here without refactoring the public API; use "operational"
+        # as the default for PR A. The field will be enriched in a later PR.
+        trace = _build_trace(
+            uow_id=uow_id,
+            register="operational",
+            outcome=ExecutorOutcome.BLOCKED,
+            execution_summary=reason,
+            surprises=[reason],
+            prescription_delta="blocked — external resolution required before re-prescription",
+        )
+        _write_trace_json(output_ref, trace)
+        _insert_corrective_trace(self.registry.db_path, trace)
+
         self.registry.complete_uow(uow_id, output_ref)
         return result
 
@@ -840,8 +1033,11 @@ def recover_ttl_exceeded_uows(registry: "Registry") -> list[str]:
             )
             recovered.append(uow_id)
         except Exception as e:
-            logger.debug(
-                f"TTL recovery failed for UoW {uow_id}: {type(e).__name__}: {e}",
+            log.debug(
+                "TTL recovery failed for UoW %s: %s: %s",
+                uow_id,
+                type(e).__name__,
+                e,
                 exc_info=True,
             )
             # Non-fatal: the UoW remains active and will be caught on the next heartbeat cycle.
