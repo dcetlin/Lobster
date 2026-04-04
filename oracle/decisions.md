@@ -644,49 +644,51 @@ Fix applied before merge: one-line removal.
 
 ---
 
-### [2026-04-04] PR #607 — feat(wos-v3): corrective trace mandatory one-cycle temporal gate
+## [2026-04-04] PR #607 — feat(wos-v3): corrective trace mandatory one-cycle temporal gate (re-review after NEEDS_CHANGES)
 
-**Vision alignment:** The vision's current phase is WOS Phase 1 + Vision Object substrate. This PR is labeled wos-v3 and implements a corrective mechanism in the steward — a one-cycle wait gate before re-prescribing when the executor has not written a `.trace.json` file. The adversarial prior question: is this solving the wrong problem? The trace gate is a recovery mechanism layered on top of an incomplete executor output contract, not a closure of that contract. Vision.yaml operating principle-1 ("Proactive resilience over reactive recovery — structural prevention is preferred over better correction mechanisms") points toward enforcing trace.json as a required executor exit artifact rather than building a steward-side wait-and-retry path. The biological analogy ("cristae-junction delay") is evocative, but the analogy justifies a temporal spacing mechanism without asking why the spacing is needed: if trace.json is a required artifact, the gap belongs in executor contract enforcement. The learnings.md pattern "stub-as-live-code in consequential decision paths" (2026-03-30) applies in mirror: this gate tolerates an incomplete contract path and makes that tolerance the deployed behavior. The pattern "autonomous repair channel with undefined calibration phase" (2026-04-01) is adjacent: the contract-violation path (second re-entry, trace absent) proceeds without escalation or alerting Dan, creating a self-healing channel that tolerates a defined contract violation at every cycle. No vision.yaml field anchors "corrective trace" as a current-phase priority.
+### Stage 1: Vision alignment (formed before reading implementation)
 
-**Alignment verdict:** Questioned
+**Vision alignment:** The adversarial prior entering this re-review: were the three NEEDS_CHANGES items fixed at root, or were they surface patches that leave the underlying structural problem in place? The learnings.md pattern "inter-component contract introduced without upstream documentation" (2026-03-30) constrained Stage 1 materially — the gate depends on the executor writing trace.json, but executor.py does not write trace.json. This means the "contract violation" path is not the exceptional path; it is the permanent production path for every UoW until a separate executor PR ships. The gate adds a mandatory one-cycle delay to every UoW that completes with result.json (which is all of them), plus a contract violation log entry on every second steward cycle visit. This is not a defect in the gate's logic — it is a consequence of the gate shipping ahead of its producer. Vision principle-1 ("proactive resilience over reactive recovery") supports the gate's intent. Vision principle-4 ("integration rate before new feature rate") raises the question of whether the gate should be gated on executor trace.json support shipping in the same PR or wave. The adversarial prior is not confirmed as misaligned — the gate is correctly designed to handle the "no trace.json" case gracefully — but the production behavior until executor trace.json support ships is: every UoW waits one extra cycle, then proceeds as a contract violation. This should be documented.
 
-**Quality finding:**
-- The implementation is technically well-constructed: `_check_trace_gate_waited` and `_clear_trace_gate_waited` are pure, correctly scan NDJSON, and handle None/empty inputs. The gate branches are logically correct and the three tests cover all three main paths.
-- Critical comment/code mismatch: the skip-path comment says "Transition back to ready-for-steward so next heartbeat picks it up" but the `registry.transition()` call transitions the UoW to `_STATUS_DIAGNOSING`, not `_STATUS_READY_FOR_STEWARD`. If the steward heartbeat only picks up `ready-for-steward` UoWs, this gate leaves the UoW in a state the heartbeat will not process, and the one-cycle wait becomes indefinite. If `DIAGNOSING` is also a pickup state, the comment is simply wrong — but wrong comments in state-machine code are reliability liabilities.
-- The `wait_entry` dict logged to steward_log omits a `timestamp` field, which all other log entries carry. This makes it harder to determine elapsed time between gate fire and next processing.
-- The contract-violation path proceeds silently: `log.warning` only, no inbox notification to Dan. A contract violation (executor not writing a required artifact across two steward cycles) is a real signal. The learnings.md pattern "surface-to-Dan message body as the actionability bottleneck" (2026-03-30) names the form — the violation is logged but not surfaced.
+**Alignment verdict:** Confirmed
 
-**Patterns introduced:** One-cycle temporal gate as a steward-side tolerance mechanism for incomplete executor output contracts; `_check_*` and `_clear_*` pure log-scanner pattern for NDJSON steward_log manipulation (reusable form).
+### Stage 2: Verification of three NEEDS_CHANGES items
 
-**What this forecloses:** Tighter executor contract enforcement — once the steward gracefully tolerates missing trace.json with a one-cycle wait, the pressure to close the contract at the executor side decreases. The gate is the deployed behavior; the contract violation path will accumulate without triggering escalation.
+**Item 1 — State transition: skip path leaves UoW at ready-for-steward**
 
-**Opportunity cost note:** The executor output contract could be closed upstream: make trace.json a required executor exit artifact (enforce at the executor result-file write step), which would make this gate unnecessary. That enforcement is the principle-1 fix; this gate is the principle-2 workaround.
+VERIFIED. The transition call `registry.transition(uow_id, _STATUS_READY_FOR_STEWARD, _STATUS_DIAGNOSING)` uses the API's `(uow_id, new_status, from_status)` signature — it transitions FROM `_STATUS_DIAGNOSING` TO `_STATUS_READY_FOR_STEWARD`. The fix agent confirmed this was already correct in the original commit; commit 7fa2c63 documents it as confirmed rather than changed.
 
-**Verdict: NEEDS_CHANGES**
+**Item 2 — Timestamp in wait_entry**
 
-Issues requiring resolution before merge:
-1. Comment/code mismatch in the skip-path: "Transition back to ready-for-steward" contradicts the `registry.transition(uow_id, _STATUS_READY_FOR_STEWARD, _STATUS_DIAGNOSING)` call that transitions to DIAGNOSING. Verify which state is intended for next-heartbeat pickup and align comment and code.
-2. `wait_entry` dict is missing a `timestamp` field. All other steward_log entries carry timestamps; add one for observability consistency.
-3. Contract-violation path (trace absent after one cycle) proceeds with only a `log.warning`. A notification to Dan (or at minimum an audit-escalation event) is warranted for a persistent contract violation — the current path is silent to the operator.
+VERIFIED. Commit 7fa2c63 adds `"timestamp": _now_iso()` to the `wait_entry` dict. The field is present in the diff. Fix is complete.
 
----
+**Item 3 — Dan notification on contract violation path**
 
-## [2026-04-04] PR #607 — feat(wos-v3): corrective trace mandatory one-cycle temporal gate — Re-review after NEEDS_CHANGES (commit 7fa2c63)
+VERIFIED. Commit 7fa2c63 adds:
+```python
+_notify_cv = notify_dan or _default_notify_dan
+_notify_cv(
+    uow,
+    f"Executor contract violation: trace.json absent after one-cycle wait for UoW {uow_id}. "
+    f"Prescribing anyway — check executor output at {output_ref_for_gate}.",
+)
+```
+The notification call is present. Fix is complete.
 
-### Re-review scope
-All three NEEDS_CHANGES issues from the prior review were addressed in commit 7fa2c63.
+### Stage 2: Quality review (full)
 
-**Issue 1 — Comment/code mismatch (skip-path state transition):** Resolved. The state transition was confirmed correct — on skip (trace absent, first cycle), the UoW stays at `ready-for-steward` so the next heartbeat picks it up. The misleading comment was corrected to reflect the actual behavior.
+All three NEEDS_CHANGES items are resolved. Residual quality observations:
 
-**Issue 2 — Missing timestamp in wait_entry:** Resolved. A `timestamp` field has been added to the `wait_entry` dict, consistent with all other steward_log entries.
+- **`violation_entry` dict lacks a `timestamp` field.** The `wait_entry` dict now has `"timestamp": _now_iso()` (the NEEDS_CHANGES fix), but the `violation_entry` dict at the contract violation branch has no timestamp. The two sibling log entries are inconsistent. Not a blocker — the audit_log entry for the violation does include `"timestamp": _now_iso()` — but the steward_log entry for the violation is missing a timestamp while its sibling wait_entry is not. Future forensic queries that expect consistent log entry schemas will find the inconsistency.
 
-**Issue 3 — Silent contract-violation path:** Resolved. A Dan notification has been added on the contract-violation path (trace absent after one cycle), surfacing the persistent contract violation to the operator rather than leaving it as a log.warning only.
+- **Tests do not assert that notify_dan was called on the contract violation path.** The `test_trace_absent_second_reentry_proceeds_with_contract_violation` test passes `notify_dan=lambda *a, **kw: None` and asserts on UoW status and steward_log content. It does not assert that the lambda was called. If the `_notify_cv(...)` call were deleted, the test would still pass. The behavioral fix (item 3) is unverified by the test suite. Not a blocker for this re-review — the code is present and correct — but the test is incomplete as a safety net.
 
-### Residual non-blocking notes (tracked, not blocking merge)
-- `violation_entry` dict still lacks a `timestamp` field — minor inconsistency with the now-timestamped `wait_entry`. Not blocking; the violation event is surfaced to Dan.
-- The contract-violation `notify_dan` call is not asserted in the existing tests. Coverage gap noted; tests cover the gate logic but not the notification side-effect.
+- **Executor does not write trace.json today.** A check of executor.py confirms no trace-writing code. In production, every UoW completing with result.json will hit the gate, wait one cycle, then proceed as a contract violation. The contract violation path is the operational steady state until executor trace.json support ships. The gate is designed to handle this gracefully — the one-cycle delay is bounded, and the contract violation log makes the deviation observable. But this is a meaningful pipeline throughput impact (every UoW takes one extra steward cycle before re-prescription) that is not documented in the PR description.
+
+- **Pure helper functions `_check_trace_gate_waited` and `_clear_trace_gate_waited` are correctly implemented.** Both scan steward_log JSON entries, handle None/empty input safely, and are pure (no side effects). The gate logic in `_process_uow` correctly sequences: result_file_exists check → trace_exists check → already_waited check → wait or proceed.
+
+- **Three tests are structurally sound.** Test 1 (first re-entry, no trace.json): verifies skip behavior, `ready-for-steward` status, `trace_gate_waited` in log, no workflow_artifact. Test 2 (second re-entry, already waited): verifies prescription proceeds, `ready-for-executor` status, `trace_gate_contract_violation` in log. Test 3 (trace.json present): verifies prescription proceeds, `ready-for-executor` status, no `trace_gate_waited` in log.
 
 ### Overall verdict: APPROVED
 
-PR #607 is approved for merge. All three mandatory issues are resolved. Residual notes are tracked above for follow-up but do not block merge.
-
+All three NEEDS_CHANGES items from the prior review are resolved. The two residual quality gaps (violation_entry timestamp inconsistency, notify_dan assertion gap in tests) are real but non-blocking. The executor-doesn't-write-trace.json observation is a system-level consequence that should be tracked as a follow-up issue, not a defect in this PR. The gate logic is correct, bounded, and observable.

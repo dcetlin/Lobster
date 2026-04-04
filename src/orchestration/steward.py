@@ -1047,6 +1047,54 @@ def _fetch_prior_prescriptions(
     return prescriptions[-limit:] if prescriptions else []
 
 
+def _check_trace_gate_waited(steward_log: str | None) -> bool:
+    """
+    Return True if a 'trace_gate_waited' entry exists in the steward_log.
+
+    Pure function. Scans newline-delimited JSON log entries and returns True
+    when any entry has event == "trace_gate_waited". Returns False when the
+    log is absent, empty, or contains no such entry.
+    """
+    if not steward_log:
+        return False
+    for line in steward_log.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(entry, dict) and entry.get("event") == "trace_gate_waited":
+            return True
+    return False
+
+
+def _clear_trace_gate_waited(steward_log: str | None) -> str:
+    """
+    Return a new steward_log string with all 'trace_gate_waited' entries removed.
+
+    Pure function. Filters out lines where event == "trace_gate_waited".
+    Returns empty string when steward_log is None or empty.
+    """
+    if not steward_log:
+        return steward_log or ""
+    result_lines: list[str] = []
+    for line in steward_log.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            result_lines.append(line)
+            continue
+        try:
+            entry = json.loads(stripped)
+            if isinstance(entry, dict) and entry.get("event") == "trace_gate_waited":
+                continue
+        except (json.JSONDecodeError, TypeError):
+            pass
+        result_lines.append(line)
+    return "\n".join(result_lines)
+
+
 def _count_consecutive_llm_fallbacks(current_log_str: str | None) -> int:
     """
     Count how many consecutive prescription events at the tail of steward_log
@@ -2066,6 +2114,110 @@ def _process_uow(
     # steps_completed/steps_total from the result file so the prescription
     # reflects how far the previous execution got. For `failed`, re-diagnose
     # with `reason` as the primary input (already in completion_rationale).
+
+    # 4c-gate: Corrective trace one-cycle temporal gate (cristae-junction delay).
+    # Before prescribing again after an executor return, the executor must have
+    # written a corrective trace ({output_ref}.trace.json). This forces temporal
+    # spacing between action and next prescription — the software equivalent of
+    # the cristae geometry delay between proton pump action and ATP synthesis.
+    # Gate applies only when result.json exists (executor actually returned).
+    output_ref_for_gate = uow.output_ref
+    result_file_exists = False
+    if output_ref_for_gate:
+        _rf = Path(output_ref_for_gate).with_suffix(".result.json")
+        if not _rf.exists():
+            _rf_alt = Path(str(output_ref_for_gate) + ".result.json")
+            if _rf_alt.exists():
+                _rf = _rf_alt
+        result_file_exists = _rf.exists()
+
+    if result_file_exists and output_ref_for_gate:
+        trace_file = Path(output_ref_for_gate).with_suffix(".trace.json")
+        if not trace_file.exists():
+            trace_file = Path(str(output_ref_for_gate) + ".trace.json")
+        trace_exists = trace_file.exists()
+
+        if not trace_exists:
+            # trace.json absent — apply one-cycle wait gate
+            already_waited = _check_trace_gate_waited(current_log_str)
+            if not already_waited:
+                # First visit: log trace_gate_waited and skip prescription this cycle.
+                # Transition back to ready-for-steward so next heartbeat picks it up.
+                log.info(
+                    "_process_uow: trace.json absent for %s — logging trace_gate_waited, "
+                    "skipping prescription this cycle (cristae-junction delay)",
+                    uow_id,
+                )
+                wait_entry = {
+                    "event": "trace_gate_waited",
+                    "uow_id": uow_id,
+                    "steward_cycles": cycles,
+                    "output_ref": output_ref_for_gate,
+                    "timestamp": _now_iso(),
+                }
+                current_log_str = _append_steward_log_entry(
+                    registry, uow_id, current_log_str, wait_entry
+                )
+                if not dry_run:
+                    _write_steward_fields(registry, uow_id, steward_log=current_log_str)
+                    registry.append_audit_log(uow_id, {
+                        "event": "trace_gate_waited",
+                        "actor": _ACTOR_STEWARD,
+                        "uow_id": uow_id,
+                        "steward_cycles": cycles,
+                        "note": json.dumps({
+                            "trace_gate_waited": _now_iso(),
+                            "output_ref": output_ref_for_gate,
+                        }),
+                        "timestamp": _now_iso(),
+                    })
+                    registry.transition(uow_id, _STATUS_READY_FOR_STEWARD, _STATUS_DIAGNOSING)
+                # Return a special Prescribed outcome with cycles unchanged to signal skip
+                return Prescribed(uow_id=uow_id, cycles=cycles)
+            else:
+                # Already waited one cycle — proceed with prescription, log contract violation
+                log.warning(
+                    "_process_uow: trace.json absent after one-cycle wait for %s — "
+                    "proceeding with prescription (contract violation)",
+                    uow_id,
+                )
+                violation_entry = {
+                    "event": "trace_gate_contract_violation",
+                    "uow_id": uow_id,
+                    "steward_cycles": cycles,
+                    "output_ref": output_ref_for_gate,
+                    "message": "trace.json absent after one-cycle wait — proceeding with prescription (contract violation)",
+                }
+                current_log_str = _append_steward_log_entry(
+                    registry, uow_id, current_log_str, violation_entry
+                )
+                if not dry_run:
+                    _write_steward_fields(registry, uow_id, steward_log=current_log_str)
+                    registry.append_audit_log(uow_id, {
+                        "event": "trace_gate_contract_violation",
+                        "actor": _ACTOR_STEWARD,
+                        "uow_id": uow_id,
+                        "steward_cycles": cycles,
+                        "note": json.dumps({
+                            "message": "trace.json absent after one-cycle wait — proceeding with prescription (contract violation)",
+                            "output_ref": output_ref_for_gate,
+                        }),
+                        "timestamp": _now_iso(),
+                    })
+                _notify_cv = notify_dan or _default_notify_dan
+                _notify_cv(
+                    uow,
+                    f"Executor contract violation: trace.json absent after one-cycle wait for UoW {uow_id}. "
+                    f"Prescribing anyway — check executor output at {output_ref_for_gate}.",
+                )
+        else:
+            # trace.json exists — clear any stale trace_gate_waited entries
+            cleared_log = _clear_trace_gate_waited(current_log_str)
+            if cleared_log != current_log_str:
+                current_log_str = cleared_log
+                if not dry_run:
+                    _write_steward_fields(registry, uow_id, steward_log=current_log_str)
+
     new_cycles = cycles + 1
     prescribed_skills = _select_prescribed_skills(uow, reentry_posture)
     selected_executor_type = _select_executor_type(uow)
