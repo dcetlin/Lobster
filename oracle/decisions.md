@@ -614,3 +614,33 @@ Finding: The file already has function-level deferred imports in another section
 
 **PR #550** is approved for merge. All three NEEDS_CHANGES items are addressed. The urllib multipart implementation is structurally correct, keeps the token in-process, and handles both transport and API-level errors.
 
+---
+
+## [2026-04-04] PR #601 — feat(wos-v3): schema migration — register field + corrective_traces
+
+### Stage 1: Is this solving the right problem?
+The schema change operationalizes V3's three new structural primitives: register (attentional configuration), corrective_traces (learning artifacts), and delivery≠closure (closed_at/close_reason). These are the exact gaps V3 identified in V2. STAGE 1: APPROVED.
+
+### Stage 2: Is the implementation well-made?
+Migration is clean and additive — all four ALTER TABLE statements backfill safely with correct NULL defaults. executor_uow_view rebuild is correct for SQLite (drop+recreate pattern). delivery≠closure fields correctly declared with NULL defaults (enforcement appropriately deferred to Steward). Two advisory gaps noted but not blocking: (1) no CHECK constraint enforcing valid register values at the DB layer — immutability is advisory, enforced only through the Registry class; (2) corrective_traces has no FK constraint on uow_id. Neither blocks merge — the Registry class enforces both constraints adequately at the application layer for the current scale.
+
+### Overall verdict: APPROVED
+
+---
+
+## [2026-04-04] PR #602 — feat(wos-v3): register classification at germination (Germinator/Registrar)
+
+### Stage 1: Is this solving the right problem?
+PR #602 operationalizes register classification at germination — the gate that makes register immutable from the moment of creation. This is the structural mechanism that prevents category-wrong dispatch. The 4-gate ordered algorithm matches the V3 design spec precisely. STAGE 1: APPROVED.
+
+### Stage 2: Is the implementation well-made?
+The `RegisterClassification` frozen dataclass with observability fields (gate_fired, evidence, confidence) is the right design — see golden-patterns.md for this pattern. The Cultivator→Germinator handoff is correctly wired. WOS-INDEX.md naming resolution is correct. 22 tests cover all gates and ordering.
+
+One mandatory fix before merge: remove `"register"` from `_PHILOSOPHICAL_TERMS` in `germinator.py` (approx line 153). `_is_philosophical()` uses boolean frozenset intersection — single token match fires Gate 3 at full confidence. The word "register" appears throughout V3 technical writing (register field, register mismatch gate, classify_register), causing systematic false positives on V3 meta-issues. Direction of failure is conservative (held for Dan review rather than category-wrong dispatch), but it degrades the philosophical register's signal value.
+
+Fix applied before merge: one-line removal.
+
+### Overall verdict: APPROVED (with pre-merge fix applied)
+
+---
+

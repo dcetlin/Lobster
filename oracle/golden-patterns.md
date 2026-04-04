@@ -166,3 +166,16 @@ StartupSweepResult = _sweep_mod.StartupSweepResult
 **Where it appears:** `scheduled-tasks/steward-heartbeat.py` lines 62–72 (PR #358). The split extracted startup sweep logic from the heartbeat; the re-export bridge preserved the test surface without requiring test modifications.
 
 **Reuse guidance:** Apply when splitting a scheduled-task script that is loaded by name via importlib in tests. The bridge belongs at module scope near the top of the file (after path setup, before the module's own logic). Note: this pattern introduces a deployment coupling — file-B requires file-A to exist at the expected relative path. Document this coupling in the module docstring. Do not use for src/ package modules where normal relative imports are available — importlib bridging is a script-context workaround, not a general-purpose import pattern.
+
+---
+
+### [2026-04-04] Pattern: classification result as typed frozen dataclass with observability fields
+
+**Pattern:** When a classification function can produce systematically wrong results (all heuristic classifiers can), return a typed frozen dataclass that carries not just the classification but also `gate_matched`, `confidence`, and `rationale`. The classification is immutable; the observability fields are first-class outputs.
+
+**Why it works:** A raw register string returned from `classify_register()` gives callers no information about *why* that classification was made or how confident the classifier was. A frozen `RegisterClassification(register, gate_matched, confidence, rationale)` gives the caller everything it needs to log, surface, and audit classifications without re-running the classifier. `confidence="low"` (the default-fallback case) is a structured signal that the Steward can use to flag UoWs for human review. `gate_matched` tells the observability layer which code path fired without requiring a debugger. The frozen/slots combination prevents mutation after the fact, which is correct for an immutable germination-time decision. This structure surfaces systematic misclassification without requiring per-item examination.
+
+**Where it appears:** `src/orchestration/germinator.py` — `RegisterClassification` dataclass and `classify_register()` return type. Introduced in PR #602 (WOS V3 Germinator). The dry-run path in `cultivator.py` logs all four fields, enabling batch inspection of classification quality before promotion.
+
+**Reuse guidance:** Apply to any classification function that (a) can misclassify and (b) whose misclassification rate matters. The minimum set of observability fields: `result` (the classification), `gate_matched` or `rule_matched` (which branch fired), `confidence` (high/medium/low), `rationale` (one sentence). Do not return bare strings from classifiers that operate on real data — the string is undebuggable at scale. The frozen dataclass is the return type; the string value is extractable in one attribute access.
+
