@@ -2153,6 +2153,7 @@ def _process_uow(
                     "uow_id": uow_id,
                     "steward_cycles": cycles,
                     "output_ref": output_ref_for_gate,
+                    "timestamp": _now_iso(),
                 }
                 current_log_str = _append_steward_log_entry(
                     registry, uow_id, current_log_str, wait_entry
@@ -2203,6 +2204,12 @@ def _process_uow(
                         }),
                         "timestamp": _now_iso(),
                     })
+                _notify_cv = notify_dan or _default_notify_dan
+                _notify_cv(
+                    uow,
+                    f"Executor contract violation: trace.json absent after one-cycle wait for UoW {uow_id}. "
+                    f"Prescribing anyway — check executor output at {output_ref_for_gate}.",
+                )
         else:
             # trace.json exists — clear any stale trace_gate_waited entries
             cleared_log = _clear_trace_gate_waited(current_log_str)
