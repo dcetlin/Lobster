@@ -480,7 +480,13 @@ launch_claude() {
     # The MCP server's _reset_state_on_startup() and handle_wait_for_messages()
     # will also write "active" once Claude is truly running, but this belt-and-
     # suspenders write ensures the state transitions even if those paths are slow.
-    ( sleep 5 && write_state "active" "claude running, attempt=$attempt" ) &
+    #
+    # Fix B (2026-04-03): Guard against the hibernation→active state race.
+    # If Claude exits into hibernation before the 5-second sleep completes,
+    # the background write would overwrite "hibernate" with "active", causing
+    # the health check to see mode=active + no WFM heartbeat → false restart.
+    # Only write "active" if the current mode is NOT "hibernate".
+    ( sleep 5 && current_mode=$(read_state_mode 2>/dev/null || echo "unknown"); [[ "$current_mode" != "hibernate" ]] && write_state "active" "claude running, attempt=$attempt" ) &
 
     # Write the dispatcher PID file so the health check can target this specific
     # process for cleanup without relying on ambiguous pgrep matches.
@@ -525,9 +531,43 @@ handle_exit() {
             log "HIBERNATING: Claude exited cleanly (hibernation). Will wait for wake signal."
             return 0
         else
-            # Claude exited cleanly but not in hibernate mode
-            # This can happen when --max-turns is exhausted
-            log "Claude exited cleanly (code 0) but not in hibernate mode. Will restart."
+            # Claude exited cleanly but mode is not "hibernate".
+            # Race condition guard: the MCP tool writes mode=hibernate then Claude
+            # exits, but if the health check fires between those two events it sees
+            # mode=active + stale WFM and triggers a false restart.
+            # Write mode=hibernate NOW (atomically, preserving existing fields) so
+            # the health check immediately sees the correct state.
+            log "Claude exited cleanly (code 0) but mode='${current_mode}' (not hibernate). Writing hibernate state before restart decision."
+            local now
+            now=$(date -Iseconds)
+            local tmp_state
+            tmp_state=$(mktemp "${STATE_FILE}.tmp.XXXXXX")
+            python3 -c "
+import json
+path = '$STATE_FILE'
+now = '$now'
+try:
+    with open(path) as f:
+        d = json.load(f)
+except Exception:
+    d = {}
+d['mode'] = 'hibernate'
+d['detail'] = 'clean exit, mode forced by wrapper (race condition guard)'
+d['updated_at'] = now
+with open('$tmp_state', 'w') as f:
+    json.dump(d, f, indent=2)
+    f.write('
+')
+" 2>/dev/null && mv -f "$tmp_state" "$STATE_FILE" || { rm -f "$tmp_state" 2>/dev/null; write_state "hibernate" "clean exit, mode forced by wrapper"; }
+            log "Hibernate state written atomically. Re-reading mode..."
+            current_mode=$(read_state_mode)
+            if [[ "$current_mode" == "hibernate" ]]; then
+                # Treat as intentional hibernation — wait for new messages
+                log "HIBERNATING: Clean exit treated as hibernation (mode forced by wrapper). Will wait for wake signal."
+                return 0
+            fi
+            # State write failed somehow — fall through to restart
+            log "State write did not yield hibernate mode (got: ${current_mode}). Will restart."
             write_state "restarting" "clean exit, max-turns likely exhausted"
             # Reset auth failure tracking — a clean exit means auth is working
             AUTH_FAIL_COUNT=0
@@ -546,9 +586,10 @@ handle_exit() {
                 send_telegram_alert "🔴 *Lobster Auth Failure*
 
 Claude cannot authenticate after $AUTH_FAIL_COUNT attempts.
-Check \`/home/lobster/.claude/.credentials.json\` — OAuth token may be expired.
+Auth is via CLAUDE_CODE_OAUTH_TOKEN in config.env.
 
-See \`docs/REMOTE-AUTH.md\` for re-authentication steps."
+Fix: update CLAUDE_CODE_OAUTH_TOKEN in ~/lobster-config/config.env, then:
+  systemctl restart lobster-claude"
                 log "AUTH ALERT: Sent Telegram notification after $AUTH_FAIL_COUNT auth failures"
             fi
         fi

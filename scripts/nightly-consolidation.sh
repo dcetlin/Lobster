@@ -8,7 +8,7 @@
 # No direct API calls are made here. Everything goes through Claude Code.
 #
 # Crontab entry:
-#   0 3 * * * $HOME/lobster/scripts/nightly-consolidation.sh
+#   0 3 * * * $HOME/lobster/scripts/nightly-consolidation.sh >> $HOME/lobster-workspace/logs/nightly-consolidation.log 2>&1
 #
 # Dedup guard: if a consolidation message is already pending in the inbox,
 # this script exits without writing a duplicate.
@@ -36,12 +36,13 @@ LOG_DIR="$WORKSPACE_DIR/logs"
 LOG_FILE="$LOG_DIR/nightly-consolidation.log"
 
 # Ensure directories exist
-mkdir -p "$INBOX"
-mkdir -p "$LOG_DIR"
+mkdir -p "$INBOX" "$LOG_DIR"
 
 log() {
     echo "[$(date -Iseconds)] $*" | tee -a "$LOG_FILE"
 }
+
+log "nightly-consolidation.sh started"
 
 # Dedup guard: skip if a consolidation message is already pending
 if ls "$INBOX"/*_consolidation.json 2>/dev/null | grep -q .; then
@@ -61,4 +62,4 @@ cat > "$INBOX/${TIMESTAMP}_consolidation.json" << EOF
 }
 EOF
 
-log "Consolidation message injected."
+log "Consolidation message injected at $(date -Iseconds)"

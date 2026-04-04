@@ -88,7 +88,7 @@ BOOT_GRACE_SECONDS=90                # 90s - skip stale-inbox, WFM, and process 
 
 HIBERNATE_FRESH_SECONDS=30           # Ignore hibernate state younger than this — transient dispatcher hibernation
 
-WFM_STALE_SECONDS=600                # 10 minutes - RED if wait_for_messages not called since this long ago
+WFM_STALE_SECONDS=1200               # 20 minutes - RED if wait_for_messages not called since this long ago (raised from 600 to accommodate long reasoning/subagent-spawning phases)
 HEARTBEAT_FILE="$WORKSPACE_DIR/logs/claude-heartbeat"
 
 OUTBOX_DIR="$MESSAGES_DIR/outbox"
@@ -440,60 +440,92 @@ is_compact_grace_period() {
 # Check if a catchup subagent is actively running (or recently started).
 # Returns 0 (true) if the WFM freshness check should be suppressed, 1 otherwise.
 #
-# The dispatcher writes catchup_started_at to lobster-state.json before spawning
-# either the startup-catchup or compact-catchup subagent, and writes
-# catchup_finished_at when the subagent result arrives.  If catchup_finished_at
-# is absent or older than catchup_started_at, the catchup is still in flight.
+# Primary path: the dispatcher writes catchup_started_at to lobster-state.json
+# before spawning either the startup-catchup or compact-catchup subagent, and
+# writes catchup_finished_at when the subagent result arrives.  If
+# catchup_finished_at is absent or older than catchup_started_at, the catchup
+# is still in flight.
 #
-# Suppression window: CATCHUP_SUPPRESS_SECONDS from catchup_started_at.
+# Fallback path (issue #1283): if the dispatcher forgot to call
+# record-catchup-state.sh (e.g. it batched the compact-reminder with other
+# messages), catchup_started_at is never updated.  In that case we fall back
+# to compacted_at: if a compaction is more recent than catchup_finished_at and
+# within CATCHUP_SUPPRESS_SECONDS, we treat catchup as in-flight.
+#
+# Suppression window: CATCHUP_SUPPRESS_SECONDS from the effective start time.
 # This caps suppression even if catchup_finished_at is never written (e.g. the
 # subagent crashed), preventing permanent suppression.
 is_catchup_active() {
     if [[ ! -f "$LOBSTER_STATE_FILE" ]]; then
         return 1
     fi
-    local started_at finished_at
-    started_at=$(python3 -c "
-import json, sys
-try:
-    d = json.load(open('$LOBSTER_STATE_FILE'))
-    print(d.get('catchup_started_at', ''))
-except Exception:
-    print('')
-" 2>/dev/null)
-    if [[ -z "$started_at" ]]; then
-        return 1
-    fi
-    local started_epoch
-    started_epoch=$(date -d "$started_at" +%s 2>/dev/null) || return 1
+
     local now
     now=$(date +%s)
-    local age=$((now - started_epoch))
-    # Hard cap: don't suppress longer than CATCHUP_SUPPRESS_SECONDS even if
-    # catchup_finished_at was never written (subagent crash, etc.)
-    if [[ $age -gt $CATCHUP_SUPPRESS_SECONDS ]]; then
-        log_info "Catchup suppression expired: started ${age}s ago (cap: ${CATCHUP_SUPPRESS_SECONDS}s)"
-        return 1
-    fi
-    # Check if catchup has already finished
-    finished_at=$(python3 -c "
+
+    # Read all relevant timestamps in one python call for efficiency
+    local started_at finished_at compacted_at
+    read -r started_at finished_at compacted_at < <(python3 -c "
 import json, sys
 try:
     d = json.load(open('$LOBSTER_STATE_FILE'))
-    print(d.get('catchup_finished_at', ''))
+    print(d.get('catchup_started_at', ''), d.get('catchup_finished_at', ''), d.get('compacted_at', ''))
 except Exception:
-    print('')
+    print('', '', '')
 " 2>/dev/null)
+
+    local finished_epoch=0
     if [[ -n "$finished_at" ]]; then
-        local finished_epoch
-        finished_epoch=$(date -d "$finished_at" +%s 2>/dev/null) || { log_warn "WARN: failed to parse finished_epoch from finished_at=${finished_at} — treating catchup as still in flight"; true; }
-        if [[ -n "$finished_epoch" && "$finished_epoch" -ge "$started_epoch" ]]; then
-            log_info "Catchup complete: finished_at=$finished_at — WFM suppression lifted"
-            return 1
+        finished_epoch=$(date -d "$finished_at" +%s 2>/dev/null) || finished_epoch=0
+    fi
+
+    # --- Primary path: catchup_started_at is present ---
+    if [[ -n "$started_at" ]]; then
+        local started_epoch
+        started_epoch=$(date -d "$started_at" +%s 2>/dev/null) || started_epoch=0
+        if [[ $started_epoch -gt 0 ]]; then
+            local age=$(( now - started_epoch ))
+            # Hard cap: don't suppress longer than CATCHUP_SUPPRESS_SECONDS even if
+            # catchup_finished_at was never written (subagent crash, etc.)
+            if [[ $age -gt $CATCHUP_SUPPRESS_SECONDS ]]; then
+                log_info "Catchup suppression expired: started ${age}s ago (cap: ${CATCHUP_SUPPRESS_SECONDS}s)"
+                # Fall through to compacted_at fallback — maybe a new compaction
+                # occurred after the cap expired and a new catchup is in flight.
+            else
+                # Check if catchup has already finished
+                if [[ $finished_epoch -gt 0 && $finished_epoch -ge $started_epoch ]]; then
+                    log_info "Catchup complete: finished_at=$finished_at — WFM suppression lifted"
+                    return 1
+                fi
+                log_info "Catchup in flight: started ${age}s ago (cap: ${CATCHUP_SUPPRESS_SECONDS}s) — WFM freshness suppressed"
+                return 0
+            fi
         fi
     fi
-    log_info "Catchup in flight: started ${age}s ago (cap: ${CATCHUP_SUPPRESS_SECONDS}s) — WFM freshness suppressed"
-    return 0
+
+    # --- Fallback path: check compacted_at (issue #1283) ---
+    # If the dispatcher forgot to write catchup_started_at (e.g. it batched
+    # the compact-reminder with other messages), we fall back to compacted_at.
+    # A compaction that is more recent than catchup_finished_at implies that
+    # a new catchup should be in flight but was never registered.
+    if [[ -n "$compacted_at" ]]; then
+        local compacted_epoch
+        compacted_epoch=$(date -d "$compacted_at" +%s 2>/dev/null) || compacted_epoch=0
+        if [[ $compacted_epoch -gt 0 ]]; then
+            local compaction_age=$(( now - compacted_epoch ))
+            if [[ $compaction_age -le $CATCHUP_SUPPRESS_SECONDS ]]; then
+                # Compaction is recent — check if catchup finished AFTER the compaction
+                if [[ $finished_epoch -gt 0 && $finished_epoch -ge $compacted_epoch ]]; then
+                    log_info "Catchup complete (fallback): compacted_at=$compacted_at, finished_at=$finished_at — WFM suppression not needed"
+                    return 1
+                fi
+                log_warn "Catchup fallback active (issue #1283): compacted_at=${compaction_age}s ago, catchup_started_at missing or stale — WFM freshness suppressed"
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
 }
 
 # Check if a boot/restart occurred within the last BOOT_GRACE_SECONDS.
@@ -903,23 +935,23 @@ check_outbox_drain() {
 }
 
 # Check 6: wait_for_messages freshness
-# The dispatcher is considered "fresh" if EITHER:
+# The dispatcher is considered "fresh" if ANY of:
 #   (a) the claude-heartbeat file was touched recently — inbox_server.py touches
 #       it at the start of every wait_for_messages call, OR
 #   (b) last_processed_at in lobster-state.json was updated recently — written
-#       by inbox_server.py on every successful mark_processed call (issue #694).
+#       by inbox_server.py on every successful mark_processed call (issue #694), OR
+#   (c) last_thinking_at in lobster-state.json was updated recently — written by
+#       hooks/thinking-heartbeat.py on every PostToolUse event (issue #1401).
 #
-# Using both signals prevents a spurious restart when the dispatcher is actively
-# processing a long batch of messages (e.g. 20 cron pings) without returning to
-# wait_for_messages.  Before this fix, a long batch could exhaust the suppression
-# window mid-batch, triggering a false-positive health-check restart even though
-# the dispatcher was busy and healthy.
+# Signals (b) and (c) together cover the full dispatcher lifecycle: (b) fires
+# during message processing batches; (c) fires during the reasoning phase (thinking,
+# composing, spawning subagents) when no WFM or mark_processed calls are made.
 #
-# The effective freshness timestamp is max(wfm_heartbeat_mtime, last_processed_at).
+# The effective freshness timestamp is max(wfm_heartbeat_mtime, last_processed_at,
+# last_thinking_at).
 #
 # Gracefully skips the check if the heartbeat file does not exist (fresh install).
-# Gracefully ignores a missing or unparseable last_processed_at (field absent on
-# older installs before this change was deployed).
+# Gracefully ignores missing or unparseable state file fields (backward compat).
 #
 # Returns: 0=GREEN (fresh or skipped), 2=RED (stale)
 check_wfm_freshness() {
@@ -935,11 +967,12 @@ check_wfm_freshness() {
         return 0
     fi
 
-    # Read the per-message heartbeat written by mark_processed (issue #694).
-    # Use whichever signal is more recent as the effective freshness epoch.
+    # Read per-message heartbeat (mark_processed, issue #694) and PostToolUse
+    # thinking heartbeat (issue #1401) from lobster-state.json.
     local last_processed_epoch=0
+    local last_thinking_epoch=0
     if [[ -f "$LOBSTER_STATE_FILE" ]]; then
-        local last_processed_at
+        local last_processed_at last_thinking_at
         last_processed_at=$(python3 -c "
 import json, sys
 try:
@@ -948,18 +981,35 @@ try:
 except Exception:
     print('')
 " 2>/dev/null)
+        last_thinking_at=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('$LOBSTER_STATE_FILE'))
+    print(d.get('last_thinking_at', ''))
+except Exception:
+    print('')
+" 2>/dev/null)
         if [[ -n "$last_processed_at" ]]; then
             last_processed_epoch=$(date -d "$last_processed_at" +%s 2>/dev/null) || last_processed_epoch=0
         fi
+        if [[ -n "$last_thinking_at" ]]; then
+            last_thinking_epoch=$(date -d "$last_thinking_at" +%s 2>/dev/null) || last_thinking_epoch=0
+        fi
     fi
 
-    # Effective freshness = most recent of the two signals
-    local effective_last
-    if [[ "$last_processed_epoch" -gt "$last_heartbeat" ]]; then
+    # Effective freshness = most recent of all three signals
+    local effective_last="$last_heartbeat"
+    local effective_source="WFM heartbeat"
+    if [[ "$last_processed_epoch" -gt "$effective_last" ]]; then
         effective_last="$last_processed_epoch"
-        log_info "WFM freshness: using last_processed_at signal (more recent than WFM heartbeat)"
-    else
-        effective_last="$last_heartbeat"
+        effective_source="last_processed_at"
+    fi
+    if [[ "$last_thinking_epoch" -gt "$effective_last" ]]; then
+        effective_last="$last_thinking_epoch"
+        effective_source="last_thinking_at"
+    fi
+    if [[ "$effective_source" != "WFM heartbeat" ]]; then
+        log_info "WFM freshness: using $effective_source signal (more recent than WFM heartbeat)"
     fi
 
     local now age
@@ -967,11 +1017,11 @@ except Exception:
     age=$(( now - effective_last ))
 
     if [[ $age -gt $WFM_STALE_SECONDS ]]; then
-        log_error "RED: dispatcher stale — last activity ${age}s ago (threshold: ${WFM_STALE_SECONDS}s, wfm=${last_heartbeat}, last_processed=${last_processed_epoch})"
+        log_error "RED: dispatcher stale — last activity ${age}s ago (threshold: ${WFM_STALE_SECONDS}s, wfm=${last_heartbeat}, last_processed=${last_processed_epoch}, last_thinking=${last_thinking_epoch})"
         return 2
     fi
 
-    log_info "WFM freshness OK: last dispatcher activity ${age}s ago"
+    log_info "WFM freshness OK: last dispatcher activity ${age}s ago (via $effective_source)"
     return 0
 }
 
@@ -1003,92 +1053,80 @@ check_disk() {
     return 0
 }
 
-# Check 8: Claude auth token expiry
-# Proactively warn before OAuth token expires so the user can re-auth.
+# Check 8: Claude auth token validity
+# Uses `claude auth status` as the single source of truth.
 #
-# FALSE POSITIVE GUARD: Claude refreshes OAuth tokens lazily — only when making
-# an actual API call, not when tools like `claude auth status` are run. This
-# means the expiresAt timestamp in the credentials file can appear stale even
-# though Claude is fully operational. To avoid false-positive alerts, we only
-# escalate to RED (and send a Telegram alert) after the token has shown as
-# expired or near-expired for AUTH_CONSECUTIVE_RED_THRESHOLD consecutive checks.
-# A single near-expiry reading is reported as YELLOW for monitoring purposes only.
+# Auth is managed via CLAUDE_CODE_OAUTH_TOKEN env var in lobster-config/config.env.
+# The token is passed directly to Claude Code — no credentials file is involved.
+# `claude auth status` is the authoritative check regardless
+# of how the token was provisioned.
 #
-# Returns: 0=GREEN, 1=YELLOW (< 4h remaining), 2=RED (confirmed expired/near-expiry)
+# RESTART GUARD: When AUTH RED is detected, do NOT restart Claude — restarting
+# cannot fix an auth problem and causes a crash loop. The auth_rc=2 check in
+# main() is deliberately NOT wired to do_restart(). Instead, we send an alert
+# and set YELLOW so the operator can intervene by updating CLAUDE_CODE_OAUTH_TOKEN
+# in config.env.
+#
+# Returns: 0=GREEN, 1=YELLOW (transient failure), 2=RED (confirmed not logged in)
 AUTH_FAILURE_COUNTER_FILE="$WORKSPACE_DIR/logs/auth-token-failures"
 AUTH_CONSECUTIVE_RED_THRESHOLD=3  # Must fail this many consecutive 4-min checks (~12 min total)
 
 check_auth_token() {
-    local creds_file="$HOME/.claude/.credentials.json"
+    # Single check: `claude auth status` is the authoritative source of truth.
+    # Auth is managed via CLAUDE_CODE_OAUTH_TOKEN env var in config.env.
+    # Unset CLAUDECODE/CLAUDE_CODE_ENTRYPOINT to avoid nested-session errors.
+    #
+    # NOTE: `claude auth status` outputs JSON by default. Do NOT pass
+    # --output-format json — that flag does not exist and causes an error,
+    # leaving auth_json empty and making the parse return "unknown" every run.
+    local auth_json
+    auth_json=$(env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
+        claude auth status 2>/dev/null)
 
-    # Option B: .credentials.json is the single canonical auth store.
-    # RED immediately if the file is missing — no fallback to env vars.
-    if [[ ! -f "$creds_file" ]]; then
-        log_error "AUTH RED: No credentials file at $creds_file — run 'claude auth login'"
-        rm -f "$AUTH_FAILURE_COUNTER_FILE"
-        return 2
-    fi
-
-    # Read token state: remaining seconds and whether a refresh token is present.
-    # A missing refresh_token means auto-refresh is disabled (Option B violation).
-    local remaining has_refresh
-    read -r remaining has_refresh < <(python3 -c "
-import json, time
+    local logged_in auth_method
+    logged_in=$(echo "$auth_json" | python3 -c "
+import json, sys
 try:
-    d = json.load(open('$creds_file'))
-    oauth = d.get('claudeAiOauth', {})
-    ea = oauth.get('expiresAt', 0) / 1000
-    has_rt = '1' if oauth.get('refreshToken') else '0'
-    print(f'{ea - time.time():.0f}', has_rt)
+    d = json.load(sys.stdin)
+    print('true' if d.get('loggedIn') else 'false')
 except:
-    print('-1', '0')
+    print('unknown')
+" 2>/dev/null)
+    auth_method=$(echo "$auth_json" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print(d.get('authMethod', 'unknown'))
+except:
+    print('unknown')
 " 2>/dev/null)
 
-    # No refresh token means this is a degraded credential set (e.g. from
-    # CLAUDE_CODE_OAUTH_TOKEN flow). Report RED immediately so the operator
-    # can run `claude auth login` to get a full credential set.
-    if [[ "${has_refresh:-0}" == "0" ]]; then
-        log_error "AUTH RED: credentials.json has no refresh_token — run 'claude auth login' to restore full OAuth"
-        rm -f "$AUTH_FAILURE_COUNTER_FILE"
-        return 2
-    fi
-
-    if [[ "${remaining:-0}" -lt 0 || "${remaining:-0}" -lt 3600 ]]; then
-        # Token is expired or expiring very soon — increment consecutive counter.
-        # With a refresh token present, Claude will auto-refresh on next API call,
-        # so we use the consecutive-failure guard to avoid false-positive alerts.
+    if [[ "$logged_in" == "false" ]]; then
+        # Confirmed not logged in — increment consecutive counter to avoid
+        # false positives from transient `claude auth status` failures.
         local failure_count=0
         if [[ -f "$AUTH_FAILURE_COUNTER_FILE" ]]; then
             failure_count=$(cat "$AUTH_FAILURE_COUNTER_FILE" 2>/dev/null || echo 0)
         fi
         failure_count=$((failure_count + 1))
         echo "$failure_count" > "$AUTH_FAILURE_COUNTER_FILE"
-
-        if [[ "${remaining:-0}" -lt 0 ]]; then
-            log_error "AUTH: Access token EXPIRED (refresh_token present; consecutive: $failure_count/$AUTH_CONSECUTIVE_RED_THRESHOLD)"
-        else
-            log_error "AUTH YELLOW: Access token expires in $((remaining / 60)) minutes (consecutive: $failure_count/$AUTH_CONSECUTIVE_RED_THRESHOLD)"
-        fi
-
-        # Only return RED after consecutive failures — Claude refreshes lazily on
-        # actual API calls, so the file may show stale expiry while Claude is healthy.
+        log_error "AUTH RED: claude auth status reports loggedIn=false (consecutive: $failure_count/$AUTH_CONSECUTIVE_RED_THRESHOLD) — check CLAUDE_CODE_OAUTH_TOKEN in config.env"
         if [[ $failure_count -ge $AUTH_CONSECUTIVE_RED_THRESHOLD ]]; then
             rm -f "$AUTH_FAILURE_COUNTER_FILE"
             return 2
         else
             return 1
         fi
-    elif [[ "${remaining:-0}" -lt 14400 ]]; then
-        # Token healthy but within 4-hour warning window: reset counter, stay YELLOW
-        rm -f "$AUTH_FAILURE_COUNTER_FILE"
-        log_warn "AUTH YELLOW: Access token expires in $((remaining / 3600))h (refresh_token OK)"
+    elif [[ "$logged_in" == "unknown" ]]; then
+        # Could not parse output — treat as transient and log a warning
+        log_warn "AUTH YELLOW: could not parse 'claude auth status' output — treating as transient"
         return 1
-    else
-        # Token is healthy and refresh token present: full GREEN
-        rm -f "$AUTH_FAILURE_COUNTER_FILE"
-        log_info "AUTH OK: Access token expires in $((remaining / 3600))h, refresh_token present"
-        return 0
     fi
+
+    # Logged in — reset failure counter and report GREEN.
+    rm -f "$AUTH_FAILURE_COUNTER_FILE"
+    log_info "AUTH OK: loggedIn=true via $auth_method (CLAUDE_CODE_OAUTH_TOKEN)"
+    return 0
 }
 
 # Check 9: Dashboard server - silently restart if not listening on port 9100
@@ -2137,9 +2175,16 @@ main() {
     check_auth_token
     local auth_rc=$?
     if [[ $auth_rc -eq 2 ]]; then
-        # Token expired or expiring very soon — log only, no Telegram alert.
-        # Claude refreshes tokens lazily; if it truly can't work, the stale
-        # inbox check will catch it and escalate via that path instead.
+        # Auth confirmed RED (loggedIn=false after consecutive checks).
+        # IMPORTANT: Do NOT pass this to do_restart(). Restarting Claude
+        # cannot fix an auth problem and causes a crash loop. Instead:
+        # - Alert via Telegram so the operator knows manual action is needed
+        # - Keep level at YELLOW (not RED) so do_restart() is never invoked
+        #   for auth failures alone
+        send_telegram_alert_deduped "auth-expired" "Lobster: Claude auth expired (loggedIn=false confirmed after consecutive checks).
+
+Restarting will NOT fix this. Manual action required:
+ssh into the server and run: claude auth login"
         if [[ "$level" != "RED" ]]; then
             level="YELLOW"
         fi

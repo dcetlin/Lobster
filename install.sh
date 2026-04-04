@@ -1618,6 +1618,30 @@ else
     info "Skipping context-monitor hook (settings.json not yet created)"
 fi
 
+# Set up Claude Code PostToolUse hook to write a thinking heartbeat to lobster-state.json.
+# Fires on every tool call — any tool use means the dispatcher is alive, so no matcher
+# filtering is needed. The health check reads last_thinking_at to avoid false-positive
+# restarts during long reasoning/subagent-spawning phases (issue #1401).
+chmod +x "$INSTALL_DIR/hooks/thinking-heartbeat.py" || true
+if [ -f "$CLAUDE_SETTINGS" ]; then
+    if ! jq -e '.hooks.PostToolUse[]? | select(.hooks[]?.command | contains("thinking-heartbeat"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
+        TMP_SETTINGS=$(mktemp)
+        jq '.hooks.PostToolUse = (.hooks.PostToolUse // []) + [{
+            "matcher": "",
+            "hooks": [{
+                "type": "command",
+                "command": "python3 '"$INSTALL_DIR"'/hooks/thinking-heartbeat.py",
+                "timeout": 5
+            }]
+        }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+        success "thinking-heartbeat hook installed"
+    else
+        info "thinking-heartbeat hook already configured in Claude Code settings"
+    fi
+else
+    info "Skipping thinking-heartbeat hook (settings.json not yet created)"
+fi
+
 # Set up Claude Code PreToolUse hook to block tool use after compaction without context reload.
 # Uses a shell wrapper so Python is only spawned when the sentinel file exists (~1% of calls).
 # On the 99%+ of calls where the sentinel is absent, `test ! -f ...` exits in ~1ms with no
@@ -2424,19 +2448,18 @@ if [ "$AUTH_METHOD" = "oauth" ] && [ "$EXISTING_OAUTH" != true ]; then
         echo "Claude Code will generate an authentication URL."
         echo -e "Open it in ${BOLD}any browser${NC} (phone, laptop, etc.) and sign in with your Anthropic account."
         echo ""
-        echo "This writes credentials to ~/.claude/.credentials.json, which supports"
-        echo "automatic token refresh — no manual token management required."
+        echo "Claude Code will authenticate and write an OAuth token."
+        echo "For headless servers, we recommend claude setup-token (captures CLAUDE_CODE_OAUTH_TOKEN)."
+        echo "claude auth login also works if you can complete the browser flow."
         echo ""
         read -p "Press Enter to continue..."
         echo ""
 
-        # --- auth login (all environments) ---
-        # Option B: always use `claude auth login`, which saves a full OAuth credential
-        # set (including refresh_token) to ~/.claude/.credentials.json. This enables
-        # Claude Code's built-in token refresh — no CLAUDE_CODE_OAUTH_TOKEN env var needed.
-        #
-        # Both headless and desktop environments work: auth login displays a URL and
-        # polls for the callback automatically, so no browser needs to be open locally.
+        # --- auth login ---
+        # `claude auth login` completes an OAuth handshake via browser URL.
+        # On headless servers, prefer `claude setup-token` which captures the
+        # token to CLAUDE_CODE_OAUTH_TOKEN in config.env for env-var-based auth.
+        # Both approaches are supported; `claude auth status` is the check.
         if script -qc "claude auth login" /dev/null; then
             if claude --print -p "ping" --max-turns 1 &>/dev/null 2>&1; then
                 success "OAuth authentication successful (verified)!"

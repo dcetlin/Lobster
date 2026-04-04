@@ -33,7 +33,7 @@ When you first start (or after reading this file), follow these steps:
 1. Call `session_start(agent_type='dispatcher', claude_session_id=hook_input["session_id"])` — pass the Claude session UUID injected by the SessionStart hook. This writes the UUID to `$LOBSTER_WORKSPACE/data/dispatcher-claude-session-id`, enabling `inject-bootup-context.py` to identify your session as the dispatcher and inject this file on future restarts. Without this call, the primary detection path is never populated and you will receive the subagent bootup file instead of this one.
 1a. Read `~/lobster-user-config/memory/canonical/handoff.md` — user context, active projects, key people, git rules, available integrations.
 2. Read `~/lobster-workspace/user-model/_context.md` if it exists — pre-computed summary of user values, preferences, and active projects. Skip if absent.
-2a. Create a new session file inline (see Session File Management). Store its path as `current_session_file`.
+2a. Create a new session file inline (see Session File Management). Store its path as `current_session_file`. Immediately after copying the template, write the session's start timestamp and set `Messages processed: 0` and `End reason: active` — this makes the file recoverable even if the session ends before any subagent writes to it.
 2b. Call `list_rules(enabled_only=true)` to load IFTTT behavioral rules into working context.
 2c. Check `~/lobster-workspace/data/context-handoff.json`:
     - If **recent** (< 10 min, based on `triggered_at`): read `context_pct`, `pending_tasks`, `last_user_message`. Notify user: "Restarted — context was at {context_pct}%. Resuming from where we left off." Re-queue any stuck messages from `~/messages/processing/`. Delete the file.
@@ -53,6 +53,12 @@ with open(ack_path) as f:
 The symlink `~/.claude/` resolves to `~/lobster/.claude/` on standard installs.
 
 3. Run `~/lobster/scripts/record-catchup-state.sh start` (suppresses WFM freshness check for 15 min).
+3b. **Claim any pending user messages immediately** to stop the health-check staleness clock:
+    - Call `check_inbox()` to get any messages currently waiting in the inbox
+    - For each message that is NOT a system message (i.e. `chat_id != 0` and `source != "system"`): call `mark_processing(message_id)`
+    - Do NOT process, reply to, or act on these messages yet — just claim them
+    - They will be returned by `wait_for_messages()` at step 5 and processed normally
+    - Rationale: `mark_processing()` moves messages from `inbox/` to `processing/`, stopping the health check's inbox-age clock. Without this step, messages that arrived during a long bootup sequence (compact-catchup can take 4–10 min) will exceed the 240s staleness threshold and trigger a false-positive health-check restart.
 4. Spawn the `compact-catchup` agent in the background with `task_id: startup-catchup` and `chat_id: 0`. See agent definition at `.claude/agents/compact-catchup.md` for the full prompt — pass it with `task_id: startup-catchup` instead of `compact-catchup`. **Never do catchup inline — it violates the 7-second rule.**
 5. Call `wait_for_messages()` to start listening.
 6. **Triage before acting on queued messages at startup**: read ALL queued messages first, identify anything risky (e.g. large audio transcription that could cause OOM), skip or defer those, then process safe ones.
@@ -63,7 +69,28 @@ The symlink `~/.claude/` resolves to `~/lobster/.claude/` on standard installs.
 - New tasks: ack normally and spawn subagent. These are unambiguously new work.
 - Urgent messages: handle them. You have handoff.md for context.
 
-**When the startup catchup result arrives** (`task_id: "startup-catchup"`, `chat_id: 0`): read for situational awareness, update `handoff.md` if anything notable changed (failed subagents, open threads). Run `~/lobster/scripts/record-catchup-state.sh finish`. Do NOT relay to user — except if `LOBSTER_DEBUG=true`, send a brief status to ADMIN_CHAT_ID: `"🔄 Back online. Context recovered from [window_start] to [now]. [N messages] processed, [M subagents] were running."` (Fill in N and M from `msg["text"]`.) **Before composing this message, convert `[window_start]` and `[now]` from UTC ISO timestamps to ET (e.g. "5:29 AM ET"). Rule: EDT (UTC-4) mid-March through early November, EST (UTC-5) otherwise. Never send raw UTC ISO strings to the user.** Then `mark_processed`.
+**When the startup catchup result arrives** (`task_id: "startup-catchup"`, `chat_id: 0`): read for situational awareness, update `handoff.md` if anything notable changed (failed subagents, open threads). Run `~/lobster/scripts/record-catchup-state.sh finish`. Do NOT relay to user — except if `LOBSTER_DEBUG=true`, send the post-bootup status message below. Then `mark_processed`.
+
+**Post-bootup status message (LOBSTER_DEBUG=true only):** Send to ADMIN_CHAT_ID. Keep to 5-8 lines, mobile-friendly. Build it from `handoff.md` (just read for startup) and `msg["text"]` (the catchup summary). Format:
+
+```
+🦞 Back online — [session_id], started [start_time ET]
+Recovery: [clean restart | context gap of ~Xm recovered]
+Catchup window: [window_start ET] → now — [N] msgs, [M] subagents
+
+PRs needing sign-off: [count] ([list first 2-3 PR numbers])
+Open tasks/commitments: [count]
+[If any URGENT/blocked items:] ⚠️ Urgent: [first item, ~60 chars max]
+```
+
+Fill in:
+- `session_id` from `current_session_file` (e.g. `20260331-009`)
+- `start_time ET` from session file — omit the `started [time]` clause entirely if session file is absent
+- `clean restart` if `compaction-state.json` gap was ≤15s; otherwise `context gap of ~Xm recovered` (X = gap in minutes)
+- N and M from `msg["text"]` (the catchup result)
+- PR count and numbers from handoff.md "PRs needing sign-off" section
+- Task/commitment count from handoff.md — omit if handoff is absent; do NOT call `list_tasks` as a fallback
+- URGENT line only if handoff contains items marked URGENT or blocked — omit entirely if none
 
 ---
 
@@ -141,13 +168,14 @@ Note: The Telegram bot sends "📨 Message received. Processing..." automaticall
    # Atomically: moves message inbox/ → processing/ AND sends the ack.
    # If return starts with "Warning:": claim succeeded, ack failed — proceed normally.
 2. Generate a short task_id (e.g. "fix-pr-475", "upstream-check")
-3. Task(
+3. Write in-flight entry (see "In-flight work tracking" below)
+4. Task(
        prompt="---\ntask_id: <task_id>\nchat_id: <chat_id>\nsource: <source>\n---\n\n...",
        subagent_type="...",
        run_in_background=true
    )
-4. mark_processed(message_id)
-5. Return to wait_for_messages() IMMEDIATELY
+5. mark_processed(message_id)
+6. Return to wait_for_messages() IMMEDIATELY
 ```
 
 Agent registration is fully automatic — a PostToolUse hook fires after each Task call. You do not need to call `register_agent`.
@@ -155,11 +183,32 @@ Agent registration is fully automatic — a PostToolUse hook fires after each Ta
 **Alternative (no ack needed):**
 ```
 1. mark_processing(message_id)
-2. ... spawn subagent ...
-3. mark_processed(message_id)
+2. Write in-flight entry (see "In-flight work tracking" below)
+3. ... spawn subagent ...
+4. mark_processed(message_id)
 ```
 
 Use `get_active_sessions` to answer "what agents are running?" at any time — accurate even across restarts.
+
+---
+
+## In-Flight Work Tracking
+
+Before calling the Agent tool to spawn any background subagent, append a JSON line to `~/lobster-workspace/data/inflight-work.jsonl` (create the file if it doesn't exist):
+
+```json
+{"task_id": "<task_id>", "type": "<task type>", "description": "<brief description>", "started_at": "<ISO UTC timestamp>", "chat_id": <chat_id>, "status": "running"}
+```
+
+This is a **synchronous write on the main thread** — it must complete before the Agent call. Use a Bash append: `echo '<json>' >> ~/lobster-workspace/data/inflight-work.jsonl`. Do not spawn a subagent for this write.
+
+**On SUBAGENT_RESULT**: immediately after `mark_processing` (before any branching), append a completion line. This fires for ALL result paths -- sent_reply_to_user, silent-drop, engineer→reviewer routing, and relay. "done" means the result arrived at the dispatcher -- not that the user has received the relay:
+
+```json
+{"task_id": "<task_id>", "completed_at": "<ISO UTC timestamp>", "status": "done"}
+```
+
+The log is append-only. A task is "done" if any entry with the same `task_id` has `"status": "done"`. Entries with `"status": "running"` and no corresponding `"status": "done"` entry are in-flight.
 
 ---
 
@@ -181,6 +230,8 @@ To clear the gate: call `mcp__lobster-inbox__wait_for_messages(confirmation='LOB
 - Do NOT call `send_reply` for these — there is no user to reply to
 - `mark_processed` after reading and acting on the content
 
+**Upgrade messages** (`type: "system"`, text starts with "System upgrade:"): these arrive when `git pull` fires the `.githooks/post-merge` hook. A local-dev rebuild merging many PRs can produce 10+ identical messages in rapid succession. Process each one with `mark_processed` silently — no subagent needed, no relay. If you see a burst of identical upgrade messages, that is expected behavior during a local-dev rebuild (rate-limited in PR #1236 but not yet always merged).
+
 ---
 
 ## Message Handlers
@@ -193,8 +244,10 @@ After a context compaction you lose situational awareness of the last ~30 minute
 
 > **MANDATORY: You MUST spawn compact-catchup before doing any other work after a compaction. Do not skip compact-catchup even if the in-conversation summary appears sufficient. The summary only covers pre-compaction context; compact-catchup also checks for in-flight subagent state and recently-returned results that the summary cannot know about.**
 
+> **CRITICAL — never batch the compact-reminder with other messages.** If `0_compact` arrives alongside other messages in the same WFM batch, handle the compact-reminder first (steps 1–7 below), return to `wait_for_messages()`, and the other messages will be waiting in the next cycle. Batching the compact-reminder with other work causes `record-catchup-state.sh start` to be skipped or forgotten, which disables WFM freshness suppression and causes a spurious health-check restart after ~10 minutes (issue #1283).
+
 ```
-1. mark_processing(message_id)
+1. mark_processing(message_id)  <- compact-reminder ONLY, not other messages
 2. Read the compact-reminder text to re-orient (identity, main loop, key files)
 2.5. Send a random ack message to admin chat (see **Selecting the ack message** in the Startup Behavior section):
    - Pick with `random.choice()` from `~/.claude/compact-ack-messages.json`
@@ -204,7 +257,7 @@ After a context compaction you lose situational awareness of the last ~30 minute
    - See .claude/agents/session-note-polish.md for the agent definition
    - Pass: task_id: "session-note-polish", chat_id: 0, source: "system", current_session_file: <path>, MESSAGE_COUNT: <current message count>
    - Do NOT wait for it — spawn and immediately proceed to step 4
-4. Run: ~/lobster/scripts/record-catchup-state.sh start
+4. Run: ~/lobster/scripts/record-catchup-state.sh start  <- MANDATORY, arms WFM suppression
 5. Spawn compact_catchup subagent (subagent_type: "compact-catchup", run_in_background=True):
    - See .claude/agents/compact-catchup.md for the full prompt
    - Pass task_id: "compact-catchup", chat_id: 0, source: "system"
@@ -241,7 +294,49 @@ Scheduled reminders arrive from `scheduled-tasks/dispatch-job.sh` (user-created 
 3. task_content = msg.get("task_content", "").strip()
 
 4. if task_content:
-       # Generic dispatch: user-created job
+       # --- CLEANUP / DELETE JOB NAME GUARD (runs before prompt construction) ---
+       # Jobs whose names include 'cleanup', 'clean-up', 'delete', or 'purge' are
+       # potentially destructive. Require explicit human confirmation before dispatching.
+       # This prevents a repeat of the 2026-03-31 incident where a dynamically-spawned
+       # log-cleanup subagent deleted 220 MB of permanent runtime data.
+       # Note: Rule 2 fires on job name only — jobs that delete files but have benign
+       # names are caught by Rule 1 when their result arrives.
+       DESTRUCTIVE_JOB_KEYWORDS = ["cleanup", "clean-up", "delete", "purge"]
+       is_destructive_job_name = any(k in reminder_type.lower() for k in DESTRUCTIVE_JOB_KEYWORDS)
+       if is_destructive_job_name:
+           # Surface the job request to the user for approval before running it.
+           # Early return: do NOT construct or dispatch a prompt for this job yet.
+           import os
+           admin_chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "0")
+           send_reply(
+               chat_id=admin_chat_id,
+               text=(
+                   f"A scheduled job named '{reminder_type}' is queued. "
+                   f"This name suggests destructive operations (cleanup/delete/purge).\n\n"
+                   f"Task preview:\n{task_content[:400]}\n\n"
+                   f"Do you want to run this job?"
+               ),
+               source="telegram",
+               buttons=[
+                   [
+                       {"text": "Run it", "callback_data": f"job-confirm-yes-{reminder_type}"},
+                       {"text": "Cancel", "callback_data": f"job-confirm-no-{reminder_type}"},
+                   ]
+               ],
+           )
+           # Park the task content so the callback can dispatch it after confirmation.
+           memory_store(
+               content=task_content,
+               metadata={
+                   "type": "pending-destructive-job",
+                   "job_name": reminder_type,
+                   "chat_id": admin_chat_id,
+               },
+           )
+           mark_processed(message_id)
+           continue  # ← explicit early exit — prompt construction never reached
+
+       # Generic dispatch: user-created job (non-destructive name)
        prompt = f"---\ntask_id: scheduled-job-{reminder_type}\nchat_id: 0\nsource: system\n---\n\n{task_content}"
    else:
        # Unknown reminder with no task content
@@ -280,6 +375,12 @@ Background subagents call `write_result(task_id, chat_id, text, ...)`, which dro
 
 ```
 1. mark_processing(message_id)
+   # Immediately write done entry -- fires for ALL subagent results regardless of relay path.
+   # "done" means the result arrived at the dispatcher, not that the user has received the relay.
+   if msg.get("task_id"):
+       task_id = msg["task_id"]
+       completed_at = datetime.utcnow().isoformat() + "Z"
+       Bash(f'echo \'{{"task_id": "{task_id}", "completed_at": "{completed_at}", "status": "done"}}\' >> ~/lobster-workspace/data/inflight-work.jsonl')
 
 2. if msg.get("sent_reply_to_user") == True:
        mark_processed(message_id)
@@ -295,6 +396,52 @@ Background subagents call `write_result(task_id, chat_id, text, ...)`, which dro
            mark_processed(message_id)
            continue  # nothing to relay
 
+       # --- DELETION INTERCEPT GUARD ---
+       # Note: deletion intercept fires before engineer→reviewer routing.
+       # Before relaying any subagent result to the user, check whether the result
+       # reports deleting, removing, purging, or cleaning up files under protected paths.
+       # If so, do NOT silently relay — intercept and require explicit user confirmation.
+       #
+       # Protected path families (matched case-insensitively):
+       DELETION_VERBS = ["deleted", "removed", "cleaned up", "purged", "wiped", "rm "]
+       PROTECTED_PATHS = ["logs/", "messages/", "audio/", "processed/", "lobster-workspace/"]
+       has_deletion_verb = any(v in text_lower for v in DELETION_VERBS)
+       has_protected_path = any(p in text_lower for p in PROTECTED_PATHS)
+       already_confirmed = msg.get("deletion_confirmed") == True  # set by callback handler after YES
+       #
+       if has_deletion_verb and has_protected_path and not already_confirmed:
+           # Intercept: show summary to user and ask for explicit confirmation.
+           # Do NOT act on or relay the subagent's text until the user approves.
+           excerpt = msg["text"][:600]
+           task_id_slug = msg.get("task_id", "unknown")
+           send_reply(
+               chat_id=msg["chat_id"],
+               text=(
+                   f"A subagent reported deleting or removing files under a protected path.\n\n"
+                   f"Summary:\n{excerpt}\n\n"
+                   f"Do you want to accept this result, or discard it?"
+               ),
+               source=msg.get("source", "telegram"),
+               buttons=[
+                   [
+                       {"text": "Accept", "callback_data": f"delete-confirm-yes-{task_id_slug}"},
+                       {"text": "Discard", "callback_data": f"delete-confirm-no-{task_id_slug}"},
+                   ]
+               ],
+           )
+           # Park the full result text in memory so the callback handler can retrieve it.
+           memory_store(
+               content=msg["text"],
+               metadata={
+                   "type": "pending-deletion-result",
+                   "task_id": task_id_slug,
+                   "chat_id": msg["chat_id"],
+                   "source": msg.get("source", "telegram"),
+               },
+           )
+           mark_processed(message_id)
+           continue
+
        # --- ENGINEER → REVIEWER routing ---
        pr_url_match = re.search(r"https://github\.com/.*/pull/\d+", msg["text"])
        if pr_url_match:
@@ -309,7 +456,7 @@ Background subagents call `write_result(task_id, chat_id, text, ...)`, which dro
                mark_processed(message_id)
            else:
                Task(
-                   subagent_type="general-purpose",
+                   subagent_type="lobster-generalist",
                    run_in_background=True,
                    prompt=(
                        f"---\ntask_id: {reviewer_task_id}\nchat_id: {msg['chat_id']}\n"
@@ -464,22 +611,65 @@ Triage heuristic: relay failures always; relay successes with actionable finding
 
 ---
 
+### consolidation (`type: "consolidation"`)
+
+`scripts/nightly-consolidation.sh` runs at 3 AM UTC via cron and writes a `consolidation` message to the inbox. This triggers a background subagent to synthesize recent memory events into the canonical memory files.
+
+```
+1. mark_processing(message_id)
+
+2. Spawn nightly-consolidation subagent (run_in_background=True):
+
+   consolidation_task_id = f"nightly-consolidation-{msg['id']}"
+
+   Task(
+       subagent_type="nightly-consolidation",
+       run_in_background=True,
+       prompt=(
+           f"---\n"
+           f"task_id: {consolidation_task_id}\n"
+           f"chat_id: 0\n"
+           f"source: system\n"
+           f"---\n\n"
+           f"Nightly consolidation triggered at {msg.get('timestamp', 'unknown time')}.\n\n"
+           f"Synthesize recent memory events into the canonical memory files. "
+           f"See your agent instructions for the full step-by-step procedure."
+       ),
+   )
+
+3. mark_processed(message_id)
+   # Return to wait_for_messages() immediately -- the subagent handles synthesis
+```
+
+Rules:
+- Never inline consolidation work -- always a background subagent
+- Subagent result (`task_id` starts with `nightly-consolidation-`) is internal -- mark processed silently, do not relay to user
+- `source` is `"internal"`, `chat_id` is `0` -- there is no user to notify
+
+---
+
 ### context_warning (`type: "context_warning"`)
 
 Written by `hooks/context-monitor.py` when context window >= 70%.
 
 ```
 1. mark_processing(message_id)
-2. Enter wind-down mode:
+2. Write a tombstone to the current session file (inline, no subagent needed — this is fast):
+   - Set Ended to current UTC ISO timestamp
+   - Set Messages processed to the count of messages handled this session (tracked in working context as MESSAGE_COUNT)
+   - Set End reason to "context_warning"
+   - Set Summary to "Graceful wind-down triggered at {context_pct}% context. [Brief list of what was in progress, if anything.]"
+   This ensures the session file is recoverable even if nothing else was written during this session.
+3. Enter wind-down mode:
    - Set WIND_DOWN_MODE = True
    - Do NOT spawn new non-trivial subagents
    - For new user messages: ack, create_task to record, tell user "Compacting context shortly — will pick this up after."
-3. Drain in-flight agents: poll get_active_sessions() every 10s. Process arriving subagent results normally.
-4. Write ~/lobster-workspace/data/context-handoff.json:
+4. Drain in-flight agents: poll get_active_sessions() every 10s. Process arriving subagent results normally.
+5. Write ~/lobster-workspace/data/context-handoff.json:
    {"triggered_at": "<iso8601>", "context_pct": <pct>, "pending_tasks": <list>, "last_user_message": "<text>", "note": "Graceful wind-down"}
-5. Send user (use admin chat_id from config): "Context at {pct}% — entering wind-down mode. Handing off cleanly."
-6. Stop the main loop — do NOT call wait_for_messages() again. Claude Code will compact naturally.
-7. mark_processed(message_id)
+6. Send user (use admin chat_id from config): "Context at {pct}% — entering wind-down mode. Handing off cleanly."
+7. Stop the main loop — do NOT call wait_for_messages() again. Claude Code will compact naturally.
+8. mark_processed(message_id)
 ```
 
 Rules: `chat_id` is 0 — use admin chat_id for step 5. Never re-enter wind-down for a second warning. Do NOT call `lobster restart` — compaction is the recovery mechanism.
@@ -530,7 +720,72 @@ Always pass the correct `source` parameter to `send_reply` — Telegram and Slac
 
 If `reacted_to_text` is empty: use `get_conversation_history` to get context.
 
-**Button callbacks** (`type: "callback"`): respond with a confirmation, no ack needed.
+**Button callbacks** (`type: "callback"`): handle by `callback_data` prefix, no ack needed.
+
+```
+1. mark_processing(message_id)
+2. data    = msg.get("callback_data", "")
+   chat_id = msg.get("chat_id")
+   source  = msg.get("source", "telegram")
+
+3. if data.startswith("delete-confirm-yes-"):
+       task_id_slug = data.removeprefix("delete-confirm-yes-")
+       # Retrieve the parked result from memory by task_id.
+       results = memory_search(query=f"pending-deletion-result {task_id_slug}", limit=5)
+       parked  = next((r for r in results if r.get("metadata", {}).get("task_id") == task_id_slug), None)
+       if parked:
+           pr_url_match = re.search(r"https://github\.com/.*/pull/\d+", parked["content"])
+           if pr_url_match:
+               # Engineer→reviewer path: spawn reviewer, do NOT send inline to user.
+               pr_url    = pr_url_match.group(0)
+               pr_parts  = pr_url.rstrip("/").split("/")
+               pr_number = pr_parts[-1]
+               pr_repo   = f"{pr_parts[-4]}/{pr_parts[-3]}"
+               reviewer_task_id = f"review-delete-confirmed-{task_id_slug}"
+               Task(
+                   subagent_type="lobster-generalist",
+                   run_in_background=True,
+                   prompt=(
+                       f"---\ntask_id: {reviewer_task_id}\nchat_id: {chat_id}\nsource: {source}\n---\n\n"
+                       f"Review PR {pr_url} and post findings:\n"
+                       f"  gh pr review <N> --repo {pr_repo} --comment --body \"PASS/NEEDS-WORK/FAIL: ...\"\n"
+                       f"Use --comment only (never --approve or --request-changes).\n"
+                       f"After posting, call write_result with a short verdict (1-3 sentences).\n\n"
+                       f"Engineer\'s briefing:\n{parked[\'content\']}"
+                   ),
+               )
+               send_reply(chat_id=chat_id, text="Deletion confirmed — spawning reviewer.", source=source)
+           else:
+               send_reply(chat_id=chat_id, text=parked["content"], source=source)
+               send_reply(chat_id=chat_id, text="Deletion confirmed and result relayed.", source=source)
+       else:
+           send_reply(chat_id=chat_id, text="Could not find parked result — it may have expired.", source=source)
+
+4. elif data.startswith("delete-confirm-no-"):
+       # Discard: the parked memory entry will expire naturally.
+       send_reply(chat_id=chat_id, text="Deletion discarded.", source=source)
+
+5. elif data.startswith("job-confirm-yes-"):
+       job_name = data.removeprefix("job-confirm-yes-")
+       results  = memory_search(query=f"pending-destructive-job {job_name}", limit=5)
+       parked   = next((r for r in results if r.get("metadata", {}).get("job_name") == job_name), None)
+       if parked:
+           task_content = parked["content"]
+           prompt = f"---\ntask_id: scheduled-job-{job_name}\nchat_id: 0\nsource: system\n---\n\n{task_content}"
+           Task(subagent_type="lobster-generalist", run_in_background=True, prompt=prompt)
+           send_reply(chat_id=chat_id, text=f"Job \'{job_name}\' dispatched.", source=source)
+       else:
+           send_reply(chat_id=chat_id, text="Could not find parked job content — it may have expired.", source=source)
+
+6. elif data.startswith("job-confirm-no-"):
+       job_name = data.removeprefix("job-confirm-no-")
+       send_reply(chat_id=chat_id, text="Job cancelled.", source=source)
+
+7. else:
+       send_reply(chat_id=chat_id, text=f"Unknown callback: {data}", source=source)
+
+8. mark_processed(message_id)
+```
 
 ### Telegram-specific
 
@@ -547,6 +802,41 @@ If `reacted_to_text` is empty: use `get_conversation_history` to get context.
 ### Group chat (`source: "lobster-group"`)
 
 Messages from whitelisted Telegram groups arrive with `source="lobster-group"`. Process them exactly like `source="telegram"` messages — `send_reply` accepts `source="lobster-group"` and will route the reply back to the originating group chat. The `group_chat_id` and `group_title` fields are present for context but `chat_id` is always the correct field to pass to `send_reply`. No ack message is sent to groups (suppressed in the bot); the bot replies directly when Lobster calls `send_reply`.
+
+### Bot-talk (`source: "bot-talk"`)
+
+Messages from other Lobster instances arrive with `source="bot-talk"`. These are written to `~/messages/inbox/` by the `lobstertalk-unified` scheduled job.
+
+Route them directly to the owner's Telegram as a formatted notification:
+
+```
+text = f"📨 From {msg['from']} via LobsterTalk:\n\n{msg['text']}"
+send_reply(
+    chat_id=8305714125,  # ADMIN_CHAT_ID
+    source="telegram",
+    text=text,
+    reply_to_message_id=msg.get("telegram_message_id"),
+)
+```
+
+The `from` field carries sender identity (e.g. `"AlbertLobster"`). The `chat_id` in the inbox message is always `8305714125` (the owner's Telegram ID) — do not use any other value for routing.
+
+---
+
+## PreToolUse Hooks (send_reply)
+
+### Link-checker hook (`hooks/link-checker.py`)
+
+A PreToolUse hook fires before every `send_reply` call. It blocks (exit 2) if **both** conditions are true:
+1. The message text references a PR or issue number (e.g. "PR #123", "issue #456")
+2. The message contains no clickable link — no `[text](url)` markdown or bare `https://` URL
+
+**Rule:** When sending a reply that mentions completing work on a PR or issue, always include the full GitHub URL.
+
+- Bad: "Done — opened PR #1236."
+- Good: "Done — opened PR #1236: https://github.com/SiderealPress/lobster/pull/1236"
+
+If a `send_reply` is blocked by this hook, reformulate with a clickable link and retry. The hook does NOT fire for messages that mention PR/issue numbers in passing without completion language.
 
 ---
 
@@ -603,7 +893,11 @@ One session note file per session. Lives in `~/lobster-user-config/memory/canoni
 1. List the directory, find highest sequence number for today. If none, start at 001.
 2. Copy `session.template.md` to the new path.
 3. Replace `Started` placeholder with current UTC ISO timestamp.
-4. Store full path as `current_session_file`.
+4. Replace `Messages processed` placeholder with `0`.
+5. Replace `End reason` placeholder with `active`.
+6. Store full path as `current_session_file`.
+
+> **Why this matters:** The session file is created at startup but subagent writes only happen when real work occurs. If the session ends before any subagent writes (crash, rapid restart, short session), the file stays as a template stub — useless for recovery. Writing minimal tombstone metadata at creation time (start time, messages=0, reason=active) means even a 30-second session leaves a partially recoverable record. Subsequent updates fill in the rest.
 
 **When to update** (via background `lobster-generalist` subagent — never inline):
 - A subagent result arrives with non-trivial content (PR opened, task completed, error)
@@ -626,6 +920,16 @@ Steps: 1. Read the file. 2. Update Open Threads, Open Tasks, Open Subagents, Not
 Do not modify Summary or Started/Ended. 3. Write back. 4. Call write_result.
 ```
 
+**Tombstone on session end (unconditional):** Whenever the session ends for any reason, write a tombstone update to the session file before stopping. This is done inline (not via subagent) and takes <1 second. Minimum content:
+- `Ended`: current UTC ISO timestamp
+- `Messages processed`: MESSAGE_COUNT (tracked in working context; increment on each `mark_processed` call)
+- `End reason`: one of `graceful wind-down`, `context_warning`, `short session`, `crash` (use `short session` if session ran < 5 minutes and no reason is known)
+- `Summary`: at minimum, "Session ended [reason]. [N] messages processed." — fill in more if context permits.
+
+This rule is unconditional — even if the session processed zero messages, the tombstone must be written. A stub file with only a start timestamp is nearly as bad as no file at all.
+
+**MESSAGE_COUNT tracking:** On startup, initialize `MESSAGE_COUNT = 0` in working context. Increment it each time you call `mark_processed(message_id)` for a real user message (not system messages like `session_note_reminder`).
+
 **Periodic snapshots:** Triggered by `session_note_reminder` (every 20 user messages). Spawn `session-note-appender` (see `.claude/agents/session-note-appender.md`) with `current_session_file`, a list of recent activity visible in working context, `in_flight` (running subagents with elapsed time), and `pending_responses` (claimed but unanswered messages).
 
 **Pre-compaction polish:** On `compact-reminder`, spawn `session-note-polish` (see `.claude/agents/session-note-polish.md`) with `current_session_file` before spawning compact_catchup. When passing context to `session-note-polish`, include:
@@ -633,7 +937,7 @@ Do not modify Summary or Started/Ended. 3. Write back. 4. Call write_result.
 - Any pending user responses (messages that were mark_processing-d but not yet replied to)
 - The current MESSAGE_COUNT at time of compaction
 
-**On context_warning:** Spawn a session note update subagent as the very first step — captures current state before graceful restart erases working context.
+**On context_warning:** Write a tombstone inline as step 2 (see context_warning handler above) — this is faster and more reliable than spawning a subagent, and ensures the record survives even if wind-down is interrupted.
 
 ---
 
@@ -860,6 +1164,55 @@ update_task(task_id, status="pending", description="<original>\n\n[Stalled: <rea
 
 - Keep the list short — periodically delete old completed tasks.
 - Do NOT create tasks for instant inline responses. Tasks are for delegated subagent work >30 seconds.
+
+---
+
+## Deletion Safety Guard
+
+Two hard rules prevent a repeat of the 2026-03-31 incident (stored prompt caused 220 MB of permanent
+runtime data to be deleted without user confirmation):
+
+### Rule 1 — Subagent result intercept
+
+Before relaying any subagent result to the user, the `subagent_result` handler checks whether the
+result text reports deletions or removals under protected paths. Detection uses two parallel signal
+sets:
+
+**Deletion verbs** (case-insensitive): `deleted`, `removed`, `cleaned up`, `purged`, `wiped`, `rm `
+
+**Protected path families**: `logs/`, `messages/`, `audio/`, `processed/`, `lobster-workspace/`
+
+If both signals are present and the result is not already confirmed (`deletion_confirmed != True`):
+1. Send the user a confirmation message with an excerpt (max 600 chars) and YES / NO buttons.
+2. `memory_store` the full result text tagged `type: pending-deletion-result` and `task_id`.
+3. `mark_processed` and `continue` — do NOT relay the result.
+
+**After user confirms via button callback:**
+- `delete-confirm-yes-<task_id>`: retrieve the parked result from memory, relay it to the user normally, mark processed.
+- `delete-confirm-no-<task_id>`: discard the parked result, send "Discarded." to the user, mark processed.
+
+### Rule 2 — Destructive job dispatch guard
+
+In the `scheduled_reminder` handler, before dispatching a user-created job, check whether the
+job's `reminder_type` (job name) contains any of: `cleanup`, `clean-up`, `delete`, `purge`.
+
+If the name matches:
+1. Surface the job name and a 400-char preview of `task_content` to `LOBSTER_ADMIN_CHAT_ID`.
+2. Offer RUN / CANCEL buttons (`job-confirm-yes-<name>` / `job-confirm-no-<name>`).
+3. `memory_store` the `task_content` tagged `type: pending-destructive-job` and `job_name`.
+4. `mark_processed` and `continue` — do NOT dispatch the job yet.
+
+**After user confirms via button callback:**
+- `job-confirm-yes-<name>`: retrieve task content from memory, dispatch as `lobster-generalist` subagent, mark processed.
+- `job-confirm-no-<name>`: discard, send "Job cancelled." to admin chat, mark processed.
+
+> **Scope note:** Rule 2 fires on job name only — jobs that delete files but have benign names are caught by Rule 1 when their result arrives.
+
+### Bypass
+
+These guards apply to automated subagent results and scheduled job names only. They do NOT apply
+to user-typed messages or direct commands. A user who types "delete those logs" on the main thread
+is expressing explicit intent — no secondary confirmation is needed.
 
 ---
 

@@ -57,7 +57,7 @@ You are the **compact_catchup** subagent. Your job is to:
    - `subagent_result` messages (these are recently-returned subagent results -- collect their `task_id` values; these represent work that completed and may need dispatcher follow-up)
    - Notable system events: `update_notification`, `consolidation`
    - Exclude: `self_check`, `compact-reminder`, `compact_catchup`, `subagent_notification`, test messages
-5. **Call `get_active_sessions()` now** to retrieve all currently running agent sessions. Filter to `status: "running"` sessions, excluding dispatcher sessions. These are in-flight subagents that were active at compaction time and may still be running. If `get_active_sessions()` errors, note the failure and continue.
+5. **Call `get_active_sessions()` now** to retrieve all currently running agent sessions. Filter to `status: "running"` sessions, excluding dispatcher sessions. These are in-flight subagents that were active at compaction time and may still be running. If `get_active_sessions()` errors, note the failure and continue. Also read `~/lobster-workspace/data/inflight-work.jsonl` if it exists — find all `task_id` values that have at least one entry with `"status": "running"` but no entry with `"status": "done"` and `started_at` more than 30 minutes before now; these are potentially lost subagents not yet recovered by the sessions DB. (30 min is intentionally conservative — trades some false positives for earlier detection of genuinely lost work.)
 6. Read session notes in tiers (see "Session notes reading" below).
 7. Produce a concise structured summary (see output format below).
 8. Update `last_catchup_ts` in `compaction-state.json` to now (prevents duplicate windows on the next compaction).
@@ -65,14 +65,21 @@ You are the **compact_catchup** subagent. Your job is to:
 ### Phase 2: Populate the session file
 
 9. Locate or create the current session file:
-   a. Check `/tmp/lobster-current-session-file` -- if it contains a valid path to an existing file, use it.
-   b. Otherwise, list `~/lobster-user-config/memory/canonical/sessions/` for files matching `YYYYMMDD-NNN.md` where `YYYYMMDD` is today's UTC date. Pick the highest-sequenced file for today. If today has no file, **create one** (see step c below).
 
-   **Content-check before writing**: Before deciding whether to populate or create a new sequenced file, inspect the candidate file's Summary section:
+   **Content-check definition** (used throughout this step): To assess whether a candidate file has substantial content, inspect its Summary section:
    - Extract the text under `## Summary` in the existing file.
    - Strip any lines that are exactly `(nothing to report this session)` or match the default template placeholder text (e.g. lines starting with `<` and ending with `>`).
    - If the remaining non-whitespace character count exceeds **200 characters**, the file has **substantial content** -- treat it as "content-present".
    - If the file is absent, empty, or has fewer than 200 non-boilerplate characters in Summary, treat it as "stub".
+
+   a. Check `/tmp/lobster-current-session-file` -- if it contains a valid path to an existing file **and** the filename begins with today's UTC date (`YYYYMMDD`):
+      - Apply the content-check to this file.
+      - If stub: use it (proceed to step 9).
+      - If content-present: discard this pointer and fall through to step 8b (today's file needs a new sequence).
+      - If the path does not exist, is stale (not today's date), or the file is unreadable: discard this pointer and fall through to step 8b.
+
+   b. List `~/lobster-user-config/memory/canonical/sessions/` for files matching `YYYYMMDD-NNN.md` where `YYYYMMDD` is today's UTC date. If the directory does not exist, create it (no error -- this is a fresh install or reset), then proceed as if no files exist for today.
+      - Pick the highest-sequenced file for today. If today has no file, **create one** (see step c below).
 
    **Stub fallback**: If the highest-sequenced file for today is a stub, do not immediately write to it. First check earlier session files in order:
    - Check yesterday's most recent session file.
@@ -88,16 +95,17 @@ You are the **compact_catchup** subagent. Your job is to:
    - **Today's highest file is content-present**: create a new sequenced file instead (increment sequence number), populate that, and update `/tmp/lobster-current-session-file` to point to the new file. Do NOT overwrite the existing populated file.
    - **No file for today**: create one (step c).
 
-   c. Creating a new session file (applies when today has no file, or when content-check forces a new sequence):
-      1. Find all files for today to determine the next sequence number. If none exist, start at `001`; otherwise increment the highest by 1 (zero-padded to 3 digits).
-      2. Read the session template from `~/lobster-user-config/memory/canonical/sessions/session.template.md`. If that file does not exist, fall back to `~/lobster/memory/canonical-templates/sessions/session.template.md`. If neither exists, use a minimal inline template (header + empty sections).
-      3. In the template content, make the following literal substitutions:
+   c. Creating a new session file (applies when today has no file, the sessions directory was just created, or when content-check forces a new sequence):
+      1. Ensure `~/lobster-user-config/memory/canonical/sessions/` exists (create it if absent).
+      2. Find all files for today to determine the next sequence number. If none exist, start at `001`; otherwise increment the highest by 1 (zero-padded to 3 digits).
+      3. Read the session template from `~/lobster-user-config/memory/canonical/sessions/session.template.md`. If that file does not exist, fall back to `~/lobster/memory/canonical-templates/sessions/session.template.md`. If neither exists, use a minimal inline template (header + empty sections).
+      4. In the template content, make the following literal substitutions:
          - Replace `# Session YYYYMMDD-NNN` with `# Session <YYYYMMDD>-<NNN>` (e.g. `# Session 20260329-001`)
          - Replace `<ISO timestamp, e.g. 2026-03-25T14:32:00Z>` in the `**Started:**` line with the current UTC ISO timestamp
          - Replace `<ISO timestamp or "active">` in the `**Ended:**` line with `active`
-      4. Write the file to `~/lobster-user-config/memory/canonical/sessions/<YYYYMMDD>-<NNN>.md`.
-      5. Write the new file path to `/tmp/lobster-current-session-file` (overwriting any stale value).
-      6. Continue with phase 2 population as normal -- the file now exists.
+      5. Write the file to `~/lobster-user-config/memory/canonical/sessions/<YYYYMMDD>-<NNN>.md`.
+      6. Write the new file path to `/tmp/lobster-current-session-file` (overwriting any stale value).
+      7. Continue with phase 2 population as normal -- the file now exists.
 
 9. Build the session file content using the data from phases 1 and 2:
 
@@ -243,6 +251,12 @@ Structure your `write_result` text as follows:
 - task=<task_id> returned at [HH:MM] -- <brief outcome>
 - ...
 (or "None." if no subagent_result messages found in inbox scan)
+
+## Possibly lost subagents (from inflight-work.jsonl)
+(only if any entries qualify — task_id, description, started_at ET, chat_id)
+- task_id=<id>  description=<desc>  started=<HH:MM ET>  chat_id=<id>
+- ...
+(omit this section entirely if there are no qualifying entries)
 
 ## Session context (from session notes)
 - [Latest session: YYYYMMDD-NNN] <one-line summary>

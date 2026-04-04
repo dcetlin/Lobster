@@ -103,6 +103,7 @@ try:
 except ImportError:
     from bot_talk_mirror import mirror_outbound as _mirror_outbound, mirror_inbound as _mirror_inbound
 
+
 # Pending agent tracker (thin adapter over session_store)
 from agents.tracker import add_pending_agent as _add_pending_agent, remove_pending_agent as _remove_pending_agent
 
@@ -4427,8 +4428,10 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
                             log.error(f"check_inbox: subagent_recovered pre-processor error: {exc}", exc_info=True)
                     msg["_filename"] = f.name
                     messages.append(msg)
-                    # Mirror real inbound user messages to bot-talk (fire-and-forget)
-                    _mirror_inbound(msg)
+                    # NOTE: Inbound cross-Lobster messages from bot-talk are routed to this
+                    # inbox by bot_talk_mirror.log_inbound_cross_lobster() with source="bot-talk".
+                    # We no longer mirror owner Telegram messages to bot-talk from here —
+                    # only actual cross-Lobster exchanges belong in bot-talk (issue #1350).
                     if len(messages) >= limit:
                         break
             except Exception as e:
@@ -4602,9 +4605,6 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
 
     # Atomic write: temp file + fsync + rename to prevent watchdog race condition
     atomic_write_json(outbox_file, reply_data)
-
-    # Mirror outbound reply to bot-talk (fire-and-forget, never blocks)
-    _mirror_outbound(text=text, source=source, chat_id=chat_id)
 
     # Save a copy to sent directory for conversation history
     sent_file = SENT_DIR / f"{reply_id}.json"
@@ -9489,6 +9489,33 @@ def _enqueue_reconciler_notification(session: dict, outcome: str) -> None:
     # Idempotency guard — if already notified, skip
     if session.get("notified_at"):
         return
+
+
+    # Dead sessions with no real user don't need dispatcher action — route to
+    # debug log only, not the inbox. The dispatcher cannot notify a user
+    # (no chat_id) or take any meaningful action. Logging preserves observability.
+    if outcome == "dead":
+        _chat_id = session.get("chat_id")
+        _chat_id_str = str(_chat_id).strip() if _chat_id is not None else ""
+        if _chat_id_str in ("0", "", "None"):
+            _agent_id = session.get("id", "")
+            log.debug(
+                "[reconciler] Dead session %r has no real user (chat_id=%r) — "
+                "skipping inbox notification (logged to debug only)",
+                _agent_id, _chat_id,
+            )
+            # Mark as notified so this session is not re-enqueued on every
+            # restart. The early return skips inbox delivery (intentional —
+            # there is no user to notify), but bookkeeping must still happen.
+            try:
+                _session_store.set_notified(_agent_id)
+            except Exception as _exc:
+                log.error(
+                    "[reconciler] Failed to set_notified for no-user dead session %r: %s",
+                    _agent_id, _exc,
+                )
+            return
+
 
     agent_id = session.get("id", "")
     now = datetime.now(timezone.utc)

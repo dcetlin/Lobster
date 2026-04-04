@@ -83,6 +83,7 @@ on every SessionStart; ordering matters only for the marker file dependency.)
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -106,6 +107,21 @@ COMPACTION_STATE_FILE = Path(
 INBOX_DIR = Path(os.path.expanduser("~/messages/inbox"))
 PROCESSING_DIR = Path(os.path.expanduser("~/messages/processing"))
 
+# Pointer to the current session file (written by compact-catchup / session management).
+# If this file exists and was modified recently, there is a prior session worth catching up.
+CURRENT_SESSION_FILE_POINTER = Path(
+    os.environ.get(
+        "LOBSTER_CURRENT_SESSION_FILE_OVERRIDE",
+        "/tmp/lobster-current-session-file",
+    )
+)
+
+# agent_sessions.db path — same resolution as claims.py in the MCP server.
+_MESSAGES_DIR = Path(
+    os.environ.get("LOBSTER_MESSAGES", os.path.expanduser("~/messages"))
+)
+AGENT_SESSIONS_DB = _MESSAGES_DIR / "config" / "agent_sessions.db"
+
 # If the compaction state file was written within this window, treat the
 # current SessionStart as a compaction restart rather than a fresh restart.
 COMPACTION_RECENCY_SECONDS = 60
@@ -114,6 +130,13 @@ COMPACTION_RECENCY_SECONDS = 60
 # so the dispatcher is forced to run compact-catchup via its WFM handler.
 # This is the code-level safety net for issue #909.
 STALE_CATCHUP_THRESHOLD_SECONDS = 30 * 60  # 30 minutes
+
+# If a session file exists and was modified within this window, inject a
+# compact-reminder even if last_catchup_ts appears recent. This handles the
+# case where the dispatcher was restarted while actively working — there may
+# be in-flight activity the new session should recover even though catchup
+# ran successfully at the start of the previous session.
+SESSION_FILE_RECENCY_SECONDS = 4 * 60 * 60  # 4 hours
 
 STARTUP_COMPACT_REMINDER_TEXT = (
     "COMPACT REMINDER \u2014 RE-ORIENT NOW (injected by on-fresh-start.py)\n\n"
@@ -187,6 +210,29 @@ def _is_catchup_stale() -> bool:
         return True
 
 
+def _has_recent_session_file() -> bool:
+    """Return True if /tmp/lobster-current-session-file points to a session file
+    that was modified within SESSION_FILE_RECENCY_SECONDS.
+
+    This catches the case where the dispatcher was restarted mid-session while
+    actively working. Even if last_catchup_ts is recent, there may be new
+    activity in the session file that the fresh session should catch up on.
+    """
+    try:
+        if not CURRENT_SESSION_FILE_POINTER.exists():
+            return False
+        session_path_str = CURRENT_SESSION_FILE_POINTER.read_text().strip()
+        if not session_path_str:
+            return False
+        session_path = Path(session_path_str)
+        if not session_path.exists():
+            return False
+        age_seconds = time.time() - session_path.stat().st_mtime
+        return age_seconds <= SESSION_FILE_RECENCY_SECONDS
+    except OSError:
+        return False
+
+
 def _compact_reminder_already_queued() -> bool:
     """Return True if a compact-reminder message is already in inbox/ or processing/.
 
@@ -212,6 +258,41 @@ def _compact_reminder_already_queued() -> bool:
     return False
 
 
+def _clear_stale_claim(message_id: str) -> None:
+    """Delete any stale message_claims row for message_id.
+
+    When on-fresh-start.py re-injects a deterministic system message (e.g.
+    0_startup_compact), the new dispatcher must be able to call mark_processing
+    on it.  The claim table uses INSERT OR FAIL on a UNIQUE PRIMARY KEY, so any
+    leftover row from a previous session — regardless of its status — will cause
+    mark_processing to return already_claimed.
+
+    This function removes the row unconditionally before injection so the new
+    dispatcher can claim the message cleanly.  It is idempotent: a missing row
+    or absent DB is silently ignored.
+
+    Operates directly on SQLite (no MCP dependency) because this hook runs
+    before the MCP server is connected.
+    """
+    if not AGENT_SESSIONS_DB.exists():
+        return
+    try:
+        conn = sqlite3.connect(str(AGENT_SESSIONS_DB))
+        try:
+            conn.execute(
+                "DELETE FROM message_claims WHERE message_id=?",
+                (message_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[on-fresh-start] failed to clear stale claim for {message_id!r}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def _inject_compact_reminder() -> None:
     """Write a startup-injected compact-reminder into the inbox.
 
@@ -235,6 +316,28 @@ def _inject_compact_reminder() -> None:
         # if both happen to coexist.
         ts_ms = 0
         message_id = f"{ts_ms}_startup_compact"
+
+        # Clear any stale message_claims row so the new dispatcher can claim
+        # this message via mark_processing.  The claims table uses INSERT OR FAIL
+        # on a UNIQUE PRIMARY KEY — a row left from a previous session (even with
+        # status='processed') will cause already_claimed on the next startup.
+        # See issue #1398.
+        _clear_stale_claim(message_id)
+
+        # Also remove any stale processing/ file for this message_id.  The MCP
+        # server moves the file from inbox/ to processing/ when mark_processing
+        # is called, and only removes it on mark_processed/mark_failed.  A
+        # crashed or compacted session may leave the file in processing/ with no
+        # active dispatcher to clear it, causing the next startup's mark_processing
+        # call to fail because the file already exists at the destination path.
+        stale_processing_file = PROCESSING_DIR / f"{message_id}.json"
+        if stale_processing_file.exists():
+            stale_processing_file.unlink()
+            print(
+                f"[on-fresh-start] removed stale processing file: {stale_processing_file}",
+                file=sys.stderr,
+            )
+
         timestamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".000000"
 
         message = {
@@ -399,7 +502,12 @@ def main() -> None:
     # guarantees the dispatcher will process a compact-reminder via
     # wait_for_messages — even if a previous session consumed the original
     # compact-reminder without running compact-catchup and then exited.
-    if _is_catchup_stale():
+    #
+    # Also inject when a recent session file exists (< 4h old), even if
+    # last_catchup_ts is recent. A mid-session restart can leave in-flight
+    # activity in the session file that the new session needs to recover,
+    # regardless of when catchup last ran.
+    if _is_catchup_stale() or _has_recent_session_file():
         _inject_compact_reminder()
 
     _schedule_reflection_prompt("bootup")

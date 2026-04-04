@@ -2325,6 +2325,74 @@ CREATE TABLE IF NOT EXISTS dispatcher_lock (
         fi
     fi
 
+    # Migration 65: Re-deploy all plain task file templates to runtime directory to fix
+    # template drift (issue #1404). When a PR updates a task file in scheduled-tasks/tasks/,
+    # the change was not propagated to already-deployed runtime copies in
+    # $WORKSPACE_DIR/scheduled-jobs/tasks/. This migration overwrites every plain .md file
+    # (not .md.template — those require placeholder substitution) so existing installs
+    # stay in sync with the repo without a full reinstall.
+    local repo_tasks_dir="$LOBSTER_DIR/scheduled-tasks/tasks"
+    local runtime_tasks_dir="$WORKSPACE_DIR/scheduled-jobs/tasks"
+    if [ -d "$repo_tasks_dir" ]; then
+        mkdir -p "$runtime_tasks_dir"
+        for task_file in "$repo_tasks_dir"/*.md; do
+            [ -f "$task_file" ] || continue
+            local base
+            base=$(basename "$task_file")
+            [ "$base" = "README.md" ] && continue
+            cp "$task_file" "$runtime_tasks_dir/$base"
+            substep "Re-deployed task template: $base"
+            migrated=$((migrated + 1))
+        done
+    fi
+
+    # Migration 66: Install PostToolUse thinking-heartbeat hook (issue #1401).
+    # The hook writes last_thinking_at to lobster-state.json on every tool call,
+    # giving the health check a freshness signal during the dispatcher's reasoning
+    # phase (10+ minutes of LLM work with no WFM or mark_processed calls).
+    chmod +x "$LOBSTER_DIR/hooks/thinking-heartbeat.py" 2>/dev/null || true
+    if [ -f "$CLAUDE_SETTINGS" ]; then
+        if ! jq -e '.hooks.PostToolUse[]? | select(.hooks[]?.command | contains("thinking-heartbeat"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
+            TMP_SETTINGS=$(mktemp)
+            jq '.hooks.PostToolUse = (.hooks.PostToolUse // []) + [{
+                "matcher": "",
+                "hooks": [{
+                    "type": "command",
+                    "command": "python3 '"$LOBSTER_DIR"'/hooks/thinking-heartbeat.py",
+                    "timeout": 5
+                }]
+            }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+            substep "Installed thinking-heartbeat PostToolUse hook"
+            migrated=$((migrated + 1))
+        fi
+    fi
+
+    # Migration 67: Update nightly-consolidation cron entry to redirect stdout+stderr to a log file.
+    # The original entry (added in Migration 61) did not capture output, so errors from the script
+    # were silently dropped. This migration replaces it with an entry that appends to
+    # ~/lobster-workspace/logs/nightly-consolidation.log.
+    local NIGHTLY_CONSOLIDATION_MARKER="# LOBSTER-NIGHTLY-CONSOLIDATION"
+    local NIGHTLY_LOG="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/logs/nightly-consolidation.log"
+    local DESIRED_ENTRY="0 3 * * * $LOBSTER_DIR/scripts/nightly-consolidation.sh >> $NIGHTLY_LOG 2>&1 $NIGHTLY_CONSOLIDATION_MARKER"
+    if crontab -l 2>/dev/null | grep -qF "$NIGHTLY_CONSOLIDATION_MARKER"; then
+        if ! crontab -l 2>/dev/null | grep -F "$NIGHTLY_CONSOLIDATION_MARKER" | grep -q ">> "; then
+            # Entry exists but lacks log redirect — replace it.
+            mkdir -p "$(dirname "$NIGHTLY_LOG")"
+            "$LOBSTER_DIR/scripts/cron-manage.sh" add "$NIGHTLY_CONSOLIDATION_MARKER" "$DESIRED_ENTRY"
+            substep "Updated nightly-consolidation cron entry to redirect output to $NIGHTLY_LOG"
+            migrated=$((migrated + 1))
+        else
+            substep "nightly-consolidation cron entry already has log redirect — skipping"
+        fi
+    else
+        # Entry is missing entirely — add it with logging.
+        mkdir -p "$(dirname "$NIGHTLY_LOG")"
+        chmod +x "$LOBSTER_DIR/scripts/nightly-consolidation.sh" 2>/dev/null || true
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$NIGHTLY_CONSOLIDATION_MARKER" "$DESIRED_ENTRY"
+        substep "Added nightly-consolidation cron entry with log redirect to $NIGHTLY_LOG"
+        migrated=$((migrated + 1))
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
