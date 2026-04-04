@@ -329,3 +329,59 @@ PR B and PR C can be developed in parallel but B should land first because the n
 - `/home/lobster/lobster/src/orchestration/workflow_artifact.py`
 - `/home/lobster/lobster/src/orchestration/registry.py`
 - `/home/lobster/lobster/src/orchestration/migrations/0007_wos_v3_register_and_corrective_traces.sql`
+
+---
+
+## V4 Design Directions
+
+*Captured from philosophical review session, 2026-04-04. These are not current PRs — they are design directions to hold as V3 lands and V4 scope opens.*
+
+---
+
+### Direction 1 — Philosopher Routing as Composable Cartridge
+
+**Current state (V3):** The "surface to Dan" path is a terminal stuck condition. When a UoW reaches `philosophical_register` or `register_mismatch`, the Steward fires `notify_dan` and stops. The interrupt is useful but flat — it delivers evidence without an orientation lens.
+
+**V4 direction:** The Dan-interrupt path should become a composable cartridge system:
+
+- **OODA-coupled:** The cartridge fires not just on explicit stuck conditions but on lack-of-clarity (Observe) and suspect-of-certainty (Orient) — the two moments where a philosopher lens adds the most value.
+- **Cartridge-swappable by UoW register/content:** The Garden's philosophical postures catalog (mito-governor, cybernetics, Theory of Learning, etc.) becomes the cartridge library. Different UoW registers and content patterns select different philosopher lenses — mito-governor for load/scaling UoWs, cybernetics for feedback loop UoWs, etc.
+- **Slight randomness:** Prevents calcification. A deterministic cartridge selector will over-optimize for the most recent successful lens. A small stochastic component (e.g., 10–15% probability of sampling a non-top-ranked cartridge) keeps the system from converging to a single philosopher posture.
+
+**What needs to be in spec before this can be designed:** The philosophical postures catalog (Garden retrieval), a cartridge interface definition (inputs: UoW register + content summary + stuck condition; outputs: philosopher lens context block), and the OODA trigger conditions beyond the current `philosophical_register` stuck condition.
+
+**Precondition:** V3 must land first and generate 10+ UoW sprint evidence. Cartridge design is premature without knowing what the Dan-interrupt path actually surfaces in practice.
+
+---
+
+### Direction 2 — Dan Attentional State + Reversible Forward Commitment
+
+**Current state (V3):** When a UoW surfaces to Dan and Dan does not respond, the UoW sits in BLOCKED indefinitely. The system halts rather than proceeding or failing explicitly.
+
+**V4 design principle:** When Dan is unavailable, the system makes a **reversible forward commitment**:
+
+1. Proceed with the best available decision (do not halt).
+2. Document the decision point explicitly as a structured artifact: what was decided, what alternatives were available, what assumptions were made, what would change the decision if wrong.
+3. Tag the decision point as "future refactor potential" — a labeled decision that Dan can revisit during his next available engagement window without needing to reconstruct the context.
+
+This is not "blindly proceed" (which ignores Dan's judgment) and not "halt" (which blocks the system on human availability). It is a bounded commitment that preserves reversibility.
+
+**What this seeds:** A routing intelligence layer that models Dan's attentional state as a system variable — not just "available/unavailable" but a richer signal (recent engagement patterns, current cognitive load, time-since-last-interaction) that informs how much autonomy to assume.
+
+**Implementation note:** The reversible commitment artifact schema is a natural extension of `trace.json` — add a `decision_points` array field that captures structured forward commitments made under Dan-unavailability conditions. The Steward's Orient phase reads these on re-entry so Dan's next engagement window has explicit, structured decision points to review rather than undifferentiated history.
+
+---
+
+### Direction 3 — Garden Retrieval as Structural Prerequisite for Orient Phase Quality
+
+**Current state (V3):** Garden retrieval (reading accumulated traces, past UoW outcomes, classification history) is implied by the architecture but not structurally enforced. The Orient phase can proceed nominally — with LLM reasoning but without retrieving relevant garden state — and the Steward has no signal that the Orient was shallow.
+
+**V4 design principle:** Structural hygiene is not optional overhead — it is what makes the Orient phase real rather than nominal.
+
+Concretely:
+
+- The Steward's `_build_prescription_instructions()` should have an explicit retrieval step that produces a structured retrieval receipt: what was searched, what was found, what relevance score was assigned. If retrieval returns nothing (empty garden for this UoW class), that is logged as a distinct state — not silently treated as equivalent to retrieval success.
+- Garden quality metrics (corrective_traces row count, trace recency, register distribution) become first-class observability instruments. If the garden for a given register is sparse (fewer than N traces), that sparsity is injected as context for the prescriber: "Note: limited prior trace data for this register."
+- The S3 Observation Loop (cross-cycle pattern synthesis) — already identified in the convergence doc as a future PR — is the mechanism that populates the garden. Until S3 ships, Orient phase quality is bounded by the sparsity of the initial garden.
+
+**Why this is V4 and not V3:** V3 already specifies trace.json writes and corrective_traces DB inserts (Changes 2 and 6). The garden population mechanism is in the current spec. What is missing is the retrieval side: explicit retrieval receipts, sparsity signals, and the cross-cycle synthesis (S3). These require the garden to have accumulated data before they are useful — which means V3 must run for a meaningful sprint first.
