@@ -150,7 +150,6 @@ _PHILOSOPHICAL_TERMS = frozenset({
     "dwelling",
     "presencing",
     "autopoiesis",
-    "register",         # only meaningful in phenomenological context; low-weight
     "logos",
     "noema",
     "noesis",
