@@ -110,6 +110,25 @@ The substrate translation principle: when an isomorphism holds exactly, implemen
 
 ---
 
+### 9. Dispatcher hibernation as governor reset
+
+When the larger ecosystem sleeps — when the dispatcher calls `wait_for_messages(hibernate_on_timeout=True)` — mitochondrial demand is globally reduced: execution is disallowed, repair is permitted, termination is enforced. Nothing replaces sleep.
+
+This is why:
+- Stimulants can age you — they override the governor reset, forcing execution during the repair window
+- High metabolism can be pathological — the governor stuck open
+- Labs can look normal while life falls apart — chemistry intact, timing broken; health checks pass, MCP server running, pipeline still failing
+- Energy increases can worsen disease — more substrate through a broken gate makes things worse
+- Recovery requires permission, not force
+
+In the system: WOS `execution_enabled=false` is not a failure state — it is the scheduled governor reset. The nightly consolidation is repair permitted. Ghost agents that can't terminate are the sleep-deprived mitochondria. Forcing `wos start` without the register classification and closure gates in place is the stimulant.
+
+The dispatcher's hibernation mode was already mitochondrial before it had a name.
+
+---
+
+> "Health is not power. Health is restraint with precision." — Dan
+
 ## What We're Building Toward
 
 When all eight of these structures are in place — the Steward governing rather than tracking, register functioning as permission rather than routing, corrective traces imposing mandatory temporal spacing, closure requiring explicit gate permission, Dan's attention functioning as a productive terminal acceptor rather than an overloaded feedback collapse, the bootstrapping gate ensuring timing structure precedes execution, ghost-agent detection treating stuck-on as governor failure, and substrate translation completed where the biology doesn't map directly — the system will have achieved something biology already achieved through iteration: a governor that can run a complex, multi-stage, multi-register process across time without either freezing (nothing terminates) or burning out (wild oscillation without feedback). The health condition is not maximal throughput. It is controlled oscillation through a functional range, with enough temporal spacing between cause and effect to permit learning, repair, and restraint. The blueprint already exists. It has been running, in various substrates, for approximately two billion years.
