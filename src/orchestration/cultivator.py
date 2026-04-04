@@ -231,12 +231,21 @@ def promote_to_wos(
     Registry.upsert handles idempotency — issues already in WOS as non-terminal
     UoWs return UpsertSkipped.
 
+    At germination, the Germinator classifies register for each issue. Register is
+    written to the UoW at INSERT time and is immutable thereafter. The Steward
+    surfaces any register mismatch to Dan on diagnosis — it does not reclassify.
+
+    Naming note: this function is part of the *GitHub Issue Cultivator* scheduled
+    job. The Germinator (germinator.py) is a separate component called here at
+    germination time. See docs/WOS-INDEX.md for the component glossary.
+
     Note: source is written by Registry as "github:issue/{number}" which traces
     back to dcetlin/Lobster since that is the only repo cultivator operates on.
     """
     # Import here so the module can be imported without WOS available
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
     from src.orchestration.registry import Registry, UpsertInserted, UpsertSkipped
+    from src.orchestration.germinator import classify_register
 
     db_path = _build_db_path()
     registry = Registry(db_path)
@@ -246,18 +255,31 @@ def promote_to_wos(
 
     for classified in candidates:
         issue = classified.issue
+        success_criteria = _extract_success_criteria(issue.body)
+
+        # Germinator: classify register at germination time.
+        # Register is immutable after this point.
+        reg_classification = classify_register(
+            title=issue.title,
+            body=issue.body,
+            success_criteria=success_criteria,
+        )
+        register = reg_classification.register
 
         if dry_run:
             print(
                 f"  [dry-run] would promote #{issue.number}: {issue.title[:60]} "
-                f"(priority={classified.priority})"
+                f"(priority={classified.priority}, register={register}, "
+                f"gate={reg_classification.gate_matched}, "
+                f"confidence={reg_classification.confidence})"
             )
             continue
 
         result = registry.upsert(
             issue_number=issue.number,
             title=issue.title,
-            success_criteria=_extract_success_criteria(issue.body),
+            success_criteria=success_criteria,
+            register=register,
         )
 
         if isinstance(result, UpsertInserted):

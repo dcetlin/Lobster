@@ -352,6 +352,7 @@ class Registry:
         success_criteria: str = "",
         source_repo: str | None = None,
         issue_url: str | None = None,
+        register: str = "operational",
     ) -> UpsertResult:
         """
         Propose a UoW for a GitHub issue.
@@ -379,6 +380,13 @@ class Registry:
                 when issue_url is not supplied explicitly.
             issue_url: Canonical GitHub issue URL. If omitted and source_repo is provided,
                 derived as "https://github.com/{source_repo}/issues/{issue_number}".
+            register: Attentional configuration required for completion evaluation.
+                Classified by the Germinator at germination time and written here.
+                Values: operational | iterative-convergent | philosophical | human-judgment.
+                Immutable after germination — the Steward surfaces mismatch to Dan rather
+                than reclassifying autonomously.
+                Default: 'operational' (safe fallback for callers that do not invoke
+                the Germinator).
         """
         if not success_criteria or not success_criteria.strip():
             raise ValueError(
@@ -388,6 +396,7 @@ class Registry:
         return self._upsert_typed(
             issue_number, title, sweep_date, uow_type, success_criteria,
             source_repo=source_repo, issue_url=issue_url,
+            register=register,
         )
 
     def _upsert_typed(
@@ -399,6 +408,7 @@ class Registry:
         success_criteria: str = "",
         source_repo: str | None = None,
         issue_url: str | None = None,
+        register: str = "operational",
     ) -> UpsertResult:
         """Core upsert logic returning typed UpsertResult."""
         if sweep_date is None:
@@ -472,6 +482,9 @@ class Registry:
             # If the INSERT fails, both roll back together.
             self._write_audit(conn, uow_id=uow_id, event="created", to_status="proposed")
 
+            # register is classified by the Germinator before this call.
+            # uow_mode mirrors register at INSERT time — kept separate to allow
+            # future divergence between routing register and execution mode.
             conn.execute(
                 """
                 INSERT INTO uow_registry (
@@ -493,8 +506,8 @@ class Registry:
                     success_criteria,
                     _LEGACY_ROUTE_REASON,
                     resolved_issue_url,
-                    "operational",   # register default — Germinator overwrites at PR1
-                    "operational",   # uow_mode mirrors register at insert time
+                    register,
+                    register,  # uow_mode mirrors register at germination time
                 ),
             )
             conn.commit()
