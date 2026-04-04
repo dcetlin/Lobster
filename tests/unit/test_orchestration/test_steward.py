@@ -1996,6 +1996,167 @@ class TestLlmPrescription:
         assert result["instructions"] == "Implement the feature."
         assert result["estimated_cycles"] == 2
 
+    # --- Tests for JSON extraction from anywhere in LLM output (bug: startswith check) ---
+
+    def test_llm_prescribe_preamble_before_json_fence_returns_none_with_old_logic(self):
+        """Directly replicates the bug: old startswith('```') check misses preamble + fence.
+
+        This test verifies the bug exists in the OLD extraction logic by testing
+        the logic in isolation. The old code only strips fences when raw_text starts
+        with '```' — so output with preamble text falls through to json.loads and fails.
+        """
+        import json as _json
+
+        # Simulate the OLD broken logic verbatim (copied from pre-fix steward.py)
+        raw_text = (
+            "Here is the prescription for this unit of work:\n\n"
+            "```json\n"
+            '{\n  "instructions": "Do the work.",\n'
+            '  "success_criteria_check": "Work done.",\n'
+            '  "estimated_cycles": 1\n}\n'
+            "```"
+        )
+
+        # Replicate old logic exactly
+        def old_extraction_logic(text: str) -> dict | None:
+            if text.startswith("```"):
+                lines = text.splitlines()
+                text = "\n".join(
+                    line for line in lines
+                    if not line.startswith("```")
+                ).strip()
+            try:
+                return _json.loads(text)
+            except _json.JSONDecodeError:
+                return None
+
+        result = old_extraction_logic(raw_text)
+        # The bug: startswith check is False, json.loads fails on prose text → None
+        assert result is None, (
+            "Expected old logic to return None (the bug) — if this fails, "
+            "the old logic may have been patched already"
+        )
+
+    def test_llm_prescribe_preamble_before_json_fence(self, monkeypatch):
+        """_llm_prescribe succeeds when LLM output has preamble text before the json fence.
+
+        This is the primary production failure mode: 8/9 Sprint 001 prescription
+        attempts failed because the LLM prefixed its JSON with a sentence like
+        'Here is the prescription...'.
+        """
+        import subprocess as _subprocess
+        steward = _import_steward()
+
+        json_payload = {
+            "instructions": "Implement the widget feature.",
+            "success_criteria_check": "Widget renders in all browsers.",
+            "estimated_cycles": 2,
+        }
+        preamble_output = (
+            "Here is the prescription for this unit of work:\n\n"
+            "```json\n"
+            + json.dumps(json_payload, indent=2)
+            + "\n```"
+        )
+
+        def mock_run(cmd, **kwargs):
+            return _subprocess.CompletedProcess(cmd, returncode=0, stdout=preamble_output, stderr="")
+
+        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
+
+        uow = self._make_uow()
+        result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
+
+        assert result is not None, "Expected successful extraction despite preamble text"
+        assert result["instructions"] == "Implement the widget feature."
+        assert result["estimated_cycles"] == 2
+
+    def test_llm_prescribe_preamble_before_plain_fence(self, monkeypatch):
+        """_llm_prescribe extracts JSON from a plain ``` fence (no language tag) with preamble."""
+        import subprocess as _subprocess
+        steward = _import_steward()
+
+        json_payload = {
+            "instructions": "Fix the bug.",
+            "success_criteria_check": "Tests pass.",
+            "estimated_cycles": 1,
+        }
+        output = (
+            "The following JSON object contains the prescription:\n\n"
+            "```\n"
+            + json.dumps(json_payload)
+            + "\n```"
+        )
+
+        def mock_run(cmd, **kwargs):
+            return _subprocess.CompletedProcess(cmd, returncode=0, stdout=output, stderr="")
+
+        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
+
+        uow = self._make_uow()
+        result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
+
+        assert result is not None
+        assert result["instructions"] == "Fix the bug."
+
+    def test_llm_prescribe_preamble_before_plain_json_no_fence(self, monkeypatch):
+        """_llm_prescribe extracts JSON when it appears after preamble prose without any fence."""
+        import subprocess as _subprocess
+        steward = _import_steward()
+
+        json_payload = {
+            "instructions": "Refactor the module.",
+            "success_criteria_check": "No regressions.",
+            "estimated_cycles": 1,
+        }
+        output = (
+            "I've analyzed the unit of work and here is my prescription:\n\n"
+            + json.dumps(json_payload)
+        )
+
+        def mock_run(cmd, **kwargs):
+            return _subprocess.CompletedProcess(cmd, returncode=0, stdout=output, stderr="")
+
+        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
+
+        uow = self._make_uow()
+        result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
+
+        assert result is not None
+        assert result["instructions"] == "Refactor the module."
+
+    def test_llm_prescribe_multiple_code_blocks_uses_first_valid_json(self, monkeypatch):
+        """_llm_prescribe uses the first valid JSON object when multiple code blocks appear."""
+        import subprocess as _subprocess
+        steward = _import_steward()
+
+        first_payload = {
+            "instructions": "First instruction set.",
+            "success_criteria_check": "First check.",
+            "estimated_cycles": 1,
+        }
+        second_payload = {
+            "instructions": "Second instruction set.",
+            "success_criteria_check": "Second check.",
+            "estimated_cycles": 2,
+        }
+        output = (
+            "Here are two options:\n\n"
+            "Option 1:\n```json\n" + json.dumps(first_payload) + "\n```\n\n"
+            "Option 2:\n```json\n" + json.dumps(second_payload) + "\n```"
+        )
+
+        def mock_run(cmd, **kwargs):
+            return _subprocess.CompletedProcess(cmd, returncode=0, stdout=output, stderr="")
+
+        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
+
+        uow = self._make_uow()
+        result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
+
+        assert result is not None
+        assert result["instructions"] == "First instruction set."
+
     # --- New tests for issue #506: timeout observability and JSON classification ---
 
     def test_llm_prescribe_timeout_configurable_via_env(self, monkeypatch):
