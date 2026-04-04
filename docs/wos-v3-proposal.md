@@ -39,10 +39,16 @@ SEEDS (any source)
   Telegram / voice note / philosophy session / nightly sweep / direct request
       │
       ▼
-CULTIVATOR (classification gate)
-  Classify: pearl or seed?
-  If pearl → write-path (frontier docs, bootup candidates)
-  If seed  → register classification → GitHub issue
+CULTIVATOR (classification gate) — two actors:
+  Tending Cultivator (orientation-register, human-in-loop):
+    Reads session outputs phenomenologically
+    Holds candidate pearls for re-encounter before routing
+    May be Dan's act of re-reading — not automatable
+    If pearl → write-path (frontier docs, bootup candidates)
+    If seed confirmed → passes to Filing Cultivator
+  Filing Cultivator (execution-register, automatable):
+    Takes confirmed seeds, writes success_criteria at germination
+    Files → GitHub issue  [= github-issue-cultivator job]
       │
       ▼
 UoW REGISTRAR (germination gate)
@@ -274,7 +280,12 @@ This gate fires before the workflow artifact is written — no category-wrong di
 
 ## 8. What Remains Unsolved
 
-**1. The Cultivator gap.** The Cultivator remains aspirational. Philosophy session outputs still reach GitHub via manual filing. Until the Cultivator is built and wired, register classification at germination is applied retroactively to existing issues — which means the Registrar must infer register from issue content rather than receiving it from the classification step. Inference quality is the bottleneck.
+**1. The Cultivator gap — two actors, not one.** The Cultivator remains aspirational, and it splits into two distinct actors:
+
+- **Tending Cultivator** (orientation-register): attends to philosophy session outputs phenomenologically; holds candidate pearls for re-encounter before routing; cannot be fully automated without collapsing orientation-register work into production tasks. This actor may be Dan's own act of re-reading session output in a subsequent session — not a Lobster subagent at all.
+- **Filing Cultivator** (execution-register): takes confirmed seeds and files them as GitHub issues with `success_criteria` written at germination time; can and should be automated. The existing `github-issue-cultivator` scheduled job is this actor.
+
+The seam between the two is **germination** — the event at which a candidate from the orientation basin is classified as ready for the execution basin. Until this split is built and wired, register classification at germination is applied retroactively to existing issues — the Registrar must infer register from issue content rather than receiving it from the classification step. Inference quality is the bottleneck. Premature germination (filing a GitHub issue before a seed's inquiry has stabilized) produces an issue with underspecified `success_criteria`.
 
 **2. Register inference at scale.** The classification algorithm above is a rule-based heuristic. At 252 UoWs, it will misclassify a meaningful fraction. The misclassification rate is currently invisible. V3 needs an observability instrument: a log of all register classifications with confidence signals, so the Observation Loop can flag systematic misrouting.
 
@@ -282,9 +293,18 @@ This gate fires before the workflow artifact is written — no category-wrong di
 
 **4. Dan's register signal.** The Steward is supposed to read "Dan's current register" from context — but the mechanism for detecting Dan's current register is unspecified. Is it from recent Telegram message tone? From vision.yaml current_focus? From explicit declaration? This is a design gap with real behavioral consequences: a Steward that misjudges Dan's register sends the right work at the wrong time.
 
-**5. Philosophical UoW lifecycle.** In V3, philosophical UoWs surface to Dan and require his confirmation to close. But "confirmation" is underspecified. What does Dan say? How does the Steward parse his response? What happens if Dan says "good but keep going"? The philosophical lifecycle needs the same rigor as the operational lifecycle.
+**5. Feedback arm for Dan-surfaced UoWs.** When the Steward surfaces a UoW to Dan — in any register — the current architecture treats delivery as completion. The UoW is marked delivered when it reaches Dan's Telegram. But delivery is not closure: closure is when Dan's encounter with the item modifies something in the system's state.
+
+This is not a philosophical UoW lifecycle problem specifically — it applies to every surfaced item across all registers. When Dan replies to a surfaced UoW (with "acknowledged," "reject," "good but keep going," or any response), that reply must:
+1. Be detected by the Steward as a closure signal
+2. Transition the UoW to the appropriate state
+3. Write a closure record to the UoW's source or output path
+
+The mechanism for all three steps is unspecified. Until this feedback arm exists, the Dan-interrupt path is a delivery system with no receiver — it sends and never hears back. The orientation basin's reflective surface queue has the same pathology: items are marked `delivered: true` but no write-back path closes the loop.
 
 **6. Trust-level autonomy gates.** V2 required Dan's `/confirm` for all UoWs. V3 should distinguish: operational UoWs with machine-observable gates could auto-advance beyond `proposed`. The autonomy gate logic needs design before it can be implemented safely.
+
+**7. The scaling governor.** V3 addresses register mismatch but not the structural pattern: Coherence immediately overextended to maximum load. The system became operational and saturated its dispatch capacity before any feedback signal could moderate it. A scaling governor that modulates batch size or execution rate based on recent success signal is the missing gate. Not in current PRs — but in the design horizon. Without it, V3 is vulnerable to the same failure mode as V2 at scale: the system works until it doesn't, with no mechanism to gracefully throttle before collapse.
 
 ---
 

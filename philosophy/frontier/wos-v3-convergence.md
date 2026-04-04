@@ -112,3 +112,14 @@ The "surface to Dan" slot needs its own design: OODA-coupled (fires on lack-of-c
 **Relationship to S3:** S3 as specified in Seeds + Sprouts is the mechanism. This section adds specificity: what data it reads, what patterns it detects, and what it outputs. S3 should be designed with these three detection categories (repeated surprises, mismatch clustering, cross-UoW prescription recycling) as the first-iteration scope.
 
 **Why this is post-V3:** Pattern learning across UoWs requires the garden to have accumulated data. Until PR A ships and the 10-UoW sprint runs, `corrective_traces` is empty. S3 design is premature until the table has meaningful content to analyze.
+
+---
+
+## Related Documents
+
+- **[wos-v3-proposal.md](../../docs/wos-v3-proposal.md)** — Foundational V3 design proposal: vision, register taxonomy, architecture, dispatch loop, and open questions.
+- **[wos-v3-steward-executor-spec.md](../../docs/wos-v3-steward-executor-spec.md)** — Implementation spec: 6 V3 changes, PR sequencing, testability notes, and V4 design directions. S1 and S2 from this document are explicit requirements for PRs B and C.
+- **[corrective-trace-loop-gain-research.md](../../docs/corrective-trace-loop-gain-research.md)** — Research note on bounded correction magnitude for the corrective trace feedback loop (PR B concern). Directly informs S1 (loop gain bounding on prescription_delta).
+- **[2026-04-04-philosopher-cybernetics.md](../sessions/2026-04-04-philosopher-cybernetics.md)** — Cybernetics philosopher session (Ashby's Law of Requisite Variety). Source of the unbounded loop gain concern that became S1 and the corrective-trace research note.
+- **[2026-04-04-philosopher-theory-of-learning.md](../sessions/2026-04-04-philosopher-theory-of-learning.md)** — Theory of Learning philosopher session. Source of "success triggers collapse" framing, scaling governor gap (S4), and the trace-mechanism-as-developmental-scaffolding observation.
+- **[2026-04-04-philosopher-mito-governor.md](../sessions/2026-04-04-philosopher-mito-governor.md)** — Mito-governor philosopher session. Source of the register-portfolio diversity gap and cross-cycle pattern learning gap (Timescales 1 and 2 in this document), and the timing-structure vs. content-processing distinction for the trace gate.

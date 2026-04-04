@@ -89,6 +89,16 @@ Add `_read_trace_json(output_ref: str) -> dict | None` — a pure function that 
 }
 ```
 
+#### Loop gain bounding (S1)
+
+`prescription_delta` must be bounded before injection into the prescriber context. Raw `prescription_delta` values can accumulate aggressive corrections that cause the garden to oscillate rather than converge.
+
+**Required mechanism (choose one at implementation time):**
+- **Magnitude threshold**: discard `prescription_delta` strings exceeding a character-count threshold (candidate: 500 chars) — truncate with a trailing note that the delta was bounded
+- **Cycle-averaged smoothing**: maintain a rolling buffer of the last N `prescription_delta` entries (candidate: N=3) from `corrective_traces`, average or de-duplicate before injection
+
+The bounding step is a pure utility: `_bound_prescription_delta(delta: str, history: list[str]) -> str`. Apply in `_process_uow()` before `_build_prescription_instructions()`, after `_read_trace_json()`. Without this guard, a single aggressive corrective trace can destabilize subsequent prescription cycles.
+
 ---
 
 ### Change 3 — Register-Mismatch Gate (Steward)
@@ -130,6 +140,28 @@ if not is_compatible:
 The mismatch should be treated as a stuck condition so that the existing surface-to-Dan machinery handles it. The `stuck_condition = "register_mismatch"` string is new — add it to `_detect_stuck_condition()`'s docstring and ensure `_default_notify_dan()` formats it with useful context (UoW register, prescription executor_type, and the reason).
 
 **Implementation note**: The gate fires only in the prescribe branch, not in the done or surface branches. If `stuck_condition` was already set earlier (e.g., `hard_cap`), the earlier condition wins and the gate is never reached — consistent with current logic ordering.
+
+#### Mismatch observability (S2)
+
+Every register-mismatch gate fire must emit a structured observation to the mismatch log, not just a Dan-surface message. The observation captures:
+
+```json
+{
+  "event": "register_mismatch_observation",
+  "uow_id": "<id>",
+  "register": "<register of the UoW>",
+  "executor_type_attempted": "<what _select_executor_type returned>",
+  "direction": "<which register→executor_type pairing fired the gate>",
+  "steward_cycles": <n>,
+  "timestamp": "<ISO>"
+}
+```
+
+The `direction` field encodes the pairing explicitly (e.g., `"philosophical→functional-engineer"`) so downstream analysis can detect systematic routing failures — not just individual mismatch events.
+
+**Why this is required:** The register table (above) was reasoned from first principles, not validated through operational data. Systematic mismatch patterns (the same register→executor_type combination firing repeatedly) are the signal that the classification or routing logic needs refinement. Without structured observability on every gate fire, classification quality is invisible.
+
+**Implementation**: Log to `audit_log` alongside the existing `steward_log` write for the `register_mismatch` stuck condition. The `check_task_outputs` tool and the S3 Observation Loop (future PR) are the downstream consumers.
 
 ---
 
@@ -283,6 +315,52 @@ PR B and PR C can be developed in parallel but B should land first because the n
 
 ---
 
+## Future PRs
+
+*These are not scheduled for the current PR sequence. They depend on evidence from the V3 sprint.*
+
+---
+
+### Future PR: S3 — Observation Loop Pattern Synthesis
+
+**Precondition:** `corrective_traces` table populated from V3 PRs A–D + 10-UoW sprint evidence.
+
+**Scope:**
+
+The V3 Observation Loop detects stalled UoWs within a single garden pass. S3 extends it to synthesize across accumulated traces — a scheduled pass that reads the full `corrective_traces` table and writes structured candidate amendments.
+
+**What it does:**
+
+1. Reads `corrective_traces` grouped by `register` and `execution_summary` patterns.
+2. Detects: repeated surprises (same surprise text appearing in 3+ distinct UoWs), register-mismatch clustering (same `direction` appearing in the mismatch observability log 3+ times), cross-UoW prescription recycling (high token overlap in `prescription_delta` across same-register UoWs).
+3. For each detected pattern: writes a candidate amendment to a `pattern_observations` file — not mutating classification logic, observations only.
+4. Surfaces the structured digest to Dan during the next engagement window.
+
+**Implementation class:** Type C cron-direct scheduled job (not a UoW — it reads the garden, it does not act on it). New `scheduled-tasks/` script.
+
+**Dependency:** Requires meaningful corrective_traces volume. Design only after the first sprint.
+
+---
+
+### Future PR: S5 — Dan-Interrupt Cartridge Specification
+
+**Precondition:** V3 PRs A–D shipped; philosopher postures catalog in Garden retrieval.
+
+**Scope:**
+
+The "surface to Dan" path in V3 is a terminal stuck condition — it delivers evidence without an orientation lens. S5 makes the interrupt path an encounter by coupling it to a composable cartridge system.
+
+**Design requirements:**
+
+- **OODA-coupled triggers:** The cartridge fires on `lack-of-clarity` (Observe) and `suspect-of-certainty` (Orient) in addition to explicit stuck conditions. These are new trigger classes that require design — they are not fired by any current V3 gate.
+- **Lens-swappable:** The Garden's philosopher postures catalog becomes the cartridge library. Mito-governor for load/scaling UoWs; cybernetics for feedback loop UoWs; Theory of Learning for iterative-convergent UoWs approaching plateau. The cartridge selection uses UoW register + content summary + stuck condition as inputs.
+- **Slight randomness (anti-calcification):** 10–15% probability of sampling a non-top-ranked cartridge to prevent the system from over-optimizing to a single philosopher posture.
+- **Cartridge interface:** `CartridgeContext(uow_register, content_summary, stuck_condition) -> philosopher_lens_block: str`. Pure function; composable with existing `_build_prescription_instructions()`.
+
+**What must exist before S5 design begins:** Philosopher postures catalog (Garden retrieval, at least 5 distinct postures), operational evidence of what the V3 `philosophical_register` and `register_mismatch` surfaces actually look like in practice, and a `cartridge_interface` spec (inputs/outputs) that can be reviewed with Dan.
+
+---
+
 ## Testability Notes
 
 ### Change 1 — Register-Aware Diagnosis
@@ -385,3 +463,38 @@ Concretely:
 - The S3 Observation Loop (cross-cycle pattern synthesis) — already identified in the convergence doc as a future PR — is the mechanism that populates the garden. Until S3 ships, Orient phase quality is bounded by the sparsity of the initial garden.
 
 **Why this is V4 and not V3:** V3 already specifies trace.json writes and corrective_traces DB inserts (Changes 2 and 6). The garden population mechanism is in the current spec. What is missing is the retrieval side: explicit retrieval receipts, sparsity signals, and the cross-cycle synthesis (S3). These require the garden to have accumulated data before they are useful — which means V3 must run for a meaningful sprint first.
+
+---
+
+### Direction 4 — Scaling Governor (S4)
+
+**The deepest open problem:** V3 addresses register mismatch — the proximate failure. It does not address the structural pattern that produced Coherence's collapse: the system immediately overextended to maximum load when it became operational. V3 has no mechanism that modulates how aggressively work is dispatched based on recent performance signals.
+
+**What the scaling governor does:**
+
+A governor that reads recent `gate_score` history and UoW completion rate to modulate two parameters:
+- **Batch size:** How many UoWs are dispatched in a single Steward pass.
+- **Execution rate:** How frequently the Steward cycle runs (or equivalently, how long the dispatch window remains open before pausing).
+
+The governor is a feedback control loop: success signal → increase throughput; failure signal → reduce throughput + increase diagnosis time before next dispatch.
+
+**Signal source:** The `corrective_traces` table (gate_scores, execution_summary) and the registry (UoW completion rate over rolling window). Both are available after V3 PRs A–D land.
+
+**Why deferred:** The governor requires the corrective trace data to be real before it can be calibrated. A governor designed on synthetic data will be tuned for the wrong operating point. Design only after the first 10-UoW sprint with real traces.
+
+**Design horizon (not spec):**
+- Governor input: rolling 7-day completion rate + average gate_score across last N completed UoWs.
+- Governor output: `dispatch_batch_size` (int, floor 1, ceiling configurable) + `inter-cycle-pause-seconds` (float).
+- Anti-windup: if batch_size has been at floor for > 3 cycles with no improvement, surface to Dan — the system is in a mode the governor cannot resolve autonomously.
+- Configuration: `wos-config.json` extension with `governor_enabled: bool` + tuning parameters. Default: disabled until calibrated.
+
+---
+
+## Related Documents
+
+- **[wos-v3-proposal.md](wos-v3-proposal.md)** — Foundational V3 design proposal that this spec implements. Covers vision, register taxonomy, architecture, dispatch loop pseudocode, and open design questions.
+- **[wos-v3-convergence.md](../philosophy/frontier/wos-v3-convergence.md)** — Seeds, sprouts, and pearls synthesis from multi-thread philosophical review. Contains S1 (loop gain bounding for PR B) and S2 (mismatch observability for PR C) as explicit spec requirements, plus the ungoverned timescales section (register-portfolio diversity, cross-cycle pattern learning).
+- **[corrective-trace-loop-gain-research.md](corrective-trace-loop-gain-research.md)** — Research note on bounded correction magnitude for Change 2 (Corrective Trace Injection, PR B). Provides engineering and biological grounding for the loop gain bounding requirement (S1). See the bounded-correction mechanisms (section 3) for implementation guidance.
+- **[2026-04-04-philosopher-cybernetics.md](../philosophy/sessions/2026-04-04-philosopher-cybernetics.md)** — Cybernetics lens (Ashby's Law). Named the unbounded loop gain risk in the corrective trace mechanism and the orientation gaps in the OODA phase.
+- **[2026-04-04-philosopher-theory-of-learning.md](../philosophy/sessions/2026-04-04-philosopher-theory-of-learning.md)** — Theory of Learning lens. Placed the spec at Discernment-Coherence designing for Attunement; identified the scaling governor gap (S4) and the trace mechanism as developmental scaffolding rather than a completed learning loop.
+- **[2026-04-04-philosopher-mito-governor.md](../philosophy/sessions/2026-04-04-philosopher-mito-governor.md)** — Mito-governor lens. Named the timing-structure vs. content-processing distinction for the trace gate (PR #607), the register-portfolio diversity gap, and the multi-timescale governance gap.
