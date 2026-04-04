@@ -1,6 +1,8 @@
+> **Status: SUPERSEDED** — This is the v2 WOS design document. The canonical design is now [`wos-v3-proposal.md`](./wos-v3-proposal.md). V2 remains the implementation reference until V3 is built.
+
 # Work Orchestration System v2 — Design Document
 
-*Status: Active — 2026-03-30*
+*Status: Superseded by V3 — 2026-04-04*
 
 ---
 

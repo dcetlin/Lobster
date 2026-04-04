@@ -323,3 +323,14 @@ The dual register — operational and philosophical — is not a technical disti
 ---
 
 *Synthesized from: wos-v2-design.md, ralph-wos-seed.md, human-ai-ooda-protocol.md, vision.yaml, registers.md (frontier), hygiene sweeps 2026-04-03/04, overnight test observations, GitHub landscape research (RALPH loop, BabyAGI/AutoGPT architectures, LLM agent canonical patterns), and cybernetics theory (Ashby's requisite variety, VSM, Boyd's OODA).*
+
+---
+
+## Related Documents
+
+- **[wos-v3-steward-executor-spec.md](wos-v3-steward-executor-spec.md)** — Implementation spec for this proposal: 6 V3 changes, PR sequencing (A → B → C → D), testability notes, and V4 design directions including the scaling governor (S4).
+- **[wos-v3-convergence.md](../philosophy/frontier/wos-v3-convergence.md)** — Seeds, sprouts, and pearls synthesis from multi-thread philosophical review. Contains S1–S5 candidate spec additions, ungoverned timescales, and final bearings.
+- **[corrective-trace-loop-gain-research.md](corrective-trace-loop-gain-research.md)** — Research note on bounded correction in the corrective trace feedback loop. Directly relevant to section 4 (the corrective trace contract) and section 8 item 3 (garden write discipline).
+- **[2026-04-04-philosopher-cybernetics.md](../philosophy/sessions/2026-04-04-philosopher-cybernetics.md)** — Cybernetics philosopher session (Ashby's Law). Grounds section 9's cybernetic extension claim and names residual variety-matching gaps.
+- **[2026-04-04-philosopher-theory-of-learning.md](../philosophy/sessions/2026-04-04-philosopher-theory-of-learning.md)** — Theory of Learning philosopher session. Grounds section 8 item 7 (scaling governor) and the Discernment-Coherence-Attunement arc framing.
+- **[2026-04-04-philosopher-mito-governor.md](../philosophy/sessions/2026-04-04-philosopher-mito-governor.md)** — Mito-governor philosopher session. Grounds the timescale observations (register-portfolio diversity, cross-cycle learning) and the four-governor-as-one-structure observation.

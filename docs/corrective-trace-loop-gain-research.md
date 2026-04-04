@@ -149,3 +149,11 @@ This is structurally analogous to `no_gate_improvement` but without requiring a 
 - Survey on feedback mechanisms in LLM-based agents: https://www.ijcai.org/proceedings/2025/1175.pdf
 - Runaway agent prevention: https://medium.com/@aiteacher/how-to-prevent-hallucinations-and-runaway-agents-in-agentic-ai-systems-bf2cfe281248
 - Agentic AI architectures and feedback control: https://arxiv.org/html/2601.12560v1
+
+---
+
+## Related Documents
+
+- **[wos-v3-steward-executor-spec.md](wos-v3-steward-executor-spec.md)** — Implementation spec. This research note directly informs Change 2 (Corrective Trace Injection, PR B): the bounded-correction mechanisms in section 3 map to S1 (loop gain bounding on prescription_delta). See also the `no_gate_improvement` and `prescription_recycling` stuck conditions in Changes 2 and 4.
+- **[wos-v3-convergence.md](../philosophy/frontier/wos-v3-convergence.md)** — Seeds and pearls synthesis. S1 (loop gain bounding on prescription_delta) in the convergence doc is the seed that this research note was written to answer. The structural recommendation in section 3e (short moving average + confidence weighting) is the bounded-correction mechanism for S1.
+- **[2026-04-04-philosopher-cybernetics.md](../philosophy/sessions/2026-04-04-philosopher-cybernetics.md)** — The cybernetics philosopher session that identified the unbounded loop gain risk (the loop gain concern in the closing section of that document). This research note is the follow-up investigation that philosopher session prompted.
