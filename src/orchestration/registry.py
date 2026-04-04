@@ -168,6 +168,23 @@ class UoW:
     # Canonical GitHub issue URL (populated after migration 0005)
     # Eliminates hardcoded repo references in Steward and Executor.
     issue_url: str | None = None
+    # V3 register fields (populated after migration 0007)
+    # register: attentional configuration required for completion evaluation.
+    #   Values: operational | iterative-convergent | philosophical | human-judgment
+    #   Immutable after germination — written at INSERT time by the Germinator.
+    #   If the Steward detects a mismatch on diagnosis, it surfaces to Dan rather
+    #   than reclassifying autonomously.
+    # uow_mode: mirrors register; used for execution context selection by Executor.
+    #   Kept separate to allow future divergence without a schema change.
+    register: str = "operational"
+    uow_mode: str | None = None
+    # Delivery≠closure fields (populated after migration 0007)
+    # closed_at: ISO timestamp written by Steward when it declares the loop done.
+    #   Distinct from completed_at (Executor delivery). NULL until Steward closes.
+    # close_reason: prose explaining the Steward's closure decision.
+    #   Required at done transition. Enables post-hoc audit of closure rationale.
+    closed_at: str | None = None
+    close_reason: str | None = None
 
 
 def _now_iso() -> str:
@@ -297,6 +314,10 @@ class Registry:
             source_last_seen_at=d.get("source_last_seen_at"),
             source_state=d.get("source_state"),
             issue_url=d.get("issue_url"),
+            register=d.get("register") or "operational",
+            uow_mode=d.get("uow_mode"),
+            closed_at=d.get("closed_at"),
+            close_reason=d.get("close_reason"),
         )
 
     def _write_audit(
@@ -457,8 +478,8 @@ class Registry:
                     id, type, source, source_issue_number, sweep_date,
                     status, posture, created_at, updated_at, summary,
                     success_criteria, route_reason, route_evidence, trigger,
-                    issue_url
-                ) VALUES (?, ?, ?, ?, ?, 'proposed', 'solo', ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}', ?)
+                    issue_url, register, uow_mode
+                ) VALUES (?, ?, ?, ?, ?, 'proposed', 'solo', ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}', ?, ?, ?)
                 """,
                 (
                     uow_id,
@@ -472,6 +493,8 @@ class Registry:
                     success_criteria,
                     _LEGACY_ROUTE_REASON,
                     resolved_issue_url,
+                    "operational",   # register default — Germinator overwrites at PR1
+                    "operational",   # uow_mode mirrors register at insert time
                 ),
             )
             conn.commit()
