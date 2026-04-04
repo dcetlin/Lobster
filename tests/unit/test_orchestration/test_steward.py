@@ -2631,3 +2631,227 @@ class TestDefaultNotifyDanInboxDelivery:
             "_default_notify_dan must write a JSON file to the inbox when the hard cap fires "
             "— WARNING log alone is not sufficient (Issue #426)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Corrective trace one-cycle temporal gate (cristae-junction delay)
+# ---------------------------------------------------------------------------
+
+class TestCorrectiveTraceGate:
+    """
+    Verify the one-cycle temporal gate: before re-prescribing after an executor
+    return, the executor must have written a corrective trace ({output_ref}.trace.json).
+
+    Biological analogy: cristae geometry creates a delay between proton pump
+    action and ATP synthesis. Without this delay, the system oscillates wildly.
+    The software equivalent: steward waits one cycle before re-prescribing if
+    trace.json is absent.
+    """
+
+    def _make_uow_with_result(
+        self,
+        conn,
+        db_path: Path,
+        tmp_path: Path,
+        outcome: str = "partial",
+    ) -> tuple[str, Path, Path]:
+        """
+        Helper: create a UoW with execution_complete audit and output + result files.
+        Returns (uow_id, output_file, result_file).
+        Does NOT write a trace.json — callers can add that selectively.
+        """
+        output_file = tmp_path / "output.txt"
+        output_file.write_text("partial work done — some steps remain.")
+        result_file = output_file.with_suffix(".result.json")
+        # Note: for partial/failed we don't use steward_cycles=0 since that skips
+        # the trace gate (first_execution posture). Use cycles=1 for re-entry.
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=1,
+            output_ref=str(output_file),
+            audit_log_entries=[
+                {
+                    "event": "execution_complete",
+                    "actor": "executor",
+                    "return_reason": "observation_complete",
+                    "timestamp": _now_iso(),
+                },
+            ],
+            success_criteria="All steps completed and output verified.",
+        )
+        result_file.write_text(json.dumps({
+            "uow_id": uow_id,
+            "outcome": outcome,
+            "reason": "partial work done",
+        }))
+        return uow_id, output_file, result_file
+
+    def test_trace_absent_first_reentry_skips_prescription(self, db_path, registry, tmp_path):
+        """
+        When result.json exists but trace.json does NOT: first re-entry must skip
+        prescription, log trace_gate_waited, and leave UoW at ready-for-steward.
+        """
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        conn = _open_db(db_path)
+        uow_id, output_file, result_file = self._make_uow_with_result(conn, db_path, tmp_path)
+        conn.close()
+
+        # No trace.json written — gate should fire
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan=lambda *a, **kw: None,
+            llm_prescriber=None,
+        )
+
+        uow = _get_uow(db_path, uow_id)
+        assert uow["status"] == "ready-for-steward", (
+            "Trace gate: first re-entry with trace.json absent must leave UoW at "
+            "ready-for-steward, not transition to ready-for-executor"
+        )
+
+        steward_log = uow.get("steward_log", "") or ""
+        assert "trace_gate_waited" in steward_log, (
+            "trace_gate_waited entry must be written to steward_log on first skip"
+        )
+
+        # workflow_artifact must NOT be written (no prescription took place)
+        assert not uow.get("workflow_artifact"), (
+            "No workflow artifact must be written when trace gate skips prescription"
+        )
+
+    def test_trace_absent_second_reentry_proceeds_with_contract_violation(
+        self, db_path, registry, tmp_path
+    ):
+        """
+        When result.json exists but trace.json does NOT, and steward_log already
+        contains trace_gate_waited: second re-entry must proceed with prescription
+        and log a contract violation.
+        """
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        output_file = tmp_path / "output.txt"
+        output_file.write_text("partial work done — some steps remain.")
+        result_file = output_file.with_suffix(".result.json")
+
+        # Pre-populate steward_log with trace_gate_waited to simulate already-waited state
+        trace_gate_log = json.dumps({
+            "event": "trace_gate_waited",
+            "uow_id": "placeholder",
+            "steward_cycles": 1,
+            "timestamp": _now_iso(),
+        })
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=1,
+            output_ref=str(output_file),
+            audit_log_entries=[
+                {
+                    "event": "execution_complete",
+                    "actor": "executor",
+                    "return_reason": "observation_complete",
+                    "timestamp": _now_iso(),
+                },
+            ],
+            success_criteria="All steps completed and output verified.",
+            steward_log=trace_gate_log,
+        )
+        result_file.write_text(json.dumps({
+            "uow_id": uow_id,
+            "outcome": "partial",
+            "reason": "partial work done",
+        }))
+        conn.close()
+
+        # No trace.json written but steward_log already has trace_gate_waited
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan=lambda *a, **kw: None,
+            llm_prescriber=None,
+        )
+
+        uow = _get_uow(db_path, uow_id)
+        assert uow["status"] == "ready-for-executor", (
+            "Trace gate: second re-entry (already waited) must proceed with prescription "
+            "and transition to ready-for-executor"
+        )
+
+        steward_log = uow.get("steward_log", "") or ""
+        assert "trace_gate_contract_violation" in steward_log, (
+            "Contract violation must be logged when proceeding after one-cycle wait "
+            "without trace.json appearing"
+        )
+
+    def test_trace_exists_prescription_proceeds_normally(self, db_path, registry, tmp_path):
+        """
+        When both result.json AND trace.json exist: prescription proceeds normally
+        without any trace gate delay.
+        """
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        output_file = tmp_path / "output.txt"
+        output_file.write_text("partial work done — some steps remain.")
+        result_file = output_file.with_suffix(".result.json")
+        trace_file = output_file.with_suffix(".trace.json")
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=1,
+            output_ref=str(output_file),
+            audit_log_entries=[
+                {
+                    "event": "execution_complete",
+                    "actor": "executor",
+                    "return_reason": "observation_complete",
+                    "timestamp": _now_iso(),
+                },
+            ],
+            success_criteria="All steps completed and output verified.",
+        )
+        result_file.write_text(json.dumps({
+            "uow_id": uow_id,
+            "outcome": "partial",
+            "reason": "partial work done",
+        }))
+        # Write trace.json — gate should NOT fire
+        trace_file.write_text(json.dumps({
+            "uow_id": uow_id,
+            "cycle": 1,
+            "corrective_observations": [],
+        }))
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan=lambda *a, **kw: None,
+            llm_prescriber=None,
+        )
+
+        uow = _get_uow(db_path, uow_id)
+        assert uow["status"] == "ready-for-executor", (
+            "When trace.json is present, prescription must proceed and UoW "
+            "must transition to ready-for-executor without any gate delay"
+        )
+
+        steward_log = uow.get("steward_log", "") or ""
+        assert "trace_gate_waited" not in steward_log, (
+            "trace_gate_waited must NOT appear in steward_log when trace.json is present"
+        )
