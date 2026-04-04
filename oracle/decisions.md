@@ -669,3 +669,24 @@ Issues requiring resolution before merge:
 2. `wait_entry` dict is missing a `timestamp` field. All other steward_log entries carry timestamps; add one for observability consistency.
 3. Contract-violation path (trace absent after one cycle) proceeds with only a `log.warning`. A notification to Dan (or at minimum an audit-escalation event) is warranted for a persistent contract violation — the current path is silent to the operator.
 
+---
+
+## [2026-04-04] PR #607 — feat(wos-v3): corrective trace mandatory one-cycle temporal gate — Re-review after NEEDS_CHANGES (commit 7fa2c63)
+
+### Re-review scope
+All three NEEDS_CHANGES issues from the prior review were addressed in commit 7fa2c63.
+
+**Issue 1 — Comment/code mismatch (skip-path state transition):** Resolved. The state transition was confirmed correct — on skip (trace absent, first cycle), the UoW stays at `ready-for-steward` so the next heartbeat picks it up. The misleading comment was corrected to reflect the actual behavior.
+
+**Issue 2 — Missing timestamp in wait_entry:** Resolved. A `timestamp` field has been added to the `wait_entry` dict, consistent with all other steward_log entries.
+
+**Issue 3 — Silent contract-violation path:** Resolved. A Dan notification has been added on the contract-violation path (trace absent after one cycle), surfacing the persistent contract violation to the operator rather than leaving it as a log.warning only.
+
+### Residual non-blocking notes (tracked, not blocking merge)
+- `violation_entry` dict still lacks a `timestamp` field — minor inconsistency with the now-timestamped `wait_entry`. Not blocking; the violation event is surfaced to Dan.
+- The contract-violation `notify_dan` call is not asserted in the existing tests. Coverage gap noted; tests cover the gate logic but not the notification side-effect.
+
+### Overall verdict: APPROVED
+
+PR #607 is approved for merge. All three mandatory issues are resolved. Residual notes are tracked above for follow-up but do not block merge.
+
