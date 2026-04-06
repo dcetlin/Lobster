@@ -1772,6 +1772,166 @@ class TestFeedbackLoopIntegration:
 
 
 # ---------------------------------------------------------------------------
+# Test: Backpressure — skip re-prescription when executor queue is saturated (#617)
+# ---------------------------------------------------------------------------
+
+class TestBackpressureSkipsRePrescription:
+    """
+    When the startup sweep returns a UoW from ready-for-executor to
+    ready-for-steward with classification=executor_orphan, the steward
+    must NOT re-prescribe. Instead it skips the UoW and logs a backpressure
+    event. This prevents LLM call waste when the executor queue is saturated.
+    """
+
+    EXECUTOR_ORPHAN_AUDIT_ENTRY = {
+        "event": "startup_sweep",
+        "classification": "executor_orphan",
+        "prior_status": "ready-for-executor",
+    }
+
+    def test_skip_represcription_when_executor_orphan(self, db_path, registry, tmp_path):
+        """UoW returned as executor_orphan must be skipped, not prescribed."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=1,
+            output_ref=None,
+            audit_log_entries=[self.EXECUTOR_ORPHAN_AUDIT_ENTRY],
+        )
+        conn.close()
+
+        result = steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+        )
+
+        # UoW must not be prescribed: status stays ready-for-steward
+        uow = _get_uow(db_path, uow_id)
+        assert uow["status"] == "ready-for-steward", (
+            "UoW with executor_orphan return reason must remain ready-for-steward, "
+            f"not be re-prescribed. Got status: {uow['status']}"
+        )
+        assert result["skipped"] >= 1, (
+            "run_steward_cycle must count the backpressure skip in skipped counter"
+        )
+
+    def test_no_llm_call_when_executor_orphan(self, db_path, registry, tmp_path):
+        """No LLM prescription call is made when return reason is executor_orphan."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        llm_calls = []
+
+        def capturing_llm_prescriber(uow, posture, gap, issue_body=""):
+            llm_calls.append(uow.id)
+            return None
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=1,
+            output_ref=None,
+            audit_log_entries=[self.EXECUTOR_ORPHAN_AUDIT_ENTRY],
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            llm_prescriber=capturing_llm_prescriber,
+        )
+
+        assert uow_id not in llm_calls, (
+            "LLM prescriber must not be called for a UoW with executor_orphan return reason"
+        )
+
+    def test_normal_uow_still_prescribed_alongside_orphan(self, db_path, registry, tmp_path):
+        """A normal UoW is prescribed even when another UoW is an executor_orphan."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        conn = _open_db(db_path)
+        orphan_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=1,
+            output_ref=None,
+            audit_log_entries=[self.EXECUTOR_ORPHAN_AUDIT_ENTRY],
+            source_issue_number=101,
+        )
+        normal_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=0,
+            output_ref=None,
+            source_issue_number=102,
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+        )
+
+        orphan_uow = _get_uow(db_path, orphan_id)
+        normal_uow = _get_uow(db_path, normal_id)
+
+        assert orphan_uow["status"] == "ready-for-steward", (
+            "executor_orphan UoW must stay ready-for-steward (backpressure skip)"
+        )
+        assert normal_uow["status"] == "ready-for-executor", (
+            f"Normal UoW must be prescribed (ready-for-executor). Got: {normal_uow['status']}"
+        )
+
+    def test_backpressure_event_written_to_audit_log(self, db_path, registry, tmp_path):
+        """A backpressure audit event is written when re-prescription is skipped."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=1,
+            output_ref=None,
+            audit_log_entries=[self.EXECUTOR_ORPHAN_AUDIT_ENTRY],
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+        )
+
+        entries = _audit_entries(db_path, uow_id)
+        backpressure_entries = [
+            e for e in entries
+            if e.get("event") == "backpressure"
+        ]
+        assert backpressure_entries, (
+            "A backpressure audit entry must be written when re-prescription is skipped"
+        )
+        # The note must contain the uow_id and cycle count
+        import json as _json
+        note_data = _json.loads(backpressure_entries[0]["note"])
+        assert note_data.get("uow_id") == uow_id
+        assert "steward_cycles" in note_data
+
+
+# ---------------------------------------------------------------------------
 # Mock helpers
 # ---------------------------------------------------------------------------
 
