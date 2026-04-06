@@ -722,3 +722,44 @@ All three NEEDS_CHANGES items from the prior review are resolved. The two residu
 ### Overall verdict: APPROVED
 
 **PR #611** is approved for merge. All 5 exit paths write trace.json. All 4 pure helper functions are correctly implemented. The thin trace design is clearly documented with enrichment deferred to PR B-D. Best-effort DB write semantics are correct and explicitly documented. The `register="operational"` hardcoding in partial/blocked paths is a documented known limitation with tracked successors. Two latent NameError bugs are fixed. 32 tests pass. The PR closes the gap named by the PR #607 oracle review and satisfies the trace gate contract. Ready to merge.
+
+---
+
+## [2026-04-06] PR #600 — docs: WOS vision, doc index, and orchestration landscape
+
+### Stage 1: Vision alignment
+
+**Q: Is this PR aligned with WOS intent?**
+
+Documentation-only PR. No code changes. Adds three missing documents:
+- `wos-vision.md` — first-principles vision and premises
+- `WOS-INDEX.md` — documentation ecosystem map (now superseded on main by the component glossary, but wos-vision.md and wos-orchestration-landscape.md remain)
+- `wos-orchestration-landscape.md` — external systems survey
+
+All three address a genuine gap: no canonical vision/premises document existed, only fragments in versioned design docs. STAGE 1: APPROVED.
+
+### Stage 2: Is the implementation well-made?
+
+**Q: Does wos-vision.md risk becoming a decision substrate for agents?**
+
+Finding: This is the named risk in vision.yaml itself (risk-2). Without explicit authority headers, an agent reading wos-vision.md could treat it as canonical intent rather than querying vision.yaml structurally.
+
+Resolution: Authority headers added before merge. The header explicitly states agents must query vision.yaml directly, that this document has no machine update authority, and that the canonical source is vision.yaml (Dan-owned, agent-read-only). The risk is addressed.
+
+**Q: Are WOS-INDEX.md and wos-orchestration-landscape.md correctly registered?**
+
+Finding: Both carry lower risk (reference/survey material) but still required explicit registration to prevent ambiguity about their authority level. Note: WOS-INDEX.md has been superseded on main by the component glossary (V3); the authority header has been adapted to match the actual document content.
+
+Resolution: Both have appropriate headers added before merge. APPROVED.
+
+**Q: Does any content in these documents contradict vision.yaml or introduce new behavioral constraints?**
+
+Finding: All three documents are descriptive/survey material. None introduce new behavioral constraints. None contradict the premise architecture in vision.yaml. APPROVED.
+
+### Human authority
+
+Dan approved this PR explicitly with the condition that authority headers be added. Condition fulfilled before merge.
+
+### Overall verdict: APPROVED
+
+**PR #600** is approved for merge. Authority headers added to all three files before merge, addressing the named vision.yaml risk-2 concern. No code changes — documentation only.

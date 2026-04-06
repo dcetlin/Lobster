@@ -1,3 +1,6 @@
+> **Status:** Reference glossary. Read-only for agents. Not a decision substrate.
+> This document resolves WOS component naming. For intent queries, use `vision.yaml`.
+
 # WOS Component Glossary (V3)
 
 This document is the authoritative component glossary for the Work Orchestration
