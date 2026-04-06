@@ -762,6 +762,35 @@ def _select_prescribed_skills(uow: "UoW", reentry_posture: str) -> list[str]:
     return skills
 
 
+def _extract_json_from_llm_output(raw_text: str) -> str:
+    """Extract the JSON content from raw LLM output.
+
+    Pure function. Handles three forms:
+    1. Fenced block anywhere in the text (``` or ```json) — extracts content between
+       the first opening fence and its closing fence.
+    2. Plain JSON starting at the first '{' or '[' — returns the substring from
+       that character to the end of the string.
+    3. Text that is already bare JSON — returned as-is.
+
+    Returns the extracted candidate string. The caller is responsible for
+    calling json.loads and handling JSONDecodeError.
+    """
+    import re as _re
+
+    # Strategy 1: find a fenced block (```json or ```) anywhere in the text
+    fence_match = _re.search(r"```(?:json)?\s*\n(.*?)\n```", raw_text, _re.DOTALL)
+    if fence_match:
+        return fence_match.group(1).strip()
+
+    # Strategy 2: find the first JSON object/array start character
+    for i, ch in enumerate(raw_text):
+        if ch in ("{", "["):
+            return raw_text[i:].strip()
+
+    # Strategy 3: return as-is (will likely fail json.loads — handled by caller)
+    return raw_text
+
+
 def _llm_prescribe(
     uow: UoW,
     reentry_posture: str,
@@ -945,13 +974,11 @@ Respond with a JSON object only (no markdown, no explanation outside the JSON):
         )
         return None
 
-    # Strip markdown code fences if present
-    if raw_text.startswith("```"):
-        lines = raw_text.splitlines()
-        raw_text = "\n".join(
-            line for line in lines
-            if not line.startswith("```")
-        ).strip()
+    # Extract JSON from anywhere in the LLM output.
+    # The LLM often prefixes its JSON with preamble prose; _extract_json_from_llm_output
+    # handles fenced blocks (```json or ```) appearing anywhere, as well as plain JSON
+    # that starts mid-text after preamble.
+    raw_text = _extract_json_from_llm_output(raw_text)
 
     # Classify parse failures: distinguish non-JSON (refusal / error prose)
     # from structurally-valid JSON that doesn't match the expected schema.
