@@ -119,6 +119,7 @@ def _is_job_enabled(job_name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_STALL_SECONDS = 1800  # 30 minutes fallback when timeout_at is NULL
+HIGH_PRESCRIPTION_THRESHOLD = 10  # Alert when prescriptions per cycle exceeds this (#618)
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +129,47 @@ _DEFAULT_STALL_SECONDS = 1800  # 30 minutes fallback when timeout_at is NULL
 def _now_iso() -> str:
     """Return current UTC time in ISO 8601 format."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _observations_log_path() -> Path:
+    """Return the observations.log path from env or default workspace."""
+    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+    return workspace / "logs" / "observations.log"
+
+
+def _append_observation(message: str) -> None:
+    """Append a plain-text warning line to observations.log (side effect isolated here)."""
+    obs_log = _observations_log_path()
+    obs_log.parent.mkdir(parents=True, exist_ok=True)
+    with obs_log.open("a") as fh:
+        fh.write(message + "\n")
+
+
+def _task_outputs_dir() -> Path:
+    """Return the task-outputs directory path."""
+    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+    return workspace / "messages" / "task-outputs"
+
+
+def _write_task_output(output: str, status: str, timestamp: str) -> None:
+    """
+    Write a task output record directly to the task-outputs directory.
+    Mirrors the format expected by check_task_outputs.
+    """
+    task_outputs = _task_outputs_dir()
+    task_outputs.mkdir(parents=True, exist_ok=True)
+    date_prefix = timestamp[:19].replace(":", "").replace("-", "").replace("T", "-")
+    filename = f"{date_prefix}-steward-heartbeat.json"
+    record = {
+        "job_name": "steward-heartbeat",
+        "timestamp": timestamp,
+        "status": status,
+        "output": output,
+    }
+    out_path = task_outputs / filename
+    tmp_path = Path(str(out_path) + ".tmp")
+    tmp_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -545,7 +587,23 @@ def main() -> int:
     # when execution_enabled=false to prevent LLM cost drain.
     from src.orchestration.dispatcher_handlers import is_execution_enabled
 
-    if not is_execution_enabled():
+    # Alert condition 2: queue depth when execution is disabled (#618).
+    # Check before skipping Phase 3 so the alert fires even when WOS is paused.
+    execution_enabled = is_execution_enabled()
+    if not execution_enabled:
+        try:
+            eligible_uows = registry.list(status="ready-for-steward")
+            eligible_count = len(eligible_uows)
+            if eligible_count > 0:
+                msg = (
+                    f"steward: {eligible_count} UoWs eligible for prescription "
+                    f"but execution_enabled=false — queue will not drain"
+                )
+                log.warning("%s", msg)
+                _append_observation(msg)
+        except Exception:
+            log.exception("Queue depth check (execution disabled) failed — continuing")
+
         log.info(
             "Steward heartbeat: skipping LLM prescription "
             "(wos-config.json execution_enabled=false). "
@@ -556,12 +614,14 @@ def main() -> int:
 
     # Phase 3: Steward main loop
     log.info("--- Phase 3: Steward main loop ---")
+    prescriptions_this_cycle = 0
     try:
         result = run_steward_cycle(
             registry=registry,
             dry_run=dry_run,
             bootup_candidate_gate=gate_active,
         )
+        prescriptions_this_cycle = result["prescribed"]
         log.info(
             "Steward cycle complete: evaluated=%d prescribed=%d done=%d "
             "surfaced=%d skipped=%d race_skipped=%d",
@@ -580,6 +640,15 @@ def main() -> int:
         log.exception("Steward main loop failed")
         return 1
 
+    # Alert condition 1: high prescription count per cycle (#618).
+    if prescriptions_this_cycle > HIGH_PRESCRIPTION_THRESHOLD:
+        msg = (
+            f"steward: high prescription count ({prescriptions_this_cycle}) "
+            f"this cycle — possible queue buildup"
+        )
+        log.warning("%s", msg)
+        _append_observation(msg)
+
     # Phase 4: Post-completion GitHub sync
     log.info("--- Phase 4: Post-completion GitHub sync ---")
     try:
@@ -595,6 +664,16 @@ def main() -> int:
                 log.warning("GitHub sync error: %s", err)
     except Exception:
         log.exception("Post-completion GitHub sync failed — continuing")
+
+    # Write task output with cycle metrics (#618).
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    task_output_summary = (
+        f"steward cycle complete: prescriptions_this_cycle={prescriptions_this_cycle}"
+    )
+    try:
+        _write_task_output(task_output_summary, "success", timestamp)
+    except Exception:
+        log.exception("Failed to write task output — continuing")
 
     log.info("Steward heartbeat complete")
     return 0
