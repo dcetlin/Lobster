@@ -147,8 +147,8 @@ def _append_observation(message: str) -> None:
 
 def _task_outputs_dir() -> Path:
     """Return the task-outputs directory path."""
-    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-    return workspace / "messages" / "task-outputs"
+    messages_base = Path(os.environ.get("LOBSTER_MESSAGES", Path.home() / "messages"))
+    return messages_base / "task-outputs"
 
 
 def _write_task_output(output: str, status: str, timestamp: str) -> None:
