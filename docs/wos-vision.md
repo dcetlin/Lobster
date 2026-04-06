@@ -1,3 +1,8 @@
+> **Status:** Human-readable companion document. **Not the authoritative intent substrate.**
+> Agents MUST query `vision.yaml` directly for WOS intent, routing, and prioritization decisions.
+> Do not quote this document to justify design decisions. This document has no machine update authority.
+> Canonical source: `~/lobster-user-config/vision.yaml` (Dan-owned, agent-read-only).
+
 # WOS Vision and Premises
 
 *Status: Active — 2026-04-04*

@@ -1,3 +1,6 @@
+> **Status:** Background survey. External systems analysis only. Not a WOS design authority.
+> This document is context for human readers, not a source of WOS behavioral constraints.
+
 # WOS Orchestration Landscape
 
 *Status: Active — 2026-04-04*
