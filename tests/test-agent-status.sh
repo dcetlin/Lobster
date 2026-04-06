@@ -346,6 +346,57 @@ else
     fail "Format mismatch: '$RESULT'"
 fi
 
+# Test 19: stop_reason=stop_sequence is treated as terminal (not shown as running)
+begin_test "Agent with stop_reason=stop_sequence is excluded from active agents"
+reset_tasks
+REAL_FILE="$TEST_TMPDIR/real_stopseq.output"
+> "$REAL_FILE"
+echo '{"type":"assistant","message":{"role":"assistant","content":[]}}' >> "$REAL_FILE"
+echo '{"type":"result","subtype":"success","stop_reason":"stop_sequence"}' >> "$REAL_FILE"
+touch -d "5 seconds ago" "$REAL_FILE"
+ln -sf "$REAL_FILE" "$TEST_TASKS_DIR/stopseq_agent.output"
+source_agent_status
+RESULT=$(scan_agent_status)
+if [ -z "$RESULT" ]; then
+    pass
+else
+    fail "Expected empty (stop_sequence is terminal), got: '$RESULT'"
+fi
+
+# Test 20: stop_reason=end_turn is still treated as terminal
+begin_test "Agent with stop_reason=end_turn is excluded from active agents"
+reset_tasks
+REAL_FILE="$TEST_TMPDIR/real_endturn.output"
+> "$REAL_FILE"
+echo '{"type":"assistant","message":{"role":"assistant","content":[]}}' >> "$REAL_FILE"
+echo '{"type":"result","subtype":"success","stop_reason":"end_turn"}' >> "$REAL_FILE"
+touch -d "5 seconds ago" "$REAL_FILE"
+ln -sf "$REAL_FILE" "$TEST_TASKS_DIR/endturn_agent.output"
+source_agent_status
+RESULT=$(scan_agent_status)
+if [ -z "$RESULT" ]; then
+    pass
+else
+    fail "Expected empty (end_turn is terminal), got: '$RESULT'"
+fi
+
+# Test 21: Unknown stop_reason is treated as terminal (defensive — new API values won't appear as running)
+begin_test "Agent with unrecognized stop_reason is excluded from active agents"
+reset_tasks
+REAL_FILE="$TEST_TMPDIR/real_unknown_stop.output"
+> "$REAL_FILE"
+echo '{"type":"assistant","message":{"role":"assistant","content":[]}}' >> "$REAL_FILE"
+echo '{"type":"result","subtype":"success","stop_reason":"max_tokens"}' >> "$REAL_FILE"
+touch -d "5 seconds ago" "$REAL_FILE"
+ln -sf "$REAL_FILE" "$TEST_TASKS_DIR/unknown_stop_agent.output"
+source_agent_status
+RESULT=$(scan_agent_status)
+if [ -z "$RESULT" ]; then
+    pass
+else
+    fail "Expected empty (unknown stop_reason treated as terminal), got: '$RESULT'"
+fi
+
 #===============================================================================
 # Summary
 #===============================================================================
