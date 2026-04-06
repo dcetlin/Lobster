@@ -28,6 +28,7 @@ set -uo pipefail
 WORKSPACE="${LOBSTER_WORKSPACE:-${HOME}/lobster-workspace}"
 LEDGER_FILE="${WORKSPACE}/data/token-ledger.jsonl"
 POINTER_FILE="${WORKSPACE}/data/token-ledger.pointer"
+LOCK_FILE="${WORKSPACE}/data/token-ledger.lock"
 INFLIGHT_FILE="${WORKSPACE}/data/inflight-work.jsonl"
 SESSION_DIR="${HOME}/.claude/projects/-home-lobster-lobster-workspace"
 LOG_FILE="${WORKSPACE}/logs/hook-failures.log"
@@ -65,10 +66,33 @@ fi
 
 # ---------------------------------------------------------------------------
 # Find the most recent session JSONL (dynamic — session ID changes per session)
+#
+# ATTRIBUTION NOTE: This hook reads from the dispatcher's session JSONL, NOT
+# from per-subagent JSONL files. Usage deltas therefore include the
+# dispatcher's accumulated context cost (prompt tokens grow with each turn).
+# Token counts in the ledger reflect dispatcher-session deltas tagged to the
+# subagent being invoked — they are NOT isolated per-subagent costs. The
+# flamegraph per-source numbers include parent-session context overhead and
+# will overstate actual subagent spend.
 # ---------------------------------------------------------------------------
 JSONL_FILE=$(ls -t "${SESSION_DIR}"/*.jsonl 2>/dev/null | head -1 || true)
 if [[ -z "${JSONL_FILE}" || ! -f "${JSONL_FILE}" ]]; then
   log_failure "no session JSONL found in ${SESSION_DIR}"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Acquire an exclusive lock before reading the pointer, collecting usage, and
+# writing back. Without this lock, concurrent PostToolUse fires (e.g. when
+# steward and executor heartbeats launch subagents simultaneously) can read
+# the same LAST_OFFSET, extract the same delta, and double-count token spend.
+# The lock covers the full read-pointer → read-delta → append-ledger →
+# write-pointer sequence. It is released automatically when the script exits.
+# ---------------------------------------------------------------------------
+mkdir -p "$(dirname "${LOCK_FILE}")" 2>/dev/null || true
+exec 9>"${LOCK_FILE}"
+if ! flock -w 10 9; then
+  log_failure "could not acquire lock on ${LOCK_FILE} within 10s"
   exit 0
 fi
 

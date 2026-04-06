@@ -167,6 +167,10 @@ def make_bar(pct):
 since_dt = fmt_ts(since_s)
 now_dt = fmt_ts(now_s)
 print(f"Token flamegraph — last {window} ({since_dt} – {now_dt})")
+print(f"  NOTE: counts reflect dispatcher-session deltas, not isolated per-subagent costs.")
+print(f"  Each entry is the usage delta recorded when a subagent call returns, measured")
+print(f"  against the dispatcher's session JSONL. Per-source totals include parent-session")
+print(f"  context overhead and will overstate actual subagent spend.")
 print()
 
 if not sorted_sources:
