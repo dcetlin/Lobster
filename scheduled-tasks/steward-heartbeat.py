@@ -538,6 +538,22 @@ def main() -> int:
     except Exception:
         log.exception("Observation loop failed — continuing to Steward main loop")
 
+    # execution_enabled gate — mirrors the executor-heartbeat pattern.
+    # Phases 0–2 (stale agent cleanup, startup sweep, observation loop) always
+    # run because they are cheap and ensure state consistency even when WOS is
+    # paused. Phase 3 (LLM prescription) and Phase 4 (GitHub sync) are skipped
+    # when execution_enabled=false to prevent LLM cost drain.
+    from src.orchestration.dispatcher_handlers import is_execution_enabled
+
+    if not is_execution_enabled():
+        log.info(
+            "Steward heartbeat: skipping LLM prescription "
+            "(wos-config.json execution_enabled=false). "
+            "Use 'wos start' to enable."
+        )
+        log.info("Steward heartbeat complete")
+        return 0
+
     # Phase 3: Steward main loop
     log.info("--- Phase 3: Steward main loop ---")
     try:
