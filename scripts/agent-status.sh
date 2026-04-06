@@ -19,8 +19,11 @@
 #   AGENT_TASKS_DIR - Override the agent output directory (for testing)
 #
 # Key insight: Claude Code writes a stop_reason field to JSONL output files.
-#   "end_turn"  = agent definitively finished
-#   "tool_use"  = agent is actively running
+#   "end_turn"      = agent finished cleanly
+#   "stop_sequence" = agent terminated by API (rate limit, content filter) — terminal
+#   "tool_use"      = agent is mid-tool-call, actively running
+#   ""              = no stop_reason yet — agent is starting up
+# Any unrecognized stop_reason is treated as terminal (safe default).
 # This is zero-cooperation, deterministic, and scans all agents in ~3ms.
 #===============================================================================
 
@@ -124,8 +127,11 @@ scan_agent_status() {
         local stop_reason
         stop_reason=$(_get_stop_reason "$filepath")
 
-        # Skip completed agents — self-check is only for active work
-        if [ "$stop_reason" = "end_turn" ]; then
+        # Skip terminal agents — self-check is only for active work.
+        # Known terminal stop reasons: "end_turn", "stop_sequence" (API rate limit or
+        # content filter), and any other unrecognized value. Only "tool_use" and empty
+        # string indicate an agent that may still be running.
+        if [ "$stop_reason" != "tool_use" ] && [ -n "$stop_reason" ]; then
             continue
         fi
 
@@ -135,28 +141,26 @@ scan_agent_status() {
         # Without these checks a crashed agent would show as "running"/"starting" forever.
         local STALE_TOOL_USE_SECONDS=$(( 30 * 60 ))
         local STALE_STARTING_SECONDS=$(( 60 * 60 ))
-        if [ "$stop_reason" = "tool_use" ] || [ -z "$stop_reason" ]; then
-            local now file_mtime file_age_seconds
-            now=$(date +%s)
-            # stat -c %Y is GNU coreutils; stat -f %m is BSD/macOS fallback
-            file_mtime=$(stat -c %Y "$filepath" 2>/dev/null || stat -f %m "$filepath" 2>/dev/null || echo "$now")
-            file_age_seconds=$(( now - file_mtime ))
-            local threshold
-            if [ "$stop_reason" = "tool_use" ]; then
-                threshold=$STALE_TOOL_USE_SECONDS
-            else
-                threshold=$STALE_STARTING_SECONDS
-            fi
-            if [ "$file_age_seconds" -gt "$threshold" ]; then
-                continue  # file too old — agent is dead, not running
-            fi
+        local now file_mtime file_age_seconds
+        now=$(date +%s)
+        # stat -c %Y is GNU coreutils; stat -f %m is BSD/macOS fallback
+        file_mtime=$(stat -c %Y "$filepath" 2>/dev/null || stat -f %m "$filepath" 2>/dev/null || echo "$now")
+        file_age_seconds=$(( now - file_mtime ))
+        local threshold
+        if [ "$stop_reason" = "tool_use" ]; then
+            threshold=$STALE_TOOL_USE_SECONDS
+        else
+            threshold=$STALE_STARTING_SECONDS
+        fi
+        if [ "$file_age_seconds" -gt "$threshold" ]; then
+            continue  # file too old — agent is dead, not running
         fi
 
         local status_text
         if [ -z "$stop_reason" ]; then
             status_text="starting"
         else
-            # "tool_use" (recently active) or any other value = actively running
+            # stop_reason=tool_use: agent is mid-tool-call, actively running
             status_text="running"
         fi
 
@@ -244,11 +248,13 @@ scan_completed_tasks() {
             continue
         fi
 
-        # Check stop_reason — only "end_turn" means definitively done
+        # Check stop_reason — "end_turn" is a clean finish; "stop_sequence" means the
+        # API terminated the agent (rate limit or content filter) — still terminal.
+        # Any other non-empty, non-tool_use value is also treated as terminal.
         local stop_reason
         stop_reason=$(_get_stop_reason "$filepath")
 
-        if [ "$stop_reason" = "end_turn" ]; then
+        if [ "$stop_reason" = "end_turn" ] || [ "$stop_reason" = "stop_sequence" ]; then
             unreported_completed+=("$filepath")
         fi
     done
