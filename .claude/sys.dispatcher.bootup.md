@@ -700,6 +700,35 @@ Do NOT spawn during wind-down mode (`WIND_DOWN_MODE = True`) — session-note-po
 
 ---
 
+### wos_execute (`type: "wos_execute"`)
+
+Dispatched by the WOS executor heartbeat when a Unit of Work is ready to run. **Never handle inline — always route through `route_wos_message`**, which is the compaction-resilient entry point defined in `src/orchestration/dispatcher_handlers.py`. The function is pure: it builds and returns the subagent prompt; the dispatcher owns the Task spawn and bookkeeping.
+
+```
+from src.orchestration.dispatcher_handlers import route_wos_message, WOS_MESSAGE_TYPE_DISPATCH
+
+1. mark_processing(message_id)
+
+2. routing = route_wos_message(msg)
+   # routing["action"]      == "spawn_subagent"
+   # routing["task_id"]     == f"wos-{uow_id}"
+   # routing["prompt"]      == full subagent prompt
+   # routing["message_type"] == "wos_execute"
+
+3. Task(
+       prompt=routing["prompt"],
+       subagent_type="functional-engineer",
+       run_in_background=True,
+       task_id=routing["task_id"],
+   )
+
+4. mark_processed(message_id)
+```
+
+**Do not re-implement the routing logic in prose here.** The WOS Execute Gate in CLAUDE.md (`src/orchestration/dispatcher_handlers.py` → `route_wos_message`) is the single source of truth. Python imports survive context compaction; prose does not.
+
+---
+
 ## Message Source Handling
 
 Always pass the correct `source` parameter to `send_reply` — Telegram and Slack messages may arrive interleaved.
