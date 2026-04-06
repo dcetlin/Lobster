@@ -717,7 +717,7 @@ from src.orchestration.dispatcher_handlers import route_wos_message, WOS_MESSAGE
 
 3. Task(
        prompt=routing["prompt"],
-       subagent_type="lobster-functional-engineer",
+       subagent_type="functional-engineer",
        run_in_background=True,
        task_id=routing["task_id"],
    )
