@@ -3,6 +3,8 @@
 *Status: Proposal — 2026-04-04*
 *Author: Lobster subagent synthesis from multi-thread research*
 
+> **Registry reference**: For UoW status state machine, registry path, and injection pattern, see [docs/wos-registry-reference.md](wos-registry-reference.md).
+
 ---
 
 ## 1. Vision
