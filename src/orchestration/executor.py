@@ -1005,14 +1005,24 @@ _EXECUTOR_TYPE_TO_PREAMBLE: dict[str, str] = {
 }
 
 
-def _dispatch_via_frontier_writer(instructions: str, uow_id: str) -> str:
+def _dispatch_via_stub(register_name: str, instructions: str, uow_id: str) -> str:
     """
-    Dispatcher for philosophical-register UoWs.
+    Shared subprocess mechanism for stub dispatchers.
 
-    This sprint: same subprocess mechanism as _dispatch_via_claude_p.
+    frontier-writer and design-review are not yet differentiated from the
+    functional-engineer path at the subprocess level — they use the same
+    `claude -p` invocation with identical flags. This helper centralises that
+    shared mechanism so the two stubs stay in sync without duplicating code.
+
     The register-appropriate preamble is prepended by _run_execution before
     this function is called. Full semantic distinction (different model,
-    different output format) is a later sprint.
+    different output format, different CLI flags) is deferred to when each
+    register is implemented properly — replace the stub dispatcher with a
+    real one at that point and remove the corresponding entry from
+    _STUB_DISPATCHERS.
+
+    ``register_name`` is used only for log messages; it does not affect
+    dispatch behaviour.
     """
     run_id = f"{uow_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
 
@@ -1034,13 +1044,13 @@ def _dispatch_via_frontier_writer(instructions: str, uow_id: str) -> str:
     if error:
         classification = classify_error(error)
         log.error(
-            "Executor(%s): frontier-writer dispatch failed — %s (fatal=%s)",
-            uow_id, error.summary(), classification.is_fatal,
+            "Executor(%s): %s dispatch failed — %s (fatal=%s)",
+            uow_id, register_name, error.summary(), classification.is_fatal,
         )
         if has_repeated_error("executor", uow_id, str(error.error_type), threshold=3):
             log.critical(
-                "Executor(%s): repeated %s errors in frontier-writer — manual intervention likely needed",
-                uow_id, error.error_type,
+                "Executor(%s): repeated %s errors in %s — manual intervention likely needed",
+                uow_id, error.error_type, register_name,
             )
         raise subprocess.CalledProcessError(
             error.exit_code or 1,
@@ -1050,52 +1060,28 @@ def _dispatch_via_frontier_writer(instructions: str, uow_id: str) -> str:
         )
 
     return run_id
+
+
+def _dispatch_via_frontier_writer(instructions: str, uow_id: str) -> str:
+    """
+    Stub dispatcher for frontier-writer-register UoWs.
+
+    Uses the same subprocess mechanism as _dispatch_via_claude_p via
+    _dispatch_via_stub. Replace with register-specific dispatch (different
+    model, output format, or CLI flags) when frontier-writer is implemented.
+    """
+    return _dispatch_via_stub("frontier-writer", instructions, uow_id)
 
 
 def _dispatch_via_design_review(instructions: str, uow_id: str) -> str:
     """
-    Dispatcher for human-judgment-register UoWs.
+    Stub dispatcher for design-review-register UoWs.
 
-    This sprint: same subprocess mechanism as _dispatch_via_claude_p.
-    The register-appropriate preamble is prepended by _run_execution before
-    this function is called. Full semantic distinction is a later sprint.
+    Uses the same subprocess mechanism as _dispatch_via_claude_p via
+    _dispatch_via_stub. Replace with register-specific dispatch (different
+    model, output format, or CLI flags) when design-review is implemented.
     """
-    run_id = f"{uow_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
-
-    command = [
-        _CLAUDE_BIN,
-        "-p", instructions,
-        "--dangerously-skip-permissions",
-        "--max-turns", "40",
-    ]
-
-    proc, error = run_subprocess_with_error_capture(
-        component="executor",
-        uow_id=uow_id,
-        command=command,
-        timeout_seconds=_get_claude_p_timeout(),
-        check=True,
-    )
-
-    if error:
-        classification = classify_error(error)
-        log.error(
-            "Executor(%s): design-review dispatch failed — %s (fatal=%s)",
-            uow_id, error.summary(), classification.is_fatal,
-        )
-        if has_repeated_error("executor", uow_id, str(error.error_type), threshold=3):
-            log.critical(
-                "Executor(%s): repeated %s errors in design-review — manual intervention likely needed",
-                uow_id, error.error_type,
-            )
-        raise subprocess.CalledProcessError(
-            error.exit_code or 1,
-            error.command,
-            stderr=error.stderr,
-            stdout=error.stdout,
-        )
-
-    return run_id
+    return _dispatch_via_stub("design-review", instructions, uow_id)
 
 
 #: Dispatch table mapping executor_type to the attribute name of its dispatcher
