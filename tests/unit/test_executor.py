@@ -888,8 +888,8 @@ class TestDispatchViaInbox:
         """
         When no dispatcher is injected, Executor._dispatcher_override must be None
         so that _run_execution uses the dispatch table (_resolve_dispatcher).
-        Callers that need a specific dispatcher (e.g. heartbeat with _dispatch_via_inbox)
-        pass it explicitly — the injected dispatcher takes precedence over the table.
+        Callers that need a specific dispatcher pass it explicitly via the constructor
+        (e.g. tests inject a no-op); the injected dispatcher takes precedence over the table.
         """
         executor = Executor(registry)
         assert executor._dispatcher_override is None, (

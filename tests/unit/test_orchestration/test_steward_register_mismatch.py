@@ -136,8 +136,8 @@ class TestCheckRegisterExecutorCompatibility:
         ok, reason = _check_register_executor_compatibility("iterative-convergent", "general")
         assert ok is False
 
-    def test_iterative_convergent_philosophical_mismatch(self):
-        """philosophical→iterative-convergent: philosophical not compatible with iterative executors."""
+    def test_philosophical_register_lobster_ops_mismatch(self):
+        """philosophical register is incompatible with lobster-ops executor."""
         ok, reason = _check_register_executor_compatibility("philosophical", "lobster-ops")
         assert ok is False
 
