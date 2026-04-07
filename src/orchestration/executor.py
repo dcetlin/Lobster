@@ -12,10 +12,14 @@ Design constraints enforced here:
 - Executor NEVER transitions to 'done' — only the Steward declares closure.
 
 Dispatch protocol:
-- The production dispatcher (_dispatch_via_claude_p) spawns a functional-engineer
-  subagent via `claude -p` (subprocess, synchronous). The subagent reads the
-  GitHub issue, implements the prescription, opens a PR, and calls write_result.
-  The executor waits for the subprocess to complete before transitioning the UoW.
+- The production dispatcher (_dispatch_via_inbox) writes a wos_execute message to
+  ~/messages/inbox/ and returns immediately. The Lobster dispatcher picks it up on
+  its next cycle and spawns a background subagent via the Task tool. This eliminates
+  the 0–3 minute polling hop — dispatch happens in seconds.
+- Legacy subprocess path (_dispatch_via_claude_p): spawns a functional-engineer
+  subagent via `claude -p` (subprocess, synchronous). Retained for CI/dev environments
+  without a live Lobster dispatcher. Activate by passing dispatcher=_dispatch_via_claude_p
+  to Executor.__init__ explicitly.
 - TTL recovery: UoWs stuck in 'active' state for more than TTL_EXCEEDED_HOURS are
   transitioned to 'failed' with return_reason='ttl_exceeded'. Call
   recover_ttl_exceeded_uows(registry) at heartbeat startup before the dispatch
@@ -23,9 +27,7 @@ Dispatch protocol:
 - Default: Executor(...) with dispatcher=None activates the dispatch table
   (_EXECUTOR_TYPE_TO_DISPATCHER). The heartbeat passes dispatcher=None so
   register-appropriate routing activates in production. Tests inject
-  _noop_dispatcher or a stub to suppress real agent dispatch. The inbox-based
-  fallback (_dispatch_via_inbox) is available for dev/CI environments that
-  lack a local claude-p subprocess.
+  _noop_dispatcher or a stub to suppress real agent dispatch.
 
 Imports:
     from orchestration.executor import Executor, ExecutorOutcome, ExecutorResult
@@ -363,8 +365,9 @@ class Executor:
                 executor_type in the workflow artifact. When explicitly provided,
                 it takes precedence over the dispatch table — this preserves
                 backward compatibility for tests and CI environments.
-                In production, executor-heartbeat.py passes _dispatch_via_claude_p
-                to spawn a real functional-engineer subagent via `claude -p`.
+                In production, executor-heartbeat.py passes dispatcher=None so
+                the dispatch table routes via _dispatch_via_inbox (event-driven path).
+                For CI/dev without a live dispatcher, pass dispatcher=_dispatch_via_claude_p.
         """
         self.registry = registry
         self._skill_activator = skill_activator or _noop_skill_activator
@@ -1088,14 +1091,22 @@ def _dispatch_via_design_review(instructions: str, uow_id: str) -> str:
 #: in this module. Values are strings so _resolve_dispatcher can look up the
 #: CURRENT module attribute at call time — this ensures monkeypatching in tests
 #: is respected (a captured function reference would bypass the patch).
-#: functional-engineer, lobster-ops, and general all use _dispatch_via_claude_p
-#: because they share the same execution mechanism (implement → PR).
+#:
+#: Production path (inbox): functional-engineer, lobster-ops, and general all use
+#: _dispatch_via_inbox — the event-driven MCP inbox pattern that eliminates the
+#: 0–3 minute polling hop. The Lobster dispatcher picks up the wos_execute message
+#: on its next cycle and spawns a background subagent via the Task tool.
+#:
+#: Legacy subprocess path (_dispatch_via_claude_p): retained for CI/dev environments
+#: without a live Lobster dispatcher. Activate by passing
+#: dispatcher=_dispatch_via_claude_p to Executor.__init__ explicitly.
+#:
 #: frontier-writer and design-review use their own dispatchers as stubs for
 #: future register-specific model/mechanism differentiation.
 _EXECUTOR_TYPE_TO_DISPATCHER: dict[str, str] = {
-    "functional-engineer": "_dispatch_via_claude_p",
-    "lobster-ops": "_dispatch_via_claude_p",
-    "general": "_dispatch_via_claude_p",
+    "functional-engineer": "_dispatch_via_inbox",
+    "lobster-ops": "_dispatch_via_inbox",
+    "general": "_dispatch_via_inbox",
     "frontier-writer": "_dispatch_via_frontier_writer",
     "design-review": "_dispatch_via_design_review",
 }
@@ -1106,9 +1117,9 @@ def _resolve_dispatcher(executor_type: str) -> SubagentDispatcher:
     Dispatch table lookup: executor_type → SubagentDispatcher.
 
     Returns the dispatcher registered for executor_type, or falls back to
-    _dispatch_via_claude_p for unknown types (safe default — operational UoWs
-    always work, unknown register types get functional-engineer behavior
-    until a specialized dispatcher is registered).
+    _dispatch_via_inbox for unknown types (safe default — operational UoWs
+    always work via the event-driven inbox path; unknown register types get
+    functional-engineer behavior until a specialized dispatcher is registered).
 
     Resolves via globals() at call time so that monkeypatching the module
     attribute in tests is respected — the dict stores attribute names, not
@@ -1117,12 +1128,12 @@ def _resolve_dispatcher(executor_type: str) -> SubagentDispatcher:
     Called by _run_execution() when no dispatcher was explicitly injected
     via Executor.__init__.
     """
-    name = _EXECUTOR_TYPE_TO_DISPATCHER.get(executor_type, "_dispatch_via_claude_p")
+    name = _EXECUTOR_TYPE_TO_DISPATCHER.get(executor_type, "_dispatch_via_inbox")
     return globals()[name]  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
-# Fallback dispatcher — inbox-based ghost message (dev / CI environments)
+# Production dispatcher — inbox-based MCP dispatch (event-driven path)
 # ---------------------------------------------------------------------------
 
 #: Inbox directory — where dispatch messages are written for the Lobster
@@ -1137,16 +1148,17 @@ _DISPATCH_CHAT_ID: str = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
 
 def _dispatch_via_inbox(instructions: str, uow_id: str) -> str:
     """
-    Fallback dispatcher: write a wos_execute message to the Lobster inbox.
+    Production dispatcher: write a wos_execute message to the Lobster inbox.
 
-    This is the original ghost-message path retained for environments without
-    a live functional-engineer (development, CI). No subprocess is spawned;
-    the message is fire-and-forget. Use this by passing dispatcher=_dispatch_via_inbox
-    to Executor(...) when a real claude -p execution is not desired.
+    This is the event-driven dispatch path — no subprocess is spawned; the
+    message is fire-and-forget. The Lobster dispatcher (main Claude loop)
+    reads ~/messages/inbox/ on each cycle. When it sees a message with
+    type='wos_execute', it spawns a background subagent via the Task tool
+    with the prescribed instructions.
 
-    The Lobster dispatcher (main Claude loop) reads ~/messages/inbox/ on each
-    cycle. When it sees a message with type='wos_execute', it spawns a
-    background subagent via the Task tool with the prescribed instructions.
+    This eliminates the 0–3 minute polling hop from the heartbeat: dispatch
+    happens on the next dispatcher cycle (~seconds) rather than the next
+    executor-heartbeat cron tick (0–3 minutes).
 
     The message_id is returned as the executor_id for audit correlation.
 
@@ -1186,10 +1198,11 @@ def _dispatch_via_inbox(instructions: str, uow_id: str) -> str:
 # ---------------------------------------------------------------------------
 # TTL recovery — mark stuck 'active' UoWs as failed
 # ---------------------------------------------------------------------------
-# TODO: Remove after PR #584 merge (executor subprocess → inbox pattern).
-# TTL recovery is a post-hoc band-aid for subprocess fragility. Once the executor
-# uses the MCP inbox pattern instead of subprocess dispatch, long-lived UoWs will
-# have natural heartbeat presence and won't need TTL-based recovery.
+# TTL recovery catches UoWs that transition to 'active' but never complete —
+# e.g. if the subagent crashes before writing its result file, or the inbox
+# message was lost. With inbox dispatch, UoWs have natural heartbeat presence
+# via the dispatcher cycle, but TTL recovery remains as a safety net for any
+# subagent that stalls beyond TTL_EXCEEDED_HOURS without writing a result.
 
 def recover_ttl_exceeded_uows(registry: "Registry") -> list[str]:
     """
