@@ -56,26 +56,35 @@ An escalation item that has no GitHub issue when write_task_output is called is 
 
 Read `~/lobster-workspace/oracle/learnings.md`. If the file does not exist, note its absence and skip this step.
 
+**Before filing any escalation items with the `learning-not-remediated` label, ensure the label exists in the repo:**
+```bash
+gh label create "learning-not-remediated" --color "e11d48" --description "Learning from oracle review not yet remediated" --repo dcetlin/Lobster 2>/dev/null || true
+```
+
 For each entry in learnings.md:
 
 1. Parse the entry date (expected format: `YYYY-MM-DD` or similar ISO date in the entry header or metadata).
-2. If the entry date is within the past 7 days (inclusive of today), it is a **recent entry** subject to verification.
-3. For each recent entry, identify the **runtime symptom** it describes — what observable behavior, artifact, log pattern, or registry state the entry says was present.
-4. Check whether that symptom is still present by inspecting actual runtime artifacts:
-   - Sweep output files in `~/lobster-workspace/hygiene/`
-   - Job logs in `~/lobster-workspace/scheduled-jobs/logs/`
-   - Rotation state in `~/lobster-workspace/hygiene/rotation-state.json`
-   - Any other file, log, or registry entry the learning entry references explicitly
-5. Classify the result:
-   - **Resolved** — symptom is no longer present in current artifacts
+2. **Minimum-age guard:** If the entry date is within the past 24 hours (i.e., the entry was written today or since the last 24-hour mark), skip it — these entries are too fresh to expect remediation. Note skipped entries in the Learnings Verification subsection as "Skipped — written within past 24 hours."
+3. If the entry date is within the past 7 days (inclusive of today, excluding entries skipped by the minimum-age guard), it is a **recent entry** subject to verification.
+4. For each recent entry, identify the **runtime symptom** it describes — what observable behavior, artifact, log pattern, or registry state the entry says was present.
+5. Check whether that symptom is still present using the following logic — **in order**:
+   - **(a) Named file check:** Does the entry text explicitly name a specific source file (e.g., `executor.py`, `token-ledger-collect.sh`, a script path)? If yes, read that file and look for the symptom described (e.g., a logic inversion, wrong variable name, counter ordering defect). Do not substitute hygiene sweep files or logs for this check.
+   - **(b) Behavioral/operational symptom check:** Does the entry describe a behavioral or operational symptom that would be observable in runtime artifacts (e.g., wrong output directory, missing log entry, rotation state corruption)? If yes, check:
+     - Sweep output files in `~/lobster-workspace/hygiene/`
+     - Job logs in `~/lobster-workspace/scheduled-jobs/logs/`
+     - Rotation state in `~/lobster-workspace/hygiene/rotation-state.json`
+   - **(c) Neither source available:** If neither (a) nor (b) applies — the entry describes a design-level defect not tied to a named file and not observable in logs or sweep files — classify as: **Cannot verify from available artifacts — manual review required.** Do not classify as "Resolved."
+6. Classify the result:
+   - **Resolved** — symptom is no longer present in the checked artifacts (only applicable when (a) or (b) produced an observable result)
    - **Still present** — symptom persists; add this as an ESC item with label `learning-not-remediated` in the Escalation List of your sweep output, formatted as:
      ```
      ESC [learning-not-remediated] <title from learnings entry> — symptom still present as of <today's date>. Source: oracle/learnings.md entry <date>.
      ```
+   - **Cannot verify from available artifacts — manual review required** — the entry documents a defect not observable in hygiene files, logs, or a named file; do not escalate as "Still present" but include in the Learnings Verification subsection
 
-Include a **Learnings Verification** subsection in your sweep output file listing each recent entry checked, its classification (Resolved / Still present), and a one-sentence rationale.
+Include a **Learnings Verification** subsection in your sweep output file listing each recent entry checked, its classification (Resolved / Still present / Cannot verify / Skipped), and a one-sentence rationale.
 
-If no entries in learnings.md are dated within the past 7 days, note "No recent learnings entries to verify" in the subsection.
+If no entries in learnings.md are dated within the past 7 days (after applying the minimum-age guard), note "No recent learnings entries to verify" in the subsection.
 
 ---
 
