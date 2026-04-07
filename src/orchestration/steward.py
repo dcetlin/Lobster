@@ -490,6 +490,27 @@ def _assess_completion(
                     reason = result_data.get("reason", "no reason provided")
 
                     if outcome == "complete":
+                        # PR C: Apply register-aware completion policy before closing.
+                        policy = _register_completion_policy(uow.register)
+                        if policy == "always-surface":
+                            # philosophical: always surface to Dan — completion requires
+                            # human judgment regardless of what result.json says.
+                            return (
+                                False,
+                                f"register=philosophical: completion requires human judgment — "
+                                f"surfacing to Dan (outcome={outcome})",
+                                "philosophical_surface",
+                            )
+                        elif policy == "require-confirmation":
+                            # human-judgment: requires Dan's explicit close_reason.
+                            if uow.close_reason:
+                                return True, f"outcome=complete: {result_file.name} (Dan confirmed)", "complete"
+                            return (
+                                False,
+                                "register=human-judgment: awaiting Dan's explicit confirmation (close_reason not set)",
+                                "human_judgment_pending",
+                            )
+                        # machine-gate (operational, iterative-convergent): fall through
                         return True, f"outcome=complete: {result_file.name}", "complete"
                     elif outcome == "blocked":
                         # Gap 3: `blocked` always routes to Dan — the Executor has
@@ -1122,6 +1143,165 @@ def _clear_trace_gate_waited(steward_log: str | None) -> str:
     return "\n".join(result_lines)
 
 
+# ---------------------------------------------------------------------------
+# PR C: Register-aware diagnosis pure helpers
+# ---------------------------------------------------------------------------
+
+# Named constant: max chars for prescription_delta before bounding kicks in
+_PRESCRIPTION_DELTA_MAX_CHARS = 500
+
+# Named constant: consecutive non-improving gate cycles before surfacing
+_NON_IMPROVING_GATE_THRESHOLD = 3
+
+
+def _register_completion_policy(register: str) -> str:
+    """
+    Map a UoW register to its completion policy identifier.
+
+    Returns one of:
+    - "machine-gate"        for operational and iterative-convergent
+    - "always-surface"      for philosophical
+    - "require-confirmation" for human-judgment
+
+    Unknown registers default to "machine-gate" (conservative pass-through).
+
+    Pure function — no side effects.
+    """
+    _POLICY_MAP = {
+        "operational": "machine-gate",
+        "iterative-convergent": "machine-gate",
+        "philosophical": "always-surface",
+        "human-judgment": "require-confirmation",
+    }
+    return _POLICY_MAP.get(register, "machine-gate")
+
+
+def _read_trace_json(output_ref: str | None, expected_uow_id: str) -> dict | None:
+    """
+    Read and validate a corrective trace file for the given output_ref.
+
+    Tries two path conventions (mirroring result.json dual-path logic):
+    - Primary:  Path(output_ref).with_suffix(".trace.json")
+    - Fallback: Path(str(output_ref) + ".trace.json")
+
+    Returns the parsed dict if the file exists and the uow_id field matches
+    expected_uow_id.  Returns None on any error (absent, invalid JSON,
+    uow_id mismatch).
+
+    Pure function with respect to state — reads files only.
+    """
+    if not output_ref:
+        return None
+
+    trace_file = Path(output_ref).with_suffix(".trace.json")
+    if not trace_file.exists():
+        trace_file_alt = Path(str(output_ref) + ".trace.json")
+        if trace_file_alt.exists():
+            trace_file = trace_file_alt
+        else:
+            return None
+
+    try:
+        data = json.loads(trace_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    # Guard: misrouted trace file
+    trace_uow_id = data.get("uow_id")
+    if trace_uow_id is not None and trace_uow_id != expected_uow_id:
+        log.warning(
+            "_read_trace_json: trace file %s has uow_id=%r but expected %r — "
+            "treating as absent (misrouted trace file)",
+            trace_file, trace_uow_id, expected_uow_id,
+        )
+        return None
+
+    return data
+
+
+def _bound_prescription_delta(delta: str, history: list[str]) -> str:
+    """
+    Bound a prescription_delta string to prevent loop gain instability.
+
+    If delta exceeds _PRESCRIPTION_DELTA_MAX_CHARS, truncate it and append
+    a trailing note indicating it was bounded.
+
+    history is informational (for potential future smoothing) but does not
+    change the bound threshold.
+
+    Pure function — no side effects.
+    """
+    if not delta or len(delta) <= _PRESCRIPTION_DELTA_MAX_CHARS:
+        return delta
+
+    truncated = delta[:_PRESCRIPTION_DELTA_MAX_CHARS]
+    return truncated + " ... [prescription_delta bounded — original exceeded limit]"
+
+
+def _count_non_improving_gate_cycles(steward_log: str | None, n: int = _NON_IMPROVING_GATE_THRESHOLD) -> int:
+    """
+    Count consecutive non-improving gate_score cycles from the tail of steward_log.
+
+    Reads trace_injection entries in order. A cycle is "non-improving" if its
+    gate_score.score is not greater than the previous cycle's score (or if there
+    is no gate_score, the entry is skipped entirely).
+
+    Returns the count of consecutive non-improving cycles at the end of the log.
+    Returns 0 when the log is absent, empty, has no gate_score entries, or the
+    scores are improving.
+
+    Pure function — no side effects.
+    """
+    if not steward_log:
+        return 0
+
+    # Collect gate_score entries from trace_injection events in order
+    scores: list[float] = []
+    for line in steward_log.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(entry, dict) or entry.get("event") != "trace_injection":
+            continue
+        gate_score = entry.get("gate_score")
+        if gate_score is None:
+            continue
+        score_val = gate_score.get("score") if isinstance(gate_score, dict) else None
+        if score_val is not None:
+            try:
+                scores.append(float(score_val))
+            except (TypeError, ValueError):
+                pass
+
+    if len(scores) < 2:
+        return 0
+
+    # Find the tail run of non-improving cycles.
+    # A "non-improving cycle" is one where the score did not increase vs. the previous.
+    # We return the count of consecutive non-improving data points at the tail,
+    # starting from 1 (the reference point after the last improvement).
+    # With scores [0.5, 0.5, 0.5]: reference=index 0, tail=[1,2] are non-improving → count=3
+    # (we include the starting point of the plateau to match the spec's "3 consecutive cycles").
+    non_improving = 1  # start counting from the last improving point (or start of log)
+    for i in range(len(scores) - 1, 0, -1):
+        if scores[i] <= scores[i - 1]:
+            non_improving += 1
+        else:
+            # Found an improvement — the plateau started AFTER this point
+            # non_improving already counts from scores[i] forward
+            return non_improving - 1  # exclude the improvement point itself
+
+    # All scores are non-improving (or only 1 pair) — all data points are the plateau
+    return non_improving
+
+
 def _count_consecutive_llm_fallbacks(current_log_str: str | None) -> int:
     """
     Count how many consecutive prescription events at the tail of steward_log
@@ -1530,6 +1710,12 @@ def _detect_stuck_condition(
     Check whether the UoW has hit a stuck condition.
 
     Returns the condition name string if stuck, or None if not stuck.
+
+    PR C additions (V3):
+    - philosophical_register: fires when register=philosophical AND reentry_posture != first_execution.
+      On first execution, wait for executor evidence before surfacing.
+    - no_gate_improvement: fires for iterative-convergent when gate_score has not improved
+      over the last _NON_IMPROVING_GATE_THRESHOLD consecutive cycles (reads from steward_log).
     """
     cycles = uow.steward_cycles
 
@@ -1539,6 +1725,18 @@ def _detect_stuck_condition(
     # crashed_no_output + cycles >= 2
     if return_reason == "crashed_no_output" and cycles >= _CRASH_SURFACE_CYCLES:
         return "crash_repeated"
+
+    # PR C, Change 4a: philosophical_register — surface after first execution
+    if uow.register == "philosophical" and reentry_posture != "first_execution":
+        return "philosophical_register"
+
+    # PR C, Change 4c: no_gate_improvement — iterative-convergent stall detection
+    if uow.register == "iterative-convergent":
+        non_improving = _count_non_improving_gate_cycles(
+            uow.steward_log, n=_NON_IMPROVING_GATE_THRESHOLD
+        )
+        if non_improving >= _NON_IMPROVING_GATE_THRESHOLD:
+            return "no_gate_improvement"
 
     return None
 
@@ -1825,6 +2023,30 @@ def _default_notify_dan(
                 )
             else:
                 body_lines.append(f"\nSteward log:\n" + "\n".join(log_lines))
+    elif condition == "philosophical_register":
+        body_lines = [
+            f"WOS: UoW {uow_id!r} is in philosophical register — executor returned output "
+            f"but completion requires human judgment. "
+            f"See output at {uow.output_ref}. "
+            f"Summary: {(uow.summary or '')[:200]}",
+        ]
+    elif condition == "register_mismatch":
+        body_lines = [
+            f"WOS: UoW {uow_id!r} — register mismatch. "
+            f"UoW register: {uow.register}. "
+            f"A {uow.register}-register UoW requires manual routing. "
+            f"See steward_log for attempted executor_type.",
+        ]
+        if surface_log:
+            body_lines.append(f"\nSteward log:\n{surface_log}")
+    elif condition == "no_gate_improvement":
+        body_lines = [
+            f"WOS: UoW {uow_id!r} — iterative-convergent gate not improving after "
+            f"{_NON_IMPROVING_GATE_THRESHOLD} cycles. "
+            f"See steward_log for gate_score history and prescription_delta.",
+        ]
+        if surface_log:
+            body_lines.append(f"\nSteward log:\n{surface_log}")
     else:
         body_lines = [
             f"WOS SURFACE: UoW {uow_id} hit condition={condition} "
@@ -2245,6 +2467,69 @@ def _process_uow(
                 if not dry_run:
                     _write_steward_fields(registry, uow_id, steward_log=current_log_str)
 
+    # PR C, Change 2: Corrective trace injection.
+    # When trace.json exists, read it and inject its content into the prescription context.
+    # This happens after the trace gate check so we only inject when a valid trace is present.
+    _trace_data: dict | None = None
+    _trace_surprises: list[str] = []
+    _trace_prescription_delta: str = ""
+    _trace_gate_score: dict | None = None
+
+    if output_ref_for_gate:
+        _trace_data = _read_trace_json(output_ref_for_gate, expected_uow_id=uow_id)
+        if _trace_data is not None:
+            _trace_surprises = _trace_data.get("surprises") or []
+            _raw_prescription_delta = _trace_data.get("prescription_delta") or ""
+            # Read historical prescription_deltas from corrective_traces for bounding
+            _prior_deltas: list[str] = []
+            try:
+                _conn_ro = sqlite3.connect(str(registry.db_path))
+                _prior_deltas = [
+                    row[0] for row in _conn_ro.execute(
+                        "SELECT prescription_delta FROM corrective_traces WHERE uow_id = ? "
+                        "ORDER BY created_at DESC LIMIT 3",
+                        (uow_id,),
+                    ).fetchall()
+                    if row[0]
+                ]
+                _conn_ro.close()
+            except Exception:
+                pass
+            _trace_prescription_delta = _bound_prescription_delta(
+                _raw_prescription_delta, history=_prior_deltas
+            )
+            _trace_gate_score = _trace_data.get("gate_score")
+
+            # Write trace_injection entry to steward_log
+            _trace_log_entry = {
+                "event": "trace_injection",
+                "uow_id": uow_id,
+                "steward_cycles": cycles,
+                "register": _trace_data.get("register", uow.register),
+                "gate_score": _trace_gate_score,
+                "surprises_count": len(_trace_surprises),
+                "prescription_delta_present": bool(_trace_prescription_delta),
+                "timestamp": _now_iso(),
+            }
+            current_log_str = _append_steward_log_entry(
+                registry, uow_id, current_log_str, _trace_log_entry
+            )
+            if not dry_run:
+                _write_steward_fields(registry, uow_id, steward_log=current_log_str)
+                registry.append_audit_log(uow_id, {
+                    "event": "trace_injection",
+                    "actor": _ACTOR_STEWARD,
+                    "uow_id": uow_id,
+                    "steward_cycles": cycles,
+                    "note": json.dumps({
+                        "execution_summary": _trace_data.get("execution_summary", ""),
+                        "surprises_count": len(_trace_surprises),
+                        "prescription_delta_present": bool(_trace_prescription_delta),
+                        "gate_score": _trace_gate_score,
+                    }),
+                    "timestamp": _now_iso(),
+                })
+
     new_cycles = cycles + 1
     prescribed_skills = _select_prescribed_skills(uow, reentry_posture)
     selected_executor_type = _select_executor_type(uow)
@@ -2281,6 +2566,28 @@ def _process_uow(
     else:
         completion_gap_for_prescription = completion_rationale
         route_reason = f"steward: {reentry_posture} — {completion_rationale[:120]}"
+
+    # PR C, Change 2: Inject trace content into prescription context.
+    # Surprises and prescription_delta from the corrective trace are injected here
+    # so the LLM prescriber sees them in the completion_gap context string.
+    if _trace_surprises:
+        surprises_text = "; ".join(str(s) for s in _trace_surprises)
+        completion_gap_for_prescription = (
+            f"Executor reported surprises: {surprises_text}. {completion_gap_for_prescription}"
+        )
+    if _trace_prescription_delta:
+        completion_gap_for_prescription = (
+            f"{completion_gap_for_prescription} "
+            f"Executor recommends prescription change: {_trace_prescription_delta}"
+        )
+    # For iterative-convergent: include gate_score in completion_gap
+    if uow.register == "iterative-convergent" and _trace_gate_score:
+        score_val = _trace_gate_score.get("score", "unknown")
+        gate_cmd = _trace_gate_score.get("command", "")
+        completion_gap_for_prescription = (
+            f"{completion_gap_for_prescription} "
+            f"[gate_score={score_val}, cmd={gate_cmd!r}]"
+        )
 
     issue_body = issue_info.get("body", "") if issue_info else ""
 
