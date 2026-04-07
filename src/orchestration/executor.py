@@ -20,10 +20,12 @@ Dispatch protocol:
   transitioned to 'failed' with return_reason='ttl_exceeded'. Call
   recover_ttl_exceeded_uows(registry) at heartbeat startup before the dispatch
   cycle so the Steward can re-diagnose stalled UoWs on its next pass.
-- Default: Executor(...) defaults to _dispatch_via_inbox for backward
-  compatibility (tests, CI, development). The heartbeat explicitly passes
-  _dispatch_via_claude_p to enable real agent dispatch. Both are public and
-  injectable — callers choose the dispatch strategy.
+- Default: Executor(...) with dispatcher=None activates the dispatch table
+  (_EXECUTOR_TYPE_TO_DISPATCHER). The heartbeat passes dispatcher=None so
+  register-appropriate routing activates in production. Tests inject
+  _noop_dispatcher or a stub to suppress real agent dispatch. The inbox-based
+  fallback (_dispatch_via_inbox) is available for dev/CI environments that
+  lack a local claude-p subprocess.
 
 Imports:
     from orchestration.executor import Executor, ExecutorOutcome, ExecutorResult
@@ -355,15 +357,20 @@ class Executor:
             registry: The Registry instance (provides db_path for raw connections).
             skill_activator: Callable that activates a skill by ID. Defaults to
                 _noop_skill_activator. Injectable for tests.
-            dispatcher: Callable that dispatches the LLM subagent task. Defaults
-                to _dispatch_via_inbox (writes a wos_execute ghost message) for
-                backward compatibility. In production, executor-heartbeat.py passes
-                _dispatch_via_claude_p to spawn a real functional-engineer subagent
-                via `claude -p`. Injectable for tests.
+            dispatcher: Callable that dispatches the LLM subagent task. When None
+                (the default), the Executor uses the register-appropriate dispatch
+                table (_resolve_dispatcher) to select a dispatcher based on the
+                executor_type in the workflow artifact. When explicitly provided,
+                it takes precedence over the dispatch table — this preserves
+                backward compatibility for tests and CI environments.
+                In production, executor-heartbeat.py passes _dispatch_via_claude_p
+                to spawn a real functional-engineer subagent via `claude -p`.
         """
         self.registry = registry
         self._skill_activator = skill_activator or _noop_skill_activator
-        self._dispatcher = dispatcher or _dispatch_via_inbox
+        # None sentinel: use dispatch table in _run_execution.
+        # Non-None: caller-injected override — takes precedence over the table.
+        self._dispatcher_override: SubagentDispatcher | None = dispatcher
 
     # -----------------------------------------------------------------------
     # Public API
@@ -679,9 +686,20 @@ class Executor:
         for skill_id in prescribed_skills:
             self._skill_activator(skill_id)
 
-        # Step 2: Dispatch LLM subagent
-        instructions = artifact["instructions"]
-        executor_id = self._dispatcher(instructions, uow_id)
+        # Step 2: Dispatch LLM subagent via register-appropriate dispatcher.
+        # If a dispatcher was explicitly injected (tests, CI), use it directly
+        # with the raw instructions (no preamble prepended — caller's responsibility).
+        # Otherwise, resolve from the dispatch table and prepend the register-appropriate
+        # preamble from _EXECUTOR_TYPE_TO_PREAMBLE before passing to the dispatcher.
+        raw_instructions = artifact["instructions"]
+        if self._dispatcher_override is not None:
+            executor_id = self._dispatcher_override(raw_instructions, uow_id)
+        else:
+            executor_type = artifact.get("executor_type", "functional-engineer")
+            preamble = _EXECUTOR_TYPE_TO_PREAMBLE.get(executor_type, "")
+            instructions = preamble + raw_instructions
+            dispatcher = _resolve_dispatcher(executor_type)
+            executor_id = dispatcher(instructions, uow_id)
 
         # Step 3: Write output_ref content (signal that execution produced output)
         _write_output_ref_content(output_ref, f"execution complete: task dispatched as {executor_id}")
@@ -706,7 +724,7 @@ class Executor:
             execution_summary=f"Executor dispatched subagent {executor_id}, subprocess exit 0.",
             surprises=[],
             prescription_delta="",
-            gate_score=None,  # operational; iterative-convergent gate_score handled in PR B
+            gate_score=None,  # gate_score enrichment is subagent-level; always null from executor
         )
         _write_trace_json(output_ref, trace)
         _insert_corrective_trace(self.registry.db_path, trace)
@@ -859,8 +877,9 @@ def _dispatch_via_claude_p(instructions: str, uow_id: str) -> str:
     """
     Production dispatcher: spawn a functional-engineer subagent via `claude -p`.
 
-    Builds a prompt from the prescription instructions and launches a
-    synchronous subprocess. The executor blocks until the subprocess exits,
+    Launches a synchronous subprocess with the instructions as-is (preamble is
+    prepended by _run_execution before this function is called — see
+    _EXECUTOR_TYPE_TO_PREAMBLE). The executor blocks until the subprocess exits,
     then inspects the return code to determine success or failure.
 
     Returns a run_id string for audit correlation (uow_id + timestamp).
@@ -874,7 +893,7 @@ def _dispatch_via_claude_p(instructions: str, uow_id: str) -> str:
     the caller's exception handler.
     """
     run_id = f"{uow_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
-    prompt = _FUNCTIONAL_ENGINEER_PREAMBLE + instructions
+    prompt = instructions
 
     command = [
         _CLAUDE_BIN,
@@ -916,6 +935,204 @@ def _dispatch_via_claude_p(instructions: str, uow_id: str) -> str:
         )
 
     return run_id
+
+
+# ---------------------------------------------------------------------------
+# Register-appropriate dispatchers — PR B (executor_type dispatch table)
+# ---------------------------------------------------------------------------
+
+#: Frontier-writer agent prompt preamble.
+#: Used for philosophical-register UoWs that require phenomenological synthesis
+#: output rather than code implementation. Does NOT open a PR — writes to
+#: output_ref and writes trace.json for the Steward's re-entry loop.
+_FRONTIER_WRITER_PREAMBLE = """\
+You are a frontier-writer subagent operating inside the WOS (Work Orchestration
+System) pipeline. Your job is to produce a phenomenological synthesis output
+for the following prescription.
+
+Follow the frontier-writer protocol:
+1. Read the prescription carefully — this is a philosophical or creative UoW,
+   not an implementation task. Do NOT open a GitHub PR.
+2. Write your synthesis output to the output_ref path specified in the prescription.
+3. Write trace.json alongside the output with your execution_summary and any
+   surprises or prescription_delta observations.
+4. Call write_result with outcome and a brief summary when done.
+
+Do NOT call send_reply. Do NOT call wait_for_messages.
+Do NOT open a GitHub PR or create a branch — this is a synthesis task.
+Write result via: mcp__lobster-inbox__write_result
+
+Prescription:
+"""
+
+#: Design-review agent prompt preamble.
+#: Used for human-judgment-register UoWs that require structured analysis
+#: for Dan's review before the UoW can be closed. Does NOT open a PR.
+_DESIGN_REVIEW_PREAMBLE = """\
+You are a design-review subagent operating inside the WOS (Work Orchestration
+System) pipeline. Your job is to produce a structured design analysis output
+for the following prescription, for Dan's review.
+
+Follow the design-review protocol:
+1. Read the prescription carefully — this is a human-judgment UoW that requires
+   structured analysis, not implementation. Do NOT open a GitHub PR.
+2. Write a structured analysis to the output_ref path specified in the prescription.
+   Include: context summary, options considered, recommendation, open questions for Dan.
+3. Write trace.json alongside the output with your execution_summary.
+4. Call write_result with outcome and a brief summary when done.
+   The Steward will surface this to Dan for confirmation.
+
+Do NOT call send_reply. Do NOT call wait_for_messages.
+Do NOT open a GitHub PR or create a branch — this is a design review task.
+Write result via: mcp__lobster-inbox__write_result
+
+Prescription:
+"""
+
+#: Preamble map: executor_type → preamble string to prepend before calling dispatcher.
+#: _run_execution looks up the preamble here and prepends it to the prescription
+#: instructions before passing to the dispatcher. This keeps dispatchers stateless
+#: (they receive a fully-formed prompt) and makes preamble selection testable
+#: via monkeypatching — the dispatcher can be replaced with a stub that checks
+#: what instructions it received.
+#: executor_type values not in this map get no preamble (safe default).
+_EXECUTOR_TYPE_TO_PREAMBLE: dict[str, str] = {
+    "functional-engineer": _FUNCTIONAL_ENGINEER_PREAMBLE,
+    "lobster-ops": _FUNCTIONAL_ENGINEER_PREAMBLE,
+    "general": _FUNCTIONAL_ENGINEER_PREAMBLE,
+    "frontier-writer": _FRONTIER_WRITER_PREAMBLE,
+    "design-review": _DESIGN_REVIEW_PREAMBLE,
+}
+
+
+def _dispatch_via_frontier_writer(instructions: str, uow_id: str) -> str:
+    """
+    Dispatcher for philosophical-register UoWs.
+
+    This sprint: same subprocess mechanism as _dispatch_via_claude_p.
+    The register-appropriate preamble is prepended by _run_execution before
+    this function is called. Full semantic distinction (different model,
+    different output format) is a later sprint.
+    """
+    run_id = f"{uow_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+
+    command = [
+        _CLAUDE_BIN,
+        "-p", instructions,
+        "--dangerously-skip-permissions",
+        "--max-turns", "40",
+    ]
+
+    proc, error = run_subprocess_with_error_capture(
+        component="executor",
+        uow_id=uow_id,
+        command=command,
+        timeout_seconds=_get_claude_p_timeout(),
+        check=True,
+    )
+
+    if error:
+        classification = classify_error(error)
+        log.error(
+            "Executor(%s): frontier-writer dispatch failed — %s (fatal=%s)",
+            uow_id, error.summary(), classification.is_fatal,
+        )
+        if has_repeated_error("executor", uow_id, str(error.error_type), threshold=3):
+            log.critical(
+                "Executor(%s): repeated %s errors in frontier-writer — manual intervention likely needed",
+                uow_id, error.error_type,
+            )
+        raise subprocess.CalledProcessError(
+            error.exit_code or 1,
+            error.command,
+            stderr=error.stderr,
+            stdout=error.stdout,
+        )
+
+    return run_id
+
+
+def _dispatch_via_design_review(instructions: str, uow_id: str) -> str:
+    """
+    Dispatcher for human-judgment-register UoWs.
+
+    This sprint: same subprocess mechanism as _dispatch_via_claude_p.
+    The register-appropriate preamble is prepended by _run_execution before
+    this function is called. Full semantic distinction is a later sprint.
+    """
+    run_id = f"{uow_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+
+    command = [
+        _CLAUDE_BIN,
+        "-p", instructions,
+        "--dangerously-skip-permissions",
+        "--max-turns", "40",
+    ]
+
+    proc, error = run_subprocess_with_error_capture(
+        component="executor",
+        uow_id=uow_id,
+        command=command,
+        timeout_seconds=_get_claude_p_timeout(),
+        check=True,
+    )
+
+    if error:
+        classification = classify_error(error)
+        log.error(
+            "Executor(%s): design-review dispatch failed — %s (fatal=%s)",
+            uow_id, error.summary(), classification.is_fatal,
+        )
+        if has_repeated_error("executor", uow_id, str(error.error_type), threshold=3):
+            log.critical(
+                "Executor(%s): repeated %s errors in design-review — manual intervention likely needed",
+                uow_id, error.error_type,
+            )
+        raise subprocess.CalledProcessError(
+            error.exit_code or 1,
+            error.command,
+            stderr=error.stderr,
+            stdout=error.stdout,
+        )
+
+    return run_id
+
+
+#: Dispatch table mapping executor_type to the attribute name of its dispatcher
+#: in this module. Values are strings so _resolve_dispatcher can look up the
+#: CURRENT module attribute at call time — this ensures monkeypatching in tests
+#: is respected (a captured function reference would bypass the patch).
+#: functional-engineer, lobster-ops, and general all use _dispatch_via_claude_p
+#: because they share the same execution mechanism (implement → PR).
+#: frontier-writer and design-review use their own dispatchers as stubs for
+#: future register-specific model/mechanism differentiation.
+_EXECUTOR_TYPE_TO_DISPATCHER: dict[str, str] = {
+    "functional-engineer": "_dispatch_via_claude_p",
+    "lobster-ops": "_dispatch_via_claude_p",
+    "general": "_dispatch_via_claude_p",
+    "frontier-writer": "_dispatch_via_frontier_writer",
+    "design-review": "_dispatch_via_design_review",
+}
+
+
+def _resolve_dispatcher(executor_type: str) -> SubagentDispatcher:
+    """
+    Dispatch table lookup: executor_type → SubagentDispatcher.
+
+    Returns the dispatcher registered for executor_type, or falls back to
+    _dispatch_via_claude_p for unknown types (safe default — operational UoWs
+    always work, unknown register types get functional-engineer behavior
+    until a specialized dispatcher is registered).
+
+    Resolves via globals() at call time so that monkeypatching the module
+    attribute in tests is respected — the dict stores attribute names, not
+    captured function references.
+
+    Called by _run_execution() when no dispatcher was explicitly injected
+    via Executor.__init__.
+    """
+    name = _EXECUTOR_TYPE_TO_DISPATCHER.get(executor_type, "_dispatch_via_claude_p")
+    return globals()[name]  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------

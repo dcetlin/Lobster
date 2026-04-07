@@ -195,9 +195,13 @@ def run_executor_cycle(registry, dry_run: bool = False) -> dict:
         )
         return {"evaluated": evaluated, "dispatched": 0, "skipped": evaluated, "errors": 0}
 
-    from src.orchestration.executor import Executor, _dispatch_via_inbox
+    from src.orchestration.executor import Executor
 
-    executor = Executor(registry, dispatcher=_dispatch_via_inbox)
+    # Pass dispatcher=None so the dispatch table (_EXECUTOR_TYPE_TO_DISPATCHER)
+    # activates in production. Each UoW's executor_type determines the dispatcher
+    # at call time via _resolve_dispatcher(). Injecting _dispatch_via_inbox here
+    # would bypass the dispatch table entirely — that path is for dev/CI only.
+    executor = Executor(registry, dispatcher=None)
 
     for uow in ready_uows:
         uow_id = uow.id
