@@ -2578,25 +2578,46 @@ def run_steward_cycle(
         # Note: _most_recent_classification scans for startup_sweep events only,
         # so executor_orphan return_reasons from execution_complete events (a
         # different scenario) are not intercepted here.
+        #
+        # Exception (#fix-backpressure-gate): if execution is currently enabled,
+        # the executor_orphan classification is stale — it was written when the
+        # executor was not running (e.g. execution_enabled=false at startup_sweep
+        # time).  When execution is now active, the orphan hold is incorrect and
+        # would permanently block the UoW.  Only apply the backpressure hold when
+        # execution is disabled (the orphan condition is genuinely valid).
         _sweep_classification = _most_recent_classification(audit_entries)
         if _sweep_classification == "executor_orphan":
-            log.info(
-                "backpressure: uow_id=%s already in ready-for-executor, "
-                "skipping re-prescription (cycle %d)",
-                uow_id,
-                uow.steward_cycles,
-            )
-            if not dry_run:
-                registry.append_audit_log(uow_id, {
-                    "event": "backpressure",
-                    "actor": _ACTOR_STEWARD,
-                    "uow_id": uow_id,
-                    "steward_cycles": uow.steward_cycles,
-                    "note": "executor_orphan: skipping re-prescription, queue may be saturated",
-                    "timestamp": _now_iso(),
-                })
-            skipped += 1
-            continue
+            try:
+                from src.orchestration.dispatcher_handlers import is_execution_enabled
+                _execution_currently_enabled = is_execution_enabled()
+            except Exception:
+                _execution_currently_enabled = False
+
+            if _execution_currently_enabled:
+                log.info(
+                    "backpressure: uow_id=%s has stale executor_orphan classification "
+                    "but execution is enabled — proceeding with re-prescription (cycle %d)",
+                    uow_id,
+                    uow.steward_cycles,
+                )
+            else:
+                log.info(
+                    "backpressure: uow_id=%s already in ready-for-executor, "
+                    "skipping re-prescription (cycle %d)",
+                    uow_id,
+                    uow.steward_cycles,
+                )
+                if not dry_run:
+                    registry.append_audit_log(uow_id, {
+                        "event": "backpressure",
+                        "actor": _ACTOR_STEWARD,
+                        "uow_id": uow_id,
+                        "steward_cycles": uow.steward_cycles,
+                        "note": "executor_orphan: skipping re-prescription, execution disabled or queue saturated",
+                        "timestamp": _now_iso(),
+                    })
+                skipped += 1
+                continue
 
         try:
             result = _process_uow(
