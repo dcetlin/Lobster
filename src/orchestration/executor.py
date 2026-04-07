@@ -20,10 +20,12 @@ Dispatch protocol:
   transitioned to 'failed' with return_reason='ttl_exceeded'. Call
   recover_ttl_exceeded_uows(registry) at heartbeat startup before the dispatch
   cycle so the Steward can re-diagnose stalled UoWs on its next pass.
-- Default: Executor(...) defaults to _dispatch_via_inbox for backward
-  compatibility (tests, CI, development). The heartbeat explicitly passes
-  _dispatch_via_claude_p to enable real agent dispatch. Both are public and
-  injectable — callers choose the dispatch strategy.
+- Default: Executor(...) with dispatcher=None activates the dispatch table
+  (_EXECUTOR_TYPE_TO_DISPATCHER). The heartbeat passes dispatcher=None so
+  register-appropriate routing activates in production. Tests inject
+  _noop_dispatcher or a stub to suppress real agent dispatch. The inbox-based
+  fallback (_dispatch_via_inbox) is available for dev/CI environments that
+  lack a local claude-p subprocess.
 
 Imports:
     from orchestration.executor import Executor, ExecutorOutcome, ExecutorResult
