@@ -946,6 +946,32 @@ class Registry:
         finally:
             conn.close()
 
+    def get_corrective_trace_history(self, uow_id: str, limit: int = 3) -> list[str]:
+        """
+        Return the most recent ``prescription_delta`` values from
+        ``corrective_traces`` for *uow_id*, newest first.
+
+        Returns an empty list if no rows exist or if the table is absent
+        (e.g. running against a pre-migration DB in tests). Callers should
+        treat an empty list as "no history available" and proceed without
+        bounding.
+
+        This is the canonical read path for corrective-trace history —
+        callers must not open a raw sqlite3 connection to query this table.
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT prescription_delta FROM corrective_traces WHERE uow_id = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (uow_id, limit),
+            ).fetchall()
+            return [row["prescription_delta"] for row in rows if row["prescription_delta"]]
+        except Exception:
+            return []
+        finally:
+            conn.close()
+
     def record_startup_sweep_active(
         self,
         uow_id: str,
