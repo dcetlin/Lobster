@@ -1122,6 +1122,129 @@ def _clear_trace_gate_waited(steward_log: str | None) -> str:
     return "\n".join(result_lines)
 
 
+def _read_trace_json(output_ref: str) -> dict | None:
+    """Read and validate a trace.json file for the given output_ref.
+
+    Pure function. Tries two path conventions:
+    - Path(output_ref).with_suffix(".trace.json")
+    - Path(str(output_ref) + ".trace.json")
+
+    Returns the parsed dict if the file exists and is valid JSON, or None on
+    any error (file not found, invalid JSON, etc.). Does not raise.
+
+    The caller is responsible for validating uow_id match before using any
+    fields from the returned dict.
+    """
+    if not output_ref:
+        return None
+
+    candidates = [
+        Path(output_ref).with_suffix(".trace.json"),
+        Path(str(output_ref) + ".trace.json"),
+    ]
+
+    for trace_file in candidates:
+        if not trace_file.exists():
+            continue
+        try:
+            data = json.loads(trace_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except (json.JSONDecodeError, OSError) as e:
+            log.debug("_read_trace_json: error reading %s: %s", trace_file, e)
+    return None
+
+
+# Maximum character length for prescription_delta before loop-gain bounding kicks in.
+_PRESCRIPTION_DELTA_MAX_CHARS = 500
+
+
+def _bound_prescription_delta(delta: str, history: list[str]) -> str:
+    """Bound a prescription_delta string to prevent loop-gain instability.
+
+    Pure function. Truncates `delta` at _PRESCRIPTION_DELTA_MAX_CHARS characters,
+    appending a note that the delta was bounded. The `history` parameter is
+    accepted for future cycle-averaged smoothing but is not used in this
+    magnitude-threshold implementation.
+
+    Returns the bounded string (or the original if within limits).
+    """
+    if len(delta) <= _PRESCRIPTION_DELTA_MAX_CHARS:
+        return delta
+    truncated = delta[:_PRESCRIPTION_DELTA_MAX_CHARS]
+    return truncated + " [prescription_delta truncated for loop-gain bounding]"
+
+
+def _count_non_improving_gate_cycles(steward_log: str | None, n: int = 3) -> int:
+    """Count consecutive trace_injection cycles with non-improving gate_score.
+
+    Pure function. Reads the last N trace_injection entries from steward_log
+    and counts how many consecutive trailing entries show no score improvement
+    over the prior entry.
+
+    Returns the count of non-improving consecutive cycles at the tail of the
+    trace_injection history. Returns 0 when there are fewer than 2 entries
+    (no comparison possible), when the log is absent, or when any entry lacks
+    gate_score data.
+    """
+    if not steward_log:
+        return 0
+
+    scores: list[float] = []
+    for line in steward_log.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            entry = json.loads(stripped)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("event") != "trace_injection":
+            continue
+        gate_score = entry.get("gate_score")
+        if gate_score is None:
+            continue
+        # gate_score may be a dict with a "score" key, or a bare float
+        if isinstance(gate_score, dict):
+            score = gate_score.get("score")
+        else:
+            try:
+                score = float(gate_score)
+            except (TypeError, ValueError):
+                continue
+        if score is None:
+            continue
+        try:
+            scores.append(float(score))
+        except (TypeError, ValueError):
+            continue
+
+    # Look at the last n+1 scores so we can compute n comparison pairs.
+    # "Not improving over n cycles" requires n transitions, which needs n+1 data points.
+    window_size = n + 1
+    scores = scores[-window_size:] if len(scores) > window_size else scores
+
+    if len(scores) < 2:
+        return 0
+
+    # Count consecutive non-improving entries from the tail
+    non_improving = 0
+    for i in range(len(scores) - 1, 0, -1):
+        if scores[i] <= scores[i - 1]:
+            non_improving += 1
+        else:
+            break
+
+    return non_improving
+
+
+# Threshold for no_gate_improvement stuck condition (number of consecutive
+# non-improving cycles required before surfacing to Dan).
+_NO_GATE_IMPROVEMENT_THRESHOLD = 3
+
+
 def _count_consecutive_llm_fallbacks(current_log_str: str | None) -> int:
     """
     Count how many consecutive prescription events at the tail of steward_log
@@ -2281,6 +2404,114 @@ def _process_uow(
     else:
         completion_gap_for_prescription = completion_rationale
         route_reason = f"steward: {reentry_posture} — {completion_rationale[:120]}"
+
+    # Corrective trace injection (Change 2): read trace.json if present and inject
+    # surprises, prescription_delta, and gate_score into the prescription context.
+    # This happens after the trace gate clears (or after the contract violation path)
+    # so the LLM prescriber sees the executor's corrective feedback.
+    _trace_data: dict | None = None
+    if output_ref_for_gate:
+        _trace_data = _read_trace_json(output_ref_for_gate)
+        if _trace_data is not None:
+            _trace_uow_id = _trace_data.get("uow_id")
+            if _trace_uow_id is not None and _trace_uow_id != uow_id:
+                # Misrouted trace file — discard
+                log.warning(
+                    "_process_uow: trace.json has uow_id=%r but expected %r — discarding",
+                    _trace_uow_id, uow_id,
+                )
+                _trace_data = None
+
+    if _trace_data is not None:
+        _trace_register = _trace_data.get("register")
+        _trace_gate_score = _trace_data.get("gate_score")
+        _trace_surprises: list[str] = _trace_data.get("surprises") or []
+        _trace_prescription_delta: str = _trace_data.get("prescription_delta") or ""
+        _trace_execution_summary: str = _trace_data.get("execution_summary") or ""
+
+        # Log register drift if trace register mismatches UoW register
+        if _trace_register and _trace_register != uow.register:
+            log.warning(
+                "_process_uow: trace.json register=%r mismatches UoW register=%r for %s — drift signal",
+                _trace_register, uow.register, uow_id,
+            )
+
+        # For iterative-convergent: include gate_score in completion_gap
+        if uow.register == "iterative-convergent" and _trace_gate_score is not None:
+            _gate_score_str = json.dumps(_trace_gate_score) if isinstance(_trace_gate_score, dict) else str(_trace_gate_score)
+            completion_gap_for_prescription = (
+                f"{completion_gap_for_prescription} [gate_score: {_gate_score_str}]"
+            )
+            # Check for no_gate_improvement stuck condition
+            _non_improving = _count_non_improving_gate_cycles(current_log_str, n=_NO_GATE_IMPROVEMENT_THRESHOLD)
+            if _non_improving >= _NO_GATE_IMPROVEMENT_THRESHOLD:
+                stuck_condition = "no_gate_improvement"
+                log.warning(
+                    "_process_uow: no_gate_improvement detected for %s — %d consecutive non-improving cycles",
+                    uow_id, _non_improving,
+                )
+                # Surface to Dan with gate score history — reuse stuck condition path
+                surface_log = current_log_str
+                _gate_notify_entry = {
+                    "event": "surface",
+                    "uow_id": uow_id,
+                    "steward_cycles": cycles,
+                    "surface_condition": stuck_condition,
+                    "return_reason": return_reason,
+                }
+                current_log_str = _append_steward_log_entry(registry, uow_id, current_log_str, _gate_notify_entry)
+                if not dry_run:
+                    _write_steward_fields(registry, uow_id, steward_log=current_log_str)
+                    registry.append_audit_log(uow_id, {
+                        "event": "steward_surface",
+                        "actor": _ACTOR_STEWARD,
+                        "uow_id": uow_id,
+                        "steward_cycles": cycles,
+                        "surface_condition": stuck_condition,
+                        "return_reason": return_reason,
+                        "timestamp": _now_iso(),
+                    })
+                _notify_gate = notify_dan or _default_notify_dan
+                _no_improve_msg = (
+                    f"WOS: UoW {uow_id} — iterative-convergent gate not improving after "
+                    f"{_non_improving} cycles. "
+                    f"Gate score: {_gate_score_str}. "
+                    f"Prescription delta: {_trace_prescription_delta[:200]}"
+                )
+                _notify_gate(uow, stuck_condition, surface_log=current_log_str, return_reason=return_reason)
+                if not dry_run:
+                    registry.transition(uow_id, _STATUS_BLOCKED, _STATUS_DIAGNOSING)
+                return Surfaced(uow_id=uow_id, condition=stuck_condition)
+
+        # Inject surprises into completion_gap_for_prescription
+        if _trace_surprises:
+            _surprises_str = "Executor reported surprises: " + "; ".join(_trace_surprises)
+            completion_gap_for_prescription = (
+                f"{_surprises_str}\n{completion_gap_for_prescription}"
+            )
+
+        # Inject bounded prescription_delta into completion_gap
+        if _trace_prescription_delta:
+            _bounded_delta = _bound_prescription_delta(_trace_prescription_delta, history=[])
+            completion_gap_for_prescription = (
+                f"{completion_gap_for_prescription}\n"
+                f"Executor recommends prescription change: {_bounded_delta}"
+            )
+
+        # Write trace_injection event to steward_log
+        _trace_inject_entry = {
+            "event": "trace_injection",
+            "uow_id": uow_id,
+            "steward_cycles": cycles,
+            "register": _trace_register,
+            "gate_score": _trace_gate_score,
+            "surprises_count": len(_trace_surprises),
+            "prescription_delta_present": bool(_trace_prescription_delta),
+            "timestamp": _now_iso(),
+        }
+        current_log_str = _append_steward_log_entry(registry, uow_id, current_log_str, _trace_inject_entry)
+        if not dry_run:
+            _write_steward_fields(registry, uow_id, steward_log=current_log_str)
 
     issue_body = issue_info.get("body", "") if issue_info else ""
 
