@@ -2541,21 +2541,10 @@ def _process_uow(
         if _trace_data is not None:
             _trace_surprises = _trace_data.get("surprises") or []
             _raw_prescription_delta = _trace_data.get("prescription_delta") or ""
-            # Read historical prescription_deltas from corrective_traces for bounding
-            _prior_deltas: list[str] = []
-            try:
-                _conn_ro = sqlite3.connect(str(registry.db_path))
-                _prior_deltas = [
-                    row[0] for row in _conn_ro.execute(
-                        "SELECT prescription_delta FROM corrective_traces WHERE uow_id = ? "
-                        "ORDER BY created_at DESC LIMIT 3",
-                        (uow_id,),
-                    ).fetchall()
-                    if row[0]
-                ]
-                _conn_ro.close()
-            except Exception:
-                pass
+            # Read historical prescription_deltas from corrective_traces for bounding.
+            # Routed through Registry to keep all corrective_traces reads behind the
+            # abstraction layer — no raw sqlite3 connections at call sites.
+            _prior_deltas: list[str] = registry.get_corrective_trace_history(uow_id)
             _trace_prescription_delta = _bound_prescription_delta(
                 _raw_prescription_delta, history=_prior_deltas
             )
