@@ -98,7 +98,12 @@ uv run src/orchestration/registry_cli.py list --status blocked
 ```
 
 Check all non-terminal statuses if you are unsure: `proposed`, `pending`,
-`ready-for-steward`, `ready-for-executor`, `active`, `diagnosing`, `blocked`.
+`active`, `blocked`.
+
+Note: `ready-for-steward`, `ready-for-executor`, and `diagnosing` are valid
+internal statuses but are not accepted as `--status` filter values by the CLI.
+To inspect records in those states, omit `--status` to list all records and
+filter by eye, or query the registry database directly.
 
 ### 2. Clear blocking records (if needed)
 
@@ -147,7 +152,11 @@ Transitions `proposed → pending → ready-for-steward` atomically.
 ### 5. Verify
 
 ```bash
-uv run src/orchestration/registry_cli.py list --status ready-for-steward
+# List all pending/active records to confirm the UoW is visible:
+uv run src/orchestration/registry_cli.py list --status pending
+uv run src/orchestration/registry_cli.py list --status active
+# Or list all and locate the new UoW by its ID:
+uv run src/orchestration/registry_cli.py get --id <uow-id>
 ```
 
 ---
@@ -191,6 +200,26 @@ All commands output JSON to stdout.
 
 Valid `--status` filter values: `proposed`, `pending`, `active`, `blocked`,
 `done`, `failed`, `expired`.
+
+---
+
+## Advanced Operations
+
+### Retry a blocked UoW without resetting the steward cycle count
+
+`decide-retry` (CLI) resets the `steward_cycles` counter to zero as part of
+its full-fresh-start semantics. If you want to retry a blocked UoW while
+preserving its accumulated cycle count, call `Registry.decide_proceed(uow_id)`
+directly in Python — no CLI equivalent exists:
+
+```python
+from src.orchestration.registry import Registry
+reg = Registry()
+reg.decide_proceed("<uow-id>")
+```
+
+This transitions the UoW from `blocked` back to `active` without touching
+`steward_cycles`.
 
 ---
 
