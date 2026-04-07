@@ -3,6 +3,8 @@
 *Status: Ready for execution — 2026-04-04*
 *Document purpose: Self-contained execution guide for a fresh context window*
 
+> **Registry operations**: See [docs/wos-registry-reference.md](wos-registry-reference.md) for injection pattern and status state machine.
+
 ---
 
 ## Purpose
