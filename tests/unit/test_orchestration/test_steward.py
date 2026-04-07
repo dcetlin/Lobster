@@ -3176,3 +3176,269 @@ class TestCorrectiveTraceGate:
         assert "trace_gate_waited" not in steward_log, (
             "trace_gate_waited must NOT appear in steward_log when trace.json is present"
         )
+
+# ---------------------------------------------------------------------------
+# Tests: Issue #648 Part B — _assess_completion legacy fallback hard-gated
+# (NULL success_criteria must not declare done without a result.json)
+# ---------------------------------------------------------------------------
+
+class TestAssessCompletionLegacyFallbackRemoved:
+    """
+    Verify that _assess_completion no longer declares 'done' based solely on
+    output_ref presence when success_criteria is NULL and no result.json exists.
+
+    Issue #648 Part B: the legacy fallback (trust output_ref + execution_complete
+    posture when success_criteria is NULL) is removed. A result.json with
+    outcome=complete is required regardless of whether success_criteria is set.
+    """
+
+    def _make_uow(self, tmp_path, uow_id=None, success_criteria=None):
+        """Build a minimal UoW with output_ref pointing to a tmp file."""
+        from src.orchestration.registry import UoW, UoWStatus
+        if uow_id is None:
+            import uuid
+            uow_id = f"uow_{uuid.uuid4().hex[:8]}"
+        output_file = tmp_path / f"{uow_id}.json"
+        output_file.write_text("execution complete: task dispatched as run-123")
+        return UoW(
+            id=uow_id,
+            status=UoWStatus.READY_FOR_STEWARD,
+            summary="Fix the login bug",
+            source="github:issue/99",
+            source_issue_number=99,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+            type="executable",
+            success_criteria=success_criteria,
+            steward_cycles=1,
+            output_ref=str(output_file),
+        ), output_file
+
+    def test_null_success_criteria_no_result_json_is_not_done(self, tmp_path):
+        """
+        NULL success_criteria + no result.json must not declare done.
+
+        The legacy fallback trusted output_ref presence alone when
+        success_criteria was NULL. A subagent that exits 0 without opening a
+        PR or calling write_result would trigger this path — false done.
+        The fix: require result.json regardless of success_criteria.
+        """
+        steward = _import_steward()
+        uow, output_file = self._make_uow(tmp_path, success_criteria=None)
+        # No result.json written — subagent exited without confirming work.
+
+        is_complete, rationale, executor_outcome = steward._assess_completion(
+            uow=uow,
+            output_content=output_file.read_text(),
+            reentry_posture="execution_complete",
+        )
+
+        assert not is_complete, (
+            "_assess_completion must return is_complete=False when no result.json "
+            "is present, even when success_criteria is NULL. "
+            "The legacy fallback must not silently declare done."
+        )
+        assert executor_outcome is None
+        assert "result file" in rationale.lower() or "result.json" in rationale.lower(), (
+            "Rationale must explain that a result file is required"
+        )
+
+    def test_null_success_criteria_with_complete_result_json_is_done(self, tmp_path):
+        """
+        NULL success_criteria + result.json with outcome=complete must declare done.
+
+        Removing the legacy fallback must not prevent legitimate completions:
+        when the Executor writes a result.json with outcome=complete, the
+        Steward should close the UoW even without explicit success_criteria.
+        """
+        steward = _import_steward()
+        uow, output_file = self._make_uow(tmp_path, success_criteria=None)
+        result_file = output_file.with_suffix(".result.json")
+        result_file.write_text(json.dumps({
+            "uow_id": uow.id,
+            "outcome": "complete",
+            "success": True,
+        }))
+
+        is_complete, rationale, executor_outcome = steward._assess_completion(
+            uow=uow,
+            output_content=output_file.read_text(),
+            reentry_posture="execution_complete",
+        )
+
+        assert is_complete, (
+            "_assess_completion must return is_complete=True when result.json "
+            "reports outcome=complete, even when success_criteria is NULL."
+        )
+        assert executor_outcome == "complete"
+
+    def test_null_success_criteria_with_failed_result_json_is_not_done(self, tmp_path):
+        """
+        NULL success_criteria + result.json with outcome=failed must not declare done.
+
+        Confirms the full routing path: result.json outcome is authoritative
+        even when success_criteria is NULL.
+        """
+        steward = _import_steward()
+        uow, output_file = self._make_uow(tmp_path, success_criteria=None)
+        result_file = output_file.with_suffix(".result.json")
+        result_file.write_text(json.dumps({
+            "uow_id": uow.id,
+            "outcome": "failed",
+            "success": False,
+            "reason": "subagent exited without opening PR",
+        }))
+
+        is_complete, rationale, executor_outcome = steward._assess_completion(
+            uow=uow,
+            output_content=output_file.read_text(),
+            reentry_posture="execution_complete",
+        )
+
+        assert not is_complete
+        assert executor_outcome == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Tests: Issue #648 Part A — inline_executor collapses the polling hop
+# ---------------------------------------------------------------------------
+
+class TestInlineExecutorDispatch:
+    """
+    Verify that when inline_executor is provided to _process_uow / run_steward_cycle,
+    the Executor is invoked immediately after the READY_FOR_EXECUTOR transition,
+    eliminating the 0-3 min polling hop described in issue #648 Part A.
+    """
+
+    def _setup_db(self, tmp_path):
+        """Return (db_path, registry, uow_id) for a fresh DB with one ready-for-steward UoW."""
+        from src.orchestration.registry import Registry
+        db_path = tmp_path / "registry.db"
+        conn = _open_db(db_path)
+        _apply_phase2_schema(conn)
+        uow_id = _make_uow_row(conn, status="ready-for-steward", source_issue_number=42)
+        conn.close()
+        registry = Registry(db_path)
+        return db_path, registry, uow_id
+
+    def test_inline_executor_called_after_prescription(self, tmp_path):
+        """
+        When inline_executor is provided and a UoW is prescribed, the callable
+        is invoked with the UoW ID immediately after the READY_FOR_EXECUTOR
+        transition — not on the next heartbeat cycle.
+        """
+        steward = _import_steward()
+        db_path, registry, uow_id = self._setup_db(tmp_path)
+
+        dispatched_uow_ids: list[str] = []
+
+        def fake_executor(uid: str) -> None:
+            dispatched_uow_ids.append(uid)
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan=lambda *a, **kw: None,
+            llm_prescriber=None,
+            inline_executor=fake_executor,
+        )
+
+        assert dispatched_uow_ids == [uow_id], (
+            f"inline_executor must be called once with the UoW ID after prescription. "
+            f"Got: {dispatched_uow_ids!r}"
+        )
+
+    def test_no_inline_executor_by_default(self, tmp_path):
+        """
+        When inline_executor is not provided (default None), the Executor is
+        not called inline — the heartbeat remains the sole dispatch path.
+
+        This verifies backward compatibility: existing callers that do not
+        pass inline_executor continue to work unchanged.
+        """
+        steward = _import_steward()
+        db_path, registry, uow_id = self._setup_db(tmp_path)
+
+        executor_called: list[str] = []
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan=lambda *a, **kw: None,
+            llm_prescriber=None,
+            # inline_executor intentionally omitted
+        )
+
+        assert executor_called == [], (
+            "With no inline_executor, the executor must not be called inline"
+        )
+
+    def test_inline_executor_failure_is_non_fatal(self, tmp_path):
+        """
+        When inline_executor raises, the error is logged but the UoW stays
+        in ready-for-executor — the heartbeat will retry on the next cycle.
+
+        The Steward must not propagate the executor exception; _process_uow
+        must return Prescribed normally even if inline dispatch fails.
+        """
+        steward = _import_steward()
+        db_path, registry, uow_id = self._setup_db(tmp_path)
+
+        def failing_executor(uid: str) -> None:
+            raise RuntimeError("Executor claim rejected — optimistic lock race")
+
+        # Must not raise even though inline_executor raises
+        result = steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan=lambda *a, **kw: None,
+            llm_prescriber=None,
+            inline_executor=failing_executor,
+        )
+
+        # The prescription still completes — Prescribed is counted
+        assert result["prescribed"] >= 1, (
+            "Steward must count the prescription as successful even when "
+            "inline_executor raises — the UoW is in ready-for-executor for retry"
+        )
+
+        # UoW is in ready-for-executor (heartbeat will pick it up)
+        uow = _get_uow(db_path, uow_id)
+        assert uow["status"] == "ready-for-executor", (
+            f"UoW must remain in ready-for-executor when inline_executor fails. "
+            f"Got: {uow['status']!r}"
+        )
+
+    def test_inline_executor_not_called_in_dry_run(self, tmp_path):
+        """
+        In dry-run mode the READY_FOR_EXECUTOR transition is suppressed, so
+        inline_executor must NOT be called (it would have nothing to claim).
+        """
+        steward = _import_steward()
+        db_path, registry, uow_id = self._setup_db(tmp_path)
+
+        dispatched: list[str] = []
+
+        def fake_executor(uid: str) -> None:
+            dispatched.append(uid)
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=True,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan=lambda *a, **kw: None,
+            llm_prescriber=None,
+            inline_executor=fake_executor,
+        )
+
+        assert dispatched == [], (
+            "inline_executor must not be called in dry-run mode — "
+            "the READY_FOR_EXECUTOR transition is suppressed in dry_run"
+        )
