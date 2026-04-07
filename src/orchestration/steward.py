@@ -742,6 +742,51 @@ def _select_executor_type(uow: "UoW") -> str:
     return _EXECUTOR_TYPE_GENERAL
 
 
+# Register → compatible executor types mapping (spec: Change 3).
+# frontier-writer and design-review are V3 gated register names — they exist
+# in the table to drive mismatch detection, but do not yet have dispatch
+# implementations. When the mismatch gate fires for philosophical or
+# human-judgment UoWs, the Steward surfaces to Dan for manual routing.
+_REGISTER_COMPATIBLE_EXECUTORS: dict[str, frozenset[str]] = {
+    "operational": frozenset({"functional-engineer", "lobster-ops", "general"}),
+    "iterative-convergent": frozenset({"functional-engineer", "lobster-ops"}),
+    "philosophical": frozenset({"frontier-writer"}),
+    "human-judgment": frozenset({"design-review"}),
+}
+
+
+def _check_register_executor_compatibility(
+    register: str,
+    executor_type: str,
+) -> tuple[bool, str]:
+    """Check whether executor_type is compatible with a UoW's register.
+
+    Pure function. Returns (is_compatible, reason).
+
+    Compatible means the executor type is listed in the compatible set for
+    the register. Unknown registers are treated as compatible with any executor
+    (conservative — do not block unknown registers).
+
+    Examples:
+        ("philosophical", "functional-engineer") → (False, "philosophical→functional-engineer: ...")
+        ("operational", "functional-engineer")   → (True, "")
+    """
+    compatible_types = _REGISTER_COMPATIBLE_EXECUTORS.get(register)
+    if compatible_types is None:
+        # Unknown register: allow through to avoid blocking unknown future registers
+        return True, f"unknown register {register!r} — allowing through"
+
+    if executor_type in compatible_types:
+        return True, ""
+
+    direction = f"{register}\u2192{executor_type}"
+    reason = (
+        f"register {register!r} is incompatible with executor_type {executor_type!r} "
+        f"({direction}). Compatible types: {sorted(compatible_types)}"
+    )
+    return False, reason
+
+
 def _select_prescribed_skills(uow: "UoW", reentry_posture: str) -> list[str]:
     """
     Select prescribed skills appropriate to the UoW type and posture.
@@ -1825,6 +1870,31 @@ def _default_notify_dan(
                 )
             else:
                 body_lines.append(f"\nSteward log:\n" + "\n".join(log_lines))
+    elif condition == "register_mismatch":
+        # Extract mismatch details from surface_log for structured message
+        _mismatch_register = uow.register
+        _mismatch_executor = "unknown"
+        _mismatch_direction = f"{_mismatch_register}→unknown"
+        if surface_log:
+            for _line in reversed(surface_log.strip().splitlines()):
+                _stripped = _line.strip()
+                if not _stripped:
+                    continue
+                try:
+                    _entry = json.loads(_stripped)
+                    if _entry.get("event") == "register_mismatch":
+                        _mismatch_executor = _entry.get("executor_type_attempted", "unknown")
+                        _mismatch_direction = _entry.get("direction", _mismatch_direction)
+                        break
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        body_lines = [
+            f"WOS: UoW {uow_id} — register mismatch. "
+            f"UoW register: {_mismatch_register}. "
+            f"Prescribed executor type: {_mismatch_executor}. "
+            f"A {_mismatch_register}-register UoW cannot be dispatched to {_mismatch_executor}. "
+            "Manual routing required."
+        ]
     else:
         body_lines = [
             f"WOS SURFACE: UoW {uow_id} hit condition={condition} "
@@ -2248,6 +2318,54 @@ def _process_uow(
     new_cycles = cycles + 1
     prescribed_skills = _select_prescribed_skills(uow, reentry_posture)
     selected_executor_type = _select_executor_type(uow)
+
+    # Register-mismatch gate (Change 3): check compatibility before writing artifact.
+    # If the selected executor_type is incompatible with the UoW's register, block
+    # dispatch and surface to Dan. The gate only fires in the prescribe branch (4c).
+    is_compatible, mismatch_reason = _check_register_executor_compatibility(
+        uow.register, selected_executor_type
+    )
+    if not is_compatible:
+        log.warning(
+            "_process_uow: register_mismatch for %s — register=%r executor_type=%r: %s",
+            uow_id, uow.register, selected_executor_type, mismatch_reason,
+        )
+        _direction = f"{uow.register}\u2192{selected_executor_type}"
+        mismatch_obs = {
+            "event": "register_mismatch_observation",
+            "uow_id": uow_id,
+            "register": uow.register,
+            "executor_type_attempted": selected_executor_type,
+            "direction": _direction,
+            "steward_cycles": cycles,
+            "timestamp": _now_iso(),
+        }
+        mismatch_log_entry = {
+            "event": "register_mismatch",
+            "uow_id": uow_id,
+            "steward_cycles": cycles,
+            "register": uow.register,
+            "executor_type_attempted": selected_executor_type,
+            "direction": _direction,
+        }
+        current_log_str = _append_steward_log_entry(registry, uow_id, current_log_str, mismatch_log_entry)
+        if not dry_run:
+            _write_steward_fields(registry, uow_id, steward_log=current_log_str)
+            registry.append_audit_log(uow_id, {
+                "event": "register_mismatch_observation",
+                "actor": _ACTOR_STEWARD,
+                "uow_id": uow_id,
+                "register": uow.register,
+                "executor_type_attempted": selected_executor_type,
+                "direction": _direction,
+                "steward_cycles": cycles,
+                "timestamp": _now_iso(),
+            })
+            registry.transition(uow_id, _STATUS_BLOCKED, _STATUS_DIAGNOSING)
+
+        _notify_mismatch = notify_dan or _default_notify_dan
+        _notify_mismatch(uow, "register_mismatch", surface_log=current_log_str, return_reason=return_reason)
+        return Surfaced(uow_id=uow_id, condition="register_mismatch")
 
     partial_steps_context: str = ""
     if executor_outcome == "partial" and uow.output_ref:
