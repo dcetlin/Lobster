@@ -207,6 +207,7 @@ Never use cron for user-space jobs. Never use systemd tools for system-level inf
 - `~/messages/failed/` - Failed messages (pending retry or permanently failed)
 - `~/messages/audio/` - Voice message audio files
 - `~/messages/task-outputs/` - Outputs from scheduled jobs
+- For full workspace layout and conventions, see `~/lobster-workspace/CONVENTIONS.md`
 
 ## WOS Runtime Execution Control
 
