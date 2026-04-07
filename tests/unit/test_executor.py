@@ -882,18 +882,19 @@ class TestDispatchViaInbox:
 
         assert deep_inbox.exists(), "inbox dir must be created even when deeply nested"
 
-    def test_executor_defaults_to_dispatch_via_inbox(
+    def test_executor_defaults_to_dispatch_table_when_no_dispatcher_injected(
         self, registry: Registry
     ) -> None:
         """
-        When no dispatcher is injected, Executor._dispatcher must be
-        _dispatch_via_inbox (backward-compatible default). The heartbeat
-        explicitly passes _dispatch_via_claude_p for production use.
+        When no dispatcher is injected, Executor._dispatcher_override must be None
+        so that _run_execution uses the dispatch table (_resolve_dispatcher).
+        Callers that need a specific dispatcher (e.g. heartbeat with _dispatch_via_inbox)
+        pass it explicitly — the injected dispatcher takes precedence over the table.
         """
         executor = Executor(registry)
-        assert executor._dispatcher is _dispatch_via_inbox, (
-            f"Default dispatcher must be _dispatch_via_inbox (backward compat), "
-            f"got {executor._dispatcher!r}"
+        assert executor._dispatcher_override is None, (
+            f"Default _dispatcher_override must be None (use dispatch table), "
+            f"got {executor._dispatcher_override!r}"
         )
 
     def test_executor_id_in_result_is_dispatcher_return_value(
