@@ -539,19 +539,25 @@ def _assess_completion(
                 log.warning("Could not parse result file %s: %s", result_file, e)
 
     # No structured result file found (or result file was invalid/misrouted).
+    # Require a result file regardless of whether success_criteria is set.
+    # A missing result.json means the Executor has not confirmed completion —
+    # the subagent may have exited 0 without opening a PR or calling write_result.
+    # Declaring done without evidence is the bug described in issue #648 Part B.
     success_criteria = uow.success_criteria
     if success_criteria:
-        # Conservative fallback: without a valid result file we cannot
-        # deterministically verify completion against success_criteria.
-        # Do not declare done — require the Executor to write a result file.
         return False, (
             f"no structured result file ({output_ref}.result.json) found — "
             f"cannot verify success_criteria without Executor confirmation: {success_criteria[:80]}"
         ), None
     else:
-        # Legacy fallback: no success_criteria and no result file.
-        # Trust the output_ref + execution_complete posture.
-        return True, f"success_criteria is NULL — output_ref present with execution_complete posture: {uow.summary[:80]}", None
+        # Hard gate: require result.json even when success_criteria is NULL.
+        # The legacy fallback (trust output_ref presence alone) is removed —
+        # it could declare done when the subagent exited 0 without producing
+        # any artifact (PR, write_result call, etc.). See issue #648 Part B.
+        return False, (
+            f"no structured result file ({output_ref}.result.json) found — "
+            f"Executor confirmation required even when success_criteria is NULL: {uow.summary[:80]}"
+        ), None
 
 
 # ---------------------------------------------------------------------------
@@ -2235,11 +2241,21 @@ def _process_uow(
     notify_dan: Callable | None,
     notify_dan_early_warning: Callable | None = None,
     llm_prescriber: Callable[..., dict[str, Any] | None] | None = _llm_prescribe,
+    inline_executor: Callable[[str], Any] | None = None,
 ) -> StewardOutcome:
     """
     Process a single UoW through the full diagnosis + prescribe/close/surface cycle.
 
     Returns a StewardOutcome: Prescribed | Done | Surfaced | RaceSkipped.
+
+    Args:
+        inline_executor: Optional callable(uow_id) that is invoked immediately after
+            the READY_FOR_EXECUTOR transition, collapsing the polling hop described in
+            issue #648 Part A.  When provided, the Steward dispatches the Executor
+            synchronously rather than waiting for the next heartbeat cycle (0–3 min).
+            The Executor's optimistic lock protects against double-execution if a
+            concurrent heartbeat fires between the transition and the inline call.
+            Defaults to None (no inline dispatch — heartbeat remains the dispatch path).
     """
     uow_id = uow.id
     cycles = uow.steward_cycles
@@ -2821,6 +2837,28 @@ def _process_uow(
         # Transition status to ready-for-executor
         registry.transition(uow_id, _STATUS_READY_FOR_EXECUTOR, _STATUS_DIAGNOSING)
 
+        # Issue #648 Part A — collapse the polling hop.
+        # When inline_executor is provided, invoke the Executor immediately after
+        # the READY_FOR_EXECUTOR transition rather than waiting for the next
+        # heartbeat cycle (which would add 0–3 min of unnecessary latency).
+        # The Executor's optimistic lock (step 2 in _claim) guards against
+        # double-execution if a concurrent heartbeat fires between transition
+        # and inline call — ClaimRejected is logged and re-raised, which the
+        # caller's exception handler surfaces.
+        if inline_executor is not None:
+            try:
+                inline_executor(uow_id)
+                log.info(
+                    "Steward: inline executor dispatch complete for UoW %s",
+                    uow_id,
+                )
+            except Exception as exc:
+                log.warning(
+                    "Steward: inline executor dispatch failed for UoW %s — %s: %s. "
+                    "UoW remains in ready-for-executor; heartbeat will retry.",
+                    uow_id, type(exc).__name__, exc,
+                )
+
     # Early warning: fire when new_cycles reaches the early-warning threshold.
     # Fires regardless of dry_run so tests can capture the notification.
     if new_cycles == _EARLY_WARNING_CYCLES:
@@ -2844,6 +2882,7 @@ def run_steward_cycle(
     bootup_candidate_gate: bool | None = None,
     db_path: Path | None = None,
     llm_prescriber: Callable[..., dict[str, Any] | None] | None = _llm_prescribe,
+    inline_executor: Callable[[str], Any] | None = None,
 ) -> dict[str, Any]:
     """
     Execute one full Steward heartbeat cycle.
@@ -2877,6 +2916,10 @@ def run_steward_cycle(
         Called during prescription to generate LLM-quality instructions.
         Inject None to bypass LLM (tests), or a stub to capture calls.
         Defaults to _llm_prescribe (production path).
+    inline_executor:
+        Optional callable(uow_id) invoked immediately after the READY_FOR_EXECUTOR
+        transition, collapsing the 0–3 min polling hop (issue #648 Part A).
+        Defaults to None — heartbeat remains the sole dispatch path.
 
     Returns
     -------
@@ -3035,6 +3078,7 @@ def run_steward_cycle(
                 notify_dan=notify_dan,
                 notify_dan_early_warning=notify_dan_early_warning,
                 llm_prescriber=llm_prescriber,
+                inline_executor=inline_executor,
             )
         except Exception:
             log.exception("Steward: unhandled error processing UoW %s — skipping", uow_id)
