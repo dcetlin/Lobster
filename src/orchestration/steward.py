@@ -3048,7 +3048,9 @@ def _process_uow(
     # Uses cumulative count (lifetime_cycles from previous attempts + new_cycles this attempt)
     # so the warning fires correctly even after decide-retry resets steward_cycles to 0.
     # Fires regardless of dry_run so tests can capture the notification.
-    if uow.lifetime_cycles + new_cycles == _EARLY_WARNING_CYCLES:
+    # >= (not ==) guards against non-sequential counts (manual data intervention, clock skew)
+    # that could jump past the threshold and silently skip the notification with ==.
+    if uow.lifetime_cycles + new_cycles >= _EARLY_WARNING_CYCLES:
         _notify_early = notify_dan_early_warning or _default_notify_dan_early_warning
         _notify_early(uow, return_reason, new_cycles)
 

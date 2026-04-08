@@ -1846,7 +1846,11 @@ class TestEarlyWarningAt4:
         )
 
     def test_early_warning_not_fired_at_hard_cap(self, db_path, registry, tmp_path):
-        """When steward_cycles == 5 (hard cap), early warning must not fire — surface fires instead."""
+        """When lifetime_cycles hits the hard cap (9), early warning must not fire — surface fires instead.
+
+        The UoW is surfaced (Surfaced returned) before reaching the prescription step where
+        the early warning check lives, so early warning is unreachable at hard cap.
+        """
         _ensure_registry_has_phase2_methods(registry)
         steward = _import_steward()
 
@@ -1860,10 +1864,13 @@ class TestEarlyWarningAt4:
             surface_calls.append(condition)
 
         conn = _open_db(db_path)
+        # lifetime_cycles=9 triggers hard cap (_HARD_CAP_CYCLES=9); steward_cycles=0 (new attempt).
+        # The UoW is surfaced before reaching prescription, so early warning never fires.
         uow_id = _make_uow_row(
             conn,
             status="ready-for-steward",
-            steward_cycles=5,
+            steward_cycles=0,
+            lifetime_cycles=9,
             output_ref=None,
         )
         conn.close()
@@ -1880,7 +1887,66 @@ class TestEarlyWarningAt4:
         assert len(early_warnings) == 0, (
             "Early warning must not fire at hard cap — surface fires instead"
         )
-        assert "hard_cap" in surface_calls, "Hard cap surface must fire at cycles=5"
+        assert "hard_cap" in surface_calls, "Hard cap surface must fire at lifetime_cycles=9"
+
+    def test_early_warning_fires_when_lifetime_cycles_jumps_past_threshold(self, db_path, registry, tmp_path):
+        """Early warning fires with >= even when lifetime_cycles jumps non-sequentially past the threshold.
+
+        Non-sequential case: lifetime_cycles=3, steward_cycles=0.
+        After prescription: 3 + 1 = 4 >= _EARLY_WARNING_CYCLES(4) → early warning fires.
+
+        With the old == operator this case would fire correctly (3+1==4), but a jump from
+        lifetime_cycles=2 to lifetime_cycles=4 (e.g. manual data intervention) would silently
+        skip the warning with ==. The >= form ensures any cumulative count that meets or
+        exceeds the threshold triggers the notification regardless of how it got there.
+        """
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        early_warnings = []
+
+        def capture_early_warning(uow, return_reason, new_cycles=None):
+            uow_id = uow.id if hasattr(uow, "id") else uow["id"]
+            early_warnings.append({"uow_id": uow_id, "new_cycles": new_cycles})
+
+        audit_entries = [
+            {"event": "execution_complete", "actor": "executor",
+             "return_reason": "needs_steward_review", "timestamp": _now_iso()},
+        ]
+
+        conn = _open_db(db_path)
+        # lifetime_cycles=3 (accumulated), steward_cycles=0 (new attempt):
+        # after prescription: 3 + 1 = 4 >= _EARLY_WARNING_CYCLES(4) → must fire.
+        # With == this case would also fire (3+1==4), but if lifetime_cycles had jumped
+        # from 2 to 4 non-sequentially, == would silently skip (4+1=5 != 4) while >= catches it.
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=0,
+            lifetime_cycles=3,
+            output_ref=None,
+            audit_log_entries=audit_entries,
+            success_criteria="Must produce artifact",
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan_early_warning=capture_early_warning,
+        )
+
+        assert len(early_warnings) == 1, (
+            f"Early warning must fire when lifetime_cycles(3) + new_cycles(1) >= "
+            f"_EARLY_WARNING_CYCLES(4), got: {early_warnings}"
+        )
+        assert early_warnings[0]["uow_id"] == uow_id
+        assert early_warnings[0]["new_cycles"] == 1, (
+            f"new_cycles must be 1 (first steward cycle on this attempt), "
+            f"got: {early_warnings[0]['new_cycles']}"
+        )
 
 
 # ---------------------------------------------------------------------------
