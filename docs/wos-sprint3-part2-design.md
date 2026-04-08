@@ -1,3 +1,9 @@
+---
+oracle_status: approved
+oracle_pr: null
+oracle_date: 2026-04-08
+---
+
 # WOS Sprint 3 Part 2 — High-Leverage Prerequisites
 
 *April 2026*
@@ -118,11 +124,14 @@ Within Tier 1, S3P2-A must merge before S3P2-B, because the `_llm_prescribe` ref
 **Tier 2 — Confirmed incident risk and governor gap (should land before Part 1 operations begin):**
 S3P2-D (reconciler flood) and S3P2-E (dispatch boundary observability) address failure modes with confirmed prior incidents or identified governor blindspots. S3P2-D's reconciler flood was a confirmed prior incident (663+ messages). Part 1's cultivator and governor produce task outputs through this reconciler path — a Part 1 restart with many in-flight tasks will reproduce the flood. S3P2-E's dispatch boundary observability gap means the asymmetric governor (S3-D, Part 1) cannot distinguish genuine starvation from starvation-due-to-dispatch-failure. Both are independent of each other and of Tier 1 items; they may be developed in parallel with Tier 1 once Tier 1 sequencing is set.
 
+**Tier 2 — Confirmed incident risk and governor gap (should land before Part 1 operations begin):**
+S3P2-G (vision_ref routing) is elevated to Tier 2 per Dan's decision. Vision_ref feeds into routing decisions that the cultivator and governor depend on — leaving the consumption pathway absent while Part 1 governing structures land makes the Phase 1 completion criterion sc-4 unverifiable during Part 1 testing. S3P2-G is independent of S3P2-D and S3P2-E and may be developed in parallel with them.
+
 **Tier 3 — Structural debt accumulation (should land during Part 1, before any UoW extends the affected surfaces):**
-S3P2-F (posture reconciliation), S3P2-G (vision_ref routing), and S3P2-H (caretaker interface drift) affect surfaces that will be extended by Part 1 PRs. They are not active correctness hazards today, but each Part 1 PR that extends steward dispatch, routing decisions, or caretaker behavior without resolving these gaps makes future oracle review harder and increases the cost of eventual reconciliation. S3P2-F must be resolved before S3P2-B finalizes the `posture` field in the prescription front-matter schema — this is the only hard ordering constraint in Tier 3. S3P2-G and S3P2-H are fully independent and may proceed in any order.
+S3P2-F (posture reconciliation) and S3P2-H (caretaker interface drift) affect surfaces that will be extended by Part 1 PRs. They are not active correctness hazards today, but each Part 1 PR that extends steward dispatch, routing decisions, or caretaker behavior without resolving these gaps makes future oracle review harder and increases the cost of eventual reconciliation. S3P2-F must be resolved before S3P2-B finalizes the `posture` field in the prescription front-matter schema — this is the only hard ordering constraint in Tier 3. S3P2-H is fully independent and may proceed in any order.
 
 **Parallelism summary:**
-The following pairs may be developed in parallel: (S3P2-A and S3P2-C), (S3P2-D and S3P2-E), (S3P2-G and S3P2-H). S3P2-B must wait for S3P2-A to merge. S3P2-F must resolve before S3P2-B finalizes its posture schema. All other pairs are independent.
+The following pairs may be developed in parallel: (S3P2-A and S3P2-C), (S3P2-D, S3P2-E, and S3P2-G), (S3P2-H). S3P2-B must wait for S3P2-A to merge. S3P2-F must resolve before S3P2-B finalizes its posture schema. All other pairs are independent. S3P2-G is elevated to Tier 2 — treat it as a peer of S3P2-D and S3P2-E for sequencing purposes.
 
 ---
 
