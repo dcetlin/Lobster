@@ -303,7 +303,7 @@ class Registry:
         if prescribed_skills_raw is not None:
             parsed_ps = _deserialize_json(prescribed_skills_raw)
             if isinstance(parsed_ps, list):
-                prescribed_skills = prescribed_ps
+                prescribed_skills = parsed_ps
 
         # vision_ref: NULL → None, '{"layer":...}' → dict
         vision_ref_raw = d.get("vision_ref")
