@@ -51,6 +51,8 @@ REPO_ROOT = Path(__file__).parent.parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from src.orchestration.steward import _HARD_CAP_CYCLES
+
 
 # ---------------------------------------------------------------------------
 # Helpers to build a Phase 2 DB
@@ -931,9 +933,6 @@ class TestHardCap:
 # ---------------------------------------------------------------------------
 # Test: hard cap uses lifetime_cycles, not steward_cycles
 # ---------------------------------------------------------------------------
-
-# Named constant from the spec
-_HARD_CAP_CYCLES = 5
 
 
 def _make_uow_row_with_lifetime(
