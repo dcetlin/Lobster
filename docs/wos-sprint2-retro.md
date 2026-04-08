@@ -37,6 +37,14 @@ The core story of Sprint 2 is that the executor dispatch infrastructure was brok
 | [#659](https://github.com/dcetlin/Lobster/pull/659) | cleanup: extract `_dispatch_via_stub` to eliminate duplicate dispatchers | 2026-04-07 | APPROVED. Sprint-2 cleanup; consolidated two identical stub dispatchers. |
 | [#660](https://github.com/dcetlin/Lobster/pull/660) | cleanup: route `corrective_traces` reads through Registry method | 2026-04-07 | APPROVED. Registry seam fix — `get_corrective_trace_history()` added. |
 | [#662](https://github.com/dcetlin/Lobster/pull/662) | fix(wos): eliminate polling hop and hard-gate legacy done fallback | 2026-04-07 | APPROVED. Inline executor wiring seam; `result.json` now required (legacy `success` field removed). |
+| [#665](https://github.com/dcetlin/Lobster/pull/665) | fix(wos): flip executor to event-driven inbox dispatch, demote heartbeat to recovery | 2026-04-07 | Replaced polling heartbeat with MCP inbox dispatch pattern; demotes heartbeat to recovery-only poller. Closes #664. |
+
+### Emergency Mid-Sprint PRs (dispatch infrastructure)
+
+| PR | Title | Merged | What broke / what was fixed |
+|----|-------|--------|------------------------------|
+| [#667](https://github.com/dcetlin/Lobster/pull/667) | fix(wos): scope staleness gate to executor_orphan recovery path only | mid-sprint | Staleness gate was applied unconditionally, blocking all dispatch. Gate now only applies to UoWs with a prior `executor_orphan` audit entry — fresh UoWs pass through immediately. |
+| [#668](https://github.com/dcetlin/Lobster/pull/668) | fix(wos): use updated_at as age anchor for ready-for-executor orphan detection | mid-sprint | Startup sweep was measuring orphan age from `created_at` (days old) instead of `updated_at` (time since steward prescribed). Caused startup sweep to reclassify freshly-prescribed UoWs as orphans every ~3 minutes, defeating the staleness gate from #667. |
 
 ### Fix Campaign PRs (post-sprint discoveries)
 
@@ -53,15 +61,11 @@ The core story of Sprint 2 is that the executor dispatch infrastructure was brok
 
 ## Oracle Learnings
 
-### Golden patterns added during Sprint 2
+### Pre-Sprint 2 patterns in oracle/learnings.md
 
-From `oracle/learnings.md`:
+The oracle learnings file ([oracle/learnings.md](../oracle/learnings.md)) captures golden patterns extracted from oracle reviews. All current entries predate Sprint 2 — they were extracted from reviews of PRs #607 and #602, both of which were reviewed on 2026-04-04, before the Sprint 2 execution track began. No new entries were added to oracle/learnings.md during Sprint 2.
 
-**State Machines (PR #607):** Comment/code mismatch at a state-machine transition causes silent state divergence. When a code comment says "transition to X" but the call transitions to Y, the UoW ends in the wrong state — which may or may not be a pickup state for the next heartbeat. State and comment must be synchronized; any mismatch is a reliability liability, not a documentation issue.
-
-**Contract & Interface Design (PR #607):** A recovery gate that tolerates an open executor contract gap inverts principle-1 ("proactive resilience over reactive recovery"). The correct fix layer is the producer (close the contract at executor exit), not the consumer (add a steward-side wait). Once a steward gate gracefully tolerates a gap, pressure to close the upstream contract decreases.
-
-**Classification & Detection (PR #602):** Boolean frozenset intersection is over-eager when technical vocabulary overlaps with domain vocabulary — a single shared term fires the gate at full confidence. Weighted scoring or frequency thresholds are more appropriate than presence-only detection. Classification results should be typed frozen dataclasses with observability fields (`gate_fired`, `evidence`, `confidence`) rather than bare return values.
+The Sprint 2 oracle verdicts for PRs #653, #658, #659, #660, and #662 are recorded in [oracle/decisions.md](../oracle/decisions.md) as inline approval notes within those PR entries, not as extracted learnings in oracle/learnings.md.
 
 ### Key NEEDS_CHANGES verdicts requiring revision
 
@@ -92,7 +96,7 @@ The audit verdict was not "this work is wrong" but "this work may be advancing t
 
 | Issue | Title | Status | Priority signal |
 |-------|-------|--------|----------------|
-| [#664](https://github.com/dcetlin/Lobster/issues/664) | Eliminate executor polling hop via MCP inbox dispatch (`_dispatch_via_inbox` at executor.py:1138) | Closed (addressed in PR #662) | — |
+| [#664](https://github.com/dcetlin/Lobster/issues/664) | Eliminate executor polling hop via MCP inbox dispatch (`_dispatch_via_inbox` at executor.py:1138) | Closed (addressed in PR #665) | — |
 | [#678](https://github.com/dcetlin/Lobster/issues/678) | Hard cap surfaces UoW but does not trigger cleanup arc (commitment is not irreversible) | Open | High — the hard cap is not a commitment gate without this |
 | [#679](https://github.com/dcetlin/Lobster/issues/679) | `steward_cycles` resets to 0 on decide-retry — hard cap provides no cumulative protection | Open | High — enables indefinite retry without lifetime tracking |
 | [#680](https://github.com/dcetlin/Lobster/issues/680) | Corrective trace absence not enforced as blocking gate before re-prescription | Open | Medium — trace loop is observed but not closed |
