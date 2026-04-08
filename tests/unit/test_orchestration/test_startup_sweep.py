@@ -548,6 +548,58 @@ class TestExecutorOrphan:
         assert result.executor_orphans_swept == 0
         assert _get_status(tmp_db, uow_id) == "ready-for-executor"
 
+    def test_updated_at_is_age_anchor_for_rfe_uow_not_created_at(self, registry, tmp_db):
+        """
+        The orphan threshold must use updated_at (when the UoW entered
+        ready-for-executor) — not created_at (when the issue was first proposed).
+
+        Sprint 2 blocker: UoWs created days ago but prescribed minutes ago were
+        being swept as executor_orphans on every heartbeat because created_at
+        exceeded the 1-hour threshold. updated_at is reset atomically when the
+        steward transitions to ready-for-executor, so it accurately reflects
+        how long the executor has had the UoW available.
+        """
+        conn = _open_conn(tmp_db)
+        uow_id = _make_uow(
+            conn,
+            status="ready-for-executor",
+            created_at=_iso_ago(7 * 24 * 3600),  # created 7 days ago (old issue)
+            updated_at=_iso_ago(120),             # entered ready-for-executor 2 min ago
+        )
+        conn.close()
+
+        # With the fix: updated_at (2 min) < threshold (1 hour) → should NOT be swept.
+        result = run_startup_sweep(registry, orphan_threshold_seconds=3600)
+
+        assert result.executor_orphans_swept == 0, (
+            "UoW with old created_at but recent updated_at must not be swept — "
+            "the executor has only had it for 2 minutes"
+        )
+        assert _get_status(tmp_db, uow_id) == "ready-for-executor"
+        assert len(_audit_entries(tmp_db, uow_id)) == 0
+
+    def test_rfe_uow_old_updated_at_is_swept_as_executor_orphan(self, registry, tmp_db):
+        """
+        A UoW whose updated_at (ready-for-executor entry time) exceeds the
+        orphan threshold should still be swept — executor genuinely never ran.
+        """
+        conn = _open_conn(tmp_db)
+        uow_id = _make_uow(
+            conn,
+            status="ready-for-executor",
+            created_at=_iso_ago(7 * 24 * 3600),  # created 7 days ago
+            updated_at=_iso_ago(7200),            # entered ready-for-executor 2 hours ago
+        )
+        conn.close()
+
+        result = run_startup_sweep(registry, orphan_threshold_seconds=3600)
+
+        assert result.executor_orphans_swept == 1
+        assert _get_status(tmp_db, uow_id) == "ready-for-steward"
+        note = json.loads(_audit_entries(tmp_db, uow_id)[0]["note"])
+        assert note["classification"] == "executor_orphan"
+        assert note["age_seconds"] > 3600
+
 
 class TestDiagnosingUow:
     def test_diagnosing_uow_is_transitioned_to_ready_for_steward(self, registry, tmp_db):
