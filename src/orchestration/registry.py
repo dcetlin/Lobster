@@ -1103,6 +1103,41 @@ class Registry:
         finally:
             conn.close()
 
+    def has_executor_orphan_history(self, uow_id: str) -> bool:
+        """
+        Return True if this UoW has ever been classified as executor_orphan
+        in the audit_log.
+
+        Used by the executor-heartbeat staleness filter to distinguish:
+        - Fresh UoWs (never orphaned): pass through immediately for dispatch
+        - Previously-orphaned UoWs: apply the RECOVERY_STALE_MINUTES gate
+
+        The executor_orphan classification is written by
+        record_startup_sweep_executor_orphan when the Steward detects a UoW
+        stuck in ready-for-executor. Its presence means the primary inbox
+        dispatch path already had a chance and missed this UoW — the heartbeat
+        is now the correct dispatch path.
+
+        Returns False on any query error (safe default: treat as fresh UoW,
+        allow immediate dispatch).
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) as c FROM audit_log
+                WHERE uow_id = ?
+                  AND event = 'startup_sweep'
+                  AND note LIKE '%"classification": "executor_orphan"%'
+                """,
+                (uow_id,),
+            ).fetchone()
+            return (row["c"] > 0) if row else False
+        except Exception:
+            return False
+        finally:
+            conn.close()
+
     def record_startup_sweep_diagnosing(
         self,
         uow_id: str,
