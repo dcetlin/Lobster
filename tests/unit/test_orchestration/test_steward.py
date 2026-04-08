@@ -1698,8 +1698,12 @@ class TestModuleConstants:
 # ---------------------------------------------------------------------------
 
 class TestEarlyWarningAt4:
-    def test_early_warning_fires_when_prescription_reaches_cycle_4(self, db_path, registry, tmp_path):
-        """When a prescription results in new steward_cycles == 4, an early warning is sent."""
+    def test_early_warning_fires_when_cumulative_cycles_reaches_4(self, db_path, registry, tmp_path):
+        """Early warning fires when lifetime_cycles + new steward_cycles reaches 4.
+
+        First-attempt case: lifetime_cycles=0, steward_cycles=3.
+        After prescription: 0 + 4 = 4 → early warning fires.
+        """
         _ensure_registry_has_phase2_methods(registry)
         steward = _import_steward()
 
@@ -1715,11 +1719,12 @@ class TestEarlyWarningAt4:
         ]
 
         conn = _open_db(db_path)
-        # steward_cycles=3: after prescription it becomes 4 → early warning
+        # lifetime_cycles=0 (first attempt), steward_cycles=3: after prescription 0+4=4 → early warning
         uow_id = _make_uow_row(
             conn,
             status="ready-for-steward",
             steward_cycles=3,
+            lifetime_cycles=0,
             output_ref=None,
             audit_log_entries=audit_entries,
             success_criteria="Must produce artifact",
@@ -1741,7 +1746,7 @@ class TestEarlyWarningAt4:
         )
         assert uow["steward_cycles"] == 4, "steward_cycles must be 4 after prescription"
         assert len(early_warnings) == 1, (
-            f"Early warning must fire exactly once when new_cycles == 4, got: {early_warnings}"
+            f"Early warning must fire exactly once when lifetime_cycles+new_cycles == 4, got: {early_warnings}"
         )
         assert early_warnings[0]["uow_id"] == uow_id
         assert early_warnings[0]["new_cycles"] == 4, (
@@ -1749,8 +1754,60 @@ class TestEarlyWarningAt4:
             f"got: {early_warnings[0]['new_cycles']}"
         )
 
-    def test_early_warning_not_fired_at_cycle_3(self, db_path, registry, tmp_path):
-        """No early warning when new steward_cycles is 3 (only fires at exactly 4)."""
+    def test_early_warning_fires_after_retry_when_cumulative_reaches_4(self, db_path, registry, tmp_path):
+        """Early warning fires based on cumulative lifetime_cycles, not per-attempt steward_cycles.
+
+        Cross-retry case: lifetime_cycles=2 (from previous attempt), steward_cycles=1.
+        After prescription: 2 + 2 = 4 → early warning fires despite steward_cycles being low.
+        Without the fix (using steward_cycles only), this would produce new_cycles=2 and not fire.
+        """
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        early_warnings = []
+
+        def capture_early_warning(uow, return_reason, new_cycles=None):
+            uow_id = uow.id if hasattr(uow, "id") else uow["id"]
+            early_warnings.append({"uow_id": uow_id, "return_reason": return_reason, "new_cycles": new_cycles})
+
+        audit_entries = [
+            {"event": "execution_complete", "actor": "executor",
+             "return_reason": "needs_steward_review", "timestamp": _now_iso()},
+        ]
+
+        conn = _open_db(db_path)
+        # lifetime_cycles=2 (accumulated from previous attempt), steward_cycles=1:
+        # after prescription: 2 + 2 = 4 → early warning must fire
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=1,
+            lifetime_cycles=2,
+            output_ref=None,
+            audit_log_entries=audit_entries,
+            success_criteria="Must produce artifact",
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan_early_warning=capture_early_warning,
+        )
+
+        uow = _get_uow(db_path, uow_id)
+        assert uow["status"] == "ready-for-executor", (
+            "UoW should be prescribed (status=ready-for-executor)"
+        )
+        assert len(early_warnings) == 1, (
+            f"Early warning must fire when lifetime_cycles(2) + new_cycles(2) == 4, got: {early_warnings}"
+        )
+        assert early_warnings[0]["uow_id"] == uow_id
+
+    def test_early_warning_not_fired_at_cumulative_cycle_3(self, db_path, registry, tmp_path):
+        """No early warning when lifetime_cycles + new steward_cycles is 3 (only fires at exactly 4)."""
         _ensure_registry_has_phase2_methods(registry)
         steward = _import_steward()
 
@@ -1765,11 +1822,12 @@ class TestEarlyWarningAt4:
         ]
 
         conn = _open_db(db_path)
-        # steward_cycles=2: after prescription it becomes 3 → no early warning
+        # lifetime_cycles=0 (first attempt), steward_cycles=2: after prescription 0+3=3 → no early warning
         uow_id = _make_uow_row(
             conn,
             status="ready-for-steward",
             steward_cycles=2,
+            lifetime_cycles=0,
             output_ref=None,
             audit_log_entries=audit_entries,
             success_criteria="Must produce artifact",
@@ -1785,7 +1843,7 @@ class TestEarlyWarningAt4:
         )
 
         assert len(early_warnings) == 0, (
-            f"Early warning must not fire at new_cycles=3, got: {early_warnings}"
+            f"Early warning must not fire at cumulative new_cycles=3, got: {early_warnings}"
         )
 
     def test_early_warning_not_fired_at_hard_cap(self, db_path, registry, tmp_path):
