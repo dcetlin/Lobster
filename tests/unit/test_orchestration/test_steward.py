@@ -3483,7 +3483,10 @@ class TestCorrectiveTraceGate:
     def test_trace_absent_first_reentry_skips_prescription(self, db_path, registry, tmp_path):
         """
         When result.json exists but trace.json does NOT: first re-entry must skip
-        prescription, log trace_gate_waited, and leave UoW at ready-for-steward.
+        prescription (WaitForTrace), log trace_gate_waited, and keep UoW in diagnosing
+        state (S3-B: NOT transition back to ready-for-steward).
+
+        The startup_sweep on the next heartbeat resets diagnosing → ready-for-steward.
         """
         _ensure_registry_has_phase2_methods(registry)
         steward = _import_steward()
@@ -3493,7 +3496,7 @@ class TestCorrectiveTraceGate:
         conn.close()
 
         # No trace.json written — gate should fire
-        steward.run_steward_cycle(
+        result = steward.run_steward_cycle(
             registry=registry,
             dry_run=False,
             github_client=_mock_github_client_open,
@@ -3502,10 +3505,16 @@ class TestCorrectiveTraceGate:
             llm_prescriber=None,
         )
 
+        # S3-B: WaitForTrace outcome is counted in wait_for_trace (not prescribed)
+        assert result.get("wait_for_trace", 0) == 1, (
+            "WaitForTrace outcome must be counted in run_steward_cycle result"
+        )
+
         uow = _get_uow(db_path, uow_id)
-        assert uow["status"] == "ready-for-steward", (
-            "Trace gate: first re-entry with trace.json absent must leave UoW at "
-            "ready-for-steward, not transition to ready-for-executor"
+        # S3-B: UoW stays in diagnosing — startup_sweep resets on next heartbeat
+        assert uow["status"] == "diagnosing", (
+            "Trace gate (S3-B): first re-entry with trace.json absent must keep UoW in "
+            "diagnosing state, not transition back to ready-for-steward or ready-for-executor"
         )
 
         steward_log = uow.get("steward_log", "") or ""
@@ -3518,13 +3527,15 @@ class TestCorrectiveTraceGate:
             "No workflow artifact must be written when trace gate skips prescription"
         )
 
-    def test_trace_absent_second_reentry_proceeds_with_contract_violation(
+    def test_trace_absent_second_reentry_proceeds_with_timeout(
         self, db_path, registry, tmp_path
     ):
         """
         When result.json exists but trace.json does NOT, and steward_log already
         contains trace_gate_waited: second re-entry must proceed with prescription
-        and log a contract violation.
+        (non-blocking fallback) and log a trace_gate_timeout event.
+
+        S3-B: renamed from contract_violation to trace_gate_timeout per spec.
         """
         _ensure_registry_has_phase2_methods(registry)
         steward = _import_steward()
@@ -3582,9 +3593,9 @@ class TestCorrectiveTraceGate:
         )
 
         steward_log = uow.get("steward_log", "") or ""
-        assert "trace_gate_contract_violation" in steward_log, (
-            "Contract violation must be logged when proceeding after one-cycle wait "
-            "without trace.json appearing"
+        assert "trace_gate_timeout" in steward_log, (
+            "trace_gate_timeout must be logged when proceeding after one-cycle wait "
+            "without trace.json appearing (S3-B: renamed from trace_gate_contract_violation)"
         )
 
     def test_trace_exists_prescription_proceeds_normally(self, db_path, registry, tmp_path):

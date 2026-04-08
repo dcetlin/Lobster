@@ -157,7 +157,22 @@ class RaceSkipped:
     uow_id: str
 
 
-StewardOutcome = Prescribed | Done | Surfaced | RaceSkipped
+@dataclass(frozen=True)
+class WaitForTrace:
+    """
+    Returned when the corrective trace (trace.json) is absent on the first
+    visit to the prescribe branch.  The UoW is left in ``diagnosing`` state;
+    the startup_sweep on the next heartbeat will reset it to ``ready-for-steward``
+    so the trace gate can be re-evaluated.
+
+    This is the S3-B one-cycle temporal gate outcome — the cristae-junction
+    analog that enforces mandatory dwell time between executor return and
+    re-prescription.
+    """
+    uow_id: str
+
+
+StewardOutcome = Prescribed | Done | Surfaced | RaceSkipped | WaitForTrace
 
 
 # ---------------------------------------------------------------------------
@@ -2641,14 +2656,15 @@ def _process_uow(
         trace_exists = trace_file.exists()
 
         if not trace_exists:
-            # trace.json absent — apply one-cycle wait gate
+            # trace.json absent — apply one-cycle wait gate (S3-B cristae-junction delay).
             already_waited = _check_trace_gate_waited(current_log_str)
             if not already_waited:
-                # First visit: log trace_gate_waited and skip prescription this cycle.
-                # Transition back to ready-for-steward so next heartbeat picks it up.
+                # First visit: log trace_gate_waited and keep UoW in diagnosing state.
+                # The startup_sweep on the next heartbeat will reset diagnosing →
+                # ready-for-steward so the gate is re-evaluated with a fresh trace check.
                 log.info(
                     "_process_uow: trace.json absent for %s — logging trace_gate_waited, "
-                    "skipping prescription this cycle (cristae-junction delay)",
+                    "keeping in diagnosing state for one heartbeat (cristae-junction delay)",
                     uow_id,
                 )
                 wait_entry = {
@@ -2674,53 +2690,49 @@ def _process_uow(
                         }),
                         "timestamp": _now_iso(),
                     })
-                    registry.transition(uow_id, _STATUS_READY_FOR_STEWARD, _STATUS_DIAGNOSING)
-                # Return a special Prescribed outcome with cycles unchanged to signal skip
+                    # UoW stays in diagnosing — startup_sweep on next heartbeat resets it.
+                    # Do NOT transition back to ready-for-steward here.
+                # Return WaitForTrace outcome — distinct from Prescribed, counted separately.
                 _append_cycle_trace(
                     uow_id=uow_id,
                     cycle_num=cycles,
                     subagent_excerpt=_read_output_ref(uow.output_ref),
                     return_reason=return_reason or "",
-                    next_action="prescribed",
+                    next_action="wait_for_trace",
                     artifact_dir=artifact_dir,
                 )
-                return Prescribed(uow_id=uow_id, cycles=cycles)
+                return WaitForTrace(uow_id=uow_id)
             else:
-                # Already waited one cycle — proceed with prescription, log contract violation
+                # Already waited one heartbeat — trace still absent.
+                # Log trace_gate_timeout and proceed with prescription (non-blocking fallback).
                 log.warning(
                     "_process_uow: trace.json absent after one-cycle wait for %s — "
-                    "proceeding with prescription (contract violation)",
+                    "logging trace_gate_timeout and proceeding with prescription",
                     uow_id,
                 )
-                violation_entry = {
-                    "event": "trace_gate_contract_violation",
+                timeout_entry = {
+                    "event": "trace_gate_timeout",
                     "uow_id": uow_id,
                     "steward_cycles": cycles,
                     "output_ref": output_ref_for_gate,
-                    "message": "trace.json absent after one-cycle wait — proceeding with prescription (contract violation)",
+                    "message": "trace.json absent after one-cycle wait — proceeding with prescription (non-blocking fallback)",
                 }
                 current_log_str = _append_steward_log_entry(
-                    registry, uow_id, current_log_str, violation_entry
+                    registry, uow_id, current_log_str, timeout_entry
                 )
                 if not dry_run:
                     _write_steward_fields(registry, uow_id, steward_log=current_log_str)
                     registry.append_audit_log(uow_id, {
-                        "event": "trace_gate_contract_violation",
+                        "event": "trace_gate_timeout",
                         "actor": _ACTOR_STEWARD,
                         "uow_id": uow_id,
                         "steward_cycles": cycles,
                         "note": json.dumps({
-                            "message": "trace.json absent after one-cycle wait — proceeding with prescription (contract violation)",
+                            "message": "trace.json absent after one-cycle wait — proceeding with prescription (non-blocking fallback)",
                             "output_ref": output_ref_for_gate,
                         }),
                         "timestamp": _now_iso(),
                     })
-                _notify_cv = notify_dan or _default_notify_dan
-                _notify_cv(
-                    uow,
-                    f"Executor contract violation: trace.json absent after one-cycle wait for UoW {uow_id}. "
-                    f"Prescribing anyway — check executor output at {output_ref_for_gate}.",
-                )
         else:
             # trace.json exists — clear any stale trace_gate_waited entries
             cleared_log = _clear_trace_gate_waited(current_log_str)
@@ -3187,6 +3199,7 @@ def run_steward_cycle(
     surfaced = 0
     skipped = 0
     race_skipped = 0
+    wait_for_trace = 0
     considered_ids = []
 
     for uow in uows:
@@ -3305,6 +3318,10 @@ def run_steward_cycle(
                 surfaced += 1
             case RaceSkipped():
                 race_skipped += 1
+            case WaitForTrace():
+                # One-cycle temporal gate fired — UoW stays in diagnosing;
+                # startup_sweep resets it to ready-for-steward next heartbeat.
+                wait_for_trace += 1
             case _:
                 skipped += 1
 
@@ -3315,5 +3332,6 @@ def run_steward_cycle(
         "surfaced": surfaced,
         "skipped": skipped,
         "race_skipped": race_skipped,
+        "wait_for_trace": wait_for_trace,
         "considered_ids": considered_ids,
     }
