@@ -1789,10 +1789,22 @@ class TestBackpressureSkipsRePrescription:
         "prior_status": "ready-for-executor",
     }
 
-    def test_skip_represcription_when_executor_orphan(self, db_path, registry, tmp_path):
-        """UoW returned as executor_orphan must be skipped, not prescribed."""
+    def test_skip_represcription_when_executor_orphan(self, db_path, registry, tmp_path, monkeypatch):
+        """UoW returned as executor_orphan must be skipped, not prescribed.
+
+        The backpressure gate only applies when execution is disabled. We mock
+        is_execution_enabled to return False so the gate triggers correctly.
+        """
         _ensure_registry_has_phase2_methods(registry)
         steward = _import_steward()
+
+        # Backpressure only fires when execution is disabled (otherwise the
+        # executor_orphan classification is considered stale).
+        # The function is imported inline in run_steward_cycle, so patch at source.
+        monkeypatch.setattr(
+            "src.orchestration.dispatcher_handlers.is_execution_enabled",
+            lambda: False,
+        )
 
         conn = _open_db(db_path)
         uow_id = _make_uow_row(
@@ -1821,10 +1833,16 @@ class TestBackpressureSkipsRePrescription:
             "run_steward_cycle must count the backpressure skip in skipped counter"
         )
 
-    def test_no_llm_call_when_executor_orphan(self, db_path, registry, tmp_path):
+    def test_no_llm_call_when_executor_orphan(self, db_path, registry, tmp_path, monkeypatch):
         """No LLM prescription call is made when return reason is executor_orphan."""
         _ensure_registry_has_phase2_methods(registry)
         steward = _import_steward()
+
+        # Backpressure only fires when execution is disabled.
+        monkeypatch.setattr(
+            "src.orchestration.dispatcher_handlers.is_execution_enabled",
+            lambda: False,
+        )
 
         llm_calls = []
 
@@ -1854,10 +1872,16 @@ class TestBackpressureSkipsRePrescription:
             "LLM prescriber must not be called for a UoW with executor_orphan return reason"
         )
 
-    def test_normal_uow_still_prescribed_alongside_orphan(self, db_path, registry, tmp_path):
+    def test_normal_uow_still_prescribed_alongside_orphan(self, db_path, registry, tmp_path, monkeypatch):
         """A normal UoW is prescribed even when another UoW is an executor_orphan."""
         _ensure_registry_has_phase2_methods(registry)
         steward = _import_steward()
+
+        # Backpressure only fires when execution is disabled.
+        monkeypatch.setattr(
+            "src.orchestration.dispatcher_handlers.is_execution_enabled",
+            lambda: False,
+        )
 
         conn = _open_db(db_path)
         orphan_id = _make_uow_row(
@@ -1894,10 +1918,16 @@ class TestBackpressureSkipsRePrescription:
             f"Normal UoW must be prescribed (ready-for-executor). Got: {normal_uow['status']}"
         )
 
-    def test_backpressure_event_written_to_audit_log(self, db_path, registry, tmp_path):
+    def test_backpressure_event_written_to_audit_log(self, db_path, registry, tmp_path, monkeypatch):
         """A backpressure audit event is written when re-prescription is skipped."""
         _ensure_registry_has_phase2_methods(registry)
         steward = _import_steward()
+
+        # Backpressure only fires when execution is disabled.
+        monkeypatch.setattr(
+            "src.orchestration.dispatcher_handlers.is_execution_enabled",
+            lambda: False,
+        )
 
         conn = _open_db(db_path)
         uow_id = _make_uow_row(
@@ -2083,11 +2113,14 @@ class TestLlmPrescription:
         def mock_run(cmd, **kwargs):
             # cmd is [claude_bin, "-p", prompt, "--output-format", "text"]
             captured_prompts.append(cmd[2])  # capture the prompt string
-            stdout = json.dumps({
-                "instructions": "Do the work again.",
-                "success_criteria_check": "File exists.",
-                "estimated_cycles": 1,
-            })
+            stdout = (
+                "---\n"
+                "executor_type: functional-engineer\n"
+                "estimated_cycles: 1\n"
+                "success_criteria_check: File exists.\n"
+                "---\n\n"
+                "Do the work again."
+            )
             return _subprocess.CompletedProcess(cmd, returncode=0, stdout=stdout, stderr="")
 
         monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
@@ -2133,19 +2166,22 @@ class TestLlmPrescription:
         result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
         assert result is None
 
-    def test_llm_prescribe_handles_markdown_fenced_json(self, monkeypatch):
-        """_llm_prescribe strips markdown code fences from the claude -p response."""
+    def test_llm_prescribe_valid_front_matter_response(self, monkeypatch):
+        """_llm_prescribe parses a well-formed front-matter + prose response."""
         import subprocess as _subprocess
         steward = _import_steward()
 
-        fenced_output = "```json\n" + json.dumps({
-            "instructions": "Implement the feature.",
-            "success_criteria_check": "Feature works.",
-            "estimated_cycles": 2,
-        }) + "\n```"
+        front_matter_output = (
+            "---\n"
+            "executor_type: functional-engineer\n"
+            "estimated_cycles: 2\n"
+            "success_criteria_check: Feature works.\n"
+            "---\n\n"
+            "Implement the feature."
+        )
 
         def mock_run(cmd, **kwargs):
-            return _subprocess.CompletedProcess(cmd, returncode=0, stdout=fenced_output, stderr="")
+            return _subprocess.CompletedProcess(cmd, returncode=0, stdout=front_matter_output, stderr="")
 
         monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
 
@@ -2155,68 +2191,47 @@ class TestLlmPrescription:
         assert result is not None
         assert result["instructions"] == "Implement the feature."
         assert result["estimated_cycles"] == 2
+        assert result["success_criteria_check"] == "Feature works."
 
-    # --- Tests for JSON extraction from anywhere in LLM output (bug: startswith check) ---
+    def test_llm_prescribe_front_matter_missing_executor_type_returns_none(self, monkeypatch):
+        """_llm_prescribe returns None when front-matter is missing executor_type."""
+        import subprocess as _subprocess
+        steward = _import_steward()
 
-    def test_llm_prescribe_preamble_before_json_fence_returns_none_with_old_logic(self):
-        """Directly replicates the bug: old startswith('```') check misses preamble + fence.
-
-        This test verifies the bug exists in the OLD extraction logic by testing
-        the logic in isolation. The old code only strips fences when raw_text starts
-        with '```' — so output with preamble text falls through to json.loads and fails.
-        """
-        import json as _json
-
-        # Simulate the OLD broken logic verbatim (copied from pre-fix steward.py)
-        raw_text = (
-            "Here is the prescription for this unit of work:\n\n"
-            "```json\n"
-            '{\n  "instructions": "Do the work.",\n'
-            '  "success_criteria_check": "Work done.",\n'
-            '  "estimated_cycles": 1\n}\n'
-            "```"
+        bad_output = (
+            "---\n"
+            "estimated_cycles: 1\n"
+            "success_criteria_check: Something.\n"
+            "---\n\n"
+            "Do some work."
         )
 
-        # Replicate old logic exactly
-        def old_extraction_logic(text: str) -> dict | None:
-            if text.startswith("```"):
-                lines = text.splitlines()
-                text = "\n".join(
-                    line for line in lines
-                    if not line.startswith("```")
-                ).strip()
-            try:
-                return _json.loads(text)
-            except _json.JSONDecodeError:
-                return None
+        def mock_run(cmd, **kwargs):
+            return _subprocess.CompletedProcess(cmd, returncode=0, stdout=bad_output, stderr="")
 
-        result = old_extraction_logic(raw_text)
-        # The bug: startswith check is False, json.loads fails on prose text → None
-        assert result is None, (
-            "Expected old logic to return None (the bug) — if this fails, "
-            "the old logic may have been patched already"
-        )
+        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
 
-    def test_llm_prescribe_preamble_before_json_fence(self, monkeypatch):
-        """_llm_prescribe succeeds when LLM output has preamble text before the json fence.
+        uow = self._make_uow()
+        result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
+        assert result is None
 
-        This is the primary production failure mode: 8/9 Sprint 001 prescription
-        attempts failed because the LLM prefixed its JSON with a sentence like
-        'Here is the prescription...'.
+    def test_llm_prescribe_preamble_before_front_matter_succeeds(self, monkeypatch):
+        """_llm_prescribe succeeds when LLM prefixes the front-matter with prose.
+
+        The parser tolerates preamble before --- to be robust against LLMs that
+        add an introductory sentence before the artifact.
         """
         import subprocess as _subprocess
         steward = _import_steward()
 
-        json_payload = {
-            "instructions": "Implement the widget feature.",
-            "success_criteria_check": "Widget renders in all browsers.",
-            "estimated_cycles": 2,
-        }
         preamble_output = (
             "Here is the prescription for this unit of work:\n\n"
-            "```json\n"
-            + json.dumps(json_payload, indent=2)
-            + "\n```"
+            "---\n"
+            "executor_type: functional-engineer\n"
+            "estimated_cycles: 1\n"
+            "success_criteria_check: Widget renders in all browsers.\n"
+            "---\n\n"
+            "Implement the widget feature."
         )
 
         def mock_run(cmd, **kwargs):
@@ -2227,25 +2242,21 @@ class TestLlmPrescription:
         uow = self._make_uow()
         result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
 
-        assert result is not None, "Expected successful extraction despite preamble text"
+        assert result is not None, "Preamble before front-matter should be tolerated"
         assert result["instructions"] == "Implement the widget feature."
-        assert result["estimated_cycles"] == 2
+        assert result["success_criteria_check"] == "Widget renders in all browsers."
 
-    def test_llm_prescribe_preamble_before_plain_fence(self, monkeypatch):
-        """_llm_prescribe extracts JSON from a plain ``` fence (no language tag) with preamble."""
+    def test_llm_prescribe_front_matter_no_closing_delimiter(self, monkeypatch):
+        """_llm_prescribe handles missing closing --- by treating all content as front-matter."""
         import subprocess as _subprocess
         steward = _import_steward()
 
-        json_payload = {
-            "instructions": "Fix the bug.",
-            "success_criteria_check": "Tests pass.",
-            "estimated_cycles": 1,
-        }
+        # No closing --- means prose body is empty (instructions will be empty → None)
         output = (
-            "The following JSON object contains the prescription:\n\n"
-            "```\n"
-            + json.dumps(json_payload)
-            + "\n```"
+            "---\n"
+            "executor_type: functional-engineer\n"
+            "estimated_cycles: 1\n"
+            "success_criteria_check: Tests pass.\n"
         )
 
         def mock_run(cmd, **kwargs):
@@ -2256,66 +2267,8 @@ class TestLlmPrescription:
         uow = self._make_uow()
         result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
 
-        assert result is not None
-        assert result["instructions"] == "Fix the bug."
-
-    def test_llm_prescribe_preamble_before_plain_json_no_fence(self, monkeypatch):
-        """_llm_prescribe extracts JSON when it appears after preamble prose without any fence."""
-        import subprocess as _subprocess
-        steward = _import_steward()
-
-        json_payload = {
-            "instructions": "Refactor the module.",
-            "success_criteria_check": "No regressions.",
-            "estimated_cycles": 1,
-        }
-        output = (
-            "I've analyzed the unit of work and here is my prescription:\n\n"
-            + json.dumps(json_payload)
-        )
-
-        def mock_run(cmd, **kwargs):
-            return _subprocess.CompletedProcess(cmd, returncode=0, stdout=output, stderr="")
-
-        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
-
-        uow = self._make_uow()
-        result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
-
-        assert result is not None
-        assert result["instructions"] == "Refactor the module."
-
-    def test_llm_prescribe_multiple_code_blocks_uses_first_valid_json(self, monkeypatch):
-        """_llm_prescribe uses the first valid JSON object when multiple code blocks appear."""
-        import subprocess as _subprocess
-        steward = _import_steward()
-
-        first_payload = {
-            "instructions": "First instruction set.",
-            "success_criteria_check": "First check.",
-            "estimated_cycles": 1,
-        }
-        second_payload = {
-            "instructions": "Second instruction set.",
-            "success_criteria_check": "Second check.",
-            "estimated_cycles": 2,
-        }
-        output = (
-            "Here are two options:\n\n"
-            "Option 1:\n```json\n" + json.dumps(first_payload) + "\n```\n\n"
-            "Option 2:\n```json\n" + json.dumps(second_payload) + "\n```"
-        )
-
-        def mock_run(cmd, **kwargs):
-            return _subprocess.CompletedProcess(cmd, returncode=0, stdout=output, stderr="")
-
-        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
-
-        uow = self._make_uow()
-        result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
-
-        assert result is not None
-        assert result["instructions"] == "First instruction set."
+        # Empty instructions → _llm_prescribe returns None (fallback)
+        assert result is None
 
     # --- New tests for issue #506: timeout observability and JSON classification ---
 
@@ -2328,11 +2281,14 @@ class TestLlmPrescription:
 
         def mock_run(cmd, **kwargs):
             captured_timeouts.append(kwargs.get("timeout"))
-            stdout = json.dumps({
-                "instructions": "Do the work.",
-                "success_criteria_check": "Work done.",
-                "estimated_cycles": 1,
-            })
+            stdout = (
+                "---\n"
+                "executor_type: functional-engineer\n"
+                "estimated_cycles: 1\n"
+                "success_criteria_check: Work done.\n"
+                "---\n\n"
+                "Do the work."
+            )
             return _subprocess.CompletedProcess(cmd, returncode=0, stdout=stdout, stderr="")
 
         monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
@@ -2379,13 +2335,13 @@ class TestLlmPrescription:
         result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
         assert result is None
 
-    def test_llm_prescribe_wrong_json_schema_non_dict(self, monkeypatch):
-        """_llm_prescribe returns None when claude -p returns a JSON array (not a dict)."""
+    def test_llm_prescribe_wrong_format_no_front_matter_returns_none(self, monkeypatch):
+        """_llm_prescribe returns None when claude -p returns content without front-matter."""
         import subprocess as _subprocess
         steward = _import_steward()
 
         def mock_run(cmd, **kwargs):
-            # Valid JSON but wrong schema — list instead of dict
+            # JSON array — not front-matter + prose format
             return _subprocess.CompletedProcess(cmd, returncode=0, stdout='["a", "b"]', stderr="")
 
         monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
@@ -2395,16 +2351,19 @@ class TestLlmPrescription:
         assert result is None
 
     def test_llm_prescribe_schema_mismatch_estimated_cycles_defaults(self, monkeypatch):
-        """_llm_prescribe defaults estimated_cycles to 1 when the field is a non-integer."""
+        """_llm_prescribe defaults estimated_cycles to 1 when the field is a non-integer string."""
         import subprocess as _subprocess
         steward = _import_steward()
 
         def mock_run(cmd, **kwargs):
-            stdout = json.dumps({
-                "instructions": "Do the work.",
-                "success_criteria_check": "Work done.",
-                "estimated_cycles": "several",  # wrong type — should be int
-            })
+            stdout = (
+                "---\n"
+                "executor_type: functional-engineer\n"
+                "estimated_cycles: several\n"  # wrong type — should be int
+                "success_criteria_check: Work done.\n"
+                "---\n\n"
+                "Do the work."
+            )
             return _subprocess.CompletedProcess(cmd, returncode=0, stdout=stdout, stderr="")
 
         monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
@@ -3442,3 +3401,162 @@ class TestInlineExecutorDispatch:
             "inline_executor must not be called in dry-run mode — "
             "the READY_FOR_EXECUTOR transition is suppressed in dry_run"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: _parse_workflow_artifact
+# ---------------------------------------------------------------------------
+
+class TestParseWorkflowArtifact:
+    """Unit tests for the pure _parse_workflow_artifact function."""
+
+    def test_valid_input_with_all_fields(self):
+        """Valid front-matter + prose → correct dict with all fields."""
+        steward = _import_steward()
+
+        raw = (
+            "---\n"
+            "executor_type: functional-engineer\n"
+            "estimated_cycles: 2\n"
+            "success_criteria_check: Verify PR is open and tests pass\n"
+            "---\n\n"
+            "Implement the widget module in src/widget.py.\n"
+            "Run tests to verify no regressions."
+        )
+
+        result = steward._parse_workflow_artifact(raw)
+
+        assert result["executor_type"] == "functional-engineer"
+        assert result["estimated_cycles"] == 2
+        assert result["success_criteria_check"] == "Verify PR is open and tests pass"
+        assert "Implement the widget module" in result["instructions"]
+        assert "Run tests" in result["instructions"]
+
+    def test_preamble_before_front_matter_is_tolerated(self):
+        """Preamble prose before the opening --- is discarded without error."""
+        steward = _import_steward()
+
+        raw = (
+            "Here is the prescription:\n\n"
+            "---\n"
+            "executor_type: functional-engineer\n"
+            "estimated_cycles: 1\n"
+            "success_criteria_check: Tests pass.\n"
+            "---\n\n"
+            "Do the work."
+        )
+
+        result = steward._parse_workflow_artifact(raw)
+
+        assert result["executor_type"] == "functional-engineer"
+        assert result["instructions"] == "Do the work."
+
+    def test_only_executor_type_uses_defaults(self):
+        """Only executor_type present → estimated_cycles defaults to 1, success_criteria_check to ''."""
+        steward = _import_steward()
+
+        raw = (
+            "---\n"
+            "executor_type: lobster-ops\n"
+            "---\n\n"
+            "Deploy the new service."
+        )
+
+        result = steward._parse_workflow_artifact(raw)
+
+        assert result["executor_type"] == "lobster-ops"
+        assert result["estimated_cycles"] == 1
+        assert result["success_criteria_check"] == ""
+        assert result["instructions"] == "Deploy the new service."
+
+    def test_missing_executor_type_raises_value_error(self):
+        """Missing executor_type raises ValueError."""
+        steward = _import_steward()
+
+        raw = (
+            "---\n"
+            "estimated_cycles: 1\n"
+            "success_criteria_check: Something.\n"
+            "---\n\n"
+            "Do some work."
+        )
+
+        with pytest.raises(ValueError, match="executor_type"):
+            steward._parse_workflow_artifact(raw)
+
+    def test_empty_input_raises_value_error(self):
+        """Empty input raises ValueError."""
+        steward = _import_steward()
+
+        with pytest.raises(ValueError):
+            steward._parse_workflow_artifact("")
+
+        with pytest.raises(ValueError):
+            steward._parse_workflow_artifact("   \n  ")
+
+    def test_prose_body_preserved_exactly(self):
+        """Prose body after closing --- is preserved with exact content."""
+        steward = _import_steward()
+
+        prose = (
+            "Step 1: Clone the repo.\n"
+            "Step 2: Run the tests.\n"
+            "Step 3: Open a PR.\n"
+            "\n"
+            "Make sure all CI checks pass."
+        )
+        raw = "---\nexecutor_type: functional-engineer\n---\n\n" + prose
+
+        result = steward._parse_workflow_artifact(raw)
+
+        assert result["instructions"] == prose.strip()
+
+    def test_extra_whitespace_in_front_matter_values(self):
+        """Extra whitespace around field values is stripped."""
+        steward = _import_steward()
+
+        raw = (
+            "---\n"
+            "executor_type:   functional-engineer   \n"
+            "estimated_cycles:  3  \n"
+            "success_criteria_check:   Tests pass.   \n"
+            "---\n\n"
+            "Do the work."
+        )
+
+        result = steward._parse_workflow_artifact(raw)
+
+        assert result["executor_type"] == "functional-engineer"
+        assert result["estimated_cycles"] == 3
+        assert result["success_criteria_check"] == "Tests pass."
+
+    def test_missing_closing_delimiter_yields_empty_instructions(self):
+        """When closing --- is absent, prose body is empty (instructions='')."""
+        steward = _import_steward()
+
+        raw = (
+            "---\n"
+            "executor_type: functional-engineer\n"
+            "estimated_cycles: 1\n"
+        )
+
+        result = steward._parse_workflow_artifact(raw)
+
+        assert result["executor_type"] == "functional-engineer"
+        assert result["instructions"] == ""
+
+    def test_non_integer_estimated_cycles_defaults_to_one(self):
+        """Non-integer estimated_cycles falls back to 1 without raising."""
+        steward = _import_steward()
+
+        raw = (
+            "---\n"
+            "executor_type: functional-engineer\n"
+            "estimated_cycles: several\n"
+            "---\n\n"
+            "Do the work."
+        )
+
+        result = steward._parse_workflow_artifact(raw)
+
+        assert result["estimated_cycles"] == 1

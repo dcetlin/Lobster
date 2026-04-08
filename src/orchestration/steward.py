@@ -863,6 +863,104 @@ def _extract_json_from_llm_output(raw_text: str) -> str:
     return raw_text
 
 
+def _parse_workflow_artifact(raw_text: str) -> dict:
+    """Parse a front-matter + prose prescription artifact.
+
+    Pure function. Accepts text in the form:
+        ---
+        executor_type: functional-engineer
+        estimated_cycles: 1
+        success_criteria_check: Verify PR is open and tests pass
+        ---
+
+        <prose instructions here>
+
+    Preamble prose before the opening --- is tolerated and discarded.
+    This mirrors the robustness of the previous JSON extraction strategy
+    and handles LLMs that add an introductory sentence before the artifact.
+
+    Returns a dict with keys:
+      - "executor_type": str (required — raises ValueError if absent)
+      - "estimated_cycles": int (default 1)
+      - "success_criteria_check": str (default "")
+      - "instructions": str — the prose body after the closing ---
+
+    Raises ValueError if executor_type is missing or no front-matter delimiter
+    is found in the input.
+
+    Implementation is deliberately dependency-free: no PyYAML, no regex,
+    just line-by-line scanning so the parse contract is unambiguous.
+    """
+    text = raw_text.strip()
+    if not text:
+        raise ValueError("_parse_workflow_artifact: empty input")
+
+    lines = text.splitlines()
+
+    # Find the first --- delimiter (opening). Preamble prose before it is
+    # tolerated so the parser is robust against LLM introductory sentences.
+    opening_idx: int | None = None
+    for i, line in enumerate(lines):
+        if line.strip() == "---":
+            opening_idx = i
+            break
+
+    if opening_idx is None:
+        raise ValueError(
+            "_parse_workflow_artifact: no front-matter '---' delimiter found in input"
+        )
+
+    # Find the closing --- (first occurrence after the opening ---)
+    closing_idx: int | None = None
+    for i in range(opening_idx + 1, len(lines)):
+        if lines[i].strip() == "---":
+            closing_idx = i
+            break
+
+    # When no closing delimiter is found, treat everything after the opening
+    # --- as front-matter (no prose body).
+    if closing_idx is None:
+        front_matter_lines = lines[opening_idx + 1:]
+        prose_lines: list[str] = []
+    else:
+        front_matter_lines = lines[opening_idx + 1:closing_idx]
+        prose_lines = lines[closing_idx + 1:]
+
+    # Parse front-matter key: value pairs (no nested structures needed).
+    front_matter: dict[str, str] = {}
+    for line in front_matter_lines:
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        front_matter[key.strip()] = value.strip()
+
+    executor_type = front_matter.get("executor_type", "")
+    if not executor_type:
+        raise ValueError(
+            "_parse_workflow_artifact: required field 'executor_type' is missing "
+            "from front-matter"
+        )
+
+    raw_cycles = front_matter.get("estimated_cycles", "1")
+    try:
+        estimated_cycles = int(raw_cycles)
+    except (TypeError, ValueError):
+        estimated_cycles = 1
+
+    success_criteria_check = front_matter.get("success_criteria_check", "")
+
+    # Preserve the prose body exactly — strip only the leading blank line that
+    # typically follows the closing --- delimiter.
+    instructions = "\n".join(prose_lines).strip()
+
+    return {
+        "executor_type": executor_type,
+        "estimated_cycles": estimated_cycles,
+        "success_criteria_check": success_criteria_check,
+        "instructions": instructions,
+    }
+
+
 def _llm_prescribe(
     uow: UoW,
     reentry_posture: str,
@@ -986,12 +1084,15 @@ For internal tasks (no user reply): write_result only with sent_reply_to_user=Fa
 {uow_context}
 
 {_DISPATCH_CONVENTIONS}
-Respond with a JSON object only (no markdown, no explanation outside the JSON):
-{{
-  "instructions": "<complete, actionable instructions for the Executor — include the specific steps, what to produce, where to write output, and any constraints from the success criteria; embed the YAML frontmatter, Minimum viable output, Boundary, and agent_type lines as described above>",
-  "success_criteria_check": "<one or two sentences describing exactly how to verify the work is complete — what to check, what file exists, what content to confirm>",
-  "estimated_cycles": <integer 1-3 — how many Executor passes this is expected to need>
-}}"""
+Respond using front-matter + prose format. Output ONLY the prescription — no preamble, no explanation outside this structure:
+
+---
+executor_type: <agent type from the table above — e.g. functional-engineer>
+estimated_cycles: <integer 1-3 — how many Executor passes this is expected to need>
+success_criteria_check: <one or two sentences describing exactly how to verify the work is complete — what to check, what file exists, what content to confirm>
+---
+
+<complete, actionable instructions for the Executor — include the specific steps, what to produce, where to write output, and any constraints from the success criteria; embed the YAML frontmatter, Minimum viable output, Boundary, and agent_type lines as described above>"""
 
     # Combine system and user prompts into a single string for claude -p,
     # which does not accept a separate --system flag in basic invocation mode.
@@ -1046,47 +1147,20 @@ Respond with a JSON object only (no markdown, no explanation outside the JSON):
         )
         return None
 
-    # Extract JSON from anywhere in the LLM output.
-    # The LLM often prefixes its JSON with preamble prose; _extract_json_from_llm_output
-    # handles fenced blocks (```json or ```) appearing anywhere, as well as plain JSON
-    # that starts mid-text after preamble.
-    raw_text = _extract_json_from_llm_output(raw_text)
-
-    # Classify parse failures: distinguish non-JSON (refusal / error prose)
-    # from structurally-valid JSON that doesn't match the expected schema.
+    # Parse the front-matter + prose prescription format.
     try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError as exc:
+        parsed = _parse_workflow_artifact(raw_text)
+    except ValueError as exc:
         log.warning(
-            "_llm_prescribe: non-JSON output from claude -p for %s "
-            "(JSONDecodeError: %s) — output preview: %r, falling back",
+            "_llm_prescribe: could not parse front-matter artifact for %s "
+            "(%s) — output preview: %r, falling back",
             uow.id, exc, raw_text[:200],
         )
         return None
 
-    if not isinstance(parsed, dict):
-        log.warning(
-            "_llm_prescribe: unexpected JSON type %s for %s "
-            "(expected dict), falling back",
-            type(parsed).__name__, uow.id,
-        )
-        return None
-
-    instructions = str(parsed.get("instructions", "")).strip()
-    success_criteria_check = str(parsed.get("success_criteria_check", "")).strip()
-
-    # Validate estimated_cycles; wrong schema (e.g. string instead of int)
-    # is logged as a schema mismatch rather than a generic parse failure.
-    raw_cycles = parsed.get("estimated_cycles", 1)
-    try:
-        estimated_cycles = int(raw_cycles)
-    except (TypeError, ValueError):
-        log.warning(
-            "_llm_prescribe: schema mismatch for %s — "
-            "estimated_cycles=%r is not an integer, defaulting to 1",
-            uow.id, raw_cycles,
-        )
-        estimated_cycles = 1
+    instructions = parsed.get("instructions", "")
+    success_criteria_check = parsed.get("success_criteria_check", "")
+    estimated_cycles = parsed.get("estimated_cycles", 1)
 
     if not instructions:
         log.warning(
