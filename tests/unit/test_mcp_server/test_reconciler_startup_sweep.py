@@ -302,10 +302,113 @@ class TestEnqueueStartupSweepSummaries:
         assert written == []
 
     def test_n_tasks_one_chat_produces_one_message_not_n(self, tmp_path):
-        """The core guarantee: N tasks for one user → 1 inbox message, not N."""
+        """The core guarantee: N tasks for one user → 1 inbox message, not N.
+
+        This is the root-cause fix for issue #469 — grouping sessions by chat_id
+        makes the N-task → N-message flood structurally impossible.
+        """
         n = 100
         sessions = [_make_session(f"agent-{i}", chat_id="42") for i in range(n)]
         written, _ = self._run_with_mocks(sessions, tmp_path)
         # With cap=20, the first 20 sessions go into the summary; the rest are notified
-        # but not included. Either way, only 1 message is written.
+        # but not included. Either way, only 1 message is written to inbox.
         assert len(written) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: internal sessions routing to task-outputs/ (issue #462)
+# ---------------------------------------------------------------------------
+
+
+class TestInternalSessionsTaskOutputsRouting:
+    """Internal sessions (chat_id=0) should be routed to task-outputs/, not inbox."""
+
+    def _run_with_mocks(
+        self, sessions: list[dict], tmp_path: Path
+    ) -> tuple[list[dict], list[dict], MagicMock]:
+        """Run _enqueue_startup_sweep_summaries with patched I/O.
+
+        Returns (inbox_messages, task_output_files, mock_store).
+        """
+        inbox_written: list[dict] = []
+        task_outputs_written: list[dict] = []
+        task_outputs_dir = tmp_path / "task-outputs"
+        task_outputs_dir.mkdir(parents=True, exist_ok=True)
+
+        def fake_atomic_write(path: Path, data: dict) -> None:
+            inbox_written.append(data)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data))
+
+        mock_store = MagicMock()
+
+        # Patch both inbox and task-outputs directories
+        # Import the module to patch constants before they're used
+        import src.mcp.inbox_server as inbox_mod
+
+        original_task_outputs_dir = inbox_mod.TASK_OUTPUTS_DIR
+        original_inbox_dir = inbox_mod.INBOX_DIR
+        try:
+            inbox_mod.TASK_OUTPUTS_DIR = task_outputs_dir
+            inbox_mod.INBOX_DIR = tmp_path / "inbox"
+            with (
+                patch.object(inbox_mod, "atomic_write_json", side_effect=fake_atomic_write),
+                patch.object(inbox_mod, "_session_store", mock_store),
+            ):
+                inbox_mod._enqueue_startup_sweep_summaries(sessions)
+        finally:
+            inbox_mod.TASK_OUTPUTS_DIR = original_task_outputs_dir
+            inbox_mod.INBOX_DIR = original_inbox_dir
+
+        # Read any task-output files written
+        for f in task_outputs_dir.glob("*.json"):
+            task_outputs_written.append(json.loads(f.read_text()))
+
+        return inbox_written, task_outputs_written, mock_store
+
+    def test_internal_sessions_routed_to_task_outputs(self, tmp_path):
+        """Internal sessions (chat_id=0) are written to task-outputs/, not inbox."""
+        sessions = [
+            _make_session("internal-1", chat_id="0", description="Internal task A"),
+            _make_session("internal-2", chat_id="0", description="Internal task B"),
+        ]
+        inbox, task_outputs, _ = self._run_with_mocks(sessions, tmp_path)
+        # No inbox messages for internal sessions
+        assert inbox == []
+        # One task-output file for all internal sessions
+        assert len(task_outputs) == 1
+        assert task_outputs[0]["job_name"] == "reconciler-sweep-internal"
+        assert task_outputs[0]["completed_count"] == 2
+        assert "Internal task A" in task_outputs[0]["output"]
+        assert "Internal task B" in task_outputs[0]["output"]
+
+    def test_mixed_sessions_routes_correctly(self, tmp_path):
+        """Internal sessions go to task-outputs/, real users to inbox."""
+        sessions = [
+            _make_session("internal-1", chat_id="0", description="Internal task"),
+            _make_session("user-task", chat_id="42", description="User task"),
+        ]
+        inbox, task_outputs, _ = self._run_with_mocks(sessions, tmp_path)
+        # One inbox message for the real user
+        assert len(inbox) == 1
+        assert inbox[0]["chat_id"] == "42"
+        # One task-output file for the internal session
+        assert len(task_outputs) == 1
+        assert task_outputs[0]["completed_count"] == 1
+
+    def test_internal_sessions_marked_notified(self, tmp_path):
+        """Internal sessions are marked notified to prevent accumulation."""
+        sessions = [_make_session("internal-1", chat_id="0")]
+        _, _, mock_store = self._run_with_mocks(sessions, tmp_path)
+        mock_store.set_notified.assert_called_with("internal-1")
+
+    def test_dead_internal_sessions_counted_separately(self, tmp_path):
+        """Dead internal sessions are counted as dead, not completed."""
+        sessions = [
+            _make_session("int-completed", chat_id="0", status="completed"),
+            _make_session("int-dead", chat_id="0", status="dead"),
+        ]
+        _, task_outputs, _ = self._run_with_mocks(sessions, tmp_path)
+        assert len(task_outputs) == 1
+        assert task_outputs[0]["completed_count"] == 1
+        assert task_outputs[0]["dead_count"] == 1
