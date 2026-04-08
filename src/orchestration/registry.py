@@ -47,6 +47,11 @@ class UoWStatus(StrEnum):
     READY_FOR_STEWARD = "ready-for-steward"
     READY_FOR_EXECUTOR = "ready-for-executor"
     ACTIVE = "active"
+    # EXECUTING: inbox message written, subagent dispatched but write_result not yet received.
+    # Transitions: active → executing (at inbox dispatch) → ready-for-steward (at write_result).
+    # This intermediate state prevents false-complete UoWs: execution_complete is only written
+    # when the subagent confirms completion via write_result (issue #669).
+    EXECUTING = "executing"
     DIAGNOSING = "diagnosing"
     BLOCKED = "blocked"
     DONE = "done"
@@ -58,9 +63,10 @@ class UoWStatus(StrEnum):
         return self in {UoWStatus.DONE, UoWStatus.FAILED, UoWStatus.EXPIRED}
 
     def is_in_flight(self) -> bool:
-        """True for statuses that block re-proposal (active, pending, ready-for-steward, ready-for-executor, diagnosing)."""
+        """True for statuses that block re-proposal (active, executing, pending, ready-for-steward, ready-for-executor, diagnosing)."""
         return self in {
             UoWStatus.ACTIVE,
+            UoWStatus.EXECUTING,
             UoWStatus.PENDING,
             UoWStatus.READY_FOR_STEWARD,
             UoWStatus.READY_FOR_EXECUTOR,
@@ -1195,9 +1201,56 @@ class Registry:
         finally:
             conn.close()
 
+    def transition_to_executing(self, uow_id: str, executor_id: str) -> None:
+        """
+        Transition a UoW from 'active' to 'executing' after inbox dispatch.
+
+        Called by the Executor immediately after writing the wos_execute inbox
+        message (fire-and-forget async dispatch). The UoW remains in 'executing'
+        until write_result is received from the subagent, at which point
+        complete_uow transitions it to 'ready-for-steward'.
+
+        This prevents false-complete UoWs: execution_complete is only written
+        when the subagent confirms completion via write_result (issue #669).
+
+        Single transaction: audit INSERT before status UPDATE
+        (audit-before-transition invariant).
+        """
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                VALUES (?, ?, 'executor_dispatch', 'active', 'executing', 'executor', ?)
+                """,
+                (now, uow_id, json.dumps({"actor": "executor", "executor_id": executor_id, "timestamp": now})),
+            )
+            conn.execute(
+                "UPDATE uow_registry SET status = 'executing', updated_at = ? WHERE id = ?",
+                (now, uow_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def complete_uow(self, uow_id: str, output_ref: str) -> None:
         """
-        Transition a UoW from 'active' to 'ready-for-steward'.
+        Transition a UoW to 'ready-for-steward' with an execution_complete audit entry.
+
+        For async inbox dispatch: transitions 'executing' → 'ready-for-steward'.
+        Called by the write_result MCP handler when the subagent reports completion.
+
+        For synchronous subprocess dispatch (frontier-writer, design-review):
+        transitions 'active' → 'ready-for-steward'. Called by the Executor after
+        the subprocess exits.
+
+        The from_status is derived from the current DB state so the audit entry
+        is accurate regardless of which dispatch path was used.
 
         Single transaction: audit INSERT before status UPDATE
         (audit-before-transition invariant).
@@ -1208,12 +1261,17 @@ class Registry:
         try:
             now = _now_iso()
             conn.execute("BEGIN IMMEDIATE")
+            # Derive current status for accurate audit log from_status.
+            row = conn.execute(
+                "SELECT status FROM uow_registry WHERE id = ?", (uow_id,)
+            ).fetchone()
+            current_status = row["status"] if row else "active"
             conn.execute(
                 """
                 INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
-                VALUES (?, ?, 'execution_complete', 'active', 'ready-for-steward', 'executor', ?)
+                VALUES (?, ?, 'execution_complete', ?, 'ready-for-steward', 'executor', ?)
                 """,
-                (now, uow_id, json.dumps({"actor": "executor", "output_ref": output_ref, "timestamp": now})),
+                (now, uow_id, current_status, json.dumps({"actor": "executor", "output_ref": output_ref, "timestamp": now})),
             )
             conn.execute(
                 "UPDATE uow_registry SET status = 'ready-for-steward', updated_at = ? WHERE id = ?",
@@ -1228,7 +1286,10 @@ class Registry:
 
     def fail_uow(self, uow_id: str, reason: str) -> None:
         """
-        Transition a UoW from 'active' to 'failed'.
+        Transition a UoW to 'failed'.
+
+        Handles UoWs in 'active' or 'executing' status. The from_status in the
+        audit entry reflects the actual current status for accurate history.
 
         Single transaction: audit INSERT before status UPDATE
         (audit-before-transition invariant).
@@ -1237,12 +1298,17 @@ class Registry:
         try:
             now = _now_iso()
             conn.execute("BEGIN IMMEDIATE")
+            # Derive current status for accurate audit log from_status.
+            row = conn.execute(
+                "SELECT status FROM uow_registry WHERE id = ?", (uow_id,)
+            ).fetchone()
+            current_status = row["status"] if row else "active"
             conn.execute(
                 """
                 INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
-                VALUES (?, ?, 'execution_failed', 'active', 'failed', 'executor', ?)
+                VALUES (?, ?, 'execution_failed', ?, 'failed', 'executor', ?)
                 """,
-                (now, uow_id, json.dumps({"actor": "executor", "reason": reason, "timestamp": now})),
+                (now, uow_id, current_status, json.dumps({"actor": "executor", "reason": reason, "timestamp": now})),
             )
             conn.execute(
                 "UPDATE uow_registry SET status = 'failed', updated_at = ? WHERE id = ?",

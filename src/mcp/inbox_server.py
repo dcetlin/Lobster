@@ -6937,6 +6937,35 @@ async def handle_write_task_output(args: dict) -> list[TextContent]:
 
 
 # =============================================================================
+# WOS registry completion helper (issue #669)
+# =============================================================================
+
+def _maybe_complete_wos_uow(task_id: str, status: str) -> None:
+    """
+    Transition a WOS UoW from 'executing' to 'ready-for-steward' when its subagent
+    calls write_result with status='success'.
+
+    Delegates to orchestration.wos_completion.maybe_complete_wos_uow — see that
+    module for full documentation. Imported lazily so inbox_server's heavy import
+    chain does not block if the orchestration package is unavailable.
+
+    Errors are logged but never raised — write_result delivery must not be blocked
+    by registry update failures.
+    """
+    try:
+        import sys as _sys
+        import os
+        from pathlib import Path as _Path
+        _src = str(_Path(__file__).resolve().parent.parent)
+        if _src not in _sys.path:
+            _sys.path.insert(0, _src)
+        from orchestration.wos_completion import maybe_complete_wos_uow
+        maybe_complete_wos_uow(task_id, status)
+    except Exception as exc:
+        log.warning("_maybe_complete_wos_uow: unexpected error — %s: %s", type(exc).__name__, exc)
+
+
+# =============================================================================
 # Subagent Result Relay Handler
 # =============================================================================
 
@@ -7051,6 +7080,16 @@ async def handle_write_result(args: dict) -> list[TextContent]:
         )
     except Exception as exc:
         log.warning(f"write_result auto-unregister failed for task_id={task_id!r}: {exc}")
+
+    # WOS registry completion (issue #669): when a subagent writes its result for a
+    # wos_execute task, transition the UoW from 'executing' → 'ready-for-steward'.
+    # The executor transitions active → executing at dispatch time (fire-and-forget inbox
+    # dispatch). The execution_complete audit entry and status transition happen here —
+    # only after the subagent confirms completion via write_result — preventing the
+    # false-complete bug where UoWs appeared done before any work was done.
+    #
+    # task_id convention: "wos-{uow_id}" (set by route_wos_message in dispatcher_handlers.py)
+    _maybe_complete_wos_uow(task_id, status)
 
     # Notify wire server so SSE clients update within 40ms
     asyncio.create_task(_notify_wire_server())
