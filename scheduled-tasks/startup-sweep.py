@@ -318,19 +318,30 @@ def run_startup_sweep(
             )
             continue
 
-        proposed_at = uow.created_at  # proposed_at proxy: conservative lower bound
+        proposed_at = uow.created_at
+
+        # Age anchor: use updated_at (the time the UoW entered ready-for-executor)
+        # rather than created_at (when the issue was first proposed). The steward
+        # sets updated_at atomically on the ready-for-executor transition, so it
+        # accurately reflects how long the executor has had the UoW available.
+        #
+        # Using created_at caused Sprint 2 UoWs (created days ago) to be swept
+        # as executor_orphans on every heartbeat even seconds after prescription,
+        # because created_at always exceeded the 1-hour threshold.
+        _age_anchor = getattr(uow, "updated_at", None) or uow.created_at
+        _age_anchor_label = "updated_at" if getattr(uow, "updated_at", None) else "created_at"
 
         try:
-            proposed_dt = datetime.fromisoformat(
-                proposed_at.replace("Z", "+00:00")
+            age_anchor_dt = datetime.fromisoformat(
+                _age_anchor.replace("Z", "+00:00")
             )
-            if proposed_dt.tzinfo is None:
-                proposed_dt = proposed_dt.replace(tzinfo=timezone.utc)
-            age_seconds = (now - proposed_dt).total_seconds()
+            if age_anchor_dt.tzinfo is None:
+                age_anchor_dt = age_anchor_dt.replace(tzinfo=timezone.utc)
+            age_seconds = (now - age_anchor_dt).total_seconds()
         except (ValueError, TypeError, AttributeError):
             log.warning(
-                "Startup sweep: UoW %s has unparseable created_at=%r — skipping",
-                uow_id, proposed_at,
+                "Startup sweep: UoW %s has unparseable %s=%r — skipping",
+                uow_id, _age_anchor_label, _age_anchor,
             )
             continue
 
