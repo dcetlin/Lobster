@@ -844,7 +844,7 @@ class TestCrashRecovery:
 
 class TestHardCap:
     def test_hard_cap_surfaces_to_dan_not_prescribes(self, db_path, registry, tmp_path):
-        """steward_cycles >= 5 → surfaces to Dan, does not prescribe or close."""
+        """lifetime_cycles >= _HARD_CAP_CYCLES → surfaces to Dan, does not prescribe or close."""
         _ensure_registry_has_phase2_methods(registry)
         steward = _import_steward()
 
@@ -858,7 +858,8 @@ class TestHardCap:
         uow_id = _make_uow_row(
             conn,
             status="ready-for-steward",
-            steward_cycles=5,
+            steward_cycles=0,
+            lifetime_cycles=steward._HARD_CAP_CYCLES,
             output_ref=None,
         )
         conn.close()
@@ -876,8 +877,8 @@ class TestHardCap:
         assert len(notifications) == 1, "Dan must be notified exactly once"
         assert notifications[0]["condition"] == "hard_cap"
 
-    def test_hard_cap_at_exactly_5(self, db_path, registry, tmp_path):
-        """steward_cycles == 5 fires the hard cap (>=5)."""
+    def test_hard_cap_at_exactly_cap_cycles(self, db_path, registry, tmp_path):
+        """lifetime_cycles == _HARD_CAP_CYCLES fires the hard cap (>=)."""
         _ensure_registry_has_phase2_methods(registry)
         steward = _import_steward()
         notifications = []
@@ -886,7 +887,12 @@ class TestHardCap:
             notifications.append(condition)
 
         conn = _open_db(db_path)
-        uow_id = _make_uow_row(conn, status="ready-for-steward", steward_cycles=5)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=0,
+            lifetime_cycles=steward._HARD_CAP_CYCLES,
+        )
         conn.close()
 
         steward.run_steward_cycle(
@@ -928,6 +934,295 @@ class TestHardCap:
         assert "hard_cap" not in notifications, "Cycles=4 must not fire hard cap"
         uow = _get_uow(db_path, uow_id)
         assert uow["status"] != "blocked"
+
+
+# ---------------------------------------------------------------------------
+# Test: Hard-cap cleanup arc (S3-A)
+# ---------------------------------------------------------------------------
+
+
+class TestHardCapCleanupArc:
+    """
+    S3-A: When a UoW hits the hard cap, the cleanup arc must:
+    1. Archive artifacts to orchestration/artifacts/archived/<uow_id>/
+    2. Write a failure trace to orchestration/failure-traces/<uow_id>.json
+    3. Set close_reason = "hard_cap_cleanup" and closed_at in the registry
+    4. Post a GitHub comment on the source issue (best-effort)
+
+    Bare decide-retry is rejected after cleanup; force override required.
+    """
+
+    def test_hard_cap_triggers_cleanup_arc_sets_close_reason(
+        self, db_path, registry, tmp_path
+    ):
+        """When hard cap fires, registry close_reason is set to 'hard_cap_cleanup'."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        notifications = []
+
+        def capture_notification(uow, condition, surface_log=None, return_reason=None):
+            notifications.append(condition)
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=0,
+            lifetime_cycles=steward._HARD_CAP_CYCLES,
+            output_ref=None,
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan=capture_notification,
+        )
+
+        assert "hard_cap" in notifications, "Hard cap must surface to Dan"
+        uow = _get_uow(db_path, uow_id)
+        assert uow["status"] == "blocked"
+        assert uow["close_reason"] == steward.CLOSE_REASON_HARD_CAP_CLEANUP, (
+            f"close_reason must be '{steward.CLOSE_REASON_HARD_CAP_CLEANUP}' after hard cap cleanup, "
+            f"got: {uow['close_reason']!r}"
+        )
+        assert uow["closed_at"] is not None, (
+            "closed_at must be set after hard cap cleanup"
+        )
+
+    def test_hard_cap_writes_failure_trace_json(self, db_path, registry, tmp_path):
+        """When hard cap fires, a failure trace JSON is written to failure-traces/<uow_id>.json."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        failure_traces_dir = tmp_path / "failure-traces"
+        notifications = []
+
+        def capture_notification(uow, condition, surface_log=None, return_reason=None):
+            notifications.append(condition)
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=0,
+            lifetime_cycles=steward._HARD_CAP_CYCLES,
+            output_ref=None,
+            summary="Test UoW for failure trace",
+        )
+        conn.close()
+
+        # Monkeypatch the default failure traces dir so the test stays isolated
+        import unittest.mock
+        with unittest.mock.patch.object(steward, "_DEFAULT_FAILURE_TRACES_DIR", failure_traces_dir):
+            steward.run_steward_cycle(
+                registry=registry,
+                dry_run=False,
+                github_client=_mock_github_client_open,
+                artifact_dir=tmp_path / "artifacts",
+                notify_dan=capture_notification,
+            )
+
+        assert "hard_cap" in notifications
+
+        trace_file = failure_traces_dir / f"{uow_id}.json"
+        assert trace_file.exists(), (
+            f"Failure trace must be written to failure-traces/{uow_id}.json"
+        )
+
+        trace = json.loads(trace_file.read_text())
+        assert trace["uow_id"] == uow_id
+        assert trace["reason"] == steward.CLOSE_REASON_HARD_CAP_CLEANUP
+        assert trace["cycle_count_lifetime"] == steward._HARD_CAP_CYCLES
+        assert "timestamp" in trace
+
+    def test_hard_cap_archives_artifact_directory(self, db_path, registry, tmp_path):
+        """When hard cap fires and an artifact directory exists, it is moved to archived/."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        # Create a mock artifact directory for the UoW
+        artifact_dir = tmp_path / "artifacts"
+        artifact_dir.mkdir(parents=True)
+        archived_dir = artifact_dir / "archived"
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=0,
+            lifetime_cycles=steward._HARD_CAP_CYCLES,
+            output_ref=None,
+        )
+        conn.close()
+
+        # Create a fake artifact directory for this UoW
+        uow_artifact_dir = artifact_dir / uow_id
+        uow_artifact_dir.mkdir()
+        (uow_artifact_dir / "output.txt").write_text("some output")
+
+        notifications = []
+
+        def capture_notification(uow, condition, surface_log=None, return_reason=None):
+            notifications.append(condition)
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=artifact_dir,
+            notify_dan=capture_notification,
+        )
+
+        assert "hard_cap" in notifications
+
+        # The artifact directory should now be in archived/
+        archived_uow_dir = archived_dir / uow_id
+        assert archived_uow_dir.exists(), (
+            f"Artifact directory must be moved to archived/{uow_id}/"
+        )
+        assert (archived_uow_dir / "output.txt").exists(), (
+            "Archived directory must contain the original files"
+        )
+        # Original should be gone
+        assert not uow_artifact_dir.exists(), (
+            "Original artifact directory must be removed after archival"
+        )
+
+    def test_archive_uow_artifacts_fallback_when_no_artifacts(self, tmp_path):
+        """_archive_uow_artifacts returns success=True when no artifact directory exists."""
+        steward = _import_steward()
+
+        artifact_dir = tmp_path / "artifacts"
+        result = steward._archive_uow_artifacts("nonexistent_uow", artifact_dir)
+
+        assert result["success"] is True, "Should succeed silently when no artifacts exist"
+        assert result["archived_path"] is None
+
+    def test_write_hard_cap_failure_trace_pure_function(self, tmp_path):
+        """_write_hard_cap_failure_trace writes a valid JSON trace file."""
+        steward = _import_steward()
+        from src.orchestration.registry import UoW, UoWStatus
+
+        uow = UoW(
+            id="uow_trace_test_001",
+            status=UoWStatus.BLOCKED,
+            summary="Test UoW",
+            source="github:issue/678",
+            source_issue_number=678,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+            type="executable",
+            success_criteria="Must complete",
+            steward_cycles=0,
+            lifetime_cycles=steward._HARD_CAP_CYCLES,
+        )
+
+        traces_dir = tmp_path / "failure-traces"
+        result = steward._write_hard_cap_failure_trace(
+            uow,
+            return_reason="execution_failed",
+            failure_traces_dir=traces_dir,
+            archived_artifact_path="/some/archived/path",
+        )
+
+        assert result["success"] is True
+        assert result["trace_path"] is not None
+
+        trace = json.loads(Path(result["trace_path"]).read_text())
+        assert trace["uow_id"] == "uow_trace_test_001"
+        assert trace["reason"] == steward.CLOSE_REASON_HARD_CAP_CLEANUP
+        assert trace["final_return_reason"] == "execution_failed"
+        assert trace["cycle_count_lifetime"] == steward._HARD_CAP_CYCLES
+        assert trace["archived_artifact_path"] == "/some/archived/path"
+
+
+class TestHardCapRetryGate:
+    """
+    S3-A: decide-retry after hard_cap_cleanup must be rejected unless force=True.
+    """
+
+    def test_bare_decide_retry_rejected_after_hard_cap_cleanup(self, db_path, registry):
+        """After cleanup arc runs (close_reason=hard_cap_cleanup), bare retry returns BLOCKED sentinel."""
+        _ensure_registry_has_phase2_methods(registry)
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="blocked",
+            steward_cycles=0,
+            lifetime_cycles=9,
+        )
+        # Set close_reason to hard_cap_cleanup (simulates cleanup arc having run)
+        conn.execute(
+            "UPDATE uow_registry SET close_reason = ? WHERE id = ?",
+            ("hard_cap_cleanup", uow_id),
+        )
+        conn.commit()
+        conn.close()
+
+        result = registry.decide_retry(uow_id)
+        assert result == registry.DECIDE_RETRY_BLOCKED_BY_HARD_CAP, (
+            f"Bare retry must be rejected after hard_cap_cleanup "
+            f"(expected DECIDE_RETRY_BLOCKED_BY_HARD_CAP=-1, got {result})"
+        )
+
+        # UoW status must not have changed
+        uow = _get_uow(db_path, uow_id)
+        assert uow["status"] == "blocked", "UoW must remain blocked after rejected retry"
+
+    def test_force_override_succeeds_after_hard_cap_cleanup(self, db_path, registry):
+        """With force=True, decide_retry succeeds even after hard_cap_cleanup."""
+        _ensure_registry_has_phase2_methods(registry)
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="blocked",
+            steward_cycles=0,
+            lifetime_cycles=9,
+        )
+        conn.execute(
+            "UPDATE uow_registry SET close_reason = ? WHERE id = ?",
+            ("hard_cap_cleanup", uow_id),
+        )
+        conn.commit()
+        conn.close()
+
+        result = registry.decide_retry(uow_id, force=True)
+        assert result == 1, (
+            f"Force-override retry must succeed (expected 1, got {result})"
+        )
+
+        uow = _get_uow(db_path, uow_id)
+        assert uow["status"] == "ready-for-steward", (
+            "UoW must transition to ready-for-steward after force-override retry"
+        )
+        # close_reason must be cleared
+        assert uow["close_reason"] is None, (
+            "close_reason must be cleared after force-override retry"
+        )
+
+    def test_normal_retry_without_cleanup_succeeds(self, db_path, registry):
+        """Without hard_cap_cleanup, normal bare retry works as before."""
+        _ensure_registry_has_phase2_methods(registry)
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="blocked",
+            steward_cycles=3,
+            lifetime_cycles=3,
+        )
+        conn.close()
+
+        result = registry.decide_retry(uow_id)
+        assert result == 1, (
+            f"Normal retry (no hard_cap_cleanup) must succeed (expected 1, got {result})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2007,7 +2302,7 @@ class TestEarlyWarningAt4:
 
 class TestHardCapSurfaceIncludesReturnReason:
     def test_hard_cap_notification_includes_return_reason(self, db_path, registry, tmp_path):
-        """At hard cap (cycles >= 5), the surface notification carries return_reason."""
+        """At hard cap (lifetime_cycles >= _HARD_CAP_CYCLES), the surface notification carries return_reason."""
         _ensure_registry_has_phase2_methods(registry)
         steward = _import_steward()
 
@@ -2025,7 +2320,8 @@ class TestHardCapSurfaceIncludesReturnReason:
         uow_id = _make_uow_row(
             conn,
             status="ready-for-steward",
-            steward_cycles=5,
+            steward_cycles=0,
+            lifetime_cycles=steward._HARD_CAP_CYCLES,
             output_ref=None,
             audit_log_entries=audit_entries,
         )
@@ -2060,7 +2356,8 @@ class TestHardCapSurfaceIncludesReturnReason:
         uow_id = _make_uow_row(
             conn,
             status="ready-for-steward",
-            steward_cycles=5,
+            steward_cycles=0,
+            lifetime_cycles=steward._HARD_CAP_CYCLES,
             output_ref=None,
         )
         conn.close()
@@ -3402,7 +3699,8 @@ class TestDefaultNotifyDanInboxDelivery:
         uow_id = _make_uow_row(
             conn,
             status="ready-for-steward",
-            steward_cycles=5,
+            steward_cycles=0,
+            lifetime_cycles=steward._HARD_CAP_CYCLES,
             output_ref=None,
         )
         conn.close()

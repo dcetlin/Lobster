@@ -1355,7 +1355,12 @@ class Registry:
     # time (issue #669) and are looping in the steward queue without advancing.
     RETRYABLE_STATUSES: frozenset[str] = frozenset({"blocked", "ready-for-steward"})
 
-    def decide_retry(self, uow_id: str) -> int:
+    # Sentinel value returned by decide_retry when the UoW was cleaned up by
+    # the hard-cap arc and a bare retry is rejected. Callers check for this
+    # value to produce a user-visible error without raising an exception.
+    DECIDE_RETRY_BLOCKED_BY_HARD_CAP = -1
+
+    def decide_retry(self, uow_id: str, *, force: bool = False) -> int:
         """
         Reset a stuck UoW so it re-enters the Steward queue.
 
@@ -1370,7 +1375,15 @@ class Registry:
         cumulative effort is never lost. The hard-cap check uses lifetime_cycles,
         so repeated retries do not silently bypass the circuit breaker.
 
-        Returns rows_affected (1 on success, 0 if UoW is not in a retryable status).
+        Hard-cap commitment gate (S3-A): if close_reason == "hard_cap_cleanup",
+        a bare decide_retry is rejected (returns DECIDE_RETRY_BLOCKED_BY_HARD_CAP).
+        Pass force=True to override the gate after manual operator review.
+
+        Returns:
+            1 on success
+            0 if UoW is not in a retryable status
+            DECIDE_RETRY_BLOCKED_BY_HARD_CAP (-1) if rejected by hard-cap commitment gate
+
         Writes audit entry atomically in the same transaction as the UPDATE.
         """
         conn = self._connect()
@@ -1381,9 +1394,10 @@ class Registry:
             # Read current status and cycle counts:
             # - from_status: for audit log (records actual pre-transition status)
             # - steward_cycles, lifetime_cycles: to accumulate lifetime effort before reset
+            # - close_reason: to enforce hard-cap commitment gate
             placeholders = ",".join("?" * len(self.RETRYABLE_STATUSES))
             row = conn.execute(
-                f"SELECT status, steward_cycles, lifetime_cycles FROM uow_registry WHERE id = ? AND status IN ({placeholders})",
+                f"SELECT status, steward_cycles, lifetime_cycles, close_reason FROM uow_registry WHERE id = ? AND status IN ({placeholders})",
                 (uow_id, *self.RETRYABLE_STATUSES),
             ).fetchone()
             from_status = row["status"] if row else None
@@ -1391,6 +1405,12 @@ class Registry:
             if row is None:
                 conn.rollback()
                 return 0
+
+            # Hard-cap commitment gate: reject bare retry if cleanup arc has run.
+            close_reason = row["close_reason"]
+            if close_reason == "hard_cap_cleanup" and not force:
+                conn.rollback()
+                return self.DECIDE_RETRY_BLOCKED_BY_HARD_CAP
 
             current_cycles: int = row["steward_cycles"] or 0
             current_lifetime: int = row["lifetime_cycles"] or 0
@@ -1402,9 +1422,11 @@ class Registry:
                 "uow_id": uow_id,
                 "timestamp": now,
                 "from_status": from_status,
+                "force_override": force,
                 "note": (
                     f"user requested retry — steward_cycles reset to 0, "
                     f"lifetime_cycles updated from {current_lifetime} to {new_lifetime}"
+                    + (" (hard-cap force override)" if force else "")
                 ),
             })
 
@@ -1422,6 +1444,8 @@ class Registry:
                 SET status = 'ready-for-steward',
                     steward_cycles = 0,
                     lifetime_cycles = ?,
+                    close_reason = NULL,
+                    closed_at = NULL,
                     updated_at = ?
                 WHERE id = ? AND status IN ({placeholders})
                 """,

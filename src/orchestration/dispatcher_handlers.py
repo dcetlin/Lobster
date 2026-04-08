@@ -128,7 +128,7 @@ def handle_confirm(uow_id: str, *, registry: "Registry") -> str:
     return handle_approve(uow_id, registry=registry)
 
 
-def handle_decide_retry(uow_id: str, *, registry: "Registry") -> str:
+def handle_decide_retry(uow_id: str, *, registry: "Registry", force: bool = False) -> str:
     """
     Handle a decide_retry action for a UoW.
 
@@ -137,12 +137,23 @@ def handle_decide_retry(uow_id: str, *, registry: "Registry") -> str:
 
     Resets steward_cycles to 0 and transitions blocked → ready-for-steward so
     the Steward re-diagnoses the UoW on its next heartbeat cycle.
+
+    Hard-cap commitment gate: if the UoW was cleaned up by the hard-cap arc
+    (close_reason == "hard_cap_cleanup"), a bare retry is rejected. Pass
+    force=True to override after manual operator review.
     """
-    rows = registry.decide_retry(uow_id)
+    rows = registry.decide_retry(uow_id, force=force)
     if rows == 1:
         return (
             f"UoW `{uow_id}` reset for retry.\n"
             f"Status: `blocked \u2192 ready-for-steward` (steward_cycles reset to 0)"
+            + (" — hard-cap force override applied" if force else "")
+        )
+    if rows == registry.DECIDE_RETRY_BLOCKED_BY_HARD_CAP:
+        return (
+            f"UoW `{uow_id}` cannot be retried \u2014 the hard-cap cleanup arc has run.\n"
+            f"This is a commitment gate: the UoW exhausted its lifetime cycle budget. "
+            f"To override, use `/decide {uow_id} retry force` (requires explicit operator intent)."
         )
     return (
         f"UoW `{uow_id}` could not be retried \u2014 it is not currently in `blocked` status.\n"
@@ -176,22 +187,28 @@ _VALID_DECIDE_ACTIONS = frozenset({"proceed", "abandon", "retry"})
 
 def handle_decide(uow_id: str, action: str, *, registry: "Registry") -> str:
     """
-    Handle /decide <uow-id> <proceed|abandon|retry>.
+    Handle /decide <uow-id> <proceed|abandon|retry[force]>.
 
     Provides a single unified command for resolving blocked UoWs from Telegram.
     Action semantics:
-      proceed  — unblock and re-queue to ready-for-steward (preserves steward_cycles)
-      retry    — reset steward_cycles to 0 and re-queue to ready-for-steward (full retry)
-      abandon  — close the UoW as user-requested failure (blocked → failed)
+      proceed     — unblock and re-queue to ready-for-steward (preserves steward_cycles)
+      retry       — reset steward_cycles to 0 and re-queue to ready-for-steward (full retry)
+      retry force — override the hard-cap commitment gate (explicit operator intent required)
+      abandon     — close the UoW as user-requested failure (blocked → failed)
 
     All three actions operate only on UoWs in `blocked` status — optimistic lock
     prevents accidental double-writes if the UoW has already been advanced.
 
     Returns a human-readable Telegram message describing the outcome.
     """
-    action = action.lower().strip()
+    # Support "retry force" as a two-word action token
+    action_normalized = action.lower().strip()
+    force_retry = False
+    if action_normalized in ("retry force", "force retry"):
+        action_normalized = "retry"
+        force_retry = True
 
-    if action not in _VALID_DECIDE_ACTIONS:
+    if action_normalized not in _VALID_DECIDE_ACTIONS:
         valid = ", ".join(sorted(_VALID_DECIDE_ACTIONS))
         return (
             f"Unknown action `{action}`.\n"
@@ -199,7 +216,7 @@ def handle_decide(uow_id: str, action: str, *, registry: "Registry") -> str:
             f"Usage: `/decide {uow_id} <{valid}>`"
         )
 
-    match action:
+    match action_normalized:
         case "proceed":
             rows = registry.decide_proceed(uow_id)
             if rows == 1:
@@ -212,7 +229,7 @@ def handle_decide(uow_id: str, action: str, *, registry: "Registry") -> str:
                 f"Run `/wos status blocked` to see blocked UoWs."
             )
         case "retry":
-            return handle_decide_retry(uow_id, registry=registry)
+            return handle_decide_retry(uow_id, registry=registry, force=force_retry)
         case "abandon":
             return handle_decide_close(uow_id, registry=registry)
         case _:
