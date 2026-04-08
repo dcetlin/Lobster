@@ -647,11 +647,11 @@ def _posture_rationale(diagnosis: dict, trace_posture: str | None = None) -> str
     No LLM, no DB reads. Called by _build_trace_entry().
 
     Args:
-        diagnosis: The diagnosis dict with reentry_posture, stuck_condition, etc.
+        diagnosis: The diagnosis dict with reentry_classification, stuck_condition, etc.
         trace_posture: Optional trace posture (v2 vocabulary). If provided, rationale
-            is written for the trace posture; otherwise falls back to reentry_posture.
+            is written for the trace posture; otherwise falls back to reentry_classification.
     """
-    reentry_classification = diagnosis.get("reentry_posture", "unknown")
+    reentry_classification = diagnosis.get("reentry_classification", "unknown")
     cycles = diagnosis.get("_cycles", 0)
     stuck_condition = diagnosis.get("stuck_condition")
 
@@ -720,7 +720,7 @@ def _posture_prediction(diagnosis: dict) -> str | None:
     Pure function: deterministic based on posture and completion state.
     Returns None only when there is genuinely nothing to predict (done).
     """
-    posture = diagnosis.get("reentry_posture", "unknown")
+    posture = diagnosis.get("reentry_classification", "unknown")
     is_complete = diagnosis.get("is_complete", False)
     stuck_condition = diagnosis.get("stuck_condition")
 
@@ -760,7 +760,7 @@ def _determine_trace_posture(diagnosis: dict) -> str:
     Returns:
         One of the five trace posture values.
     """
-    reentry_classification = diagnosis.get("reentry_posture", "unknown")
+    reentry_classification = diagnosis.get("reentry_classification", "unknown")
     is_complete = diagnosis.get("is_complete", False)
     stuck_condition = diagnosis.get("stuck_condition")
     executor_outcome = diagnosis.get("executor_outcome")
@@ -2051,7 +2051,7 @@ def _diagnose_uow(
     Produce a diagnosis for a single UoW.
 
     Pure function: reads inputs, returns a diagnosis dict with fields:
-    - reentry_posture: str
+    - reentry_classification: str
     - return_reason: str | None
     - return_reason_classification: str
     - output_content: str
@@ -2087,7 +2087,7 @@ def _diagnose_uow(
         is_complete = False
 
     return {
-        "reentry_posture": reentry_posture,
+        "reentry_classification": reentry_posture,
         "return_reason": return_reason,
         "return_reason_classification": classification,
         "output_content": output_content,
@@ -2556,7 +2556,7 @@ def _process_uow(
 
     # Step 3: Diagnose
     diagnosis = _diagnose_uow(uow, audit_entries, issue_info)
-    reentry_posture = diagnosis["reentry_posture"]
+    reentry_posture = diagnosis["reentry_classification"]
     return_reason = diagnosis["return_reason"]
     is_complete = diagnosis["is_complete"]
     completion_rationale = diagnosis["completion_rationale"]

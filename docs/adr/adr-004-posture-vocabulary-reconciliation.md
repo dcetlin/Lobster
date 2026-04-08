@@ -1,6 +1,6 @@
 # ADR-004: Posture Vocabulary Reconciliation
 
-**Status:** PROPOSED  
+**Status:** ACCEPTED  
 **Date:** 2026-04-08  
 **Issues:** #571, #567  
 **References:** PR #564, wos-v2-design.md, work-orchestration-system.md
