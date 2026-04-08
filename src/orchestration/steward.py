@@ -262,6 +262,60 @@ def _classify_return_reason(return_reason: str | None) -> str:
     return _RETURN_REASON_CLASSIFICATIONS.get(return_reason, _CLASSIFICATION_ERROR)
 
 
+# ---------------------------------------------------------------------------
+# Per-cycle steward trace logging
+# ---------------------------------------------------------------------------
+
+_CYCLE_TRACE_EXCERPT_MAX = 200
+_DEFAULT_CYCLE_TRACE_DIR = Path(
+    os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
+) / "orchestration" / "artifacts"
+
+
+def _append_cycle_trace(
+    uow_id: str,
+    cycle_num: int,
+    subagent_excerpt: str,
+    return_reason: str,
+    next_action: str,
+    artifact_dir: Path | None = None,
+) -> None:
+    """Append one JSONL entry to <artifact_dir>/<uow_id>.cycles.jsonl.
+
+    Each entry records the outcome of a single steward cycle, enabling
+    post-hoc debugging of multi-cycle UoW lifecycles.
+
+    Args:
+        uow_id: The UoW identifier.
+        cycle_num: The current steward_cycles value (pre-increment).
+        subagent_excerpt: Text from the executor output (output_ref), truncated
+            to _CYCLE_TRACE_EXCERPT_MAX chars with a trailing ellipsis if longer.
+        return_reason: The return_reason from diagnosis, or empty string.
+        next_action: One of 'prescribed', 'done', 'surfaced', 'stuck'.
+        artifact_dir: Override for the artifact directory. Defaults to
+            ~/lobster-workspace/orchestration/artifacts.
+    """
+    resolved_dir = Path(artifact_dir) if artifact_dir is not None else _DEFAULT_CYCLE_TRACE_DIR
+    resolved_dir.mkdir(parents=True, exist_ok=True)
+
+    # Truncate excerpt with ellipsis if it exceeds the max length
+    excerpt = subagent_excerpt
+    if len(excerpt) > _CYCLE_TRACE_EXCERPT_MAX:
+        excerpt = excerpt[:_CYCLE_TRACE_EXCERPT_MAX] + "\u2026"
+
+    entry = {
+        "cycle_num": cycle_num,
+        "subagent_excerpt": excerpt,
+        "return_reason": return_reason,
+        "next_action": next_action,
+        "timestamp": _now_iso(),
+    }
+
+    trace_path = resolved_dir / f"{uow_id}.cycles.jsonl"
+    with trace_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+
 def _parse_audit_log(audit_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     Extract structured entries from the audit_log rows passed in.
@@ -2400,6 +2454,14 @@ def _process_uow(
         if not dry_run:
             registry.transition(uow_id, _STATUS_BLOCKED, _STATUS_DIAGNOSING)
 
+        _append_cycle_trace(
+            uow_id=uow_id,
+            cycle_num=cycles,
+            subagent_excerpt=_read_output_ref(uow.output_ref),
+            return_reason=return_reason or "",
+            next_action="stuck",
+            artifact_dir=artifact_dir,
+        )
         return Surfaced(uow_id=uow_id, condition=stuck_condition)
 
     # 4b: Declare done
@@ -2432,6 +2494,14 @@ def _process_uow(
             })
             registry.transition(uow_id, _STATUS_DONE, _STATUS_DIAGNOSING)
 
+        _append_cycle_trace(
+            uow_id=uow_id,
+            cycle_num=cycles,
+            subagent_excerpt=_read_output_ref(uow.output_ref),
+            return_reason=return_reason or "",
+            next_action="done",
+            artifact_dir=artifact_dir,
+        )
         return Done(uow_id=uow_id)
 
     # 4c: Prescribe another Executor pass
@@ -2499,6 +2569,14 @@ def _process_uow(
                     })
                     registry.transition(uow_id, _STATUS_READY_FOR_STEWARD, _STATUS_DIAGNOSING)
                 # Return a special Prescribed outcome with cycles unchanged to signal skip
+                _append_cycle_trace(
+                    uow_id=uow_id,
+                    cycle_num=cycles,
+                    subagent_excerpt=_read_output_ref(uow.output_ref),
+                    return_reason=return_reason or "",
+                    next_action="prescribed",
+                    artifact_dir=artifact_dir,
+                )
                 return Prescribed(uow_id=uow_id, cycles=cycles)
             else:
                 # Already waited one cycle — proceed with prescription, log contract violation
@@ -2865,6 +2943,14 @@ def _process_uow(
         _notify_early = notify_dan_early_warning or _default_notify_dan_early_warning
         _notify_early(uow, return_reason, new_cycles)
 
+    _append_cycle_trace(
+        uow_id=uow_id,
+        cycle_num=cycles,
+        subagent_excerpt=_read_output_ref(uow.output_ref),
+        return_reason=return_reason or "",
+        next_action="prescribed",
+        artifact_dir=artifact_dir,
+    )
     return Prescribed(uow_id=uow_id, cycles=new_cycles)
 
 
