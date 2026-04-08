@@ -705,7 +705,7 @@ class Executor:
             executor_id = dispatcher(instructions, uow_id)
 
         # Step 3: Write output_ref content (signal that execution produced output)
-        _write_output_ref_content(output_ref, f"execution complete: task dispatched as {executor_id}")
+        _write_output_ref_content(output_ref, f"execution dispatched: task_id={executor_id}")
 
         # Step 4: Build result
         result = ExecutorResult(
@@ -732,8 +732,23 @@ class Executor:
         _write_trace_json(output_ref, trace)
         _insert_corrective_trace(self.registry.db_path, trace)
 
-        # Step 6: Transition to ready-for-steward (audit before status update, single transaction)
-        self.registry.complete_uow(uow_id, output_ref)
+        # Step 6: Status transition — depends on dispatch path.
+        #
+        # Async (inbox) dispatchers: write wos_execute to inbox and return immediately.
+        # The subagent has NOT yet done any work — calling complete_uow here would produce
+        # a false execution_complete before the subagent confirms. Instead, transition to
+        # 'executing' (active → executing). The write_result MCP handler transitions
+        # executing → ready-for-steward (with execution_complete audit) when the subagent
+        # reports back. (issue #669)
+        #
+        # Synchronous (subprocess) dispatchers: block until the subprocess exits. By the
+        # time we reach this point, the subagent has finished its work. Call complete_uow
+        # directly (active → ready-for-steward) as before.
+        executor_type = artifact.get("executor_type", "functional-engineer")
+        if _dispatcher_is_async(self._dispatcher_override, executor_type):
+            self.registry.transition_to_executing(uow_id, executor_id or "")
+        else:
+            self.registry.complete_uow(uow_id, output_ref)
 
         return result
 
@@ -1111,6 +1126,36 @@ _EXECUTOR_TYPE_TO_DISPATCHER: dict[str, str] = {
     "design-review": "_dispatch_via_design_review",
 }
 
+#: Executor types that use the async inbox dispatch path (_dispatch_via_inbox).
+#: For these types, the executor transitions to 'executing' at dispatch time;
+#: complete_uow (execution_complete) fires only when write_result arrives.
+#: Types absent from this set use synchronous subprocess dispatch — complete_uow
+#: is called immediately after the subprocess exits (issue #669).
+_ASYNC_EXECUTOR_TYPES: frozenset[str] = frozenset({
+    "functional-engineer",
+    "lobster-ops",
+    "general",
+})
+
+
+def _dispatcher_is_async(dispatcher_override: "SubagentDispatcher | None", executor_type: str) -> bool:
+    """
+    Return True when the dispatch path is asynchronous (inbox fire-and-forget).
+
+    When a dispatcher_override is injected (tests, CI), it is treated as
+    synchronous — the override may be _noop_dispatcher or a test stub, and
+    callers that inject overrides expect the legacy complete_uow-immediately
+    behavior. Only the production dispatch table uses the async path.
+
+    For production dispatch (dispatcher_override is None), the executor_type
+    determines the path: types in _ASYNC_EXECUTOR_TYPES use _dispatch_via_inbox
+    (async); all others use synchronous subprocess dispatchers.
+    """
+    if dispatcher_override is not None:
+        # Injected dispatcher — assume synchronous (test/CI path).
+        return False
+    return executor_type in _ASYNC_EXECUTOR_TYPES
+
 
 def _resolve_dispatcher(executor_type: str) -> SubagentDispatcher:
     """
@@ -1196,18 +1241,23 @@ def _dispatch_via_inbox(instructions: str, uow_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# TTL recovery — mark stuck 'active' UoWs as failed
+# TTL recovery — mark stuck 'active' and 'executing' UoWs as failed
 # ---------------------------------------------------------------------------
-# TTL recovery catches UoWs that transition to 'active' but never complete —
-# e.g. if the subagent crashes before writing its result file, or the inbox
-# message was lost. With inbox dispatch, UoWs have natural heartbeat presence
-# via the dispatcher cycle, but TTL recovery remains as a safety net for any
-# subagent that stalls beyond TTL_EXCEEDED_HOURS without writing a result.
+# TTL recovery catches UoWs that transition to 'active' or 'executing' but
+# never complete — e.g. if the subagent crashes before writing its result file,
+# or the inbox message was lost. With inbox dispatch, UoWs have natural heartbeat
+# presence via the dispatcher cycle, but TTL recovery remains as a safety net for
+# any subagent that stalls beyond TTL_EXCEEDED_HOURS without writing a result.
+#
+# 'executing' UoWs are included alongside 'active': an 'executing' UoW whose
+# subagent never calls write_result (orphan, crash, context loss) must be
+# recovered so the Steward can re-diagnose it. Without this, orphaned 'executing'
+# UoWs would be invisible to standard recovery paths (issue #669).
 
 def recover_ttl_exceeded_uows(registry: "Registry") -> list[str]:
     """
-    Scan for UoWs in 'active' state that have exceeded TTL_EXCEEDED_HOURS and
-    transition them to 'failed' with return_reason='ttl_exceeded'.
+    Scan for UoWs in 'active' or 'executing' state that have exceeded
+    TTL_EXCEEDED_HOURS and transition them to 'failed'.
 
     Call this at executor-heartbeat startup, before the dispatch cycle, so
     the Steward can re-diagnose stalled UoWs on its next pass.
@@ -1230,7 +1280,7 @@ def recover_ttl_exceeded_uows(registry: "Registry") -> list[str]:
         rows = conn.execute(
             """
             SELECT id FROM uow_registry
-            WHERE status = 'active'
+            WHERE status IN ('active', 'executing')
               AND started_at IS NOT NULL
               AND started_at < ?
             """,

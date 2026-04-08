@@ -142,7 +142,7 @@ def run_ttl_recovery(registry, dry_run: bool = False) -> list[str]:
                 rows = conn.execute(
                     """
                     SELECT id FROM uow_registry
-                    WHERE status = 'active'
+                    WHERE status IN ('active', 'executing')
                       AND started_at IS NOT NULL
                       AND started_at < ?
                     """,
