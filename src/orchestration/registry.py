@@ -170,6 +170,10 @@ class UoW:
     steward_agenda: str | None = None
     steward_log: str | None = None
     proposed_at: str | None = None
+    # started_at: ISO timestamp when the Executor claimed the UoW and transitioned
+    #   to 'active' status. Used by startup sweep for per-UoW age threshold when
+    #   combined with estimated_runtime (#572). NULL until execution begins.
+    started_at: str | None = None
     # GardenCaretaker source tracking fields (populated after migration 0004)
     source_ref: str | None = None
     source_last_seen_at: str | None = None
@@ -194,6 +198,11 @@ class UoW:
     #   Required at done transition. Enables post-hoc audit of closure rationale.
     closed_at: str | None = None
     close_reason: str | None = None
+    # vision_ref: JSON {layer, field, statement, anchored_at} populated by the
+    # issue-sweeper when creating UoWs. Consumed by vision_routing.resolve_vision_route()
+    # to produce vision-anchored route_reason values.
+    # NULL = created before Vision Object existed or no vision anchor found.
+    vision_ref: dict | None = None
 
 
 def _now_iso() -> str:
@@ -294,7 +303,15 @@ class Registry:
         if prescribed_skills_raw is not None:
             parsed_ps = _deserialize_json(prescribed_skills_raw)
             if isinstance(parsed_ps, list):
-                prescribed_skills = parsed_ps
+                prescribed_skills = prescribed_ps
+
+        # vision_ref: NULL → None, '{"layer":...}' → dict
+        vision_ref_raw = d.get("vision_ref")
+        vision_ref: dict | None = None
+        if vision_ref_raw is not None:
+            parsed_vr = _deserialize_json(vision_ref_raw)
+            if isinstance(parsed_vr, dict):
+                vision_ref = parsed_vr
 
         return UoW(
             id=d["id"],
@@ -320,6 +337,7 @@ class Registry:
             estimated_runtime=d.get("estimated_runtime"),
             steward_agenda=d.get("steward_agenda"),
             steward_log=d.get("steward_log"),
+            started_at=d.get("started_at"),
             source_ref=d.get("source_ref"),
             source_last_seen_at=d.get("source_last_seen_at"),
             source_state=d.get("source_state"),
@@ -328,6 +346,7 @@ class Registry:
             uow_mode=d.get("uow_mode"),
             closed_at=d.get("closed_at"),
             close_reason=d.get("close_reason"),
+            vision_ref=vision_ref,
         )
 
     def _write_audit(
@@ -363,6 +382,7 @@ class Registry:
         source_repo: str | None = None,
         issue_url: str | None = None,
         register: str = "operational",
+        source_ref: str | None = None,
     ) -> UpsertResult:
         """
         Propose a UoW for a GitHub issue.
@@ -397,6 +417,8 @@ class Registry:
                 than reclassifying autonomously.
                 Default: 'operational' (safe fallback for callers that do not invoke
                 the Germinator).
+            source_ref: Canonical source reference (e.g. "github:issue/42"). If provided,
+                used directly; otherwise derived from issue_number for backwards compatibility.
         """
         if not success_criteria or not success_criteria.strip():
             raise ValueError(
@@ -419,6 +441,7 @@ class Registry:
         source_repo: str | None = None,
         issue_url: str | None = None,
         register: str = "operational",
+        source_ref: str | None = None,
     ) -> UpsertResult:
         """Core upsert logic returning typed UpsertResult."""
         if sweep_date is None:
@@ -486,7 +509,8 @@ class Registry:
 
             uow_id = _generate_uow_id()
             now = _now_iso()
-            source = f"github:issue/{issue_number}"
+            # Use source_ref from IssueSnapshot if provided; fall back for backwards compatibility.
+            source = source_ref if source_ref else f"github:issue/{issue_number}"
 
             # Audit entry is written BEFORE the INSERT (Principle 1: audit first).
             # If the INSERT fails, both roll back together.
