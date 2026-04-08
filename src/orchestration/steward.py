@@ -2568,7 +2568,30 @@ def _process_uow(
                 "assessment": completion_rationale,
                 "timestamp": _now_iso(),
             })
-            registry.transition(uow_id, _STATUS_DONE, _STATUS_DIAGNOSING)
+            # Primary done-transition: expects 'diagnosing' (set by the claim
+            # step above). This is the normal path.
+            #
+            # Fallback done-transition (issue #671): a concurrent startup_sweep
+            # may reset status from 'diagnosing' → 'ready-for-steward' between
+            # the claim and this transition. When the primary WHERE fails (rows=0),
+            # attempt a fallback transition from 'ready-for-steward' so the closure
+            # is not silently lost.
+            rows = registry.transition(uow_id, _STATUS_DONE, _STATUS_DIAGNOSING)
+            if rows == 0:
+                rows = registry.transition(uow_id, _STATUS_DONE, _STATUS_READY_FOR_STEWARD)
+                if rows == 0:
+                    log.warning(
+                        "done-transition failed for %s — status was neither 'diagnosing' "
+                        "nor 'ready-for-steward' (possible concurrent state change); "
+                        "UoW may not have reached 'done'",
+                        uow_id,
+                    )
+                else:
+                    log.info(
+                        "done-transition fallback succeeded for %s — "
+                        "status was 'ready-for-steward' (startup_sweep reset race)",
+                        uow_id,
+                    )
 
         _append_cycle_trace(
             uow_id=uow_id,
