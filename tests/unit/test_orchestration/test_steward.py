@@ -1889,16 +1889,16 @@ class TestEarlyWarningAt4:
         )
         assert "hard_cap" in surface_calls, "Hard cap surface must fire at lifetime_cycles=9"
 
-    def test_early_warning_fires_when_lifetime_cycles_jumps_past_threshold(self, db_path, registry, tmp_path):
-        """Early warning fires with >= even when lifetime_cycles jumps non-sequentially past the threshold.
+    def test_early_warning_fires_exactly_once_when_cumulative_first_crosses_threshold(self, db_path, registry, tmp_path):
+        """Early warning fires on the first crossing of the threshold, not on subsequent post-threshold cycles.
 
-        Non-sequential case: lifetime_cycles=3, steward_cycles=0.
-        After prescription: 3 + 1 = 4 >= _EARLY_WARNING_CYCLES(4) → early warning fires.
+        First-crossing case: lifetime_cycles=3, steward_cycles=0 (new attempt after a decide-retry reset).
+        After prescription: new_cycles=1, cumulative=3+1=4 — crosses _EARLY_WARNING_CYCLES(4) for the first time.
+        Previous cumulative = 3+0=3 < 4 → first-crossing guard fires.
 
-        With the old == operator this case would fire correctly (3+1==4), but a jump from
-        lifetime_cycles=2 to lifetime_cycles=4 (e.g. manual data intervention) would silently
-        skip the warning with ==. The >= form ensures any cumulative count that meets or
-        exceeds the threshold triggers the notification regardless of how it got there.
+        The >= (not ==) on the current cumulative ensures the warning also catches a non-sequential jump
+        that lands above the threshold (e.g. lifetime_cycles=2, steward_cycles=1 → cumulative jumps from
+        3 to 4 directly), as long as the previous cumulative was below the threshold.
         """
         _ensure_registry_has_phase2_methods(registry)
         steward = _import_steward()
@@ -1915,10 +1915,10 @@ class TestEarlyWarningAt4:
         ]
 
         conn = _open_db(db_path)
-        # lifetime_cycles=3 (accumulated), steward_cycles=0 (new attempt):
-        # after prescription: 3 + 1 = 4 >= _EARLY_WARNING_CYCLES(4) → must fire.
-        # With == this case would also fire (3+1==4), but if lifetime_cycles had jumped
-        # from 2 to 4 non-sequentially, == would silently skip (4+1=5 != 4) while >= catches it.
+        # lifetime_cycles=3 (accumulated from previous attempts), steward_cycles=0 (new attempt):
+        # previous cumulative = 3+0=3 < _EARLY_WARNING_CYCLES(4)
+        # current cumulative  = 3+1=4 >= _EARLY_WARNING_CYCLES(4)
+        # → first-crossing guard fires.
         uow_id = _make_uow_row(
             conn,
             status="ready-for-steward",
@@ -1939,13 +1939,65 @@ class TestEarlyWarningAt4:
         )
 
         assert len(early_warnings) == 1, (
-            f"Early warning must fire when lifetime_cycles(3) + new_cycles(1) >= "
-            f"_EARLY_WARNING_CYCLES(4), got: {early_warnings}"
+            f"Early warning must fire exactly once when crossing threshold for the first time "
+            f"(lifetime_cycles=3, new_cycles=1 → cumulative=4 >= _EARLY_WARNING_CYCLES=4), "
+            f"got: {early_warnings}"
         )
         assert early_warnings[0]["uow_id"] == uow_id
         assert early_warnings[0]["new_cycles"] == 1, (
             f"new_cycles must be 1 (first steward cycle on this attempt), "
             f"got: {early_warnings[0]['new_cycles']}"
+        )
+
+    def test_early_warning_does_not_multi_fire_on_post_threshold_cycles(self, db_path, registry, tmp_path):
+        """Early warning must not re-fire when a UoW continues past the early-warning threshold.
+
+        Multi-fire prevention: lifetime_cycles=0, steward_cycles=4.
+        Previous cumulative = 0+4=4 >= _EARLY_WARNING_CYCLES(4) — threshold already crossed.
+        Current cumulative  = 0+5=5 >= _EARLY_WARNING_CYCLES(4).
+        → first-crossing guard does NOT fire (previous was already at threshold).
+
+        Without the first-crossing guard, >= would fire on every cycle from 4 to 8 (five
+        notifications per UoW lifetime). The first-crossing guard bounds this to exactly one.
+        """
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        early_warnings = []
+
+        def capture_early_warning(uow, return_reason, new_cycles=None):
+            early_warnings.append(new_cycles)
+
+        audit_entries = [
+            {"event": "execution_complete", "actor": "executor",
+             "return_reason": "needs_steward_review", "timestamp": _now_iso()},
+        ]
+
+        conn = _open_db(db_path)
+        # steward_cycles=4: threshold was first crossed at steward_cycle=4 (cumulative=4).
+        # This cycle is steward_cycle=5 — already past the threshold. Must not re-fire.
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=4,
+            lifetime_cycles=0,
+            output_ref=None,
+            audit_log_entries=audit_entries,
+            success_criteria="Must produce artifact",
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan_early_warning=capture_early_warning,
+        )
+
+        assert len(early_warnings) == 0, (
+            f"Early warning must not re-fire past the threshold (steward_cycles=4 → "
+            f"previous cumulative=4 already >= _EARLY_WARNING_CYCLES=4), got: {early_warnings}"
         )
 
 
