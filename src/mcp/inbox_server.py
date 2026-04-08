@@ -98,10 +98,12 @@ from reliability import (
 from update_manager import UpdateManager
 
 # Bot-talk mirroring — fire-and-forget relay to the shared SaharLobster/AlbertLobster channel
+# mirror_inbound was removed from bot_talk_mirror (cross-Lobster messages only; owner messages
+# are never logged here). Only mirror_outbound is used in this module.
 try:
-    from bot_talk.mirror import mirror_outbound as _mirror_outbound, mirror_inbound as _mirror_inbound
+    from bot_talk.mirror import mirror_outbound as _mirror_outbound
 except ImportError:
-    from bot_talk_mirror import mirror_outbound as _mirror_outbound, mirror_inbound as _mirror_inbound
+    from bot_talk_mirror import mirror_outbound as _mirror_outbound
 
 
 # Pending agent tracker (thin adapter over session_store)
