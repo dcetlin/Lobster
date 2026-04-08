@@ -654,30 +654,60 @@ def _assess_completion(
 # Per-cycle trace entry builder (pure functions — no DB writes)
 # ---------------------------------------------------------------------------
 
-def _posture_rationale(diagnosis: dict) -> str:
+def _posture_rationale(diagnosis: dict, trace_posture: str | None = None) -> str:
     """
     Return a 1-sentence rationale for the current posture.
 
     Pure function: derives the string deterministically from diagnosis fields.
     No LLM, no DB reads. Called by _build_trace_entry().
-    """
-    posture = diagnosis.get("reentry_posture", "unknown")
-    cycles = diagnosis.get("_cycles", 0)
 
-    if posture == "first_execution":
+    Args:
+        diagnosis: The diagnosis dict with reentry_classification, stuck_condition, etc.
+        trace_posture: Optional trace posture (v2 vocabulary). If provided, rationale
+            is written for the trace posture; otherwise falls back to reentry_classification.
+    """
+    reentry_classification = diagnosis.get("reentry_classification", "unknown")
+    cycles = diagnosis.get("_cycles", 0)
+    stuck_condition = diagnosis.get("stuck_condition")
+
+    # Use trace posture vocabulary if provided (S3P2-F reconciliation)
+    if trace_posture:
+        if trace_posture == "orienting":
+            return "First contact — establishing scope and dispatching initial execution."
+        elif trace_posture == "clarifying":
+            if reentry_classification == "execution_complete":
+                return "Executor result present — assessing completion criteria."
+            return "Evaluating current state to determine next action."
+        elif trace_posture == "waiting_for_signal":
+            return "Blocked on external input — awaiting response before proceeding."
+        elif trace_posture == "scope_challenged":
+            if stuck_condition:
+                return f"Anomaly detected: {stuck_condition} — recovery in progress."
+            if reentry_classification in ("crashed_no_output", "crashed_output_ref_missing"):
+                return "Executor crash detected — analyzing failure for recovery."
+            if reentry_classification == "executor_orphan":
+                return "Executor never claimed UoW — re-prescribing."
+            return "Unexpected state encountered — investigating."
+        elif trace_posture == "closing_with_discovery":
+            return "Completion criteria satisfied — closing with findings documented."
+        else:
+            return f"Trace posture: {trace_posture}."
+
+    # Legacy fallback: use reentry_posture vocabulary (internal diagnostic codes)
+    if reentry_classification == "first_execution":
         return "No prior audit entries — first steward contact, dispatching executor."
-    elif posture == "execution_complete":
+    elif reentry_classification == "execution_complete":
         return "Executor result file present and valid — assessing completion."
-    elif posture == "crashed_output_ref_missing":
+    elif reentry_classification == "crashed_output_ref_missing":
         return "Startup sweep detected missing output_ref — executor may have crashed."
-    elif posture == "executor_orphan":
+    elif reentry_classification == "executor_orphan":
         return "UoW stuck in ready-for-executor beyond threshold — executor never claimed."
-    elif posture == "diagnosing_orphan":
+    elif reentry_classification == "diagnosing_orphan":
         return "Steward crashed mid-diagnosis — re-diagnosing from current state."
-    elif posture == "steward_cycle_cap":
+    elif reentry_classification == "steward_cycle_cap":
         return f"Steward cycle cap reached ({cycles} cycles) — surfacing to Dan."
     else:
-        return f"Posture: {posture}."
+        return f"Posture: {reentry_classification}."
 
 
 def _extract_criteria_checks(diagnosis: dict) -> list[dict]:
@@ -705,7 +735,7 @@ def _posture_prediction(diagnosis: dict) -> str | None:
     Pure function: deterministic based on posture and completion state.
     Returns None only when there is genuinely nothing to predict (done).
     """
-    posture = diagnosis.get("reentry_posture", "unknown")
+    posture = diagnosis.get("reentry_classification", "unknown")
     is_complete = diagnosis.get("is_complete", False)
     stuck_condition = diagnosis.get("stuck_condition")
 
@@ -722,6 +752,68 @@ def _posture_prediction(diagnosis: dict) -> str | None:
     if posture == "executor_orphan":
         return "Re-prescription will be issued — executor never claimed UoW."
     return "Next prescription will be determined from diagnosis output."
+
+
+# ---------------------------------------------------------------------------
+# Trace posture derivation (S3P2-F vocabulary reconciliation)
+# ---------------------------------------------------------------------------
+
+def _determine_trace_posture(diagnosis: dict) -> str:
+    """
+    Derive the narrative trace posture from reentry classification and diagnosis state.
+
+    This function reconciles the internal diagnostic classification (reentry_posture)
+    with the v2 design trace posture vocabulary per ADR-004.
+
+    Trace posture vocabulary (wos-v2-design.md / PR #564):
+    - orienting: First contact, establishing scope
+    - clarifying: Assessing completion, determining next steps
+    - waiting_for_signal: Blocked on external input (Dan, system)
+    - scope_challenged: Anomaly detected, recovery in progress
+    - closing_with_discovery: Completion confirmed, wrapping up
+
+    Returns:
+        One of the five trace posture values.
+    """
+    reentry_classification = diagnosis.get("reentry_classification", "unknown")
+    is_complete = diagnosis.get("is_complete", False)
+    stuck_condition = diagnosis.get("stuck_condition")
+    executor_outcome = diagnosis.get("executor_outcome")
+
+    # Stuck conditions → scope_challenged (anomaly recovery)
+    if stuck_condition:
+        return "scope_challenged"
+
+    # Completion confirmed → closing_with_discovery
+    if is_complete:
+        return "closing_with_discovery"
+
+    # First execution → orienting (establishing scope)
+    if reentry_classification == "first_execution":
+        return "orienting"
+
+    # Blocked outcomes → waiting_for_signal
+    if executor_outcome == "blocked":
+        return "waiting_for_signal"
+
+    # Crash/failure states → scope_challenged (anomaly recovery)
+    if reentry_classification in (
+        "crashed_no_output",
+        "crashed_zero_bytes",
+        "crashed_output_ref_missing",
+        "execution_failed",
+        "executor_orphan",
+        "diagnosing_orphan",
+        "stall_detected",
+    ):
+        return "scope_challenged"
+
+    # Normal re-entry with work to do → clarifying
+    if reentry_classification in ("execution_complete", "startup_sweep_possibly_complete"):
+        return "clarifying"
+
+    # Default fallback → clarifying (assessing state)
+    return "clarifying"
 
 
 def _build_trace_entry(diagnosis: dict, cycles: int) -> dict:
@@ -741,10 +833,13 @@ def _build_trace_entry(diagnosis: dict, cycles: int) -> dict:
     # Inject cycles so _posture_rationale can access it for the cycle-cap case
     diagnosis_with_cycles = {**diagnosis, "_cycles": cycles}
 
+    # Derive narrative trace posture from diagnostic classification (S3P2-F)
+    trace_posture = _determine_trace_posture(diagnosis)
+
     return {
         "cycle": cycles,
-        "posture": diagnosis.get("reentry_posture", "unknown"),
-        "posture_rationale": _posture_rationale(diagnosis_with_cycles),
+        "posture": trace_posture,
+        "posture_rationale": _posture_rationale(diagnosis_with_cycles, trace_posture),
         "success_criteria_checked": _extract_criteria_checks(diagnosis),
         "anomalies": (
             [diagnosis["stuck_condition"]]
@@ -2218,7 +2313,7 @@ def _diagnose_uow(
     Produce a diagnosis for a single UoW.
 
     Pure function: reads inputs, returns a diagnosis dict with fields:
-    - reentry_posture: str
+    - reentry_classification: str
     - return_reason: str | None
     - return_reason_classification: str
     - output_content: str
@@ -2254,7 +2349,7 @@ def _diagnose_uow(
         is_complete = False
 
     return {
-        "reentry_posture": reentry_posture,
+        "reentry_classification": reentry_posture,
         "return_reason": return_reason,
         "return_reason_classification": classification,
         "output_content": output_content,
@@ -2723,7 +2818,7 @@ def _process_uow(
 
     # Step 3: Diagnose
     diagnosis = _diagnose_uow(uow, audit_entries, issue_info)
-    reentry_posture = diagnosis["reentry_posture"]
+    reentry_posture = diagnosis["reentry_classification"]
     return_reason = diagnosis["return_reason"]
     is_complete = diagnosis["is_complete"]
     completion_rationale = diagnosis["completion_rationale"]
