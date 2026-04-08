@@ -4534,11 +4534,18 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
     for msg in messages:
         source = msg.get("source", "unknown").upper()
         user = msg.get("user_name", msg.get("username", "Unknown"))
-        text = msg.get("text", "(no text)")
         ts = msg.get("timestamp", "")
         msg_id = msg.get("id", msg.get("_filename", ""))
         chat_id = msg.get("chat_id", "")
         msg_type = msg.get("type", "text")
+        # Synthesize a meaningful text summary for structured system messages
+        # that carry no text field (e.g. wos_execute). This prevents the
+        # dispatcher from seeing '(no text)' and failing to recognise the type.
+        if msg_type == "wos_execute":
+            _uow_id = msg.get("uow_id", "?")
+            text = f"wos_execute: uow_id={_uow_id}"
+        else:
+            text = msg.get("text", "(no text)")
 
         output += f"---\n"
         # Add type-specific indicators
@@ -4574,6 +4581,9 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
         elif msg_type == "subagent_recovered":
             task_id = msg.get("task_id", "?")
             output += f"⚠️ **[SUBAGENT RECOVERY]** task `{task_id}` exited without calling write_result — salvaged content logged\n"
+        elif msg_type == "wos_execute":
+            uow_id = msg.get("uow_id", "?")
+            output += f"🔧 **[WOS EXECUTE]** uow_id=`{uow_id}`\n"
         else:
             output += f"**[{source}]** from **{user}**\n"
         output += f"Chat ID: `{chat_id}` | Message ID: `{msg_id}`\n"
@@ -4586,6 +4596,9 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
             output += "dispatcher_hint: SUBAGENT_NOTIFICATION — user already received the subagent's reply. Don't summarize it. If you respond, add new value only — a question, a correction, missing context. Call mark_processed when done.\n"
         if msg_type == "subagent_recovered":
             output += "dispatcher_hint: SUBAGENT_RECOVERED — agent exited without calling write_result; content was salvaged from transcript. The owner has been notified via inbox. Do NOT relay the raw dump to the user. Call mark_processed when done.\n"
+        if msg_type == "wos_execute":
+            uow_id = msg.get("uow_id", "?")
+            output += f"dispatcher_hint: WOS_EXECUTE — call route_wos_message(msg) from src/orchestration/dispatcher_handlers.py. uow_id={uow_id}. Do not read prose — use the structural route.\n"
         _has_file = msg_type in ("voice", "photo", "document") or bool(
             msg.get("image_file") or msg.get("image_files") or
             msg.get("file_path") or msg.get("audio_file")
@@ -6996,6 +7009,35 @@ async def handle_write_task_output(args: dict) -> list[TextContent]:
 
 
 # =============================================================================
+# WOS registry completion helper (issue #669)
+# =============================================================================
+
+def _maybe_complete_wos_uow(task_id: str, status: str) -> None:
+    """
+    Transition a WOS UoW from 'executing' to 'ready-for-steward' when its subagent
+    calls write_result with status='success'.
+
+    Delegates to orchestration.wos_completion.maybe_complete_wos_uow — see that
+    module for full documentation. Imported lazily so inbox_server's heavy import
+    chain does not block if the orchestration package is unavailable.
+
+    Errors are logged but never raised — write_result delivery must not be blocked
+    by registry update failures.
+    """
+    try:
+        import sys as _sys
+        import os
+        from pathlib import Path as _Path
+        _src = str(_Path(__file__).resolve().parent.parent)
+        if _src not in _sys.path:
+            _sys.path.insert(0, _src)
+        from orchestration.wos_completion import maybe_complete_wos_uow
+        maybe_complete_wos_uow(task_id, status)
+    except Exception as exc:
+        log.warning("_maybe_complete_wos_uow: unexpected error — %s: %s", type(exc).__name__, exc)
+
+
+# =============================================================================
 # Subagent Result Relay Handler
 # =============================================================================
 
@@ -7110,6 +7152,16 @@ async def handle_write_result(args: dict) -> list[TextContent]:
         )
     except Exception as exc:
         log.warning(f"write_result auto-unregister failed for task_id={task_id!r}: {exc}")
+
+    # WOS registry completion (issue #669): when a subagent writes its result for a
+    # wos_execute task, transition the UoW from 'executing' → 'ready-for-steward'.
+    # The executor transitions active → executing at dispatch time (fire-and-forget inbox
+    # dispatch). The execution_complete audit entry and status transition happen here —
+    # only after the subagent confirms completion via write_result — preventing the
+    # false-complete bug where UoWs appeared done before any work was done.
+    #
+    # task_id convention: "wos-{uow_id}" (set by route_wos_message in dispatcher_handlers.py)
+    _maybe_complete_wos_uow(task_id, status)
 
     # Notify wire server so SSE clients update within 40ms
     asyncio.create_task(_notify_wire_server())

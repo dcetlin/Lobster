@@ -47,6 +47,11 @@ class UoWStatus(StrEnum):
     READY_FOR_STEWARD = "ready-for-steward"
     READY_FOR_EXECUTOR = "ready-for-executor"
     ACTIVE = "active"
+    # EXECUTING: inbox message written, subagent dispatched but write_result not yet received.
+    # Transitions: active → executing (at inbox dispatch) → ready-for-steward (at write_result).
+    # This intermediate state prevents false-complete UoWs: execution_complete is only written
+    # when the subagent confirms completion via write_result (issue #669).
+    EXECUTING = "executing"
     DIAGNOSING = "diagnosing"
     BLOCKED = "blocked"
     DONE = "done"
@@ -58,9 +63,10 @@ class UoWStatus(StrEnum):
         return self in {UoWStatus.DONE, UoWStatus.FAILED, UoWStatus.EXPIRED}
 
     def is_in_flight(self) -> bool:
-        """True for statuses that block re-proposal (active, pending, ready-for-steward, ready-for-executor, diagnosing)."""
+        """True for statuses that block re-proposal (active, executing, pending, ready-for-steward, ready-for-executor, diagnosing)."""
         return self in {
             UoWStatus.ACTIVE,
+            UoWStatus.EXECUTING,
             UoWStatus.PENDING,
             UoWStatus.READY_FOR_STEWARD,
             UoWStatus.READY_FOR_EXECUTOR,
@@ -156,6 +162,9 @@ class UoW:
     workflow_artifact: str | None = None
     prescribed_skills: list | None = None
     steward_cycles: int = 0
+    # lifetime_cycles: cumulative steward_cycles across all decide-retry resets.
+    # Never reset. Used for the hard-cap circuit-breaker check.
+    lifetime_cycles: int = 0
     timeout_at: str | None = None
     estimated_runtime: str | None = None
     steward_agenda: str | None = None
@@ -306,6 +315,7 @@ class Registry:
             workflow_artifact=d.get("workflow_artifact"),
             prescribed_skills=prescribed_skills,
             steward_cycles=d.get("steward_cycles") or 0,
+            lifetime_cycles=d.get("lifetime_cycles") or 0,
             timeout_at=d.get("timeout_at"),
             estimated_runtime=d.get("estimated_runtime"),
             steward_agenda=d.get("steward_agenda"),
@@ -1195,9 +1205,56 @@ class Registry:
         finally:
             conn.close()
 
+    def transition_to_executing(self, uow_id: str, executor_id: str) -> None:
+        """
+        Transition a UoW from 'active' to 'executing' after inbox dispatch.
+
+        Called by the Executor immediately after writing the wos_execute inbox
+        message (fire-and-forget async dispatch). The UoW remains in 'executing'
+        until write_result is received from the subagent, at which point
+        complete_uow transitions it to 'ready-for-steward'.
+
+        This prevents false-complete UoWs: execution_complete is only written
+        when the subagent confirms completion via write_result (issue #669).
+
+        Single transaction: audit INSERT before status UPDATE
+        (audit-before-transition invariant).
+        """
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                VALUES (?, ?, 'executor_dispatch', 'active', 'executing', 'executor', ?)
+                """,
+                (now, uow_id, json.dumps({"actor": "executor", "executor_id": executor_id, "timestamp": now})),
+            )
+            conn.execute(
+                "UPDATE uow_registry SET status = 'executing', updated_at = ? WHERE id = ?",
+                (now, uow_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def complete_uow(self, uow_id: str, output_ref: str) -> None:
         """
-        Transition a UoW from 'active' to 'ready-for-steward'.
+        Transition a UoW to 'ready-for-steward' with an execution_complete audit entry.
+
+        For async inbox dispatch: transitions 'executing' → 'ready-for-steward'.
+        Called by the write_result MCP handler when the subagent reports completion.
+
+        For synchronous subprocess dispatch (frontier-writer, design-review):
+        transitions 'active' → 'ready-for-steward'. Called by the Executor after
+        the subprocess exits.
+
+        The from_status is derived from the current DB state so the audit entry
+        is accurate regardless of which dispatch path was used.
 
         Single transaction: audit INSERT before status UPDATE
         (audit-before-transition invariant).
@@ -1208,12 +1265,17 @@ class Registry:
         try:
             now = _now_iso()
             conn.execute("BEGIN IMMEDIATE")
+            # Derive current status for accurate audit log from_status.
+            row = conn.execute(
+                "SELECT status FROM uow_registry WHERE id = ?", (uow_id,)
+            ).fetchone()
+            current_status = row["status"] if row else "active"
             conn.execute(
                 """
                 INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
-                VALUES (?, ?, 'execution_complete', 'active', 'ready-for-steward', 'executor', ?)
+                VALUES (?, ?, 'execution_complete', ?, 'ready-for-steward', 'executor', ?)
                 """,
-                (now, uow_id, json.dumps({"actor": "executor", "output_ref": output_ref, "timestamp": now})),
+                (now, uow_id, current_status, json.dumps({"actor": "executor", "output_ref": output_ref, "timestamp": now})),
             )
             conn.execute(
                 "UPDATE uow_registry SET status = 'ready-for-steward', updated_at = ? WHERE id = ?",
@@ -1228,7 +1290,10 @@ class Registry:
 
     def fail_uow(self, uow_id: str, reason: str) -> None:
         """
-        Transition a UoW from 'active' to 'failed'.
+        Transition a UoW to 'failed'.
+
+        Handles UoWs in 'active' or 'executing' status. The from_status in the
+        audit entry reflects the actual current status for accurate history.
 
         Single transaction: audit INSERT before status UPDATE
         (audit-before-transition invariant).
@@ -1237,12 +1302,17 @@ class Registry:
         try:
             now = _now_iso()
             conn.execute("BEGIN IMMEDIATE")
+            # Derive current status for accurate audit log from_status.
+            row = conn.execute(
+                "SELECT status FROM uow_registry WHERE id = ?", (uow_id,)
+            ).fetchone()
+            current_status = row["status"] if row else "active"
             conn.execute(
                 """
                 INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
-                VALUES (?, ?, 'execution_failed', 'active', 'failed', 'executor', ?)
+                VALUES (?, ?, 'execution_failed', ?, 'failed', 'executor', ?)
                 """,
-                (now, uow_id, json.dumps({"actor": "executor", "reason": reason, "timestamp": now})),
+                (now, uow_id, current_status, json.dumps({"actor": "executor", "reason": reason, "timestamp": now})),
             )
             conn.execute(
                 "UPDATE uow_registry SET status = 'failed', updated_at = ? WHERE id = ?",
@@ -1255,17 +1325,28 @@ class Registry:
         finally:
             conn.close()
 
+    # Statuses from which decide-retry may recover a UoW.
+    # 'blocked' covers the normal hard-cap / stuck-steward case.
+    # 'ready-for-steward' covers UoWs that false-completed at executor dispatch
+    # time (issue #669) and are looping in the steward queue without advancing.
+    RETRYABLE_STATUSES: frozenset[str] = frozenset({"blocked", "ready-for-steward"})
+
     def decide_retry(self, uow_id: str) -> int:
         """
         Reset a stuck UoW so it re-enters the Steward queue.
 
         Intended for use when Dan selects "Retry" after the Steward surfaces a
-        UoW that has hit the 5-cycle hard cap or another stuck condition.
+        UoW that has hit the hard cap, or when a UoW has false-completed
+        at executor dispatch time (issue #669) and is looping in ready-for-steward.
 
-        Transitions: blocked → ready-for-steward (optimistic lock on blocked).
-        Also resets steward_cycles to 0 so the Steward treats it as a fresh start.
+        Transitions: blocked → ready-for-steward
+                     ready-for-steward → ready-for-steward (with cycle reset)
+        Resets steward_cycles to 0 so the Steward treats it as a fresh start,
+        but first adds the current steward_cycles value to lifetime_cycles so
+        cumulative effort is never lost. The hard-cap check uses lifetime_cycles,
+        so repeated retries do not silently bypass the circuit breaker.
 
-        Returns rows_affected (1 on success, 0 if UoW is not in blocked status).
+        Returns rows_affected (1 on success, 0 if UoW is not in a retryable status).
         Writes audit entry atomically in the same transaction as the UPDATE.
         """
         conn = self._connect()
@@ -1273,31 +1354,54 @@ class Registry:
             now = _now_iso()
             conn.execute("BEGIN IMMEDIATE")
 
+            # Read current status and cycle counts:
+            # - from_status: for audit log (records actual pre-transition status)
+            # - steward_cycles, lifetime_cycles: to accumulate lifetime effort before reset
+            placeholders = ",".join("?" * len(self.RETRYABLE_STATUSES))
+            row = conn.execute(
+                f"SELECT status, steward_cycles, lifetime_cycles FROM uow_registry WHERE id = ? AND status IN ({placeholders})",
+                (uow_id, *self.RETRYABLE_STATUSES),
+            ).fetchone()
+            from_status = row["status"] if row else None
+
+            if row is None:
+                conn.rollback()
+                return 0
+
+            current_cycles: int = row["steward_cycles"] or 0
+            current_lifetime: int = row["lifetime_cycles"] or 0
+            new_lifetime: int = current_lifetime + current_cycles
+
             note_json = json.dumps({
                 "event": "decide_retry",
                 "actor": "user",
                 "uow_id": uow_id,
                 "timestamp": now,
-                "note": "user requested retry — steward_cycles reset to 0",
+                "from_status": from_status,
+                "note": (
+                    f"user requested retry — steward_cycles reset to 0, "
+                    f"lifetime_cycles updated from {current_lifetime} to {new_lifetime}"
+                ),
             })
 
             conn.execute(
                 """
                 INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
-                VALUES (?, ?, 'decide_retry', 'blocked', 'ready-for-steward', 'user', ?)
+                VALUES (?, ?, 'decide_retry', ?, 'ready-for-steward', 'user', ?)
                 """,
-                (now, uow_id, note_json),
+                (now, uow_id, from_status, note_json),
             )
 
             cursor = conn.execute(
-                """
+                f"""
                 UPDATE uow_registry
                 SET status = 'ready-for-steward',
                     steward_cycles = 0,
+                    lifetime_cycles = ?,
                     updated_at = ?
-                WHERE id = ? AND status = 'blocked'
+                WHERE id = ? AND status IN ({placeholders})
                 """,
-                (now, uow_id),
+                (new_lifetime, now, uow_id, *self.RETRYABLE_STATUSES),
             )
             rows_affected = cursor.rowcount
 
@@ -1544,6 +1648,7 @@ _STEWARD_EXECUTOR_REQUIRED_FIELDS = frozenset({
     "success_criteria",
     "prescribed_skills",
     "steward_cycles",
+    "lifetime_cycles",
     "timeout_at",
     "estimated_runtime",
     "steward_agenda",

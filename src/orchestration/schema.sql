@@ -56,6 +56,11 @@ CREATE TABLE IF NOT EXISTS uow_registry (
     success_criteria    TEXT    NOT NULL DEFAULT '',
     prescribed_skills   TEXT    NULL,
     steward_cycles      INTEGER NOT NULL DEFAULT 0,
+    -- lifetime_cycles: cumulative steward cycles across all decide-retry resets.
+    --   Incremented by steward_cycles before each reset so progress is never lost.
+    --   Never reset. Used for the hard-cap circuit-breaker check.
+    --   Steward-private (excluded from executor_uow_view).
+    lifetime_cycles     INTEGER NOT NULL DEFAULT 0,
     timeout_at          TEXT    NULL,
     estimated_runtime   INTEGER NULL,
 
@@ -89,7 +94,10 @@ CREATE TABLE IF NOT EXISTS uow_registry (
 -- success_criteria: prose completion statement; written at germination, immutable.
 -- prescribed_skills: JSON array of skill IDs to load at Executor task start.
 --   NULL = not yet prescribed; [] = explicitly prescribed with no skills.
--- steward_cycles: count of Steward diagnosis+prescription cycles completed.
+-- steward_cycles: count of Steward diagnosis+prescription cycles for the current attempt.
+--   Reset to 0 on decide-retry. Use lifetime_cycles for the hard-cap check.
+-- lifetime_cycles: cumulative steward_cycles across all decide-retry resets.
+--   Never reset. The hard-cap circuit breaker checks this, not steward_cycles.
 -- timeout_at: ISO timestamp computed as started_at + estimated_runtime (or +1800s).
 -- estimated_runtime: optional seconds estimate for timeout_at computation.
 

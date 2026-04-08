@@ -59,11 +59,19 @@ _ACTIVE_STATES = {
 # States where source closing/deletion triggers archive (no in-flight work)
 _ARCHIVE_ON_CLOSE_STATES = {UoWStatus.PROPOSED, UoWStatus.PENDING}
 
-# States where source closing/deletion surfaces to Steward (in-flight work)
+# States with active execution in-flight — caretaker must not close or surface
+# these when source closes, to prevent the feedback loop where issue closure
+# causes UoW teardown while a subagent is actively executing it (issue #676).
+# A UoW in these states must be left alone; the executor/steward drives it forward.
+EXECUTING_STATES = {
+    UoWStatus.ACTIVE,
+    UoWStatus.READY_FOR_EXECUTOR,
+}
+
+# States where source closing/deletion surfaces to Steward (in-flight work,
+# but not actively executing — steward intervention is appropriate).
 _SURFACE_ON_CLOSE_STATES = {
     UoWStatus.READY_FOR_STEWARD,
-    UoWStatus.READY_FOR_EXECUTOR,
-    UoWStatus.ACTIVE,
     UoWStatus.DIAGNOSING,
     UoWStatus.BLOCKED,
 }
@@ -475,14 +483,18 @@ def _reconcile(uow_status: UoWStatus, snapshot: IssueSnapshot | None) -> str:
     This is a pure function — it only reads its arguments and returns a string.
     All side effects live in GardenCaretaker's action methods.
 
-    Reconciliation decision table (from design doc):
+    Reconciliation decision table (from design doc, updated by issue #676):
 
-    | Source State      | proposed | ready | active | done  | expired/failed |
-    |-------------------|----------|-------|--------|-------|----------------|
-    | open              | no_op    | no_op | no_op  | no_op | reactivate     |
-    | closed            | archive  | archive | surface | no_op | no_op        |
-    | deleted/not_found | archive  | archive | surface | no_op | archive      |
-    | unknown/error     | warn     | warn  | warn   | warn  | warn           |
+    | Source State      | proposed | pending | rfs    | rfe    | active | diagnosing | blocked | done  | expired/failed |
+    |-------------------|----------|---------|--------|--------|--------|------------|---------|-------|----------------|
+    | open              | no_op    | no_op   | no_op  | no_op  | no_op  | no_op      | no_op   | no_op | reactivate     |
+    | closed            | archive  | archive | surface| no_op  | no_op  | surface    | surface | no_op | no_op          |
+    | deleted/not_found | archive  | archive | surface| no_op  | no_op  | surface    | surface | no_op | archive        |
+    | unknown/error     | warn     | warn    | warn   | warn   | warn   | warn       | warn    | warn  | warn           |
+
+    Key: rfs=ready-for-steward, rfe=ready-for-executor (EXECUTING_STATES)
+    EXECUTING_STATES (active, ready-for-executor) are always no-op — the caretaker
+    must not interfere with UoWs that are actively being executed (issue #676).
 
     "reopened" (open + terminal UoW) → reactivate to proposed (only for expired/failed)
     """
@@ -510,7 +522,15 @@ def _reconcile(uow_status: UoWStatus, snapshot: IssueSnapshot | None) -> str:
 
 
 def _reconcile_closed(uow_status: UoWStatus) -> str:
-    """Reconciliation when source issue is closed."""
+    """Reconciliation when source issue is closed.
+
+    EXECUTING_STATES (active, ready-for-executor) are always no-op on source close.
+    Closing the source while a subagent is actively executing the UoW must not
+    interrupt in-flight work (issue #676). The executor/steward drives these UoWs
+    to completion; caretaker stays out of the way.
+    """
+    if uow_status in EXECUTING_STATES:
+        return "no_op"
     if uow_status in _ARCHIVE_ON_CLOSE_STATES:
         return "archive"
     if uow_status in _SURFACE_ON_CLOSE_STATES:
@@ -521,7 +541,13 @@ def _reconcile_closed(uow_status: UoWStatus) -> str:
 
 
 def _reconcile_deleted(uow_status: UoWStatus) -> str:
-    """Reconciliation when source issue is deleted/not_found/transferred."""
+    """Reconciliation when source issue is deleted/not_found/transferred.
+
+    EXECUTING_STATES (active, ready-for-executor) are always no-op on source deletion.
+    A deleted source during active execution must not teardown in-flight work (issue #676).
+    """
+    if uow_status in EXECUTING_STATES:
+        return "no_op"
     if uow_status in _ARCHIVE_ON_CLOSE_STATES:
         return "archive"
     if uow_status in _SURFACE_ON_CLOSE_STATES:
