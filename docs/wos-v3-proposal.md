@@ -1,3 +1,7 @@
+> **SUPERSEDED** — This was the initial V3 proposal. The current authoritative spec is [wos-v3-steward-executor-spec.md](./wos-v3-steward-executor-spec.md). Retained as context for the design rationale.
+
+---
+
 # Work Orchestration System v3 — Design Proposal
 
 *Status: Proposal — 2026-04-04*
