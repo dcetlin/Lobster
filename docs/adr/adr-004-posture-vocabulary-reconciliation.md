@@ -1,3 +1,8 @@
+---
+oracle_status: approved
+oracle_pr: https://github.com/dcetlin/Lobster/pull/718
+oracle_date: 2026-04-08
+---
 # ADR-004: Posture Vocabulary Reconciliation
 
 **Status:** ACCEPTED  
