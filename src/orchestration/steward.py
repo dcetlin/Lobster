@@ -44,6 +44,7 @@ from src.orchestration.error_capture import (
     has_repeated_error,
 )
 from src.orchestration.config import TimeoutConfig
+from src.orchestration.vision_routing import resolve_vision_route
 
 log = logging.getLogger("steward")
 
@@ -997,6 +998,45 @@ def _check_register_executor_compatibility(
         f"({direction}). Compatible types: {sorted(compatible_types)}"
     )
     return False, reason
+
+
+def _build_prescription_route_reason(
+    uow: "UoW",
+    reentry_posture: str,
+    executor_outcome: str,
+    partial_steps_context: str,
+    completion_rationale: str,
+) -> str:
+    """
+    Build the route_reason string for a prescription cycle.
+
+    When vision_ref is present on the UoW, the route_reason is prefixed with
+    the vision-anchored reason from resolve_vision_route(). This changes the
+    actual pipeline decision: a vision-anchored UoW gets a structurally
+    different route_reason than a heuristic-routed UoW, which is visible in
+    audit logs, steward_log, and the DB.
+
+    When vision_ref is absent, falls back to the steward heuristic string.
+
+    Pure function: produces no side effects, safe to call from tests.
+    """
+    if executor_outcome == "partial" and partial_steps_context:
+        heuristic_reason = (
+            f"steward: {reentry_posture} — partial continuation "
+            f"({partial_steps_context}) — {completion_rationale[:80]}"
+        )
+    else:
+        heuristic_reason = f"steward: {reentry_posture} — {completion_rationale[:120]}"
+
+    # Vision-anchored path: when vision_ref is present, prepend vision routing result.
+    # This changes the route_reason from a pure heuristic string to one that references
+    # the vision anchor — a real pipeline decision, not just metadata.
+    if uow.vision_ref is not None:
+        vision_result = resolve_vision_route(uow, log_fallback=False)
+        if vision_result.anchored:
+            return f"{vision_result.route_reason} | {heuristic_reason}"
+
+    return heuristic_reason
 
 
 def _select_prescribed_skills(uow: "UoW", reentry_posture: str) -> list[str]:
@@ -3255,13 +3295,12 @@ def _process_uow(
         completion_gap_for_prescription = (
             f"{completion_rationale} [{partial_steps_context}]"
         )
-        route_reason = (
-            f"steward: {reentry_posture} — partial continuation "
-            f"({partial_steps_context}) — {completion_rationale[:80]}"
-        )
     else:
         completion_gap_for_prescription = completion_rationale
-        route_reason = f"steward: {reentry_posture} — {completion_rationale[:120]}"
+
+    route_reason = _build_prescription_route_reason(
+        uow, reentry_posture, executor_outcome, partial_steps_context, completion_rationale
+    )
 
     # PR C, Change 2: Inject trace content into prescription context.
     # Surprises and prescription_delta from the corrective trace are injected here
