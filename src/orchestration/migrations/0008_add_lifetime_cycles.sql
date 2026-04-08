@@ -1,0 +1,21 @@
+-- Migration 0008: add lifetime_cycles column to uow_registry.
+--
+-- Problem:
+--   steward_cycles is reset to 0 on every decide-retry, so the registry only
+--   shows cycles for the most recent attempt. A UoW could accumulate 20+ real
+--   cycles but always appear at steward_cycles=1 after a reset. The 5-cycle
+--   hard-cap check (steward_cycles >= 5) was therefore per-attempt-run, not
+--   per-UoW-lifetime — defeating its purpose as a circuit breaker.
+--
+-- Fix:
+--   Add lifetime_cycles (INTEGER, NOT NULL DEFAULT 0) that:
+--     - Is incremented by the current steward_cycles value at decide-retry time.
+--     - Is never reset.
+--     - Is checked by the hard-cap gate instead of steward_cycles.
+--   steward_cycles continues to be reset on decide-retry so the Steward still
+--   knows "how far into the current attempt are we".
+--
+-- Column visibility: Steward-private (excluded from executor_uow_view).
+--   The executor does not need to know total lifetime effort.
+
+ALTER TABLE uow_registry ADD COLUMN lifetime_cycles INTEGER NOT NULL DEFAULT 0;

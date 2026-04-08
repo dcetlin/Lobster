@@ -162,6 +162,9 @@ class UoW:
     workflow_artifact: str | None = None
     prescribed_skills: list | None = None
     steward_cycles: int = 0
+    # lifetime_cycles: cumulative steward_cycles across all decide-retry resets.
+    # Never reset. Used for the hard-cap circuit-breaker check.
+    lifetime_cycles: int = 0
     timeout_at: str | None = None
     estimated_runtime: str | None = None
     steward_agenda: str | None = None
@@ -312,6 +315,7 @@ class Registry:
             workflow_artifact=d.get("workflow_artifact"),
             prescribed_skills=prescribed_skills,
             steward_cycles=d.get("steward_cycles") or 0,
+            lifetime_cycles=d.get("lifetime_cycles") or 0,
             timeout_at=d.get("timeout_at"),
             estimated_runtime=d.get("estimated_runtime"),
             steward_agenda=d.get("steward_agenda"),
@@ -1332,12 +1336,15 @@ class Registry:
         Reset a stuck UoW so it re-enters the Steward queue.
 
         Intended for use when Dan selects "Retry" after the Steward surfaces a
-        UoW that has hit the 5-cycle hard cap, or when a UoW has false-completed
+        UoW that has hit the hard cap, or when a UoW has false-completed
         at executor dispatch time (issue #669) and is looping in ready-for-steward.
 
         Transitions: blocked → ready-for-steward
                      ready-for-steward → ready-for-steward (with cycle reset)
-        Also resets steward_cycles to 0 so the Steward treats it as a fresh start.
+        Resets steward_cycles to 0 so the Steward treats it as a fresh start,
+        but first adds the current steward_cycles value to lifetime_cycles so
+        cumulative effort is never lost. The hard-cap check uses lifetime_cycles,
+        so repeated retries do not silently bypass the circuit breaker.
 
         Returns rows_affected (1 on success, 0 if UoW is not in a retryable status).
         Writes audit entry atomically in the same transaction as the UPDATE.
@@ -1347,12 +1354,23 @@ class Registry:
             now = _now_iso()
             conn.execute("BEGIN IMMEDIATE")
 
-            # Read current status so the audit log records the actual from_status.
+            # Read current status and cycle counts:
+            # - from_status: for audit log (records actual pre-transition status)
+            # - steward_cycles, lifetime_cycles: to accumulate lifetime effort before reset
+            placeholders = ",".join("?" * len(self.RETRYABLE_STATUSES))
             row = conn.execute(
-                "SELECT status FROM uow_registry WHERE id = ?",
-                (uow_id,),
+                f"SELECT status, steward_cycles, lifetime_cycles FROM uow_registry WHERE id = ? AND status IN ({placeholders})",
+                (uow_id, *self.RETRYABLE_STATUSES),
             ).fetchone()
             from_status = row["status"] if row else None
+
+            if row is None:
+                conn.rollback()
+                return 0
+
+            current_cycles: int = row["steward_cycles"] or 0
+            current_lifetime: int = row["lifetime_cycles"] or 0
+            new_lifetime: int = current_lifetime + current_cycles
 
             note_json = json.dumps({
                 "event": "decide_retry",
@@ -1360,7 +1378,10 @@ class Registry:
                 "uow_id": uow_id,
                 "timestamp": now,
                 "from_status": from_status,
-                "note": "user requested retry — steward_cycles reset to 0",
+                "note": (
+                    f"user requested retry — steward_cycles reset to 0, "
+                    f"lifetime_cycles updated from {current_lifetime} to {new_lifetime}"
+                ),
             })
 
             conn.execute(
@@ -1371,16 +1392,16 @@ class Registry:
                 (now, uow_id, from_status, note_json),
             )
 
-            placeholders = ",".join("?" * len(self.RETRYABLE_STATUSES))
             cursor = conn.execute(
                 f"""
                 UPDATE uow_registry
                 SET status = 'ready-for-steward',
                     steward_cycles = 0,
+                    lifetime_cycles = ?,
                     updated_at = ?
                 WHERE id = ? AND status IN ({placeholders})
                 """,
-                (now, uow_id, *self.RETRYABLE_STATUSES),
+                (new_lifetime, now, uow_id, *self.RETRYABLE_STATUSES),
             )
             rows_affected = cursor.rowcount
 
@@ -1627,6 +1648,7 @@ _STEWARD_EXECUTOR_REQUIRED_FIELDS = frozenset({
     "success_criteria",
     "prescribed_skills",
     "steward_cycles",
+    "lifetime_cycles",
     "timeout_at",
     "estimated_runtime",
     "steward_agenda",
