@@ -279,11 +279,11 @@ class TestCountNonImprovingGateCycles:
         assert result >= NON_IMPROVING_GATE_THRESHOLD
 
     def test_resets_after_improvement(self):
-        """Improvement resets the non-improving counter."""
-        log = self._make_log_with_trace_injections([0.5, 0.5, 0.8, 0.8])
+        """Improvement then plateau: counter reflects only the tail plateau length."""
+        log = self._make_log_with_trace_injections([0.4, 0.6, 0.7, 0.7, 0.7])
         result = _count_non_improving_gate_cycles(log, n=NON_IMPROVING_GATE_THRESHOLD)
-        # Only 2 non-improving at the end (0.8, 0.8), not 3
-        assert result < NON_IMPROVING_GATE_THRESHOLD
+        # Scores improve to 0.7 then plateau for 3 cycles → non-improving count = 3
+        assert result == 3
 
     def test_zero_when_no_gate_score_entries(self):
         """Entries without gate_score (non-iterative-convergent) count as 0."""

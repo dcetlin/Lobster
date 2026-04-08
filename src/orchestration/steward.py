@@ -1286,17 +1286,25 @@ def _count_non_improving_gate_cycles(steward_log: str | None, n: int = _NON_IMPR
     # Find the tail run of non-improving cycles.
     # A "non-improving cycle" is one where the score did not increase vs. the previous.
     # We return the count of consecutive non-improving data points at the tail,
-    # starting from 1 (the reference point after the last improvement).
-    # With scores [0.5, 0.5, 0.5]: reference=index 0, tail=[1,2] are non-improving → count=3
-    # (we include the starting point of the plateau to match the spec's "3 consecutive cycles").
+    # including the plateau-start cycle (the first cycle that stopped improving).
+    #
+    # With scores [0.5, 0.5, 0.5]: all non-improving → count=3
+    # With scores [0.4, 0.6, 0.7, 0.7, 0.7]: plateau at [0.7, 0.7, 0.7] → count=3
+    # With scores [0.5, 0.7, 0.9]: fully improving → count=0
+    #
+    # non_improving is initialized to 1 to pre-count the last score as a reference point.
+    # When an improvement is found at position i:
+    #   - if non_improving == 1 (never incremented), the tail is purely improving → return 0
+    #   - if non_improving > 1 (plateau was found), the plateau includes scores[i] → return non_improving
     non_improving = 1  # start counting from the last improving point (or start of log)
     for i in range(len(scores) - 1, 0, -1):
         if scores[i] <= scores[i - 1]:
             non_improving += 1
         else:
-            # Found an improvement — the plateau started AFTER this point
-            # non_improving already counts from scores[i] forward
-            return non_improving - 1  # exclude the improvement point itself
+            # Found an improvement at position i.
+            # If non_improving was never incremented (==1), the tail is purely improving.
+            # Otherwise, non_improving already includes scores[i] as the plateau start.
+            return non_improving if non_improving > 1 else 0
 
     # All scores are non-improving (or only 1 pair) — all data points are the plateau
     return non_improving
