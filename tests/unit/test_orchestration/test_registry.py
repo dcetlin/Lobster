@@ -801,3 +801,224 @@ class TestNoteAccessor:
         notes = NoteAccessor(registry)
         # Should not raise — silently no-ops when UoW doesn't exist
         notes.set("nonexistent_id", "key", "value")
+
+
+# ---------------------------------------------------------------------------
+# lifetime_cycles — cumulative cycle tracking across decide-retry resets
+# ---------------------------------------------------------------------------
+
+# Named constant matching the spec: steward_cycles is reset to 0 on decide-retry
+# but lifetime_cycles preserves the cumulative total.
+LIFETIME_CYCLES_NEVER_RESET = True
+
+
+def _make_blocked_uow(conn: sqlite3.Connection, registry, steward_cycles: int = 0, lifetime_cycles: int = 0) -> str:
+    """
+    Insert a UoW in 'blocked' status with the given cycle counts.
+    Returns the uow_id.
+    """
+    from src.orchestration.registry import UpsertInserted
+    result = registry.upsert(
+        issue_number=9900 + steward_cycles + lifetime_cycles,
+        title=f"Blocked UoW test (sc={steward_cycles}, lc={lifetime_cycles})",
+        success_criteria="Test criteria.",
+    )
+    assert isinstance(result, UpsertInserted)
+    uow_id = result.id
+    conn.execute(
+        "UPDATE uow_registry SET status='blocked', steward_cycles=?, lifetime_cycles=? WHERE id=?",
+        (steward_cycles, lifetime_cycles, uow_id),
+    )
+    conn.commit()
+    return uow_id
+
+
+class TestLifetimeCycles:
+    """
+    Tests for lifetime_cycles — the cumulative steward cycle counter that
+    persists across decide-retry resets.
+
+    Spec:
+    - lifetime_cycles starts at 0
+    - decide_retry adds current steward_cycles to lifetime_cycles before resetting
+    - steward_cycles is reset to 0 on decide-retry (fresh start per attempt)
+    - lifetime_cycles is never reset
+    - Multiple retries accumulate correctly
+    """
+
+    def test_lifetime_cycles_column_exists_in_schema(self, registry, db_path):
+        """Migration 0008 adds lifetime_cycles to uow_registry."""
+        conn = _open_db(db_path)
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(uow_registry)")}
+        conn.close()
+        assert "lifetime_cycles" in cols, "lifetime_cycles column must exist after migration"
+
+    def test_new_uow_has_lifetime_cycles_default_zero(self, registry):
+        """Freshly inserted UoWs have lifetime_cycles = 0."""
+        from src.orchestration.registry import UpsertInserted
+        result = registry.upsert(
+            issue_number=10001,
+            title="Fresh UoW",
+            success_criteria="Done when X.",
+        )
+        assert isinstance(result, UpsertInserted)
+        uow = registry.get(result.id)
+        assert uow is not None
+        assert uow.lifetime_cycles == 0
+
+    def test_decide_retry_accumulates_current_cycles_into_lifetime(self, registry, db_path):
+        """
+        decide_retry adds steward_cycles to lifetime_cycles before resetting.
+        A UoW with steward_cycles=3 and lifetime_cycles=0 should become
+        steward_cycles=0 and lifetime_cycles=3 after retry.
+        """
+        conn = _open_db(db_path)
+        uow_id = _make_blocked_uow(conn, registry, steward_cycles=3, lifetime_cycles=0)
+        conn.close()
+
+        rows_affected = registry.decide_retry(uow_id)
+        assert rows_affected == 1
+
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.steward_cycles == 0, "steward_cycles must be reset to 0 on retry"
+        assert uow.lifetime_cycles == 3, "lifetime_cycles must accumulate steward_cycles before reset"
+
+    def test_decide_retry_accumulates_across_multiple_resets(self, registry, db_path):
+        """
+        Across multiple decide-retry calls, lifetime_cycles accumulates all
+        per-attempt steward_cycles — never resets.
+
+        Attempt 1: steward_cycles=3 → retry → lifetime_cycles=3, steward_cycles=0
+        Attempt 2: steward_cycles=4 → retry → lifetime_cycles=7, steward_cycles=0
+        """
+        conn = _open_db(db_path)
+        uow_id = _make_blocked_uow(conn, registry, steward_cycles=3, lifetime_cycles=0)
+        conn.close()
+
+        # First retry: should add 3 to lifetime_cycles
+        registry.decide_retry(uow_id)
+        uow = registry.get(uow_id)
+        assert uow.lifetime_cycles == 3
+        assert uow.steward_cycles == 0
+
+        # Simulate second attempt: advance steward_cycles to 4 and re-block
+        conn2 = _open_db(db_path)
+        conn2.execute(
+            "UPDATE uow_registry SET status='blocked', steward_cycles=4 WHERE id=?",
+            (uow_id,),
+        )
+        conn2.commit()
+        conn2.close()
+
+        # Second retry: should add 4 to lifetime_cycles (total=7)
+        registry.decide_retry(uow_id)
+        uow = registry.get(uow_id)
+        assert uow.lifetime_cycles == 7, (
+            f"lifetime_cycles should be 3+4=7 after two retries, got {uow.lifetime_cycles}"
+        )
+        assert uow.steward_cycles == 0
+
+    def test_decide_retry_with_existing_lifetime_cycles(self, registry, db_path):
+        """
+        If lifetime_cycles already has a non-zero value (from a prior retry),
+        decide_retry adds the current steward_cycles on top.
+        """
+        # Simulate a UoW that has already been retried once: lifetime_cycles=5
+        conn = _open_db(db_path)
+        uow_id = _make_blocked_uow(conn, registry, steward_cycles=2, lifetime_cycles=5)
+        conn.close()
+
+        registry.decide_retry(uow_id)
+        uow = registry.get(uow_id)
+        assert uow.lifetime_cycles == 7, "lifetime_cycles=5 + steward_cycles=2 = 7"
+        assert uow.steward_cycles == 0
+
+    def test_decide_retry_noop_on_non_blocked_uow(self, registry, db_path):
+        """
+        decide_retry returns 0 rows_affected when the UoW is not in 'blocked' status.
+        lifetime_cycles must not be modified.
+        """
+        from src.orchestration.registry import UpsertInserted
+        result = registry.upsert(
+            issue_number=10005,
+            title="Non-blocked UoW",
+            success_criteria="Done.",
+        )
+        assert isinstance(result, UpsertInserted)
+        uow_id = result.id
+        # UoW is in 'proposed' status — not blocked
+
+        rows = registry.decide_retry(uow_id)
+        assert rows == 0, "decide_retry must return 0 on non-blocked UoW"
+
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.lifetime_cycles == 0, "lifetime_cycles must not change when decide_retry is a no-op"
+
+    def test_decide_retry_audit_log_records_lifetime_update(self, registry, db_path):
+        """
+        The audit log entry written by decide_retry must mention the lifetime_cycles update.
+        """
+        conn = _open_db(db_path)
+        uow_id = _make_blocked_uow(conn, registry, steward_cycles=5, lifetime_cycles=10)
+        conn.close()
+
+        registry.decide_retry(uow_id)
+
+        conn2 = _open_db(db_path)
+        row = conn2.execute(
+            "SELECT note FROM audit_log WHERE uow_id=? AND event='decide_retry'",
+            (uow_id,),
+        ).fetchone()
+        conn2.close()
+
+        assert row is not None
+        note = json.loads(row["note"])
+        assert "lifetime_cycles" in note["note"], (
+            "audit note must mention lifetime_cycles so post-hoc audit is possible"
+        )
+
+    def test_validate_steward_executor_schema_includes_lifetime_cycles(self, db_path):
+        """validate_steward_executor_schema raises if lifetime_cycles column is absent."""
+        from src.orchestration.registry import Registry, validate_steward_executor_schema
+        # Initialize schema (which includes lifetime_cycles via migration 0008)
+        Registry(db_path)
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        # Should pass without raising — column is present after migration
+        validate_steward_executor_schema(conn)
+        conn.close()
+
+    def test_validate_steward_executor_schema_raises_if_lifetime_cycles_missing(self, tmp_path):
+        """validate_steward_executor_schema raises RuntimeError when lifetime_cycles absent."""
+        from src.orchestration.registry import validate_steward_executor_schema
+        # Build a minimal DB without lifetime_cycles
+        db_path = tmp_path / "minimal.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("""
+            CREATE TABLE uow_registry (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'proposed',
+                summary TEXT NOT NULL DEFAULT '',
+                workflow_artifact TEXT,
+                success_criteria TEXT NOT NULL DEFAULT '',
+                prescribed_skills TEXT,
+                steward_cycles INTEGER NOT NULL DEFAULT 0,
+                -- lifetime_cycles intentionally omitted
+                timeout_at TEXT,
+                estimated_runtime INTEGER,
+                steward_agenda TEXT,
+                steward_log TEXT
+            )
+        """)
+        conn.commit()
+        conn.row_factory = sqlite3.Row
+
+        with pytest.raises(RuntimeError, match="lifetime_cycles"):
+            validate_steward_executor_schema(conn)
+        conn.close()

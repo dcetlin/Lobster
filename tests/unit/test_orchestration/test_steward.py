@@ -133,6 +133,10 @@ def _make_uow_row(
     uow_id: str | None = None,
     status: str = "ready-for-steward",
     steward_cycles: int = 0,
+    # lifetime_cycles: cumulative across all retries. Defaults to mirror steward_cycles
+    # so that existing tests setting steward_cycles=5 also get lifetime_cycles=5
+    # (correct: steward_cycles can never exceed lifetime_cycles in real usage).
+    lifetime_cycles: int | None = None,
     output_ref: str | None = None,
     audit_log_entries: list[dict] | None = None,
     steward_agenda: str | None = None,
@@ -146,20 +150,22 @@ def _make_uow_row(
     """Insert a UoW row and optional audit entries. Returns the uow_id."""
     if uow_id is None:
         uow_id = f"uow_test_{uuid.uuid4().hex[:6]}"
+    # lifetime_cycles defaults to steward_cycles: in real usage, lifetime can never be less.
+    effective_lifetime_cycles = lifetime_cycles if lifetime_cycles is not None else steward_cycles
     now = _now_iso()
     conn.execute(
         """
         INSERT INTO uow_registry
             (id, type, source, source_issue_number, sweep_date, status, posture,
-             created_at, updated_at, summary, output_ref, steward_cycles,
+             created_at, updated_at, summary, output_ref, steward_cycles, lifetime_cycles,
              steward_agenda, steward_log, success_criteria, prescribed_skills,
              route_evidence, trigger)
         VALUES (?, 'executable', 'github:issue/42', ?, '2026-01-01', ?, 'solo',
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}')
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}')
         """,
         (uow_id, source_issue_number, status, now, now, summary,
-         output_ref, steward_cycles, steward_agenda, steward_log,
-         success_criteria, prescribed_skills),
+         output_ref, steward_cycles, effective_lifetime_cycles,
+         steward_agenda, steward_log, success_criteria, prescribed_skills),
     )
     if audit_log_entries:
         for entry in audit_log_entries:
@@ -297,8 +303,12 @@ def _import_steward():
 # ---------------------------------------------------------------------------
 
 class TestSchemaValidation:
-    def test_validate_phase2_passes_with_phase2_schema(self, db_path):
-        """validate_phase2_schema raises nothing when all Phase 2 fields are present."""
+    def test_validate_phase2_passes_with_phase2_schema(self, db_path, registry):
+        """validate_phase2_schema raises nothing when all required fields are present.
+
+        The registry fixture runs migrations (including 0008 which adds lifetime_cycles),
+        ensuring the schema is fully up to date before validation runs.
+        """
         steward = _import_steward()
         conn = _open_db(db_path)
         try:
@@ -756,6 +766,174 @@ class TestHardCap:
         assert "hard_cap" not in notifications, "Cycles=4 must not fire hard cap"
         uow = _get_uow(db_path, uow_id)
         assert uow["status"] != "blocked"
+
+
+# ---------------------------------------------------------------------------
+# Test: hard cap uses lifetime_cycles, not steward_cycles
+# ---------------------------------------------------------------------------
+
+# Named constant from the spec
+_HARD_CAP_CYCLES = 5
+
+
+def _make_uow_row_with_lifetime(
+    conn: sqlite3.Connection,
+    uow_id: str | None = None,
+    status: str = "ready-for-steward",
+    steward_cycles: int = 0,
+    lifetime_cycles: int = 0,
+    output_ref: str | None = None,
+    source_issue_number: int = 42,
+    summary: str = "Test UoW with lifetime",
+    success_criteria: str = "Done when output exists.",
+) -> str:
+    """Insert a UoW row including lifetime_cycles. Returns the uow_id."""
+    import uuid as _uuid
+    if uow_id is None:
+        uow_id = f"uow_lt_{_uuid.uuid4().hex[:6]}"
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        INSERT INTO uow_registry
+            (id, type, source, source_issue_number, sweep_date, status, posture,
+             created_at, updated_at, summary, output_ref, steward_cycles, lifetime_cycles,
+             success_criteria, route_evidence, trigger)
+        VALUES (?, 'executable', 'github:issue/42', ?, '2026-01-01', ?, 'solo',
+                ?, ?, ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}')
+        """,
+        (uow_id, source_issue_number, status, now, now, summary,
+         output_ref, steward_cycles, lifetime_cycles, success_criteria),
+    )
+    conn.commit()
+    return uow_id
+
+
+class TestHardCapUsesLifetimeCycles:
+    """
+    The hard-cap circuit breaker must check lifetime_cycles, not steward_cycles.
+    A UoW that accumulates cycles across multiple decide-retry resets cannot
+    bypass the cap simply because steward_cycles was reset to 0.
+    """
+
+    def test_lifetime_cycles_at_cap_triggers_hard_cap_even_when_steward_cycles_zero(
+        self, db_path, registry, tmp_path
+    ):
+        """
+        lifetime_cycles=5, steward_cycles=0 → hard_cap fires.
+
+        This is the core regression guard: after a decide-retry, steward_cycles
+        resets to 0 but the UoW has already burned through its lifetime budget.
+        The hard cap must fire based on lifetime_cycles.
+        """
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+        notifications = []
+
+        def capture_notification(uow, condition, surface_log=None, return_reason=None):
+            notifications.append(condition)
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row_with_lifetime(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=0,        # reset by decide-retry
+            lifetime_cycles=_HARD_CAP_CYCLES,   # but lifetime budget is exhausted
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan=capture_notification,
+        )
+
+        assert "hard_cap" in notifications, (
+            "Hard cap must fire when lifetime_cycles >= _HARD_CAP_CYCLES, "
+            "regardless of steward_cycles value"
+        )
+        uow = _get_uow(db_path, uow_id)
+        assert uow["status"] == "blocked"
+
+    def test_steward_cycles_at_cap_but_lifetime_cycles_below_cap_does_not_fire(
+        self, db_path, registry, tmp_path
+    ):
+        """
+        steward_cycles=5, lifetime_cycles=0 (impossible in practice but verifies
+        direction of change: if the old code was checking steward_cycles, this
+        would fire; under the new code using lifetime_cycles, it should fire too
+        because the gap between them is the whole point).
+
+        Actually this verifies the inverse: when lifetime_cycles < cap, even if
+        steward_cycles matches cap, we check lifetime_cycles.
+        Since in practice steward_cycles <= lifetime_cycles always holds
+        (lifetime accumulates steward_cycles), we test the readable scenario:
+        steward_cycles=3, lifetime_cycles=4 → should NOT fire.
+        """
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+        notifications = []
+
+        def capture_notification(uow, condition, surface_log=None, return_reason=None):
+            notifications.append(condition)
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row_with_lifetime(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=3,
+            lifetime_cycles=4,   # one below cap
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan=capture_notification,
+        )
+
+        assert "hard_cap" not in notifications, (
+            "Hard cap must not fire when lifetime_cycles < _HARD_CAP_CYCLES"
+        )
+
+    def test_lifetime_cycles_below_cap_allows_prescription(
+        self, db_path, registry, tmp_path
+    ):
+        """
+        lifetime_cycles=2 (well below cap) → Steward may prescribe normally,
+        not blocked by cap.
+        """
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+        notifications = []
+
+        def capture_notification(uow, condition, surface_log=None, return_reason=None):
+            notifications.append(condition)
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row_with_lifetime(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=0,
+            lifetime_cycles=2,
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            notify_dan=capture_notification,
+        )
+
+        assert "hard_cap" not in notifications, (
+            "lifetime_cycles=2 is below the cap and must not trigger hard_cap"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3275,9 +3453,12 @@ class TestInlineExecutorDispatch:
         db_path = tmp_path / "registry.db"
         conn = _open_db(db_path)
         _apply_phase2_schema(conn)
+        conn.close()
+        # Init Registry first so migration 0008 adds lifetime_cycles before _make_uow_row.
+        registry = Registry(db_path)
+        conn = _open_db(db_path)
         uow_id = _make_uow_row(conn, status="ready-for-steward", source_issue_number=42)
         conn.close()
-        registry = Registry(db_path)
         return db_path, registry, uow_id
 
     def test_inline_executor_called_after_prescription(self, tmp_path):

@@ -199,13 +199,16 @@ _STATUS_BLOCKED = UoWStatus.BLOCKED
 # Actor identifier written to audit entries
 _ACTOR_STEWARD = "steward"
 
-# Hard cap: surface to Dan unconditionally if steward_cycles >= this value
+# Hard cap: surface to Dan unconditionally if lifetime_cycles >= this value.
+# lifetime_cycles accumulates across all decide-retry resets, so this is a true
+# per-UoW-lifetime circuit breaker. steward_cycles (per-attempt) is NOT used here.
 _HARD_CAP_CYCLES = 5
 
 # Early warning threshold: notify Dan when steward_cycles reaches this value
 _EARLY_WARNING_CYCLES = 4
 
-# Crash surface threshold: surface if crashed_no_output and cycles >= this value
+# Crash surface threshold: surface if crashed_no_output and steward_cycles >= this value.
+# Uses per-attempt steward_cycles (not lifetime_cycles) — crash detection is per-attempt.
 _CRASH_SURFACE_CYCLES = 2
 
 # Fields required by the Steward for operation
@@ -214,6 +217,7 @@ _STEWARD_REQUIRED_FIELDS = frozenset({
     "success_criteria",
     "prescribed_skills",
     "steward_cycles",
+    "lifetime_cycles",
     "timeout_at",
     "estimated_runtime",
     "steward_agenda",
@@ -492,11 +496,11 @@ def _assess_completion(
     - output_ref is not NULL and file exists and is non-empty
     - Most recent execution cycle had execution_complete (not stall/crash)
     - Output content confirms original intent is addressed
-    - steward_cycles < HARD_CAP_CYCLES
+    - lifetime_cycles < HARD_CAP_CYCLES
     """
-    cycles = uow.steward_cycles
+    cycles = uow.lifetime_cycles
     if cycles >= _HARD_CAP_CYCLES:
-        return False, f"hard_cap: steward_cycles={cycles} >= {_HARD_CAP_CYCLES}", None
+        return False, f"hard_cap: lifetime_cycles={cycles} >= {_HARD_CAP_CYCLES}", None
 
     if reentry_posture == "first_execution":
         return False, "first_execution: awaiting executor dispatch", None
@@ -1898,13 +1902,13 @@ def _detect_stuck_condition(
     - no_gate_improvement: fires for iterative-convergent when gate_score has not improved
       over the last _NON_IMPROVING_GATE_THRESHOLD consecutive cycles (reads from steward_log).
     """
-    cycles = uow.steward_cycles
+    cycles = uow.lifetime_cycles
 
     if cycles >= _HARD_CAP_CYCLES:
         return "hard_cap"
 
-    # crashed_no_output + cycles >= 2
-    if return_reason == "crashed_no_output" and cycles >= _CRASH_SURFACE_CYCLES:
+    # crashed_no_output + cycles >= 2 (uses steward_cycles for per-attempt crash detection)
+    if return_reason == "crashed_no_output" and uow.steward_cycles >= _CRASH_SURFACE_CYCLES:
         return "crash_repeated"
 
     # PR C, Change 4a: philosophical_register — surface after first execution
@@ -2148,17 +2152,19 @@ def _default_notify_dan(
     trying to accomplish) so Dan can triage without leaving the inbox thread.
     """
     uow_id = uow.id
-    cycles = uow.steward_cycles
+    # Use lifetime_cycles for hard_cap reporting (that's what triggered it);
+    # steward_cycles for other conditions (per-attempt context).
+    cycles = uow.lifetime_cycles if condition == "hard_cap" else uow.steward_cycles
     log.warning(
-        "SURFACE TO DAN: UoW %s — condition=%s cycles=%s",
-        uow_id, condition, cycles,
+        "SURFACE TO DAN: UoW %s — condition=%s cycles=%s (lifetime_cycles=%s)",
+        uow_id, condition, cycles, uow.lifetime_cycles,
     )
     msg_id = str(uuid.uuid4())
     if condition == "hard_cap":
         # Hard cap: exhaustive context so Dan can triage and act without
         # digging through logs. Include summary, agenda, log, and reason.
         body_lines = [
-            f"WOS: UoW `{uow_id}` hit hard cap ({_HARD_CAP_CYCLES} cycles). "
+            f"WOS: UoW `{uow_id}` hit hard cap ({_HARD_CAP_CYCLES} lifetime cycles). "
             f"return_reason: {return_reason}.",
         ]
 
