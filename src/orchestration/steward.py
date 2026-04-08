@@ -176,6 +176,123 @@ StewardOutcome = Prescribed | Done | Surfaced | RaceSkipped | WaitForTrace
 
 
 # ---------------------------------------------------------------------------
+# Steward decision enums (golden pattern: StrEnum for exhaustiveness checks)
+# ---------------------------------------------------------------------------
+
+class ReentryPosture(StrEnum):
+    """Categorized executor state from audit trail analysis."""
+    FIRST_EXECUTION = "first_execution"
+    EXECUTION_COMPLETE = "execution_complete"
+    STALL_DETECTED = "stall_detected"
+    STARTUP_SWEEP_POSSIBLY_COMPLETE = "startup_sweep_possibly_complete"
+    CRASHED_NO_OUTPUT = "crashed_no_output"
+    CRASHED_ZERO_BYTES = "crashed_zero_bytes"
+    CRASHED_OUTPUT_REF_MISSING = "crashed_output_ref_missing"
+    EXECUTION_FAILED = "execution_failed"
+    EXECUTOR_ORPHAN = "executor_orphan"
+    DIAGNOSING_ORPHAN = "diagnosing_orphan"
+
+
+class ReturnReasonClassification(StrEnum):
+    """Classification of return_reason strings."""
+    NORMAL = "normal"
+    BLOCKED = "blocked"
+    ABNORMAL = "abnormal"
+    ERROR = "error"
+    ORPHAN = "orphan"
+
+
+class StuckCondition(StrEnum):
+    """Conditions that trigger surface-to-Dan."""
+    HARD_CAP = "hard_cap"
+    CRASH_REPEATED = "crash_repeated"
+    PHILOSOPHICAL_REGISTER = "philosophical_register"
+    NO_GATE_IMPROVEMENT = "no_gate_improvement"
+    EXECUTOR_BLOCKED = "executor_blocked"
+    REGISTER_MISMATCH = "register_mismatch"
+
+
+# ---------------------------------------------------------------------------
+# Typed diagnostic and result structures (golden pattern: frozen dataclasses)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class Diagnosis:
+    """
+    Result of diagnosing a UoW's execution state.
+
+    All fields are immutable. Created by _diagnose_uow() as a pure
+    computation from UoW + audit trail inputs.
+    """
+    reentry_posture: str  # Use str to allow ReentryPosture or legacy string values
+    return_reason: str | None
+    return_reason_classification: str  # Use str to allow ReturnReasonClassification or legacy
+    output_content: str
+    output_valid: bool
+    is_complete: bool
+    completion_rationale: str
+    stuck_condition: str | None  # Use str to allow StuckCondition or legacy string values
+    executor_outcome: str | None
+    success_criteria_missing: bool
+
+
+@dataclass(frozen=True, slots=True)
+class IssueInfo:
+    """
+    GitHub issue information fetched via gh CLI.
+
+    Replaces dict[str, Any] return from _fetch_github_issue.
+    """
+    status_code: int
+    state: str | None
+    labels: list[str]
+    body: str
+    title: str
+
+
+@dataclass(frozen=True, slots=True)
+class LLMPrescription:
+    """
+    Result from LLM-based prescription generation.
+
+    Replaces dict[str, Any] return from _llm_prescribe.
+    """
+    instructions: str
+    success_criteria_check: str
+    estimated_cycles: int
+
+
+@dataclass(frozen=True, slots=True)
+class CycleResult:
+    """
+    Result of a complete Steward heartbeat cycle.
+
+    Replaces dict[str, Any] return from run_steward_cycle.
+    """
+    evaluated: int
+    prescribed: int
+    done: int
+    surfaced: int
+    skipped: int
+    race_skipped: int
+    wait_for_trace: int
+    considered_ids: tuple[str, ...]  # Use tuple for hashability with frozen=True
+
+    def as_dict(self) -> dict[str, Any]:
+        """Convert to dict for backward compatibility with callers expecting dict."""
+        return {
+            "evaluated": self.evaluated,
+            "prescribed": self.prescribed,
+            "done": self.done,
+            "surfaced": self.surfaced,
+            "skipped": self.skipped,
+            "race_skipped": self.race_skipped,
+            "wait_for_trace": self.wait_for_trace,
+            "considered_ids": list(self.considered_ids),
+        }
+
+
+# ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
 
@@ -639,77 +756,78 @@ def _assess_completion(
 # Per-cycle trace entry builder (pure functions — no DB writes)
 # ---------------------------------------------------------------------------
 
-def _posture_rationale(diagnosis: dict) -> str:
+def _posture_rationale(diagnosis: Diagnosis, cycles: int) -> str:
     """
     Return a 1-sentence rationale for the current posture.
 
     Pure function: derives the string deterministically from diagnosis fields.
     No LLM, no DB reads. Called by _build_trace_entry().
     """
-    posture = diagnosis.get("reentry_posture", "unknown")
-    cycles = diagnosis.get("_cycles", 0)
+    posture = diagnosis.reentry_posture
 
-    if posture == "first_execution":
-        return "No prior audit entries — first steward contact, dispatching executor."
-    elif posture == "execution_complete":
-        return "Executor result file present and valid — assessing completion."
-    elif posture == "crashed_output_ref_missing":
-        return "Startup sweep detected missing output_ref — executor may have crashed."
-    elif posture == "executor_orphan":
-        return "UoW stuck in ready-for-executor beyond threshold — executor never claimed."
-    elif posture == "diagnosing_orphan":
-        return "Steward crashed mid-diagnosis — re-diagnosing from current state."
-    elif posture == "steward_cycle_cap":
-        return f"Steward cycle cap reached ({cycles} cycles) — surfacing to Dan."
-    else:
-        return f"Posture: {posture}."
+    match posture:
+        case "first_execution":
+            return "No prior audit entries — first steward contact, dispatching executor."
+        case "execution_complete":
+            return "Executor result file present and valid — assessing completion."
+        case "crashed_output_ref_missing":
+            return "Startup sweep detected missing output_ref — executor may have crashed."
+        case "executor_orphan":
+            return "UoW stuck in ready-for-executor beyond threshold — executor never claimed."
+        case "diagnosing_orphan":
+            return "Steward crashed mid-diagnosis — re-diagnosing from current state."
+        case "steward_cycle_cap":
+            return f"Steward cycle cap reached ({cycles} cycles) — surfacing to Dan."
+        case _:
+            return f"Posture: {posture}."
 
 
-def _extract_criteria_checks(diagnosis: dict) -> list[dict]:
+def _extract_criteria_checks(diagnosis: Diagnosis) -> list[dict]:
     """
-    Extract success criteria check results from the diagnosis dict.
+    Extract success criteria check results from the Diagnosis.
 
     Pure function: maps is_complete + completion_rationale to a list of
     check dicts with {name, passed, evidence}. Always returns a list.
     """
-    is_complete = diagnosis.get("is_complete", False)
-    completion_rationale = diagnosis.get("completion_rationale", "")
     return [
         {
             "name": "completion_check",
-            "passed": bool(is_complete),
-            "evidence": completion_rationale,
+            "passed": bool(diagnosis.is_complete),
+            "evidence": diagnosis.completion_rationale,
         }
     ]
 
 
-def _posture_prediction(diagnosis: dict) -> str | None:
+def _posture_prediction(diagnosis: Diagnosis) -> str | None:
     """
     Return a forward prediction string based on the diagnosis.
 
     Pure function: deterministic based on posture and completion state.
     Returns None only when there is genuinely nothing to predict (done).
     """
-    posture = diagnosis.get("reentry_posture", "unknown")
-    is_complete = diagnosis.get("is_complete", False)
-    stuck_condition = diagnosis.get("stuck_condition")
+    posture = diagnosis.reentry_posture
+    is_complete = diagnosis.is_complete
+    stuck_condition = diagnosis.stuck_condition
 
     if stuck_condition:
         return "Will be surfaced to Dan — stuck condition detected."
     if is_complete:
         return "Closure will be declared — completion criteria satisfied."
-    if posture == "first_execution":
-        return "Executor will be dispatched for first execution pass."
-    if posture == "execution_complete":
-        return "Completion check will determine next action (prescribe or close)."
-    if posture in ("crashed_no_output", "execution_failed"):
-        return "Re-prescription will be issued after failure analysis."
-    if posture == "executor_orphan":
-        return "Re-prescription will be issued — executor never claimed UoW."
-    return "Next prescription will be determined from diagnosis output."
+
+    match posture:
+        case "first_execution":
+            return "Executor will be dispatched for first execution pass."
+        case "execution_complete":
+            return "Completion check will determine next action (prescribe or close)."
+        case "crashed_no_output" | "execution_failed":
+            return "Re-prescription will be issued after failure analysis."
+        case "executor_orphan":
+            return "Re-prescription will be issued — executor never claimed UoW."
+        case _:
+            return "Next prescription will be determined from diagnosis output."
 
 
-def _build_trace_entry(diagnosis: dict, cycles: int) -> dict:
+def _build_trace_entry(diagnosis: Diagnosis, cycles: int) -> dict:
     """
     Build a single steward_agenda trace entry from a completed diagnosis.
 
@@ -717,23 +835,20 @@ def _build_trace_entry(diagnosis: dict, cycles: int) -> dict:
     _process_uow() after diagnosis and before the stuck/done/prescribe split.
 
     Args:
-        diagnosis: dict returned by _diagnose_uow().
+        diagnosis: typed Diagnosis returned by _diagnose_uow().
         cycles: current uow.steward_cycles (pre-increment).
 
     Returns:
         Trace entry dict conforming to the v2 cycle trace entry schema.
     """
-    # Inject cycles so _posture_rationale can access it for the cycle-cap case
-    diagnosis_with_cycles = {**diagnosis, "_cycles": cycles}
-
     return {
         "cycle": cycles,
-        "posture": diagnosis.get("reentry_posture", "unknown"),
-        "posture_rationale": _posture_rationale(diagnosis_with_cycles),
+        "posture": diagnosis.reentry_posture,
+        "posture_rationale": _posture_rationale(diagnosis, cycles),
         "success_criteria_checked": _extract_criteria_checks(diagnosis),
         "anomalies": (
-            [diagnosis["stuck_condition"]]
-            if diagnosis.get("stuck_condition")
+            [diagnosis.stuck_condition]
+            if diagnosis.stuck_condition
             else []
         ),
         "prediction": _posture_prediction(diagnosis),
@@ -1043,17 +1158,17 @@ def _llm_prescribe(
     reentry_posture: str,
     completion_gap: str,
     issue_body: str = "",
-) -> dict[str, Any] | None:
+) -> LLMPrescription | None:
     """
     Call Claude to generate a tailored prescription for the given UoW.
 
     Dispatches via `claude -p` subprocess (the Lobster-standard LLM call path).
     No ANTHROPIC_API_KEY or anthropic SDK required — the claude CLI handles auth.
 
-    Returns a dict with keys:
-      - "instructions": str — full instruction block for the Executor
-      - "success_criteria_check": str — how to verify completion
-      - "estimated_cycles": int — expected execution passes needed
+    Returns a typed LLMPrescription dataclass containing:
+      - instructions: str — full instruction block for the Executor
+      - success_criteria_check: str — how to verify completion
+      - estimated_cycles: int — expected execution passes needed
 
     Returns None if the subprocess fails, times out, or returns unparseable output.
     The caller must fall back to the deterministic template on None.
@@ -1251,11 +1366,11 @@ success_criteria_check: <one or two sentences describing exactly how to verify t
         "_llm_prescribe: LLM prescription generated for %s (model=%s, estimated_cycles=%d)",
         uow.id, model, estimated_cycles,
     )
-    return {
-        "instructions": instructions,
-        "success_criteria_check": success_criteria_check,
-        "estimated_cycles": max(1, min(3, estimated_cycles)),
-    }
+    return LLMPrescription(
+        instructions=instructions,
+        success_criteria_check=success_criteria_check,
+        estimated_cycles=max(1, min(3, estimated_cycles)),
+    )
 
 
 def _fetch_prior_prescriptions(
@@ -1697,7 +1812,7 @@ def _build_prescription_instructions(
     reentry_posture: str,
     completion_gap: str,
     issue_body: str = "",
-    llm_prescriber: Callable[..., dict[str, Any] | None] | None = _llm_prescribe,
+    llm_prescriber: Callable[..., LLMPrescription | None] | None = _llm_prescribe,
     prior_prescriptions: list[dict[str, Any]] | None = None,
 ) -> str:
     """
@@ -1713,8 +1828,8 @@ def _build_prescription_instructions(
         completion_gap: Human-readable rationale for why work is incomplete.
         issue_body: Raw GitHub issue body text. Used when success_criteria is absent.
         llm_prescriber: Callable that takes (uow, reentry_posture, completion_gap,
-            issue_body) and returns a dict or None. Inject None or a stub in tests
-            to bypass the LLM call. Defaults to _llm_prescribe.
+            issue_body) and returns LLMPrescription or None. Inject None or a stub
+            in tests to bypass the LLM call. Defaults to _llm_prescribe.
         prior_prescriptions: List of prior steward_log prescription entries
             (from _fetch_prior_prescriptions). No longer used since deterministic
             fallback is removed. Kept for backward compatibility.
@@ -1738,8 +1853,8 @@ def _build_prescription_instructions(
             "Check steward logs for details. No deterministic fallback is performed."
         )
 
-    instructions = llm_result["instructions"]
-    success_check = llm_result.get("success_criteria_check", "")
+    instructions = llm_result.instructions
+    success_check = llm_result.success_criteria_check
     # Append the success_criteria_check as a verification note so the
     # Executor has an explicit completion signal alongside the instructions.
     if success_check:
@@ -1944,27 +2059,19 @@ def _detect_stuck_condition(
 
 
 # ---------------------------------------------------------------------------
-# Core per-UoW diagnosis function (pure — returns diagnosis dict, no DB writes)
+# Core per-UoW diagnosis function (pure — returns typed Diagnosis, no DB writes)
 # ---------------------------------------------------------------------------
 
 def _diagnose_uow(
     uow: UoW,
     audit_entries: list[dict],
-    issue_info: dict[str, Any] | None,
-) -> dict[str, Any]:
+    issue_info: IssueInfo | None,
+) -> Diagnosis:
     """
     Produce a diagnosis for a single UoW.
 
-    Pure function: reads inputs, returns a diagnosis dict with fields:
-    - reentry_posture: str
-    - return_reason: str | None
-    - return_reason_classification: str
-    - output_content: str
-    - output_valid: bool
-    - is_complete: bool
-    - completion_rationale: str
-    - stuck_condition: str | None
-    - success_criteria_missing: bool
+    Pure function: reads inputs, returns a typed Diagnosis dataclass.
+    The Diagnosis is frozen and immutable — callers cannot modify it.
     """
     return_reason = _most_recent_return_reason(audit_entries)
     reentry_posture = _determine_reentry_posture(audit_entries, return_reason)
@@ -1991,18 +2098,18 @@ def _diagnose_uow(
     if stuck_condition == "hard_cap":
         is_complete = False
 
-    return {
-        "reentry_posture": reentry_posture,
-        "return_reason": return_reason,
-        "return_reason_classification": classification,
-        "output_content": output_content,
-        "output_valid": output_valid,
-        "is_complete": is_complete,
-        "completion_rationale": completion_rationale,
-        "stuck_condition": stuck_condition,
-        "executor_outcome": executor_outcome,
-        "success_criteria_missing": success_criteria_missing,
-    }
+    return Diagnosis(
+        reentry_posture=reentry_posture,
+        return_reason=return_reason,
+        return_reason_classification=classification,
+        output_content=output_content,
+        output_valid=output_valid,
+        is_complete=is_complete,
+        completion_rationale=completion_rationale,
+        stuck_condition=stuck_condition,
+        executor_outcome=executor_outcome,
+        success_criteria_missing=success_criteria_missing,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2032,12 +2139,12 @@ def _repo_from_issue_url(issue_url: str | None) -> str | None:
     return None
 
 
-def _fetch_github_issue(issue_number: int, repo: str) -> dict[str, Any]:
+def _fetch_github_issue(issue_number: int, repo: str) -> IssueInfo:
     """
     Fetch issue info from GitHub using gh CLI for a given repo.
 
-    Returns dict with keys: status_code, state, labels (list), body, title.
-    On any error, returns status_code=0 with empty fields.
+    Returns a typed IssueInfo dataclass.
+    On any error, returns IssueInfo with status_code=0 and empty fields.
     """
     command = [
         "gh", "issue", "view", str(issue_number),
@@ -2056,27 +2163,27 @@ def _fetch_github_issue(issue_number: int, repo: str) -> dict[str, Any]:
 
     if error:
         log.warning("GitHub fetch error for %s#%s: %s", repo, issue_number, error.summary())
-        return {"status_code": 0, "state": None, "labels": [], "body": "", "title": ""}
+        return IssueInfo(status_code=0, state=None, labels=[], body="", title="")
 
     if result is None or result.returncode != 0:
-        return {"status_code": 1, "state": None, "labels": [], "body": "", "title": ""}
+        return IssueInfo(status_code=1, state=None, labels=[], body="", title="")
 
     try:
         data = json.loads(result.stdout)
         labels = [l.get("name", "") for l in data.get("labels", [])]
-        return {
-            "status_code": 200,
-            "state": data.get("state", "open"),
-            "labels": labels,
-            "body": data.get("body", ""),
-            "title": data.get("title", ""),
-        }
+        return IssueInfo(
+            status_code=200,
+            state=data.get("state", "open"),
+            labels=labels,
+            body=data.get("body", ""),
+            title=data.get("title", ""),
+        )
     except Exception as e:
         log.warning("GitHub parse error for issue %s (repo=%s): %s", issue_number, repo, e)
-        return {"status_code": 0, "state": None, "labels": [], "body": "", "title": ""}
+        return IssueInfo(status_code=0, state=None, labels=[], body="", title="")
 
 
-def _default_github_client(issue_number: int) -> dict[str, Any]:
+def _default_github_client(issue_number: int) -> IssueInfo:
     """
     Fetch issue info from GitHub using gh CLI.
 
@@ -2085,8 +2192,7 @@ def _default_github_client(issue_number: int) -> dict[str, Any]:
     issue_url and the Steward loop calls _fetch_github_issue directly
     with the derived repo, bypassing this function.
 
-    Returns dict with keys: status_code, state, labels (list), body, title.
-    On any error, returns status_code=0 with empty fields.
+    Returns a typed IssueInfo dataclass.
     """
     return _fetch_github_issue(issue_number, repo="dcetlin/Lobster")
 
@@ -2388,20 +2494,22 @@ def _process_uow(
     uow: UoW,
     registry,
     audit_entries: list[dict[str, Any]],
-    issue_info: dict[str, Any] | None,
+    issue_info: IssueInfo | None,
     dry_run: bool,
     artifact_dir: Path | None,
     notify_dan: Callable | None,
     notify_dan_early_warning: Callable | None = None,
-    llm_prescriber: Callable[..., dict[str, Any] | None] | None = _llm_prescribe,
+    llm_prescriber: Callable[..., LLMPrescription | None] | None = _llm_prescribe,
     inline_executor: Callable[[str], Any] | None = None,
 ) -> StewardOutcome:
     """
     Process a single UoW through the full diagnosis + prescribe/close/surface cycle.
 
-    Returns a StewardOutcome: Prescribed | Done | Surfaced | RaceSkipped.
+    Returns a StewardOutcome: Prescribed | Done | Surfaced | RaceSkipped | WaitForTrace.
 
     Args:
+        issue_info: Typed IssueInfo from GitHub API (or None if no issue).
+        llm_prescriber: Callable returning LLMPrescription or None. Inject None to bypass LLM.
         inline_executor: Optional callable(uow_id) that is invoked immediately after
             the READY_FOR_EXECUTOR transition, collapsing the polling hop described in
             issue #648 Part A.  When provided, the Steward dispatches the Executor
@@ -2433,7 +2541,7 @@ def _process_uow(
 
     if cycles == 0:
         # Build initial agenda before any other action
-        issue_body = issue_info.get("body", "") if issue_info else ""
+        issue_body = issue_info.body if issue_info else ""
         agenda = _build_initial_agenda(uow, issue_body)
         agenda_log_entry = {
             "event": "agenda_update",
@@ -2459,15 +2567,15 @@ def _process_uow(
                 "timestamp": _now_iso(),
             })
 
-    # Step 3: Diagnose
+    # Step 3: Diagnose — returns typed Diagnosis dataclass
     diagnosis = _diagnose_uow(uow, audit_entries, issue_info)
-    reentry_posture = diagnosis["reentry_posture"]
-    return_reason = diagnosis["return_reason"]
-    is_complete = diagnosis["is_complete"]
-    completion_rationale = diagnosis["completion_rationale"]
-    stuck_condition = diagnosis["stuck_condition"]
-    success_criteria_missing = diagnosis["success_criteria_missing"]
-    executor_outcome = diagnosis.get("executor_outcome")
+    reentry_posture = diagnosis.reentry_posture
+    return_reason = diagnosis.return_reason
+    is_complete = diagnosis.is_complete
+    completion_rationale = diagnosis.completion_rationale
+    stuck_condition = diagnosis.stuck_condition
+    success_criteria_missing = diagnosis.success_criteria_missing
+    executor_outcome = diagnosis.executor_outcome
 
     # Append diagnosis to steward_log
     diag_log_entry = {
@@ -2900,7 +3008,7 @@ def _process_uow(
             f"[gate_score={score_val}, cmd={gate_cmd!r}]"
         )
 
-    issue_body = issue_info.get("body", "") if issue_info else ""
+    issue_body = issue_info.body if issue_info else ""
 
     # Fetch prior prescription attempts from steward_log when re-prescribing
     # (cycles > 0).  This lets the Executor see what was already tried so it
@@ -2920,7 +3028,7 @@ def _process_uow(
         reentry_posture_arg: str,
         completion_gap_arg: str,
         issue_body_arg: str = "",
-    ) -> dict[str, Any] | None:
+    ) -> LLMPrescription | None:
         result = llm_prescriber(uow_arg, reentry_posture_arg, completion_gap_arg, issue_body_arg)  # type: ignore[misc]
         if result is not None:
             _llm_path_taken[0] = True
@@ -3098,15 +3206,15 @@ def _process_uow(
 def run_steward_cycle(
     registry=None,
     dry_run: bool = False,
-    github_client: Callable[[int], dict[str, Any]] | None = None,
+    github_client: Callable[[int], IssueInfo] | None = None,
     artifact_dir: Path | None = None,
     notify_dan: Callable | None = None,
     notify_dan_early_warning: Callable | None = None,
     bootup_candidate_gate: bool | None = None,
     db_path: Path | None = None,
-    llm_prescriber: Callable[..., dict[str, Any] | None] | None = _llm_prescribe,
+    llm_prescriber: Callable[..., LLMPrescription | None] | None = _llm_prescribe,
     inline_executor: Callable[[str], Any] | None = None,
-) -> dict[str, Any]:
+) -> CycleResult:
     """
     Execute one full Steward heartbeat cycle.
 
@@ -3119,7 +3227,7 @@ def run_steward_cycle(
     dry_run:
         If True, diagnose without writing artifacts or transitioning state.
     github_client:
-        Callable(issue_number) → {status_code, state, labels, body, title}.
+        Callable(issue_number) → IssueInfo. Returns typed issue info.
         Defaults to the production gh CLI client.
     artifact_dir:
         Override for the artifact directory path. Used in tests.
@@ -3135,7 +3243,7 @@ def run_steward_cycle(
     db_path:
         Path to registry DB. Only used if registry is None.
     llm_prescriber:
-        Callable(uow, reentry_posture, completion_gap, issue_body) → dict | None.
+        Callable(uow, reentry_posture, completion_gap, issue_body) → LLMPrescription | None.
         Called during prescription to generate LLM-quality instructions.
         Inject None to bypass LLM (tests), or a stub to capture calls.
         Defaults to _llm_prescribe (production path).
@@ -3146,14 +3254,9 @@ def run_steward_cycle(
 
     Returns
     -------
-    dict with keys:
-        evaluated: int — UoWs processed
-        prescribed: int — UoWs advanced to ready-for-executor
-        done: int — UoWs closed as done
-        surfaced: int — UoWs surfaced to Dan
-        skipped: int — UoWs skipped (gate, race, etc.)
-        race_skipped: int — UoWs skipped due to optimistic lock race
-        considered_ids: list[str] — IDs of UoWs considered in this cycle
+    CycleResult:
+        Typed dataclass with fields: evaluated, prescribed, done, surfaced, skipped,
+        race_skipped, considered_ids. Call .as_dict() for dict compatibility.
     """
     from src.orchestration.registry import Registry
 
@@ -3213,7 +3316,7 @@ def run_steward_cycle(
         # issue_url is NULL, fall back to _github_client (which uses the legacy
         # hardcoded repo). Pure resolution: no side effects.
         resolved_repo = _repo_from_issue_url(getattr(uow, "issue_url", None))
-        def _resolve_issue_info(n: int) -> dict[str, Any]:
+        def _resolve_issue_info(n: int) -> IssueInfo:
             if resolved_repo:
                 return _fetch_github_issue(n, resolved_repo)
             return _github_client(n)
@@ -3221,7 +3324,7 @@ def run_steward_cycle(
         # BOOTUP_CANDIDATE_GATE: skip if label present and gate is True
         if _gate and source_issue_number:
             issue_info = _resolve_issue_info(source_issue_number)
-            labels = issue_info.get("labels", [])
+            labels = issue_info.labels
             if "bootup-candidate" in labels:
                 log.debug(
                     "UoW %s (issue #%s) skipped: bootup-candidate gate is active",
@@ -3325,13 +3428,13 @@ def run_steward_cycle(
             case _:
                 skipped += 1
 
-    return {
-        "evaluated": evaluated,
-        "prescribed": prescribed,
-        "done": done,
-        "surfaced": surfaced,
-        "skipped": skipped,
-        "race_skipped": race_skipped,
-        "wait_for_trace": wait_for_trace,
-        "considered_ids": considered_ids,
-    }
+    return CycleResult(
+        evaluated=evaluated,
+        prescribed=prescribed,
+        done=done,
+        surfaced=surfaced,
+        skipped=skipped,
+        race_skipped=race_skipped,
+        wait_for_trace=wait_for_trace,
+        considered_ids=tuple(considered_ids),
+    )

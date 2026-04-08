@@ -375,8 +375,8 @@ class TestStewardQueryScope:
         )
 
         # Only the ready-for-steward UoW should be considered
-        assert result["evaluated"] >= 1
-        considered_ids = result.get("considered_ids", [])
+        assert result.evaluated >= 1
+        considered_ids = result.considered_ids
         if considered_ids:
             assert rfs_id in considered_ids
             assert pending_id not in considered_ids
@@ -839,12 +839,12 @@ class TestCrashRecovery:
 
 
 # ---------------------------------------------------------------------------
-# Test: Hard cap (steward_cycles >= 5)
+# Test: Hard cap (lifetime_cycles >= 9)
 # ---------------------------------------------------------------------------
 
 class TestHardCap:
     def test_hard_cap_surfaces_to_dan_not_prescribes(self, db_path, registry, tmp_path):
-        """steward_cycles >= 5 → surfaces to Dan, does not prescribe or close."""
+        """lifetime_cycles >= 9 → surfaces to Dan, does not prescribe or close."""
         _ensure_registry_has_phase2_methods(registry)
         steward = _import_steward()
 
@@ -858,7 +858,7 @@ class TestHardCap:
         uow_id = _make_uow_row(
             conn,
             status="ready-for-steward",
-            steward_cycles=5,
+            steward_cycles=9,  # lifetime_cycles defaults to steward_cycles
             output_ref=None,
         )
         conn.close()
@@ -876,8 +876,8 @@ class TestHardCap:
         assert len(notifications) == 1, "Dan must be notified exactly once"
         assert notifications[0]["condition"] == "hard_cap"
 
-    def test_hard_cap_at_exactly_5(self, db_path, registry, tmp_path):
-        """steward_cycles == 5 fires the hard cap (>=5)."""
+    def test_hard_cap_at_exactly_9(self, db_path, registry, tmp_path):
+        """lifetime_cycles == 9 fires the hard cap (>=9)."""
         _ensure_registry_has_phase2_methods(registry)
         steward = _import_steward()
         notifications = []
@@ -886,7 +886,7 @@ class TestHardCap:
             notifications.append(condition)
 
         conn = _open_db(db_path)
-        uow_id = _make_uow_row(conn, status="ready-for-steward", steward_cycles=5)
+        uow_id = _make_uow_row(conn, status="ready-for-steward", steward_cycles=9)
         conn.close()
 
         steward.run_steward_cycle(
@@ -899,8 +899,8 @@ class TestHardCap:
 
         assert "hard_cap" in notifications
 
-    def test_cycles_4_does_not_fire_hard_cap(self, db_path, registry, tmp_path):
-        """steward_cycles == 4 does NOT fire the hard cap."""
+    def test_cycles_8_does_not_fire_hard_cap(self, db_path, registry, tmp_path):
+        """lifetime_cycles == 8 does NOT fire the hard cap."""
         _ensure_registry_has_phase2_methods(registry)
         steward = _import_steward()
         notifications = []
@@ -912,7 +912,7 @@ class TestHardCap:
         uow_id = _make_uow_row(
             conn,
             status="ready-for-steward",
-            steward_cycles=4,
+            steward_cycles=8,
             output_ref=None,
         )
         conn.close()
@@ -925,7 +925,7 @@ class TestHardCap:
             notify_dan=capture_notification,
         )
 
-        assert "hard_cap" not in notifications, "Cycles=4 must not fire hard cap"
+        assert "hard_cap" not in notifications, "Cycles=8 must not fire hard cap"
         uow = _get_uow(db_path, uow_id)
         assert uow["status"] != "blocked"
 
@@ -1206,13 +1206,14 @@ class TestBootupCandidateGate:
         conn.close()
 
         def github_client_with_bootup_label(issue_number):
-            return {
-                "status_code": 200,
-                "state": "open",
-                "labels": ["bootup-candidate"],
-                "body": "Test issue body",
-                "title": "Test issue",
-            }
+            from src.orchestration.steward import IssueInfo
+            return IssueInfo(
+                status_code=200,
+                state="open",
+                labels=["bootup-candidate"],
+                body="Test issue body",
+                title="Test issue",
+            )
 
         result = steward.run_steward_cycle(
             registry=registry,
@@ -1241,13 +1242,14 @@ class TestBootupCandidateGate:
         conn.close()
 
         def github_client_with_bootup_label(issue_number):
-            return {
-                "status_code": 200,
-                "state": "open",
-                "labels": ["bootup-candidate"],
-                "body": "Test issue body",
-                "title": "Test issue",
-            }
+            from src.orchestration.steward import IssueInfo
+            return IssueInfo(
+                status_code=200,
+                state="open",
+                labels=["bootup-candidate"],
+                body="Test issue body",
+                title="Test issue",
+            )
 
         steward.run_steward_cycle(
             registry=registry,
@@ -2342,7 +2344,7 @@ class TestBackpressureSkipsRePrescription:
             "UoW with executor_orphan return reason must remain ready-for-steward, "
             f"not be re-prescribed. Got status: {uow['status']}"
         )
-        assert result["skipped"] >= 1, (
+        assert result.skipped >= 1, (
             "run_steward_cycle must count the backpressure skip in skipped counter"
         )
 
@@ -2478,15 +2480,16 @@ class TestBackpressureSkipsRePrescription:
 # Mock helpers
 # ---------------------------------------------------------------------------
 
-def _mock_github_client_open(issue_number: int) -> dict:
-    """Mock GitHub client: issue is open, no labels."""
-    return {
-        "status_code": 200,
-        "state": "open",
-        "labels": [],
-        "body": f"Issue #{issue_number}: implement this feature.\n\nAcceptance criteria:\n- Feature works",
-        "title": f"Test issue {issue_number}",
-    }
+def _mock_github_client_open(issue_number: int):
+    """Mock GitHub client: issue is open, no labels. Returns typed IssueInfo."""
+    from src.orchestration.steward import IssueInfo
+    return IssueInfo(
+        status_code=200,
+        state="open",
+        labels=[],
+        body=f"Issue #{issue_number}: implement this feature.\n\nAcceptance criteria:\n- Feature works",
+        title=f"Test issue {issue_number}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2702,9 +2705,9 @@ class TestLlmPrescription:
         result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
 
         assert result is not None
-        assert result["instructions"] == "Implement the feature."
-        assert result["estimated_cycles"] == 2
-        assert result["success_criteria_check"] == "Feature works."
+        assert result.instructions == "Implement the feature."
+        assert result.estimated_cycles == 2
+        assert result.success_criteria_check == "Feature works."
 
     def test_llm_prescribe_front_matter_missing_executor_type_returns_none(self, monkeypatch):
         """_llm_prescribe returns None when front-matter is missing executor_type."""
@@ -2756,8 +2759,8 @@ class TestLlmPrescription:
         result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
 
         assert result is not None, "Preamble before front-matter should be tolerated"
-        assert result["instructions"] == "Implement the widget feature."
-        assert result["success_criteria_check"] == "Widget renders in all browsers."
+        assert result.instructions == "Implement the widget feature."
+        assert result.success_criteria_check == "Widget renders in all browsers."
 
     def test_llm_prescribe_front_matter_no_closing_delimiter(self, monkeypatch):
         """_llm_prescribe handles missing closing --- by treating all content as front-matter."""
@@ -2885,7 +2888,7 @@ class TestLlmPrescription:
         result = steward._llm_prescribe(uow, "executor_orphan", "no prior output")
 
         assert result is not None
-        assert result["estimated_cycles"] == 1
+        assert result.estimated_cycles == 1
 
     def test_count_consecutive_llm_fallbacks_empty_log(self):
         """_count_consecutive_llm_fallbacks returns 0 for None or empty log."""
@@ -3889,7 +3892,7 @@ class TestInlineExecutorDispatch:
         )
 
         # The prescription still completes — Prescribed is counted
-        assert result["prescribed"] >= 1, (
+        assert result.prescribed >= 1, (
             "Steward must count the prescription as successful even when "
             "inline_executor raises — the UoW is in ready-for-executor for retry"
         )
