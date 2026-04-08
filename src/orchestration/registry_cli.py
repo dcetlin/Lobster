@@ -156,17 +156,21 @@ def cmd_decide_retry(registry: Registry, args: argparse.Namespace) -> None:
     """Handle decide-retry: reset a stuck UoW for a new Steward cycle."""
     uow_id = args.id
     rows = registry.decide_retry(uow_id)
+    retryable = ", ".join(sorted(registry.RETRYABLE_STATUSES))
     if rows == 1:
         _output({
             "status": "ok",
             "id": uow_id,
-            "message": f"UoW `{uow_id}` reset for retry — blocked \u2192 ready-for-steward (steward_cycles reset to 0)",
+            "message": f"UoW `{uow_id}` reset for retry \u2192 ready-for-steward (steward_cycles reset to 0)",
         })
     else:
         _output({
-            "status": "not_blocked",
+            "status": "not_retryable",
             "id": uow_id,
-            "message": f"UoW `{uow_id}` could not be retried — it is not currently in `blocked` status",
+            "message": (
+                f"UoW `{uow_id}` could not be retried — "
+                f"it is not in a retryable status ({retryable})"
+            ),
         })
 
 

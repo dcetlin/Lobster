@@ -1255,17 +1255,25 @@ class Registry:
         finally:
             conn.close()
 
+    # Statuses from which decide-retry may recover a UoW.
+    # 'blocked' covers the normal hard-cap / stuck-steward case.
+    # 'ready-for-steward' covers UoWs that false-completed at executor dispatch
+    # time (issue #669) and are looping in the steward queue without advancing.
+    RETRYABLE_STATUSES: frozenset[str] = frozenset({"blocked", "ready-for-steward"})
+
     def decide_retry(self, uow_id: str) -> int:
         """
         Reset a stuck UoW so it re-enters the Steward queue.
 
         Intended for use when Dan selects "Retry" after the Steward surfaces a
-        UoW that has hit the 5-cycle hard cap or another stuck condition.
+        UoW that has hit the 5-cycle hard cap, or when a UoW has false-completed
+        at executor dispatch time (issue #669) and is looping in ready-for-steward.
 
-        Transitions: blocked → ready-for-steward (optimistic lock on blocked).
+        Transitions: blocked → ready-for-steward
+                     ready-for-steward → ready-for-steward (with cycle reset)
         Also resets steward_cycles to 0 so the Steward treats it as a fresh start.
 
-        Returns rows_affected (1 on success, 0 if UoW is not in blocked status).
+        Returns rows_affected (1 on success, 0 if UoW is not in a retryable status).
         Writes audit entry atomically in the same transaction as the UPDATE.
         """
         conn = self._connect()
@@ -1273,31 +1281,40 @@ class Registry:
             now = _now_iso()
             conn.execute("BEGIN IMMEDIATE")
 
+            # Read current status so the audit log records the actual from_status.
+            row = conn.execute(
+                "SELECT status FROM uow_registry WHERE id = ?",
+                (uow_id,),
+            ).fetchone()
+            from_status = row["status"] if row else None
+
             note_json = json.dumps({
                 "event": "decide_retry",
                 "actor": "user",
                 "uow_id": uow_id,
                 "timestamp": now,
+                "from_status": from_status,
                 "note": "user requested retry — steward_cycles reset to 0",
             })
 
             conn.execute(
                 """
                 INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
-                VALUES (?, ?, 'decide_retry', 'blocked', 'ready-for-steward', 'user', ?)
+                VALUES (?, ?, 'decide_retry', ?, 'ready-for-steward', 'user', ?)
                 """,
-                (now, uow_id, note_json),
+                (now, uow_id, from_status, note_json),
             )
 
+            placeholders = ",".join("?" * len(self.RETRYABLE_STATUSES))
             cursor = conn.execute(
-                """
+                f"""
                 UPDATE uow_registry
                 SET status = 'ready-for-steward',
                     steward_cycles = 0,
                     updated_at = ?
-                WHERE id = ? AND status = 'blocked'
+                WHERE id = ? AND status IN ({placeholders})
                 """,
-                (now, uow_id),
+                (now, uow_id, *self.RETRYABLE_STATUSES),
             )
             rows_affected = cursor.rowcount
 
