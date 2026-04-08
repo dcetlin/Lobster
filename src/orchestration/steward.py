@@ -2302,8 +2302,8 @@ def _default_notify_dan_early_warning(
     new_cycles: int | None = None,
 ) -> None:
     """
-    Send an early-warning notification to Dan when steward_cycles reaches
-    _EARLY_WARNING_CYCLES (4), one cycle before the hard cap.
+    Send an early-warning notification to Dan when lifetime_cycles reaches
+    _EARLY_WARNING_CYCLES (4), five cycles before the hard cap (_HARD_CAP_CYCLES=9).
 
     new_cycles is the post-prescription cycle count (uow.steward_cycles + 1).
     Pass it explicitly so the message reflects the cycle count after prescription,

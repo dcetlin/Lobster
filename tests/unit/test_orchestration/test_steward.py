@@ -932,8 +932,8 @@ class TestHardCap:
 # Test: hard cap uses lifetime_cycles, not steward_cycles
 # ---------------------------------------------------------------------------
 
-# Named constant from the spec
-_HARD_CAP_CYCLES = 5
+# Import from production module so tests always reflect the live constant.
+from src.orchestration.steward import _HARD_CAP_CYCLES
 
 
 def _make_uow_row_with_lifetime(
