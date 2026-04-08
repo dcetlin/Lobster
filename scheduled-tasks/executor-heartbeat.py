@@ -177,54 +177,84 @@ def run_ttl_recovery(registry, dry_run: bool = False) -> list[str]:
     return recovered
 
 
-def _filter_stale_uows(ready_uows: list, stale_minutes: int) -> list:
+def _filter_stale_uows(
+    ready_uows: list,
+    stale_minutes: int,
+    is_orphan_fn=None,
+) -> list:
     """
-    Return only UoWs that have been in ready-for-executor state for longer than
-    stale_minutes, measured by their updated_at timestamp.
+    Return UoWs eligible for heartbeat dispatch.
 
-    UoWs written recently are skipped — the primary event-driven inbox dispatch
-    should pick them up within seconds. Only UoWs that have been waiting longer
-    than the recovery threshold are candidates for heartbeat re-dispatch.
+    Two dispatch paths are distinguished:
+
+    1. Fresh UoWs (never been executor_orphan): pass through immediately.
+       The primary event-driven inbox dispatch may have been missed entirely
+       (e.g. dispatcher was down when the UoW was prescribed). The heartbeat
+       should pick these up without waiting — the steward re-prescribes every
+       ~2 min, so a time-based staleness gate would never open for a fresh UoW.
+
+    2. Previously-orphaned UoWs (prior executor_orphan audit entry): apply
+       the stale_minutes gate. These UoWs had a dispatch attempt that the
+       primary path missed; the heartbeat is the recovery path and we wait
+       to confirm the primary path is truly blocked.
 
     Args:
-        ready_uows: List of UoW objects with an updated_at attribute (ISO 8601 str).
-        stale_minutes: Minimum age in minutes before a UoW is eligible for recovery.
+        ready_uows: List of UoW objects with an id and updated_at attribute.
+        stale_minutes: Minimum age in minutes before an orphaned UoW is
+            eligible for recovery dispatch. Not applied to fresh UoWs.
+        is_orphan_fn: Optional callable(uow_id: str) -> bool. Returns True
+            if the UoW has prior executor_orphan history. When None, all UoWs
+            are treated as fresh (immediate dispatch).
 
     Returns:
-        Filtered list of stale UoW objects (may be empty).
+        Filtered list of UoW objects eligible for dispatch (may be empty).
     """
     from datetime import datetime, timezone, timedelta
 
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)
-    stale = []
+    eligible = []
     for uow in ready_uows:
+        # Determine whether this UoW has prior executor_orphan history.
+        # If is_orphan_fn is None or raises, treat as fresh (safe default).
+        try:
+            previously_orphaned = is_orphan_fn(uow.id) if is_orphan_fn is not None else False
+        except Exception:
+            previously_orphaned = False
+
+        if not previously_orphaned:
+            # Fresh UoW — pass through immediately for dispatch.
+            eligible.append(uow)
+            continue
+
+        # Previously-orphaned — apply the staleness gate.
         try:
             updated = datetime.fromisoformat(uow.updated_at)
             # Ensure timezone-aware comparison
             if updated.tzinfo is None:
                 updated = updated.replace(tzinfo=timezone.utc)
             if updated < cutoff:
-                stale.append(uow)
+                eligible.append(uow)
         except (ValueError, TypeError, AttributeError):
-            # If updated_at is missing, non-string, or unparseable, treat as stale (safe default)
-            stale.append(uow)
-    return stale
+            # If updated_at is missing or unparseable, treat as stale (safe default)
+            eligible.append(uow)
+    return eligible
 
 
 def run_executor_cycle(registry, dry_run: bool = False) -> dict:
     """
-    Recovery-dispatch UoWs in `ready-for-executor` state that are older than
-    RECOVERY_STALE_MINUTES.
+    Dispatch UoWs in `ready-for-executor` state that were not picked up by the
+    primary event-driven inbox path.
 
-    This is a recovery poller, not the primary dispatch path. The primary path
-    is the event-driven inbox dispatch in _dispatch_via_inbox: when the Steward
-    prescribes a UoW, the Executor writes a wos_execute message to ~/messages/inbox/
-    and the Lobster dispatcher picks it up within seconds.
+    Two eligibility rules are applied by _filter_stale_uows:
 
-    The heartbeat dispatches UoWs that were NOT picked up by the primary path —
-    e.g. due to dispatcher downtime, restart races, or any other gap. UoWs younger
-    than RECOVERY_STALE_MINUTES are skipped (they are expected to be picked up by
-    the primary path imminently).
+    - Fresh UoWs (no prior executor_orphan audit entry): dispatched immediately.
+      These were never attempted — the primary inbox dispatch may have been missed
+      entirely (e.g. dispatcher downtime when the UoW was prescribed).
+
+    - Previously-orphaned UoWs (prior executor_orphan audit entry): dispatched
+      only after RECOVERY_STALE_MINUTES have elapsed since updated_at. These had
+      a missed dispatch attempt and need the staleness gate to confirm the primary
+      path is truly blocked before re-dispatching.
 
     Each UoW is processed independently. Errors on individual UoWs are
     caught, logged, and skipped — the cycle continues for remaining UoWs.
@@ -243,15 +273,19 @@ def run_executor_cycle(registry, dry_run: bool = False) -> dict:
         return {"evaluated": 0, "ready": 0, "stale": 0, "dispatched": 0, "skipped": 0, "errors": 0}
 
     ready_count = len(ready_uows)
-    stale_uows = _filter_stale_uows(ready_uows, RECOVERY_STALE_MINUTES)
-    stale_count = len(stale_uows)
-    recent_count = ready_count - stale_count
+    eligible_uows = _filter_stale_uows(
+        ready_uows,
+        RECOVERY_STALE_MINUTES,
+        is_orphan_fn=registry.has_executor_orphan_history,
+    )
+    eligible_count = len(eligible_uows)
+    ineligible_count = ready_count - eligible_count
 
-    if recent_count > 0:
+    if ineligible_count > 0:
         log.debug(
-            "Executor cycle: %d ready-for-executor UoW(s) younger than %d min — "
-            "skipping (primary inbox dispatch expected)",
-            recent_count, RECOVERY_STALE_MINUTES,
+            "Executor cycle: %d ready-for-executor UoW(s) not yet eligible "
+            "(orphaned but <=%d min old) — skipping (primary inbox dispatch expected)",
+            ineligible_count, RECOVERY_STALE_MINUTES,
         )
 
     dispatched = 0
@@ -261,20 +295,20 @@ def run_executor_cycle(registry, dry_run: bool = False) -> dict:
     if dry_run:
         log.info(
             "Executor cycle (DRY RUN): %d ready-for-executor UoWs found, "
-            "%d stale (>%d min) — skipping all (dry-run mode)",
-            ready_count, stale_count, RECOVERY_STALE_MINUTES,
+            "%d eligible — skipping all (dry-run mode)",
+            ready_count, eligible_count,
         )
         return {
             "evaluated": ready_count,
             "ready": ready_count,
-            "stale": stale_count,
+            "stale": eligible_count,
             "dispatched": 0,
             "skipped": ready_count,
             "errors": 0,
         }
 
-    if stale_count == 0:
-        log.debug("Executor cycle: no stale UoWs to recover")
+    if eligible_count == 0:
+        log.debug("Executor cycle: no eligible UoWs to dispatch")
         return {
             "evaluated": ready_count,
             "ready": ready_count,
@@ -285,8 +319,8 @@ def run_executor_cycle(registry, dry_run: bool = False) -> dict:
         }
 
     log.info(
-        "Executor cycle (recovery): %d stale UoW(s) found (ready >%d min) — dispatching",
-        stale_count, RECOVERY_STALE_MINUTES,
+        "Executor cycle: %d eligible UoW(s) found — dispatching",
+        eligible_count,
     )
 
     from src.orchestration.executor import Executor
@@ -296,7 +330,7 @@ def run_executor_cycle(registry, dry_run: bool = False) -> dict:
     # functional-engineer, lobster-ops, and general executor types.
     executor = Executor(registry, dispatcher=None)
 
-    for uow in stale_uows:
+    for uow in eligible_uows:
         uow_id = uow.id
         try:
             result = executor.execute_uow(uow_id)
@@ -352,7 +386,7 @@ def run_executor_cycle(registry, dry_run: bool = False) -> dict:
     return {
         "evaluated": ready_count,
         "ready": ready_count,
-        "stale": stale_count,
+        "stale": eligible_count,
         "dispatched": dispatched,
         "skipped": skipped,
         "errors": errors,
