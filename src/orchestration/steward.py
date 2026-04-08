@@ -202,7 +202,7 @@ _ACTOR_STEWARD = "steward"
 # Hard cap: surface to Dan unconditionally if lifetime_cycles >= this value.
 # lifetime_cycles accumulates across all decide-retry resets, so this is a true
 # per-UoW-lifetime circuit breaker. steward_cycles (per-attempt) is NOT used here.
-_HARD_CAP_CYCLES = 5
+_HARD_CAP_CYCLES = 9
 
 # Early warning threshold: notify Dan when lifetime_cycles + steward_cycles reaches this value.
 # Uses cumulative lifetime_cycles + new_cycles (post-prescription) so the warning fires based
