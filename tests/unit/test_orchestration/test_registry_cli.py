@@ -233,3 +233,107 @@ class TestGateReadinessCommand:
         assert "days_running" in result
         assert "proposed_to_confirmed_ratio_7d" in result
         assert "reason" in result
+
+
+# ---------------------------------------------------------------------------
+# decide-retry command
+# ---------------------------------------------------------------------------
+
+def _force_status(db_path: Path, uow_id: str, status: str) -> None:
+    """Directly set a UoW's status in the DB, bypassing Registry transitions."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "UPDATE uow_registry SET status = ? WHERE id = ?",
+        (status, uow_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestDecideRetryCommand:
+    def test_retry_from_blocked_resets_to_ready_for_steward(self, db_path):
+        """A UoW in blocked status is retried successfully."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "80", "--title", "Issue 80", "--sweep-date", today)
+        uow_id = inserted["id"]
+        _force_status(db_path, uow_id, "blocked")
+
+        result = run_cli(db_path, "decide-retry", "--id", uow_id)
+
+        assert result["status"] == "ok"
+        assert result["id"] == uow_id
+        # Confirm DB status was updated
+        record = run_cli(db_path, "get", "--id", uow_id)
+        assert record["status"] == "ready-for-steward"
+        assert record["steward_cycles"] == 0
+
+    def test_retry_from_ready_for_steward_resets_cycles(self, db_path):
+        """
+        A UoW stuck in ready-for-steward (false-complete via issue #669) can be
+        retried — decide-retry must not silently no-op when status is not blocked.
+        """
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "81", "--title", "Issue 81", "--sweep-date", today)
+        uow_id = inserted["id"]
+        # Force into ready-for-steward with non-zero steward_cycles to simulate false-complete
+        _force_status(db_path, uow_id, "ready-for-steward")
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("UPDATE uow_registry SET steward_cycles = 3 WHERE id = ?", (uow_id,))
+        conn.commit()
+        conn.close()
+
+        result = run_cli(db_path, "decide-retry", "--id", uow_id)
+
+        assert result["status"] == "ok"
+        assert result["id"] == uow_id
+        record = run_cli(db_path, "get", "--id", uow_id)
+        assert record["status"] == "ready-for-steward"
+        assert record["steward_cycles"] == 0
+
+    def test_retry_from_non_retryable_status_returns_not_retryable(self, db_path):
+        """A UoW in active status (not retryable) returns a clear error, not silent no-op."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "82", "--title", "Issue 82", "--sweep-date", today)
+        uow_id = inserted["id"]
+        _force_status(db_path, uow_id, "active")
+
+        result = run_cli(db_path, "decide-retry", "--id", uow_id)
+
+        assert result["status"] == "not_retryable"
+        assert result["id"] == uow_id
+        assert "retryable" in result["message"].lower()
+        # Status unchanged
+        record = run_cli(db_path, "get", "--id", uow_id)
+        assert record["status"] == "active"
+
+    def test_retry_from_done_status_returns_not_retryable(self, db_path):
+        """A done UoW cannot be retried — done is terminal and intentional."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "83", "--title", "Issue 83", "--sweep-date", today)
+        uow_id = inserted["id"]
+        _force_status(db_path, uow_id, "done")
+
+        result = run_cli(db_path, "decide-retry", "--id", uow_id)
+
+        assert result["status"] == "not_retryable"
+
+    def test_retry_audit_log_records_actual_from_status(self, db_path):
+        """Audit log must record the actual source status, not a hardcoded 'blocked'."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "84", "--title", "Issue 84", "--sweep-date", today)
+        uow_id = inserted["id"]
+        _force_status(db_path, uow_id, "ready-for-steward")
+
+        run_cli(db_path, "decide-retry", "--id", uow_id)
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT from_status FROM audit_log WHERE uow_id = ? AND event = 'decide_retry' ORDER BY ts DESC LIMIT 1",
+            (uow_id,),
+        ).fetchone()
+        conn.close()
+        assert row is not None, "audit_log must have a decide_retry entry"
+        assert row["from_status"] == "ready-for-steward", (
+            "audit log from_status must reflect actual source status, not hardcoded 'blocked'"
+        )
