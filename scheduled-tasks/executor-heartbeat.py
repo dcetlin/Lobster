@@ -90,6 +90,22 @@ def _is_job_enabled(job_name: str) -> bool:
         return True
 
 
+def _warn_if_legacy_registry_exists() -> None:
+    """Log a warning if the deprecated legacy registry path exists and is non-empty."""
+    workspace = Path(os.environ.get(
+        "LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"
+    ))
+    legacy_path = workspace / "data" / "wos-registry.db"
+    if legacy_path.exists() and legacy_path.stat().st_size > 0:
+        log.warning(
+            "Legacy registry DB at %s exists and is non-empty (%d bytes). "
+            "Canonical path is %s. Investigate and remove the legacy file.",
+            legacy_path,
+            legacy_path.stat().st_size,
+            workspace / "orchestration" / "registry.db",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Recovery threshold — UoWs not yet dispatched after this many minutes are
 # considered missed by the primary event-driven inbox path and are eligible
@@ -423,6 +439,8 @@ def main() -> int:
     if not _is_job_enabled("executor-heartbeat"):
         log.info("Executor heartbeat: skipped (disabled in jobs.json)")
         return 0
+
+    _warn_if_legacy_registry_exists()
 
     from src.orchestration.steward import is_bootup_candidate_gate_active
     log.info("BOOTUP_CANDIDATE_GATE = %s", is_bootup_candidate_gate_active())

@@ -226,6 +226,22 @@ def _default_db_path() -> Path:
     return workspace / "orchestration" / "registry.db"
 
 
+def _warn_if_legacy_registry_exists() -> None:
+    """Log a warning if the deprecated legacy registry path exists and is non-empty."""
+    workspace = Path(os.environ.get(
+        "LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"
+    ))
+    legacy_path = workspace / "data" / "wos-registry.db"
+    if legacy_path.exists() and legacy_path.stat().st_size > 0:
+        log.warning(
+            "Legacy registry DB at %s exists and is non-empty (%d bytes). "
+            "Canonical path is %s. Investigate and remove the legacy file.",
+            legacy_path,
+            legacy_path.stat().st_size,
+            workspace / "orchestration" / "registry.db",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Agent cleanup — prevent backlog accumulation (Phase 1)
 # ---------------------------------------------------------------------------
@@ -525,6 +541,8 @@ def main() -> int:
     if not _is_job_enabled("steward-heartbeat"):
         log.info("Steward heartbeat: skipped (disabled in jobs.json)")
         return 0
+
+    _warn_if_legacy_registry_exists()
 
     gate_active = is_bootup_candidate_gate_active()
     log.info("BOOTUP_CANDIDATE_GATE = %s", gate_active)
