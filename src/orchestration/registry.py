@@ -313,6 +313,14 @@ class Registry:
             if isinstance(parsed_vr, dict):
                 vision_ref = parsed_vr
 
+        # vision_ref: NULL → None, '{"layer":...}' → dict
+        vision_ref_raw = d.get("vision_ref")
+        vision_ref: dict | None = None
+        if vision_ref_raw is not None:
+            parsed_vr = _deserialize_json(vision_ref_raw)
+            if isinstance(parsed_vr, dict):
+                vision_ref = parsed_vr
+
         return UoW(
             id=d["id"],
             status=UoWStatus(d["status"]),
