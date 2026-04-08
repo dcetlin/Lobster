@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -218,6 +219,20 @@ _ACTOR_STEWARD = "steward"
 # lifetime_cycles accumulates across all decide-retry resets, so this is a true
 # per-UoW-lifetime circuit breaker. steward_cycles (per-attempt) is NOT used here.
 _HARD_CAP_CYCLES = 9
+
+# close_reason written by the cleanup arc when a UoW hits the hard cap.
+# Used to gate decide-retry: bare retry is rejected; explicit override required.
+CLOSE_REASON_HARD_CAP_CLEANUP = "hard_cap_cleanup"
+
+# Default path for failure trace files written by the cleanup arc.
+_DEFAULT_FAILURE_TRACES_DIR = Path(
+    os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
+) / "orchestration" / "failure-traces"
+
+# Default path for archived artifact directories written by the cleanup arc.
+_DEFAULT_ARTIFACTS_ARCHIVED_DIR = Path(
+    os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
+) / "orchestration" / "artifacts" / "archived"
 
 # Early warning threshold: notify Dan when lifetime_cycles + steward_cycles reaches this value.
 # Uses cumulative lifetime_cycles + new_cycles (post-prescription) so the warning fires based
@@ -1798,6 +1813,8 @@ def _write_steward_fields(
     route_reason: str | None = None,
     steward_cycles: int | None = None,
     completed_at: str | None = None,
+    closed_at: str | None = None,
+    close_reason: str | None = None,
 ) -> None:
     """
     Write Steward-private and Steward-managed fields to the UoW row.
@@ -1821,6 +1838,10 @@ def _write_steward_fields(
         updates["steward_cycles"] = steward_cycles
     if completed_at is not None:
         updates["completed_at"] = completed_at
+    if closed_at is not None:
+        updates["closed_at"] = closed_at
+    if close_reason is not None:
+        updates["close_reason"] = close_reason
 
     if not updates:
         return
@@ -1861,6 +1882,247 @@ def _append_steward_log_entry(
     if current_log:
         return current_log.rstrip("\n") + "\n" + entry_str
     return entry_str
+
+
+# ---------------------------------------------------------------------------
+# Hard-cap cleanup arc (S3-A)
+# ---------------------------------------------------------------------------
+
+def _archive_uow_artifacts(
+    uow_id: str,
+    artifact_dir: Path | None,
+    archived_dir: Path | None = None,
+) -> dict[str, Any]:
+    """
+    Move the UoW's artifact directory to the archived location.
+
+    Returns a dict with keys:
+      - archived_path: str | None — absolute path of the archived directory, or None
+      - success: bool
+      - error: str | None — error message if archival failed
+
+    Fallback contract: a failure to archive is logged but does not block the
+    state transition. Cleanup arc failure is preferable to no cleanup arc.
+
+    Pure filesystem operation — no DB writes, no side effects beyond the move.
+    """
+    resolved_artifact_dir = Path(artifact_dir) if artifact_dir is not None else _DEFAULT_CYCLE_TRACE_DIR
+    src = resolved_artifact_dir / uow_id
+
+    resolved_archived_dir = Path(archived_dir) if archived_dir is not None else _DEFAULT_ARTIFACTS_ARCHIVED_DIR
+    dst = resolved_archived_dir / uow_id
+
+    if not src.exists():
+        # No artifact directory — not an error (UoW may have no artifacts yet)
+        return {"archived_path": None, "success": True, "error": None}
+
+    try:
+        resolved_archived_dir.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.move(str(src), str(dst))
+        return {"archived_path": str(dst), "success": True, "error": None}
+    except Exception as e:
+        log.error("hard_cap cleanup: artifact archival failed for %s: %s", uow_id, e)
+        return {"archived_path": None, "success": False, "error": str(e)}
+
+
+def _write_hard_cap_failure_trace(
+    uow: UoW,
+    return_reason: str | None,
+    failure_traces_dir: Path | None = None,
+    archived_artifact_path: str | None = None,
+) -> dict[str, Any]:
+    """
+    Write a structured failure trace JSON to orchestration/failure-traces/<uow_id>.json.
+
+    The trace preserves execution history for post-cleanup audit.  This is written
+    AFTER artifact archival so that trace.json (included in the artifact directory by
+    S3-B) has already been moved to archived/ — the trace record here captures the
+    final state, not a snapshot of live files.
+
+    Returns dict with keys:
+      - trace_path: str | None — absolute path of written trace, or None on failure
+      - success: bool
+      - error: str | None
+
+    Fallback contract: failure to write the trace does not block state transition.
+    """
+    resolved_dir = Path(failure_traces_dir) if failure_traces_dir is not None else _DEFAULT_FAILURE_TRACES_DIR
+    resolved_dir.mkdir(parents=True, exist_ok=True)
+
+    trace = {
+        "uow_id": uow.id,
+        "reason": CLOSE_REASON_HARD_CAP_CLEANUP,
+        "final_return_reason": return_reason,
+        "cycle_count_lifetime": uow.lifetime_cycles,
+        "summary": uow.summary,
+        "success_criteria": uow.success_criteria,
+        "archived_artifact_path": archived_artifact_path,
+        "timestamp": _now_iso(),
+    }
+
+    trace_path = resolved_dir / f"{uow.id}.json"
+    try:
+        trace_path.write_text(json.dumps(trace, indent=2), encoding="utf-8")
+        return {"trace_path": str(trace_path), "success": True, "error": None}
+    except Exception as e:
+        log.error("hard_cap cleanup: failure trace write failed for %s: %s", uow.id, e)
+        return {"trace_path": None, "success": False, "error": str(e)}
+
+
+def _post_hard_cap_github_comment(
+    uow: UoW,
+    failure_trace_path: str | None,
+) -> bool:
+    """
+    Post a comment to the source GitHub issue noting the failure trace.
+
+    Returns True on success, False on any error.
+    Best-effort: failures are logged but do not block the cleanup arc.
+    """
+    issue_url = uow.issue_url
+    if not issue_url:
+        log.info(
+            "hard_cap cleanup: no issue_url for %s — skipping GitHub comment", uow.id
+        )
+        return False
+
+    repo = _repo_from_issue_url(issue_url)
+    if not repo:
+        log.warning(
+            "hard_cap cleanup: could not parse repo from issue_url %r — skipping comment",
+            issue_url,
+        )
+        return False
+
+    # Extract issue number from URL: .../issues/<number>
+    try:
+        issue_number = int(issue_url.rstrip("/").split("/")[-1])
+    except (ValueError, IndexError):
+        log.warning(
+            "hard_cap cleanup: could not extract issue number from %r — skipping comment",
+            issue_url,
+        )
+        return False
+
+    trace_note = (
+        f"\n\nFailure trace written to: `{failure_trace_path}`"
+        if failure_trace_path
+        else ""
+    )
+    comment_body = (
+        f"**WOS hard cap reached** for UoW `{uow.id}`.\n\n"
+        f"This UoW exhausted its lifetime cycle budget ({_HARD_CAP_CYCLES} cycles) "
+        f"and has been archived. The cleanup arc has:\n"
+        f"- Archived artifacts to `orchestration/artifacts/archived/{uow.id}/`\n"
+        f"- Written a failure trace recording the final state{trace_note}\n\n"
+        f"A decide-retry requires an explicit operator flag (`force` override) — "
+        f"bare retry is rejected at the hard-cap commitment boundary."
+    )
+
+    command = [
+        "gh", "issue", "comment", str(issue_number),
+        "--repo", repo,
+        "--body", comment_body,
+    ]
+
+    result, error = run_subprocess_with_error_capture(
+        component="steward_github",
+        uow_id=uow.id,
+        command=command,
+        timeout_seconds=15,
+        check=False,
+    )
+
+    if error:
+        log.warning(
+            "hard_cap cleanup: GitHub comment failed for %s#%s: %s",
+            repo, issue_number, error.summary(),
+        )
+        return False
+
+    if result is None or result.returncode != 0:
+        log.warning(
+            "hard_cap cleanup: GitHub comment subprocess non-zero for %s#%s",
+            repo, issue_number,
+        )
+        return False
+
+    log.info(
+        "hard_cap cleanup: GitHub comment posted for %s#%s", repo, issue_number
+    )
+    return True
+
+
+def _run_hard_cap_cleanup(
+    uow: UoW,
+    registry,
+    return_reason: str | None,
+    artifact_dir: Path | None,
+    failure_traces_dir: Path | None = None,
+    archived_dir: Path | None = None,
+) -> dict[str, Any]:
+    """
+    Run the hard-cap cleanup arc atomically (best-effort at each step).
+
+    Steps executed in order:
+    1. Archive UoW artifacts to orchestration/artifacts/archived/<uow_id>/
+    2. Write failure trace to orchestration/failure-traces/<uow_id>.json
+    3. Set close_reason = CLOSE_REASON_HARD_CAP_CLEANUP and closed_at in registry
+    4. Post GitHub comment on source issue (optional — best-effort)
+
+    Returns a summary dict for audit log inclusion.
+
+    Fallback contract: each step is individually protected. A failure in archival
+    does not block the failure trace write, and a failure in either does not block
+    the registry close_reason write. The state transition (blocked) always proceeds.
+    """
+    uow_id = uow.id
+    log.info("hard_cap cleanup arc starting for %s (lifetime_cycles=%s)", uow_id, uow.lifetime_cycles)
+
+    # Step 1: Archive artifacts
+    archive_result = _archive_uow_artifacts(uow_id, artifact_dir, archived_dir)
+    if not archive_result["success"]:
+        log.warning("hard_cap cleanup: archival step failed for %s — continuing", uow_id)
+
+    # Step 2: Write failure trace
+    trace_result = _write_hard_cap_failure_trace(
+        uow,
+        return_reason=return_reason,
+        failure_traces_dir=failure_traces_dir,
+        archived_artifact_path=archive_result.get("archived_path"),
+    )
+    if not trace_result["success"]:
+        log.warning("hard_cap cleanup: failure trace write failed for %s — continuing", uow_id)
+
+    # Step 3: Set close_reason and closed_at in registry
+    try:
+        _write_steward_fields(
+            registry,
+            uow_id,
+            close_reason=CLOSE_REASON_HARD_CAP_CLEANUP,
+            closed_at=_now_iso(),
+        )
+    except Exception as e:
+        log.error("hard_cap cleanup: registry close_reason write failed for %s: %s", uow_id, e)
+
+    # Step 4: Post GitHub comment (best-effort, does not block)
+    github_comment_posted = _post_hard_cap_github_comment(
+        uow,
+        failure_trace_path=trace_result.get("trace_path"),
+    )
+
+    summary = {
+        "artifact_archived": archive_result["success"],
+        "archived_path": archive_result.get("archived_path"),
+        "failure_trace_written": trace_result["success"],
+        "failure_trace_path": trace_result.get("trace_path"),
+        "close_reason": CLOSE_REASON_HARD_CAP_CLEANUP,
+        "github_comment_posted": github_comment_posted,
+    }
+    log.info("hard_cap cleanup arc complete for %s: %s", uow_id, summary)
+    return summary
 
 
 def _update_agenda_node_status(
@@ -2544,6 +2806,34 @@ def _process_uow(
                 "surface_condition": stuck_condition,
                 "return_reason": return_reason,
                 "timestamp": _now_iso(),
+            })
+
+        # Hard cap: run cleanup arc before surfacing to Dan (S3-A).
+        # The cleanup arc archives artifacts, writes failure trace, and sets
+        # close_reason/closed_at. Each step is individually protected — failure
+        # in archival does not block the surface-to-Dan path.
+        cleanup_summary: dict[str, Any] | None = None
+        if stuck_condition == "hard_cap" and not dry_run:
+            # Derive archived_dir from artifact_dir so archived artifacts stay
+            # co-located with active ones (under artifacts/archived/).
+            _resolved_artifact_dir = (
+                Path(artifact_dir) if artifact_dir is not None
+                else _DEFAULT_CYCLE_TRACE_DIR
+            )
+            cleanup_summary = _run_hard_cap_cleanup(
+                uow=uow,
+                registry=registry,
+                return_reason=return_reason,
+                artifact_dir=artifact_dir,
+                archived_dir=_resolved_artifact_dir / "archived",
+            )
+            # Append cleanup summary to audit log
+            registry.append_audit_log(uow_id, {
+                "event": "hard_cap_cleanup",
+                "actor": _ACTOR_STEWARD,
+                "uow_id": uow_id,
+                "timestamp": _now_iso(),
+                **(cleanup_summary or {}),
             })
 
         # Surface to Dan (injectable for tests)
