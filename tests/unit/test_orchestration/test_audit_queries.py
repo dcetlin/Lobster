@@ -288,3 +288,240 @@ class TestExecutionOutcomes:
         cutoff = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
         result = execution_outcomes(cutoff, registry_path=db_path)
         assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# execution_attempts
+# ---------------------------------------------------------------------------
+
+class TestExecutionAttempts:
+    def test_returns_execution_events_newest_first(self, db_path):
+        from src.orchestration.audit_queries import execution_attempts
+
+        _seed_audit(db_path, uow_id="uow-1", event="executor_dispatch",
+                    ts="2026-01-01T10:00:00+00:00")
+        _seed_audit(db_path, uow_id="uow-1", event="execution_failed",
+                    ts="2026-01-01T11:00:00+00:00")
+        _seed_audit(db_path, uow_id="uow-1", event="execution_complete",
+                    ts="2026-01-01T12:00:00+00:00")
+
+        results = execution_attempts("uow-1", registry_path=db_path)
+        assert len(results) == 3
+        # Newest first by id
+        assert results[0]["event"] == "execution_complete"
+        assert results[-1]["event"] == "executor_dispatch"
+
+    def test_excludes_non_execution_events(self, db_path):
+        from src.orchestration.audit_queries import execution_attempts
+
+        _seed_audit(db_path, uow_id="uow-1", event="status_change",
+                    ts="2026-01-01T10:00:00+00:00")
+        _seed_audit(db_path, uow_id="uow-1", event="execution_complete",
+                    ts="2026-01-01T11:00:00+00:00")
+
+        results = execution_attempts("uow-1", registry_path=db_path)
+        assert len(results) == 1
+        assert results[0]["event"] == "execution_complete"
+
+    def test_empty_for_uow_with_no_execution_events(self, db_path):
+        from src.orchestration.audit_queries import execution_attempts
+
+        results = execution_attempts("no-such-uow", registry_path=db_path)
+        assert results == []
+
+    def test_does_not_return_other_uow_events(self, db_path):
+        from src.orchestration.audit_queries import execution_attempts
+
+        _seed_audit(db_path, uow_id="uow-A", event="execution_complete",
+                    ts="2026-01-01T10:00:00+00:00")
+        _seed_audit(db_path, uow_id="uow-B", event="execution_complete",
+                    ts="2026-01-01T10:00:00+00:00")
+
+        results = execution_attempts("uow-A", registry_path=db_path)
+        assert all(r["uow_id"] == "uow-A" for r in results)
+
+
+# ---------------------------------------------------------------------------
+# diagnosis_following_failure
+# ---------------------------------------------------------------------------
+
+class TestDiagnosisFollowingFailure:
+    def test_empty_when_no_failures(self, db_path):
+        from src.orchestration.audit_queries import diagnosis_following_failure
+
+        since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        result = diagnosis_following_failure(since, registry_path=db_path)
+        assert result == []
+
+    def test_failure_without_rediagnosis_excluded(self, db_path):
+        from src.orchestration.audit_queries import diagnosis_following_failure
+
+        _seed_audit(db_path, uow_id="uow-1", event="execution_failed",
+                    ts="2026-01-01T10:00:00+00:00")
+        # No subsequent diagnosis event
+        since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        result = diagnosis_following_failure(since, registry_path=db_path)
+        assert result == []
+
+    def test_failure_with_steward_diagnosis_included(self, db_path):
+        from src.orchestration.audit_queries import diagnosis_following_failure
+
+        _seed_audit(db_path, uow_id="uow-1", event="execution_failed",
+                    ts="2026-01-01T10:00:00+00:00")
+        _seed_audit(db_path, uow_id="uow-1", event="steward_diagnosis",
+                    ts="2026-01-01T11:00:00+00:00")
+        since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        result = diagnosis_following_failure(since, registry_path=db_path)
+        assert len(result) == 1
+        entry = result[0]
+        assert entry["uow_id"] == "uow-1"
+        assert entry["gap_seconds"] == 3600.0
+
+    def test_failure_with_reentry_prescription_included(self, db_path):
+        from src.orchestration.audit_queries import diagnosis_following_failure
+
+        _seed_audit(db_path, uow_id="uow-1", event="execution_failed",
+                    ts="2026-01-01T10:00:00+00:00")
+        _seed_audit(db_path, uow_id="uow-1", event="reentry_prescription",
+                    ts="2026-01-01T10:30:00+00:00")
+        since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        result = diagnosis_following_failure(since, registry_path=db_path)
+        assert len(result) == 1
+        assert result[0]["gap_seconds"] == 1800.0
+
+    def test_excludes_failures_before_since(self, db_path):
+        from src.orchestration.audit_queries import diagnosis_following_failure
+
+        _seed_audit(db_path, uow_id="uow-old", event="execution_failed",
+                    ts="2025-12-31T23:00:00+00:00")
+        _seed_audit(db_path, uow_id="uow-old", event="steward_diagnosis",
+                    ts="2026-01-01T00:30:00+00:00")
+        since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        result = diagnosis_following_failure(since, registry_path=db_path)
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# completed_uow_durations
+# ---------------------------------------------------------------------------
+
+class TestCompletedUowDurations:
+    def _insert_done_uow(
+        self,
+        db_path: Path,
+        uow_id: str,
+        created_at: str,
+        completed_at: str,
+        steward_cycles: int = 1,
+        register: str = "operational",
+    ) -> None:
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """
+            INSERT INTO uow_registry
+                (id, source, status, summary, created_at, updated_at,
+                 steward_cycles, steward_log, success_criteria, completed_at, register)
+            VALUES (?, ?, 'done', ?, ?, ?, ?, '', '', ?, ?)
+            """,
+            (uow_id, "github:issue/1", "test", created_at, created_at,
+             steward_cycles, completed_at, register),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_empty_when_no_completed_uows(self, db_path):
+        from src.orchestration.audit_queries import completed_uow_durations
+
+        result = completed_uow_durations("2026-01-01", registry_path=db_path)
+        assert result == []
+
+    def test_returns_completed_uow_with_duration(self, db_path):
+        from src.orchestration.audit_queries import completed_uow_durations
+
+        self._insert_done_uow(
+            db_path, "uow-1",
+            created_at="2026-01-01T00:00:00+00:00",
+            completed_at="2026-01-01T02:00:00+00:00",
+        )
+        result = completed_uow_durations("2026-01-01", registry_path=db_path)
+        assert len(result) == 1
+        entry = result[0]
+        assert entry["uow_id"] == "uow-1"
+        assert entry["wall_clock_hours"] == 2.0
+        assert entry["steward_cycles"] == 1
+
+    def test_excludes_uows_completed_before_since(self, db_path):
+        from src.orchestration.audit_queries import completed_uow_durations
+
+        self._insert_done_uow(
+            db_path, "uow-old",
+            created_at="2025-12-31T00:00:00+00:00",
+            completed_at="2025-12-31T01:00:00+00:00",
+        )
+        result = completed_uow_durations("2026-01-01", registry_path=db_path)
+        assert result == []
+
+    def test_register_field_included(self, db_path):
+        from src.orchestration.audit_queries import completed_uow_durations
+
+        self._insert_done_uow(
+            db_path, "uow-1",
+            created_at="2026-01-01T00:00:00+00:00",
+            completed_at="2026-01-01T01:00:00+00:00",
+            register="reflective",
+        )
+        result = completed_uow_durations("2026-01-01", registry_path=db_path)
+        assert result[0]["register"] == "reflective"
+
+
+# ---------------------------------------------------------------------------
+# event_sequence
+# ---------------------------------------------------------------------------
+
+class TestEventSequence:
+    def test_returns_full_sequence_oldest_first(self, db_path):
+        from src.orchestration.audit_queries import event_sequence
+
+        _seed_audit(db_path, uow_id="uow-1", event="status_change",
+                    ts="2026-01-01T10:00:00+00:00", to_status="pending")
+        _seed_audit(db_path, uow_id="uow-1", event="steward_diagnosis",
+                    ts="2026-01-01T11:00:00+00:00")
+        _seed_audit(db_path, uow_id="uow-1", event="execution_complete",
+                    ts="2026-01-01T12:00:00+00:00")
+
+        result = event_sequence("uow-1", registry_path=db_path)
+        assert len(result) == 3
+        # Oldest first
+        assert result[0]["event"] == "status_change"
+        assert result[1]["event"] == "steward_diagnosis"
+        assert result[2]["event"] == "execution_complete"
+
+    def test_empty_for_unknown_uow(self, db_path):
+        from src.orchestration.audit_queries import event_sequence
+
+        result = event_sequence("no-such-uow", registry_path=db_path)
+        assert result == []
+
+    def test_does_not_return_other_uow_events(self, db_path):
+        from src.orchestration.audit_queries import event_sequence
+
+        _seed_audit(db_path, uow_id="uow-A", event="status_change",
+                    ts="2026-01-01T10:00:00+00:00")
+        _seed_audit(db_path, uow_id="uow-B", event="execution_complete",
+                    ts="2026-01-01T10:00:00+00:00")
+
+        result = event_sequence("uow-A", registry_path=db_path)
+        assert all(r.get("uow_id") is None or True for r in result)
+        # event_sequence only selects ts, event, from_status, to_status, agent, note
+        assert len(result) == 1
+        assert result[0]["event"] == "status_change"
+
+    def test_returns_dict_with_expected_keys(self, db_path):
+        from src.orchestration.audit_queries import event_sequence
+
+        _seed_audit(db_path, uow_id="uow-1", event="execution_complete",
+                    ts="2026-01-01T10:00:00+00:00")
+
+        result = event_sequence("uow-1", registry_path=db_path)
+        entry = result[0]
+        assert set(entry.keys()) == {"ts", "event", "from_status", "to_status", "agent", "note"}

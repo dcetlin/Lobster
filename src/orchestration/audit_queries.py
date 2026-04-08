@@ -203,3 +203,288 @@ def execution_outcomes(
         return {row["outcome"]: row["cnt"] for row in rows}
     finally:
         conn.close()
+
+
+def diagnosis_events(
+    registry_path: Path | None = None,
+) -> list[dict]:
+    """Return all steward_diagnosis and steward_prescription audit_log entries.
+
+    Results are ordered by ts ASC so callers can reason about the sequence of
+    diagnostic events without needing to re-sort.
+
+    Each dict contains the standard audit_log columns:
+        id, ts, uow_id, event, from_status, to_status, agent, note
+    """
+    path = registry_path if registry_path is not None else _default_registry_path()
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, ts, uow_id, event, from_status, to_status, agent, note
+            FROM audit_log
+            WHERE event IN ('steward_diagnosis', 'steward_prescription')
+            ORDER BY ts ASC
+            """,
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def terminal_outcomes(
+    registry_path: Path | None = None,
+) -> dict[str, str]:
+    """Return {uow_id: outcome} for the latest terminal event per UoW.
+
+    Outcome values are the event strings 'execution_complete' or
+    'execution_failed'. Only the latest such event per UoW is included —
+    if a UoW was failed then retried and completed, the result is
+    'execution_complete'.
+
+    UoWs with no terminal event are omitted.
+    """
+    path = registry_path if registry_path is not None else _default_registry_path()
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT uow_id, event
+            FROM audit_log
+            WHERE id IN (
+                SELECT MAX(id)
+                FROM audit_log
+                WHERE event IN ('execution_complete', 'execution_failed')
+                GROUP BY uow_id
+            )
+            """,
+        ).fetchall()
+        return {row["uow_id"]: row["event"] for row in rows}
+    finally:
+        conn.close()
+
+
+def execution_attempts(
+    uow_id: str,
+    registry_path: Path | None = None,
+) -> list[dict]:
+    """Return all execution-related audit entries for a UoW, newest first.
+
+    Includes events: execution_complete, execution_failed, executor_dispatch.
+    Results are ordered newest first (by id DESC).
+
+    Each dict contains the standard audit_log columns:
+        id, ts, uow_id, event, from_status, to_status, agent, note
+    """
+    path = registry_path if registry_path is not None else _default_registry_path()
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, ts, uow_id, event, from_status, to_status, agent, note
+            FROM audit_log
+            WHERE uow_id = ?
+              AND event IN ('execution_complete', 'execution_failed', 'executor_dispatch')
+            ORDER BY id DESC
+            """,
+            (uow_id,),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def diagnosis_following_failure(
+    since: datetime,
+    registry_path: Path | None = None,
+) -> list[dict]:
+    """Return UoW IDs where re-diagnosis follows an execution_failed event.
+
+    For each UoW that had an execution_failed since ``since``, checks whether
+    a steward_diagnosis or reentry_prescription event followed. Returns one
+    entry per qualifying UoW with timing information.
+
+    Parameters
+    ----------
+    since:
+        Only consider execution_failed events at or after this datetime.
+        If no tzinfo, treated as UTC.
+
+    Returns
+    -------
+    list of dicts with keys:
+        uow_id, failure_ts, rediagnosis_ts, gap_seconds
+    """
+    path = registry_path if registry_path is not None else _default_registry_path()
+    since_iso = (
+        since.isoformat()
+        if since.tzinfo is not None
+        else since.replace(tzinfo=timezone.utc).isoformat()
+    )
+    conn = _connect(path)
+    try:
+        # Fetch all execution_failed events since the cutoff
+        fail_rows = conn.execute(
+            """
+            SELECT uow_id, ts, id
+            FROM audit_log
+            WHERE event = 'execution_failed'
+              AND ts >= ?
+            ORDER BY id ASC
+            """,
+            (since_iso,),
+        ).fetchall()
+
+        result = []
+        for fail_row in fail_rows:
+            uow_id = fail_row["uow_id"]
+            fail_ts = fail_row["ts"]
+            fail_id = fail_row["id"]
+
+            # Look for the earliest re-diagnosis event after this failure
+            rediag = conn.execute(
+                """
+                SELECT ts
+                FROM audit_log
+                WHERE uow_id = ?
+                  AND event IN ('steward_diagnosis', 'reentry_prescription')
+                  AND id > ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (uow_id, fail_id),
+            ).fetchone()
+
+            if rediag is None:
+                continue
+
+            rediagnosis_ts = rediag["ts"]
+            # Compute gap in seconds
+            gap_seconds: float | None = None
+            try:
+                def _parse_ts(ts: str) -> datetime:
+                    ts = ts.replace("Z", "+00:00")
+                    try:
+                        return datetime.fromisoformat(ts)
+                    except ValueError:
+                        return datetime.fromisoformat(ts[:19]).replace(tzinfo=timezone.utc)
+                gap_seconds = round(
+                    (_parse_ts(rediagnosis_ts) - _parse_ts(fail_ts)).total_seconds(), 2
+                )
+            except (ValueError, TypeError):
+                pass
+
+            result.append({
+                "uow_id": uow_id,
+                "failure_ts": fail_ts,
+                "rediagnosis_ts": rediagnosis_ts,
+                "gap_seconds": gap_seconds,
+            })
+        return result
+    finally:
+        conn.close()
+
+
+def completed_uow_durations(
+    since: str,
+    registry_path: Path | None = None,
+) -> list[dict]:
+    """Return duration and metadata for UoWs completed since the given timestamp.
+
+    Parameters
+    ----------
+    since:
+        ISO-8601 timestamp string (UTC). Only UoWs whose completed_at is
+        at or after this value are included.
+
+    Returns
+    -------
+    list of dicts with keys:
+        uow_id, created_at, completed_at, steward_cycles,
+        wall_clock_hours, register, type
+    """
+    path = registry_path if registry_path is not None else _default_registry_path()
+    try:
+        conn = _connect(path)
+    except sqlite3.OperationalError:
+        return []
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, created_at, completed_at, steward_cycles, register, type
+            FROM uow_registry
+            WHERE status = 'done'
+              AND completed_at IS NOT NULL
+              AND completed_at >= ?
+            ORDER BY completed_at ASC
+            """,
+            (since,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+
+    result = []
+    for row in rows:
+        created = row["created_at"]
+        completed = row["completed_at"]
+        wall_clock_hours: float | None = None
+        if created and completed:
+            try:
+                def _parse(ts: str) -> datetime:
+                    ts = ts.replace("Z", "+00:00")
+                    try:
+                        return datetime.fromisoformat(ts)
+                    except ValueError:
+                        return datetime.fromisoformat(ts[:19]).replace(tzinfo=timezone.utc)
+                wall_clock_hours = round(
+                    (_parse(completed) - _parse(created)).total_seconds() / 3600, 4
+                )
+            except (ValueError, TypeError):
+                pass
+        result.append({
+            "uow_id": row["id"],
+            "created_at": created,
+            "completed_at": completed,
+            "steward_cycles": row["steward_cycles"],
+            "wall_clock_hours": wall_clock_hours,
+            "register": row["register"] or "operational",
+            "type": row["type"] or "executable",
+        })
+    return result
+
+
+def event_sequence(
+    uow_id: str,
+    registry_path: Path | None = None,
+) -> list[dict]:
+    """Return the full ordered event sequence for a UoW from audit_log.
+
+    Results are ordered oldest first (chronological by id ASC).
+
+    Parameters
+    ----------
+    uow_id:
+        The UoW identifier to query.
+
+    Returns
+    -------
+    list of dicts with keys:
+        ts, event, from_status, to_status, agent, note
+    """
+    path = registry_path if registry_path is not None else _default_registry_path()
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT ts, event, from_status, to_status, agent, note
+            FROM audit_log
+            WHERE uow_id = ?
+            ORDER BY id ASC
+            """,
+            (uow_id,),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+    finally:
+        conn.close()
