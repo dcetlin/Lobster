@@ -27,6 +27,7 @@ from src.orchestration.registry import Registry, UoWStatus
 from src.orchestration.issue_source import IssueSnapshot
 from src.orchestration.garden_caretaker import (
     GardenCaretaker,
+    EXECUTING_STATES,
     _qualifies,
     _reconcile,
     _DEFAULT_CONFIG,
@@ -175,14 +176,18 @@ class TestReconcileDecisionTable:
     def test_closed_pending_archives(self) -> None:
         assert _reconcile(UoWStatus.PENDING, _snapshot(state="closed")) == "archive"
 
-    def test_closed_active_surfaces(self) -> None:
-        assert _reconcile(UoWStatus.ACTIVE, _snapshot(state="closed")) == "surface"
+    # EXECUTING_STATES (active, ready-for-executor): no-op even when source closes
+    # (issue #676: caretaker must not interrupt in-flight execution)
+    def test_closed_active_is_noop_not_surface(self) -> None:
+        """Source closure must not surface or archive a UoW that is actively executing."""
+        assert _reconcile(UoWStatus.ACTIVE, _snapshot(state="closed")) == "no_op"
+
+    def test_closed_ready_for_executor_is_noop_not_surface(self) -> None:
+        """Source closure must not surface a UoW queued for execution."""
+        assert _reconcile(UoWStatus.READY_FOR_EXECUTOR, _snapshot(state="closed")) == "no_op"
 
     def test_closed_ready_for_steward_surfaces(self) -> None:
         assert _reconcile(UoWStatus.READY_FOR_STEWARD, _snapshot(state="closed")) == "surface"
-
-    def test_closed_ready_for_executor_surfaces(self) -> None:
-        assert _reconcile(UoWStatus.READY_FOR_EXECUTOR, _snapshot(state="closed")) == "surface"
 
     def test_closed_done_noop(self) -> None:
         assert _reconcile(UoWStatus.DONE, _snapshot(state="closed")) == "no_op"
@@ -197,8 +202,13 @@ class TestReconcileDecisionTable:
     def test_deleted_pending_archives(self) -> None:
         assert _reconcile(UoWStatus.PENDING, None) == "archive"
 
-    def test_deleted_active_surfaces(self) -> None:
-        assert _reconcile(UoWStatus.ACTIVE, None) == "surface"
+    def test_deleted_active_is_noop_not_surface(self) -> None:
+        """Source deletion must not surface a UoW that is actively executing (issue #676)."""
+        assert _reconcile(UoWStatus.ACTIVE, None) == "no_op"
+
+    def test_deleted_ready_for_executor_is_noop(self) -> None:
+        """Source deletion must not archive/surface a UoW queued for execution."""
+        assert _reconcile(UoWStatus.READY_FOR_EXECUTOR, None) == "no_op"
 
     def test_deleted_done_noop(self) -> None:
         assert _reconcile(UoWStatus.DONE, None) == "no_op"
@@ -215,6 +225,25 @@ class TestReconcileDecisionTable:
 
     def test_error_state_warns(self) -> None:
         assert _reconcile(UoWStatus.ACTIVE, _snapshot(state="error")) == "warn"
+
+    # EXECUTING_STATES set membership — all members must be no_op on close/delete
+    def test_executing_states_are_all_noop_on_closed(self) -> None:
+        """Every status in EXECUTING_STATES must yield no_op when source closes (issue #676)."""
+        for status in EXECUTING_STATES:
+            result = _reconcile(status, _snapshot(state="closed"))
+            assert result == "no_op", (
+                f"Expected no_op for EXECUTING_STATES status {status!r} on source close, "
+                f"got {result!r}. Add it to EXECUTING_STATES or fix _reconcile_closed."
+            )
+
+    def test_executing_states_are_all_noop_on_deleted(self) -> None:
+        """Every status in EXECUTING_STATES must yield no_op when source is deleted (issue #676)."""
+        for status in EXECUTING_STATES:
+            result = _reconcile(status, None)
+            assert result == "no_op", (
+                f"Expected no_op for EXECUTING_STATES status {status!r} on source deletion, "
+                f"got {result!r}. Add it to EXECUTING_STATES or fix _reconcile_deleted."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -394,9 +423,14 @@ class TestTend:
         assert result["archived"] == 1
         assert registry.query(status="pending") == []
 
-    def test_tend_surfaces_to_steward_when_source_closed_and_active(
+    def test_tend_noop_when_source_closed_and_active(
         self, registry: Registry
     ) -> None:
+        """UoW in 'active' status must not be disturbed when source closes (issue #676).
+
+        Closing the source while a subagent is actively executing must not interrupt
+        in-flight work. The UoW must remain in 'active' and be counted as no_change.
+        """
         upsert_result = registry.upsert(issue_number=20, title="Active issue", success_criteria="Test completion.")
         # Manually set to active (bypassing normal flow for test setup)
         registry.set_status_direct(upsert_result.id, "active")
@@ -407,16 +441,23 @@ class TestTend:
 
         result = caretaker.tend()
 
-        assert result["surfaced_to_steward"] == 1
+        # active + source closed → no_op (EXECUTING_STATES protection)
+        assert result["no_change"] == 1
+        assert result["surfaced_to_steward"] == 0
         assert result["archived"] == 0
-        # Should be ready-for-steward, not expired
-        assert registry.query(status="expired") == []
-        ready = registry.query(status="ready-for-steward")
-        assert len(ready) == 1
+        # UoW must remain in 'active' — caretaker must not touch it
+        active = registry.query(status="active")
+        assert len(active) == 1
+        assert active[0].id == upsert_result.id
 
-    def test_tend_surfaces_to_steward_when_source_deleted_and_active(
+    def test_tend_noop_when_source_deleted_and_active(
         self, registry: Registry
     ) -> None:
+        """UoW in 'active' status must not be disturbed when source is deleted (issue #676).
+
+        Deleting the source issue must not interrupt an actively executing UoW.
+        The UoW must remain in 'active' — counted as no_change.
+        """
         upsert_result = registry.upsert(issue_number=30, title="Active deleted", success_criteria="Test completion.")
         registry.set_status_direct(upsert_result.id, "active")
 
@@ -426,9 +467,12 @@ class TestTend:
 
         result = caretaker.tend()
 
-        assert result["surfaced_to_steward"] == 1
-        ready = registry.query(status="ready-for-steward")
-        assert len(ready) == 1
+        # active + source deleted → no_op (EXECUTING_STATES protection)
+        assert result["no_change"] == 1
+        assert result["surfaced_to_steward"] == 0
+        active = registry.query(status="active")
+        assert len(active) == 1
+        assert active[0].id == upsert_result.id
 
     def test_tend_reactivates_archived_uow_when_source_reopens(
         self, registry: Registry
@@ -499,9 +543,12 @@ class TestTend:
         assert "archived_by_caretaker" in events
 
     def test_tend_audit_log_written_on_surface(self, registry: Registry) -> None:
+        """Audit log records surface event for diagnosing UoW whose source closes."""
         import sqlite3
         upsert_result = registry.upsert(issue_number=90, title="Surface audit", success_criteria="Test completion.")
-        registry.set_status_direct(upsert_result.id, "active")
+        # Use 'diagnosing' — still in _SURFACE_ON_CLOSE_STATES (not EXECUTING_STATES).
+        # 'active' is now protected (EXECUTING_STATES) and yields no_op on close.
+        registry.set_status_direct(upsert_result.id, "diagnosing")
 
         snap = _snapshot(source_ref="github:issue/90", state="closed")
         source = _make_source(issue_map={"github:issue/90": snap})
