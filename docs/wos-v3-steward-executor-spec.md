@@ -1,3 +1,5 @@
+> **Addendum to [WOS V3 Proposal](./wos-v3-proposal.md).** This document provides the detailed steward/executor contract. The proposal is the authoritative unified reference; this file is retained as the technical addendum with full implementation detail.
+
 # WOS V3 Steward/Executor Spec
 
 ## Current State of Relevant Files

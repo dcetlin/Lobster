@@ -1,7 +1,3 @@
-> **SUPERSEDED** — This was the initial V3 proposal. The current authoritative spec is [wos-v3-steward-executor-spec.md](./wos-v3-steward-executor-spec.md). Retained as context for the design rationale.
-
----
-
 # Work Orchestration System v3 — Design Proposal
 
 *Status: Proposal — 2026-04-04*
@@ -332,9 +328,35 @@ The dual register — operational and philosophical — is not a technical disti
 
 ---
 
+## Steward–Executor Contract
+
+*Detailed steward/executor contract — integrated from wos-v3-steward-executor-spec.md*
+
+Full spec: [wos-v3-steward-executor-spec.md](./wos-v3-steward-executor-spec.md)
+
+The implementation spec translates this proposal's architecture into 6 concrete V3 changes across `steward.py` and `executor.py`. Summary:
+
+**Change 1 — Register-Aware Diagnosis (Steward):** `_assess_completion()` gains a `_register_completion_policy()` branch. Operational/iterative-convergent UoWs use the existing machine-gate path. Philosophical UoWs are never auto-closed — `is_complete` is always `False`, routing to a new `philosophical_register` stuck condition. Human-judgment UoWs require an explicit `close_reason` (Dan confirmation) before closing.
+
+**Change 2 — Corrective Trace Injection (Steward):** After the trace gate, the Steward reads `{output_ref}.trace.json` and injects `surprises` and `prescription_delta` into the prescription context. For iterative-convergent UoWs, `gate_score` is read and tracked; no improvement across 3 cycles triggers the `no_gate_improvement` Dan interrupt. A loop gain bounding step (`_bound_prescription_delta()`) guards against oscillation from aggressive corrective deltas.
+
+**Change 3 — Register-Mismatch Gate (Steward):** Before writing a workflow artifact, `_check_register_executor_compatibility(register, executor_type)` runs. If a `philosophical` or `human-judgment` UoW would be dispatched to `functional-engineer`, the artifact is not written, the UoW transitions to BLOCKED, and Dan is surfaced with context. Every gate fire emits a structured `register_mismatch_observation` to the audit log for downstream pattern detection.
+
+**Change 4 — Expanded Dan Interrupt Conditions (Steward):** Three new stuck conditions: `philosophical_register` (fires after first executor cycle on philosophical UoWs), `register_mismatch` (Change 3), and `no_gate_improvement` (iterative-convergent with stalled gate scores over 3 cycles). Each has a distinct surface message format.
+
+**Change 5 — Register-Appropriate Executor Routing (Executor):** `_run_execution()` reads `executor_type` from the workflow artifact and dispatches to the appropriate function via `_EXECUTOR_TYPE_TO_DISPATCHER`. New preambles: `_ITERATIVE_ENGINEER_PREAMBLE` (run gate command, score, iterate), `_FRONTIER_WRITER_PREAMBLE` (phenomenological synthesis, no PR), `_DESIGN_REVIEW_PREAMBLE` (structured analysis for Dan's review). Existing `functional-engineer` and `lobster-ops` paths unchanged.
+
+**Change 6 — trace.json Write Requirement (Executor):** `_write_trace_json()` and `_insert_corrective_trace()` added. Trace is written at all 4 exit paths (complete, partial, blocked, exception). The corrective_traces DB table (migration 0007) receives a best-effort INSERT alongside the file write. For iterative-convergent UoWs, `gate_score` must include `command`, `result`, and a float `score` (0.0–1.0).
+
+**PR sequence:** A (trace.json write) → B (register routing) → C (register-aware diagnosis) → D (mismatch gate + expanded interrupts). A must precede C; B and C can be developed in parallel.
+
+**V4 design directions** captured in the spec: philosopher routing as composable cartridge (S5), Dan attentional state + reversible forward commitment, garden retrieval as structural prerequisite for Orient phase quality, and the scaling governor (S4) — the deepest open structural gap from Coherence's collapse.
+
+---
+
 ## Related Documents
 
-- **[wos-v3-steward-executor-spec.md](wos-v3-steward-executor-spec.md)** — Implementation spec for this proposal: 6 V3 changes, PR sequencing (A → B → C → D), testability notes, and V4 design directions including the scaling governor (S4).
+- **[wos-v3-steward-executor-spec.md](wos-v3-steward-executor-spec.md)** — Detailed steward/executor implementation spec: 6 V3 changes with full code locations, testability notes, PR sequencing (A → B → C → D), and V4 design directions including the scaling governor (S4). This is the addendum to the unified reference above.
 - **[wos-v3-convergence.md](../philosophy/frontier/wos-v3-convergence.md)** — Seeds, sprouts, and pearls synthesis from multi-thread philosophical review. Contains S1–S5 candidate spec additions, ungoverned timescales, and final bearings.
 - **[corrective-trace-loop-gain-research.md](corrective-trace-loop-gain-research.md)** — Research note on bounded correction in the corrective trace feedback loop. Directly relevant to section 4 (the corrective trace contract) and section 8 item 3 (garden write discipline).
 - **[2026-04-04-philosopher-cybernetics.md](../philosophy/sessions/2026-04-04-philosopher-cybernetics.md)** — Cybernetics philosopher session (Ashby's Law). Grounds section 9's cybernetic extension claim and names residual variety-matching gaps.
