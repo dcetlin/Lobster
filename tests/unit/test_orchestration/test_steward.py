@@ -3560,3 +3560,19 @@ class TestParseWorkflowArtifact:
         result = steward._parse_workflow_artifact(raw)
 
         assert result["estimated_cycles"] == 1
+
+    def test_parse_workflow_artifact_value_with_colon(self):
+        """Front-matter values containing colons are preserved in full."""
+        steward = _import_steward()
+
+        raw = (
+            "---\n"
+            "executor_type: functional-engineer\n"
+            "success_criteria_check: Check that status: done appears in output\n"
+            "---\n\n"
+            "Do the work."
+        )
+
+        result = steward._parse_workflow_artifact(raw)
+
+        assert result["success_criteria_check"] == "Check that status: done appears in output"

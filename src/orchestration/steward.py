@@ -931,8 +931,10 @@ def _parse_workflow_artifact(raw_text: str) -> dict:
     for line in front_matter_lines:
         if ":" not in line:
             continue
-        key, _, value = line.partition(":")
-        front_matter[key.strip()] = value.strip()
+        parts = line.split(":", 1)
+        key = parts[0].strip()
+        value = parts[1].strip() if len(parts) > 1 else ""
+        front_matter[key] = value
 
     executor_type = front_matter.get("executor_type", "")
     if not executor_type:
