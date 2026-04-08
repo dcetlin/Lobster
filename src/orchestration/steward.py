@@ -204,7 +204,9 @@ _ACTOR_STEWARD = "steward"
 # per-UoW-lifetime circuit breaker. steward_cycles (per-attempt) is NOT used here.
 _HARD_CAP_CYCLES = 5
 
-# Early warning threshold: notify Dan when steward_cycles reaches this value
+# Early warning threshold: notify Dan when lifetime_cycles + steward_cycles reaches this value.
+# Uses cumulative lifetime_cycles + new_cycles (post-prescription) so the warning fires based
+# on total cycles across all decide-retry rounds, not just the current attempt.
 _EARLY_WARNING_CYCLES = 4
 
 # Crash surface threshold: surface if crashed_no_output and steward_cycles >= this value.
@@ -3042,9 +3044,11 @@ def _process_uow(
                     uow_id, type(exc).__name__, exc,
                 )
 
-    # Early warning: fire when new_cycles reaches the early-warning threshold.
+    # Early warning: fire when lifetime_cycles + new_cycles reaches the early-warning threshold.
+    # Uses cumulative count (lifetime_cycles from previous attempts + new_cycles this attempt)
+    # so the warning fires correctly even after decide-retry resets steward_cycles to 0.
     # Fires regardless of dry_run so tests can capture the notification.
-    if new_cycles == _EARLY_WARNING_CYCLES:
+    if uow.lifetime_cycles + new_cycles == _EARLY_WARNING_CYCLES:
         _notify_early = notify_dan_early_warning or _default_notify_dan_early_warning
         _notify_early(uow, return_reason, new_cycles)
 
