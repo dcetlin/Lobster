@@ -1,54 +1,34 @@
 """
-analytics.py — Prescription quality tracking for the WOS steward pipeline.
+analytics.py — Prescription quality and pipeline observability for WOS.
 
 The steward_log field on each UoW is a newline-delimited JSON log of every
 Steward decision point. Prescription events carry a ``prescription_path``
 field that records whether the LLM or deterministic fallback path was used.
+Trace injection events carry a ``gate_score`` dict with a convergence score.
 
-This module exposes a single public function:
+This module exposes three public functions:
 
     prescription_quality_summary(registry_path?) -> dict
+    convergence_metrics(registry_path?) -> dict
+    diagnostic_accuracy(registry_path?) -> dict
 
-It queries uow_registry, parses each steward_log, and returns:
-
-  {
-    "per_uow": [
-      {
-        "id":            str,          # UoW UUID
-        "summary":       str,          # issue title / summary
-        "status":        str,          # final/current status
-        "steward_cycles": int,         # total steward cycles from DB column
-        "prescription_paths": list[str],  # ordered "llm"/"fallback" per cycle
-        "llm_count":     int,
-        "fallback_count": int,
-      },
-      ...
-    ],
-    "aggregate": {
-      "total_uows":         int,
-      "uows_with_data":     int,   # UoWs that have >=1 prescription event
-      "avg_cycles_to_done": float | None,
-      "pct_llm":            float | None,   # 0–100
-      "pct_fallback":       float | None,   # 0–100
-      "total_prescriptions": int,
-      "llm_prescriptions":   int,
-      "fallback_prescriptions": int,
-    },
-    "data_gap": str | None,  # human-readable note if data is too sparse
-  }
+And a CLI entry point (``main()``) that accepts subcommands:
+    quality, convergence, diagnostic, all
 
 Design notes:
 - Pure function composition: each concern (connect, query, parse, aggregate)
-  is a separate function. prescription_quality_summary() composes them.
+  is a separate function. Public functions compose them.
 - No writes. Read-only connection.
 - Graceful on empty/missing DB: returns empty results with a data_gap note.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -264,3 +244,381 @@ def prescription_quality_summary(
         "aggregate": aggregate,
         "data_gap": data_gap,
     }
+
+
+# ---------------------------------------------------------------------------
+# convergence_metrics — internal helpers
+# ---------------------------------------------------------------------------
+
+# Minimum tail window for stall detection: >= this many consecutive
+# non-improving scores at the end of a trajectory qualifies as stalled.
+_STALL_TAIL_LENGTH = 3
+
+# A UoW is considered converged if its final gate score meets this threshold.
+_CONVERGENCE_SCORE_THRESHOLD = 0.8
+
+
+def _parse_gate_scores(steward_log_raw: str | None) -> list[float]:
+    """
+    Extract ordered gate_score values from trace_injection events in a
+    newline-delimited steward_log string.
+
+    Returns a list of floats in cycle order. Events without gate_score are
+    skipped. Malformed JSON lines are silently skipped.
+    """
+    if not steward_log_raw:
+        return []
+
+    scores: list[float] = []
+    for line in steward_log_raw.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if entry.get("event") != "trace_injection":
+            continue
+        gate_score = entry.get("gate_score")
+        if isinstance(gate_score, dict):
+            score = gate_score.get("score")
+            if isinstance(score, (int, float)):
+                scores.append(float(score))
+        elif isinstance(gate_score, (int, float)):
+            scores.append(float(gate_score))
+    return scores
+
+
+def _is_stalled(scores: list[float]) -> bool:
+    """
+    Return True if the tail of the score trajectory shows >= _STALL_TAIL_LENGTH
+    consecutive non-improving scores.
+
+    Non-improving means each score is <= the previous one. This is a local
+    helper; do not import stall detection from the steward.
+    """
+    if len(scores) < _STALL_TAIL_LENGTH:
+        return False
+    tail = scores[-_STALL_TAIL_LENGTH:]
+    return all(tail[i] <= tail[i - 1] for i in range(1, len(tail)))
+
+
+def _build_convergence_record(row: dict) -> dict[str, Any]:
+    """Build a per-UoW convergence record from a uow_registry row."""
+    scores = _parse_gate_scores(row.get("steward_log"))
+    status = row.get("status", "")
+
+    converged = (
+        (scores and scores[-1] >= _CONVERGENCE_SCORE_THRESHOLD)
+        or status == "done"
+    )
+
+    # cycles_to_converge: index of first score crossing threshold, or None
+    cycles_to_converge: int | None = None
+    for i, s in enumerate(scores):
+        if s >= _CONVERGENCE_SCORE_THRESHOLD:
+            cycles_to_converge = i + 1  # 1-indexed cycle count
+            break
+
+    score_delta: float | None = (
+        round(scores[-1] - scores[0], 4)
+        if len(scores) >= 2
+        else None
+    )
+
+    return {
+        "id": row["id"],
+        "summary": row.get("summary", ""),
+        "status": status,
+        "score_trajectory": scores,
+        "converged": converged,
+        "cycles_to_converge": cycles_to_converge,
+        "score_delta": score_delta,
+    }
+
+
+def _compute_convergence_aggregate(per_uow: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compute aggregate convergence metrics from per-UoW records."""
+    tracked = [r for r in per_uow if r["score_trajectory"]]
+    total_tracked = len(tracked)
+    converged = [r for r in tracked if r["converged"]]
+    convergence_rate = len(converged) / total_tracked if total_tracked > 0 else None
+
+    cycles_list = [
+        r["cycles_to_converge"]
+        for r in converged
+        if r["cycles_to_converge"] is not None
+    ]
+    avg_cycles_to_converge: float | None = (
+        round(sum(cycles_list) / len(cycles_list), 2) if cycles_list else None
+    )
+
+    deltas = [r["score_delta"] for r in tracked if r["score_delta"] is not None]
+    avg_score_delta: float | None = (
+        round(sum(deltas) / len(deltas), 4) if deltas else None
+    )
+
+    stalled_count = sum(1 for r in tracked if _is_stalled(r["score_trajectory"]))
+
+    return {
+        "total_tracked": total_tracked,
+        "convergence_rate": round(convergence_rate, 4) if convergence_rate is not None else None,
+        "avg_cycles_to_converge": avg_cycles_to_converge,
+        "avg_score_delta": avg_score_delta,
+        "stalled_count": stalled_count,
+    }
+
+
+# ---------------------------------------------------------------------------
+# diagnostic_accuracy — internal helpers
+# ---------------------------------------------------------------------------
+
+def _fetch_audit_diagnosis_rows(conn: sqlite3.Connection) -> list[dict]:
+    """Return all steward_diagnosis and steward_prescription audit entries."""
+    rows = conn.execute(
+        """
+        SELECT id, ts, uow_id, event, from_status, to_status, agent, note
+        FROM audit_log
+        WHERE event IN ('steward_diagnosis', 'steward_prescription')
+        ORDER BY ts ASC
+        """
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _fetch_terminal_outcome_rows(conn: sqlite3.Connection) -> dict[str, str]:
+    """Return {uow_id: event} for the latest terminal event per UoW."""
+    rows = conn.execute(
+        """
+        SELECT uow_id, event
+        FROM audit_log
+        WHERE id IN (
+            SELECT MAX(id)
+            FROM audit_log
+            WHERE event IN ('execution_complete', 'execution_failed')
+            GROUP BY uow_id
+        )
+        """
+    ).fetchall()
+    return {row["uow_id"]: row["event"] for row in rows}
+
+
+def _build_diagnostic_per_uow(
+    diagnosis_rows: list[dict],
+    outcomes: dict[str, str],
+) -> list[dict[str, Any]]:
+    """
+    Build per-UoW diagnostic records by grouping diagnosis events and
+    cross-referencing with terminal outcomes.
+    """
+    # Group by uow_id while preserving insertion order
+    by_uow: dict[str, list[dict]] = {}
+    for row in diagnosis_rows:
+        by_uow.setdefault(row["uow_id"], []).append(row)
+
+    result = []
+    for uow_id, events in by_uow.items():
+        outcome = outcomes.get(uow_id)
+        result.append({
+            "uow_id": uow_id,
+            "diagnosis_count": len(events),
+            "outcome": outcome,  # "execution_complete" | "execution_failed" | None
+        })
+    return result
+
+
+def _compute_diagnostic_summary(per_uow: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate diagnostic accuracy across all UoWs."""
+    total_diagnoses = sum(r["diagnosis_count"] for r in per_uow)
+    followed_by_success = sum(
+        1 for r in per_uow if r["outcome"] == "execution_complete"
+    )
+    followed_by_failure = sum(
+        1 for r in per_uow if r["outcome"] == "execution_failed"
+    )
+    pending = sum(1 for r in per_uow if r["outcome"] is None)
+    resolved = followed_by_success + followed_by_failure
+    success_rate: float | None = (
+        round(followed_by_success / resolved, 4) if resolved > 0 else None
+    )
+    return {
+        "total_diagnoses": total_diagnoses,
+        "followed_by_success": followed_by_success,
+        "followed_by_failure": followed_by_failure,
+        "pending": pending,
+        "success_rate": success_rate,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public API — convergence_metrics
+# ---------------------------------------------------------------------------
+
+def convergence_metrics(
+    registry_path: Path | None = None,
+) -> dict[str, Any]:
+    """
+    Query uow_registry and return convergence metrics derived from
+    trace_injection gate scores in each UoW's steward_log.
+
+    Parameters
+    ----------
+    registry_path:
+        Path to the registry SQLite DB. Defaults to the canonical path
+        resolved from REGISTRY_DB_PATH or LOBSTER_WORKSPACE env vars.
+
+    Returns
+    -------
+    dict with keys:
+        per_uow   — list of per-UoW convergence records, each with:
+                    id, summary, status, score_trajectory, converged,
+                    cycles_to_converge, score_delta
+        aggregate — cross-UoW summary with:
+                    total_tracked, convergence_rate, avg_cycles_to_converge,
+                    avg_score_delta, stalled_count
+    """
+    path = registry_path if registry_path is not None else _default_registry_path()
+
+    if not path.exists():
+        return {
+            "per_uow": [],
+            "aggregate": _compute_convergence_aggregate([]),
+        }
+
+    try:
+        conn = _connect_ro(path)
+    except sqlite3.OperationalError:
+        return {
+            "per_uow": [],
+            "aggregate": _compute_convergence_aggregate([]),
+        }
+
+    try:
+        rows = _fetch_uow_rows(conn)
+    except sqlite3.OperationalError:
+        return {
+            "per_uow": [],
+            "aggregate": _compute_convergence_aggregate([]),
+        }
+    finally:
+        conn.close()
+
+    per_uow = [_build_convergence_record(row) for row in rows]
+    aggregate = _compute_convergence_aggregate(per_uow)
+    return {"per_uow": per_uow, "aggregate": aggregate}
+
+
+# ---------------------------------------------------------------------------
+# Public API — diagnostic_accuracy
+# ---------------------------------------------------------------------------
+
+def diagnostic_accuracy(
+    registry_path: Path | None = None,
+) -> dict[str, Any]:
+    """
+    Query audit_log for steward_diagnosis / steward_prescription events,
+    cross-reference with terminal outcomes, and return diagnostic accuracy
+    metrics.
+
+    Parameters
+    ----------
+    registry_path:
+        Path to the registry SQLite DB.
+
+    Returns
+    -------
+    dict with keys:
+        summary  — aggregate metrics:
+                   total_diagnoses, followed_by_success, followed_by_failure,
+                   pending, success_rate (float 0–1 or None)
+        per_uow  — list of per-UoW records:
+                   uow_id, diagnosis_count, outcome
+    """
+    path = registry_path if registry_path is not None else _default_registry_path()
+
+    if not path.exists():
+        return {
+            "summary": _compute_diagnostic_summary([]),
+            "per_uow": [],
+        }
+
+    try:
+        conn = _connect_ro(path)
+    except sqlite3.OperationalError:
+        return {
+            "summary": _compute_diagnostic_summary([]),
+            "per_uow": [],
+        }
+
+    try:
+        diagnosis_rows = _fetch_audit_diagnosis_rows(conn)
+        outcomes = _fetch_terminal_outcome_rows(conn)
+    except sqlite3.OperationalError:
+        return {
+            "summary": _compute_diagnostic_summary([]),
+            "per_uow": [],
+        }
+    finally:
+        conn.close()
+
+    per_uow = _build_diagnostic_per_uow(diagnosis_rows, outcomes)
+    summary = _compute_diagnostic_summary(per_uow)
+    return {"summary": summary, "per_uow": per_uow}
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    """
+    analytics_report CLI — print WOS analytics as JSON to stdout.
+
+    Subcommands:
+        quality      prescription_quality_summary()
+        convergence  convergence_metrics()
+        diagnostic   diagnostic_accuracy()
+        all          all three metrics under their respective keys (default)
+
+    Options:
+        --db PATH    override the default registry DB path
+    """
+    parser = argparse.ArgumentParser(
+        prog="analytics_report",
+        description="WOS pipeline analytics report (JSON output)",
+    )
+    parser.add_argument(
+        "subcommand",
+        nargs="?",
+        choices=["quality", "convergence", "diagnostic", "all"],
+        default="all",
+        help="Which metrics to report (default: all)",
+    )
+    parser.add_argument(
+        "--db",
+        metavar="PATH",
+        help="Path to registry DB (overrides REGISTRY_DB_PATH and LOBSTER_WORKSPACE)",
+    )
+    args = parser.parse_args()
+
+    db_path = Path(args.db) if args.db else None
+
+    if args.subcommand == "quality":
+        result = prescription_quality_summary(db_path)
+    elif args.subcommand == "convergence":
+        result = convergence_metrics(db_path)
+    elif args.subcommand == "diagnostic":
+        result = diagnostic_accuracy(db_path)
+    else:  # "all"
+        result = {
+            "quality": prescription_quality_summary(db_path),
+            "convergence": convergence_metrics(db_path),
+            "diagnostic": diagnostic_accuracy(db_path),
+        }
+
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()

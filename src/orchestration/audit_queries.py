@@ -203,3 +203,62 @@ def execution_outcomes(
         return {row["outcome"]: row["cnt"] for row in rows}
     finally:
         conn.close()
+
+
+def diagnosis_events(
+    registry_path: Path | None = None,
+) -> list[dict]:
+    """Return all steward_diagnosis and steward_prescription audit_log entries.
+
+    Results are ordered by ts ASC so callers can reason about the sequence of
+    diagnostic events without needing to re-sort.
+
+    Each dict contains the standard audit_log columns:
+        id, ts, uow_id, event, from_status, to_status, agent, note
+    """
+    path = registry_path if registry_path is not None else _default_registry_path()
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, ts, uow_id, event, from_status, to_status, agent, note
+            FROM audit_log
+            WHERE event IN ('steward_diagnosis', 'steward_prescription')
+            ORDER BY ts ASC
+            """,
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def terminal_outcomes(
+    registry_path: Path | None = None,
+) -> dict[str, str]:
+    """Return {uow_id: outcome} for the latest terminal event per UoW.
+
+    Outcome values are the event strings 'execution_complete' or
+    'execution_failed'. Only the latest such event per UoW is included —
+    if a UoW was failed then retried and completed, the result is
+    'execution_complete'.
+
+    UoWs with no terminal event are omitted.
+    """
+    path = registry_path if registry_path is not None else _default_registry_path()
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT uow_id, event
+            FROM audit_log
+            WHERE id IN (
+                SELECT MAX(id)
+                FROM audit_log
+                WHERE event IN ('execution_complete', 'execution_failed')
+                GROUP BY uow_id
+            )
+            """,
+        ).fetchall()
+        return {row["uow_id"]: row["event"] for row in rows}
+    finally:
+        conn.close()
