@@ -28,8 +28,13 @@ from src.orchestration.analytics import (
     prescription_quality_summary,
     convergence_metrics,
     diagnostic_accuracy,
+    execution_fidelity_summary,
+    diagnostic_accuracy_summary,
+    convergence_summary,
+    complexity_appropriateness_summary,
     _CONVERGENCE_SCORE_THRESHOLD,
     _STALL_TAIL_LENGTH,
+    _OPERATIONAL_COMPLEXITY_THRESHOLD,
 )
 
 
@@ -612,3 +617,389 @@ class TestDiagnosticAccuracy:
         # Latest event is execution_complete → success
         assert result["summary"]["followed_by_success"] == 1
         assert result["summary"]["followed_by_failure"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: execution_fidelity_summary
+# ---------------------------------------------------------------------------
+
+class TestExecutionFidelitySummary:
+    def test_empty_db_returns_zero_aggregate(self, tmp_path):
+        """Empty audit_log produces zero totals and None rates."""
+        db_path = _init_db(tmp_path)
+        result = execution_fidelity_summary(registry_path=db_path)
+        assert result["per_uow"] == []
+        agg = result["aggregate"]
+        assert agg["total_executions"] == 0
+        assert agg["success_rate"] is None
+        assert agg["failure_rate"] is None
+        assert agg["re_diagnosis_rate"] is None
+
+    def test_nonexistent_db_returns_empty(self, tmp_path):
+        result = execution_fidelity_summary(registry_path=tmp_path / "no.db")
+        assert result["per_uow"] == []
+        assert result["aggregate"]["total_executions"] == 0
+
+    def test_single_successful_execution(self, tmp_path):
+        """UoW with one dispatch and one complete: success_rate = 1.0."""
+        db_path = _init_db(tmp_path)
+        _insert_audit(db_path, uow_id="uow-1", event="executor_dispatch",
+                      ts="2026-01-01T10:00:00+00:00")
+        _insert_audit(db_path, uow_id="uow-1", event="execution_complete",
+                      ts="2026-01-01T11:00:00+00:00")
+        result = execution_fidelity_summary(registry_path=db_path)
+        assert result["aggregate"]["total_executions"] == 1
+        assert result["aggregate"]["success_rate"] == 1.0
+        assert result["aggregate"]["failure_rate"] == 0.0
+        per = result["per_uow"][0]
+        assert per["uow_id"] == "uow-1"
+        assert per["final_outcome"] == "execution_complete"
+        assert per["re_diagnosis_occurred"] is False
+
+    def test_single_failed_execution_with_rediagnosis(self, tmp_path):
+        """Failure followed by steward_diagnosis is flagged as re_diagnosis."""
+        db_path = _init_db(tmp_path)
+        _insert_audit(db_path, uow_id="uow-1", event="execution_failed",
+                      ts="2026-01-01T10:00:00+00:00")
+        _insert_audit(db_path, uow_id="uow-1", event="steward_diagnosis",
+                      ts="2026-01-01T11:00:00+00:00")
+        result = execution_fidelity_summary(registry_path=db_path)
+        agg = result["aggregate"]
+        assert agg["total_executions"] == 1
+        assert agg["failure_rate"] == 1.0
+        assert agg["re_diagnosis_rate"] == 1.0
+        per = result["per_uow"][0]
+        assert per["re_diagnosis_occurred"] is True
+
+    def test_mixed_outcomes_two_uows(self, tmp_path):
+        """One success, one failure — success_rate = 0.5."""
+        db_path = _init_db(tmp_path)
+        _insert_audit(db_path, uow_id="uow-ok", event="execution_complete",
+                      ts="2026-01-01T10:00:00+00:00")
+        _insert_audit(db_path, uow_id="uow-fail", event="execution_failed",
+                      ts="2026-01-01T10:00:00+00:00")
+        result = execution_fidelity_summary(registry_path=db_path)
+        agg = result["aggregate"]
+        assert agg["total_executions"] == 2
+        assert agg["success_rate"] == 0.5
+        assert agg["failure_rate"] == 0.5
+        assert agg["re_diagnosis_rate"] == 0.0
+
+    def test_no_rediagnosis_without_failure(self, tmp_path):
+        """Successful UoW with subsequent steward_diagnosis not flagged as re_diagnosis."""
+        db_path = _init_db(tmp_path)
+        # No prior failure for this UoW — re_diagnosis_occurred should be False
+        _insert_audit(db_path, uow_id="uow-ok", event="execution_complete",
+                      ts="2026-01-01T10:00:00+00:00")
+        _insert_audit(db_path, uow_id="uow-ok", event="steward_diagnosis",
+                      ts="2026-01-01T11:00:00+00:00")
+        result = execution_fidelity_summary(registry_path=db_path)
+        # Since uow-ok had no failure, it should NOT be flagged
+        assert result["aggregate"]["re_diagnosis_rate"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Tests: diagnostic_accuracy_summary
+# ---------------------------------------------------------------------------
+
+def _insert_uow_with_log(
+    db_path: Path,
+    uow_id: str,
+    status: str = "done",
+    steward_log: str = "",
+) -> None:
+    """Insert a UoW with a steward_log for diagnostic_accuracy_summary tests."""
+    _insert_uow(db_path, uow_id=uow_id, status=status, steward_log=steward_log)
+
+
+class TestDiagnosticAccuracySummary:
+    def test_empty_db_returns_zero_aggregate(self, tmp_path):
+        """Empty DB: zero totals, None success rate."""
+        db_path = _init_db(tmp_path)
+        result = diagnostic_accuracy_summary(registry_path=db_path)
+        assert result["per_uow"] == []
+        agg = result["aggregate"]
+        assert agg["total_diagnosed"] == 0
+        assert agg["successful_first_attempt_count"] == 0
+        assert agg["first_attempt_success_rate"] is None
+
+    def test_nonexistent_db_returns_empty(self, tmp_path):
+        result = diagnostic_accuracy_summary(registry_path=tmp_path / "no.db")
+        assert result["per_uow"] == []
+
+    def test_first_attempt_success_when_complete_precedes_failure(self, tmp_path):
+        """execution_complete before any execution_failed → first_attempt_success=True."""
+        db_path = _init_db(tmp_path)
+        _insert_audit(db_path, uow_id="uow-1", event="prescription",
+                      ts="2026-01-01T09:00:00+00:00")
+        _insert_audit(db_path, uow_id="uow-1", event="execution_complete",
+                      ts="2026-01-01T10:00:00+00:00")
+        result = diagnostic_accuracy_summary(registry_path=db_path)
+        agg = result["aggregate"]
+        assert agg["total_diagnosed"] == 1
+        assert agg["successful_first_attempt_count"] == 1
+        assert agg["first_attempt_success_rate"] == 1.0
+        assert result["per_uow"][0]["first_attempt_success"] is True
+
+    def test_first_attempt_failure_when_failed_precedes_complete(self, tmp_path):
+        """execution_failed before execution_complete → first_attempt_success=False."""
+        db_path = _init_db(tmp_path)
+        _insert_audit(db_path, uow_id="uow-1", event="reentry_prescription",
+                      ts="2026-01-01T09:00:00+00:00")
+        _insert_audit(db_path, uow_id="uow-1", event="execution_failed",
+                      ts="2026-01-01T10:00:00+00:00")
+        _insert_audit(db_path, uow_id="uow-1", event="execution_complete",
+                      ts="2026-01-01T11:00:00+00:00")
+        result = diagnostic_accuracy_summary(registry_path=db_path)
+        assert result["aggregate"]["first_attempt_success_rate"] == 0.0
+        assert result["per_uow"][0]["first_attempt_success"] is False
+
+    def test_pending_uow_with_no_execution_event(self, tmp_path):
+        """UoW with prescription but no execution event yet → None success."""
+        db_path = _init_db(tmp_path)
+        _insert_audit(db_path, uow_id="uow-pending", event="prescription",
+                      ts="2026-01-01T09:00:00+00:00")
+        result = diagnostic_accuracy_summary(registry_path=db_path)
+        agg = result["aggregate"]
+        assert agg["total_diagnosed"] == 1
+        assert agg["first_attempt_success_rate"] is None
+        assert result["per_uow"][0]["first_attempt_success"] is None
+
+    def test_multiple_uows_mixed_outcomes(self, tmp_path):
+        """Two UoWs: one first-attempt success, one failure → rate = 0.5."""
+        db_path = _init_db(tmp_path)
+        _insert_audit(db_path, uow_id="uow-good", event="prescription",
+                      ts="2026-01-01T09:00:00+00:00")
+        _insert_audit(db_path, uow_id="uow-good", event="execution_complete",
+                      ts="2026-01-01T10:00:00+00:00")
+        _insert_audit(db_path, uow_id="uow-bad", event="prescription",
+                      ts="2026-01-01T09:00:00+00:00")
+        _insert_audit(db_path, uow_id="uow-bad", event="execution_failed",
+                      ts="2026-01-01T10:00:00+00:00")
+        result = diagnostic_accuracy_summary(registry_path=db_path)
+        assert result["aggregate"]["first_attempt_success_rate"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# Tests: convergence_summary
+# ---------------------------------------------------------------------------
+
+def _insert_completed_uow(
+    db_path: Path,
+    uow_id: str,
+    steward_cycles: int,
+    created_at: str,
+    completed_at: str | None,
+) -> None:
+    """Insert a completed UoW with timing fields for convergence_summary tests."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        INSERT INTO uow_registry
+            (id, source, status, summary, created_at, updated_at,
+             steward_cycles, steward_log, success_criteria, completed_at)
+        VALUES (?, ?, 'done', ?, ?, ?, ?, '', '', ?)
+        """,
+        (uow_id, "github:issue/1", "test", created_at, created_at,
+         steward_cycles, completed_at),
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestConvergenceSummary:
+    def test_empty_db_returns_zero_aggregate(self, tmp_path):
+        """No completed UoWs → all aggregates None."""
+        db_path = _init_db(tmp_path)
+        result = convergence_summary(registry_path=db_path)
+        assert result["per_uow"] == []
+        agg = result["aggregate"]
+        assert agg["avg_cycles_to_done"] is None
+        assert agg["median_cycles"] is None
+        assert agg["outlier_uow_ids"] == []
+
+    def test_nonexistent_db_returns_empty(self, tmp_path):
+        result = convergence_summary(registry_path=tmp_path / "no.db")
+        assert result["per_uow"] == []
+
+    def test_single_completed_uow(self, tmp_path):
+        """Single done UoW: avg/median/max all equal steward_cycles."""
+        db_path = _init_db(tmp_path)
+        _insert_completed_uow(
+            db_path, "uow-1", steward_cycles=3,
+            created_at="2026-01-01T00:00:00+00:00",
+            completed_at="2026-01-01T06:00:00+00:00",
+        )
+        result = convergence_summary(registry_path=db_path)
+        assert len(result["per_uow"]) == 1
+        agg = result["aggregate"]
+        assert agg["avg_cycles_to_done"] == 3.0
+        assert agg["median_cycles"] == 3
+        assert agg["max_cycles"] == 3
+        assert agg["avg_wall_clock_hours"] == 6.0
+        assert agg["outlier_uow_ids"] == []
+
+    def test_outlier_detection(self, tmp_path):
+        """UoW with cycles > 2 * median is flagged as outlier."""
+        db_path = _init_db(tmp_path)
+        # Three normal UoWs at 2 cycles each (median=2)
+        for i in range(3):
+            _insert_completed_uow(
+                db_path, f"uow-{i}", steward_cycles=2,
+                created_at="2026-01-01T00:00:00+00:00",
+                completed_at="2026-01-01T01:00:00+00:00",
+            )
+        # One outlier at 5 cycles (> 2 * 2 = 4)
+        _insert_completed_uow(
+            db_path, "uow-outlier", steward_cycles=5,
+            created_at="2026-01-01T00:00:00+00:00",
+            completed_at="2026-01-01T02:00:00+00:00",
+        )
+        result = convergence_summary(registry_path=db_path)
+        assert "uow-outlier" in result["aggregate"]["outlier_uow_ids"]
+
+    def test_no_outlier_when_cycles_within_bounds(self, tmp_path):
+        """UoW with cycles = 2 * median is NOT an outlier (must strictly exceed)."""
+        db_path = _init_db(tmp_path)
+        _insert_completed_uow(
+            db_path, "uow-1", steward_cycles=2,
+            created_at="2026-01-01T00:00:00+00:00",
+            completed_at="2026-01-01T01:00:00+00:00",
+        )
+        _insert_completed_uow(
+            db_path, "uow-2", steward_cycles=4,  # exactly 2 * median(2) — not an outlier
+            created_at="2026-01-01T00:00:00+00:00",
+            completed_at="2026-01-01T02:00:00+00:00",
+        )
+        result = convergence_summary(registry_path=db_path)
+        assert result["aggregate"]["outlier_uow_ids"] == []
+
+    def test_wall_clock_hours_computed(self, tmp_path):
+        """Wall-clock hours are correctly derived from created_at / completed_at."""
+        db_path = _init_db(tmp_path)
+        _insert_completed_uow(
+            db_path, "uow-1", steward_cycles=1,
+            created_at="2026-01-01T00:00:00+00:00",
+            completed_at="2026-01-01T02:30:00+00:00",
+        )
+        result = convergence_summary(registry_path=db_path)
+        assert result["per_uow"][0]["wall_clock_hours"] == 2.5
+
+    def test_pending_uows_excluded(self, tmp_path):
+        """Only done UoWs are counted in convergence_summary."""
+        db_path = _init_db(tmp_path)
+        # Insert a pending UoW — should not appear
+        _insert_uow(db_path, uow_id="uow-pending", status="pending", steward_cycles=5)
+        result = convergence_summary(registry_path=db_path)
+        assert result["per_uow"] == []
+
+
+# ---------------------------------------------------------------------------
+# Tests: complexity_appropriateness_summary
+# ---------------------------------------------------------------------------
+
+def _insert_complexity_uow(
+    db_path: Path,
+    uow_id: str,
+    register: str = "operational",
+    uow_type: str = "executable",
+    steward_cycles: int = 0,
+    steward_log: str = "",
+) -> None:
+    """Insert a UoW with register/type/cycles/log for complexity tests."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        INSERT INTO uow_registry
+            (id, source, status, summary, created_at, updated_at,
+             steward_cycles, steward_log, success_criteria, register, type)
+        VALUES (?, ?, 'done', ?, '2026-01-01T00:00:00', '2026-01-01T00:00:00',
+                ?, ?, '', ?, ?)
+        """,
+        (uow_id, "github:issue/1", "test", steward_cycles, steward_log, register, uow_type),
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestComplexityAppropriatenessSummary:
+    def test_empty_db_returns_empty_breakdown(self, tmp_path):
+        """No UoWs → empty by_register."""
+        db_path = _init_db(tmp_path)
+        result = complexity_appropriateness_summary(registry_path=db_path)
+        assert result["per_uow"] == []
+        assert result["aggregate"]["by_register"] == {}
+
+    def test_nonexistent_db_returns_empty(self, tmp_path):
+        result = complexity_appropriateness_summary(registry_path=tmp_path / "no.db")
+        assert result["per_uow"] == []
+
+    def test_single_operational_uow_llm_path(self, tmp_path):
+        """Operational UoW with LLM path is correctly classified."""
+        db_path = _init_db(tmp_path)
+        log = _make_log(_prescription_event("llm"))
+        _insert_complexity_uow(
+            db_path, "uow-1", register="operational", steward_cycles=2, steward_log=log
+        )
+        result = complexity_appropriateness_summary(registry_path=db_path)
+        per = result["per_uow"][0]
+        assert per["register"] == "operational"
+        assert per["prescription_path"] == "llm"
+        assert per["over_complex_flag"] is False
+        agg = result["aggregate"]["by_register"]["operational"]
+        assert agg["pct_llm"] == 100.0
+        assert agg["pct_fallback"] == 0.0
+
+    def test_over_complex_flag_set_for_operational_high_cycles(self, tmp_path):
+        """Operational UoW with cycles > _OPERATIONAL_COMPLEXITY_THRESHOLD is flagged."""
+        db_path = _init_db(tmp_path)
+        _insert_complexity_uow(
+            db_path, "uow-heavy", register="operational",
+            steward_cycles=_OPERATIONAL_COMPLEXITY_THRESHOLD + 1
+        )
+        result = complexity_appropriateness_summary(registry_path=db_path)
+        per = result["per_uow"][0]
+        assert per["over_complex_flag"] is True
+        agg = result["aggregate"]["by_register"]["operational"]
+        assert agg["over_complex_count"] == 1
+
+    def test_over_complex_not_flagged_at_threshold(self, tmp_path):
+        """Cycles == _OPERATIONAL_COMPLEXITY_THRESHOLD is NOT flagged (must strictly exceed)."""
+        db_path = _init_db(tmp_path)
+        _insert_complexity_uow(
+            db_path, "uow-ok", register="operational",
+            steward_cycles=_OPERATIONAL_COMPLEXITY_THRESHOLD
+        )
+        result = complexity_appropriateness_summary(registry_path=db_path)
+        assert result["per_uow"][0]["over_complex_flag"] is False
+
+    def test_non_operational_register_not_flagged(self, tmp_path):
+        """Non-operational registers with high cycles are NOT flagged as over-complex."""
+        db_path = _init_db(tmp_path)
+        _insert_complexity_uow(
+            db_path, "uow-deep", register="reflective",
+            steward_cycles=10  # high cycles OK for non-operational
+        )
+        result = complexity_appropriateness_summary(registry_path=db_path)
+        assert result["per_uow"][0]["over_complex_flag"] is False
+
+    def test_multiple_registers_grouped_separately(self, tmp_path):
+        """UoWs in different registers appear in separate by_register buckets."""
+        db_path = _init_db(tmp_path)
+        log = _make_log(_prescription_event("llm"))
+        _insert_complexity_uow(db_path, "uow-op", register="operational", steward_log=log)
+        _insert_complexity_uow(db_path, "uow-ref", register="reflective",
+                               steward_log=_make_log(_prescription_event("fallback")))
+        result = complexity_appropriateness_summary(registry_path=db_path)
+        by_reg = result["aggregate"]["by_register"]
+        assert "operational" in by_reg
+        assert "reflective" in by_reg
+        assert by_reg["operational"]["count"] == 1
+        assert by_reg["reflective"]["count"] == 1
+
+    def test_uow_with_no_prescription_events_has_unknown_path(self, tmp_path):
+        """UoW with no prescription events in steward_log → prescription_path = 'unknown'."""
+        db_path = _init_db(tmp_path)
+        _insert_complexity_uow(db_path, "uow-blank", register="operational", steward_log="")
+        result = complexity_appropriateness_summary(registry_path=db_path)
+        assert result["per_uow"][0]["prescription_path"] == "unknown"

@@ -6,11 +6,15 @@ Steward decision point. Prescription events carry a ``prescription_path``
 field that records whether the LLM or deterministic fallback path was used.
 Trace injection events carry a ``gate_score`` dict with a convergence score.
 
-This module exposes three public functions:
+This module exposes seven public functions:
 
     prescription_quality_summary(registry_path?) -> dict
     convergence_metrics(registry_path?) -> dict
     diagnostic_accuracy(registry_path?) -> dict
+    execution_fidelity_summary(registry_path?) -> dict
+    diagnostic_accuracy_summary(registry_path?) -> dict
+    convergence_summary(registry_path?) -> dict
+    complexity_appropriateness_summary(registry_path?) -> dict
 
 And a CLI entry point (``main()``) that accepts subcommands:
     quality, convergence, diagnostic, all
@@ -28,7 +32,9 @@ import argparse
 import json
 import os
 import sqlite3
+import statistics
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -565,6 +571,550 @@ def diagnostic_accuracy(
     per_uow = _build_diagnostic_per_uow(diagnosis_rows, outcomes)
     summary = _compute_diagnostic_summary(per_uow)
     return {"summary": summary, "per_uow": per_uow}
+
+
+# ---------------------------------------------------------------------------
+# execution_fidelity_summary — internal helpers
+# ---------------------------------------------------------------------------
+
+# Named constants derived from the spec
+_EXECUTION_COMPLETE_EVENT = "execution_complete"
+_EXECUTION_FAILED_EVENT = "execution_failed"
+_EXECUTOR_DISPATCH_EVENT = "executor_dispatch"
+_STEWARD_DIAGNOSIS_EVENT = "steward_diagnosis"
+_REENTRY_PRESCRIPTION_EVENT = "reentry_prescription"
+
+# Operational register UoWs with more cycles than this are flagged as
+# potentially over-complex in complexity_appropriateness_summary.
+_OPERATIONAL_COMPLEXITY_THRESHOLD = 3
+
+
+def _fetch_execution_audit_rows(conn: sqlite3.Connection) -> list[dict]:
+    """Return all execution-related audit events: complete, failed, dispatch."""
+    rows = conn.execute(
+        """
+        SELECT id, ts, uow_id, event, from_status, to_status, agent, note
+        FROM audit_log
+        WHERE event IN (?, ?, ?)
+        ORDER BY id ASC
+        """,
+        (
+            _EXECUTION_COMPLETE_EVENT,
+            _EXECUTION_FAILED_EVENT,
+            _EXECUTOR_DISPATCH_EVENT,
+        ),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _fetch_rediagnosis_rows(conn: sqlite3.Connection) -> list[dict]:
+    """Return steward_diagnosis and reentry_prescription events."""
+    rows = conn.execute(
+        """
+        SELECT id, ts, uow_id, event
+        FROM audit_log
+        WHERE event IN (?, ?)
+        ORDER BY id ASC
+        """,
+        (_STEWARD_DIAGNOSIS_EVENT, _REENTRY_PRESCRIPTION_EVENT),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _build_fidelity_per_uow(
+    exec_rows: list[dict],
+    rediag_rows: list[dict],
+) -> list[dict[str, Any]]:
+    """
+    Build per-UoW execution fidelity records.
+
+    For each UoW that has execution events: count attempts, determine final
+    outcome, and detect whether re-diagnosis occurred after a failure.
+    """
+    # Group execution events by uow_id
+    by_uow: dict[str, list[dict]] = {}
+    for row in exec_rows:
+        by_uow.setdefault(row["uow_id"], []).append(row)
+
+    # Build set of uow_ids that had rediagnosis (any steward_diagnosis or
+    # reentry_prescription event after an execution_failed)
+    failed_uow_ids: set[str] = set()
+    for row in exec_rows:
+        if row["event"] == _EXECUTION_FAILED_EVENT:
+            failed_uow_ids.add(row["uow_id"])
+
+    rediag_uow_ids: set[str] = set()
+    for row in rediag_rows:
+        if row["uow_id"] in failed_uow_ids:
+            rediag_uow_ids.add(row["uow_id"])
+
+    result = []
+    for uow_id, events in by_uow.items():
+        dispatch_events = [e for e in events if e["event"] == _EXECUTOR_DISPATCH_EVENT]
+        fail_events = [e for e in events if e["event"] == _EXECUTION_FAILED_EVENT]
+        complete_events = [e for e in events if e["event"] == _EXECUTION_COMPLETE_EVENT]
+
+        # Final outcome is the last terminal event
+        terminal = [e for e in events if e["event"] in (_EXECUTION_COMPLETE_EVENT, _EXECUTION_FAILED_EVENT)]
+        final_outcome: str | None = terminal[-1]["event"] if terminal else None
+
+        result.append({
+            "uow_id": uow_id,
+            "execution_attempts": len(dispatch_events),
+            "failure_count": len(fail_events),
+            "success_count": len(complete_events),
+            "final_outcome": final_outcome,
+            "re_diagnosis_occurred": uow_id in rediag_uow_ids,
+        })
+    return result
+
+
+def _compute_fidelity_aggregate(per_uow: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate execution fidelity rates across UoWs."""
+    total = len(per_uow)
+    if total == 0:
+        return {
+            "total_executions": 0,
+            "success_rate": None,
+            "failure_rate": None,
+            "re_diagnosis_rate": None,
+        }
+    resolved = [r for r in per_uow if r["final_outcome"] is not None]
+    successes = [r for r in resolved if r["final_outcome"] == _EXECUTION_COMPLETE_EVENT]
+    failures = [r for r in resolved if r["final_outcome"] == _EXECUTION_FAILED_EVENT]
+    rediagnosed = [r for r in per_uow if r["re_diagnosis_occurred"]]
+    total_resolved = len(resolved)
+    return {
+        "total_executions": total,
+        "success_rate": round(len(successes) / total_resolved, 4) if total_resolved > 0 else None,
+        "failure_rate": round(len(failures) / total_resolved, 4) if total_resolved > 0 else None,
+        "re_diagnosis_rate": round(len(rediagnosed) / total, 4) if total > 0 else None,
+    }
+
+
+def execution_fidelity_summary(
+    registry_path: Path | None = None,
+) -> dict[str, Any]:
+    """
+    Measure how often executors succeed vs. fail vs. require re-diagnosis.
+
+    Queries audit_log for execution_complete, execution_failed, and
+    executor_dispatch events. Per-UoW counts are combined into aggregate
+    success_rate, failure_rate, and re_diagnosis_rate.
+
+    Parameters
+    ----------
+    registry_path:
+        Path to the registry SQLite DB. Defaults to the canonical path
+        resolved from REGISTRY_DB_PATH or LOBSTER_WORKSPACE env vars.
+
+    Returns
+    -------
+    dict with keys:
+        per_uow   — list of per-UoW fidelity records
+        aggregate — {total_executions, success_rate, failure_rate, re_diagnosis_rate}
+    """
+    path = registry_path if registry_path is not None else _default_registry_path()
+    if not path.exists():
+        return {"per_uow": [], "aggregate": _compute_fidelity_aggregate([])}
+    try:
+        conn = _connect_ro(path)
+    except sqlite3.OperationalError:
+        return {"per_uow": [], "aggregate": _compute_fidelity_aggregate([])}
+    try:
+        exec_rows = _fetch_execution_audit_rows(conn)
+        rediag_rows = _fetch_rediagnosis_rows(conn)
+    except sqlite3.OperationalError:
+        return {"per_uow": [], "aggregate": _compute_fidelity_aggregate([])}
+    finally:
+        conn.close()
+
+    per_uow = _build_fidelity_per_uow(exec_rows, rediag_rows)
+    aggregate = _compute_fidelity_aggregate(per_uow)
+    return {"per_uow": per_uow, "aggregate": aggregate}
+
+
+# ---------------------------------------------------------------------------
+# diagnostic_accuracy_summary — internal helpers
+# ---------------------------------------------------------------------------
+
+def _fetch_prescription_audit_rows(conn: sqlite3.Connection) -> list[dict]:
+    """Return all prescription and reentry_prescription audit events."""
+    rows = conn.execute(
+        """
+        SELECT id, ts, uow_id, event
+        FROM audit_log
+        WHERE event IN ('prescription', 'reentry_prescription')
+        ORDER BY id ASC
+        """,
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _build_first_attempt_success(
+    prescription_rows: list[dict],
+    exec_rows: list[dict],
+) -> list[dict[str, Any]]:
+    """
+    Determine first-execution-attempt outcome per UoW.
+
+    A first attempt is successful if execution_complete follows the first
+    prescription event without an intervening execution_failed.
+    """
+    # Build ordered event id -> event for each uow
+    by_uow_prescriptions: dict[str, list[dict]] = {}
+    for row in prescription_rows:
+        by_uow_prescriptions.setdefault(row["uow_id"], []).append(row)
+
+    by_uow_exec: dict[str, list[dict]] = {}
+    for row in exec_rows:
+        if row["event"] in (_EXECUTION_COMPLETE_EVENT, _EXECUTION_FAILED_EVENT):
+            by_uow_exec.setdefault(row["uow_id"], []).append(row)
+
+    result = []
+    for uow_id, presc_events in by_uow_prescriptions.items():
+        first_presc_id = presc_events[0]["id"]
+        exec_events = by_uow_exec.get(uow_id, [])
+        # Events after the first prescription, in order
+        post_presc = [e for e in exec_events if e["id"] > first_presc_id]
+        if not post_presc:
+            # No execution events yet — pending
+            result.append({"uow_id": uow_id, "first_attempt_success": None})
+            continue
+        first_exec = post_presc[0]
+        # First attempt is a success if no failure precedes the first complete
+        first_failure = next(
+            (e for e in post_presc if e["event"] == _EXECUTION_FAILED_EVENT), None
+        )
+        first_complete = next(
+            (e for e in post_presc if e["event"] == _EXECUTION_COMPLETE_EVENT), None
+        )
+        if first_complete and (first_failure is None or first_complete["id"] < first_failure["id"]):
+            success = True
+        else:
+            success = False
+        result.append({"uow_id": uow_id, "first_attempt_success": success})
+    return result
+
+
+def _compute_first_attempt_aggregate(per_uow: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate first-attempt success rate."""
+    total_diagnosed = len(per_uow)
+    resolved = [r for r in per_uow if r["first_attempt_success"] is not None]
+    successes = [r for r in resolved if r["first_attempt_success"] is True]
+    return {
+        "total_diagnosed": total_diagnosed,
+        "successful_first_attempt_count": len(successes),
+        "first_attempt_success_rate": (
+            round(len(successes) / len(resolved), 4) if resolved else None
+        ),
+    }
+
+
+def diagnostic_accuracy_summary(
+    registry_path: Path | None = None,
+) -> dict[str, Any]:
+    """
+    Measure how often steward prescriptions lead to successful closure on
+    the first execution attempt.
+
+    A first attempt is successful when execution_complete follows the first
+    prescription/reentry_prescription event without an intervening
+    execution_failed.
+
+    Parameters
+    ----------
+    registry_path:
+        Path to the registry SQLite DB.
+
+    Returns
+    -------
+    dict with keys:
+        per_uow   — list of {uow_id, first_attempt_success: bool | None}
+        aggregate — {total_diagnosed, successful_first_attempt_count,
+                     first_attempt_success_rate}
+    """
+    path = registry_path if registry_path is not None else _default_registry_path()
+    if not path.exists():
+        return {"per_uow": [], "aggregate": _compute_first_attempt_aggregate([])}
+    try:
+        conn = _connect_ro(path)
+    except sqlite3.OperationalError:
+        return {"per_uow": [], "aggregate": _compute_first_attempt_aggregate([])}
+    try:
+        presc_rows = _fetch_prescription_audit_rows(conn)
+        exec_rows = _fetch_execution_audit_rows(conn)
+    except sqlite3.OperationalError:
+        return {"per_uow": [], "aggregate": _compute_first_attempt_aggregate([])}
+    finally:
+        conn.close()
+
+    per_uow = _build_first_attempt_success(presc_rows, exec_rows)
+    aggregate = _compute_first_attempt_aggregate(per_uow)
+    return {"per_uow": per_uow, "aggregate": aggregate}
+
+
+# ---------------------------------------------------------------------------
+# convergence_summary — internal helpers
+# ---------------------------------------------------------------------------
+
+def _fetch_completed_uow_rows(conn: sqlite3.Connection) -> list[dict]:
+    """Return completed UoWs with timing and cycle fields."""
+    rows = conn.execute(
+        """
+        SELECT id, steward_cycles, created_at, completed_at
+        FROM uow_registry
+        WHERE status = 'done'
+          AND steward_cycles IS NOT NULL
+        ORDER BY id ASC
+        """,
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _wall_clock_hours(created_at: str | None, completed_at: str | None) -> float | None:
+    """Return wall-clock hours between two ISO timestamps, or None if either is missing."""
+    if not created_at or not completed_at:
+        return None
+    try:
+        fmt = "%Y-%m-%dT%H:%M:%S"
+        # Strip timezone suffix for fromisoformat compatibility
+        def _parse(ts: str) -> datetime:
+            ts = ts.replace("Z", "+00:00")
+            try:
+                return datetime.fromisoformat(ts)
+            except ValueError:
+                # Fallback: strip tz and treat as UTC
+                return datetime.fromisoformat(ts[:19]).replace(tzinfo=timezone.utc)
+        start = _parse(created_at)
+        end = _parse(completed_at)
+        delta = (end - start).total_seconds()
+        return round(delta / 3600, 4)
+    except (ValueError, TypeError):
+        return None
+
+
+def _compute_convergence_summary_aggregate(
+    per_uow: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate cycle and wall-clock duration stats for completed UoWs."""
+    cycles = [r["steward_cycles"] for r in per_uow if r["steward_cycles"] is not None]
+    hours = [r["wall_clock_hours"] for r in per_uow if r["wall_clock_hours"] is not None]
+
+    if not cycles:
+        return {
+            "avg_cycles_to_done": None,
+            "median_cycles": None,
+            "p90_cycles": None,
+            "max_cycles": None,
+            "avg_wall_clock_hours": None,
+            "outlier_uow_ids": [],
+        }
+
+    avg_cycles = round(sum(cycles) / len(cycles), 4)
+    median_c = statistics.median(cycles)
+    sorted_cycles = sorted(cycles)
+    p90_index = max(0, int(len(sorted_cycles) * 0.9) - 1)
+    p90_c = sorted_cycles[p90_index]
+    max_c = max(cycles)
+    avg_hours = round(sum(hours) / len(hours), 4) if hours else None
+
+    # Outliers: UoWs with steward_cycles > 2 × median
+    outlier_threshold = 2 * median_c
+    outlier_ids = [
+        r["uow_id"]
+        for r in per_uow
+        if r["steward_cycles"] is not None and r["steward_cycles"] > outlier_threshold
+    ]
+
+    return {
+        "avg_cycles_to_done": avg_cycles,
+        "median_cycles": median_c,
+        "p90_cycles": p90_c,
+        "max_cycles": max_c,
+        "avg_wall_clock_hours": avg_hours,
+        "outlier_uow_ids": outlier_ids,
+    }
+
+
+def convergence_summary(
+    registry_path: Path | None = None,
+) -> dict[str, Any]:
+    """
+    Measure cycles to UoW closure and identify outliers among completed UoWs.
+
+    Only considers UoWs with status='done'. Outliers are UoWs whose
+    steward_cycles exceed 2× the median cycle count.
+
+    Parameters
+    ----------
+    registry_path:
+        Path to the registry SQLite DB.
+
+    Returns
+    -------
+    dict with keys:
+        per_uow   — list of {uow_id, steward_cycles, wall_clock_hours}
+        aggregate — {avg_cycles_to_done, median_cycles, p90_cycles, max_cycles,
+                     avg_wall_clock_hours, outlier_uow_ids}
+    """
+    path = registry_path if registry_path is not None else _default_registry_path()
+    if not path.exists():
+        return {"per_uow": [], "aggregate": _compute_convergence_summary_aggregate([])}
+    try:
+        conn = _connect_ro(path)
+    except sqlite3.OperationalError:
+        return {"per_uow": [], "aggregate": _compute_convergence_summary_aggregate([])}
+    try:
+        rows = _fetch_completed_uow_rows(conn)
+    except sqlite3.OperationalError:
+        return {"per_uow": [], "aggregate": _compute_convergence_summary_aggregate([])}
+    finally:
+        conn.close()
+
+    per_uow = [
+        {
+            "uow_id": r["id"],
+            "steward_cycles": r["steward_cycles"],
+            "wall_clock_hours": _wall_clock_hours(r["created_at"], r["completed_at"]),
+        }
+        for r in rows
+    ]
+    aggregate = _compute_convergence_summary_aggregate(per_uow)
+    return {"per_uow": per_uow, "aggregate": aggregate}
+
+
+# ---------------------------------------------------------------------------
+# complexity_appropriateness_summary — internal helpers
+# ---------------------------------------------------------------------------
+
+def _fetch_uow_complexity_rows(conn: sqlite3.Connection) -> list[dict]:
+    """Return UoW rows with register, type, steward_cycles, and steward_log."""
+    rows = conn.execute(
+        """
+        SELECT id, register, type, steward_cycles, steward_log
+        FROM uow_registry
+        ORDER BY id ASC
+        """,
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _classify_prescription_path(steward_log_raw: str | None) -> str:
+    """
+    Return 'llm', 'fallback', or 'unknown' based on the dominant prescription
+    path in the steward_log.
+
+    'llm' wins if any prescription event used the LLM path.
+    'fallback' if all prescription events used fallback.
+    'unknown' if no prescription events exist.
+    """
+    paths = _parse_prescription_paths(steward_log_raw)
+    if not paths:
+        return "unknown"
+    if "llm" in paths:
+        return "llm"
+    return "fallback"
+
+
+def _build_complexity_per_uow(rows: list[dict]) -> list[dict[str, Any]]:
+    """Build per-UoW complexity records from uow_registry rows."""
+    result = []
+    for row in rows:
+        register = row.get("register") or "operational"
+        uow_type = row.get("type") or "executable"
+        cycles = row.get("steward_cycles") or 0
+        path = _classify_prescription_path(row.get("steward_log"))
+        over_complex = (
+            register == "operational" and cycles > _OPERATIONAL_COMPLEXITY_THRESHOLD
+        )
+        result.append({
+            "uow_id": row["id"],
+            "register": register,
+            "type": uow_type,
+            "steward_cycles": cycles,
+            "prescription_path": path,
+            "over_complex_flag": over_complex,
+        })
+    return result
+
+
+def _compute_complexity_aggregate(
+    per_uow: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Compute per-register breakdown of avg_cycles and prescription path
+    distribution.
+
+    Returns:
+        by_register: {register_value: {avg_cycles, pct_llm, pct_fallback,
+                                       count, over_complex_count}}
+    """
+    by_register: dict[str, list[dict]] = {}
+    for r in per_uow:
+        by_register.setdefault(r["register"], []).append(r)
+
+    breakdown: dict[str, dict[str, Any]] = {}
+    for reg, uows in by_register.items():
+        count = len(uows)
+        cycles_vals = [u["steward_cycles"] for u in uows if u["steward_cycles"] is not None]
+        avg_c = round(sum(cycles_vals) / len(cycles_vals), 4) if cycles_vals else None
+        llm_count = sum(1 for u in uows if u["prescription_path"] == "llm")
+        fallback_count = sum(1 for u in uows if u["prescription_path"] == "fallback")
+        over_complex = sum(1 for u in uows if u["over_complex_flag"])
+        pct_llm = round(100 * llm_count / count, 1) if count > 0 else None
+        pct_fallback = round(100 * fallback_count / count, 1) if count > 0 else None
+        breakdown[reg] = {
+            "count": count,
+            "avg_cycles": avg_c,
+            "pct_llm": pct_llm,
+            "pct_fallback": pct_fallback,
+            "over_complex_count": over_complex,
+        }
+
+    return {"by_register": breakdown}
+
+
+def complexity_appropriateness_summary(
+    registry_path: Path | None = None,
+) -> dict[str, Any]:
+    """
+    Compare prescribed workflow complexity to UoW type and register.
+
+    Flags 'operational' register UoWs with more than
+    _OPERATIONAL_COMPLEXITY_THRESHOLD steward cycles as potentially
+    over-complex.
+
+    Parameters
+    ----------
+    registry_path:
+        Path to the registry SQLite DB.
+
+    Returns
+    -------
+    dict with keys:
+        per_uow   — list of {uow_id, register, type, steward_cycles,
+                             prescription_path, over_complex_flag}
+        aggregate — {by_register: {register: {count, avg_cycles, pct_llm,
+                                              pct_fallback, over_complex_count}}}
+    """
+    path = registry_path if registry_path is not None else _default_registry_path()
+    if not path.exists():
+        return {"per_uow": [], "aggregate": _compute_complexity_aggregate([])}
+    try:
+        conn = _connect_ro(path)
+    except sqlite3.OperationalError:
+        return {"per_uow": [], "aggregate": _compute_complexity_aggregate([])}
+    try:
+        rows = _fetch_uow_complexity_rows(conn)
+    except sqlite3.OperationalError:
+        return {"per_uow": [], "aggregate": _compute_complexity_aggregate([])}
+    finally:
+        conn.close()
+
+    per_uow = _build_complexity_per_uow(rows)
+    aggregate = _compute_complexity_aggregate(per_uow)
+    return {"per_uow": per_uow, "aggregate": aggregate}
 
 
 # ---------------------------------------------------------------------------
