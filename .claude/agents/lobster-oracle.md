@@ -69,6 +69,16 @@ Read the implementation (diff, code, output). Evaluate:
 
 ## Output
 
+**Before writing APPROVED verdict:** add (or update) `oracle_status: approved` frontmatter to the document being reviewed. If the document has no YAML frontmatter block, prepend one. If it already has a frontmatter block, set or update the `oracle_status`, `oracle_pr`, and `oracle_date` fields. Use the PR URL for `oracle_pr` (or `null` if not PR-gated), and today's ISO date for `oracle_date`. This makes the document's review status machine-readable without consulting decisions.md.
+
+```yaml
+---
+oracle_status: approved
+oracle_pr: <PR URL or null>
+oracle_date: <YYYY-MM-DD>
+---
+```
+
 **Append to** `~/lobster-workspace/oracle/decisions.md`:
 
 ```markdown
