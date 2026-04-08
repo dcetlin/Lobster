@@ -258,11 +258,17 @@ class TestSC4RoutingDifference:
 
     def test_disabling_vision_ref_changes_routing_outcome(self):
         """
-        Explicit test for sc-4: if we "disable" vision_ref (set to None),
-        the routing outcome is measurably different.
+        sc-4: disabling vision_ref on a UoW causes the steward prescription path
+        to produce a structurally different route_reason.
+
+        This test exercises _build_prescription_route_reason — the wired call site
+        in steward.py — not just the vision_routing library in isolation. When
+        vision_ref is present, the steward writes a vision-anchored route_reason to
+        the DB. When vision_ref is absent, it writes a plain heuristic string.
+        That divergence is the pipeline decision sc-4 requires.
         """
         from src.orchestration.registry import UoW, UoWStatus
-        from src.orchestration.vision_routing import resolve_vision_route
+        from src.orchestration.steward import _build_prescription_route_reason
         import dataclasses
 
         # Create UoW with vision_ref
@@ -286,18 +292,25 @@ class TestSC4RoutingDifference:
         # "Disable" vision_ref by creating identical UoW with vision_ref=None
         uow_disabled = dataclasses.replace(uow_enabled, vision_ref=None)
 
-        result_enabled = resolve_vision_route(uow_enabled)
-        result_disabled = resolve_vision_route(uow_disabled, log_fallback=False)
+        reentry_posture = "first_execution"
+        completion_rationale = "awaiting executor dispatch"
 
-        # Routing outcomes must differ
-        assert result_enabled.anchored != result_disabled.anchored
-        assert result_enabled.route_reason != result_disabled.route_reason
+        route_with_vision = _build_prescription_route_reason(
+            uow_enabled, reentry_posture, "complete", "", completion_rationale
+        )
+        route_without_vision = _build_prescription_route_reason(
+            uow_disabled, reentry_posture, "complete", "", completion_rationale
+        )
 
-        # The enabled version references the vision layer
-        assert "vision.active_project.phase_intent" in result_enabled.route_reason
+        # Pipeline decision: route_reason values must be structurally different
+        assert route_with_vision != route_without_vision
 
-        # The disabled version explicitly notes the fallback
-        assert "vision_ref null" in result_disabled.route_reason
+        # Vision-anchored path: route_reason includes the vision anchor reference
+        assert "vision.active_project.phase_intent" in route_with_vision
+
+        # Heuristic fallback path: plain steward string, no vision anchor
+        assert "vision" not in route_without_vision
+        assert "steward:" in route_without_vision
 
 
 # ---------------------------------------------------------------------------
