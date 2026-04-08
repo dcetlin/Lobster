@@ -1190,6 +1190,58 @@ _INBOX_DIR_TEMPLATE = "~/messages/inbox"
 #: route results back to Dan if needed.
 _DISPATCH_CHAT_ID: str = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
 
+#: Dispatch boundary log — structured JSONL records for observability.
+#: Records all dispatch attempts, retries, and failures at the executor→inbox
+#: boundary. Location: ~/lobster-workspace/logs/dispatch-boundary.jsonl
+_DISPATCH_BOUNDARY_LOG_TEMPLATE = "~/lobster-workspace/logs/dispatch-boundary.jsonl"
+
+
+def _log_dispatch_boundary(
+    uow_id: str,
+    dispatch_attempt: int,
+    outcome: str,
+    msg_id: str | None = None,
+    failure_reason: str | None = None,
+) -> None:
+    """
+    Log a structured record to the dispatch boundary log (non-blocking).
+
+    Records are appended as JSONL to ~/lobster-workspace/logs/dispatch-boundary.jsonl.
+    This log is queryable via grep/jq for post-incident analysis.
+
+    The write is best-effort and non-blocking: failures are logged via the
+    standard logger but do not gate the dispatch outcome.
+
+    Args:
+        uow_id: The UoW being dispatched.
+        dispatch_attempt: Attempt number (1 for first attempt, 2+ for retries).
+        outcome: One of "success", "retry", "failure".
+        msg_id: The inbox message ID (on success).
+        failure_reason: Reason for failure or retry (on non-success).
+    """
+    record = {
+        "ts": _now_iso(),
+        "uow_id": uow_id,
+        "dispatch_attempt": dispatch_attempt,
+        "outcome": outcome,
+    }
+    if msg_id is not None:
+        record["msg_id"] = msg_id
+    if failure_reason is not None:
+        record["failure_reason"] = failure_reason
+
+    try:
+        log_path = Path(os.path.expanduser(_DISPATCH_BOUNDARY_LOG_TEMPLATE))
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        # Non-blocking: log write failure via standard logger, do not raise.
+        log.warning(
+            "Dispatch boundary log write failed for UoW %s — %s (outcome was %s)",
+            uow_id, e, outcome,
+        )
+
 
 def _dispatch_via_inbox(instructions: str, uow_id: str) -> str:
     """
@@ -1207,12 +1259,27 @@ def _dispatch_via_inbox(instructions: str, uow_id: str) -> str:
 
     The message_id is returned as the executor_id for audit correlation.
 
+    Observability: All dispatch attempts, retries, and failures are logged to
+    ~/lobster-workspace/logs/dispatch-boundary.jsonl with structured records:
+    {uow_id, dispatch_attempt, timestamp, outcome: success|retry|failure, failure_reason?}
+
     Raises OSError if the inbox directory cannot be created or the message
     file cannot be written.
     """
     msg_id = str(uuid.uuid4())
     inbox_dir = Path(os.path.expanduser(_INBOX_DIR_TEMPLATE))
-    inbox_dir.mkdir(parents=True, exist_ok=True)
+
+    # Attempt 1: create inbox directory
+    try:
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        _log_dispatch_boundary(
+            uow_id=uow_id,
+            dispatch_attempt=1,
+            outcome="failure",
+            failure_reason=f"inbox_dir_create_failed: {e}",
+        )
+        raise
 
     msg: dict = {
         "id": msg_id,
@@ -1229,6 +1296,21 @@ def _dispatch_via_inbox(instructions: str, uow_id: str) -> str:
     try:
         tmp_path.write_text(json.dumps(msg, indent=2), encoding="utf-8")
         tmp_path.rename(dest_path)
+        # Success — log and return
+        _log_dispatch_boundary(
+            uow_id=uow_id,
+            dispatch_attempt=1,
+            outcome="success",
+            msg_id=msg_id,
+        )
+    except OSError as e:
+        _log_dispatch_boundary(
+            uow_id=uow_id,
+            dispatch_attempt=1,
+            outcome="failure",
+            failure_reason=f"inbox_write_failed: {e}",
+        )
+        raise
     finally:
         # Best-effort cleanup of tmp file if rename failed.
         try:
