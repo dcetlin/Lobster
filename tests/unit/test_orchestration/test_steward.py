@@ -607,6 +607,166 @@ class TestCompletionPath:
 
 
 # ---------------------------------------------------------------------------
+# Test: Done-transition WHERE clause guard (issue #671)
+# ---------------------------------------------------------------------------
+
+# Named constant matching the steward's WHERE guard at the done-transition.
+# If this constant is wrong the WHERE guard test below will catch it.
+_DONE_TRANSITION_FROM_STATUS = "diagnosing"
+_DONE_TRANSITION_FALLBACK_STATUS = "ready-for-steward"
+
+
+def _setup_completable_uow(conn, tmp_path, steward_cycles=1):
+    """
+    Create a UoW in ready-for-steward with execution_complete audit entry and
+    a valid result file. Returns (uow_id, output_file, result_file).
+
+    Helper shared by done-transition tests so both tests cover the identical
+    UoW state without duplicating setup code.
+    """
+    output_file = tmp_path / "output.txt"
+    output_file.write_text("Task completed successfully. All acceptance criteria met.")
+
+    audit_entries = [
+        {
+            "event": "execution_complete",
+            "actor": "executor",
+            "from_status": "active",
+            "to_status": "ready-for-steward",
+            "return_reason": "observation_complete",
+            "timestamp": _now_iso(),
+        },
+    ]
+
+    uow_id = _make_uow_row(
+        conn,
+        status="ready-for-steward",
+        steward_cycles=steward_cycles,
+        output_ref=str(output_file),
+        audit_log_entries=audit_entries,
+        success_criteria="Task completed successfully.",
+    )
+    conn.commit()
+
+    result_file = tmp_path / "output.result.json"
+    result_file.write_text(json.dumps({
+        "uow_id": uow_id,
+        "outcome": "complete",
+        "success": True,
+        "reason": "all criteria met",
+    }))
+
+    return uow_id, output_file, result_file
+
+
+class TestDoneTransitionWhereGuard:
+    """
+    Tests for issue #671: steward done-transition WHERE clause guard.
+
+    The done-transition at `registry.transition(uow_id, STATUS_DONE, from_status)`
+    must use the correct `from_status`. This class verifies:
+    1. Normal path: claim sets status to `diagnosing`; done-transition fires from `diagnosing`.
+    2. Startup-sweep race: if startup_sweep resets status to `ready-for-steward`
+       after the claim but before the done-transition, the steward must still
+       close the UoW rather than silently no-oping.
+    """
+
+    def test_done_transition_fires_from_diagnosing_on_normal_path(
+        self, db_path, registry, tmp_path
+    ):
+        """
+        Normal completion path: steward claims ready-for-steward → diagnosing,
+        then transitions diagnosing → done. UoW must reach done status.
+
+        Verifies the WHERE guard is _STATUS_DIAGNOSING (the status after claim).
+        This is the primary path described in issue #671.
+        """
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        conn = _open_db(db_path)
+        uow_id, _, _ = _setup_completable_uow(conn, tmp_path)
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+        )
+
+        uow = _get_uow(db_path, uow_id)
+        # The done-transition WHERE guard must have matched (diagnosing) for this to pass.
+        assert uow["status"] == "done", (
+            f"done-transition failed: UoW is in '{uow['status']}' instead of 'done'. "
+            f"The WHERE guard may be incorrect. Expected from_status={_DONE_TRANSITION_FROM_STATUS!r}."
+        )
+        assert uow["completed_at"] is not None, "completed_at must be set when done"
+
+    def test_done_transition_succeeds_when_status_reset_to_ready_for_steward(
+        self, db_path, registry, tmp_path
+    ):
+        """
+        Race condition: startup_sweep resets status from 'diagnosing' back to
+        'ready-for-steward' after the steward has claimed the UoW but before the
+        done-transition fires.
+
+        The steward must still close the UoW. Without the fallback WHERE guard
+        (_STATUS_READY_FOR_STEWARD), the done-transition no-ops silently and the
+        UoW never reaches 'done'. (issue #671)
+        """
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        conn = _open_db(db_path)
+        uow_id, _, _ = _setup_completable_uow(conn, tmp_path)
+        conn.close()
+
+        # Intercept the done-transition call to simulate a concurrent startup_sweep
+        # that resets the UoW from 'diagnosing' back to 'ready-for-steward'.
+        from src.orchestration import registry as reg_mod
+        original_transition = reg_mod.Registry.transition
+        call_count = [0]
+
+        def transition_with_race(self, uow_id_arg, to_status, where_status):
+            call_count[0] += 1
+            # On the done-transition specifically (to=done, where=diagnosing):
+            # simulate startup_sweep resetting status to ready-for-steward first,
+            # making the WHERE diagnosing fail.
+            if to_status == "done" and where_status == _DONE_TRANSITION_FROM_STATUS:
+                # Reset status to ready-for-steward (simulating concurrent startup_sweep)
+                conn2 = self._connect()
+                conn2.execute(
+                    "UPDATE uow_registry SET status = ? WHERE id = ?",
+                    (_DONE_TRANSITION_FALLBACK_STATUS, uow_id_arg),
+                )
+                conn2.commit()
+                conn2.close()
+            # Now call the real transition — WHERE diagnosing will fail (0 rows),
+            # but the fallback WHERE ready-for-steward should succeed.
+            return original_transition(self, uow_id_arg, to_status, where_status)
+
+        reg_mod.Registry.transition = transition_with_race
+        try:
+            steward.run_steward_cycle(
+                registry=registry,
+                dry_run=False,
+                github_client=_mock_github_client_open,
+                artifact_dir=tmp_path / "artifacts",
+            )
+        finally:
+            reg_mod.Registry.transition = original_transition
+
+        uow = _get_uow(db_path, uow_id)
+        # Without the fallback WHERE guard, the UoW would remain in 'ready-for-steward'.
+        assert uow["status"] == "done", (
+            f"Startup-sweep race not handled: UoW is in '{uow['status']}' instead of 'done'. "
+            f"The done-transition must fall back to WHERE {_DONE_TRANSITION_FALLBACK_STATUS!r} "
+            f"when the primary WHERE {_DONE_TRANSITION_FROM_STATUS!r} fails. (issue #671)"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Test: Crash recovery — prescribes another pass (cycles < 2)
 # ---------------------------------------------------------------------------
 
