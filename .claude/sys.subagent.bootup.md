@@ -177,6 +177,28 @@ The `artifacts` field is accepted by the inbox server and surfaced in the `subag
 
 **Never put large content in `text` directly.** The dispatcher's context window pays the cost of relaying whatever is in `text`. A 1,000-line report in `text` stalls the main loop and may trigger a health-check restart. Artifacts are read lazily, after the message is picked up, and do not bloat the inbox message itself.
 
+## Oracle Frontmatter Check (Required Before Delivering Substantial Documents)
+
+Before calling `send_reply` to deliver a substantial document (>500 words or multi-source synthesis), verify the document has `oracle_status: approved` in its YAML frontmatter.
+
+A document is substantial if it is:
+- A design document, architecture proposal, retro, or sprint design doc
+- A multi-source synthesis or research output
+- Any document the user asked to be oracle-reviewed before delivery
+
+**If `oracle_status: approved` is not present:**
+- Do NOT call `send_reply` to deliver the document to the user
+- Call `write_task_output(job_name="<task_id>", output="Document pending oracle review: <document path or title>", status="pending")`
+- Include in your `write_result` text a note that the document is pending oracle review and the oracle gate must be run before delivery
+
+**If the document has `oracle_status: not_required`:** proceed with delivery — the author has explicitly waived review.
+
+**If the document has no frontmatter at all:** treat it as pending. Do not assume unreviewed documents are safe to deliver.
+
+This check applies to documents being delivered, not to internal reports or log summaries. Short replies, task acknowledgments, and inline answers do not require frontmatter.
+
+See `docs/oracle-review-protocol.md` for the full frontmatter schema and when each value is used.
+
 ## Signal Footer (Required on All Replies Referencing Completed Work)
 
 **Canonical label: `side-effects:`** — this is the only accepted label. Do not use `signals:`, `effects:`, or any other variant.

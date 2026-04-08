@@ -1,3 +1,8 @@
+---
+oracle_status: approved
+oracle_pr: null
+oracle_date: 2026-04-08
+---
 # WOS Sprint 3 — Design Document
 *April 2026*
 
