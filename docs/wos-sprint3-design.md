@@ -250,5 +250,37 @@ The following must be true before Sprint 3 starts:
 
 ---
 
+## Sprint 3 COMPLETE Definition
+
+Sprint 3 is complete when all five gates below are satisfied. Partial completion does not count. If a gate cannot be stated as closed from memory, the sprint is not done.
+
+**UoW gate.** All seven UoWs (S3-A through S3-G) have their corresponding PRs merged on main with an `oracle_status: approved` frontmatter entry recorded in `oracle/decisions.md`. A UoW whose PR is open, blocked, or oracle-pending holds the gate. S3-B must precede S3-A per the inter-UoW dependency — the gate verifies merge order, not just merge count. S3-G (pre-existing test failures) is satisfied by either a passing fix on main or a root-cause issue linked here with an explicit "does not block Sprint 3 dispatch paths" verdict from the oracle.
+
+**Integration test gate.** The full claim-dispatch-return cycle integration test referenced in "What Sprint 2 Taught Us" passes on main. Specifically, a test that starts with a UoW in `ready-for-steward`, exercises prescription, executor claim, executor return with trace.json written, and Steward re-entry with trace-informed prescription — all against the real state machine, not mocks of individual functions. The test name or file path is recorded here before Sprint 3 closes. A passing unit test suite with no integration coverage of the end-to-end path does not satisfy this gate.
+
+**Observability gate.** The wos-queue-monitor (S3-D) is registered in `jobs.json`, has run at least once at its configured schedule, and has written at least one successful `write_task_output` observation (even if that observation is "queue depth: 2, nominal"). A script that exists on disk but has never executed does not satisfy this gate. The gate is closed by verifying a non-empty entry in `check_task_outputs` for `job_name="wos-queue-monitor"`.
+
+**Oracle gate.** This document carries `oracle_status: approved` in its frontmatter. If S3-E (the oracle-docs frontmatter protocol) lands first, its schema governs — this document must be retroactively tagged. The gate closes when the frontmatter is present and the corresponding oracle PR is recorded in `oracle/decisions.md`. An oracle review conducted but not recorded in machine-readable frontmatter does not satisfy this gate; that is precisely the structural gap S3-E exists to close.
+
+**Retro gate.** A Sprint 3 retrospective document exists at `docs/wos-sprint3-retro.md`, has been oracle-reviewed (with `oracle_status: approved` in its frontmatter), and is committed on main. The retro is not a perfunctory sign-off — it must address the questions identified in the Meta-Monitoring section below. A retro written but not oracle-reviewed, or oracle-reviewed but not committed, does not close the gate.
+
+---
+
+## Meta-Monitoring
+
+This section describes how Sprint 3 is monitored while it is in flight — not as a post-hoc review, but as a live operational discipline. The sprint is not a batch of PRs; it is a governed process. These signals determine whether the sprint is progressing or stuck.
+
+**Signals that a UoW is progressing versus stuck.** A UoW is progressing if its GitHub issue has received a substantive comment (oracle advisory, PR link, implementation note, or merge confirmation) within the last 72 hours. A UoW is stuck if its issue is open, no PR has been filed, and there has been no comment for more than 72 hours. Stuck is not the same as blocked: a UoW waiting on a dependency (e.g., S3-A waiting for S3-B) is blocked by a known condition, not stuck. Blocked UoWs require no intervention unless the blocking UoW is itself stuck. A stuck UoW with no blocker requires Dan's attention within the next engagement window.
+
+**Inter-UoW ordering is tracked by explicit merge-order verification.** The S3-B-before-S3-A dependency is the only hard sequencing constraint in Sprint 3. It is not enforced by the dispatch system — it must be enforced by the human who merges the PRs. The dispatcher should note, at the time S3-A's PR is submitted for oracle review, whether S3-B's PR has already been merged on main. If S3-B is not yet merged, the oracle's advisory on S3-A must note the dependency explicitly, and the merge must be held. Tracking this in flight means: when S3-A's PR opens, verify `gh pr list --repo dcetlin/Lobster --state merged | grep S3-B` before approving merge. All other UoWs have no hard ordering and may be developed in parallel.
+
+**What constitutes a sprint blocker requiring Dan's attention versus dispatcher-handled.** The dispatcher can handle: filing a GitHub issue before dispatch (S3-C and S3-E have no issues yet), checking pre-flight items against the checklist, verifying merge counts, and writing task outputs. Dan's attention is required for: a UoW stuck for more than 72 hours with no known blocker, a merge-order violation (S3-A merged before S3-B), a test failure on main that the oracle cannot attribute to pre-existing failures, and any oracle verdict of NEEDS_CHANGES that has not been acted on within 48 hours. The asymmetric governor (S3-D) does not alert Dan directly — it writes observations to `check_task_outputs`. Dan reviews those during engagement windows; none of them are sprint blockers on their own.
+
+**Post-completion reflection trigger.** The retro begins when both of the following are true: (1) all seven UoWs have oracle-approved PRs merged on main, and (2) the integration test gate passes. The integration test gate is the tighter constraint — it is possible for all UoWs to be merged while the integration test is still failing, in which case the retro waits. The retro is not triggered by the observability gate alone, because S3-D may produce meaningful observations only after a few days of operation, and waiting for it would stall the retro indefinitely. The retro may note that queue-monitor data is preliminary.
+
+**What the retro must capture.** The Sprint 3 retro is not a summary of what was built — that is recorded in the UoW issues and PRs. The retro must answer four questions: (1) What held the sprint up, and was it a structural gap, a process gap, or a contingent problem? If structural, what governing structure would close it — and is that Sprint 4 scope? (2) What surprised us, positively or negatively, about how the governing structures interacted once live? Specifically: did the S3-B temporal gate produce any false `WaitForTrace` outcomes, and if so, under what conditions? (3) Which oracle advisory patterns appeared more than once — and should any of them be promoted to `oracle/learnings.md` as durable rules? (4) How should Sprint 4 be sequenced differently, given what Sprint 3 demonstrated about the relationship between governing structures and execution capability? A retro that cannot answer these four questions from the sprint record is not ready for oracle review.
+
+---
+
 *Document status: PENDING oracle review. Frontmatter oracle_status: pending.*
 *Source documents: wos-sprint2-retro.md, wos-v3-proposal.md, wos-v3-sprint-001.md, wos-v3-steward-executor-spec.md, wos-sprint2-design.md, wos-design-audit-2026-04-08.md, oracle/learnings.md, oracle/decisions.md (last 100 lines). Open issues verified via gh issue list.*
