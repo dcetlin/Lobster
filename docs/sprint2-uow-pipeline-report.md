@@ -1,5 +1,8 @@
 # Sprint 2 UoW Pipeline Report
 
+**Sprint 2 Issues:** [#652](https://github.com/dcetlin/Lobster/issues/652) (S2-A) · [#613](https://github.com/dcetlin/Lobster/issues/613) (S2-B) · [#583](https://github.com/dcetlin/Lobster/issues/583) (S2-C)  
+**PRs:** [#672](https://github.com/dcetlin/Lobster/pull/672) · [#673](https://github.com/dcetlin/Lobster/pull/673) · [#674](https://github.com/dcetlin/Lobster/pull/674)
+
 **Generated:** 2026-04-08  
 **Registry:** `/home/lobster/lobster-workspace/orchestration/registry.db`  
 **Scope:** Three Sprint 2 UoWs — S2-A, S2-B, S2-C
