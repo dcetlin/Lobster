@@ -287,6 +287,18 @@ class TestCountNonImprovingGateCycles:
         # Only 2 non-improving at the end (0.8, 0.8), not 3
         assert result < NON_IMPROVING_GATE_THRESHOLD
 
+    def test_count_non_improving_exact_plateau_length(self):
+        """Exact equality: 2 non-improving at tail preceded by 1 improvement returns exactly 2."""
+        # Regression: off-by-one in early-return branch (uow_20260409_790ce6)
+        # scores [0.5, 0.5, 0.8, 0.8]: improvement at index 1->2 (0.5->0.8).
+        # The tail [0.8, 0.8] (indices 2 and 3) are non-improving (0.8 not > 0.8).
+        # The algorithm initializes non_improving=1, then increments at i=3 (0.8<=0.8 → 2),
+        # then at i=2 finds improvement (0.8 > 0.5) and returns non_improving=2.
+        # The old `return non_improving - 1` incorrectly returned 1; correct answer is 2.
+        log = self._make_log_with_trace_injections([0.5, 0.5, 0.8, 0.8])
+        result = _count_non_improving_gate_cycles(log, n=NON_IMPROVING_GATE_THRESHOLD)
+        assert result == 2
+
     def test_zero_when_no_gate_score_entries(self):
         """Entries without gate_score (non-iterative-convergent) count as 0."""
         entries = []

@@ -1764,7 +1764,7 @@ def _count_non_improving_gate_cycles(steward_log: str | None, n: int = _NON_IMPR
         else:
             # Found an improvement — the plateau started AFTER this point
             # non_improving already counts from scores[i] forward
-            return non_improving - 1  # exclude the improvement point itself
+            return non_improving if non_improving > 1 else 0  # exclude initialised-but-not-yet-counted tail when first pair improves
 
     # All scores are non-improving (or only 1 pair) — all data points are the plateau
     return non_improving
