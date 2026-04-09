@@ -1509,7 +1509,7 @@ check_usage_limit() {
     fi
 
     local limit_line
-    limit_line=$(tail -50 "$CLAUDE_SESSION_LOG" 2>/dev/null | grep -i "you.ve hit your limit\|hit your limit" | tail -1)
+    limit_line=$(tail -50 "$CLAUDE_SESSION_LOG" 2>/dev/null | grep -i "you.ve hit your limit\|hit your limit\|out of extra usage\|you.re out of" | tail -1)
 
     if [[ -z "$limit_line" ]]; then
         return 1
@@ -1523,39 +1523,42 @@ check_usage_limit() {
 
     local now
     now=$(date +%s)
-    echo "$now ${reset_time:-unknown}" > "$LIMIT_WAIT_STATE_FILE"
-    log_info "USAGE LIMIT: Wrote limit-wait state to $LIMIT_WAIT_STATE_FILE (reset: ${reset_time:-unknown})"
+    local midnight_utc
+    midnight_utc=$(date -u -d 'tomorrow 00:00:00' +%s)
+    local sleep_seconds=$(( midnight_utc - now ))
+    echo "$now $sleep_seconds $midnight_utc ${reset_time:-midnight-utc}" > "$LIMIT_WAIT_STATE_FILE"
+    log_info "USAGE LIMIT: Wrote limit-wait state to $LIMIT_WAIT_STATE_FILE (sleep ${sleep_seconds}s until midnight UTC)"
+
+    local wake_time_et
+    wake_time_et=$(TZ="America/New_York" date -d "@$midnight_utc" "+%-I:%M %p ET")
 
     local alert_text
     if [[ -n "$reset_time" ]]; then
-        alert_text="Claude usage limit hit. ${reset_time^}. Will retry automatically — no restart needed."
+        alert_text="Claude usage limit hit. ${reset_time^}. Sleeping until midnight UTC ($wake_time_et). Will retry automatically — no restart needed."
     else
-        alert_text="Claude usage limit hit. Reset time unknown. Will retry automatically — no restart needed."
+        alert_text="Claude usage limit hit. Sleeping until midnight UTC ($wake_time_et). Will retry automatically — no restart needed."
     fi
 
     send_telegram_alert_deduped "usage-limit" "$alert_text"
     return 0
 }
 
-# is_limit_wait — returns 0 if a recent usage-limit event was recorded and
-# the limit-wait window has not yet expired.  Uses a 10-minute retry interval
-# so the system recovers quickly on false positives rather than sitting dead
-# for 4 hours.
-LIMIT_WAIT_MAX_SECONDS=600  # 10 minutes
-
+# is_limit_wait — returns 0 if a usage-limit event was recorded and midnight
+# UTC (quota reset) has not yet been reached.  Reads the stored target epoch
+# from $LIMIT_WAIT_STATE_FILE so the guard window matches the actual quota
+# reset boundary rather than a fixed 10-minute interval.
 is_limit_wait() {
     [[ -f "$LIMIT_WAIT_STATE_FILE" ]] || return 1
-    local recorded_at
-    read -r recorded_at _ < "$LIMIT_WAIT_STATE_FILE" 2>/dev/null || return 1
+    local recorded_at sleep_secs target_epoch
+    read -r recorded_at sleep_secs target_epoch _ < "$LIMIT_WAIT_STATE_FILE" 2>/dev/null || return 1
     [[ "$recorded_at" =~ ^[0-9]+$ ]] || return 1
-    local now
-    now=$(date +%s)
-    local age=$(( now - recorded_at ))
-    if [[ $age -lt $LIMIT_WAIT_MAX_SECONDS ]]; then
-        log_info "LIMIT-WAIT: Usage limit recorded ${age}s ago (guard: ${LIMIT_WAIT_MAX_SECONDS}s) — suppressing restart"
+    local now; now=$(date +%s)
+    if [[ "$target_epoch" =~ ^[0-9]+$ ]] && (( now < target_epoch )); then
+        local remaining=$(( target_epoch - now ))
+        log_info "LIMIT-WAIT: Quota exhausted — sleeping until midnight UTC (${remaining}s remaining)"
         return 0
     fi
-    # Guard expired — remove stale state file so normal crash logic resumes
+    # Midnight UTC reached — remove stale state file so normal logic resumes
     rm -f "$LIMIT_WAIT_STATE_FILE"
     return 1
 }
@@ -2069,6 +2072,12 @@ main() {
                     clear_stale_inbox_markers
                 fi
             fi
+            ;;
+
+        quota_wait)
+            # Wrapper is sleeping until midnight UTC for quota reset.
+            # This is expected behavior — suppress all restart logic.
+            log_info "QUOTA-WAIT: Sleeping until midnight UTC for quota reset — suppressing all checks"
             ;;
 
         stopped)
