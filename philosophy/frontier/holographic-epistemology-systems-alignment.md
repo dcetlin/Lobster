@@ -129,4 +129,12 @@ This does not invalidate the oracle or meta agent designs. Those designs are str
 
 ---
 
-*See also: holographic-epistemology.md (source framing), oracle/decisions.md (oracle run record), lobster-meta agent definition.*
+---
+
+## Related Documents
+
+- [holographic-epistemology.md](holographic-epistemology.md) — The source framing this analysis applies to Lobster's architecture; establishes the beam-alignment/encoding-failure taxonomy and the geometric-vs-additive distinction.
+- [holographic-epistemology-challenge.md](holographic-epistemology-challenge.md) — Adversarial objections that directly bear on the architecture findings here, especially the objection that orthogonality cannot be verified from prompting alone.
+- [holographic-epistemology-synthesis.md](holographic-epistemology-synthesis.md) — Integrates this architecture analysis with the core framing and challenge; names the latent typology (diversity-by-protocol vs. diversity-by-prompting) as the synthesis's key emergent claim.
+
+*See also: oracle/decisions.md (oracle run record), lobster-meta agent definition.*

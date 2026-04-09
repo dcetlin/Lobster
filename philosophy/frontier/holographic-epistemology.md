@@ -99,3 +99,11 @@ The honest version: the holographic framing is a productive analogy that carves 
 *Living document. Updated as the inquiry moves.*
 
 **Telos grounding**: The geometric-vs-additive distinction for multi-agent systems is load-bearing for Lobster's orchestration architecture. If the advantage is additive, more agents always helps (diminishing returns, but the direction is clear). If the advantage is geometric, agent diversity is the critical variable — and adding more agents with similar beam angles is waste or noise. The holographic framing makes this design question precise.
+
+---
+
+## Related Documents
+
+- [holographic-epistemology-challenge.md](holographic-epistemology-challenge.md) — Adversarial objections to this framing; finds that the orthogonality measure is undefined and the AdS/CFT grounding is weaker than claimed.
+- [holographic-epistemology-systems-alignment.md](holographic-epistemology-systems-alignment.md) — Examines where Lobster's architecture actually enforces the geometric diversity principle versus where it assumes it; finds that oracle review and the meta agent are the genuine implementations.
+- [holographic-epistemology-synthesis.md](holographic-epistemology-synthesis.md) — Integrates this document with the challenge and architecture analysis; identifies what survived adversarial pressure, what was qualified, and where the unresolved tensions live.

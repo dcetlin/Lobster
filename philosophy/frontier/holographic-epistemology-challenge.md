@@ -155,3 +155,11 @@ The most dangerous failure mode is not that the framing is wrong. It is that it 
 *Written as adversarial challenge to `holographic-epistemology.md`, 2026-04-09.*
 
 *This document intentionally does not soften objections or offer resolution. Resolution, if any, belongs in a separate document.*
+
+---
+
+## Related Documents
+
+- [holographic-epistemology.md](holographic-epistemology.md) — The core framing this document challenges.
+- [holographic-epistemology-systems-alignment.md](holographic-epistemology-systems-alignment.md) — Architecture analysis that finds the places where the principle is structurally enforced versus merely assumed; provides empirical grounding for some of the objections here.
+- [holographic-epistemology-synthesis.md](holographic-epistemology-synthesis.md) — Integrates this challenge with the core framing and architecture analysis; identifies what survived adversarial pressure, what was qualified, and what remains genuinely unresolved.

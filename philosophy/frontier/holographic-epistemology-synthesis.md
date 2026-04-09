@@ -124,4 +124,12 @@ The challenge is right that the framing cannot currently fulfill its most import
 
 ---
 
-*Synthesis written 2026-04-09. Source documents: holographic-epistemology.md, holographic-epistemology-challenge.md, holographic-epistemology-systems-alignment.md.*
+---
+
+## Related Documents (Sources)
+
+- [holographic-epistemology.md](holographic-epistemology.md) — Core framing: LLMs as holographic compressions, beam-angle-dependent readout, geometric vs. additive multi-agent advantage, beam-alignment/encoding-failure taxonomy.
+- [holographic-epistemology-challenge.md](holographic-epistemology-challenge.md) — Adversarial objections: AdS/CFT overclaim, orthogonality unachievable in practice, no novel predictions, justification-engine risk.
+- [holographic-epistemology-systems-alignment.md](holographic-epistemology-systems-alignment.md) — Architecture analysis: oracle review and meta agent as genuine orthogonal projections; WOS pipeline as additive; diversity-by-protocol vs. diversity-by-prompting.
+
+*Synthesis written 2026-04-09.*
