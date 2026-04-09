@@ -58,6 +58,7 @@ if str(_SRC) not in sys.path:
 from orchestration.registry import Registry, UoWStatus, UpsertInserted
 from orchestration.issue_source import IssueSnapshot
 from orchestration.garden_caretaker import GardenCaretaker
+from orchestration.steward import IssueInfo
 
 
 # ---------------------------------------------------------------------------
@@ -202,8 +203,8 @@ def test_garden_caretaker_holds_issue_closed_trigger(registry: Registry) -> None
     )
 
     # Stub github_client: issue 999 is still open
-    def _stub_github_open(issue_number: int) -> dict:
-        return {"status_code": 200, "state": "open"}
+    def _stub_github_open(issue_number: int) -> IssueInfo:
+        return IssueInfo(status_code=200, state="open", labels=[], body="", title="")
 
     with patch(
         "orchestration.garden_caretaker.evaluate_condition",
@@ -309,14 +310,14 @@ def test_steward_picks_up_ready_for_steward_uow(registry: Registry, tmp_path: Pa
     assert uow_before.status == UoWStatus.READY_FOR_STEWARD
 
     # Stub github_client: issue is open, no blocking labels
-    def _stub_github_client(issue_number: int) -> dict:
-        return {
-            "status_code": 200,
-            "state": "open",
-            "labels": [],
-            "body": "Integration test UoW.",
-            "title": "Steward handoff integration test",
-        }
+    def _stub_github_client(issue_number: int) -> IssueInfo:
+        return IssueInfo(
+            status_code=200,
+            state="open",
+            labels=[],
+            body="Integration test UoW.",
+            title="Steward handoff integration test",
+        )
 
     # null notify_dan — tests must not send Telegram messages
     def _null_notify(*_args, **_kwargs) -> None:
@@ -376,15 +377,15 @@ def _null_notify(*_args, **_kwargs) -> None:
     pass
 
 
-def _stub_github_open(issue_number: int) -> dict:
+def _stub_github_open(issue_number: int) -> IssueInfo:
     """Stub GitHub client: open issue, no labels."""
-    return {
-        "status_code": 200,
-        "state": "open",
-        "labels": [],
-        "body": "Test UoW.",
-        "title": "Test",
-    }
+    return IssueInfo(
+        status_code=200,
+        state="open",
+        labels=[],
+        body="Test UoW.",
+        title="Test",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -432,8 +433,10 @@ def test_steward_trace_entry_written_on_first_execution(registry: Registry, tmp_
 
     entry = trace_entries[0]
     assert entry["cycle"] == 0, f"Expected cycle=0, got {entry['cycle']!r}"
-    assert entry["posture"] == "first_execution", (
-        f"Expected posture='first_execution', got {entry['posture']!r}"
+    # first_execution maps to "orienting" in v2 trace posture vocabulary (ADR-004)
+    assert entry["posture"] == "orienting", (
+        f"Expected posture='orienting' (first_execution maps to orienting per ADR-004), "
+        f"got {entry['posture']!r}"
     )
     assert isinstance(entry["success_criteria_checked"], list), (
         f"success_criteria_checked is not a list: {entry['success_criteria_checked']!r}"
@@ -626,12 +629,14 @@ def test_steward_trace_anomaly_captured_on_stuck(registry: Registry, tmp_path: P
         title="Anomaly trace capture test",
     )
 
-    # Directly set steward_cycles to _HARD_CAP_CYCLES so the Steward
+    # Directly set lifetime_cycles to _HARD_CAP_CYCLES so the Steward
     # immediately hits the hard_cap stuck condition on next diagnosis.
+    # Note: the hard_cap check uses lifetime_cycles (not steward_cycles),
+    # since lifetime_cycles accumulates across decide-retry resets.
     conn = sqlite3.connect(str(registry.db_path))
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
-        "UPDATE uow_registry SET steward_cycles = ? WHERE id = ?",
+        "UPDATE uow_registry SET lifetime_cycles = ? WHERE id = ?",
         (_HARD_CAP_CYCLES, uow_id),
     )
     conn.commit()
@@ -661,13 +666,18 @@ def test_steward_trace_anomaly_captured_on_stuck(registry: Registry, tmp_path: P
         f"No trace entries found in agenda after stuck cycle: {agenda}"
     )
 
-    # Find the trace entry for this cycle (cycle == _HARD_CAP_CYCLES)
-    stuck_entry = next((e for e in trace_entries if e["cycle"] == _HARD_CAP_CYCLES), None)
+    # Find the trace entry that captured the stuck condition.
+    # The trace entry cycle number reflects steward_cycles (per-attempt), not
+    # lifetime_cycles, so we search by anomalies content rather than cycle number.
+    stuck_entry = next((e for e in trace_entries if e.get("anomalies")), None)
     assert stuck_entry is not None, (
-        f"No trace entry with cycle={_HARD_CAP_CYCLES} found. Entries: {trace_entries}"
+        f"No trace entry with anomalies found. Entries: {trace_entries}"
     )
     assert len(stuck_entry.get("anomalies", [])) > 0, (
         f"Expected non-empty anomalies for hard_cap stuck condition, got: {stuck_entry!r}"
+    )
+    assert "hard_cap" in stuck_entry.get("anomalies", []), (
+        f"Expected 'hard_cap' in anomalies, got: {stuck_entry.get('anomalies')!r}"
     )
     # Also verify the notification was fired (confirms the stuck branch was hit)
     assert len(captured_notifications) >= 1, "Stuck condition did not fire a Dan notification"

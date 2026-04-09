@@ -48,6 +48,7 @@ from orchestration.executor import (
     TTL_EXCEEDED_HOURS,
     recover_ttl_exceeded_uows,
 )
+from orchestration.steward import IssueInfo
 
 # startup-sweep.py has a hyphen in the filename — not directly importable as a module.
 # Use importlib to load it by file path and register it in sys.modules.
@@ -299,25 +300,29 @@ def test_startup_sweep_detects_executor_orphan(
     """
     uow_id = _seed_ready_for_executor(registry)
 
-    # Backdate created_at to be well past the 1-hour orphan threshold
-    old_created_at = _ago_iso(hours=2)
+    # Backdate both created_at and updated_at to be well past the 1-hour orphan threshold.
+    # The startup sweep uses updated_at as the age anchor (added to fix Sprint 2 regression
+    # where created_at always exceeded threshold). Both must be backdated so the sweep
+    # treats the UoW as stale.
+    old_timestamp = _ago_iso(hours=2)
     conn.execute(
         "UPDATE uow_registry SET created_at = ?, updated_at = ? WHERE id = ?",
-        (old_created_at, _now_iso(), uow_id),
+        (old_timestamp, old_timestamp, uow_id),
     )
     conn.commit()
 
     # Verify precondition
     row = conn.execute(
-        "SELECT status, created_at FROM uow_registry WHERE id = ?",
+        "SELECT status, created_at, updated_at FROM uow_registry WHERE id = ?",
         (uow_id,),
     ).fetchone()
     assert row["status"] == "ready-for-executor"
-    assert row["created_at"] == old_created_at
+    assert row["created_at"] == old_timestamp
+    assert row["updated_at"] == old_timestamp
 
     # Run startup sweep with no-op github_client (no labels → not bootup-candidate-gated)
-    def _noop_github(issue_number: int) -> dict:
-        return {"labels": [], "state": "open", "status_code": 200, "body": "", "title": ""}
+    def _noop_github(issue_number: int) -> IssueInfo:
+        return IssueInfo(status_code=200, state="open", labels=[], body="", title="")
 
     result = run_startup_sweep(
         registry=registry,
@@ -378,8 +383,8 @@ def test_startup_sweep_ignores_fresh_ready_for_executor_uow(
 
     # created_at is very recent — under the orphan threshold
 
-    def _noop_github(issue_number: int) -> dict:
-        return {"labels": [], "state": "open", "status_code": 200, "body": "", "title": ""}
+    def _noop_github(issue_number: int) -> IssueInfo:
+        return IssueInfo(status_code=200, state="open", labels=[], body="", title="")
 
     result = run_startup_sweep(
         registry=registry,
