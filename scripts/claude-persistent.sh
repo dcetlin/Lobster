@@ -578,6 +578,27 @@ with open('$tmp_state', 'w') as f:
         log "Claude exited with code $exit_code. Will restart after backoff."
         write_state "restarting" "exit_code=$exit_code"
 
+        # Detect quota exhaustion — sleep until midnight UTC before retrying
+        if tail -20 "$LOG_DIR/claude-session.log" 2>/dev/null | grep -qi "out of extra usage\|you.ve hit your limit\|hit your limit\|you.re out of"; then
+            log "QUOTA EXHAUSTED: Detected usage quota error. Sleeping until midnight UTC."
+            local now midnight_utc sleep_secs wake_time_et
+            now=$(date +%s)
+            midnight_utc=$(date -u -d 'tomorrow 00:00:00' +%s)
+            sleep_secs=$(( midnight_utc - now ))
+            wake_time_et=$(TZ="America/New_York" date -d "@$midnight_utc" "+%-I:%M %p ET")
+            write_state "quota_wait" "sleeping until midnight UTC ($wake_time_et), ${sleep_secs}s"
+            send_telegram_alert "⏸ *Lobster Quota Exhausted*
+
+Usage quota hit. Sleeping until midnight UTC ($wake_time_et).
+Will auto-restart at quota reset. No action needed."
+            sleep "$sleep_secs"
+            log "QUOTA WAIT COMPLETE: Midnight UTC reached, resuming restart."
+            write_state "restarting" "quota_wait_complete"
+            AUTH_FAIL_COUNT=0
+            AUTH_FAIL_ALERTED=false
+            return 1
+        fi
+
         # Detect auth failures from session log
         if tail -5 "$LOG_DIR/claude-session.log" 2>/dev/null | grep -q "authentication_error\|OAuth token has expired\|API usage limits"; then
             AUTH_FAIL_COUNT=$((AUTH_FAIL_COUNT + 1))
