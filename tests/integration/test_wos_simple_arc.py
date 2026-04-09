@@ -37,22 +37,23 @@ if str(_SRC) not in sys.path:
 
 from orchestration.registry import Registry, UpsertInserted, ApproveConfirmed
 from orchestration.executor import Executor, ExecutorOutcome
-from orchestration.steward import run_steward_cycle, Prescribed, Done
+from orchestration.steward import run_steward_cycle, Prescribed, Done, IssueInfo
+from orchestration.workflow_artifact import from_frontmatter
 
 
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
 
-def _noop_github_client(issue_number: int) -> dict[str, Any]:
-    """Mocked GitHub client — returns a minimal open issue with no special labels."""
-    return {
-        "status_code": 200,
-        "state": "open",
-        "labels": [],
-        "body": "Integration test issue body.",
-        "title": "Integration test UoW",
-    }
+def _noop_github_client(issue_number: int) -> IssueInfo:
+    """Mocked GitHub client — returns a minimal open IssueInfo with no special labels."""
+    return IssueInfo(
+        status_code=200,
+        state="open",
+        labels=[],
+        body="Integration test issue body.",
+        title="Integration test UoW",
+    )
 
 
 def _noop_notify_dan(uow, condition, surface_log=None, return_reason=None) -> None:
@@ -151,17 +152,10 @@ class TestWosSimpleArc:
 
         uow = registry.get(uow_id)
         assert uow is not None
-        assert uow.status == "pending", f"Expected pending, got {uow.status}"
-
-        # ----------------------------------------------------------------
-        # Step 2: Advance pending → ready-for-steward.
-        # In production the trigger evaluator does this; here we use
-        # set_status_direct to keep the test self-contained.
-        # ----------------------------------------------------------------
-        registry.set_status_direct(uow_id, "ready-for-steward")
-        uow = registry.get(uow_id)
+        # approve() auto-advances proposed → ready-for-steward (pending is no longer
+        # a resting state as of the current registry implementation).
         assert uow.status == "ready-for-steward", (
-            f"Expected ready-for-steward, got {uow.status}"
+            f"Expected ready-for-steward after approve(), got {uow.status}"
         )
 
         # ----------------------------------------------------------------
@@ -194,6 +188,29 @@ class TestWosSimpleArc:
         )
         assert uow.steward_cycles == 1, (
             f"Expected steward_cycles=1, got {uow.steward_cycles}"
+        )
+
+        # ----------------------------------------------------------------
+        # AC-21/AC-22 (G1 — S3P2 regression guard): verify the artifact
+        # file on disk is in ---json front-matter format and round-trips
+        # correctly via from_frontmatter().
+        # ----------------------------------------------------------------
+        artifact_path = Path(uow.workflow_artifact)
+        assert artifact_path.exists(), (
+            f"Workflow artifact file not found at {artifact_path}"
+        )
+        artifact_text = artifact_path.read_text()
+        assert artifact_text.startswith("---json"), (
+            "Artifact file must start with '---json' front-matter opener (S3P2 format)"
+        )
+        # AC-21: from_frontmatter round-trips without error
+        parsed_artifact = from_frontmatter(artifact_text)
+        # AC-22: instructions prose is present (not empty)
+        assert parsed_artifact["instructions"], (
+            "Artifact instructions must not be empty after from_frontmatter round-trip"
+        )
+        assert parsed_artifact["uow_id"] == uow_id, (
+            f"Artifact uow_id mismatch: expected {uow_id}, got {parsed_artifact['uow_id']}"
         )
 
         # ----------------------------------------------------------------
@@ -435,4 +452,80 @@ class TestWosSimpleArc:
         assert steward_result_3.evaluated == 0, (
             f"Steward cycle 3 should find 0 UoWs to evaluate (done is terminal), "
             f"got: {steward_result_3}"
+        )
+
+    def test_vision_ref_propagates_to_route_reason(self, arc_env: dict) -> None:
+        """
+        G3 (vision_ref → route_reason propagation in arc context).
+
+        Seeds a UoW with a valid vision_ref, runs Steward cycle 1, then asserts
+        that route_reason in the UoW record starts with 'vision-anchored'.
+
+        This verifies PR #714 integration: resolve_vision_route() is called by
+        _build_prescription_route_reason() during prescription, and the result
+        is written to the UoW's route_reason field via _write_steward_fields().
+
+        AC-7: vision_ref is present in UoW and route_reason starts with 'vision-anchored'.
+        """
+        import json
+        import sqlite3
+        from datetime import datetime, timezone
+
+        registry: Registry = arc_env["registry"]
+        artifact_dir: Path = arc_env["artifact_dir"]
+        db_path: Path = arc_env["db_path"]
+
+        # Seed a UoW with a fresh (non-stale) vision_ref
+        upsert_result = registry.upsert(
+            issue_number=9001,
+            title="Vision ref propagation test UoW",
+            success_criteria="route_reason reflects vision_ref after Steward cycle 1",
+        )
+        assert isinstance(upsert_result, UpsertInserted)
+        uow_id = upsert_result.id
+
+        registry.approve(uow_id)
+
+        # Write vision_ref directly via SQL — the public upsert API does not
+        # accept vision_ref yet; it is populated by the issue-sweeper in production.
+        vision_ref = {
+            "layer": "active_project",
+            "field": "phase_intent",
+            "statement": "Build the substrate for intent-anchored decisions.",
+            "anchored_at": datetime.now(timezone.utc).isoformat(),
+        }
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "UPDATE uow_registry SET vision_ref = ? WHERE id = ?",
+            (json.dumps(vision_ref), uow_id),
+        )
+        conn.commit()
+        conn.close()
+
+        # Confirm vision_ref is readable back through Registry
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.vision_ref is not None, "vision_ref should be readable after direct SQL write"
+        assert uow.vision_ref["layer"] == "active_project"
+
+        # Run Steward cycle 1 — this calls _build_prescription_route_reason
+        # which calls resolve_vision_route() when vision_ref is present
+        run_steward_cycle(
+            registry=registry,
+            github_client=_noop_github_client,
+            artifact_dir=artifact_dir,
+            notify_dan=_noop_notify_dan,
+            notify_dan_early_warning=_noop_notify_dan_early_warning,
+            bootup_candidate_gate=False,
+        )
+
+        # AC-7: route_reason must start with 'vision-anchored' after prescription
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.route_reason is not None, (
+            "route_reason must be written by the Steward during prescription"
+        )
+        assert uow.route_reason.startswith("vision-anchored"), (
+            f"route_reason must start with 'vision-anchored' when vision_ref is present. "
+            f"Got: {uow.route_reason!r}"
         )
