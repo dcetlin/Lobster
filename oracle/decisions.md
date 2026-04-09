@@ -771,3 +771,11 @@ Dan approved this PR explicitly with the condition that authority headers be add
 ### Overall verdict: APPROVED
 
 **PR #717** is approved for merge. All three NEEDS_CHANGES items from prior oracle rounds have been resolved: source_ref forwarding fixed with full INSERT chain, prescribed_ps NameError fixed (parsed_ps), and PR description updated to document all 3 changed files. Bind parameter count 14/14 verified. New test added and passes.
+
+---
+
+## [2026-04-09] PR #720 (S3P2-A Steward typed migration) — oracle-s3p2-a5
+
+### Overall verdict: APPROVED
+
+**PR #720** is approved for merge. Comprehensive fix — all CycleResult/IssueInfo/LLMPrescription plain dict usages converted to dataclass access across 6 test files and production startup-sweep.py. 73 tests passed. No remaining plain dict accesses anywhere in tests or production.
