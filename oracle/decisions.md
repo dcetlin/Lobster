@@ -779,3 +779,11 @@ Dan approved this PR explicitly with the condition that authority headers be add
 ### Overall verdict: APPROVED
 
 **PR #720** is approved for merge. Comprehensive fix — all CycleResult/IssueInfo/LLMPrescription plain dict usages converted to dataclass access across 6 test files and production startup-sweep.py. 73 tests passed. No remaining plain dict accesses anywhere in tests or production.
+
+---
+
+## [2026-04-09] PR #724 (fix: quota sleep-until-midnight) — oracle-pr-724
+
+### Overall verdict: APPROVED
+
+**PR #724** is approved for merge. Field ordering verified, quota_wait case confirmed correct, auth-failure ordering safe, no dual-alert risk.
