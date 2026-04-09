@@ -303,7 +303,7 @@ class Registry:
         if prescribed_skills_raw is not None:
             parsed_ps = _deserialize_json(prescribed_skills_raw)
             if isinstance(parsed_ps, list):
-                prescribed_skills = prescribed_ps
+                prescribed_skills = parsed_ps
 
         # vision_ref: NULL → None, '{"layer":...}' → dict
         vision_ref_raw = d.get("vision_ref")
@@ -428,7 +428,7 @@ class Registry:
         return self._upsert_typed(
             issue_number, title, sweep_date, uow_type, success_criteria,
             source_repo=source_repo, issue_url=issue_url,
-            register=register,
+            register=register, source_ref=source_ref,
         )
 
     def _upsert_typed(
@@ -525,8 +525,8 @@ class Registry:
                     id, type, source, source_issue_number, sweep_date,
                     status, posture, created_at, updated_at, summary,
                     success_criteria, route_reason, route_evidence, trigger,
-                    issue_url, register, uow_mode
-                ) VALUES (?, ?, ?, ?, ?, 'proposed', 'solo', ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}', ?, ?, ?)
+                    issue_url, register, uow_mode, source_ref
+                ) VALUES (?, ?, ?, ?, ?, 'proposed', 'solo', ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}', ?, ?, ?, ?)
                 """,
                 (
                     uow_id,
@@ -542,6 +542,7 @@ class Registry:
                     resolved_issue_url,
                     register,
                     register,  # uow_mode mirrors register at germination time
+                    source_ref,
                 ),
             )
             conn.commit()
