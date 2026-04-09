@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -43,6 +44,7 @@ from src.orchestration.error_capture import (
     has_repeated_error,
 )
 from src.orchestration.config import TimeoutConfig
+from src.orchestration.vision_routing import resolve_vision_route
 
 log = logging.getLogger("steward")
 
@@ -335,6 +337,20 @@ _ACTOR_STEWARD = "steward"
 # lifetime_cycles accumulates across all decide-retry resets, so this is a true
 # per-UoW-lifetime circuit breaker. steward_cycles (per-attempt) is NOT used here.
 _HARD_CAP_CYCLES = 9
+
+# close_reason written by the cleanup arc when a UoW hits the hard cap.
+# Used to gate decide-retry: bare retry is rejected; explicit override required.
+CLOSE_REASON_HARD_CAP_CLEANUP = "hard_cap_cleanup"
+
+# Default path for failure trace files written by the cleanup arc.
+_DEFAULT_FAILURE_TRACES_DIR = Path(
+    os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
+) / "orchestration" / "failure-traces"
+
+# Default path for archived artifact directories written by the cleanup arc.
+_DEFAULT_ARTIFACTS_ARCHIVED_DIR = Path(
+    os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
+) / "orchestration" / "artifacts" / "archived"
 
 # Early warning threshold: notify Dan when lifetime_cycles + steward_cycles reaches this value.
 # Uses cumulative lifetime_cycles + new_cycles (post-prescription) so the warning fires based
@@ -756,15 +772,46 @@ def _assess_completion(
 # Per-cycle trace entry builder (pure functions — no DB writes)
 # ---------------------------------------------------------------------------
 
-def _posture_rationale(diagnosis: Diagnosis, cycles: int) -> str:
+def _posture_rationale(diagnosis: Diagnosis, cycles: int, trace_posture: str | None = None) -> str:
     """
     Return a 1-sentence rationale for the current posture.
 
     Pure function: derives the string deterministically from diagnosis fields.
     No LLM, no DB reads. Called by _build_trace_entry().
+
+    Args:
+        diagnosis: Typed Diagnosis dataclass returned by _diagnose_uow().
+        cycles: Current steward_cycles count.
+        trace_posture: Optional trace posture (v2 vocabulary per ADR-004). If provided,
+            rationale is written for the trace posture; otherwise falls back to reentry_posture.
     """
     posture = diagnosis.reentry_posture
+    stuck_condition = diagnosis.stuck_condition
 
+    # Use trace posture vocabulary if provided (S3P2-F reconciliation)
+    if trace_posture:
+        if trace_posture == "orienting":
+            return "First contact — establishing scope and dispatching initial execution."
+        elif trace_posture == "clarifying":
+            if posture == "execution_complete":
+                return "Executor result present — assessing completion criteria."
+            return "Evaluating current state to determine next action."
+        elif trace_posture == "waiting_for_signal":
+            return "Blocked on external input — awaiting response before proceeding."
+        elif trace_posture == "scope_challenged":
+            if stuck_condition:
+                return f"Anomaly detected: {stuck_condition} — recovery in progress."
+            if posture in ("crashed_no_output", "crashed_output_ref_missing"):
+                return "Executor crash detected — analyzing failure for recovery."
+            if posture == "executor_orphan":
+                return "Executor never claimed UoW — re-prescribing."
+            return "Unexpected state encountered — investigating."
+        elif trace_posture == "closing_with_discovery":
+            return "Completion criteria satisfied — closing with findings documented."
+        else:
+            return f"Trace posture: {trace_posture}."
+
+    # Fallback: use reentry_posture vocabulary (internal diagnostic codes)
     match posture:
         case "first_execution":
             return "No prior audit entries — first steward contact, dispatching executor."
@@ -827,6 +874,68 @@ def _posture_prediction(diagnosis: Diagnosis) -> str | None:
             return "Next prescription will be determined from diagnosis output."
 
 
+# ---------------------------------------------------------------------------
+# Trace posture derivation (S3P2-F vocabulary reconciliation)
+# ---------------------------------------------------------------------------
+
+def _determine_trace_posture(diagnosis: Diagnosis) -> str:
+    """
+    Derive the narrative trace posture from reentry classification and diagnosis state.
+
+    This function reconciles the internal diagnostic classification (reentry_posture)
+    with the v2 design trace posture vocabulary per ADR-004.
+
+    Trace posture vocabulary (wos-v2-design.md / PR #564):
+    - orienting: First contact, establishing scope
+    - clarifying: Assessing completion, determining next steps
+    - waiting_for_signal: Blocked on external input (Dan, system)
+    - scope_challenged: Anomaly detected, recovery in progress
+    - closing_with_discovery: Completion confirmed, wrapping up
+
+    Returns:
+        One of the five trace posture values.
+    """
+    reentry_classification = diagnosis.reentry_posture
+    is_complete = diagnosis.is_complete
+    stuck_condition = diagnosis.stuck_condition
+    executor_outcome = diagnosis.executor_outcome
+
+    # Stuck conditions → scope_challenged (anomaly recovery)
+    if stuck_condition:
+        return "scope_challenged"
+
+    # Completion confirmed → closing_with_discovery
+    if is_complete:
+        return "closing_with_discovery"
+
+    # First execution → orienting (establishing scope)
+    if reentry_classification == "first_execution":
+        return "orienting"
+
+    # Blocked outcomes → waiting_for_signal
+    if executor_outcome == "blocked":
+        return "waiting_for_signal"
+
+    # Crash/failure states → scope_challenged (anomaly recovery)
+    if reentry_classification in (
+        "crashed_no_output",
+        "crashed_zero_bytes",
+        "crashed_output_ref_missing",
+        "execution_failed",
+        "executor_orphan",
+        "diagnosing_orphan",
+        "stall_detected",
+    ):
+        return "scope_challenged"
+
+    # Normal re-entry with work to do → clarifying
+    if reentry_classification in ("execution_complete", "startup_sweep_possibly_complete"):
+        return "clarifying"
+
+    # Default fallback → clarifying (assessing state)
+    return "clarifying"
+
+
 def _build_trace_entry(diagnosis: Diagnosis, cycles: int) -> dict:
     """
     Build a single steward_agenda trace entry from a completed diagnosis.
@@ -841,10 +950,13 @@ def _build_trace_entry(diagnosis: Diagnosis, cycles: int) -> dict:
     Returns:
         Trace entry dict conforming to the v2 cycle trace entry schema.
     """
+    # Derive narrative trace posture from diagnostic classification (S3P2-F)
+    trace_posture = _determine_trace_posture(diagnosis)
+
     return {
         "cycle": cycles,
-        "posture": diagnosis.reentry_posture,
-        "posture_rationale": _posture_rationale(diagnosis, cycles),
+        "posture": trace_posture,
+        "posture_rationale": _posture_rationale(diagnosis, cycles, trace_posture),
         "success_criteria_checked": _extract_criteria_checks(diagnosis),
         "anomalies": (
             [diagnosis.stuck_condition]
@@ -1002,6 +1114,45 @@ def _check_register_executor_compatibility(
         f"({direction}). Compatible types: {sorted(compatible_types)}"
     )
     return False, reason
+
+
+def _build_prescription_route_reason(
+    uow: "UoW",
+    reentry_posture: str,
+    executor_outcome: str,
+    partial_steps_context: str,
+    completion_rationale: str,
+) -> str:
+    """
+    Build the route_reason string for a prescription cycle.
+
+    When vision_ref is present on the UoW, the route_reason is prefixed with
+    the vision-anchored reason from resolve_vision_route(). This changes the
+    actual pipeline decision: a vision-anchored UoW gets a structurally
+    different route_reason than a heuristic-routed UoW, which is visible in
+    audit logs, steward_log, and the DB.
+
+    When vision_ref is absent, falls back to the steward heuristic string.
+
+    Pure function: produces no side effects, safe to call from tests.
+    """
+    if executor_outcome == "partial" and partial_steps_context:
+        heuristic_reason = (
+            f"steward: {reentry_posture} — partial continuation "
+            f"({partial_steps_context}) — {completion_rationale[:80]}"
+        )
+    else:
+        heuristic_reason = f"steward: {reentry_posture} — {completion_rationale[:120]}"
+
+    # Vision-anchored path: when vision_ref is present, prepend vision routing result.
+    # This changes the route_reason from a pure heuristic string to one that references
+    # the vision anchor — a real pipeline decision, not just metadata.
+    if uow.vision_ref is not None:
+        vision_result = resolve_vision_route(uow, log_fallback=False)
+        if vision_result.anchored:
+            return f"{vision_result.route_reason} | {heuristic_reason}"
+
+    return heuristic_reason
 
 
 def _select_prescribed_skills(uow: "UoW", reentry_posture: str) -> list[str]:
@@ -1913,6 +2064,8 @@ def _write_steward_fields(
     route_reason: str | None = None,
     steward_cycles: int | None = None,
     completed_at: str | None = None,
+    closed_at: str | None = None,
+    close_reason: str | None = None,
 ) -> None:
     """
     Write Steward-private and Steward-managed fields to the UoW row.
@@ -1936,6 +2089,10 @@ def _write_steward_fields(
         updates["steward_cycles"] = steward_cycles
     if completed_at is not None:
         updates["completed_at"] = completed_at
+    if closed_at is not None:
+        updates["closed_at"] = closed_at
+    if close_reason is not None:
+        updates["close_reason"] = close_reason
 
     if not updates:
         return
@@ -1976,6 +2133,247 @@ def _append_steward_log_entry(
     if current_log:
         return current_log.rstrip("\n") + "\n" + entry_str
     return entry_str
+
+
+# ---------------------------------------------------------------------------
+# Hard-cap cleanup arc (S3-A)
+# ---------------------------------------------------------------------------
+
+def _archive_uow_artifacts(
+    uow_id: str,
+    artifact_dir: Path | None,
+    archived_dir: Path | None = None,
+) -> dict[str, Any]:
+    """
+    Move the UoW's artifact directory to the archived location.
+
+    Returns a dict with keys:
+      - archived_path: str | None — absolute path of the archived directory, or None
+      - success: bool
+      - error: str | None — error message if archival failed
+
+    Fallback contract: a failure to archive is logged but does not block the
+    state transition. Cleanup arc failure is preferable to no cleanup arc.
+
+    Pure filesystem operation — no DB writes, no side effects beyond the move.
+    """
+    resolved_artifact_dir = Path(artifact_dir) if artifact_dir is not None else _DEFAULT_CYCLE_TRACE_DIR
+    src = resolved_artifact_dir / uow_id
+
+    resolved_archived_dir = Path(archived_dir) if archived_dir is not None else _DEFAULT_ARTIFACTS_ARCHIVED_DIR
+    dst = resolved_archived_dir / uow_id
+
+    if not src.exists():
+        # No artifact directory — not an error (UoW may have no artifacts yet)
+        return {"archived_path": None, "success": True, "error": None}
+
+    try:
+        resolved_archived_dir.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.move(str(src), str(dst))
+        return {"archived_path": str(dst), "success": True, "error": None}
+    except Exception as e:
+        log.error("hard_cap cleanup: artifact archival failed for %s: %s", uow_id, e)
+        return {"archived_path": None, "success": False, "error": str(e)}
+
+
+def _write_hard_cap_failure_trace(
+    uow: UoW,
+    return_reason: str | None,
+    failure_traces_dir: Path | None = None,
+    archived_artifact_path: str | None = None,
+) -> dict[str, Any]:
+    """
+    Write a structured failure trace JSON to orchestration/failure-traces/<uow_id>.json.
+
+    The trace preserves execution history for post-cleanup audit.  This is written
+    AFTER artifact archival so that trace.json (included in the artifact directory by
+    S3-B) has already been moved to archived/ — the trace record here captures the
+    final state, not a snapshot of live files.
+
+    Returns dict with keys:
+      - trace_path: str | None — absolute path of written trace, or None on failure
+      - success: bool
+      - error: str | None
+
+    Fallback contract: failure to write the trace does not block state transition.
+    """
+    resolved_dir = Path(failure_traces_dir) if failure_traces_dir is not None else _DEFAULT_FAILURE_TRACES_DIR
+    resolved_dir.mkdir(parents=True, exist_ok=True)
+
+    trace = {
+        "uow_id": uow.id,
+        "reason": CLOSE_REASON_HARD_CAP_CLEANUP,
+        "final_return_reason": return_reason,
+        "cycle_count_lifetime": uow.lifetime_cycles,
+        "summary": uow.summary,
+        "success_criteria": uow.success_criteria,
+        "archived_artifact_path": archived_artifact_path,
+        "timestamp": _now_iso(),
+    }
+
+    trace_path = resolved_dir / f"{uow.id}.json"
+    try:
+        trace_path.write_text(json.dumps(trace, indent=2), encoding="utf-8")
+        return {"trace_path": str(trace_path), "success": True, "error": None}
+    except Exception as e:
+        log.error("hard_cap cleanup: failure trace write failed for %s: %s", uow.id, e)
+        return {"trace_path": None, "success": False, "error": str(e)}
+
+
+def _post_hard_cap_github_comment(
+    uow: UoW,
+    failure_trace_path: str | None,
+) -> bool:
+    """
+    Post a comment to the source GitHub issue noting the failure trace.
+
+    Returns True on success, False on any error.
+    Best-effort: failures are logged but do not block the cleanup arc.
+    """
+    issue_url = uow.issue_url
+    if not issue_url:
+        log.info(
+            "hard_cap cleanup: no issue_url for %s — skipping GitHub comment", uow.id
+        )
+        return False
+
+    repo = _repo_from_issue_url(issue_url)
+    if not repo:
+        log.warning(
+            "hard_cap cleanup: could not parse repo from issue_url %r — skipping comment",
+            issue_url,
+        )
+        return False
+
+    # Extract issue number from URL: .../issues/<number>
+    try:
+        issue_number = int(issue_url.rstrip("/").split("/")[-1])
+    except (ValueError, IndexError):
+        log.warning(
+            "hard_cap cleanup: could not extract issue number from %r — skipping comment",
+            issue_url,
+        )
+        return False
+
+    trace_note = (
+        f"\n\nFailure trace written to: `{failure_trace_path}`"
+        if failure_trace_path
+        else ""
+    )
+    comment_body = (
+        f"**WOS hard cap reached** for UoW `{uow.id}`.\n\n"
+        f"This UoW exhausted its lifetime cycle budget ({_HARD_CAP_CYCLES} cycles) "
+        f"and has been archived. The cleanup arc has:\n"
+        f"- Archived artifacts to `orchestration/artifacts/archived/{uow.id}/`\n"
+        f"- Written a failure trace recording the final state{trace_note}\n\n"
+        f"A decide-retry requires an explicit operator flag (`force` override) — "
+        f"bare retry is rejected at the hard-cap commitment boundary."
+    )
+
+    command = [
+        "gh", "issue", "comment", str(issue_number),
+        "--repo", repo,
+        "--body", comment_body,
+    ]
+
+    result, error = run_subprocess_with_error_capture(
+        component="steward_github",
+        uow_id=uow.id,
+        command=command,
+        timeout_seconds=15,
+        check=False,
+    )
+
+    if error:
+        log.warning(
+            "hard_cap cleanup: GitHub comment failed for %s#%s: %s",
+            repo, issue_number, error.summary(),
+        )
+        return False
+
+    if result is None or result.returncode != 0:
+        log.warning(
+            "hard_cap cleanup: GitHub comment subprocess non-zero for %s#%s",
+            repo, issue_number,
+        )
+        return False
+
+    log.info(
+        "hard_cap cleanup: GitHub comment posted for %s#%s", repo, issue_number
+    )
+    return True
+
+
+def _run_hard_cap_cleanup(
+    uow: UoW,
+    registry,
+    return_reason: str | None,
+    artifact_dir: Path | None,
+    failure_traces_dir: Path | None = None,
+    archived_dir: Path | None = None,
+) -> dict[str, Any]:
+    """
+    Run the hard-cap cleanup arc atomically (best-effort at each step).
+
+    Steps executed in order:
+    1. Archive UoW artifacts to orchestration/artifacts/archived/<uow_id>/
+    2. Write failure trace to orchestration/failure-traces/<uow_id>.json
+    3. Set close_reason = CLOSE_REASON_HARD_CAP_CLEANUP and closed_at in registry
+    4. Post GitHub comment on source issue (optional — best-effort)
+
+    Returns a summary dict for audit log inclusion.
+
+    Fallback contract: each step is individually protected. A failure in archival
+    does not block the failure trace write, and a failure in either does not block
+    the registry close_reason write. The state transition (blocked) always proceeds.
+    """
+    uow_id = uow.id
+    log.info("hard_cap cleanup arc starting for %s (lifetime_cycles=%s)", uow_id, uow.lifetime_cycles)
+
+    # Step 1: Archive artifacts
+    archive_result = _archive_uow_artifacts(uow_id, artifact_dir, archived_dir)
+    if not archive_result["success"]:
+        log.warning("hard_cap cleanup: archival step failed for %s — continuing", uow_id)
+
+    # Step 2: Write failure trace
+    trace_result = _write_hard_cap_failure_trace(
+        uow,
+        return_reason=return_reason,
+        failure_traces_dir=failure_traces_dir,
+        archived_artifact_path=archive_result.get("archived_path"),
+    )
+    if not trace_result["success"]:
+        log.warning("hard_cap cleanup: failure trace write failed for %s — continuing", uow_id)
+
+    # Step 3: Set close_reason and closed_at in registry
+    try:
+        _write_steward_fields(
+            registry,
+            uow_id,
+            close_reason=CLOSE_REASON_HARD_CAP_CLEANUP,
+            closed_at=_now_iso(),
+        )
+    except Exception as e:
+        log.error("hard_cap cleanup: registry close_reason write failed for %s: %s", uow_id, e)
+
+    # Step 4: Post GitHub comment (best-effort, does not block)
+    github_comment_posted = _post_hard_cap_github_comment(
+        uow,
+        failure_trace_path=trace_result.get("trace_path"),
+    )
+
+    summary = {
+        "artifact_archived": archive_result["success"],
+        "archived_path": archive_result.get("archived_path"),
+        "failure_trace_written": trace_result["success"],
+        "failure_trace_path": trace_result.get("trace_path"),
+        "close_reason": CLOSE_REASON_HARD_CAP_CLEANUP,
+        "github_comment_posted": github_comment_posted,
+    }
+    log.info("hard_cap cleanup arc complete for %s: %s", uow_id, summary)
+    return summary
 
 
 def _update_agenda_node_status(
@@ -2654,6 +3052,34 @@ def _process_uow(
                 "timestamp": _now_iso(),
             })
 
+        # Hard cap: run cleanup arc before surfacing to Dan (S3-A).
+        # The cleanup arc archives artifacts, writes failure trace, and sets
+        # close_reason/closed_at. Each step is individually protected — failure
+        # in archival does not block the surface-to-Dan path.
+        cleanup_summary: dict[str, Any] | None = None
+        if stuck_condition == "hard_cap" and not dry_run:
+            # Derive archived_dir from artifact_dir so archived artifacts stay
+            # co-located with active ones (under artifacts/archived/).
+            _resolved_artifact_dir = (
+                Path(artifact_dir) if artifact_dir is not None
+                else _DEFAULT_CYCLE_TRACE_DIR
+            )
+            cleanup_summary = _run_hard_cap_cleanup(
+                uow=uow,
+                registry=registry,
+                return_reason=return_reason,
+                artifact_dir=artifact_dir,
+                archived_dir=_resolved_artifact_dir / "archived",
+            )
+            # Append cleanup summary to audit log
+            registry.append_audit_log(uow_id, {
+                "event": "hard_cap_cleanup",
+                "actor": _ACTOR_STEWARD,
+                "uow_id": uow_id,
+                "timestamp": _now_iso(),
+                **(cleanup_summary or {}),
+            })
+
         # Surface to Dan (injectable for tests)
         _notify = notify_dan or _default_notify_dan
         _notify(uow, stuck_condition, surface_log=current_log_str, return_reason=return_reason)
@@ -2978,13 +3404,12 @@ def _process_uow(
         completion_gap_for_prescription = (
             f"{completion_rationale} [{partial_steps_context}]"
         )
-        route_reason = (
-            f"steward: {reentry_posture} — partial continuation "
-            f"({partial_steps_context}) — {completion_rationale[:80]}"
-        )
     else:
         completion_gap_for_prescription = completion_rationale
-        route_reason = f"steward: {reentry_posture} — {completion_rationale[:120]}"
+
+    route_reason = _build_prescription_route_reason(
+        uow, reentry_posture, executor_outcome, partial_steps_context, completion_rationale
+    )
 
     # PR C, Change 2: Inject trace content into prescription context.
     # Surprises and prescription_delta from the corrective trace are injected here

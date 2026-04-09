@@ -212,6 +212,7 @@ class GardenCaretaker:
                 title=snapshot.title,
                 success_criteria=success_criteria,
                 issue_url=snapshot.url or None,
+                source_ref=snapshot.source_ref,
             )
 
             if not isinstance(result, UpsertInserted):

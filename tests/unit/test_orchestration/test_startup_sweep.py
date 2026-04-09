@@ -129,6 +129,7 @@ def _make_uow(
     created_at: str | None = None,
     updated_at: str | None = None,
     started_at: str | None = None,
+    estimated_runtime: int | None = None,
     source_issue_number: int = 42,
 ) -> str:
     if uow_id is None:
@@ -136,7 +137,7 @@ def _make_uow(
     # For `active` UoWs, default updated_at to 10 minutes ago so the
     # active_sweep_threshold_seconds (300 s) does not suppress the sweep.
     # Tests that need to verify the threshold behaviour can pass explicit
-    # updated_at / started_at values.
+    # updated_at / started_at / estimated_runtime values.
     if status == "active" and updated_at is None and started_at is None:
         updated_at = _iso_ago(600)
     now = created_at or _now_iso()
@@ -145,12 +146,12 @@ def _make_uow(
         """
         INSERT INTO uow_registry
             (id, type, source, source_issue_number, sweep_date, status, posture,
-             created_at, updated_at, started_at, summary, output_ref, route_evidence, trigger)
+             created_at, updated_at, started_at, estimated_runtime, summary, output_ref, route_evidence, trigger)
         VALUES (?, 'executable', ?, ?, '2026-01-01', ?, 'solo',
-                ?, ?, ?, 'Test UoW', ?, '{}', '{"type": "immediate"}')
+                ?, ?, ?, ?, 'Test UoW', ?, '{}', '{"type": "immediate"}')
         """,
         (uow_id, f"github:issue/{source_issue_number}", source_issue_number,
-         status, now, _updated_at, started_at, output_ref),
+         status, now, _updated_at, started_at, estimated_runtime, output_ref),
     )
     conn.commit()
     return uow_id
@@ -487,6 +488,117 @@ class TestActiveSweepThreshold:
         # Young UoW was suppressed by the age guard — not counted as dry-run skip
         assert result.skipped_dry_run == 0
         assert result.active_swept == 0
+
+
+class TestEstimatedRuntimeThreshold:
+    """
+    Tests for the per-UoW estimated_runtime threshold (#572, S3P2-C).
+
+    When estimated_runtime is set, the sweep uses:
+        started_at + estimated_runtime < now
+    instead of the fallback threshold (300 s).
+
+    This prevents the timing race where long-running subprocesses are
+    misclassified as crashed_output_ref_missing.
+    """
+
+    def test_active_uow_younger_than_estimated_runtime_is_not_swept(self, registry, tmp_db):
+        """
+        An active UoW whose age is less than its estimated_runtime must NOT be
+        reclassified — the subprocess may still be running.
+        """
+        conn = _open_conn(tmp_db)
+        # UoW started 5 minutes ago, estimated_runtime is 10 minutes (600 s)
+        # Age (300 s) < estimated_runtime (600 s) → should NOT be swept
+        uow_id = _make_uow(
+            conn,
+            status="active",
+            output_ref=None,
+            started_at=_iso_ago(300),  # 5 minutes ago
+            estimated_runtime=600,      # 10 minutes expected runtime
+        )
+        conn.close()
+
+        result = run_startup_sweep(registry)
+
+        assert result.active_swept == 0
+        assert _get_status(tmp_db, uow_id) == "active"
+        assert len(_audit_entries(tmp_db, uow_id)) == 0
+
+    def test_active_uow_older_than_estimated_runtime_is_swept(self, registry, tmp_db):
+        """
+        An active UoW whose age exceeds its estimated_runtime must be swept
+        as a crash candidate — the subprocess should have completed by now.
+        """
+        conn = _open_conn(tmp_db)
+        # UoW started 15 minutes ago, estimated_runtime is 10 minutes (600 s)
+        # Age (900 s) > estimated_runtime (600 s) → SHOULD be swept
+        uow_id = _make_uow(
+            conn,
+            status="active",
+            output_ref=None,
+            started_at=_iso_ago(900),  # 15 minutes ago
+            estimated_runtime=600,      # 10 minutes expected runtime
+        )
+        conn.close()
+
+        result = run_startup_sweep(registry)
+
+        assert result.active_swept == 1
+        assert _get_status(tmp_db, uow_id) == "ready-for-steward"
+        entries = _audit_entries(tmp_db, uow_id)
+        assert len(entries) == 1
+        note = json.loads(entries[0]["note"])
+        assert note["classification"] == "crashed_no_output_ref"
+
+    def test_estimated_runtime_takes_precedence_over_fallback_threshold(
+        self, registry, tmp_db
+    ):
+        """
+        When estimated_runtime is set, it takes precedence over the fallback
+        threshold — even if the fallback would have allowed the sweep.
+        """
+        conn = _open_conn(tmp_db)
+        # UoW started 6 minutes ago (360 s), estimated_runtime is 30 minutes (1800 s)
+        # Without estimated_runtime: age (360 s) > fallback (300 s) → would sweep
+        # With estimated_runtime: age (360 s) < estimated_runtime (1800 s) → skip
+        uow_id = _make_uow(
+            conn,
+            status="active",
+            output_ref=None,
+            started_at=_iso_ago(360),   # 6 minutes ago
+            estimated_runtime=1800,      # 30 minutes expected runtime
+        )
+        conn.close()
+
+        result = run_startup_sweep(registry, active_sweep_threshold_seconds=300)
+
+        # estimated_runtime (1800 s) takes precedence, so UoW is NOT swept
+        assert result.active_swept == 0
+        assert _get_status(tmp_db, uow_id) == "active"
+
+    def test_fallback_threshold_used_when_estimated_runtime_is_null(
+        self, registry, tmp_db
+    ):
+        """
+        When estimated_runtime is NULL, the fallback threshold is used.
+        """
+        conn = _open_conn(tmp_db)
+        # UoW started 6 minutes ago (360 s), no estimated_runtime
+        # Age (360 s) > fallback (300 s) → should be swept
+        uow_id = _make_uow(
+            conn,
+            status="active",
+            output_ref=None,
+            started_at=_iso_ago(360),
+            estimated_runtime=None,  # No estimated_runtime
+        )
+        conn.close()
+
+        result = run_startup_sweep(registry, active_sweep_threshold_seconds=300)
+
+        assert result.active_swept == 1
+        assert _get_status(tmp_db, uow_id) == "ready-for-steward"
 
 
 class TestExecutorOrphan:

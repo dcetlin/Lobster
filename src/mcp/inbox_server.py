@@ -9693,7 +9693,83 @@ def _enqueue_reconciler_notification(session: dict, outcome: str) -> None:
 # included only in the summary rather than individual messages. This cap is only
 # relevant when the summary grouping produces a single chat_id with many sessions —
 # in normal operation the summary approach makes it structurally impossible to flood.
+#
+# Root-cause fix (#469): the startup sweep groups all unnotified sessions by chat_id
+# and writes ONE summary message per user. This makes the N-task → N-message flood
+# structurally impossible. The batch cap is defense-in-depth for edge cases where
+# a single user has an unusually large backlog.
 _STARTUP_SWEEP_BATCH_CAP = 20
+
+
+def _write_internal_sessions_to_task_outputs(
+    sessions: list[dict],
+    now: datetime,
+) -> None:
+    """Route chat_id=0 sessions to task-outputs/ (per issue #462).
+
+    Internal/system agents have no real user to notify, so they skip the inbox
+    and go directly to task-outputs/ for observability without dispatcher noise.
+
+    Args:
+        sessions: List of internal sessions (chat_id=0/empty).
+        now:      Current UTC datetime.
+    """
+    if not sessions:
+        return
+
+    completed = [s for s in sessions if s.get("status") == "completed"]
+    dead = [s for s in sessions if s.get("status") != "completed"]
+
+    lines: list[str] = []
+    if completed:
+        lines.append(f"{len(completed)} internal task(s) completed:")
+        for s in completed:
+            desc = s.get("description", "unknown task")
+            task_id = s.get("task_id") or s.get("id", "")
+            elapsed_raw = s.get("elapsed_seconds")
+            try:
+                elapsed_min = int(elapsed_raw) // 60 if elapsed_raw is not None else 0
+            except (TypeError, ValueError):
+                elapsed_min = 0
+            lines.append(f"  - {desc} (task_id={task_id}, {elapsed_min}m)")
+    if dead:
+        lines.append(f"{len(dead)} internal task(s) disappeared (no output):")
+        for s in dead:
+            desc = s.get("description", "unknown task")
+            task_id = s.get("task_id") or s.get("id", "")
+            lines.append(f"  - {desc} (task_id={task_id})")
+
+    output_text = "\n".join(lines)
+    timestamp_str = now.strftime("%Y%m%d-%H%M%S")
+
+    output_data = {
+        "job_name": "reconciler-sweep-internal",
+        "timestamp": now.isoformat(),
+        "status": "success",
+        "output": output_text,
+        "completed_count": len(completed),
+        "dead_count": len(dead),
+        "session_ids": [s.get("id", "") for s in sessions],
+    }
+
+    # Use the module-level TASK_OUTPUTS_DIR (allows test patching)
+    import src.mcp.inbox_server as _this_mod
+    task_outputs_dir = _this_mod.TASK_OUTPUTS_DIR
+
+    output_file = task_outputs_dir / f"{timestamp_str}-reconciler-sweep-internal.json"
+    try:
+        task_outputs_dir.mkdir(parents=True, exist_ok=True)
+        with open(output_file, "w") as f:
+            json.dump(output_data, f, indent=2)
+        log.info(
+            "[reconciler] Wrote %d internal session(s) to task-outputs/ (%d completed, %d dead)",
+            len(sessions), len(completed), len(dead),
+        )
+    except Exception as exc:
+        log.error(
+            "[reconciler] Failed to write internal sessions to task-outputs/: %s",
+            exc, exc_info=True,
+        )
 
 
 def _build_startup_sweep_summary(
@@ -9769,9 +9845,12 @@ def _enqueue_startup_sweep_summaries(sessions: list[dict]) -> None:
     one inbox message per originating chat, not one per task.  This makes the
     N-task → N-message flood structurally impossible.
 
-    Sessions with chat_id=0/empty are silently dropped (no real user to notify;
-    they are already logged by the caller).  All sessions are marked notified
-    regardless of whether a summary was written, so no stale sessions persist.
+    Sessions with chat_id=0/empty are routed to task-outputs/ (per issue #462)
+    rather than inbox — internal agents have no real user to notify, but their
+    completion is still recorded for observability.
+
+    All sessions are marked notified regardless of destination, preventing
+    accumulation across restarts.
 
     Args:
         sessions: All unnotified completed/dead sessions from the last 24 hours.
@@ -9780,14 +9859,14 @@ def _enqueue_startup_sweep_summaries(sessions: list[dict]) -> None:
 
     now = datetime.now(timezone.utc)
 
-    # Group by chat_id, excluding internal agents (chat_id=0/empty)
+    # Group by chat_id, separating internal agents (chat_id=0/empty) for task-outputs/
     by_chat: dict[str, list[dict]] = defaultdict(list)
-    skipped_internal = 0
+    internal_sessions: list[dict] = []
     for session in sessions:
         raw = session.get("chat_id")
         chat_id_str = str(raw).strip() if raw is not None else ""
         if chat_id_str in ("0", "", "None"):
-            skipped_internal += 1
+            internal_sessions.append(session)
             # Mark notified so these don't accumulate across restarts
             agent_id = session.get("id", "")
             try:
@@ -9800,11 +9879,13 @@ def _enqueue_startup_sweep_summaries(sessions: list[dict]) -> None:
             continue
         by_chat[chat_id_str].append(session)
 
-    if skipped_internal:
+    # Route internal sessions to task-outputs/ (per issue #462)
+    if internal_sessions:
+        _write_internal_sessions_to_task_outputs(internal_sessions, now)
         log.debug(
-            "[reconciler] Startup sweep: skipped %d internal sessions (chat_id=0) — "
-            "no inbox notification needed",
-            skipped_internal,
+            "[reconciler] Startup sweep: routed %d internal sessions (chat_id=0) "
+            "to task-outputs/",
+            len(internal_sessions),
         )
 
     total_sessions = sum(len(v) for v in by_chat.values())

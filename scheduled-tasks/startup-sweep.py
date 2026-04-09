@@ -54,12 +54,14 @@ _STATUS_DIAGNOSING = "diagnosing"
 _STARTUP_SWEEP_ACTOR = "steward_startup"
 _EXECUTOR_ORPHAN_THRESHOLD_SECONDS = 3600  # 1 hour: ready-for-executor age threshold
 
-# Minimum age (seconds) for an `active` UoW before the startup sweep will
-# classify it as a crash candidate.  The executor writes `output_ref` to the
-# DB during the 6-step atomic claim BEFORE launching the `claude -p`
-# subprocess, so the file is absent on disk while the subprocess is running.
-# Without this guard the 3-minute heartbeat races the subprocess and
-# misclassifies a live execution as `crashed_output_ref_missing`.
+# Fallback minimum age (seconds) for an `active` UoW before the startup sweep
+# will classify it as a crash candidate.  This constant is used when the UoW
+# does not have an `estimated_runtime` value (S3P2-C).
+#
+# When estimated_runtime IS available, the sweep uses per-UoW accuracy:
+#   started_at + estimated_runtime < now
+# This prevents false positives for UoWs whose runtime is known to exceed the
+# heartbeat cadence (#572).
 #
 # 300 s (5 minutes) is a generous buffer above the 3-minute heartbeat cadence.
 # True crashed UoWs are caught by TTL recovery (TTL_EXCEEDED_HOURS=4h in
@@ -156,10 +158,13 @@ def run_startup_sweep(
 
     1. `active` UoWs: Executors that may have crashed mid-execution.
        Classified by output_ref state and surfaced to ready-for-steward.
-       Only UoWs that have been `active` for longer than
-       `active_sweep_threshold_seconds` (default: 300 s) are swept.
-       Younger UoWs are skipped — the executor subprocess may still be
-       running and has not yet written the output_ref file.
+
+       Minimum age threshold (per-UoW accuracy when estimated_runtime is set):
+       - If estimated_runtime is available: started_at + estimated_runtime < now
+       - Otherwise: fallback to active_sweep_threshold_seconds (default: 300 s)
+
+       This prevents the 3-minute heartbeat from racing long-running subprocesses
+       and misclassifying live executions as crashed_output_ref_missing (#572).
 
     2. `ready-for-executor` UoWs older than orphan_threshold_seconds:
        Executors that crashed before step 1 of the claim sequence.
@@ -177,10 +182,9 @@ def run_startup_sweep(
     the `bootup-candidate` label are skipped in all three populations,
     consistent with the gate applied in run_steward_cycle.
 
-    active_sweep_threshold_seconds: minimum age (measured from updated_at,
-        which is set atomically when status changes to `active`) before an
-        `active` UoW is swept as a crash candidate. Default: 300 s. Pass 0
-        to disable the guard (original behavior, not recommended in production).
+    active_sweep_threshold_seconds: fallback minimum age (seconds) when
+        estimated_runtime is not set. Default: 300 s. Pass 0 to disable
+        the guard entirely (not recommended in production).
     orphan_threshold_seconds: minimum age before a `ready-for-executor` UoW
         is classified as executor_orphan. Default: 3600 s.
     bootup_candidate_gate: override for BOOTUP_CANDIDATE_GATE module constant.
@@ -243,37 +247,58 @@ def run_startup_sweep(
             )
             continue
 
-        # Minimum-age guard: skip UoWs that transitioned to `active` too
-        # recently.  The executor sets output_ref in the DB and commits the
+        # Minimum-age guard: skip UoWs that have not exceeded their expected
+        # runtime.  The executor sets output_ref in the DB and commits the
         # status→active transition BEFORE launching the subprocess, so the
         # output_ref file is legitimately absent while the subprocess runs.
         # Without this guard the 3-minute heartbeat races the subprocess and
         # misclassifies a live execution as `crashed_output_ref_missing`.
         #
-        # updated_at is set atomically when the status changes to `active`
-        # (started_at is not exposed on the UoW dataclass) and is a reliable
-        # proxy for "when did this UoW enter active state".
-        if active_sweep_threshold_seconds > 0:
-            age_anchor = getattr(uow, "updated_at", None)
-            if age_anchor is not None:
-                try:
-                    anchor_dt = datetime.fromisoformat(
-                        age_anchor.replace("Z", "+00:00")
+        # Per-UoW accuracy (#572): if estimated_runtime is set, use
+        #   started_at + estimated_runtime < now
+        # Otherwise fall back to active_sweep_threshold_seconds (300 s).
+        #
+        # started_at is the canonical anchor when available; updated_at is used
+        # as a fallback for UoWs that predate the started_at field.
+        started_at_raw = getattr(uow, "started_at", None)
+        estimated_runtime_raw = getattr(uow, "estimated_runtime", None)
+
+        # Determine effective threshold: per-UoW when estimated_runtime is set,
+        # otherwise use the fallback constant.
+        effective_threshold_seconds = active_sweep_threshold_seconds
+        using_estimated_runtime = False
+
+        if estimated_runtime_raw is not None:
+            try:
+                # estimated_runtime is stored as INTEGER seconds in the DB
+                effective_threshold_seconds = int(estimated_runtime_raw)
+                using_estimated_runtime = True
+            except (ValueError, TypeError):
+                pass  # Unparseable — fall through to fallback
+
+        # Determine age anchor: prefer started_at, fall back to updated_at
+        age_anchor = started_at_raw or getattr(uow, "updated_at", None)
+
+        if effective_threshold_seconds > 0 and age_anchor is not None:
+            try:
+                anchor_dt = datetime.fromisoformat(
+                    age_anchor.replace("Z", "+00:00")
+                )
+                if anchor_dt.tzinfo is None:
+                    anchor_dt = anchor_dt.replace(tzinfo=timezone.utc)
+                active_age_seconds = (now - anchor_dt).total_seconds()
+                if active_age_seconds < effective_threshold_seconds:
+                    log.debug(
+                        "Startup sweep: skipping active UoW %s — too young "
+                        "(age=%.0fs < threshold=%ds%s); executor subprocess "
+                        "may still be running",
+                        uow_id, active_age_seconds, effective_threshold_seconds,
+                        " [estimated_runtime]" if using_estimated_runtime else " [fallback]",
                     )
-                    if anchor_dt.tzinfo is None:
-                        anchor_dt = anchor_dt.replace(tzinfo=timezone.utc)
-                    active_age_seconds = (now - anchor_dt).total_seconds()
-                    if active_age_seconds < active_sweep_threshold_seconds:
-                        log.debug(
-                            "Startup sweep: skipping active UoW %s — too young "
-                            "(age=%.0fs < threshold=%ds); executor subprocess "
-                            "may still be running",
-                            uow_id, active_age_seconds, active_sweep_threshold_seconds,
-                        )
-                        continue
-                except (ValueError, TypeError):
-                    # Unparseable timestamp — fall through and sweep normally.
-                    pass
+                    continue
+            except (ValueError, TypeError):
+                # Unparseable timestamp — fall through and sweep normally.
+                pass
 
         output_ref = uow.output_ref
         classification, extra = _classify_active_uow(output_ref)

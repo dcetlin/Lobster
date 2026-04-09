@@ -363,6 +363,29 @@ class TestIssueUrlPopulation:
         assert uow.issue_url == url
 
 
+class TestSourceRefPassthrough:
+    """source_ref passed to upsert() must be persisted in the DB (S3P2-H)."""
+
+    def test_non_github_source_ref_written_to_db(self, registry, db_path):
+        """upsert() with a non-github: source_ref stores the value in source_ref column."""
+        from src.orchestration.registry import UpsertInserted
+        today = datetime.now(timezone.utc).date().isoformat()
+        result = registry.upsert(
+            issue_number=777,
+            title="Custom source ref issue",
+            sweep_date=today,
+            success_criteria="Source ref is persisted.",
+            source_ref="linear:issue/ABC-123",
+        )
+        assert isinstance(result, UpsertInserted)
+        conn = _open_db(db_path)
+        row = conn.execute(
+            "SELECT source_ref FROM uow_registry WHERE id = ?", (result.id,)
+        ).fetchone()
+        conn.close()
+        assert row["source_ref"] == "linear:issue/ABC-123"
+
+
 class TestRepoFromIssueUrl:
     """_repo_from_issue_url pure function (issue #488)."""
 

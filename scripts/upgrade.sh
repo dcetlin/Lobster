@@ -2442,6 +2442,36 @@ CREATE TABLE IF NOT EXISTS dispatcher_lock (
         substep "wfm-watchdog.sh cron entry already present — skipping"
     fi
 
+    # Migration 70: Register validate-workflow-artifact.py PostToolUse hook (S3-A, issue #678).
+    # The hook validates WorkflowArtifact JSON schema when Write writes to
+    # orchestration/artifacts/*.json — enforcing executor_type, prescribed_skills,
+    # and required fields at the commit boundary before a hard-cap cleanup can
+    # archive a malformed prescription artifact.
+    if [ -f "$CLAUDE_SETTINGS" ] && command -v jq >/dev/null 2>&1; then
+        local has_artifact_validator
+        has_artifact_validator=$(jq -r '
+            [.hooks.PostToolUse[]?.hooks[]?.command // empty]
+            | map(select(contains("validate-workflow-artifact")))
+            | length
+        ' "$CLAUDE_SETTINGS" 2>/dev/null || echo "0")
+        if [ "${has_artifact_validator:-0}" = "0" ] || [ "${has_artifact_validator:-0}" = "" ]; then
+            TMP_SETTINGS=$(mktemp)
+            jq --arg cmd "python3 $LOBSTER_DIR/hooks/validate-workflow-artifact.py" \
+               '.hooks.PostToolUse = (.hooks.PostToolUse // []) + [{
+                "matcher": "Write",
+                "hooks": [{
+                    "type": "command",
+                    "command": $cmd,
+                    "timeout": 5
+                }]
+            }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+            substep "Registered validate-workflow-artifact PostToolUse hook (S3-A)"
+            migrated=$((migrated + 1))
+        else
+            substep "validate-workflow-artifact hook already registered — skipping"
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
