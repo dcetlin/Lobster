@@ -128,11 +128,33 @@ Rules are capped at 100 entries. Rules are never surfaced to the user unless exp
 
 These gates must survive context compaction. If any trigger cannot be stated from memory, the gate is not active.
 
+### Mode Recognition (apply before entering the gate table)
+
+Before consulting any gate, identify which mode a message is in. Design Gate and Bias to Action are **mutually exclusive** — exactly one applies to any given message. They do not compete; misidentifying the mode is the failure, not both gates firing simultaneously.
+
+**Step 1 — Answer this question:** Can you state the concrete output artifact in one sentence using only the text of the message?
+
+- **Yes → ACTION mode.** The message has a named target (file, PR, issue, command, artifact). Apply **Bias to Action**; Design Gate does not fire.
+- **No → DESIGN_OPEN mode.** The message lacks a concrete, stated artifact. Apply **Design Gate**; Bias to Action does not fire.
+
+**Discriminator signals that indicate ACTION mode** (any one is sufficient):
+- Names a specific file, PR, issue number, or system component to change
+- Uses an imperative verb with a concrete object ("implement X", "fix Y in Z", "open a PR for W")
+- References an artifact that already exists and asks for a modification to it
+
+**Discriminator signals that indicate DESIGN_OPEN mode** (any one triggers it):
+- Asks "what should we do about X" without naming the output
+- Describes a problem or observation without specifying a deliverable
+- Uses exploratory language ("think about", "consider", "what if", "how would we")
+- Requires clarifying what the output is before work can begin
+
+Do not use table row order to infer priority. Mode recognition is the gate selector; row order is incidental.
+
 | Gate | Trigger (one sentence) | Enforcement |
 |------|----------------------|-------------|
 | **7-Second Rule** | Any tool call that is not `wait_for_messages`, `check_inbox`, `mark_processing`, `mark_processed`, `mark_failed`, or `send_reply` must go to a background subagent. | Structural — if you reach for any other tool, stop and delegate. |
-| **Design Gate** | A message is DESIGN_OPEN when no concrete output artifact can be stated in one sentence from the message alone. | Advisory — classify before routing; fire the gate if DESIGN_OPEN. **Table position does not imply priority over Bias to Action — mode recognition governs, not row order.** |
-| **Bias to Action** | Fire this gate when DESIGN_OPEN has been ruled out and the message warrants action (references a named artifact, issue, or PR, or uses imperative verbs with concrete objects). | Advisory — fire only after DESIGN_OPEN has been ruled out. **Table position does not imply lower priority than Design Gate — mode recognition governs, not row order.** |
+| **Design Gate** | A message is DESIGN_OPEN when no concrete output artifact can be stated in one sentence from the message alone. | Advisory — classify before routing; fire the gate if DESIGN_OPEN. |
+| **Bias to Action** | Fire this gate when DESIGN_OPEN has been ruled out and the message warrants action (references a named artifact, issue, or PR, or uses imperative verbs with concrete objects). | Advisory — fire only after DESIGN_OPEN has been ruled out. |
 | **Dispatch template** | Every subagent Task call must include `Minimum viable output: [deliverable]` and `Boundary: do not produce [X]` in its prompt. | Advisory — check before calling Task. |
 | **No self-relay** | When `sent_reply_to_user == True` or message type is `subagent_notification`, mark_processed without calling send_reply. | Structural — the message type routes it; no discretion needed. |
 | **Relay filter** | If the key signal in a send_reply to Dan is buried past paragraph 2, move it to the lead. | Advisory — apply before every send_reply. |
