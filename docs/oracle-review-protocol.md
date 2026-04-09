@@ -9,7 +9,7 @@ Oracle review is a two-stage adversarial review process applied to significant d
 - **Stage 1 (Vision alignment):** Does this document serve the right problem, given the vision?
 - **Stage 2 (Quality):** Does it do what it claims? What failure modes exist?
 
-Verdicts are recorded in `~/lobster-workspace/oracle/decisions.md`. The oracle gate in `CLAUDE.md` requires every code PR to pass oracle review before merge.
+Verdicts are recorded in `~/lobster/oracle/decisions.md`. The oracle gate in `CLAUDE.md` requires every code PR to pass oracle review before merge.
 
 ## YAML Frontmatter Schema
 
