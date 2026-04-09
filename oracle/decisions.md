@@ -48,6 +48,34 @@ Issues requiring resolution before merge:
 
 ---
 
+### [2026-04-09] PR #730 — fix: off-by-one in _count_non_improving_gate_cycles early-return branch
+
+**Vision alignment (Stage 1 — written before evaluating implementation):**
+The adversarial prior: is this fix solving the wrong problem, or does the prescription (`return non_improving`) correct the bug without the engineer's conditional? The learnings.md entry for this exact bug (2026-04-08, "off-by-one in reverse-scan non-improving counter") names `return non_improving` as the correction. But the prescription was written before the fully-improving edge case was traced through. The Stage 1 question is whether `return non_improving` actually holds for all cases, or whether the prescription itself has a defect the engineer correctly identified. The function's governing structure role (counting non-improving cycles to gate `no_gate_improvement` stuck-condition detection) is central to Sprint 3 commitment gate work — getting this wrong delays gate intervention. The fix either repairs or preserves the off-by-one. The right posture is to treat the prescription as a hypothesis, not a ground truth. What would have to be true for the prescription to be correct? The prescription's example in the issue (`[0.5, 0.8, 0.5, 0.5]` → result=2) would have to be correct. If that example itself is wrong, the prescription is wrong. This is exactly what must be verified in Stage 2.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- The prescription `return non_improving` in issue #728 is incorrect for the fully-improving case. Trace: `[0.5, 0.7, 0.9]` — i=2 finds improvement immediately, `non_improving=1`, `return 1` — but the correct answer is 0 (tail is improving, not stalled). The engineer's observation that the prescription breaks the fully-improving case is verified.
+- The engineer's fix `return non_improving if non_improving > 1 else 0` is correct for all verified edge cases: (a) fully-improving `[0.5, 0.7, 0.9]` → `non_improving=1` → returns 0; (b) improvement-then-plateau `[0.5, 0.5, 0.8, 0.8]` → `non_improving=2` → returns 2; (c) all non-improving `[0.5, 0.5, 0.5]` → falls through, unaffected by this change; (d) single-element or two-element fully improving `[0.5, 0.9]` → `non_improving=1` → returns 0.
+- The issue's stated example `[0.5, 0.8, 0.5, 0.5]` → result=2 is itself incorrect (the correct result is 3: the non-improving tail from index 1 onward is [0.8, 0.5, 0.5]). The engineer correctly identified this discrepancy and substituted the better regression case `[0.5, 0.5, 0.8, 0.8]` → result=2. The regression test's exact-equality assertion (`assert result == 2`) covers the case the old relational assertion (`result < NON_IMPROVING_GATE_THRESHOLD`) could not.
+- The learnings.md "test coverage gap hides early-return path bug" pattern directly constrained what I looked for: the regression test must use exact equality (`result == N`), not a relational bound. The new test uses `assert result == 2`. This satisfies the pattern's detection rule. The pattern's effect on my analysis: I did not accept the passing test count (35) as evidence of correctness without verifying the assertion form.
+- 35 tests pass in the target file. The pre-existing `ModuleNotFoundError` in `test_attunement.py` is unrelated (declared pre-existing by engineer; visible as a collection error, not a test failure in this file).
+
+**Patterns introduced:**
+- Exact-equality regression test as the canonical form for counting function bugs: `assert result == N`, not `result < THRESHOLD`. The existing test `test_resets_after_improvement` retains the weaker relational form and remains weak (though it now passes for the right reason). No cleanup of the existing test was required — its weakness is documented in learnings.md.
+- Conditional zero-return on `non_improving > 1` as the correct form for the "improvement found at first check" edge case in reverse-scan counters: when `non_improving` was initialized to 1 but the loop immediately finds improvement (before any confirmed non-improving pair is counted), the correct return is 0, not 1.
+
+**What this forecloses:**
+Nothing. Pure function change, no structural impact on callers. The gate's behavior is now correct; it fires 1 cycle sooner when the UoW showed improvement before stalling.
+
+**Opportunity cost note:**
+This is a learning-not-remediated bug from the 2026-04-08 oracle cycle, surfaced by the negentropic sweep. Correct gate timing is a prerequisite for the Sprint 3 commitment gate to function as specified — an off-by-one here delays stuck-condition detection by one full steward cycle per affected UoW.
+
+**VERDICT: APPROVED**
+
+---
+
 ## [2026-04-01] PR #537 (dcetlin fork) — fix(inbox_server): replace hardcoded /home/admin/ path in bisque connection URL handler
 
 ### Stage 1: Is this solving the right problem?
