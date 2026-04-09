@@ -1,5 +1,21 @@
 # Oracle: Decisions
 
+## PR #726 — WOS front-matter+prose artifact format
+
+**Date:** 2026-04-09
+**Task ID:** oracle-pr726-wos-frontmatter
+**Verdict:** APPROVED
+
+Stage 1 adversarial prior did not survive: the pure-JSON format was causing concrete JSONDecodeError failures when LLMs emitted preamble before the artifact block — this is damage repair, not scope expansion.
+
+Key findings:
+- from_frontmatter() uses json.loads() on the entire envelope line — no colon-truncation risk.
+- The ---json sentinel is distinct from bare --- used by _parse_workflow_artifact in steward.py.
+- The four steward tests updated by inspection are the complete set that read prescription artifacts from disk.
+- One latent issue noted in learnings.md: instructions prose containing a standalone --- line would silently truncate the artifact. Low-probability; not blocking.
+
+**Advisory (non-blocking):** Misleading comment in from_frontmatter about "stripping a leading newline" — inaccurate but behavior is correct. Also: standalone --- in instructions prose would silently truncate; low-probability edge case.
+
 ## [2026-04-01] PR #551 — feat(monitoring): file-size-monitor for bootup/config files
 
 ### Stage 1: Vision alignment (formed before reading implementation)
@@ -787,3 +803,28 @@ Dan approved this PR explicitly with the condition that authority headers be add
 ### Overall verdict: APPROVED
 
 **PR #724** is approved for merge. Field ordering verified, quota_wait case confirmed correct, auth-failure ordering safe, no dual-alert risk.
+
+---
+
+### [2026-04-09] PR #727 — fix: oracle agent path references corrected to ~/lobster/oracle/
+
+**Vision alignment:** The adversarial prior entering Stage 1: is this solving the wrong problem, or foreclosing a better path? The PR's theory of change is that oracle agents were instructed to write verdicts and learnings to `~/lobster-workspace/oracle/`, but the canonical location per `paths.py` (lines 47-48: `ORACLE_DECISIONS = LOBSTER_REPO / "oracle" / "decisions.md"`) is `~/lobster/oracle/`, which is tracked in git. This mismatch caused two separate live oracle files to accumulate independently: `~/lobster-workspace/oracle/decisions.md` (989KB, 4547 lines — the legacy-path file) and `~/lobster/oracle/decisions.md` (58KB, 789 lines — the repo-tracked file). Both files exist and have real content. Recent oracle writes (PR #717, #720, #724) went to the repo path, confirming the repo path is the current operative location for the PR merge gate. The fix is correctly targeted: it closes the seam on future oracle agent writes by correcting the instruction text to match where the merge gate reads from. The stranded history in the workspace file is a data migration question that is out of scope for a text-correction PR. No learnings.md failure pattern applies structurally — the "feature-bundling" pattern does not apply (diff scope precisely matches PR description), and the "verification artifact scope mismatch" pattern is not triggered (the verification grep is appropriate for a text-correction claim). One uncorrected reference exists: `negentropic-sweep.md` line 57 still reads `~/lobster-workspace/oracle/learnings.md`. This was not changed by the PR. Since the workspace learnings.md (199KB) has more accumulated content than the repo learnings.md (3.9KB), the negentropic sweep reading the workspace path may actually be reading the more complete source — this is not a defect introduced by the PR, but it is a remaining path inconsistency in the system. The adversarial prior did not survive scrutiny: the PR is solving the right problem, the fix is correctly scoped, and nothing is foreclosed.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **Three corrections are exact and correct.** `lobster-oracle.md` line 82 (decisions.md append instruction), line 94 (learnings.md append instruction), and `docs/oracle-review-protocol.md` line 12 (verdicts location description) are all changed from `~/lobster-workspace/oracle/` to `~/lobster/oracle/`. The diff is exactly what the PR description claims.
+- **Engineer's verification is complete and appropriate for this scope.** The grep confirmed zero remaining `~/lobster-workspace/oracle/decisions.md` or `~/lobster-workspace/oracle/learnings.md` references in the target files. This is the correct verification for a text-correction PR.
+- **One uncorrected path remains in the system: `negentropic-sweep.md` line 57.** This is not in the PR's stated scope and is not a defect introduced by this PR. But it is a remaining inconsistency: the negentropic sweep task reads from the workspace oracle learnings path, while the oracle agent now writes learnings to the repo path. Future negentropic sweeps will not see oracle learnings written after this PR ships, unless that reference is also corrected. Advisory only — the PR is correct as stated.
+- **No runtime impact.** These are instruction text changes, not code. The only failure mode (stranded oracle history at workspace path) predates this PR and requires a separate data migration to resolve.
+
+**Patterns introduced:** None new to system character. This is a targeted instruction-text correction with no architectural implications.
+
+**What this forecloses:** Nothing. The fix does not prevent a future migration of workspace oracle history to the repo path. The negentropic sweep path inconsistency remains open and should be addressed in a follow-on issue.
+
+**Opportunity cost note:** Not applicable. This is a targeted correctness fix for a mismatch that caused oracle verdicts to be written to a location the merge gate does not read from.
+
+**VERDICT: APPROVED**
+
+PR #727 is approved for merge. Three path references correctly updated. One remaining path inconsistency (`negentropic-sweep.md` line 57) noted but out of scope for this PR — recommend filing a follow-on issue.
+
