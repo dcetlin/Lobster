@@ -1,5 +1,73 @@
 # Oracle: Decisions
 
+---
+
+### [2026-04-09] PR #738 — test(wos): Sprint 4 pipeline test harness (HARNESS-001 through HARNESS-004)
+
+**Vision alignment:** The active_project phase_intent is "Build the substrate that lets every agent make intent-anchored decisions." The current phase's success criteria require the Registry live, vision_ref carried per UoW, and the morning briefing surfacing staleness warnings. This PR closes test coverage gaps (G1-G3) on production paths that are already load-bearing in that substrate. vision.yaml principle-4 ("Wire what exists before building more") directly supports closing test gaps on existing wired infrastructure before layering more features. The adversarial prior: test work can be premature formalization of code that hasn't stabilized, or it can create false confidence through synthetic arc simulations that bypass the real contract boundaries. The Stage 1 question is whether the tested paths are genuinely exercised in production and whether the harness design reaches the actual seams. The world in which this work is wasted: wos_completion.py is dead or transitional code, or the arc harness validates synthetic paths that diverge from the real executor-steward contract because HARNESS-004 bypasses the actual Executor. Having seen the PR: that concern is partially real but is handled correctly — the PR documents why it bypasses the Executor and traces precisely which code path `_simulate_crashed_execution` exercises instead. The G2 gap (zero coverage on `maybe_complete_wos_uow`) is genuinely load-bearing: it is the deferred `execution_complete` transition in the async inbox dispatch path, and untested filtering logic there would be invisible to any regression. Stage 1 verdict stands as Confirmed.
+
+**Alignment verdict:** Confirmed
+
+**VERDICT: APPROVED**
+
+**Quality finding:**
+- **wos_completion.py unit tests are thorough and correctly isolated.** The 12-test suite covers the full behavioral surface: prefix gate, error-status no-op, executing+success transition, audit entry, not-found skip, duplicate idempotency, missing DB, done skip, registry exception absorption, and constant value anchoring. The exception absorption test patches at the correct module level (`orchestration.registry.Registry`) and the idempotency test verifies the second call lands on a non-executing UoW rather than retrying the transition — both are non-obvious behaviors that would otherwise be invisible to a regression.
+- **HARNESS-004 crash path design is sound and well-documented.** The decision to bypass `Executor.execute_uow()` and inject directly via `registry.record_startup_sweep_active(classification="crashed_no_output")` is correct: running the real Executor writes an `execution_complete` audit entry that `_most_recent_return_reason()` treats as authoritative, masking the crash simulation. The PR docstring traces exactly which code path in `_detect_stuck_condition` this exercises and why `classification` is the fallback read. This is a principled bypass, not a lazy shortcut — it mirrors the exact path `startup-sweep.py` takes in production.
+- **One assertion softening in AC-6 is a minor divergence from spec.** HARNESS-001 asserts `steward_cycles >= 1` rather than `== 2` as the design doc specifies, with a comment explaining the 0-indexed cycle counting. The comment is honest but the spec drift introduces test tolerance that could mask a regression where steward_cycles is 1 when it should be 2. The `>= 1` form passes even on a single-pass arc where the closure happened in the same heartbeat as the prescription. This is low-severity but is a named discrepancy.
+- **vision_ref is seeded via direct SQL in both test files because the public upsert API does not yet accept it.** This is correct practice for test isolation and is explicitly acknowledged in both test comments. However, it also signals that the public API seam for vision_ref is not closed: a future test or sweeper that uses `registry.upsert()` to set vision_ref will need this path to be opened. The test pattern correctly surfaces this gap without creating a workaround that hides it.
+
+**Patterns introduced:** Direct SQL injection as explicit API seam surfacer — using direct SQL writes in tests when the public API doesn't yet accept a field makes the gap visible and documents it at the test level rather than papering over it with a private method. Pure mock helper factories (`_make_capturing_notify_dan`, `_make_mock_dispatcher`) returning `(fn, log_list)` tuples are the correct functional pattern for capturing side-effects in integration tests without reaching into internal state.
+
+**What this forecloses:** Nothing — no production code is modified. The only mild foreclosure is the `>= 1` AC-6 form: if this becomes a canonical harness people copy, the soft assertion tolerance propagates.
+
+**Opportunity cost note:** No production feature was deferred by this PR. Coverage work on existing load-bearing paths is aligned with principle-4 and does not compete with the current phase's critical path (sweeper, vision_ref wiring, morning briefing staleness check).
+
+---
+
+### [2026-04-09] PR #732 — docs: mode-discriminator rewrite for Design Gate vs. Bias to Action
+
+**Vision alignment:** The active operating principle from vision.yaml is principle-5: "When a behavioral rule isn't followed, improve the discriminator — do not add more rules." Issue #225 is a premise-review escalation naming exactly this failure: the existing description resolves the gate tension via priority ordering rather than discriminator improvement. This PR is directly responsive to that named principle. The adversarial prior entering Stage 1: the fix may describe the correct taxonomy without providing a decision-procedural discriminator — explanation where the failure requires classification. What the dispatcher needs is a test it can apply under working memory pressure that returns a binary answer before consulting the gate table. The Stage 1 question is whether the new section provides that test or merely explains why the confusion exists. The world in which this work is wasted: the new section is explanatory prose that requires the dispatcher to synthesize a classification from multiple signals, which is the same cognitive load as the original ambiguity expressed differently.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **The discriminator is decision-procedural, not explanatory.** Step 1 is a binary question ("Can you state the concrete output artifact in one sentence from the message alone?") with a binary Yes/No branch to ACTION or DESIGN_OPEN mode. This is structurally the same form as the DESIGN_OPEN trigger in the existing gate table (also a one-sentence artifact test), but it is presented as the classification entry point rather than buried in a gate row. A dispatcher reading under context pressure encounters the question before the table, not after.
+- **The signal lists are positive discriminators, not ambiguity zone descriptions.** Each mode lists signals where any single signal is sufficient — not a weighted combination requiring synthesis. This is the correct form for a gate selector applied under compaction pressure. The DESIGN_OPEN signals list is complete: it covers problem-without-deliverable, exploratory language, and clarification-required — the three configurations where the original table was most ambiguous.
+- **The parenthetical priority disclaimers are cleanly removed.** The Design Gate and Bias to Action rows in the table previously carried inline text asserting "table position does not imply priority." That inline assertion acknowledged the problem while embedding the ambiguous table position as the document structure. The new section solves the problem structurally: mode recognition is the pre-table step, so the table rows do not need disclaimers. The removal is correct.
+- **One residual ambiguity: the Bias to Action gate row still says "fire only after DESIGN_OPEN has been ruled out."** With the new mode-recognition section preceding the table, this is now redundant — the dispatcher arrives at the Bias to Action row only after having classified to ACTION mode. The redundancy is benign but creates a minor contradiction: if the dispatcher has already run Step 1 and landed in ACTION mode, the phrase "after DESIGN_OPEN has been ruled out" implies a second DESIGN_OPEN check inside the table. This is not a blocking defect — the behavior is correct — but it is a residual of the old priority-implication phrasing that the PR didn't fully clean up. A follow-on cleanup could remove that phrase.
+
+**Patterns introduced:** Mode-recognition-as-pre-table-gate. The discriminator section establishes that gate selectors run before the gate table, not inside it. This is the correct structural form for a classifier that controls which of several mutually exclusive gates applies. If additional pairs of mutually exclusive gates are added in the future, this section is the correct precedent for how to express the exclusivity.
+
+**What this forecloses:** Nothing. The enforcement logic for Design Gate and Bias to Action is unchanged. No architectural direction is closed.
+
+**Opportunity cost note:** Issue #225 was open since 2026-03-23 and was labeled premise-review. The fix is a 24-line documentation change. The cost of not shipping was dispatcher misidentification on every ambiguous message during that period. No opportunity cost to this work.
+
+**VERDICT: APPROVED**
+
+---
+
+## [2026-04-09] PR #731 — fix(wos): move evaluated counter after backpressure gate
+
+**Vision alignment:** This is a counter-semantics correctness fix in `run_steward_cycle`. The adversarial prior — that "evaluated" could legitimately mean "UoWs considered for processing (including skipped ones)" — does not survive inspection of the CycleResult naming convention and the `evaluated`/`skipped` pairing: the pair only has coherent meaning if they partition the candidate set, not if they overlap. The work was surfaced by the negentropic sweep acting on a learnings.md pattern filed 3 days earlier (the "evaluated counter incremented before guard gate fires" pattern from 2026-04-06). This is the oracle loop functioning as designed. The fix is a one-line relocation with no architectural surface, no interface changes, no new patterns introduced, and nothing foreclosed. It directly serves `principle-3` (determinism over judgment for conditionals — counter arithmetic is code, not inference). No deeper premise is implicated.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- `evaluated += 1` at line 3814 is placed after the complete `if _sweep_classification == "executor_orphan":` block, meaning it fires for UoWs that (a) have no executor_orphan classification, and (b) have the classification but fall through because execution is currently enabled. Both paths correctly reach processing. The placement answers the key review question affirmatively.
+- The BOOTUP_CANDIDATE_GATE (lines 3743-3752) also has `skipped += 1; continue` that fires before line 3814. Both early-exit gates are excluded from `evaluated`. The fix is complete.
+- The 5 pre-existing test failures are confirmed unrelated: they trace to `issue_info.body` AttributeError (the IssueInfo dataclass migration defect already in learnings.md from PR #720). They do not touch the backpressure counter path.
+- 4 backpressure-specific unit tests pass and directly cover the counter behavior under test.
+
+**Patterns introduced:** None. One-line relocation of existing arithmetic.
+
+**What this forecloses:** Nothing. Counter placement cannot foreclose architectural directions.
+
+**Opportunity cost note:** Not applicable — this is a 3-day-old learnings.md entry being closed by its prescribed fix. The sweep-to-fix latency is appropriate.
+
+**VERDICT: APPROVED**
+
+---
+
 ## PR #726 — WOS front-matter+prose artifact format
 
 **Date:** 2026-04-09
