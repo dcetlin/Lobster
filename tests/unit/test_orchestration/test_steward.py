@@ -3509,7 +3509,7 @@ class TestCorrectiveTraceGate:
         )
 
         # S3-B: WaitForTrace outcome is counted in wait_for_trace (not prescribed)
-        assert result.get("wait_for_trace", 0) == 1, (
+        assert result.wait_for_trace == 1, (
             "WaitForTrace outcome must be counted in run_steward_cycle result"
         )
 

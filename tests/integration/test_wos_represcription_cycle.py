@@ -278,8 +278,8 @@ class TestReprescriptionCycle:
             notify_dan=mock_notify_dan,
             bootup_candidate_gate=False,
         )
-        assert result1["prescribed"] == 1, f"Expected 1 prescribed, got: {result1}"
-        assert result1["surfaced"] == 0
+        assert result1.prescribed == 1, f"Expected 1 prescribed, got: {result1}"
+        assert result1.surfaced == 0
 
         row1 = _read_uow_row(conn, uow_id)
         assert row1["status"] == "ready-for-executor", (
@@ -307,8 +307,8 @@ class TestReprescriptionCycle:
             notify_dan=mock_notify_dan,
             bootup_candidate_gate=False,
         )
-        assert result2["prescribed"] == 1, f"Expected 1 re-prescribed, got: {result2}"
-        assert result2["surfaced"] == 0, "Should not surface below cap"
+        assert result2.prescribed == 1, f"Expected 1 re-prescribed, got: {result2}"
+        assert result2.surfaced == 0, "Should not surface below cap"
 
         row2 = _read_uow_row(conn, uow_id)
         assert row2["status"] == "ready-for-executor", (
@@ -357,7 +357,7 @@ class TestReprescriptionCycle:
                 notify_dan=mock_notify_dan,
                 bootup_candidate_gate=False,
             )
-            assert steward_result["prescribed"] == 1, (
+            assert steward_result.prescribed == 1, (
                 f"Cycle {cycle_num}: expected prescribed=1, got: {steward_result}"
             )
 
@@ -434,7 +434,7 @@ class TestReprescriptionCycle:
                 notify_dan_early_warning=mock_notify_dan_early_warning,
                 bootup_candidate_gate=False,
             )
-            assert steward_result["prescribed"] == 1, (
+            assert steward_result.prescribed == 1, (
                 f"Cycle {cycle_num}: expected prescribed=1, got: {steward_result}"
             )
 
@@ -467,10 +467,10 @@ class TestReprescriptionCycle:
             bootup_candidate_gate=False,
         )
 
-        assert cap_result["surfaced"] == 1, (
+        assert cap_result.surfaced == 1, (
             f"Expected surfaced=1 at hard cap, got: {cap_result}"
         )
-        assert cap_result["prescribed"] == 0, (
+        assert cap_result.prescribed == 0, (
             f"Expected prescribed=0 at hard cap (no re-prescription), got: {cap_result}"
         )
 
@@ -615,8 +615,8 @@ class TestReprescriptionCycle:
                 f"Cycle {cycle_num}: expected steward_cycles={cycle_num}, "
                 f"got: {row['steward_cycles']}"
             )
-            assert steward_result["prescribed"] == 1
-            assert steward_result["surfaced"] == 0
+            assert steward_result.prescribed == 1
+            assert steward_result.surfaced == 0
 
             _simulate_executor_fail(
                 registry, conn, uow_id, tmp_path, f"failure #{cycle_num}"
@@ -642,8 +642,8 @@ class TestReprescriptionCycle:
             bootup_candidate_gate=False,
         )
 
-        assert cap_result["surfaced"] == 1
-        assert cap_result["prescribed"] == 0
+        assert cap_result.surfaced == 1
+        assert cap_result.prescribed == 0
 
         row_capped = _read_uow_row(conn, uow_id)
         assert row_capped["status"] == "blocked"
