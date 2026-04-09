@@ -763,3 +763,11 @@ Dan approved this PR explicitly with the condition that authority headers be add
 ### Overall verdict: APPROVED
 
 **PR #600** is approved for merge. Authority headers added to all three files before merge, addressing the named vision.yaml risk-2 concern. No code changes — documentation only.
+
+---
+
+## [2026-04-09] PR #717 (S3P2-H) — oracle-s3p2-h-r3
+
+### Overall verdict: APPROVED
+
+**PR #717** is approved for merge. All three NEEDS_CHANGES items from prior oracle rounds have been resolved: source_ref forwarding fixed with full INSERT chain, prescribed_ps NameError fixed (parsed_ps), and PR description updated to document all 3 changed files. Bind parameter count 14/14 verified. New test added and passes.
