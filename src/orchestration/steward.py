@@ -3757,7 +3757,6 @@ def run_steward_cycle(
                 else None
             )
 
-        evaluated += 1
         audit_entries = _fetch_audit_entries(registry, uow_id)
 
         # Backpressure gate (#617): skip re-prescription when the UoW was
@@ -3812,6 +3811,7 @@ def run_steward_cycle(
                 skipped += 1
                 continue
 
+        evaluated += 1
         try:
             result = _process_uow(
                 uow=uow,
