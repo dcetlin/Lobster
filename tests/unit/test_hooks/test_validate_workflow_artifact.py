@@ -1,16 +1,32 @@
 """
-Unit tests for hooks/validate-workflow-artifact.py (S3-A, issue #678).
+Unit tests for hooks/validate-workflow-artifact.py (S3P2-B, issue #613).
+
+The hook validates WorkflowArtifact front-matter + prose format (.md) when
+Claude writes to ~/lobster-workspace/orchestration/artifacts/*.md.
+
+Exit code 2 causes Claude Code to surface the error to Claude, which must
+correct and retry. Exit code 0 = pass or not our concern.
+
+Disk format validated:
+    ---json
+    {"uow_id": "...", "executor_type": "...", "constraints": [], "prescribed_skills": []}
+    ---
+    <instructions prose>
 
 Tests cover:
-- Valid artifact passes validation (exit 0)
-- Invalid JSON is rejected (exit 2)
-- Missing required fields are rejected (exit 2)
-- Invalid executor_type is rejected (exit 2)
-- Non-list prescribed_skills/constraints are rejected (exit 2)
-- Non-string instructions is rejected (exit 2)
+- Valid artifact passes (exit 0)
+- Non-Write tool calls are ignored (exit 0)
 - Non-artifact Write paths are ignored (exit 0)
 - Archived artifact paths are ignored (exit 0)
-- Non-Write tool calls are ignored (exit 0)
+- Legacy .json artifact paths are ignored (exit 0) — not our concern
+- Missing ---json opener is rejected (exit 2)
+- Missing closing --- is rejected (exit 2)
+- Invalid JSON in envelope is rejected (exit 2)
+- Missing required envelope fields are rejected (exit 2)
+- Invalid executor_type is rejected (exit 2)
+- Non-list prescribed_skills/constraints are rejected (exit 2)
+- Valid executor_type values: general, functional-engineer, lobster-ops
+- Unknown extra fields in envelope are silently ignored
 """
 
 import importlib.util
@@ -36,7 +52,7 @@ def _load_hook():
 
 def _hook_input(
     tool_name: str = "Write",
-    file_path: str = "/home/lobster/lobster-workspace/orchestration/artifacts/uow_abc123.json",
+    file_path: str = "/home/lobster/lobster-workspace/orchestration/artifacts/uow_abc123.md",
     content: str = "",
 ) -> dict:
     return {
@@ -48,42 +64,92 @@ def _hook_input(
     }
 
 
-def _valid_artifact(uow_id: str = "uow_abc123") -> dict:
-    return {
+def _valid_artifact_content(uow_id: str = "uow_abc123") -> str:
+    """Return a valid front-matter + prose artifact string."""
+    envelope = json.dumps({
         "uow_id": uow_id,
         "executor_type": "general",
         "constraints": [],
         "prescribed_skills": [],
-        "instructions": "Do the thing.",
-    }
+    }, separators=(",", ":"))
+    return f"---json\n{envelope}\n---\nDo the thing."
 
 
 # ---------------------------------------------------------------------------
 # Happy path
 # ---------------------------------------------------------------------------
 
-
 class TestValidArtifact:
     def test_valid_artifact_passes(self):
-        """A fully valid WorkflowArtifact JSON returns exit 0."""
+        """A fully valid WorkflowArtifact front-matter returns no errors."""
         mod = _load_hook()
         errors = mod._validate_artifact(
-            json.dumps(_valid_artifact()), "/some/artifacts/uow_abc123.json"
+            _valid_artifact_content(), "/some/artifacts/uow_abc123.md"
         )
         assert errors == []
 
     def test_valid_artifact_with_functional_engineer_executor_type(self):
         mod = _load_hook()
-        artifact = _valid_artifact()
-        artifact["executor_type"] = "functional-engineer"
-        errors = mod._validate_artifact(json.dumps(artifact), "/some/artifacts/uow_abc.json")
+        envelope = json.dumps({
+            "uow_id": "uow_abc",
+            "executor_type": "functional-engineer",
+            "constraints": [],
+            "prescribed_skills": [],
+        }, separators=(",", ":"))
+        content = f"---json\n{envelope}\n---\nImplement the feature."
+        errors = mod._validate_artifact(content, "/some/artifacts/uow_abc.md")
         assert errors == []
 
     def test_valid_artifact_with_lobster_ops_executor_type(self):
         mod = _load_hook()
-        artifact = _valid_artifact()
-        artifact["executor_type"] = "lobster-ops"
-        errors = mod._validate_artifact(json.dumps(artifact), "/some/artifacts/uow_abc.json")
+        envelope = json.dumps({
+            "uow_id": "uow_abc",
+            "executor_type": "lobster-ops",
+            "constraints": [],
+            "prescribed_skills": [],
+        }, separators=(",", ":"))
+        content = f"---json\n{envelope}\n---\nRun the ops task."
+        errors = mod._validate_artifact(content, "/some/artifacts/uow_abc.md")
+        assert errors == []
+
+    def test_valid_artifact_with_general_executor_type(self):
+        mod = _load_hook()
+        envelope = json.dumps({
+            "uow_id": "uow_abc",
+            "executor_type": "general",
+            "constraints": [],
+            "prescribed_skills": [],
+        }, separators=(",", ":"))
+        content = f"---json\n{envelope}\n---\nGeneral task."
+        errors = mod._validate_artifact(content, "/some/artifacts/uow_abc.md")
+        assert errors == []
+
+    def test_unknown_extra_fields_in_envelope_are_silently_ignored(self):
+        """Extra keys in the JSON envelope are ignored for forward compatibility."""
+        mod = _load_hook()
+        envelope = json.dumps({
+            "uow_id": "uow_abc",
+            "executor_type": "general",
+            "constraints": [],
+            "prescribed_skills": [],
+            "future_field": "some_value",
+        }, separators=(",", ":"))
+        content = f"---json\n{envelope}\n---\nInstructions."
+        errors = mod._validate_artifact(content, "/some/artifacts/uow_abc.md")
+        assert errors == []
+
+    def test_multiline_instructions_are_accepted(self):
+        """Instructions prose can span multiple lines."""
+        mod = _load_hook()
+        envelope = json.dumps({
+            "uow_id": "uow_abc",
+            "executor_type": "general",
+            "constraints": [],
+            "prescribed_skills": [],
+        }, separators=(",", ":"))
+        instructions = "Step 1: Do this.\nStep 2: Do that.\nStep 3: Verify."
+        content = f"---json\n{envelope}\n---\n{instructions}"
+        errors = mod._validate_artifact(content, "/some/artifacts/uow_abc.md")
         assert errors == []
 
 
@@ -91,26 +157,31 @@ class TestValidArtifact:
 # Path filtering
 # ---------------------------------------------------------------------------
 
-
 class TestPathFiltering:
-    def test_non_artifact_path_ignored(self):
-        """Write to a non-artifact path returns exit 0 immediately."""
+    def test_non_artifact_path_not_matched(self):
+        """Write to a non-artifact path is not our concern."""
         mod = _load_hook()
-        assert not mod._is_artifact_path("/home/lobster/some-other-file.json")
+        assert not mod._is_artifact_path("/home/lobster/some-other-file.md")
 
-    def test_archived_path_ignored(self):
+    def test_json_artifact_path_not_matched(self):
+        """Legacy .json artifact files are NOT validated by this hook."""
+        mod = _load_hook()
+        json_path = "/home/lobster/lobster-workspace/orchestration/artifacts/uow_abc123.json"
+        assert not mod._is_artifact_path(json_path)
+
+    def test_archived_path_not_matched(self):
         """Write to orchestration/artifacts/archived/ is excluded — cleanup arc output."""
         mod = _load_hook()
-        archived_path = "/home/lobster/lobster-workspace/orchestration/artifacts/archived/uow_abc123/output.json"
+        archived_path = "/home/lobster/lobster-workspace/orchestration/artifacts/archived/uow_abc123/output.md"
         assert not mod._is_artifact_path(archived_path)
 
-    def test_active_artifact_path_matches(self):
-        """Write to orchestration/artifacts/<uow_id>.json is validated."""
+    def test_active_md_artifact_path_matches(self):
+        """Write to orchestration/artifacts/<uow_id>.md is validated."""
         mod = _load_hook()
-        active_path = "/home/lobster/lobster-workspace/orchestration/artifacts/uow_abc123.json"
+        active_path = "/home/lobster/lobster-workspace/orchestration/artifacts/uow_abc123.md"
         assert mod._is_artifact_path(active_path)
 
-    def test_non_write_tool_ignored(self, monkeypatch, capsys):
+    def test_non_write_tool_ignored(self, monkeypatch):
         """Non-Write tool calls (e.g. Edit) always pass immediately."""
         mod = _load_hook()
         data = _hook_input(tool_name="Edit")
@@ -118,140 +189,13 @@ class TestPathFiltering:
         result = mod.main()
         assert result == 0
 
-
-# ---------------------------------------------------------------------------
-# Schema validation
-# ---------------------------------------------------------------------------
-
-
-class TestSchemaValidation:
-    def test_invalid_json_rejected(self):
-        """Non-JSON content returns an error."""
-        mod = _load_hook()
-        errors = mod._validate_artifact("not json at all", "/some/artifacts/uow.json")
-        assert len(errors) == 1
-        assert "Invalid JSON" in errors[0]
-
-    def test_missing_required_field_uow_id(self):
-        """Missing uow_id is rejected."""
-        mod = _load_hook()
-        artifact = _valid_artifact()
-        del artifact["uow_id"]
-        errors = mod._validate_artifact(json.dumps(artifact), "/some/artifacts/uow.json")
-        assert any("uow_id" in e for e in errors)
-
-    def test_missing_required_field_executor_type(self):
-        """Missing executor_type is rejected."""
-        mod = _load_hook()
-        artifact = _valid_artifact()
-        del artifact["executor_type"]
-        errors = mod._validate_artifact(json.dumps(artifact), "/some/artifacts/uow.json")
-        assert any("executor_type" in e for e in errors)
-
-    def test_missing_required_field_instructions(self):
-        """Missing instructions is rejected."""
-        mod = _load_hook()
-        artifact = _valid_artifact()
-        del artifact["instructions"]
-        errors = mod._validate_artifact(json.dumps(artifact), "/some/artifacts/uow.json")
-        assert any("instructions" in e for e in errors)
-
-    def test_missing_multiple_required_fields(self):
-        """Multiple missing required fields are all reported."""
-        mod = _load_hook()
-        errors = mod._validate_artifact("{}", "/some/artifacts/uow.json")
-        # All 5 required fields should be missing
-        assert len(errors) >= 1
-        assert any("missing required fields" in e for e in errors)
-
-    def test_invalid_executor_type_rejected(self):
-        """executor_type='unknown-executor' is not in the allowed set."""
-        mod = _load_hook()
-        artifact = _valid_artifact()
-        artifact["executor_type"] = "unknown-executor"
-        errors = mod._validate_artifact(json.dumps(artifact), "/some/artifacts/uow.json")
-        assert any("executor_type" in e or "Invalid" in e for e in errors)
-
-    def test_prescribed_skills_must_be_list(self):
-        """prescribed_skills as a string (not list) is rejected."""
-        mod = _load_hook()
-        artifact = _valid_artifact()
-        artifact["prescribed_skills"] = "wos"  # Should be a list
-        errors = mod._validate_artifact(json.dumps(artifact), "/some/artifacts/uow.json")
-        assert any("prescribed_skills" in e for e in errors)
-
-    def test_constraints_must_be_list(self):
-        """constraints as a dict (not list) is rejected."""
-        mod = _load_hook()
-        artifact = _valid_artifact()
-        artifact["constraints"] = {"no-network": True}  # Should be a list
-        errors = mod._validate_artifact(json.dumps(artifact), "/some/artifacts/uow.json")
-        assert any("constraints" in e for e in errors)
-
-    def test_instructions_must_be_string(self):
-        """instructions as a list (not string) is rejected."""
-        mod = _load_hook()
-        artifact = _valid_artifact()
-        artifact["instructions"] = ["step 1", "step 2"]  # Should be a string
-        errors = mod._validate_artifact(json.dumps(artifact), "/some/artifacts/uow.json")
-        assert any("instructions" in e for e in errors)
-
-    def test_json_list_rejected(self):
-        """JSON array at root is rejected."""
-        mod = _load_hook()
-        errors = mod._validate_artifact(
-            '[{"uow_id": "x"}]', "/some/artifacts/uow.json"
-        )
-        assert any("JSON object" in e for e in errors)
-
-    def test_unknown_extra_fields_are_silently_ignored(self):
-        """Extra fields beyond required set are silently ignored (forward compat)."""
-        mod = _load_hook()
-        artifact = _valid_artifact()
-        artifact["extra_field_from_future"] = "some value"
-        errors = mod._validate_artifact(json.dumps(artifact), "/some/artifacts/uow.json")
-        assert errors == []
-
-
-# ---------------------------------------------------------------------------
-# Integration: main() exit codes
-# ---------------------------------------------------------------------------
-
-
-class TestMainExitCode:
-    def test_valid_artifact_write_exits_zero(self, monkeypatch):
-        """main() returns 0 for a valid artifact Write."""
-        mod = _load_hook()
-        artifact_path = "/home/lobster/lobster-workspace/orchestration/artifacts/uow_abc.json"
-        data = _hook_input(
-            tool_name="Write",
-            file_path=artifact_path,
-            content=json.dumps(_valid_artifact()),
-        )
-        monkeypatch.setattr("sys.stdin", StringIO(json.dumps(data)))
-        result = mod.main()
-        assert result == 0
-
-    def test_invalid_artifact_write_exits_two(self, monkeypatch, capsys):
-        """main() returns 2 for an invalid artifact Write."""
-        mod = _load_hook()
-        artifact_path = "/home/lobster/lobster-workspace/orchestration/artifacts/uow_abc.json"
-        data = _hook_input(
-            tool_name="Write",
-            file_path=artifact_path,
-            content='{"uow_id": "uow_abc"}',  # Missing required fields
-        )
-        monkeypatch.setattr("sys.stdin", StringIO(json.dumps(data)))
-        result = mod.main()
-        assert result == 2
-
     def test_non_artifact_path_exits_zero(self, monkeypatch):
-        """main() returns 0 for a Write to a non-artifact path (not our concern)."""
+        """main() returns 0 for a Write to a non-artifact path."""
         mod = _load_hook()
         data = _hook_input(
             tool_name="Write",
             file_path="/home/lobster/lobster/some-config.json",
-            content='{"key": "value"}',
+            content="{}",
         )
         monkeypatch.setattr("sys.stdin", StringIO(json.dumps(data)))
         result = mod.main()
@@ -262,9 +206,197 @@ class TestMainExitCode:
         mod = _load_hook()
         data = _hook_input(
             tool_name="Write",
-            file_path="/home/lobster/lobster-workspace/orchestration/artifacts/archived/uow_abc/output.json",
-            content='{}',
+            file_path="/home/lobster/lobster-workspace/orchestration/artifacts/archived/uow_abc/output.md",
+            content="{}",
         )
         monkeypatch.setattr("sys.stdin", StringIO(json.dumps(data)))
         result = mod.main()
         assert result == 0
+
+    def test_json_artifact_path_exits_zero(self, monkeypatch):
+        """main() returns 0 for a Write to a legacy .json path (not our concern)."""
+        mod = _load_hook()
+        data = _hook_input(
+            tool_name="Write",
+            file_path="/home/lobster/lobster-workspace/orchestration/artifacts/uow_abc.json",
+            content='{"key": "value"}',
+        )
+        monkeypatch.setattr("sys.stdin", StringIO(json.dumps(data)))
+        result = mod.main()
+        assert result == 0
+
+
+# ---------------------------------------------------------------------------
+# Front-matter structure validation
+# ---------------------------------------------------------------------------
+
+class TestFrontMatterStructure:
+    def test_missing_json_opener_rejected(self):
+        """Content without ---json opener is rejected."""
+        mod = _load_hook()
+        content = '{"uow_id": "uow_abc", "executor_type": "general", "constraints": [], "prescribed_skills": []}'
+        errors = mod._validate_artifact(content, "/some/artifacts/uow_abc.md")
+        assert len(errors) >= 1
+        assert any("---json" in e for e in errors)
+
+    def test_bare_yaml_opener_rejected(self):
+        """Content with bare --- opener (LLM stdout format) is rejected — wrong format."""
+        mod = _load_hook()
+        content = "---\nexecutor_type: general\n---\nInstructions."
+        errors = mod._validate_artifact(content, "/some/artifacts/uow_abc.md")
+        assert len(errors) >= 1
+        assert any("---json" in e for e in errors)
+
+    def test_missing_closing_delimiter_rejected(self):
+        """Content with ---json opener but no closing --- is rejected."""
+        mod = _load_hook()
+        envelope = json.dumps({
+            "uow_id": "uow_abc",
+            "executor_type": "general",
+            "constraints": [],
+            "prescribed_skills": [],
+        }, separators=(",", ":"))
+        content = f"---json\n{envelope}\nInstructions without closing delimiter."
+        errors = mod._validate_artifact(content, "/some/artifacts/uow_abc.md")
+        assert len(errors) >= 1
+        assert any("---" in e for e in errors)
+
+    def test_invalid_json_in_envelope_rejected(self):
+        """Non-JSON on the envelope line is rejected."""
+        mod = _load_hook()
+        content = "---json\nnot valid json at all\n---\nInstructions."
+        errors = mod._validate_artifact(content, "/some/artifacts/uow_abc.md")
+        assert len(errors) >= 1
+        assert any("Invalid JSON" in e or "JSON" in e for e in errors)
+
+    def test_json_array_envelope_rejected(self):
+        """JSON array on the envelope line is rejected — must be an object."""
+        mod = _load_hook()
+        content = '---json\n[{"uow_id": "uow_abc"}]\n---\nInstructions.'
+        errors = mod._validate_artifact(content, "/some/artifacts/uow_abc.md")
+        assert len(errors) >= 1
+        assert any("object" in e.lower() for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# Envelope field validation
+# ---------------------------------------------------------------------------
+
+class TestEnvelopeFieldValidation:
+    def test_missing_uow_id_rejected(self):
+        """Missing uow_id in envelope is rejected."""
+        mod = _load_hook()
+        envelope = json.dumps({
+            "executor_type": "general",
+            "constraints": [],
+            "prescribed_skills": [],
+        }, separators=(",", ":"))
+        content = f"---json\n{envelope}\n---\nInstructions."
+        errors = mod._validate_artifact(content, "/some/artifacts/uow_abc.md")
+        assert any("uow_id" in e for e in errors)
+
+    def test_missing_executor_type_rejected(self):
+        """Missing executor_type in envelope is rejected."""
+        mod = _load_hook()
+        envelope = json.dumps({
+            "uow_id": "uow_abc",
+            "constraints": [],
+            "prescribed_skills": [],
+        }, separators=(",", ":"))
+        content = f"---json\n{envelope}\n---\nInstructions."
+        errors = mod._validate_artifact(content, "/some/artifacts/uow_abc.md")
+        assert any("executor_type" in e for e in errors)
+
+    def test_missing_multiple_required_fields_rejected(self):
+        """Missing multiple required fields are all reported."""
+        mod = _load_hook()
+        content = "---json\n{}\n---\nInstructions."
+        errors = mod._validate_artifact(content, "/some/artifacts/uow_abc.md")
+        assert len(errors) >= 1
+        assert any("missing required fields" in e for e in errors)
+
+    def test_invalid_executor_type_rejected(self):
+        """executor_type not in the valid set is rejected."""
+        mod = _load_hook()
+        envelope = json.dumps({
+            "uow_id": "uow_abc",
+            "executor_type": "unknown-executor",
+            "constraints": [],
+            "prescribed_skills": [],
+        }, separators=(",", ":"))
+        content = f"---json\n{envelope}\n---\nInstructions."
+        errors = mod._validate_artifact(content, "/some/artifacts/uow_abc.md")
+        assert any("executor_type" in e or "Invalid" in e for e in errors)
+
+    def test_prescribed_skills_must_be_list(self):
+        """prescribed_skills as a string (not list) is rejected."""
+        mod = _load_hook()
+        envelope = json.dumps({
+            "uow_id": "uow_abc",
+            "executor_type": "general",
+            "constraints": [],
+            "prescribed_skills": "wos",
+        }, separators=(",", ":"))
+        content = f"---json\n{envelope}\n---\nInstructions."
+        errors = mod._validate_artifact(content, "/some/artifacts/uow_abc.md")
+        assert any("prescribed_skills" in e for e in errors)
+
+    def test_constraints_must_be_list(self):
+        """constraints as a dict (not list) is rejected."""
+        mod = _load_hook()
+        envelope = json.dumps({
+            "uow_id": "uow_abc",
+            "executor_type": "general",
+            "constraints": {"no-network": True},
+            "prescribed_skills": [],
+        }, separators=(",", ":"))
+        content = f"---json\n{envelope}\n---\nInstructions."
+        errors = mod._validate_artifact(content, "/some/artifacts/uow_abc.md")
+        assert any("constraints" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# Integration: main() exit codes
+# ---------------------------------------------------------------------------
+
+class TestMainExitCode:
+    def test_valid_artifact_write_exits_zero(self, monkeypatch):
+        """main() returns 0 for a valid artifact Write."""
+        mod = _load_hook()
+        artifact_path = "/home/lobster/lobster-workspace/orchestration/artifacts/uow_abc.md"
+        data = _hook_input(
+            tool_name="Write",
+            file_path=artifact_path,
+            content=_valid_artifact_content(),
+        )
+        monkeypatch.setattr("sys.stdin", StringIO(json.dumps(data)))
+        result = mod.main()
+        assert result == 0
+
+    def test_invalid_artifact_write_exits_two(self, monkeypatch, capsys):
+        """main() returns 2 for an invalid artifact Write."""
+        mod = _load_hook()
+        artifact_path = "/home/lobster/lobster-workspace/orchestration/artifacts/uow_abc.md"
+        # Missing ---json opener
+        data = _hook_input(
+            tool_name="Write",
+            file_path=artifact_path,
+            content='{"uow_id": "uow_abc"}',
+        )
+        monkeypatch.setattr("sys.stdin", StringIO(json.dumps(data)))
+        result = mod.main()
+        assert result == 2
+
+    def test_missing_required_fields_exits_two(self, monkeypatch):
+        """main() returns 2 when required envelope fields are missing."""
+        mod = _load_hook()
+        artifact_path = "/home/lobster/lobster-workspace/orchestration/artifacts/uow_abc.md"
+        content = '---json\n{"uow_id": "uow_abc"}\n---\nInstructions.'
+        data = _hook_input(
+            tool_name="Write",
+            file_path=artifact_path,
+            content=content,
+        )
+        monkeypatch.setattr("sys.stdin", StringIO(json.dumps(data)))
+        result = mod.main()
+        assert result == 2

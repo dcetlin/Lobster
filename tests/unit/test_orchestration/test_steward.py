@@ -1773,7 +1773,7 @@ class TestDryRun:
         )
 
         if artifact_dir.exists():
-            artifacts = list(artifact_dir.glob("*.json"))
+            artifacts = list(artifact_dir.glob("*.md")) + list(artifact_dir.glob("*.json"))
             assert len(artifacts) == 0, "Dry-run must not write any artifact files"
 
 
@@ -2488,10 +2488,11 @@ class TestFeedbackLoopIntegration:
         )
 
         # Read back the written workflow artifact and check instructions
-        artifacts = list((tmp_path / "artifacts").glob("*.json"))
+        from orchestration.workflow_artifact import from_frontmatter
+        artifacts = list((tmp_path / "artifacts").glob("*.md"))
         assert artifacts, "Expected a workflow artifact to be written"
-        artifact_data = json.loads(artifacts[0].read_text())
-        instructions = artifact_data.get("instructions", "")
+        artifact = from_frontmatter(artifacts[0].read_text())
+        instructions = artifact.get("instructions", "")
         assert "Prior prescription attempts" not in instructions
 
     def test_second_cycle_includes_prior_context(self, db_path, registry, tmp_path):
@@ -2536,10 +2537,11 @@ class TestFeedbackLoopIntegration:
             llm_prescriber=None,
         )
 
-        artifacts = list((tmp_path / "artifacts").glob("*.json"))
+        from orchestration.workflow_artifact import from_frontmatter
+        artifacts = list((tmp_path / "artifacts").glob("*.md"))
         assert artifacts, "Expected a workflow artifact to be written"
-        artifact_data = json.loads(artifacts[0].read_text())
-        instructions = artifact_data.get("instructions", "")
+        artifact = from_frontmatter(artifacts[0].read_text())
+        instructions = artifact.get("instructions", "")
         assert "Prior prescription attempts" in instructions, (
             f"Re-prescription instructions must include prior context.\nInstructions:\n{instructions}"
         )
@@ -2576,10 +2578,11 @@ class TestFeedbackLoopIntegration:
             llm_prescriber=None,
         )
 
-        artifacts = list((tmp_path / "artifacts").glob("*.json"))
+        from orchestration.workflow_artifact import from_frontmatter
+        artifacts = list((tmp_path / "artifacts").glob("*.md"))
         assert artifacts, "Expected a workflow artifact to be written"
-        artifact_data = json.loads(artifacts[0].read_text())
-        instructions = artifact_data.get("instructions", "")
+        artifact = from_frontmatter(artifacts[0].read_text())
+        instructions = artifact.get("instructions", "")
         assert "Prior prescription attempts" not in instructions
 
 
@@ -3345,11 +3348,12 @@ class TestLlmPrescription:
         assert llm_calls[0]["uow_id"] == uow_id
 
         # Artifact file should contain the LLM-generated instructions
-        artifacts = list(artifact_dir.glob("*.json"))
+        from orchestration.workflow_artifact import from_frontmatter
+        artifacts = list(artifact_dir.glob("*.md"))
         assert len(artifacts) == 1
-        artifact_data = json.loads(artifacts[0].read_text())
-        assert "LLM-generated" in artifact_data["instructions"]
-        assert "Completion check:" in artifact_data["instructions"]
+        artifact = from_frontmatter(artifacts[0].read_text())
+        assert "LLM-generated" in artifact["instructions"]
+        assert "Completion check:" in artifact["instructions"]
 
 
 # ---------------------------------------------------------------------------
