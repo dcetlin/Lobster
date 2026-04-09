@@ -2500,43 +2500,36 @@ def _write_workflow_artifact(
     executor_type: str = _EXECUTOR_TYPE_GENERAL,
 ) -> str:
     """
-    Write a WorkflowArtifact JSON file to disk.
+    Write a WorkflowArtifact to disk in front-matter + prose format (.md).
+
+    The disk format (S3P2-B, issue #613) is front-matter + prose rather than
+    pure JSON, making prescriptions human-readable and eliminating the class of
+    JSONDecodeError failures caused by LLM preamble emission.
 
     Returns the absolute path to the written file.
     artifact_dir: override for the artifact directory (used in tests).
     executor_type: the executor type to embed in the artifact (defaults to general).
     """
-    try:
-        from src.orchestration.workflow_artifact import WorkflowArtifact, to_json
-        artifact = WorkflowArtifact(
-            uow_id=uow_id,
-            executor_type=executor_type,
-            constraints=[],
-            prescribed_skills=prescribed_skills,
-            instructions=instructions,
-        )
-        artifact_json = to_json(artifact)
-    except ImportError:
-        # Fallback if workflow_artifact.py not yet on branch (pre-merge)
-        artifact_data = {
-            "uow_id": uow_id,
-            "executor_type": executor_type,
-            "constraints": [],
-            "prescribed_skills": prescribed_skills,
-            "instructions": instructions,
-        }
-        artifact_json = json.dumps(artifact_data)
+    from src.orchestration.workflow_artifact import WorkflowArtifact, to_frontmatter
+    artifact = WorkflowArtifact(
+        uow_id=uow_id,
+        executor_type=executor_type,
+        constraints=[],
+        prescribed_skills=prescribed_skills,
+        instructions=instructions,
+    )
+    artifact_text = to_frontmatter(artifact)
 
     if artifact_dir is not None:
         artifact_dir = Path(artifact_dir)
-        artifact_path = artifact_dir / f"{uow_id}.json"
+        artifact_path = artifact_dir / f"{uow_id}.md"
     else:
         artifact_path = Path(os.path.expanduser(
-            f"~/lobster-workspace/orchestration/artifacts/{uow_id}.json"
+            f"~/lobster-workspace/orchestration/artifacts/{uow_id}.md"
         ))
 
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    artifact_path.write_text(artifact_json, encoding="utf-8")
+    artifact_path.write_text(artifact_text, encoding="utf-8")
 
     return str(artifact_path.resolve())
 

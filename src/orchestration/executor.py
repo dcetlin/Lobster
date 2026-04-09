@@ -58,7 +58,7 @@ log = logging.getLogger("executor")
 
 from orchestration.registry import Registry, UoW, UoWStatus
 from orchestration.result_writer import write_result as _write_subagent_result
-from orchestration.workflow_artifact import WorkflowArtifact, from_json
+from orchestration.workflow_artifact import WorkflowArtifact, from_json, from_frontmatter
 from orchestration.error_capture import (
     run_subprocess_with_error_capture,
     log_subprocess_error,
@@ -546,7 +546,7 @@ class Executor:
                     reason="workflow_artifact field is NULL or empty",
                 )
 
-            # The Steward writes the artifact JSON to a file and stores the
+            # The Steward writes the artifact to a file and stores the
             # absolute path in the workflow_artifact column. Detect a path
             # value (starts with '/') and read the file; otherwise treat the
             # field value as inline JSON (legacy / test path).
@@ -582,7 +582,20 @@ class Executor:
                 artifact_json_str = artifact_file.read_text(encoding="utf-8")
 
             try:
-                artifact = from_json(artifact_json_str)
+                # Dispatch to the correct deserializer based on file extension
+                # or content heuristic (S3P2-B, issue #613):
+                #   .md  → front-matter + prose format (new, written by _write_workflow_artifact)
+                #   .json or inline JSON (starts with '{') → legacy JSON format (backward compat)
+                if workflow_artifact_raw.endswith(".md"):
+                    artifact = from_frontmatter(artifact_json_str)
+                elif workflow_artifact_raw.endswith(".json") or artifact_json_str.lstrip().startswith("{"):
+                    artifact = from_json(artifact_json_str)
+                else:
+                    # Unknown format — attempt front-matter first, fall back to JSON.
+                    try:
+                        artifact = from_frontmatter(artifact_json_str)
+                    except ValueError:
+                        artifact = from_json(artifact_json_str)
             except ValueError as e:
                 deser_reason = f"workflow_artifact deserialization failed: {e}"
                 deser_result = ExecutorResult(
