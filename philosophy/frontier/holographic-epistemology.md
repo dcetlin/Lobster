@@ -104,6 +104,6 @@ The honest version: the holographic framing is a productive analogy that carves 
 
 ## Related Documents
 
-- [holographic-epistemology-challenge.md](holographic-epistemology-challenge.md) — Adversarial objections to this framing; finds that the orthogonality measure is undefined and the AdS/CFT grounding is weaker than claimed.
-- [holographic-epistemology-systems-alignment.md](holographic-epistemology-systems-alignment.md) — Examines where Lobster's architecture actually enforces the geometric diversity principle versus where it assumes it; finds that oracle review and the meta agent are the genuine implementations.
-- [holographic-epistemology-synthesis.md](holographic-epistemology-synthesis.md) — Integrates this document with the challenge and architecture analysis; identifies what survived adversarial pressure, what was qualified, and where the unresolved tensions live.
+- [holographic-epistemology-challenge.md](https://github.com/dcetlin/Lobster/blob/main/philosophy/frontier/holographic-epistemology-challenge.md) — Adversarial objections to this framing; finds that the orthogonality measure is undefined and the AdS/CFT grounding is weaker than claimed.
+- [holographic-epistemology-systems-alignment.md](https://github.com/dcetlin/Lobster/blob/main/philosophy/frontier/holographic-epistemology-systems-alignment.md) — Examines where Lobster's architecture actually enforces the geometric diversity principle versus where it assumes it; finds that oracle review and the meta agent are the genuine implementations.
+- [holographic-epistemology-synthesis.md](https://github.com/dcetlin/Lobster/blob/main/philosophy/frontier/holographic-epistemology-synthesis.md) — Integrates this document with the challenge and architecture analysis; identifies what survived adversarial pressure, what was qualified, and where the unresolved tensions live.
