@@ -205,7 +205,7 @@ def run_startup_sweep(
         if not source_issue_number:
             return False
         issue_info = _github(source_issue_number)
-        labels = issue_info.get("labels", [])
+        labels = issue_info.labels
         return "bootup-candidate" in labels
 
     try:

@@ -33,6 +33,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.orchestration.steward import (
     _check_register_executor_compatibility,
+    IssueInfo,
+    LLMPrescription,
 )
 
 
@@ -193,9 +195,9 @@ class TestRegisterMismatchGateIntegration:
 
         result = _process_uow(
             uow=uow, registry=registry, audit_entries=audit_entries,
-            issue_info={"body": "", "state": "open", "labels": []},
+            issue_info=IssueInfo(status_code=1, state="open", labels=[], body="", title=""),
             dry_run=True, artifact_dir=tmp_path, notify_dan=fake_notify,
-            llm_prescriber=lambda *a, **k: {"instructions": "x", "success_criteria_check": "y", "estimated_cycles": 1},
+            llm_prescriber=lambda *a, **k: LLMPrescription(instructions="x", success_criteria_check="y", estimated_cycles=1),
         )
 
         assert isinstance(result, Surfaced), f"Expected Surfaced, got {result}"
@@ -222,9 +224,9 @@ class TestRegisterMismatchGateIntegration:
 
         result = _process_uow(
             uow=uow, registry=registry, audit_entries=audit_entries,
-            issue_info={"body": "", "state": "open", "labels": []},
+            issue_info=IssueInfo(status_code=1, state="open", labels=[], body="", title=""),
             dry_run=True, artifact_dir=artifact_dir, notify_dan=lambda *a, **k: None,
-            llm_prescriber=lambda *a, **k: {"instructions": "x", "success_criteria_check": "y", "estimated_cycles": 1},
+            llm_prescriber=lambda *a, **k: LLMPrescription(instructions="x", success_criteria_check="y", estimated_cycles=1),
         )
 
         assert isinstance(result, Surfaced)
@@ -249,9 +251,9 @@ class TestRegisterMismatchGateIntegration:
 
         _process_uow(
             uow=uow, registry=registry, audit_entries=audit_entries,
-            issue_info={"body": "", "state": "open", "labels": []},
+            issue_info=IssueInfo(status_code=1, state="open", labels=[], body="", title=""),
             dry_run=False, artifact_dir=tmp_path, notify_dan=lambda *a, **k: None,
-            llm_prescriber=lambda *a, **k: {"instructions": "x", "success_criteria_check": "y", "estimated_cycles": 1},
+            llm_prescriber=lambda *a, **k: LLMPrescription(instructions="x", success_criteria_check="y", estimated_cycles=1),
         )
 
         uow_after = registry.get("uow-obs")
@@ -286,9 +288,9 @@ class TestRegisterMismatchGateIntegration:
 
         result = _process_uow(
             uow=uow, registry=registry, audit_entries=audit_entries,
-            issue_info={"body": "", "state": "open", "labels": []},
+            issue_info=IssueInfo(status_code=1, state="open", labels=[], body="", title=""),
             dry_run=True, artifact_dir=tmp_path, notify_dan=lambda *a, **k: None,
-            llm_prescriber=lambda *a, **k: {"instructions": "x", "success_criteria_check": "y", "estimated_cycles": 1},
+            llm_prescriber=lambda *a, **k: LLMPrescription(instructions="x", success_criteria_check="y", estimated_cycles=1),
         )
 
         assert isinstance(result, Prescribed), f"Expected Prescribed, got {result}"
@@ -310,9 +312,9 @@ class TestRegisterMismatchGateIntegration:
 
         _process_uow(
             uow=uow, registry=registry, audit_entries=audit_entries,
-            issue_info={"body": "", "state": "open", "labels": []},
+            issue_info=IssueInfo(status_code=1, state="open", labels=[], body="", title=""),
             dry_run=False, artifact_dir=tmp_path, notify_dan=lambda *a, **k: None,
-            llm_prescriber=lambda *a, **k: {"instructions": "x", "success_criteria_check": "y", "estimated_cycles": 1},
+            llm_prescriber=lambda *a, **k: LLMPrescription(instructions="x", success_criteria_check="y", estimated_cycles=1),
         )
 
         # Read audit log directly
