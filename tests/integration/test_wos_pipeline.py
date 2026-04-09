@@ -1087,7 +1087,10 @@ class TestBootupCandidateGate:
         p2_conn.commit()
 
         uow = read_uow(p2_conn, uow_id)
-        assert uow["status"] == "pending"
+        # approve() auto-advances proposed → ready-for-steward; pending is no longer
+        # a resting state. The gate test verifies that evaluate_condition blocks
+        # further advancement, not that the UoW stays in pending.
+        assert uow["status"] == "ready-for-steward"
         trigger = json.loads(uow["trigger"])
         assert trigger["type"] == "bootup-candidate-gate"
 
@@ -1095,11 +1098,11 @@ class TestBootupCandidateGate:
         gate_is_open = True  # BOOTUP_CANDIDATE_GATE = True
         should_advance = (not gate_is_open) or (trigger["type"] != "bootup-candidate-gate")
         assert should_advance is False, (
-            "Bootup-candidate UoW must remain pending while BOOTUP_CANDIDATE_GATE is True"
+            "Bootup-candidate UoW must remain blocked while BOOTUP_CANDIDATE_GATE is True"
         )
 
-        # UoW must still be in pending
-        assert read_uow(p2_conn, uow_id)["status"] == "pending"
+        # UoW must still be in ready-for-steward (gate blocks steward from advancing it)
+        assert read_uow(p2_conn, uow_id)["status"] == "ready-for-steward"
 
     def test_bootup_candidate_advances_when_gate_clears(
         self,

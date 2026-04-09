@@ -57,6 +57,7 @@ from orchestration.steward import (
     run_steward_cycle,
     _HARD_CAP_CYCLES,
     _EARLY_WARNING_CYCLES,
+    IssueInfo,
 )
 from orchestration.executor import Executor, ExecutorOutcome, _result_json_path
 
@@ -85,15 +86,15 @@ def _read_audit_log(conn: sqlite3.Connection, uow_id: str) -> list[dict[str, Any
     return [dict(r) for r in rows]
 
 
-def _stub_github_client(issue_number: int) -> dict[str, Any]:
-    """No-op GitHub client — returns open issue with no labels."""
-    return {
-        "status_code": 200,
-        "state": "open",
-        "labels": [],
-        "body": f"Test issue #{issue_number}",
-        "title": f"Test issue #{issue_number}",
-    }
+def _stub_github_client(issue_number: int) -> IssueInfo:
+    """No-op GitHub client — returns open IssueInfo with no labels."""
+    return IssueInfo(
+        status_code=200,
+        state="open",
+        labels=[],
+        body=f"Test issue #{issue_number}",
+        title=f"Test issue #{issue_number}",
+    )
 
 
 def _seed_uow_at_ready_for_steward(

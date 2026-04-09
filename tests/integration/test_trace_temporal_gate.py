@@ -50,7 +50,7 @@ if str(_SRC) not in sys.path:
 
 from orchestration.migrate import run_migrations
 from orchestration.registry import Registry, UpsertInserted, ApproveConfirmed
-from orchestration.steward import run_steward_cycle, WaitForTrace, CycleResult
+from orchestration.steward import run_steward_cycle, WaitForTrace, CycleResult, IssueInfo
 from orchestration.executor import Executor, _result_json_path, _trace_json_path
 
 
@@ -86,15 +86,15 @@ def _read_audit_events(conn: sqlite3.Connection, uow_id: str) -> list[str]:
     return [r["event"] for r in rows]
 
 
-def _stub_github_client(issue_number: int) -> dict[str, Any]:
+def _stub_github_client(issue_number: int) -> IssueInfo:
     """Minimal open-issue stub — no bootup-candidate label."""
-    return {
-        "status_code": 200,
-        "state": "open",
-        "labels": [],
-        "body": f"Implement feature for issue #{issue_number}",
-        "title": f"Test issue #{issue_number}",
-    }
+    return IssueInfo(
+        status_code=200,
+        state="open",
+        labels=[],
+        body=f"Implement feature for issue #{issue_number}",
+        title=f"Test issue #{issue_number}",
+    )
 
 
 def _seed_uow_at_ready_for_steward(
