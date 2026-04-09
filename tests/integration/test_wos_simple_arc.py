@@ -178,10 +178,10 @@ class TestWosSimpleArc:
             bootup_candidate_gate=False,
         )
 
-        assert steward_result_1["prescribed"] == 1, (
+        assert steward_result_1.prescribed == 1, (
             f"Steward cycle 1 should have prescribed 1 UoW, got: {steward_result_1}"
         )
-        assert steward_result_1["done"] == 0, (
+        assert steward_result_1.done == 0, (
             f"Steward cycle 1 should not have closed any UoW, got: {steward_result_1}"
         )
 
@@ -266,10 +266,10 @@ class TestWosSimpleArc:
             bootup_candidate_gate=False,
         )
 
-        assert steward_result_2["done"] == 1, (
+        assert steward_result_2.done == 1, (
             f"Steward cycle 2 should have closed 1 UoW, got: {steward_result_2}"
         )
-        assert steward_result_2["prescribed"] == 0, (
+        assert steward_result_2.prescribed == 0, (
             f"Steward cycle 2 should not have prescribed anything, got: {steward_result_2}"
         )
 
@@ -432,7 +432,7 @@ class TestWosSimpleArc:
             notify_dan_early_warning=_noop_notify_dan_early_warning,
             bootup_candidate_gate=False,
         )
-        assert steward_result_3["evaluated"] == 0, (
+        assert steward_result_3.evaluated == 0, (
             f"Steward cycle 3 should find 0 UoWs to evaluate (done is terminal), "
             f"got: {steward_result_3}"
         )

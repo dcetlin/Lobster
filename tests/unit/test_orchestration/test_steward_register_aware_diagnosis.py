@@ -43,6 +43,8 @@ from src.orchestration.steward import (
     _count_non_improving_gate_cycles,
     _assess_completion,
     _detect_stuck_condition,
+    IssueInfo,
+    LLMPrescription,
     Surfaced,
     Prescribed,
 )
@@ -549,11 +551,13 @@ class TestTraceInjectionIntegration:
 
         _process_uow(
             uow=uow, registry=registry, audit_entries=audit_entries,
-            issue_info={"body": "", "state": "open", "labels": []},
+            issue_info=IssueInfo(status_code=1, state="open", labels=[], body="", title=""),
             dry_run=False, artifact_dir=tmp_path, notify_dan=lambda *a, **k: None,
-            llm_prescriber=lambda *a, **k: {"instructions": "x",
-                                             "success_criteria_check": "y",
-                                             "estimated_cycles": 1},
+            llm_prescriber=lambda *a, **k: LLMPrescription(
+                instructions="x",
+                success_criteria_check="y",
+                estimated_cycles=1,
+            ),
         )
 
         uow_after = registry.get("uow-ti")
@@ -617,18 +621,25 @@ class TestTraceInjectionIntegration:
 
         result = _process_uow(
             uow=uow, registry=registry, audit_entries=audit_entries,
-            issue_info={"body": "", "state": "open", "labels": []},
+            issue_info=IssueInfo(status_code=1, state="open", labels=[], body="", title=""),
             dry_run=True, artifact_dir=tmp_path, notify_dan=fake_notify,
-            llm_prescriber=lambda *a, **k: {"instructions": "x",
-                                             "success_criteria_check": "y",
-                                             "estimated_cycles": 1},
+            llm_prescriber=lambda *a, **k: LLMPrescription(
+                instructions="x",
+                success_criteria_check="y",
+                estimated_cycles=1,
+            ),
         )
 
         assert isinstance(result, Surfaced), f"Expected Surfaced, got {result}"
         assert result.condition == "philosophical_register"
 
-    def test_philosophical_no_surface_on_first_execution(self, tmp_path):
-        """philosophical UoW on first_execution (cycles=0, no output_ref) → not surfaced yet."""
+    def test_philosophical_no_philosophical_register_surface_on_first_execution(self, tmp_path):
+        """philosophical_register stuck condition does NOT fire on first_execution.
+
+        The register_mismatch gate fires first (philosophical has no auto-selectable executor),
+        so the result is Surfaced — but the condition is register_mismatch, not philosophical_register.
+        philosophical_register only fires on reentry (cycles > 0, execution_complete posture).
+        """
         registry, db_path = _make_registry(tmp_path)
         conn = _open_db(db_path)
         _insert_uow(conn, "uow-phil-first", register="philosophical",
@@ -647,13 +658,17 @@ class TestTraceInjectionIntegration:
 
         result = _process_uow(
             uow=uow, registry=registry, audit_entries=audit_entries,
-            issue_info={"body": "", "state": "open", "labels": []},
+            issue_info=IssueInfo(status_code=1, state="open", labels=[], body="", title=""),
             dry_run=True, artifact_dir=tmp_path, notify_dan=fake_notify,
-            llm_prescriber=lambda *a, **k: {"instructions": "x",
-                                             "success_criteria_check": "y",
-                                             "estimated_cycles": 1},
+            llm_prescriber=lambda *a, **k: LLMPrescription(
+                instructions="x",
+                success_criteria_check="y",
+                estimated_cycles=1,
+            ),
         )
 
-        # On first_execution, philosophical UoW should be prescribed (not surfaced)
-        assert isinstance(result, Prescribed), f"Expected Prescribed on first_execution, got {result}"
+        # philosophical_register must NOT fire on first_execution
         assert not any(c == "philosophical_register" for _, c in surfaced)
+        # The register_mismatch gate fires first (no compatible auto-selected executor for philosophical)
+        assert isinstance(result, Surfaced), f"Expected Surfaced (register_mismatch), got {result}"
+        assert result.condition == "register_mismatch"

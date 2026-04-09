@@ -50,7 +50,7 @@ if str(_SRC) not in sys.path:
 
 from orchestration.migrate import run_migrations
 from orchestration.registry import Registry, UpsertInserted, ApproveConfirmed
-from orchestration.steward import run_steward_cycle, WaitForTrace
+from orchestration.steward import run_steward_cycle, WaitForTrace, CycleResult
 from orchestration.executor import Executor, _result_json_path, _trace_json_path
 
 
@@ -218,8 +218,8 @@ def _simulate_startup_sweep_diagnosing(
 def _run_steward_heartbeat(
     registry: Registry,
     tmp_path: Path,
-) -> dict[str, Any]:
-    """Run one steward heartbeat, returning the result dict."""
+) -> CycleResult:
+    """Run one steward heartbeat, returning the CycleResult."""
     return run_steward_cycle(
         registry=registry,
         dry_run=False,
@@ -303,11 +303,11 @@ class TestTraceTemporalGate:
         # --- Heartbeat 1: trace absent ---
         result1 = _run_steward_heartbeat(registry, tmp_path)
 
-        assert result1.get("wait_for_trace", 0) == TRACE_GATE_DWELL_HEARTBEATS, (
+        assert result1.wait_for_trace == TRACE_GATE_DWELL_HEARTBEATS, (
             f"S3-B: expected wait_for_trace=={TRACE_GATE_DWELL_HEARTBEATS} in heartbeat 1 result, "
             f"got {result1}"
         )
-        assert result1.get("prescribed", 0) == 0, (
+        assert result1.prescribed == 0, (
             "Heartbeat 1 must NOT prescribe when trace gate fires"
         )
 
@@ -353,10 +353,10 @@ class TestTraceTemporalGate:
         # --- Heartbeat 2: trace present → prescribe proceeds ---
         result2 = _run_steward_heartbeat(registry, tmp_path)
 
-        assert result2.get("prescribed", 0) == 1, (
+        assert result2.prescribed == 1, (
             f"S3-B: heartbeat 2 must prescribe when trace.json is present; got {result2}"
         )
-        assert result2.get("wait_for_trace", 0) == 0, (
+        assert result2.wait_for_trace == 0, (
             "Heartbeat 2 must NOT fire the trace gate when trace.json is present"
         )
 
@@ -402,7 +402,7 @@ class TestTraceTemporalGate:
 
         # Heartbeat 1: trace absent → WaitForTrace
         result1 = _run_steward_heartbeat(registry, tmp_path)
-        assert result1.get("wait_for_trace", 0) == 1, (
+        assert result1.wait_for_trace == 1, (
             f"Heartbeat 1 must return WaitForTrace; got {result1}"
         )
 
@@ -415,7 +415,7 @@ class TestTraceTemporalGate:
         # Heartbeat 2: trace STILL absent → trace_gate_timeout + proceed with prescription
         result2 = _run_steward_heartbeat(registry, tmp_path)
 
-        assert result2.get("prescribed", 0) == 1, (
+        assert result2.prescribed == 1, (
             f"S3-B: heartbeat 2 must prescribe (non-blocking fallback) when trace still absent; "
             f"got {result2}"
         )
@@ -465,10 +465,10 @@ class TestTraceTemporalGate:
         # Single heartbeat: trace present → prescribe immediately
         result = _run_steward_heartbeat(registry, tmp_path)
 
-        assert result.get("wait_for_trace", 0) == 0, (
+        assert result.wait_for_trace == 0, (
             "Trace gate must NOT fire when trace.json is present"
         )
-        assert result.get("prescribed", 0) == 1, (
+        assert result.prescribed == 1, (
             "Must prescribe immediately when trace.json is present"
         )
 

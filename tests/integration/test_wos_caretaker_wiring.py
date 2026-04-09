@@ -341,7 +341,7 @@ def test_steward_picks_up_ready_for_steward_uow(registry: Registry, tmp_path: Pa
         f"Steward did not claim UoW {uow_id!r} — still ready-for-steward after cycle. "
         f"Cycle result: {cycle_result}"
     )
-    assert cycle_result.get("evaluated", 0) >= 1, (
+    assert cycle_result.evaluated >= 1, (
         f"Steward cycle reported 0 UoWs evaluated. Result: {cycle_result}"
     )
 

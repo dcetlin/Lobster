@@ -39,6 +39,8 @@ _REPO_ROOT = Path(__file__).parent.parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from src.orchestration.steward import CycleResult
+
 import importlib.util
 
 _STEWARD_PATH = _REPO_ROOT / "scheduled-tasks" / "steward-heartbeat.py"
@@ -113,10 +115,11 @@ class TestStewardExecutionGate:
         db_path = tmp_path / "registry.db"
         db_path.touch()
 
-        mock_steward_result = {
-            "evaluated": 1, "prescribed": 1, "done": 0,
-            "surfaced": 0, "skipped": 0, "race_skipped": 0,
-        }
+        mock_steward_result = CycleResult(
+            evaluated=1, prescribed=1, done=0,
+            surfaced=0, skipped=0, race_skipped=0,
+            wait_for_trace=0, considered_ids=(),
+        )
 
         with patch.object(steward_heartbeat, "_is_job_enabled", return_value=True), \
              patch.object(steward_heartbeat, "is_bootup_candidate_gate_active", return_value=False), \

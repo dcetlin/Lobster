@@ -212,14 +212,15 @@ def _ensure_registry_has_phase2_methods(registry) -> None:
         registry.append_audit_log = types.MethodType(append_audit_log, registry)
 
 
-def _mock_github_client_open(issue_number: int) -> dict:
-    return {
-        "status_code": 200,
-        "state": "open",
-        "labels": [],
-        "body": f"Issue #{issue_number}: implement this feature.\n\nAcceptance criteria:\n- Feature works",
-        "title": f"Test issue {issue_number}",
-    }
+def _mock_github_client_open(issue_number: int):
+    from src.orchestration.steward import IssueInfo
+    return IssueInfo(
+        status_code=200,
+        state="open",
+        labels=[],
+        body=f"Issue #{issue_number}: implement this feature.\n\nAcceptance criteria:\n- Feature works",
+        title=f"Test issue {issue_number}",
+    )
 
 
 def _import_steward():
