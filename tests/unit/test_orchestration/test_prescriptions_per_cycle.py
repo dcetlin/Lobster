@@ -61,14 +61,17 @@ def _make_mock_registry(ready_for_steward_uows=None):
 
 
 def _make_steward_result(prescribed=0):
-    return {
-        "evaluated": prescribed,
-        "prescribed": prescribed,
-        "done": 0,
-        "surfaced": 0,
-        "skipped": 0,
-        "race_skipped": 0,
-    }
+    from src.orchestration.steward import CycleResult
+    return CycleResult(
+        evaluated=prescribed,
+        prescribed=prescribed,
+        done=0,
+        surfaced=0,
+        skipped=0,
+        race_skipped=0,
+        wait_for_trace=0,
+        considered_ids=(),
+    )
 
 
 # ---------------------------------------------------------------------------

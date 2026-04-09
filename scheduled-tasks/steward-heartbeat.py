@@ -639,16 +639,16 @@ def main() -> int:
             dry_run=dry_run,
             bootup_candidate_gate=gate_active,
         )
-        prescriptions_this_cycle = result["prescribed"]
+        prescriptions_this_cycle = result.prescribed
         log.info(
             "Steward cycle complete: evaluated=%d prescribed=%d done=%d "
             "surfaced=%d skipped=%d race_skipped=%d",
-            result["evaluated"],
-            result["prescribed"],
-            result["done"],
-            result["surfaced"],
-            result["skipped"],
-            result["race_skipped"],
+            result.evaluated,
+            result.prescribed,
+            result.done,
+            result.surfaced,
+            result.skipped,
+            result.race_skipped,
         )
     except RuntimeError as e:
         # Schema migration not applied — hard exit with clear message
