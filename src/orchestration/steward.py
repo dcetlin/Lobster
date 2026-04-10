@@ -352,6 +352,11 @@ _DEFAULT_ARTIFACTS_ARCHIVED_DIR = Path(
     os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
 ) / "orchestration" / "artifacts" / "archived"
 
+# Default path for UoW artifact directories (active, pre-archival).
+_DEFAULT_ARTIFACTS_DIR = Path(
+    os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
+) / "orchestration" / "artifacts"
+
 # Early warning threshold: notify Dan when lifetime_cycles + steward_cycles reaches this value.
 # Uses cumulative lifetime_cycles + new_cycles (post-prescription) so the warning fires based
 # on total cycles across all decide-retry rounds, not just the current attempt.
@@ -2157,7 +2162,7 @@ def _archive_uow_artifacts(
 
     Pure filesystem operation — no DB writes, no side effects beyond the move.
     """
-    resolved_artifact_dir = Path(artifact_dir) if artifact_dir is not None else _DEFAULT_CYCLE_TRACE_DIR
+    resolved_artifact_dir = Path(artifact_dir) if artifact_dir is not None else _DEFAULT_ARTIFACTS_DIR
     src = resolved_artifact_dir / uow_id
 
     resolved_archived_dir = Path(archived_dir) if archived_dir is not None else _DEFAULT_ARTIFACTS_ARCHIVED_DIR
@@ -3055,7 +3060,7 @@ def _process_uow(
             # co-located with active ones (under artifacts/archived/).
             _resolved_artifact_dir = (
                 Path(artifact_dir) if artifact_dir is not None
-                else _DEFAULT_CYCLE_TRACE_DIR
+                else _DEFAULT_ARTIFACTS_DIR
             )
             cleanup_summary = _run_hard_cap_cleanup(
                 uow=uow,
