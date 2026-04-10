@@ -206,14 +206,6 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# ---------------------------------------------------------------------------
-# Phase helper
-# ---------------------------------------------------------------------------
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def _default_db_path() -> Path:
     workspace = Path(os.environ.get(
         "LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"
