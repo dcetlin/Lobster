@@ -26,6 +26,7 @@ import yaml
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 # Ensure src/mcp/ is on sys.path so log_utils (a sibling module) can be
 # imported when this script is run directly (same guard used by
@@ -450,21 +451,37 @@ _REPLY_TRACK_MAX = 100
 
 
 # ---------------------------------------------------------------------------
-# Timezone utility — reads owner timezone from owner.toml for display
+# Timezone utility — delegates to utils.timezone for all display/conversion
+# ---------------------------------------------------------------------------
+#
+# The canonical implementation lives in utils/timezone.py.  Local wrappers
+# are kept here for backwards-compatibility with existing call sites inside
+# this file so that no other lines need to change.
+#
+# _format_ts_with_et has been renamed to _format_ts_for_user and now uses
+# the owner's configured timezone instead of hardcoding Eastern Time.
 # ---------------------------------------------------------------------------
 
-def _get_display_tz():
-    """Return the owner's local timezone for display purposes.
+try:
+    from utils.timezone import (
+        format_for_user as _tz_format_for_user,
+        format_iso_for_user as _tz_format_iso_for_user,
+        format_with_utc_and_local as _tz_format_with_utc_and_local,
+        get_owner_zoneinfo as _tz_get_owner_zoneinfo,
+    )
+    _TZ_UTIL_AVAILABLE = True
+except ImportError:
+    _TZ_UTIL_AVAILABLE = False
 
-    Reads the 'timezone' field from owner.toml (e.g. 'America/Los_Angeles').
-    Falls back to UTC if not set or if zoneinfo cannot load the zone.
-    Always returns a zoneinfo.ZoneInfo-compatible object.
-    """
+
+def _get_display_tz():
+    """Return the owner's local timezone (ZoneInfo) for display purposes."""
+    if _TZ_UTIL_AVAILABLE:
+        return _tz_get_owner_zoneinfo()
     import zoneinfo as _zoneinfo
     try:
         from user_model.owner import get_owner_timezone as _get_owner_tz
-        tz_name = _get_owner_tz()
-        return _zoneinfo.ZoneInfo(tz_name)
+        return _zoneinfo.ZoneInfo(_get_owner_tz())
     except Exception:
         return _zoneinfo.ZoneInfo("UTC")
 
@@ -472,28 +489,45 @@ def _get_display_tz():
 def _format_display_ts(dt: "datetime", fmt: str = "%Y-%m-%d %I:%M %p %Z") -> str:
     """Convert a datetime to the owner's local timezone and format it for display.
 
-    Args:
-        dt:  A datetime object (naive datetimes are assumed UTC).
-        fmt: strftime format string. Default produces e.g. '2026-03-19 02:18 AM PST'.
-
-    Returns a formatted string in the owner's local time.
+    Naive datetimes are assumed UTC.
     """
+    if _TZ_UTIL_AVAILABLE:
+        return _tz_format_for_user(dt, fmt=fmt)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    local_dt = dt.astimezone(_get_display_tz())
-    return local_dt.strftime(fmt)
+    return dt.astimezone(_get_display_tz()).strftime(fmt)
 
 
 def _format_iso_for_display(iso_str: str, fmt: str = "%Y-%m-%d %I:%M %p %Z") -> str:
-    """Parse an ISO 8601 string and format it in the owner's local timezone.
-
-    Falls back to the raw string if parsing fails.
-    """
+    """Parse an ISO 8601 string and format it in the owner's local timezone."""
+    if _TZ_UTIL_AVAILABLE:
+        return _tz_format_iso_for_user(iso_str, fmt=fmt)
     try:
         dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
         return _format_display_ts(dt, fmt)
     except Exception:
         return iso_str
+
+
+def _format_ts_with_et(ts_str: str) -> str:
+    """Format a timestamp as 'YYYY-MM-DDTHH:MM:SS UTC (H:MM AM/PM <owner-tz>)'.
+
+    Previously hardcoded to Eastern Time; now uses the owner's configured
+    timezone from owner.toml so display matches the owner's actual locale.
+    Falls back to the raw string if parsing fails.
+    """
+    if _TZ_UTIL_AVAILABLE:
+        return _tz_format_with_utc_and_local(ts_str)
+    try:
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        utc_str = dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S UTC")
+        local_dt = dt.astimezone(_get_display_tz())
+        local_str = local_dt.strftime("%I:%M %p %Z").lstrip("0")
+        return f"{utc_str} ({local_str})"
+    except Exception:
+        return ts_str
 
 
 def _track_reply(chat_id: Any) -> None:
@@ -4592,7 +4626,7 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
         tg_msg_id = msg.get("telegram_message_id")
         if tg_msg_id:
             output += f"Telegram Message ID: `{tg_msg_id}` (pass as reply_to_message_id to send_reply to thread your reply)\n"
-        output += f"Time: {ts}\n"
+        output += f"Time: {_format_ts_with_et(ts)}\n"
         # dispatcher_hint: structural signals for the dispatcher to route correctly
         if msg_type == "subagent_notification":
             output += "dispatcher_hint: SUBAGENT_NOTIFICATION — user already received the subagent's reply. Don't summarize it. If you respond, add new value only — a question, a correction, missing context. Call mark_processed when done.\n"
