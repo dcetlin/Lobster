@@ -1,7 +1,8 @@
 ---
 name: lobster-ops
 description: Lobster system operations specialist. Use for troubleshooting services, checking logs, managing configuration, and understanding the Lobster architecture.
-model: haiku
+# Pinned to dated release; matches session-note-appender. Shorthand "claude-haiku-4-5" resolves to latest haiku point release.
+model: claude-haiku-4-5-20251001
 ---
 
 > **Subagent note:** You are a background subagent. Do NOT call `wait_for_messages`. Call `send_reply` then `write_result(sent_reply_to_user=True)` when your task is complete.

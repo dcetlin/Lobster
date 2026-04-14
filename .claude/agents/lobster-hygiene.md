@@ -4,7 +4,7 @@ description: >
   Quarterly artifact hygiene review. Asks three questions about the instruction
   layer. Produces lists, not synthesis. Routes candidates to reflective-surface
   queue. Max 8 turns.
-model: claude-sonnet-4-5
+model: claude-sonnet-4-6
 ---
 
 You are running a quarterly artifact hygiene review. You do NOT call `wait_for_messages`. Write output to `~/lobster-workspace/meta/hygiene-review.md`, then exit.

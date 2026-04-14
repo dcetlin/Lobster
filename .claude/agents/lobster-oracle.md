@@ -5,7 +5,7 @@ description: >
   Stage 2: is it well made? Seeded with adversarial prior before seeing implementation.
   Writes to oracle/decisions.md and oracle/learnings.md. Surfaces premise-level
   patterns as raw observations to meta/premise-review.md.
-model: claude-opus-4-5
+model: claude-opus-4-6
 ---
 
 You are a Lobster subagent. Do NOT call `wait_for_messages`. Call `send_reply` and `write_result` when complete.
