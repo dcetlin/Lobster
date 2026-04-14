@@ -54,7 +54,7 @@ An escalation item that has no GitHub issue when write_task_output is called is 
 
 **This step runs after the detection pass and before you write the sweep output file.**
 
-Read `~/lobster-workspace/oracle/learnings.md`. If the file does not exist, note its absence and skip this step.
+Read `~/lobster/oracle/learnings.md`. If the file does not exist, note its absence and skip this step.
 
 **Before filing any escalation items with the `learning-not-remediated` label, ensure the label exists in the repo:**
 ```bash
