@@ -777,3 +777,100 @@ conn.close()
         substep "Created empty $MESSAGES_CONFIG_DIR/group-whitelist.json"
         migrated=$((migrated + 1))
     fi
+
+    # d11: Register learnings-proposals scheduled job
+    # Weekly job that reads oracle/learnings.md entries from the past week and
+    # appends a new proposal entry to ~/lobster-workspace/meta/proposals.md.
+    # proposals-digest.py handles delivery; this job only writes.
+    local learnings_proposals_task="$LOBSTER_DIR/scheduled-tasks/tasks/learnings-proposals.md"
+    if [ ! -f "$learnings_proposals_task" ]; then
+        mkdir -p "$LOBSTER_DIR/scheduled-tasks/tasks"
+        cat > "$learnings_proposals_task" << 'LEARNINGS_PROPOSALS_TASK'
+# Learnings Proposals
+
+**Job**: learnings-proposals
+**Schedule**: Weekly on Sundays at 4:00 AM UTC (`0 4 * * 0`)
+**Created**: 2026-04-13
+
+## Context
+
+You are running as a scheduled task. Your purpose is to read the week's oracle learnings and generate actionable proposals for `meta/proposals.md`.
+
+## Instructions
+
+### 1. Read oracle/learnings.md
+
+Read `~/lobster-workspace/oracle/learnings.md` (Layer 2 archive section preferred; fall back to Layer 1 index if Layer 2 is empty).
+
+Filter to entries dated within the past 7 days. If no entries exist in that window, write a task output noting "No new learnings this week — no proposal generated" and exit.
+
+### 2. Read existing proposals
+
+Read `~/lobster-workspace/meta/proposals.md` to understand existing proposals and avoid duplicating themes already covered.
+
+### 3. Generate a proposal
+
+Based on the week's learnings, write a proposal that answers: "Given what oracle review surfaced this week, what concrete system improvement would address the underlying pattern?"
+
+Requirements for the proposal:
+- Must be actionable (a specific change, not a vague suggestion)
+- Must reference the learning(s) that motivated it (by date and PR number)
+- Must state what the expected outcome would be if implemented
+
+### 4. Append to proposals.md
+
+Append a new entry to `~/lobster-workspace/meta/proposals.md` in this exact format:
+
+```
+### [YYYY-MM-DD] Learnings-driven: <short title>
+
+**Signals processed:** <count of learnings entries from this week>
+
+**Source learnings:**
+- [YYYY-MM-DD] PR #NNN — <learning summary>
+
+**Proposal:** <the concrete proposal>
+
+**Expected outcome:** <what changes if this is implemented>
+```
+
+Use today's date for the heading. Do not add a delivered marker — the `proposals-digest` job handles delivery.
+
+## Output
+
+Call `write_task_output` with:
+- job_name: "learnings-proposals"
+- output: Summary of what was written (or why nothing was written)
+- status: "success" or "failed"
+LEARNINGS_PROPOSALS_TASK
+        substep "Created learnings-proposals task file in scheduled-tasks/tasks/"
+        migrated=$((migrated + 1))
+    fi
+    if [ -f "$JOBS_FILE" ] && command -v jq >/dev/null 2>&1; then
+        if ! jq -e '.jobs["learnings-proposals"]' "$JOBS_FILE" > /dev/null 2>&1; then
+            local lp_now_iso
+            lp_now_iso=$(date -u +"%Y-%m-%dT%H:%M:%S.%6N+00:00")
+            TMP_JOBS=$(mktemp)
+            jq --arg now "$lp_now_iso" '.jobs["learnings-proposals"] = {
+                "name": "learnings-proposals",
+                "schedule": "0 4 * * 0",
+                "schedule_human": "Weekly on Sundays at 4:00 AM UTC",
+                "task_file": "tasks/learnings-proposals.md",
+                "created_at": $now,
+                "updated_at": $now,
+                "enabled": true
+            }' "$JOBS_FILE" > "$TMP_JOBS" && mv "$TMP_JOBS" "$JOBS_FILE"
+            substep "Registered learnings-proposals job in jobs.json (weekly Sundays at 04:00 UTC)"
+            migrated=$((migrated + 1))
+        fi
+    fi
+    local LP_MARKER="# LOBSTER-SCHEDULED-LEARNINGS-PROPOSALS"
+    if ! crontab -l 2>/dev/null | grep -q "$LP_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$LP_MARKER" \
+            "0 4 * * 0 $LOBSTER_DIR/scheduled-tasks/dispatch-job.sh learnings-proposals $LP_MARKER"
+        substep "Added learnings-proposals cron entry (weekly Sundays at 04:00 UTC)"
+        migrated=$((migrated + 1))
+    else
+        substep "learnings-proposals crontab entry already present"
+    fi
+
