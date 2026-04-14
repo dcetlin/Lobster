@@ -969,3 +969,26 @@ PR #727 is approved for merge. Three path references correctly updated. One rema
 
 **Opportunity cost note:** No production features deferred. The only marginal cost is the stale docstring not being corrected alongside the assertion fix — a one-line change that was not made.
 
+
+
+---
+
+### [2026-04-14] Design decision: oracle document review protocol
+
+**Vision alignment:** The system's stated phase intent is to build a substrate that lets every agent make intent-anchored decisions. The oracle's existing code-review protocol operationalizes this for code PRs: it names the failure mode before seeing the implementation, then adjudicates whether the implementation forecloses better paths. Document artifacts -- bootup docs, agent definitions, protocol specs, context files -- are at least as load-bearing as code in this substrate. They encode the behavioral contracts that all agents operate under. A code PR that ships a wrong algorithm is wrong in one place; a document that encodes a wrong premise propagates that premise into every agent session that reads it. Yet documents have no external adjudicator: unlike code, there are no tests to run. The adversarial prior does not transfer cleanly -- "this document is solving the wrong problem" must be cashed out as "this document makes something invisible that matters." The vision alignment for this protocol extension: principle-5 ("when a behavioral rule isn't followed, improve the discriminator") is a document-governance principle as much as a gate-table principle. This protocol gives the oracle a decision-procedural discriminator for document review rather than an open-ended "is this good?" question.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- The key structural transfer from code review is not the gate (APPROVED/NEEDS_CHANGES) but the requirement that NEEDS_CHANGES names a specific thing that must change. For code, this is a failing behavior. For documents, this is a named gap -- something the document makes invisible that a reader would need to know. The three-path resolution contract (addressed / disputed / deferred) replaces the binary "fixed it" that works for code bugs but fails for documents, where a gap may be intentionally out of scope.
+- The revision contract's three paths are necessary because documents have legitimate reasons not to address every gap: scope constraints, deliberate deferral, or genuine disagreement with the oracle's interpretation. The "disputed" path is the accountability mechanism -- it requires the author to state a specific reason for disagreement rather than silently omitting the gap. Without it, "I didn't fix gap 2" is indistinguishable from "I disagree that gap 2 is a gap."
+- Prior gap tracking (enumerating previous named gaps and their status before issuing a new verdict) closes the cycle that code re-review relies on test-rerun to close. Without this, a document can be re-reviewed on the second pass without the oracle knowing whether the first pass's gaps were addressed, creating the appearance of resolution without the substance.
+- The "interpretation finding" field forces the oracle to take a position in disputable terms -- not "this document is incomplete" but "this document treats X as settled when a reader would need to know Y to evaluate that claim." This is the minimum requirement for accountable review of interpretation.
+
+**Patterns introduced:** Named-gap citation structure as the document analog of failing-test citation. Three-path gap resolution (addressed/disputed/deferred) as the accountability mechanism for document revision cycles. Prior gap tracking as the document analog of test-rerun for code re-review.
+
+**What this forecloses:** Open-ended "improve it" review cycles where a document can be revised without tracing revisions to named gaps. This is the primary failure mode the protocol exists to prevent -- generic improvement that satisfies the form of revision without closing the specific interpretive gap the oracle identified.
+
+**Opportunity cost note:** No tooling, automation, or new files were built. The protocol is entirely expressed in the oracle agent definition and this decisions.md entry. The cost of not having this: document artifacts in the system accumulate without accountable review, and the oracle has no decision-procedural basis for document verdicts. This has been true since the oracle was introduced. The cost was diffuse (every document reviewed without the named-gap structure) rather than acute.
+
+**VERDICT: APPROVED**
