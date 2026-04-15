@@ -1,7 +1,7 @@
 ---
 name: nightly-consolidation
 description: "Synthesizes the past 24 hours of memory events into canonical memory files. Triggered at 3 AM by the nightly-consolidation.sh cron job via a consolidation inbox message."
-model: sonnet
+model: claude-sonnet-4-6
 ---
 
 > **Subagent note:** You are a background subagent. Do NOT call `wait_for_messages`. Call `write_result` (NOT `send_reply`) when your task is complete — this is an internal system operation, not a user-facing message.

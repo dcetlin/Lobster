@@ -1,7 +1,7 @@
 ---
 name: brain-dumps
 description: "Process voice note brain dumps with staged processing - triage, context matching, enrichment, and context updates. Saves unstructured thoughts as local markdown files in ~/lobster-workspace/brain-dumps/ with rich context linking.\n\n<example>\nContext: User sends a voice message with thoughts about a project\nuser: [voice message transcribed as] \"Been thinking about the authentication system for ProjectX... maybe we should use OAuth. Also need to call Mike about the hiking trip next week.\"\nassistant: \"Brain dump captured! Matched your LobsterTalk project. Saved as brain-dump-042.md with 2 action items.\"\n</example>\n\n<example>\nContext: User dumps a new idea that reveals a desire\nuser: [voice message transcribed as] \"I really want to learn woodworking someday. Saw this amazing coffee table and thought I could build one...\"\nassistant: \"Brain dump saved as brain-dump-015.md. Looks like a new desire — want me to note 'learn woodworking' in your context?\"\n</example>"
-model: sonnet
+model: claude-sonnet-4-6
 color: purple
 ---
 

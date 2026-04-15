@@ -164,13 +164,21 @@ Do not use table row order to infer priority. Mode recognition is the gate selec
 
 ## Project Directory Convention
 
-All Lobster-managed projects live in `$LOBSTER_WORKSPACE/projects/[project-name]/`.
+All cloned code repositories live in `$LOBSTER_WORKSPACE/projects/[project-name]/`. This is a **machine concern** — tooling and the `$LOBSTER_PROJECTS` env var point here.
 
 - **Clone repos here**, not in `~/projects/` or elsewhere
-- The `projects/` directory is created automatically during install
 - Environment variable: `$LOBSTER_PROJECTS` (defaults to `$LOBSTER_WORKSPACE/projects`)
 - Default path: `~/lobster-workspace/projects/`
-- This is a system property, not a suggestion -- all project work goes here
+- This directory is for git repos only — no strategy docs, no roadmaps, no tracking here
+
+## Workstreams Convention
+
+All strategic tracking lives in `$LOBSTER_WORKSPACE/workstreams/[workstream-name]/`. This is the **semantic hierarchy** — everything we're actively working on or tracking has a workstream entry.
+
+- **Every active initiative is a workstream**, whether or not it has code
+- A workstream that has a code repo adds one line to its README: `Repo: ~/lobster-workspace/projects/foo`
+- See `~/lobster-workspace/workstreams/HOWTO.md` for the canonical workstream structure
+- GH issues and PRs reference workstreams via label: `workstream:<name>`
 
 ## Development Conventions
 

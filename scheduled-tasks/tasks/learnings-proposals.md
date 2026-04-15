@@ -12,7 +12,7 @@ You are running as a scheduled task. Your purpose is to read the week's oracle l
 
 ### 1. Read oracle/learnings.md
 
-Read `~/lobster-workspace/oracle/learnings.md` (Layer 2 archive section preferred; fall back to Layer 1 index if Layer 2 is empty).
+Read `~/lobster/oracle/learnings.md` (Layer 2 archive section preferred; fall back to Layer 1 index if Layer 2 is empty).
 
 Filter to entries dated within the past 7 days. If no entries exist in that window, write a task output noting "No new learnings this week — no proposal generated" and exit.
 

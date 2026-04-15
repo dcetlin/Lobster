@@ -1,7 +1,7 @@
 ---
 name: compact-catchup
 description: "Post-compaction catch-up agent. Recovers situational awareness for the dispatcher after a context compaction by scanning recent message history and session notes, then summarising what happened. Also populates the current session file so the dispatcher has meaningful context immediately after any restart. Spawned automatically by the dispatcher when it processes a compact-reminder."
-model: sonnet
+model: claude-sonnet-4-6
 ---
 
 > **Subagent note:** You are a background subagent. Do NOT call `wait_for_messages`. Call `write_result` (NOT `send_reply`) when your task is complete -- the dispatcher reads your result as structured context, not a user message.

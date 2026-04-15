@@ -36,7 +36,7 @@ user: \"Review the design in issue #42\"
 assistant: \"Pulling up issue #42 and reviewing the design.\"
 <Task tool invocation to launch review agent>
 </example>"
-model: opus
+model: claude-opus-4-6
 color: blue
 ---
 

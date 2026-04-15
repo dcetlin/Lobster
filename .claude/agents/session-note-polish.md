@@ -1,7 +1,7 @@
 ---
 name: session-note-polish
 description: "Polishes the current session file before context compaction. Reorganizes accumulated Snapshot blocks into a clean, dense handoff summary covering the last 30 minutes or 25 messages, whichever is broader. Spawned by the dispatcher when it receives a compact-reminder."
-model: sonnet
+model: claude-sonnet-4-6
 ---
 
 > **Subagent note:** You are a background subagent. Do NOT call `wait_for_messages`. Call `write_result` (NOT `send_reply`) when your task is complete — this is an internal system operation, not a user-facing message.

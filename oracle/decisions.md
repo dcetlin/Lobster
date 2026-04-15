@@ -924,3 +924,26 @@ Dan approved this PR explicitly with the condition that authority headers be add
 
 PR #727 is approved for merge. Three path references correctly updated. One remaining path inconsistency (`negentropic-sweep.md` line 57) noted but out of scope for this PR — recommend filing a follow-on issue.
 
+
+---
+
+### [2026-04-09] PR #739 — fix(tests): resolve 18 integration test failures
+
+**Vision alignment:** The PR's claim is that 18 pre-existing integration test failures were caused by test-infrastructure drift against production code changes, and that no production behavior is incorrect. Stage 1 adversarial prior: test fixes can paper over production bugs by lowering assertion bars to accept incorrect production output. The specific risk here is that the `pending → ready-for-steward` assertion change reflects tests being updated to accept incorrect production behavior rather than tests correcting a stale expectation. What would have to be true for this to be the right path: (1) `approve()` genuinely and correctly auto-advances atomically past `pending`, (2) `first_execution` genuinely maps to `orienting` in ADR-004 vocabulary, (3) `updated_at` is genuinely the age anchor in the executor orphan sweep, and (4) `lifetime_cycles` genuinely drives the hard_cap check. All four are verifiable against production code and were confirmed in Stage 2. The PR is aligned with vision.yaml principle-4 ("Wire what exists before building more"): a test suite with 18 failures against current production behavior is not wired. Restoring test reliability without touching production code is the minimum viable correctness step before any further substrate work can be trusted.
+
+**Alignment verdict:** Confirmed
+
+**VERDICT: APPROVED**
+
+**Quality finding:**
+- **All four root causes trace cleanly to production code changes that were not mirrored in test stubs.** `IssueInfo` as a typed dataclass (dict stubs failing attribute access), `approve()` atomic two-step transition (pending no longer a resting state), `updated_at` as the executor-orphan age anchor (not `created_at`), and `_determine_trace_posture()` mapping `first_execution → "orienting"` per ADR-004 — each is directly verifiable in the production code and correctly identified as the root cause.
+- **The `TestBootupCandidateGate` assertion change is semantically correct but introduces a stale docstring problem.** The class docstring still reads "stays in 'pending' until the gate is cleared" and `_seed_uow`'s docstring still reads "approve-to-pending steps" — both are now wrong. The assertions are correct; the documentation is not. This is a low-severity correctness gap but matches the learnings.md pattern "comment/code mismatch at state-machine transition causes silent state divergence" (PR #607). No test reader can understand the gate contract from the stale docstrings.
+- **The hard_cap/lifetime_cycles fix is sound.** Production code at line 651-652 of steward.py is unambiguous: `cycles = uow.lifetime_cycles; if cycles >= _HARD_CAP_CYCLES`. Setting `steward_cycles` in the test was inert — it could never trigger the hard_cap branch. Setting `lifetime_cycles` is correct. The fallback trace entry lookup (searching by anomalies content rather than cycle number) correctly accounts for the fact that `cycle` in a trace entry records `steward_cycles` (per-attempt), which is 0 when the test fires from a fresh UoW even though `lifetime_cycles` was set to the cap.
+- **The executor orphan fix (backdating both `created_at` and `updated_at`) is the minimal correct fix.** startup-sweep.py line 356 explicitly uses `updated_at` as the age anchor with `created_at` as a fallback — the prior test backdated only `created_at`, leaving `updated_at` at now, so the UoW appeared fresh. The precondition assertion is also updated to verify both fields are backdated, which correctly anchors the test contract against future changes to the age anchor logic.
+
+**Patterns introduced:** `IssueInfo` stub pattern (returning typed dataclass from github_client stubs) is now consistent across all 5 test files — this is the correct pattern and propagates a uniform stub contract. The anomalies-content-based trace entry lookup (rather than cycle-number-based) is a sound adaptation to a two-counter world (`steward_cycles` per-attempt vs `lifetime_cycles` cumulative), but search-by-content is weaker than search-by-identity — if a future cycle also has anomalies, the lookup returns the first one, which may not be the stuck-condition entry.
+
+**What this forecloses:** Stale docstrings in `TestBootupCandidateGate` (class docstring and `_seed_uow` docstring) are not corrected. A future test author reading the class docstring will have an incorrect mental model of the gate contract. The PR does not foreclose any production paths.
+
+**Opportunity cost note:** No production features deferred. The only marginal cost is the stale docstring not being corrected alongside the assertion fix — a one-line change that was not made.
+

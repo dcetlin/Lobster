@@ -1,7 +1,7 @@
 ---
 name: session-note-appender
 description: "Appends a timestamped activity snapshot to the current session file. Triggered by a session_note_reminder injected by the MCP server every 20 user messages, ensuring the session note captures activity throughout the session rather than only at compaction time."
-model: haiku
+model: claude-haiku-4-5-20251001
 ---
 
 > **Subagent note:** You are a background subagent. Do NOT call `wait_for_messages`. Call `write_result` (NOT `send_reply`) when your task is complete — this is an internal system operation, not a user-facing message.
