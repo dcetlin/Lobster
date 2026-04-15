@@ -22,6 +22,7 @@ if str(_MCP_DIR) not in sys.path:
 # Pre-load the module so that unittest.mock can resolve "src.mcp.inbox_server"
 # as an attribute of the `src.mcp` package before patch.multiple opens.
 import src.mcp.inbox_server  # noqa: F401
+from src.mcp.inbox_server import VALID_OUTCOME_CATEGORIES
 
 # We'll test the handlers directly by importing them
 # and patching the directory constants
@@ -1271,9 +1272,6 @@ class TestEnqueueRecoveryNotification:
 # Tests for outcome_category field on write_result (issue #754)
 # ---------------------------------------------------------------------------
 
-VALID_CATEGORIES = ["heat", "shit", "seed", "pearl"]
-
-
 class TestWriteResultOutcomeCategory:
     """write_result stores outcome_category in the inbox message and the outcome ledger.
 
@@ -1307,7 +1305,7 @@ class TestWriteResultOutcomeCategory:
         assert len(inbox_files) == 1, f"Expected 1 inbox file, found {len(inbox_files)}"
         return json.loads(inbox_files[0].read_text())
 
-    @pytest.mark.parametrize("category", VALID_CATEGORIES)
+    @pytest.mark.parametrize("category", VALID_OUTCOME_CATEGORIES)
     def test_valid_category_stored_in_inbox_message(self, dirs, category):
         """Each valid outcome_category value is persisted in the inbox message JSON."""
         msg = self._run_write_result(
@@ -1346,7 +1344,7 @@ class TestWriteResultOutcomeCategory:
             "Invalid outcome_category should not appear in inbox message"
         )
 
-    @pytest.mark.parametrize("category", VALID_CATEGORIES)
+    @pytest.mark.parametrize("category", VALID_OUTCOME_CATEGORIES)
     def test_valid_category_appended_to_outcome_ledger(self, dirs, category):
         """Each valid outcome_category value is appended to the outcome ledger JSONL."""
         import asyncio
@@ -1392,7 +1390,7 @@ class TestWriteResultOutcomeCategory:
         import asyncio
         from src.mcp.inbox_server import handle_write_result
 
-        for i, category in enumerate(VALID_CATEGORIES):
+        for i, category in enumerate(VALID_OUTCOME_CATEGORIES):
             asyncio.run(handle_write_result({
                 "task_id": f"multi-{i}",
                 "chat_id": 300 + i,
@@ -1404,9 +1402,9 @@ class TestWriteResultOutcomeCategory:
         ledger_file = dirs["outcome_ledger"]
         assert ledger_file.exists()
         entries = [json.loads(line) for line in ledger_file.read_text().splitlines() if line.strip()]
-        assert len(entries) == len(VALID_CATEGORIES)
+        assert len(entries) == len(VALID_OUTCOME_CATEGORIES)
         recorded_categories = [e["outcome_category"] for e in entries]
-        assert sorted(recorded_categories) == sorted(VALID_CATEGORIES)
+        assert sorted(recorded_categories) == sorted(VALID_OUTCOME_CATEGORIES)
 
     def test_outcome_category_preserved_through_subagent_notification_type(self, dirs):
         """outcome_category is stored even when sent_reply_to_user=True (subagent_notification)."""
