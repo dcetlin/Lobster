@@ -121,6 +121,9 @@ def isolate_inbox_server_paths(tmp_path: Path):
     state_file = messages / "config" / "lobster-state.json"
     log_dir = workspace / "logs"
 
+    outcome_ledger = workspace / "data" / "outcome-ledger.jsonl"
+    (workspace / "data").mkdir(parents=True, exist_ok=True)
+
     dirs_result = {
         "base": messages,
         "inbox": messages / "inbox",
@@ -144,6 +147,8 @@ def isolate_inbox_server_paths(tmp_path: Path):
         "scheduled_tasks_logs": sched / "logs",
         # BIS-165 Slice 4: redirected DB path for tests that write to messages.db
         "messages_db": messages / "messages.db",
+        # Issue #754: outcome category ledger
+        "outcome_ledger": outcome_ledger,
     }
 
     # Ensure the module is in sys.modules before patching.  patch.multiple
@@ -192,6 +197,8 @@ def isolate_inbox_server_paths(tmp_path: Path):
             SCHEDULED_TASKS_LOGS_DIR=sched / "logs",
             # BIS-165 Slice 4: isolate DB path so tests never touch production messages.db
             MESSAGES_DB_PATH=messages / "messages.db",
+            # Issue #754: isolate outcome ledger so tests never write to production data/
+            OUTCOME_LEDGER_FILE=outcome_ledger,
         )
         if _test_claims_db is not None:
             # Issue #1360: isolate claim DB so SQLite claim rows don't bleed

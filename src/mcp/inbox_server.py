@@ -534,6 +534,14 @@ MESSAGES_DB_PATH = Path(
 )
 LOBSTER_TMUX_SESSION = os.environ.get("LOBSTER_TMUX_SESSION", "lobster")
 
+# Valid metabolic value categories for write_result outcome_category field (issue #754).
+# Self-assessed by the completing subagent; stored alongside the result for flamegraph queries.
+VALID_OUTCOME_CATEGORIES: frozenset[str] = frozenset({"heat", "shit", "seed", "pearl"})
+# Outcome category ledger: append-only JSONL recording {task_id, outcome_category, source, ts}
+# for every write_result call that includes outcome_category. Used by token-flamegraph.sh
+# to render the category breakdown axis without touching the token-ledger schema.
+OUTCOME_LEDGER_FILE = _WORKSPACE / "data" / "outcome-ledger.jsonl"
+
 # Instance identity for multi-instance deployments (BIS-85).
 # Prefer an explicit observability token; fall back to hostname so reports are
 # always attributed to the Lobster instance that filed them.
@@ -2453,6 +2461,19 @@ async def list_tools() -> list[Tool]:
                             "result to the user."
                         ),
                         "default": False,
+                    },
+                    "outcome_category": {
+                        "type": "string",
+                        "description": (
+                            "Optional metabolic value tag for this result. Self-assessed by the subagent — "
+                            "the completing agent has the most context to categorize honestly. "
+                            "heat: pure dissipation, no residue (empty checks, healthy no-ops). "
+                            "shit: organic waste that persists and must be processed (stale notes, unread accumulation). "
+                            "seed: intentional investment in future capability (infra fixes, tooling, instrumentation). "
+                            "pearl: direct high-value output (bugs caught, frameworks encoded, analysis acted on). "
+                            "Omit if the outcome does not fit any category."
+                        ),
+                        "enum": ["heat", "shit", "seed", "pearl"],
                     },
                 },
                 "required": ["task_id", "chat_id", "text"],
@@ -7416,6 +7437,12 @@ async def handle_write_result(args: dict) -> list[TextContent]:
     status = args.get("status", "success")
     artifacts = args.get("artifacts") or []
     thread_ts = args.get("thread_ts")
+    outcome_category_raw = args.get("outcome_category")
+    outcome_category = (
+        outcome_category_raw
+        if outcome_category_raw in VALID_OUTCOME_CATEGORIES
+        else None
+    )
     # Accept new name (sent_reply_to_user) with backward-compat alias (forward).
     # Semantics: sent_reply_to_user=True means subagent already called send_reply →
     # dispatcher should NOT relay. This is the inverse of the old `forward` field.
@@ -7490,9 +7517,28 @@ async def handle_write_result(args: dict) -> list[TextContent]:
         message["artifacts"] = artifacts
     if thread_ts:
         message["thread_ts"] = thread_ts
+    if outcome_category is not None:
+        message["outcome_category"] = outcome_category
 
     inbox_file = INBOX_DIR / f"{message_id}.json"
     atomic_write_json(inbox_file, message)
+
+    # Issue #754: persist outcome_category to the outcome ledger for flamegraph queries.
+    # Append-only JSONL; failures are non-fatal (observability, not correctness).
+    if outcome_category is not None:
+        try:
+            import time as _time
+            ledger_entry = json.dumps({
+                "ts": int(_time.time()),
+                "task_id": task_id,
+                "outcome_category": outcome_category,
+                "source": source,
+            })
+            OUTCOME_LEDGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(OUTCOME_LEDGER_FILE, "a") as _lf:
+                _lf.write(ledger_entry + "\n")
+        except Exception as _exc:
+            log.warning(f"write_result: failed to append outcome_category to ledger: {_exc}")
 
     # BIS-167 Slice 6: persist agent event immediately on write_result.
     # Before auto-unregister so the record is in the DB even if the dispatcher crashes.

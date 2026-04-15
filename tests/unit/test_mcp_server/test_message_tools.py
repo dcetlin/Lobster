@@ -1265,3 +1265,158 @@ class TestEnqueueRecoveryNotification:
             _enqueue_recovery_notification({"task_id": "x", "text": ""})
 
         assert list(inbox_dir.glob("*.json")) == []
+
+
+# ---------------------------------------------------------------------------
+# Tests for outcome_category field on write_result (issue #754)
+# ---------------------------------------------------------------------------
+
+VALID_CATEGORIES = ["heat", "shit", "seed", "pearl"]
+
+
+class TestWriteResultOutcomeCategory:
+    """write_result stores outcome_category in the inbox message and the outcome ledger.
+
+    The outcome_category field is optional and self-assessed by the subagent.
+    Valid values: heat, shit, seed, pearl.
+    Invalid or missing values are silently ignored (field absent from message).
+    """
+
+    @pytest.fixture
+    def dirs(self, inbox_server_dirs):
+        return inbox_server_dirs
+
+    def _run_write_result(self, dirs, *, task_id, chat_id, text, outcome_category=None, **extra):
+        """Helper: call handle_write_result and return the written inbox message."""
+        import asyncio
+        from src.mcp.inbox_server import handle_write_result
+
+        call_args = {
+            "task_id": task_id,
+            "chat_id": chat_id,
+            "text": text,
+            "source": "telegram",
+            **extra,
+        }
+        if outcome_category is not None:
+            call_args["outcome_category"] = outcome_category
+
+        asyncio.run(handle_write_result(call_args))
+
+        inbox_files = list(dirs["inbox"].glob("*.json"))
+        assert len(inbox_files) == 1, f"Expected 1 inbox file, found {len(inbox_files)}"
+        return json.loads(inbox_files[0].read_text())
+
+    @pytest.mark.parametrize("category", VALID_CATEGORIES)
+    def test_valid_category_stored_in_inbox_message(self, dirs, category):
+        """Each valid outcome_category value is persisted in the inbox message JSON."""
+        msg = self._run_write_result(
+            dirs,
+            task_id=f"test-{category}",
+            chat_id=100,
+            text=f"Result for {category}",
+            outcome_category=category,
+        )
+        assert msg.get("outcome_category") == category, (
+            f"Expected outcome_category={category!r} in inbox message, got {msg.get('outcome_category')!r}"
+        )
+
+    def test_missing_category_not_present_in_message(self, dirs):
+        """When outcome_category is omitted, the field is absent from the inbox message."""
+        msg = self._run_write_result(
+            dirs,
+            task_id="test-no-category",
+            chat_id=101,
+            text="Result without category",
+        )
+        assert "outcome_category" not in msg, (
+            "outcome_category should be absent when not provided"
+        )
+
+    def test_invalid_category_silently_dropped(self, dirs):
+        """An unrecognized outcome_category value is silently dropped (not stored)."""
+        msg = self._run_write_result(
+            dirs,
+            task_id="test-invalid-category",
+            chat_id=102,
+            text="Result with invalid category",
+            outcome_category="trash",  # not a valid category
+        )
+        assert "outcome_category" not in msg, (
+            "Invalid outcome_category should not appear in inbox message"
+        )
+
+    @pytest.mark.parametrize("category", VALID_CATEGORIES)
+    def test_valid_category_appended_to_outcome_ledger(self, dirs, category):
+        """Each valid outcome_category value is appended to the outcome ledger JSONL."""
+        import asyncio
+        from src.mcp.inbox_server import handle_write_result
+
+        asyncio.run(handle_write_result({
+            "task_id": f"ledger-test-{category}",
+            "chat_id": 200,
+            "text": f"Ledger test for {category}",
+            "source": "telegram",
+            "outcome_category": category,
+        }))
+
+        ledger_file = dirs["outcome_ledger"]
+        assert ledger_file.exists(), "outcome ledger file should be created"
+
+        entries = [json.loads(line) for line in ledger_file.read_text().splitlines() if line.strip()]
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["outcome_category"] == category
+        assert entry["task_id"] == f"ledger-test-{category}"
+        assert "ts" in entry
+
+    def test_missing_category_does_not_write_ledger_entry(self, dirs):
+        """When outcome_category is omitted, no entry is appended to the ledger."""
+        import asyncio
+        from src.mcp.inbox_server import handle_write_result
+
+        asyncio.run(handle_write_result({
+            "task_id": "no-category-ledger",
+            "chat_id": 201,
+            "text": "No category, no ledger write",
+            "source": "telegram",
+        }))
+
+        ledger_file = dirs["outcome_ledger"]
+        assert not ledger_file.exists() or ledger_file.read_text().strip() == "", (
+            "Ledger should not be written when outcome_category is absent"
+        )
+
+    def test_multiple_categories_accumulate_in_ledger(self, dirs):
+        """Multiple write_result calls append independent entries to the ledger."""
+        import asyncio
+        from src.mcp.inbox_server import handle_write_result
+
+        for i, category in enumerate(VALID_CATEGORIES):
+            asyncio.run(handle_write_result({
+                "task_id": f"multi-{i}",
+                "chat_id": 300 + i,
+                "text": f"Entry {i}",
+                "source": "telegram",
+                "outcome_category": category,
+            }))
+
+        ledger_file = dirs["outcome_ledger"]
+        assert ledger_file.exists()
+        entries = [json.loads(line) for line in ledger_file.read_text().splitlines() if line.strip()]
+        assert len(entries) == len(VALID_CATEGORIES)
+        recorded_categories = [e["outcome_category"] for e in entries]
+        assert sorted(recorded_categories) == sorted(VALID_CATEGORIES)
+
+    def test_outcome_category_preserved_through_subagent_notification_type(self, dirs):
+        """outcome_category is stored even when sent_reply_to_user=True (subagent_notification)."""
+        msg = self._run_write_result(
+            dirs,
+            task_id="notification-with-category",
+            chat_id=400,
+            text="Already sent directly.",
+            outcome_category="pearl",
+            sent_reply_to_user=True,
+        )
+        assert msg["type"] == "subagent_notification"
+        assert msg.get("outcome_category") == "pearl"
