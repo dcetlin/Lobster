@@ -199,4 +199,83 @@ calls_s = f"{total_count} call{'s' if total_count != 1 else ''}"
 print(f"  {'TOTAL':<{max_source_len if sorted_sources else 8}}  {'':<{BAR_WIDTH}}  {total_in_s:>10} in / {total_out_s} out | cache_read: {cache_read_s} | cache_write: {cache_write_s} | {calls_s}")
 PYEOF
 
+# ---------------------------------------------------------------------------
+# Outcome category breakdown (issue #754)
+# Reads outcome-ledger.jsonl and shows counts per metabolic category in the
+# same time window. Skipped silently if the ledger doesn't exist yet.
+# ---------------------------------------------------------------------------
+OUTCOME_LEDGER_FILE="${WORKSPACE}/data/outcome-ledger.jsonl"
+
+if [[ -f "${OUTCOME_LEDGER_FILE}" && -s "${OUTCOME_LEDGER_FILE}" ]]; then
+python3 - "${OUTCOME_LEDGER_FILE}" "${SINCE_S}" "${NOW_S}" "${WINDOW}" <<'PYEOF_OUTCOME'
+import sys
+import json
+from collections import defaultdict
+
+outcome_ledger_path = sys.argv[1]
+since_s = int(sys.argv[2])
+now_s = int(sys.argv[3])
+window = sys.argv[4]
+
+# Category display order and descriptions
+CATEGORY_ORDER = ["pearl", "seed", "heat", "shit"]
+CATEGORY_LABEL = {
+    "pearl": "pearl  direct high-value output (bugs caught, frameworks encoded, analysis acted on)",
+    "seed":  "seed   intentional investment in future capability (infra, tooling, instrumentation)",
+    "heat":  "heat   pure dissipation, no residue (empty checks, healthy no-ops)",
+    "shit":  "shit   organic waste that must be processed (stale notes, unread accumulation)",
+}
+
+counts = defaultdict(int)
+total = 0
+
+with open(outcome_ledger_path) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ts = entry.get("ts", 0)
+        if ts < since_s or ts > now_s:
+            continue
+        cat = entry.get("outcome_category", "")
+        if cat:
+            counts[cat] += 1
+            total += 1
+
+if not counts:
+    print()
+    print("  Outcome categories: (none tagged in this window)")
+    sys.exit(0)
+
+print()
+print("  Outcome category breakdown (self-assessed):")
+print()
+
+BAR_WIDTH = 12
+FULL_BLOCK = "█"
+LIGHT_BLOCK = "░"
+
+# Show known categories in fixed order, then any unknown values
+display_order = CATEGORY_ORDER + [k for k in sorted(counts) if k not in CATEGORY_ORDER]
+
+for cat in display_order:
+    if cat not in counts:
+        continue
+    n = counts[cat]
+    pct = (n / total * 100) if total > 0 else 0
+    filled = round(BAR_WIDTH * pct / 100)
+    filled = max(1, min(filled, BAR_WIDTH)) if n > 0 else 0
+    bar = FULL_BLOCK * filled + LIGHT_BLOCK * (BAR_WIDTH - filled)
+    label = CATEGORY_LABEL.get(cat, cat)
+    print(f"  {bar}  {n:3d} ({pct:3.0f}%)  {label}")
+
+print()
+print(f"  Total tagged: {total} write_result call{'s' if total != 1 else ''}")
+PYEOF_OUTCOME
+fi
+
 exit 0
