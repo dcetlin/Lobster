@@ -275,7 +275,7 @@ NOW_S=$(date +%s)
 
 mkdir -p "$(dirname "${LEDGER_FILE}")" 2>/dev/null || true
 
-ENTRY=$(jq -n \
+ENTRY=$(jq -cn \
   --argjson ts "${NOW_S}" \
   --arg source "${SOURCE_TAG}" \
   --arg task_id "${TASK_ID_VAL}" \
