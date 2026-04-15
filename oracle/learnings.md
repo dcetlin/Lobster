@@ -35,6 +35,12 @@ Patterns and antipatterns surfaced through oracle review. These inform future de
 | 2026-04-09 | #738 | Direct SQL field injection in tests signals an unsealed public API seam — when a field must be set via SQL because the upsert API doesn't accept it yet, document the seam explicitly so a future API addition is not a surprise |
 
 
+### Timezone Handling
+
+| Date | PR | Learning |
+|------|----|----------|
+| 2026-04-15 | #753 | Hardcoded UTC offset `timezone(timedelta(hours=-4))` drifts during EST (November through mid-March) — use `zoneinfo.ZoneInfo("America/New_York")` instead |
+
 ### Document Review
 
 | Date | Context | Learning |
@@ -905,6 +911,12 @@ Both `test_wos_simple_arc.py` and `test_wos_e2e_harness.py` inject `vision_ref` 
 
 When an oracle agent's instruction file specifies path A for output and the code/merge gate reads from path B, two independent files accumulate content over time. The workspace file (`~/lobster-workspace/oracle/decisions.md`, 989KB) and the repo file (`~/lobster/oracle/decisions.md`, 58KB) both had real content, with the workspace file holding the older accumulated history and the repo file holding recent commits. The fix (correcting the instruction text) closes future writes to the right path but does not migrate stranded history. Detection: any time an oracle file path appears in both an instruction document and a code constant (`paths.py`), verify they point to the same resolved location. If both paths exist on disk with content, a split has occurred and migration is needed alongside the instruction fix. Additional note: when correcting oracle write paths, enumerate all instruction files that reference the old path — in this case, `negentropic-sweep.md` line 57 was missed and still reads from the workspace path, creating a residual inconsistency.
 
+
+---
+
+### [2026-04-15] Pattern: hardcoded UTC offset diverges from local time during DST transitions
+
+`timezone(timedelta(hours=-4))` hardcodes Eastern Daylight Time (EDT) and is wrong for approximately 4 months per year (November through mid-March, when Eastern Standard Time is UTC-5). The failure is silent: timestamps are rendered one hour off, which is tolerable in a CLI analytical tool but accumulates into misleading historical records if the output is persisted. The correct pattern for any code displaying times to a US/Eastern user is `zoneinfo.ZoneInfo("America/New_York")` (stdlib from Python 3.9+). Applied in `scripts/usage-retro.py` (PR #753). Detection: when reviewing any Python file that uses `timezone(timedelta(hours=N))` for a named timezone, flag it — named timezones are not fixed offsets. The pattern is especially common in scripts that are written during DST when the current offset is correct and the off-season failure is not visible.
 
 ---
 
