@@ -27,7 +27,7 @@ Steps:
 3. If the branch IS 'local-dev': no action needed (do not send a reply)
 4. call write_result(task_id='debug-branch-check', chat_id=0, source='system', text='Branch check complete. Branch: <branch>. Alert sent: <yes/no>.', status='success')
 """,
-    subagent_type="general-purpose",
+    subagent_type="lobster-generalist",
     run_in_background=True,
 )
 ```
