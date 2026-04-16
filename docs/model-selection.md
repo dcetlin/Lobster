@@ -50,7 +50,7 @@ If neither environment variable nor config file is set, the system defaults to `
 
 When the Steward prescribes a new Unit of Work:
 
-1. `_get_prescription_model()` resolves the model from env/config/default
+1. `select_steward_model(uow)` selects the model tier based on UoW type and cycle count
 2. The `claude -p` subprocess is invoked with `--model <MODEL>` flag
 3. Prescription execution logs include the model used (INFO level)
 
