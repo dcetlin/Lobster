@@ -1584,6 +1584,67 @@ class Registry:
         finally:
             conn.close()
 
+    def decide_defer(self, uow_id: str, *, note: str = "") -> int:
+        """
+        Defer a blocked UoW — leave it in `blocked` status with an audit note.
+
+        Intended for use when Dan sends `/decide <uow-id> defer [note]` to
+        explicitly acknowledge a blocked UoW without yet choosing to retry or close
+        it. The UoW remains in `blocked` status; the audit entry records the deferral
+        decision and any operator note for future context.
+
+        No status transition occurs — this is a record-only operation. The UoW will
+        remain blocked until a subsequent decide-retry, decide-proceed, or decide-close.
+
+        Returns rows_affected (1 on success, 0 if UoW is not in blocked status).
+        Writes audit entry atomically in the same transaction as the SELECT-guard.
+        """
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            conn.execute("BEGIN IMMEDIATE")
+
+            # Optimistic lock: only write the audit entry if the UoW is still blocked.
+            row = conn.execute(
+                "SELECT id FROM uow_registry WHERE id = ? AND status = 'blocked'",
+                (uow_id,),
+            ).fetchone()
+
+            if row is None:
+                conn.rollback()
+                return 0
+
+            note_json = json.dumps({
+                "event": "decide_defer",
+                "actor": "user",
+                "uow_id": uow_id,
+                "timestamp": now,
+                "note": note or "user deferred — UoW remains blocked pending future decision",
+            })
+
+            conn.execute(
+                """
+                INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                VALUES (?, ?, 'decide_defer', 'blocked', 'blocked', 'user', ?)
+                """,
+                (now, uow_id, note_json),
+            )
+
+            # Touch updated_at so callers can detect a recent decision was recorded.
+            conn.execute(
+                "UPDATE uow_registry SET updated_at = ? WHERE id = ? AND status = 'blocked'",
+                (now, uow_id),
+            )
+
+            conn.commit()
+            return 1
+
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def registry_health(self) -> GateStatus:
         """
         Report registry health / autonomy gate status.

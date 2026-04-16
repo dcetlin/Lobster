@@ -182,31 +182,65 @@ def handle_decide_close(uow_id: str, *, registry: "Registry") -> str:
     )
 
 
-_VALID_DECIDE_ACTIONS = frozenset({"proceed", "abandon", "retry"})
+_VALID_DECIDE_ACTIONS = frozenset({"proceed", "abandon", "retry", "defer"})
+
+
+def handle_decide_defer(uow_id: str, note: str = "", *, registry: "Registry") -> str:
+    """
+    Handle a decide_defer action for a UoW.
+
+    Called when Dan sends `/decide <uow-id> defer [note]` to explicitly
+    acknowledge a blocked UoW without yet choosing to retry or close it.
+    The UoW remains in `blocked` status; a dated audit entry records the
+    deferral decision and any operator note for future context.
+
+    No status transition occurs — the UoW stays blocked until a subsequent
+    decide-proceed, decide-retry, or decide-close.
+    """
+    rows = registry.decide_defer(uow_id, note=note)
+    if rows == 1:
+        note_suffix = f"\nNote recorded: {note}" if note else ""
+        return (
+            f"UoW `{uow_id}` deferred.\n"
+            f"Status: `blocked` (unchanged) \u2014 audit entry written."
+            + note_suffix
+        )
+    return (
+        f"UoW `{uow_id}` could not be deferred \u2014 it is not currently in `blocked` status.\n"
+        f"Run `/wos status blocked` to see blocked UoWs."
+    )
 
 
 def handle_decide(uow_id: str, action: str, *, registry: "Registry") -> str:
     """
-    Handle /decide <uow-id> <proceed|abandon|retry[force]>.
+    Handle /decide <uow-id> <proceed|abandon|retry[force]|defer[note]>.
 
     Provides a single unified command for resolving blocked UoWs from Telegram.
     Action semantics:
-      proceed     — unblock and re-queue to ready-for-steward (preserves steward_cycles)
-      retry       — reset steward_cycles to 0 and re-queue to ready-for-steward (full retry)
-      retry force — override the hard-cap commitment gate (explicit operator intent required)
-      abandon     — close the UoW as user-requested failure (blocked → failed)
+      proceed          — unblock and re-queue to ready-for-steward (preserves steward_cycles)
+      retry            — reset steward_cycles to 0 and re-queue to ready-for-steward (full retry)
+      retry force      — override the hard-cap commitment gate (explicit operator intent required)
+      abandon          — close the UoW as user-requested failure (blocked → failed)
+      defer [note]     — leave in blocked, write a dated audit entry with optional note
 
-    All three actions operate only on UoWs in `blocked` status — optimistic lock
+    All actions operate only on UoWs in `blocked` status — optimistic lock
     prevents accidental double-writes if the UoW has already been advanced.
 
     Returns a human-readable Telegram message describing the outcome.
     """
-    # Support "retry force" as a two-word action token
+    # Support "retry force" as a two-word action token.
+    # Support "defer <note>" where any trailing text after "defer" is the note.
     action_normalized = action.lower().strip()
     force_retry = False
+    defer_note = ""
+
     if action_normalized in ("retry force", "force retry"):
         action_normalized = "retry"
         force_retry = True
+    elif action_normalized.startswith("defer "):
+        # "defer waiting on external review" → action=defer, note="waiting on external review"
+        defer_note = action.strip()[len("defer "):].strip()
+        action_normalized = "defer"
 
     if action_normalized not in _VALID_DECIDE_ACTIONS:
         valid = ", ".join(sorted(_VALID_DECIDE_ACTIONS))
@@ -232,6 +266,8 @@ def handle_decide(uow_id: str, action: str, *, registry: "Registry") -> str:
             return handle_decide_retry(uow_id, registry=registry, force=force_retry)
         case "abandon":
             return handle_decide_close(uow_id, registry=registry)
+        case "defer":
+            return handle_decide_defer(uow_id, defer_note, registry=registry)
         case _:
             # Unreachable — guarded by frozenset check above — but satisfies mypy exhaustiveness
             return f"Unhandled action `{action}`."
