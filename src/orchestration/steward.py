@@ -155,28 +155,6 @@ def select_steward_model(uow: "UoW") -> str:  # noqa: F821 — UoW imported belo
     # 5. Default: first-pass or non-escalated executable → sonnet.
     return MODEL_TIER_SONNET
 
-
-def _get_prescription_model() -> str:
-    """Return the model to use for prescription dispatch (legacy, no UoW context).
-
-    Resolves in order of precedence:
-    1. LOBSTER_PRESCRIPTION_MODEL environment variable
-    2. prescription_model field in wos-config.json
-    3. Default: "opus"
-
-    Retained for backward compatibility with callers that don't have UoW context.
-    Prefer select_steward_model(uow) when UoW is available — it applies tiering.
-    """
-    env_model = os.environ.get("LOBSTER_PRESCRIPTION_MODEL", "").strip()
-    if env_model:
-        return env_model
-
-    config_model = _read_prescription_model_config()
-    if config_model:
-        return config_model
-
-    return MODEL_TIER_OPUS
-
 # claude binary — resolved from PATH at call time.
 _CLAUDE_BIN = "claude"
 
