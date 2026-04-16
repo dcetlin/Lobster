@@ -72,34 +72,110 @@ def _get_llm_prescription_timeout() -> int:
     return TimeoutConfig.llm_prescription_timeout_secs()
 
 
+# ---------------------------------------------------------------------------
+# Model tiering constants
+# ---------------------------------------------------------------------------
+
+# Named model tier constants — reference these instead of raw strings so that
+# a model rename is a one-line change and tests catch mismatches.
+MODEL_TIER_SONNET = "sonnet"
+MODEL_TIER_HAIKU = "haiku"
+MODEL_TIER_OPUS = "opus"
+
+# steward_cycles threshold above which a UoW is considered escalated.
+# Spec: "steward_cycles > 1 → opus", so the threshold is 1.
+# A UoW at steward_cycles == ESCALATION_THRESHOLD is not yet escalated.
+# A UoW at steward_cycles > ESCALATION_THRESHOLD is escalated → opus.
+ESCALATION_THRESHOLD: int = 1
+
+# UoW types that are pure routing or classification decisions → haiku.
+# These types represent pass-through decisions with no deep reasoning required.
+_ROUTING_UOW_TYPES: frozenset[str] = frozenset({"routing", "classification"})
+
+
+def _read_prescription_model_config() -> str | None:
+    """Read the prescription_model override from wos-config.json.
+
+    Returns the model string if present and non-empty, else None.
+    Extracted as a named function so tests can patch it directly
+    without needing to mock the full dispatcher_handlers module.
+    """
+    try:
+        from src.orchestration.dispatcher_handlers import read_wos_config
+        config = read_wos_config()
+        model = config.get("prescription_model", "")
+        if model:
+            return model.strip()
+    except Exception:
+        pass
+    return None
+
+
+def select_steward_model(uow: "UoW") -> str:  # noqa: F821 — UoW imported below module level
+    """Select the model tier for a steward prescription, given UoW signals.
+
+    Pure function: all inputs are read from `uow` and the environment;
+    no side effects. Safe to call in tests with no DB connection.
+
+    Resolution order (first match wins):
+    1. LOBSTER_PRESCRIPTION_MODEL env var — global override, always wins.
+    2. prescription_model in wos-config.json — config-level override.
+    3. Routing/classification UoW type → haiku (cheapest; no reasoning needed).
+    4. Escalated (steward_cycles > ESCALATION_THRESHOLD) → opus (deep reasoning).
+    5. Default (first pass or non-escalated non-routing) → sonnet.
+
+    The safe default on missing signals is sonnet (cost-conservative per spec).
+
+    Args:
+        uow: The Unit of Work being prescribed.
+
+    Returns:
+        A model tier string: one of MODEL_TIER_SONNET, MODEL_TIER_HAIKU,
+        MODEL_TIER_OPUS, or an override string from env/config.
+    """
+    # 1. Environment variable override — highest precedence.
+    env_model = os.environ.get("LOBSTER_PRESCRIPTION_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    # 2. Config file override — second precedence.
+    config_model = _read_prescription_model_config()
+    if config_model:
+        return config_model
+
+    # 3. Routing/classification decisions → haiku regardless of cycle count.
+    #    These are definitionally pass-through — no reasoning depth needed.
+    if uow.type in _ROUTING_UOW_TYPES:
+        return MODEL_TIER_HAIKU
+
+    # 4. Escalated UoWs (cycled more than once) → opus for full reasoning depth.
+    if uow.steward_cycles > ESCALATION_THRESHOLD:
+        return MODEL_TIER_OPUS
+
+    # 5. Default: first-pass or non-escalated executable → sonnet.
+    return MODEL_TIER_SONNET
+
+
 def _get_prescription_model() -> str:
-    """Return the model to use for prescription dispatch.
+    """Return the model to use for prescription dispatch (legacy, no UoW context).
 
     Resolves in order of precedence:
     1. LOBSTER_PRESCRIPTION_MODEL environment variable
     2. prescription_model field in wos-config.json
     3. Default: "opus"
 
-    Supports budget flexibility by allowing non-Sonnet models (e.g., haiku)
-    when available.
+    Retained for backward compatibility with callers that don't have UoW context.
+    Prefer select_steward_model(uow) when UoW is available — it applies tiering.
     """
-    # Check environment variable first
-    env_model = os.environ.get("LOBSTER_PRESCRIPTION_MODEL")
+    env_model = os.environ.get("LOBSTER_PRESCRIPTION_MODEL", "").strip()
     if env_model:
-        return env_model.strip()
+        return env_model
 
-    # Check wos-config.json
-    try:
-        from src.orchestration.dispatcher_handlers import read_wos_config
-        config = read_wos_config()
-        if "prescription_model" in config and config["prescription_model"]:
-            return config["prescription_model"].strip()
-    except Exception:
-        # If config read fails, continue to default
-        pass
+    config_model = _read_prescription_model_config()
+    if config_model:
+        return config_model
 
-    # Default fallback
-    return "opus"
+    return MODEL_TIER_OPUS
 
 # claude binary — resolved from PATH at call time.
 _CLAUDE_BIN = "claude"
@@ -1447,7 +1523,7 @@ success_criteria_check: <one or two sentences describing exactly how to verify t
     prompt = f"{system_prompt}\n\n{user_prompt}"
 
     timeout_secs = _get_llm_prescription_timeout()
-    model = _get_prescription_model()
+    model = select_steward_model(uow)
 
     command = [_CLAUDE_BIN, "-p", prompt, "--output-format", "text", "--model", model]
 
