@@ -127,11 +127,10 @@ scan_agent_status() {
         local stop_reason
         stop_reason=$(_get_stop_reason "$filepath")
 
-        # Skip terminal agents — self-check is only for active work.
-        # Known terminal stop reasons: "end_turn", "stop_sequence" (API rate limit or
-        # content filter), and any other unrecognized value. Only "tool_use" and empty
-        # string indicate an agent that may still be running.
-        if [ "$stop_reason" != "tool_use" ] && [ -n "$stop_reason" ]; then
+        # Skip completed agents — self-check is only for active work.
+        # Terminal stop reasons: end_turn (normal), stop_sequence (hit stop seq),
+        # max_tokens (hit token limit). All mean the agent is done.
+        if [ "$stop_reason" = "end_turn" ] || [ "$stop_reason" = "stop_sequence" ] || [ "$stop_reason" = "max_tokens" ]; then
             continue
         fi
 
@@ -248,13 +247,13 @@ scan_completed_tasks() {
             continue
         fi
 
-        # Check stop_reason — "end_turn" is a clean finish; "stop_sequence" means the
-        # API terminated the agent (rate limit or content filter) — still terminal.
-        # Any other non-empty, non-tool_use value is also treated as terminal.
+        # Check stop_reason — terminal states mean definitively done.
+        # end_turn: normal completion; stop_sequence: hit a stop sequence;
+        # max_tokens: hit token limit. All are terminal.
         local stop_reason
         stop_reason=$(_get_stop_reason "$filepath")
 
-        if [ "$stop_reason" = "end_turn" ] || [ "$stop_reason" = "stop_sequence" ]; then
+        if [ "$stop_reason" = "end_turn" ] || [ "$stop_reason" = "stop_sequence" ] || [ "$stop_reason" = "max_tokens" ]; then
             unreported_completed+=("$filepath")
         fi
     done

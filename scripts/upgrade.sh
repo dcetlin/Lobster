@@ -2582,7 +2582,45 @@ CREATE TABLE IF NOT EXISTS dispatcher_lock (
         fi
     done
 
-    # Migration 73: Register validate-workflow-artifact.py PostToolUse hook (S3-A, issue #678).
+    # Migration 73: Remove stale system-audit.context.md from memory/canonical/
+    # install.sh's generic canonical-template loop previously copied system-audit.context.md
+    # to both memory/canonical/ and agents/ (the latter via a dedicated block).
+    # The agents/ copy is the canonical write target — the memory/canonical/ copy was
+    # never updated by the lobster-auditor and drifted stale. Fix: delete the stale copy
+    # and exclude it from the generic loop going forward (issue #1196).
+    local stale_audit_context="$USER_CONFIG_DIR/memory/canonical/system-audit.context.md"
+    if [ -f "$stale_audit_context" ]; then
+        rm -f "$stale_audit_context"
+        substep "Removed stale system-audit.context.md from memory/canonical/ (canonical copy is agents/system-audit.context.md)"
+        migrated=$((migrated + 1))
+    fi
+
+    # Migration 74: Enable and start lobster-transcription.service on existing installs.
+    # Prior to this fix, install.sh installed the service file but never called
+    # systemctl enable, so voice messages accumulated in pending-transcription/ forever.
+    if systemctl is-system-running >/dev/null 2>&1 || pidof systemd >/dev/null 2>&1; then
+        local transcription_svc="$LOBSTER_DIR/services/lobster-transcription.service"
+        if [ -f "$transcription_svc" ]; then
+            sudo cp "$transcription_svc" /etc/systemd/system/lobster-transcription.service
+            sudo systemctl daemon-reload 2>/dev/null || true
+            if ! systemctl is-enabled --quiet lobster-transcription 2>/dev/null; then
+                sudo systemctl enable lobster-transcription 2>/dev/null || true
+                substep "Enabled lobster-transcription.service"
+                migrated=$((migrated + 1))
+            fi
+            if ! systemctl is-active --quiet lobster-transcription 2>/dev/null; then
+                sudo systemctl start lobster-transcription 2>/dev/null || true
+                substep "Started lobster-transcription.service"
+                migrated=$((migrated + 1))
+            fi
+        else
+            substep "WARN: lobster-transcription.service not found at $transcription_svc — skipping"
+        fi
+    else
+        substep "systemd not running — skipping lobster-transcription.service enable (container?)"
+    fi
+
+    # Migration 75: Register validate-workflow-artifact.py PostToolUse hook (S3-A, issue #678).
     # The hook validates WorkflowArtifact JSON schema when Write writes to
     # orchestration/artifacts/*.json — enforcing executor_type, prescribed_skills,
     # and required fields at the commit boundary before a hard-cap cleanup can

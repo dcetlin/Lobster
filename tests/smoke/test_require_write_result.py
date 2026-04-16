@@ -74,6 +74,22 @@ def _run_hook(transcript_json: str) -> subprocess.CompletedProcess:
     )
 
 
+def _clear_fire_count_files() -> None:
+    """Remove all hook fire-count temp files to prevent cross-test accumulation.
+
+    The hook tracks retry fires in /tmp/lobster-hook-fires-{agent_key}.
+    Tests that pass no session_id or agent_id use the key "unknown".
+    If multiple tests run in sequence without cleanup, the count accumulates
+    and the hook gives up blocking (exits 0) when it reaches MAX_HOOK_FIRES.
+    """
+    import glob as _glob
+    for path in _glob.glob("/tmp/lobster-hook-fires-*"):
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # C1 — no reminder when write_result was called
 # ---------------------------------------------------------------------------
@@ -99,12 +115,11 @@ def test_no_reminder_when_write_result_called():
     result = _run_hook(transcript)
 
     assert result.returncode == 0
-    # Hook may emit {"suppressOutput": true} to suppress CC's feedback injection.
-    # That is a control directive, not a reminder — it is not visible to the agent.
-    stdout_stripped = result.stdout.strip()
-    assert stdout_stripped == "" or stdout_stripped == '{"suppressOutput": true}', (
-        f"Expected empty stdout or suppressOutput directive (no reminder), got: {result.stdout!r}\n"
-        "Hook emitted a spurious reminder despite write_result being present."
+    # On success the hook emits {"suppressOutput": true} to suppress CC feedback
+    # injection (see hook module docstring). An empty stdout is also acceptable.
+    assert result.stdout.strip() in ("", '{"suppressOutput": true}'), (
+        f"Expected empty stdout or suppressOutput JSON, got: {result.stdout!r}\n"
+        "Hook emitted unexpected output despite write_result being present."
     )
 
 
@@ -124,6 +139,10 @@ def test_reminder_emitted_when_write_result_not_called():
     CC SubagentStop hooks that exit non-zero prevent the agent session from
     ending — this is the intentional enforcement mechanism.
     """
+    # Clear fire-count files so this test starts fresh, regardless of prior
+    # test runs in the same process (the hook tracks fires per agent_key in /tmp).
+    _clear_fire_count_files()
+
     transcript = _build_transcript(
         "mcp__github__issue_read",
         "mcp__github__create_pull_request",
@@ -134,11 +153,11 @@ def test_reminder_emitted_when_write_result_not_called():
         f"Hook must exit 2 (hard-block mode), got {result.returncode}. "
         "Exit 2 prevents the subagent session from terminating without calling write_result."
     )
-    # Reminder goes to stderr so Claude Code sees it as feedback, not as output.
+    # The reminder is written to stderr so CC injects it as a system message.
     reminder_output = result.stderr.strip() or result.stdout.strip()
     assert reminder_output, (
-        "Hook must emit a reminder (on stderr or stdout) when write_result was not called.\n"
-        f"Got empty stderr and stdout."
+        "Hook must print a reminder when write_result was not called.\n"
+        f"Got empty stdout and stderr."
     )
     assert "write_result" in reminder_output, (
         "Reminder text must mention 'write_result' so the subagent knows "
@@ -152,15 +171,16 @@ def test_reminder_emitted_when_transcript_is_empty():
     A session with no tool calls at all is still a subagent that failed to
     report back; the hook should fire here too and exit 2 to hard-block.
     """
+    _clear_fire_count_files()
     result = _run_hook(json.dumps({"transcript": []}))
 
     assert result.returncode == 2, (
         f"Hook must exit 2 (hard-block) even when the transcript has no tool calls at all. "
         f"Got exit {result.returncode}."
     )
-    # Reminder goes to stderr so Claude Code sees it as feedback, not as output.
-    assert result.stderr.strip() or result.stdout.strip(), (
-        "Hook must emit a reminder (on stderr or stdout) even when the transcript has no tool calls at all."
+    reminder_output = result.stderr.strip() or result.stdout.strip()
+    assert reminder_output, (
+        "Hook must emit a reminder even when the transcript has no tool calls at all."
     )
 
 
@@ -169,32 +189,57 @@ def test_reminder_emitted_when_transcript_is_empty():
 # ---------------------------------------------------------------------------
 
 
-def test_dispatcher_skips_enforcement():
-    """C3: Hook emits nothing when the transcript contains wait_for_messages.
+def test_dispatcher_skips_enforcement(tmp_path):
+    """C3: Hook emits nothing when the session is identified as the dispatcher.
 
-    The dispatcher is identified by the presence of wait_for_messages in its
-    tool calls.  The hook must never tell the dispatcher to call write_result —
-    the dispatcher never does (it receives results, it does not produce them).
+    The dispatcher is identified via state files: the hook reads the Claude
+    session UUID from the dispatcher-claude-session-id state file and compares
+    it against hook_input["session_id"].  The hook must never tell the
+    dispatcher to call write_result — the dispatcher never does.
 
     Failure mode caught: if the hook fires for the dispatcher, every post-
     compact cycle would inject a spurious STOP message into the main loop,
     breaking the dispatcher's ability to resume normal message processing.
     """
-    transcript = _build_transcript(
-        "mcp__lobster-inbox__wait_for_messages",
-        "mcp__lobster-inbox__send_reply",
-        "mcp__lobster-inbox__mark_processed",
+    import uuid
+
+    # Create a fake dispatcher session ID and write it to a temp state file.
+    dispatcher_session_id = str(uuid.uuid4())
+    claude_session_file = tmp_path / "data" / "dispatcher-claude-session-id"
+    claude_session_file.parent.mkdir(parents=True, exist_ok=True)
+    claude_session_file.write_text(dispatcher_session_id)
+
+    # Build hook input with the matching session_id so is_dispatcher() returns True.
+    hook_input = {
+        "session_id": dispatcher_session_id,
+        "transcript": [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "name": "mcp__lobster-inbox__wait_for_messages", "id": "call_0"},
+                    {"type": "tool_use", "name": "mcp__lobster-inbox__send_reply", "id": "call_1"},
+                ],
+            }
+        ],
+    }
+
+    import os
+    env = {**os.environ, "LOBSTER_WORKSPACE": str(tmp_path)}
+    result = subprocess.run(
+        [sys.executable, str(HOOK)],
+        input=json.dumps(hook_input),
+        capture_output=True,
+        text=True,
+        env=env,
     )
-    result = _run_hook(transcript)
 
     assert result.returncode == 0, (
         f"Hook must exit 0 for dispatcher sessions, got {result.returncode}."
     )
-    # Hook may emit {"suppressOutput": true} to suppress CC's feedback injection.
-    # That is a control directive, not a reminder — it is not visible to the agent.
-    stdout_stripped = result.stdout.strip()
-    assert stdout_stripped == "" or stdout_stripped == '{"suppressOutput": true}', (
-        "Hook must produce no reminder output for dispatcher sessions. "
+    # On success the hook may emit {"suppressOutput": true} to suppress CC feedback
+    # injection. An empty stdout is also acceptable.
+    assert result.stdout.strip() in ("", '{"suppressOutput": true}'), (
+        "Hook must produce no substantive output for dispatcher sessions. "
         f"Got: {result.stdout!r}"
     )
 
@@ -278,10 +323,9 @@ def test_hook_exits_0_with_write_result_including_task_id():
         f"Hook must exit 0 when write_result was called with task_id + chat_id. "
         f"Got exit {result.returncode}. stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    # Hook may emit {"suppressOutput": true} to suppress CC's feedback injection.
-    # That is a control directive, not a reminder — it is not visible to the agent.
-    stdout_stripped = result.stdout.strip()
-    assert stdout_stripped == "" or stdout_stripped == '{"suppressOutput": true}', (
-        f"Hook must produce no reminder output when write_result was called. "
+    # On success the hook may emit {"suppressOutput": true} to suppress CC feedback
+    # injection. An empty stdout is also acceptable.
+    assert result.stdout.strip() in ("", '{"suppressOutput": true}'), (
+        f"Hook must produce no substantive output when write_result was called. "
         f"Got: {result.stdout!r}"
     )

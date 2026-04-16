@@ -336,6 +336,49 @@ def test_format_truncates_long_description():
     assert "..." in result
 
 
+def test_format_system_agent_separated_from_user_count():
+    """System agents (chat_id=0) must not inflate the user-facing agent count."""
+    sessions = [
+        {"agent_type": "subagent", "description": "User task",
+         "chat_id": "8305714125", "elapsed_seconds": 300, "id": "u1"},
+        {"agent_type": "subagent", "description": "startup-catchup",
+         "chat_id": "0", "elapsed_seconds": 60, "id": "s1"},
+    ]
+    result = session_store.format_active_sessions_block(sessions)
+    # User count should be 1, not 2
+    assert "[1 agent running" in result
+    # System count annotation
+    assert "1 system" in result
+    # System agent shown with 'system' label, not chat_id
+    assert "(system," in result
+    # User agent shown with real chat_id
+    assert "chat: 8305714125" in result
+
+
+def test_format_plural_system_agents():
+    """Two system agents should show '2 systems' (not '2 system')."""
+    sessions = [
+        {"agent_type": "subagent", "description": "startup-catchup",
+         "chat_id": "0", "elapsed_seconds": 60, "id": "s1"},
+        {"agent_type": "subagent", "description": "health-check",
+         "chat_id": 0, "elapsed_seconds": 30, "id": "s2"},
+    ]
+    result = session_store.format_active_sessions_block(sessions)
+    assert "2 systems" in result, f"Expected '2 systems' in output, got: {result!r}"
+    assert "2 system]" not in result, "Singular 'system' must not appear with count 2"
+
+
+def test_format_only_system_agents():
+    """When only system agents are running, header shows 0 user agents + N system."""
+    sessions = [
+        {"agent_type": "subagent", "description": "startup-catchup",
+         "chat_id": 0, "elapsed_seconds": 60, "id": "s1"},
+    ]
+    result = session_store.format_active_sessions_block(sessions)
+    assert "[0 agents running, 1 system]" in result
+    assert "(system," in result
+
+
 # ---------------------------------------------------------------------------
 # Test: tracker.py adapter compatibility
 # ---------------------------------------------------------------------------
@@ -530,17 +573,28 @@ def test_cleanup_stale_running_no_output_file(isolated_db):
 
 
 def test_cleanup_stale_running_output_missing(isolated_db, tmp_path):
-    """Session whose output_file does not exist on disk is marked dead."""
+    """Session whose output_file does not exist is marked dead after the grace period.
+
+    The session must have been spawned more than 2 minutes ago for the missing-file
+    rule to fire.  Sessions spawned within 2 minutes are left running (see
+    test_cleanup_stale_running_output_missing_within_grace_period).
+    """
     db = isolated_db
     missing_path = str(tmp_path / "nonexistent.output")
 
-    session_store.session_start(
-        id="stale-missing-file",
-        description="Agent with missing output",
-        chat_id="123",
-        output_file=missing_path,
-        path=db,
+    # Insert a session with spawned_at well in the past (5 minutes ago) so that
+    # the 2-minute grace period has already elapsed.
+    old_spawned_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    session_store._get_connection(db).execute(
+        """
+        INSERT INTO agent_sessions
+            (id, description, chat_id, source, status, spawned_at, output_file)
+        VALUES ('stale-missing-file', 'Agent with missing output', '123', 'telegram',
+                'running', ?, ?)
+        """,
+        (old_spawned_at, missing_path),
     )
+    session_store._get_connection(db).commit()
 
     server_start = datetime.now(timezone.utc)
     dead = session_store.cleanup_stale_running_sessions(server_start, path=db)
@@ -549,6 +603,36 @@ def test_cleanup_stale_running_output_missing(isolated_db, tmp_path):
     result = session_store.find_session("stale-missing-file", path=db)
     assert result["status"] == "dead"
     assert "missing" in result["result_summary"]
+
+
+def test_cleanup_stale_running_output_missing_within_grace_period(isolated_db, tmp_path):
+    """Session with missing output_file is left running within the 2-minute grace period.
+
+    The output_file for a freshly-spawned agent may not exist yet (Claude Code creates
+    it after the first tool turn).  If the MCP server restarts within 2 minutes of
+    spawning, the startup cleanup must not mark the session dead prematurely.
+    """
+    db = isolated_db
+    missing_path = str(tmp_path / "not_yet_created.output")
+
+    session_store.session_start(
+        id="fresh-missing-file",
+        description="Newly spawned agent — output file not yet created",
+        chat_id="123",
+        output_file=missing_path,
+        path=db,
+    )
+
+    # Server restarts 30 seconds after spawn — well within the 2-minute grace period.
+    server_start = datetime.now(timezone.utc) + timedelta(seconds=30)
+    dead = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    assert "fresh-missing-file" not in dead, (
+        "Freshly-spawned agent should NOT be killed within the 2-minute grace period "
+        "even if its output_file is missing"
+    )
+    result = session_store.find_session("fresh-missing-file", path=db)
+    assert result["status"] == "running"
 
 
 def test_cleanup_stale_running_output_tool_use_left_running(isolated_db, tmp_path):
@@ -673,7 +757,7 @@ def test_cleanup_stale_running_skips_no_file_within_timeout(isolated_db):
 
 
 def test_cleanup_stale_running_oserror_marks_dead(isolated_db, tmp_path):
-    """Session whose output_file raises OSError is marked dead (unreadable path)."""
+    """Session whose output_file raises OSError is marked dead after the grace period."""
     db = isolated_db
     # Use a path inside a non-existent directory to provoke OSError on resolve/stat.
     # Path.resolve() on a dangling path inside a missing parent dir can raise OSError
@@ -682,13 +766,18 @@ def test_cleanup_stale_running_oserror_marks_dead(isolated_db, tmp_path):
 
     output_path = str(tmp_path / "unreadable.output")
 
-    session_store.session_start(
-        id="oserror-agent",
-        description="Agent with unreadable output",
-        chat_id="123",
-        output_file=output_path,
-        path=db,
+    # Insert with spawned_at 5 minutes ago so the 2-minute grace period has elapsed.
+    old_spawned_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    session_store._get_connection(db).execute(
+        """
+        INSERT INTO agent_sessions
+            (id, description, chat_id, source, status, spawned_at, output_file)
+        VALUES ('oserror-agent', 'Agent with unreadable output', '123', 'telegram',
+                'running', ?, ?)
+        """,
+        (old_spawned_at, output_path),
     )
+    session_store._get_connection(db).commit()
 
     # Patch Path.resolve to raise OSError for this specific path
     original_resolve = Path.resolve

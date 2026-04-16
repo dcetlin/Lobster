@@ -93,7 +93,11 @@ class TestPythonEnvironment:
     def test_bot_module_importable(self):
         """Test that bot module can be imported without raising an ImportError."""
         try:
+            # Module-level imports should succeed; runtime startup may require env vars
             from src.bot import lobster_bot  # noqa: F401
+            assert hasattr(lobster_bot, "handle_message"), (
+                "lobster_bot must expose handle_message after import"
+            )
         except ImportError as e:
             pytest.skip(f"Bot module not importable: {e}")
         except Exception:

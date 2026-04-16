@@ -80,8 +80,7 @@ from utils.ifttt_rules import (
 )
 import uuid as _uuid_mod
 
-# Reliability utilities (atomic writes, validation, audit logging, circuit breaker,
-# capability failure alerting)
+# Reliability utilities (atomic writes, validation, audit logging)
 from reliability import (
     atomic_write_json,
     validate_send_reply_args,
@@ -89,10 +88,6 @@ from reliability import (
     ValidationError,
     init_audit_log,
     audit_log,
-    IdempotencyTracker,
-    CircuitBreaker,
-    CapabilityFailureTracker,
-    _response_is_failure,
 )
 
 # Self-update system
@@ -802,6 +797,7 @@ def _tick_user_message_counter(msg_type: str, msg_source: str) -> None:
                 "type": "session_note_reminder",
                 "source": "system",
                 "chat_id": 0,
+                "task_origin": "internal",
                 "text": (
                     f"session_note_reminder: {_user_message_counter} user messages "
                     f"processed this session. Spawn session-note-appender in the background "
@@ -1050,23 +1046,6 @@ _seed_canonical_templates()
 # Initialize audit log for structured observability
 init_audit_log(LOG_DIR)
 
-# Initialize idempotency tracker to prevent duplicate reply sends
-# TODO: Wire into send_reply and outbox processing paths
-_reply_idempotency = IdempotencyTracker(ttl_seconds=300)
-
-# Circuit breaker for outbox delivery (Telegram/Slack API)
-# TODO: Wire into lobster_bot.py outbox delivery to short-circuit when Telegram is down
-_outbox_breaker = CircuitBreaker("outbox_delivery", failure_threshold=5, cooldown_seconds=120)
-
-# Capability failure tracker — alerts Dan when a core tool fails N consecutive times.
-# Threshold: 3 consecutive failures → immediate Telegram alert.
-# Cooldown: 30 minutes between repeat alerts for a tool that stays degraded.
-# Alert delivery: direct OUTBOX_DIR write (bypasses dispatcher, no token burn).
-_capability_tracker = CapabilityFailureTracker(
-    failure_threshold=3,
-    alert_cooldown_seconds=1800,
-)
-
 # OpenAI configuration for Whisper transcription
 # Try environment first, then fall back to config file
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -1085,6 +1064,117 @@ if not TASKS_FILE.exists():
 # Record the moment this server process started. Used by stale-session cleanup
 # to distinguish output files from the current run vs a previous (dead) run.
 _SERVER_START_TIME = datetime.now(timezone.utc)
+
+# ---------------------------------------------------------------------------
+# Inbox Flood Detection (issue #1420)
+# ---------------------------------------------------------------------------
+#
+# When the dispatcher starts (or reconnects after an MCP restart), the inbox
+# can receive a large burst of stale messages — most commonly reconciler ghost
+# entries: subagent_result messages with elapsed_seconds < 30 generated during
+# the startup sweep. Each one requires a full WFM cycle to drain, burning
+# tokens and delaying real user messages.
+#
+# Strategy: scan for known-safe flood patterns before returning messages to
+# the dispatcher, bulk-mark-processed them on the server side, and report the
+# drain count as a prefix so the dispatcher can log the event.
+#
+# Known-safe flood types (auto-drain without dispatcher deliberation):
+#   1. Reconciler ghost sweep — subagent_result with elapsed_seconds < GHOST_ELAPSED_THRESHOLD
+#      AND message arrived within STARTUP_WINDOW_SECONDS of server start.
+#      These are stale completion notices for sessions that were dead before
+#      the server restarted; the dispatcher can never act on them meaningfully.
+#
+# Unknown floods are NOT auto-drained — they pass through normally so the
+# dispatcher can decide. The dispatcher bootup instructions handle alerting.
+#
+# Thresholds (named constants so the spec is traceable in tests):
+GHOST_ELAPSED_THRESHOLD_SECONDS = 30   # subagent_result with <30s elapsed = ghost candidate
+STARTUP_WINDOW_SECONDS = 60            # messages within 60s of server start = startup sweep
+
+
+def _is_reconciler_ghost(msg: dict, server_start: datetime) -> bool:
+    """Return True if this inbox message is a reconciler startup ghost.
+
+    A ghost is a subagent_result that:
+      - Has elapsed_seconds below GHOST_ELAPSED_THRESHOLD_SECONDS (30s), indicating
+        the reconciler detected the session as dead in the same sweep that created
+        the notification — no real work was done.
+      - Was created within STARTUP_WINDOW_SECONDS (60s) of server start, indicating
+        it is part of the startup sweep rather than real in-session activity.
+
+    Pure function — reads msg and compares to server_start. No I/O.
+    """
+    if msg.get("type") != "subagent_result":
+        return False
+
+    # Check elapsed_seconds — ghosts have near-zero elapsed time
+    try:
+        elapsed = int(msg.get("elapsed_seconds", 0) or 0)
+    except (TypeError, ValueError):
+        elapsed = 0
+    if elapsed >= GHOST_ELAPSED_THRESHOLD_SECONDS:
+        return False  # Real work was done — not a ghost
+
+    # Check timestamp — ghosts are generated during the startup sweep
+    ts_str = msg.get("timestamp", "")
+    if not ts_str:
+        return False
+    try:
+        msg_time = datetime.fromisoformat(ts_str)
+        if msg_time.tzinfo is None:
+            msg_time = msg_time.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return False
+
+    age_seconds = (msg_time - server_start).total_seconds()
+    return 0 <= age_seconds <= STARTUP_WINDOW_SECONDS
+
+
+def _drain_reconciler_ghosts() -> int:
+    """Scan inbox for reconciler startup ghosts and move them to processed/.
+
+    Returns the count of messages drained. Side effect: moves matching inbox
+    files from INBOX_DIR to PROCESSED_DIR and logs a single summary line.
+
+    Called once at the start of each wait_for_messages call, so any ghost
+    accumulation from the startup sweep is cleared before the dispatcher sees
+    the inbox. Safe to call repeatedly — non-ghost messages are untouched.
+    """
+    drained = 0
+    errors = 0
+
+    for inbox_file in list(INBOX_DIR.glob("*.json")):
+        try:
+            msg = json.loads(inbox_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        if not _is_reconciler_ghost(msg, _SERVER_START_TIME):
+            continue
+
+        # Move to processed/ — bypasses the user-reply guard because these are
+        # internal system messages (chat_id=0 or no user) with nothing to relay.
+        try:
+            dest = PROCESSED_DIR / inbox_file.name
+            inbox_file.rename(dest)
+            drained += 1
+        except OSError as exc:
+            log.warning(
+                "[flood-drain] Failed to move ghost %r to processed/: %s",
+                inbox_file.name, exc,
+            )
+            errors += 1
+
+    if drained > 0:
+        log.info(
+            "[flood-drain] Drained %d reconciler ghost(s) from startup sweep "
+            "(elapsed<%ds within %ds of server start); %d error(s)",
+            drained, GHOST_ELAPSED_THRESHOLD_SECONDS, STARTUP_WINDOW_SECONDS, errors,
+        )
+
+    return drained
+
 
 # ---------------------------------------------------------------------------
 # HTTP session identity — dispatcher session tagging (Options A and B)
@@ -1256,6 +1346,7 @@ def _write_session_lost_reminder() -> None:
             "source": "system",
             "type": "compact-reminder",
             "chat_id": 0,
+            "task_origin": "internal",
             "text": (
                 "SESSION LOST — The MCP server restarted and your previous session was "
                 "invalidated. Re-orient now: read sys.dispatcher.bootup.md and resume "
@@ -1747,7 +1838,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="send_whatsapp_reply",
-            description="Send a WhatsApp message via Twilio. Use this to reply to WhatsApp messages (source='whatsapp'). Requires TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_WHATSAPP_NUMBER to be configured.",
+            description="Send a WhatsApp message via the Baileys bridge. Use this to reply to WhatsApp messages (source='whatsapp'). Requires lobster-whatsapp-bridge and lobster-whatsapp-adapter services to be running. No Twilio credentials needed.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2604,6 +2695,17 @@ async def list_tools() -> list[Tool]:
                         ),
                         "enum": ["safe", "unsafe", "unknown"],
                     },
+                    "task_origin": {
+                        "type": "string",
+                        "description": (
+                            "Origin of this task: 'user' | 'scheduled' | 'internal'. "
+                            "'user' — triggered by a real user message. "
+                            "'scheduled' — triggered by a scheduled job or cron. "
+                            "'internal' — system-initiated, no user involved. "
+                            "Defaults to 'user'."
+                        ),
+                        "enum": ["user", "scheduled", "internal"],
+                    },
                 },
                 "required": ["agent_id", "description", "chat_id"],
             },
@@ -2704,6 +2806,21 @@ async def list_tools() -> list[Tool]:
                             "'unknown' — caller did not classify (default; treated as unsafe for recovery)."
                         ),
                         "enum": ["safe", "unsafe", "unknown"],
+                    },
+                    "task_origin": {
+                        "type": "string",
+                        "description": (
+                            "Origin of this task: 'user' | 'scheduled' | 'internal'. "
+                            "'user' — triggered by a real user message (Telegram, Slack, etc.). "
+                            "'scheduled' — triggered by a scheduled job or cron task. "
+                            "'internal' — system-initiated, no user involved (reconciler, "
+                            "health check, session management, etc.). "
+                            "Defaults to 'user' when not specified. "
+                            "Code that previously checked chat_id==0 to detect system tasks "
+                            "should check task_origin=='internal' instead — the two conditions "
+                            "are equivalent but task_origin makes intent explicit."
+                        ),
+                        "enum": ["user", "scheduled", "internal"],
                     },
                     "claude_session_id": {
                         "type": "string",
@@ -4238,8 +4355,25 @@ async def handle_wait_for_messages(args: dict) -> list[TextContent]:
     _recover_stale_processing()
     _recover_retryable_messages()
 
+    # Flood detection: drain reconciler startup ghosts before the dispatcher
+    # sees the inbox. This prevents the 100+ ghost WFM cycle storm that occurs
+    # when the reconciler startup sweep generates stale subagent_result messages
+    # for every dead session it finds (issue #1420).
+    _drained_ghosts = _drain_reconciler_ghosts()
+
     # Build active-sessions prefix once (fast SQLite read, <1ms)
     sessions_prefix = _build_active_sessions_prefix()
+
+    # Prepend flood drain summary to sessions_prefix so the dispatcher is informed
+    # without requiring an extra WFM cycle or manual inbox check.
+    if _drained_ghosts > 0:
+        drain_notice = (
+            f"[flood-drain] Auto-drained {_drained_ghosts} reconciler ghost(s) "
+            f"from startup sweep (elapsed<{GHOST_ELAPSED_THRESHOLD_SECONDS}s, "
+            f"within {STARTUP_WINDOW_SECONDS}s of server start). "
+            "No dispatcher action needed — these were stale completion notices with no real work."
+        )
+        sessions_prefix = (drain_notice + "\n\n" + sessions_prefix) if sessions_prefix else drain_notice
 
     # Start the observer BEFORE the initial glob check to eliminate the TOCTOU
     # race window: a message that arrives between the glob and observer.start()
@@ -4859,6 +4993,13 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
         elif msg_type == "wos_execute":
             uow_id = msg.get("uow_id", "?")
             output += f"🔧 **[WOS EXECUTE]** uow_id=`{uow_id}`\n"
+        elif msg_type == "reaction":
+            emoji = msg.get("emoji", "?")
+            reacted_to_text = msg.get("reacted_to_text", "")
+            if reacted_to_text:
+                output += f"**[{source}]** {emoji} reaction from **{user}** (on: '{reacted_to_text}')\n"
+            else:
+                output += f"**[{source}]** {emoji} reaction from **{user}**\n"
         else:
             output += f"**[{source}]** from **{user}**\n"
         output += f"Chat ID: `{chat_id}` | Message ID: `{msg_id}`\n"
@@ -5160,16 +5301,22 @@ async def handle_mark_processed(args: dict) -> list[TextContent]:
     if not found:
         return [TextContent(type="text", text=f"Message not found: {message_id}")]
 
-    # Guard: check that a reply was sent for user-facing messages.
-    # Uses msg type (not source) to classify — source is the routing destination
-    # and cannot distinguish a direct user message from a subagent_result that
-    # happens to carry source="telegram" for delivery.
-    # If no reply was sent, auto-send a fallback reply instead of returning a
-    # soft warning (which the LLM ignores, causing silent message drops).
+    # Guard: log a warning if a user-facing message is being marked processed
+    # without a prior send_reply.  This is a dispatcher bug — the dispatcher
+    # should always reply to user messages before marking them processed.
+    #
+    # We intentionally do NOT auto-send any fallback reply here (issue #1594).
+    # The previous implementation auto-sent "Noted." which is actively harmful:
+    # it masquerades as an intentional response and caused repeated spurious
+    # "Noted." messages to be delivered to the user for self-checks, subagent
+    # completions, and other non-reply-requiring messages.
+    #
+    # Correct fix: log the missing reply so it's visible in monitoring, then
+    # mark processed silently.  A missing reply is a dispatcher bug, not
+    # something to paper over with an auto-reply.
     if not force:
         try:
             msg = json.loads(found.read_text())
-            source = msg.get("source", "")
             msg_type = msg.get("type", "")
             chat_id = msg.get("chat_id", 0)
             msg_ts_raw = msg.get("timestamp", "")
@@ -5187,42 +5334,12 @@ async def handle_mark_processed(args: dict) -> list[TextContent]:
                 chat_key = str(chat_id)
                 reply_ts = _recent_replies.get(chat_key, 0.0)
                 if reply_ts < msg_epoch:
-                    # No reply was sent for this human message.
-                    # Skip auto-reply for callback (button press) messages —
-                    # the bot already answered the callback query inline.
-                    # Skip auto-reply for reaction messages — reactions are
-                    # signals that the dispatcher processes contextually;
-                    # sending "Noted." is never correct.
-                    if msg_type == "callback":
-                        log.info(f"Skipping auto-reply fallback for callback message {message_id}")
-                    elif msg_type == "reaction":
-                        log.info(f"Skipping auto-reply fallback for reaction message {message_id}")
-                    elif abs(chat_id) <= 1_000_000:
-                        # Fake/test chat_id — Telegram rejects delivery; skip to avoid dead-letter buildup
-                        log.info(f"Skipping auto-reply fallback for fake/test chat_id {chat_id}")
-                    else:
-                        # Auto-send a fallback reply so the user isn't silently ignored
-                        fallback_text = "Noted."
-                        fallback_id = f"{int(time.time() * 1000)}_{source}"
-                        fallback_data = {
-                            "id": fallback_id,
-                            "source": source,
-                            "chat_id": chat_id,
-                            "text": fallback_text,
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "_fallback": True,
-                        }
-                        if source == "bisque":
-                            outbox_file = BISQUE_OUTBOX_DIR / f"{fallback_id}.json"
-                        else:
-                            outbox_file = OUTBOX_DIR / f"{fallback_id}.json"
-                        atomic_write_json(outbox_file, fallback_data)
-
-                        sent_file = SENT_DIR / f"{fallback_id}.json"
-                        atomic_write_json(sent_file, fallback_data)
-
-                        _track_reply(chat_id)
-                        log.warning(f"Auto-reply fallback triggered for message {message_id} (chat {chat_id})")
+                    # No reply was sent for this human message — log and proceed silently.
+                    log.warning(
+                        f"mark_processed called without send_reply for user message "
+                        f"{message_id} (type={msg_type}, chat={chat_id}) — "
+                        "dispatcher may have dropped a reply"
+                    )
         except (json.JSONDecodeError, OSError):
             pass  # If we can't read the message, skip the guard
 
@@ -5744,6 +5861,7 @@ def _apply_filters_and_paginate(
 ) -> tuple[list[dict], int]:
     """Apply chat_id / source / search / sender_type filters, sort by timestamp, then paginate.
 
+
     Returns (paginated_slice, total_count_before_pagination).
     All filtering and sorting is performed in-memory. This is the legacy
     fallback path used when messages.db is unavailable.
@@ -5779,6 +5897,9 @@ def _apply_filters_and_paginate(
     return filtered[offset: offset + limit], total
 
 
+_HISTORY_TEXT_DISPLAY_LIMIT = 4000  # Max chars shown per message in get_conversation_history
+
+
 def _format_history_output(
     paginated: list[dict],
     total_count: int,
@@ -5789,6 +5910,8 @@ def _format_history_output(
 
     Each dict must have _direction set to 'received' or 'sent'.
     Fields source, chat_id, timestamp, text, user_name, username are optional.
+    Messages longer than _HISTORY_TEXT_DISPLAY_LIMIT chars are shown with a
+    [truncated] suffix so the caller knows the content was cut.
     """
     showing_end = min(offset + limit, total_count)
     output = f"**Conversation History** (showing {offset + 1}-{showing_end} of {total_count}):\n\n"
@@ -5806,7 +5929,8 @@ def _format_history_output(
         except (ValueError, TypeError):
             ts_display = ts
 
-        truncated = text[:500] + ("..." if len(text) > 500 else "")
+        was_truncated = len(text) > _HISTORY_TEXT_DISPLAY_LIMIT
+        truncated = text[:_HISTORY_TEXT_DISPLAY_LIMIT] + (" [truncated]" if was_truncated else "")
         if msg["_direction"] == "received":
             user = msg.get("user_name", msg.get("username", "Unknown"))
             output += "---\n"
@@ -7742,6 +7866,7 @@ async def handle_register_agent(args: dict) -> list[TextContent]:
     output_file = args.get("output_file") or None
     timeout_minutes = args.get("timeout_minutes") or None
     idempotency = args.get("idempotency") or None
+    task_origin = args.get("task_origin") or None
 
     if not agent_id:
         return [TextContent(type="text", text="Error: agent_id is required")]
@@ -7773,6 +7898,7 @@ async def handle_register_agent(args: dict) -> list[TextContent]:
             output_file=output_file,
             timeout_minutes=timeout_minutes,
             idempotency=idempotency,
+            task_origin=task_origin,
         )
     except Exception as exc:
         log.error(f"register_agent failed: {exc}", exc_info=True)
@@ -7845,6 +7971,7 @@ async def handle_session_start(args: dict) -> list[TextContent]:
     trigger_message_id = args.get("trigger_message_id") or None
     trigger_snippet = args.get("trigger_snippet") or None
     idempotency = args.get("idempotency") or None
+    task_origin = args.get("task_origin") or None
     claude_session_id = (args.get("claude_session_id") or "").strip() or None
 
     if not agent_id:
@@ -7875,6 +8002,7 @@ async def handle_session_start(args: dict) -> list[TextContent]:
             trigger_message_id=trigger_message_id,
             trigger_snippet=trigger_snippet,
             idempotency=idempotency,
+            task_origin=task_origin,
         )
     except Exception as exc:
         log.error(f"session_start failed: {exc}", exc_info=True)
@@ -9939,6 +10067,7 @@ def _build_reconciler_message(
     task_id = session.get("task_id") or agent_id
     input_summary = session.get("input_summary")
     output_file = session.get("output_file")
+    session_task_origin = session.get("task_origin") or "user"
 
     elapsed_raw = session.get("elapsed_seconds")
     try:
@@ -9958,6 +10087,7 @@ def _build_reconciler_message(
             "type": "subagent_result",
             "source": session.get("source", "telegram"),
             "chat_id": session.get("chat_id", ""),
+            "task_origin": session_task_origin,
             "text": (
                 f"Agent completed: {description}\n"
                 f"(reconciler-detected via stop_reason=end_turn, {elapsed_min}m elapsed)"
@@ -9981,6 +10111,7 @@ def _build_reconciler_message(
             "type": "agent_failed",
             "source": "system",
             "chat_id": 0,
+            "task_origin": "internal",
             "text": (
                 f"Agent failed/disappeared: {description}\n"
                 f"(no output file after {elapsed_min}m — marked dead)"

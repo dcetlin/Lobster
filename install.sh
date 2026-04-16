@@ -177,6 +177,49 @@ generate_from_template() {
 }
 
 #===============================================================================
+# Config File Helpers
+#===============================================================================
+
+# set_config_if_missing KEY VALUE [CONFIG_PATH]
+#
+# Writes KEY=VALUE to the config file only if the key is absent or has an
+# empty / placeholder value ("your_*_here").  Safe to call on every install
+# run — already-configured values are never overwritten.
+set_config_if_missing() {
+    local key="$1"
+    local value="$2"
+    local file="${3:-$CONFIG_FILE}"
+
+    if [ ! -f "$file" ]; then
+        mkdir -p "$(dirname "$file")"
+        touch "$file"
+    fi
+
+    # Read current value for this key
+    local current
+    current=$(grep -E "^${key}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+
+    # Skip if already set to a non-empty, non-placeholder value
+    if [ -n "$current" ] && [[ "$current" != your_*_here ]]; then
+        return 0
+    fi
+
+    if grep -q "^${key}=" "$file" 2>/dev/null; then
+        # Key exists but is empty or placeholder — replace in-place
+        local tmp
+        tmp=$(mktemp)
+        KEY="$key" VALUE="$value" awk             'BEGIN { replaced=0 }
+             $0 ~ "^" ENVIRON["KEY"] "=" && !replaced { print ENVIRON["KEY"] "=" ENVIRON["VALUE"]; replaced=1; next }
+             { print }'             "$file" > "$tmp" && mv "$tmp" "$file"
+    else
+        # Key absent — append
+        printf '
+%s=%s
+' "$key" "$value" >> "$file"
+    fi
+}
+
+#===============================================================================
 # Private Configuration Overlay
 #===============================================================================
 
@@ -391,7 +434,19 @@ if [ "$CONTAINER_SETUP" = true ]; then
     fi
 
     # Create stub user-config agent files if they don't exist
-    for stub_file in "user.base.bootup.md" "user.base.context.md" "user.dispatcher.bootup.md" "user.subagent.bootup.md"; do
+    # user.base.bootup.md gets seeded from the example template (contains timezone placeholder)
+    USER_BASE_BOOTUP_TEMPLATE="$INSTALL_DIR/memory/canonical-templates/user.base.bootup.md.example"
+    user_base_bootup_dest="$USER_CONFIG_DIR/agents/user.base.bootup.md"
+    if [ ! -f "$user_base_bootup_dest" ]; then
+        if [ -f "$USER_BASE_BOOTUP_TEMPLATE" ]; then
+            cp "$USER_BASE_BOOTUP_TEMPLATE" "$user_base_bootup_dest"
+            info "  Seeded user.base.bootup.md from template (customize timezone and preferences)"
+        else
+            touch "$user_base_bootup_dest"
+            info "  Created stub: agents/user.base.bootup.md"
+        fi
+    fi
+    for stub_file in "user.base.context.md" "user.dispatcher.bootup.md" "user.subagent.bootup.md"; do
         stub_dest="$USER_CONFIG_DIR/agents/$stub_file"
         if [ ! -f "$stub_dest" ]; then
             touch "$stub_dest"
@@ -522,7 +577,13 @@ if [ "$(id -u)" = "0" ]; then
     echo ""
     info "Re-running installer as 'lobster' user..."
     echo ""
-    exec sudo -u lobster HOME="$LOBSTER_HOME" bash "$TMP_SCRIPT" "$@"
+    # Pass Telegram credentials through the re-exec so non-interactive install can write them
+    TELEGRAM_CRED_VARS=()
+    [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && TELEGRAM_CRED_VARS+=("TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}")
+    [ -n "${TELEGRAM_ALLOWED_USERS:-}" ] && TELEGRAM_CRED_VARS+=("TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS}")
+    [ -n "${TELEGRAM_USER_ID:-}" ] && TELEGRAM_CRED_VARS+=("TELEGRAM_USER_ID=${TELEGRAM_USER_ID}")
+    [ -n "${LOBSTER_ADMIN_CHAT_ID:-}" ] && TELEGRAM_CRED_VARS+=("LOBSTER_ADMIN_CHAT_ID=${LOBSTER_ADMIN_CHAT_ID}")
+    exec sudo -u lobster HOME="$LOBSTER_HOME" env "${TELEGRAM_CRED_VARS[@]}" bash "$TMP_SCRIPT" "$@"
 fi
 
 # Check if running interactively
@@ -855,36 +916,35 @@ fi
 #===============================================================================
 
 if [ "$CLAUDE_INSTALLED" = false ]; then
-    if [ "$NON_INTERACTIVE" = true ]; then
-        warn "Claude Code not found — skipping installation (non-interactive mode)."
-        info "Run the installer interactively or install Claude Code manually: curl -fsSL https://claude.ai/install.sh | bash"
-    else
-        step "Installing Claude Code..."
+    step "Installing Claude Code..."
 
-        curl -fsSL https://claude.ai/install.sh | bash
+    # The official Claude Code installer (curl -fsSL https://claude.ai/install.sh | bash)
+    # is itself non-interactive — it does not prompt for input. We can safely run it in
+    # both interactive and non-interactive modes. The previous behaviour of skipping the
+    # install in non-interactive mode left the lobster-claude service unable to start.
+    curl -fsSL https://claude.ai/install.sh | bash
 
-        # Add to PATH for current session and clear bash's command hash table so
-        # command -v picks up the newly installed binary immediately.
-        export PATH="$HOME/.local/bin:$PATH"
-        hash -r 2>/dev/null || true
+    # Add to PATH for current session and clear bash's command hash table so
+    # command -v picks up the newly installed binary immediately.
+    export PATH="$HOME/.local/bin:$PATH"
+    hash -r 2>/dev/null || true
 
-        # Persist ~/.local/bin to PATH in shell config files
-        PATH_LINE="export PATH=\"\$HOME/.local/bin:\$PATH\""
-        for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
-            if [ -f "$rc" ] && ! grep -q '\.local/bin' "$rc"; then
-                echo "" >> "$rc"
-                echo "# Added by Lobster installer" >> "$rc"
-                echo "$PATH_LINE" >> "$rc"
-                info "Added ~/.local/bin to PATH in $rc"
-            fi
-        done
-
-        if command -v claude &>/dev/null || [ -x "$HOME/.local/bin/claude" ]; then
-            success "Claude Code installed"
-        else
-            error "Claude Code installation failed"
-            exit 1
+    # Persist ~/.local/bin to PATH in shell config files
+    PATH_LINE="export PATH=\"\$HOME/.local/bin:\$PATH\""
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+        if [ -f "$rc" ] && ! grep -q '\.local/bin' "$rc"; then
+            echo "" >> "$rc"
+            echo "# Added by Lobster installer" >> "$rc"
+            echo "$PATH_LINE" >> "$rc"
+            info "Added ~/.local/bin to PATH in $rc"
         fi
+    done
+
+    if command -v claude &>/dev/null || [ -x "$HOME/.local/bin/claude" ]; then
+        success "Claude Code installed"
+    else
+        error "Claude Code installation failed"
+        exit 1
     fi
 fi
 
@@ -1105,11 +1165,17 @@ fi
 mkdir -p "$HOME/projects"/{personal,business}
 
 # Seed canonical templates (only files that don't already exist; skip examples)
+# NOTE: system-audit.context.md is excluded from this loop — it belongs in
+# user-config/agents/, not memory/canonical/. It has its own seeding block below.
+# Including it here would create a stale duplicate that diverges from the agents/
+# copy over time (issue #1196).
 TEMPLATES_DIR="$INSTALL_DIR/memory/canonical-templates"
 if [ -d "$TEMPLATES_DIR" ]; then
     for tmpl in "$TEMPLATES_DIR"/*.md; do
         [ -f "$tmpl" ] || continue
         base=$(basename "$tmpl")
+        # system-audit.context.md is seeded to agents/ below, not memory/canonical/
+        [[ "$base" == "system-audit.context.md" ]] && continue
         dest="$USER_CONFIG_DIR/memory/canonical/$base"
         if [ ! -f "$dest" ]; then
             cp "$tmpl" "$dest"
@@ -1152,7 +1218,19 @@ if [ -f "$AUDIT_CONTEXT_SEED" ] && [ ! -f "$AUDIT_CONTEXT_DEST" ]; then
 fi
 
 # Create stub user-config agent files if they don't exist
-for stub_file in "user.base.bootup.md" "user.base.context.md" "user.dispatcher.bootup.md" "user.subagent.bootup.md"; do
+# user.base.bootup.md gets seeded from the example template (contains timezone placeholder)
+USER_BASE_BOOTUP_TEMPLATE="$INSTALL_DIR/memory/canonical-templates/user.base.bootup.md.example"
+user_base_bootup_dest="$USER_CONFIG_DIR/agents/user.base.bootup.md"
+if [ ! -f "$user_base_bootup_dest" ]; then
+    if [ -f "$USER_BASE_BOOTUP_TEMPLATE" ]; then
+        cp "$USER_BASE_BOOTUP_TEMPLATE" "$user_base_bootup_dest"
+        info "  Seeded user.base.bootup.md from template (customize timezone and preferences)"
+    else
+        touch "$user_base_bootup_dest"
+        info "  Created stub: agents/user.base.bootup.md"
+    fi
+fi
+for stub_file in "user.base.context.md" "user.dispatcher.bootup.md" "user.subagent.bootup.md"; do
     stub_dest="$USER_CONFIG_DIR/agents/$stub_file"
     if [ ! -f "$stub_dest" ]; then
         touch "$stub_dest"
@@ -2053,16 +2131,49 @@ else
 fi
 
 if [ "$NEED_CONFIG" = true ] && [ "$NON_INTERACTIVE" = true ]; then
-    warn "Skipping Telegram configuration (non-interactive mode)."
-    info "Run the installer again without --non-interactive to configure Telegram."
-    # Write a placeholder config so downstream steps don't fail
-    if [ ! -f "$CONFIG_FILE" ]; then
+    # Resolve TELEGRAM_ALLOWED_USERS from TELEGRAM_USER_ID if needed
+    if [ -z "${TELEGRAM_ALLOWED_USERS:-}" ] && [ -n "${TELEGRAM_USER_ID:-}" ]; then
+        TELEGRAM_ALLOWED_USERS="$TELEGRAM_USER_ID"
+    fi
+    # Also use LOBSTER_ADMIN_CHAT_ID = TELEGRAM_ALLOWED_USERS if not set separately
+    if [ -z "${LOBSTER_ADMIN_CHAT_ID:-}" ] && [ -n "${TELEGRAM_ALLOWED_USERS:-}" ]; then
+        LOBSTER_ADMIN_CHAT_ID="$TELEGRAM_ALLOWED_USERS"
+    fi
+    if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ "${TELEGRAM_BOT_TOKEN}" != "your_bot_token_here" ] \
+       && [ -n "${TELEGRAM_ALLOWED_USERS:-}" ]; then
+        info "Writing Telegram credentials from environment variables (non-interactive mode)."
         mkdir -p "$(dirname "$CONFIG_FILE")"
         cat > "$CONFIG_FILE" << EOF
 # Lobster Configuration
+# Generated by installer on $(date) (non-interactive)
+
+# Telegram Bot
+TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS}
+
+# Admin chat ID (Telegram numeric user ID for the primary admin user).
+# Used by alert.sh and scheduled tasks to deliver messages.
+LOBSTER_ADMIN_CHAT_ID=${LOBSTER_ADMIN_CHAT_ID:-${TELEGRAM_ALLOWED_USERS}}
+
+# Environment mode: production | dev | test
+# Set to "dev" to make the persistent session and health check inert while doing
+# interactive SSH work. Revert to "production" (or remove this line) to resume.
+LOBSTER_ENV=production
+EOF
+        success "Telegram configuration written from environment variables."
+    else
+        warn "Skipping Telegram configuration (non-interactive mode, no credentials in environment)."
+        info "Set TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USERS (or TELEGRAM_USER_ID) env vars to configure automatically."
+        info "Or run the installer again without --non-interactive to configure Telegram."
+        # Write a placeholder config so downstream steps don't fail
+        if [ ! -f "$CONFIG_FILE" ]; then
+            mkdir -p "$(dirname "$CONFIG_FILE")"
+            cat > "$CONFIG_FILE" << EOF
+# Lobster Configuration
 # Generated by installer on $(date) (non-interactive - needs configuration)
 
-# Telegram Bot (UNCONFIGURED - run installer interactively to set up)
+# Telegram Bot (UNCONFIGURED - set TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USERS env vars
+# before running the installer, or run interactively to configure)
 TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_ALLOWED_USERS=
 
@@ -2075,6 +2186,7 @@ LOBSTER_ADMIN_CHAT_ID=
 # interactive SSH work. Revert to "production" (or remove this line) to resume.
 LOBSTER_ENV=production
 EOF
+        fi
     fi
     NEED_CONFIG=false
 fi
@@ -2121,24 +2233,19 @@ if [ "$NEED_CONFIG" = true ]; then
         fi
     done
 
-    # Write config (Telegram only; auth method is configured in the next section)
-    cat > "$CONFIG_FILE" << EOF
-# Lobster Configuration
-# Generated by installer on $(date)
-
-# Telegram Bot
-TELEGRAM_BOT_TOKEN=$BOT_TOKEN
-TELEGRAM_ALLOWED_USERS=$USER_ID
-
-# Admin chat ID (Telegram numeric user ID for the primary admin user).
-# Used by alert.sh to deliver system notifications.
-LOBSTER_ADMIN_CHAT_ID=$USER_ID
-
-# Environment mode: production | dev | test
-# Set to "dev" to make the persistent session and health check inert while doing
-# interactive SSH work. Revert to "production" (or remove this line) to resume.
-LOBSTER_ENV=production
-EOF
+    # Write Telegram config using set_config_if_missing so that other keys
+    # already present in config.env (e.g. LOBSTER_INTERNAL_SECRET, API keys)
+    # are never overwritten when the user re-runs the installer.
+    if [ ! -f "$CONFIG_FILE" ]; then
+        mkdir -p "$(dirname "$CONFIG_FILE")"
+        printf '# Lobster Configuration
+# Generated by installer on %s
+' "$(date)" > "$CONFIG_FILE"
+    fi
+    set_config_if_missing TELEGRAM_BOT_TOKEN "$BOT_TOKEN"
+    set_config_if_missing TELEGRAM_ALLOWED_USERS "$USER_ID"
+    set_config_if_missing LOBSTER_ADMIN_CHAT_ID "$USER_ID"
+    set_config_if_missing LOBSTER_ENV production
 
     success "Telegram configuration saved"
 fi
@@ -2635,11 +2742,9 @@ if [ "$AUTH_METHOD" = "apikey" ] || [ "$AUTH_METHOD" = "apikey_fallback" ]; then
             fi
         done
 
-        # Save API key to config.env if we got one
+        # Save API key to config.env if we got one (idempotent — won't overwrite)
         if [ -n "${ANTHROPIC_API_KEY:-}" ] && [ -f "$CONFIG_FILE" ]; then
-            echo "" >> "$CONFIG_FILE"
-            echo "# Anthropic API Key (per-token billing)" >> "$CONFIG_FILE"
-            echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY" >> "$CONFIG_FILE"
+            set_config_if_missing ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY"
         fi
     fi
 fi
@@ -2757,6 +2862,13 @@ else
     if [ -f "$INSTALL_DIR/services/lobster-observability.service" ]; then
         sudo cp "$INSTALL_DIR/services/lobster-observability.service" /etc/systemd/system/
         info "Observability server service installed (enable manually with: sudo systemctl enable lobster-observability)"
+    fi
+
+    # Install transcription worker service (always present — whisper.cpp is a hard dependency)
+    if [ -f "$INSTALL_DIR/services/lobster-transcription.service" ]; then
+        sudo cp "$INSTALL_DIR/services/lobster-transcription.service" /etc/systemd/system/
+        sudo systemctl enable lobster-transcription 2>/dev/null || true
+        success "Transcription worker service installed and enabled (lobster-transcription)"
     fi
 
     sudo systemctl daemon-reload
@@ -2935,6 +3047,9 @@ if [[ ! $REPLY =~ ^[Nn]$ ]]; then
     sudo systemctl start lobster-router
     sleep 2
     sudo systemctl start lobster-claude
+    # Start transcription worker (already enabled above; start it now so pending voice
+    # messages in ~/messages/pending-transcription/ are processed immediately)
+    sudo systemctl start lobster-transcription 2>/dev/null || true
 
     sleep 3
 

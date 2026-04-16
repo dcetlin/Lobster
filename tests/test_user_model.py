@@ -142,7 +142,7 @@ class TestDbSchema:
             "SELECT value FROM um_metadata WHERE key = 'schema_version'"
         ).fetchone()
         assert row is not None
-        assert int(row[0]) == 2
+        assert int(row[0]) == 3
 
 
 # ---------------------------------------------------------------------------
