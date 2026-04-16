@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import pytest
 
-from src.orchestration.dispatcher_handlers import handle_approve, handle_confirm, handle_decide, handle_wos_execute, handle_wos_status, handle_wos_unblock
+from src.orchestration.dispatcher_handlers import handle_approve, handle_confirm, handle_decide, handle_decide_defer, handle_wos_execute, handle_wos_status, handle_wos_unblock
 
 
 @pytest.fixture
@@ -318,3 +318,120 @@ class TestHandleDecide:
         handle_decide(result.id, "retry", registry=registry)
         uow = registry.get(result.id)
         assert uow.steward_cycles == 0  # reset
+
+
+# ---------------------------------------------------------------------------
+# /decide defer tests — issue #343
+# ---------------------------------------------------------------------------
+
+# Named constant: the expected event name written to audit_log on defer.
+DECIDE_DEFER_AUDIT_EVENT = "decide_defer"
+
+
+class TestHandleDecideDefer:
+    """Tests for /decide <uow-id> defer — leave blocked, write audit entry."""
+
+    def test_defer_leaves_uow_in_blocked_status(self, registry, blocked_uow_id):
+        """defer does not transition the UoW — it stays in blocked status."""
+        response = handle_decide(blocked_uow_id, "defer", registry=registry)
+        assert "deferred" in response.lower()
+        uow = registry.get(blocked_uow_id)
+        assert uow.status.value == "blocked"
+
+    def test_defer_writes_audit_entry(self, registry, blocked_uow_id):
+        """defer writes a decide_defer audit log entry — the deferral is auditable."""
+        import sqlite3
+        handle_decide(blocked_uow_id, "defer", registry=registry)
+        conn = sqlite3.connect(str(registry.db_path))
+        row = conn.execute(
+            "SELECT event, from_status, to_status, agent FROM audit_log WHERE uow_id=? AND event=?",
+            (blocked_uow_id, DECIDE_DEFER_AUDIT_EVENT),
+        ).fetchone()
+        conn.close()
+        assert row is not None, "audit log must contain a decide_defer entry"
+        assert row[1] == "blocked"   # from_status
+        assert row[2] == "blocked"   # to_status (no transition)
+        assert row[3] == "user"      # actor
+
+    def test_defer_with_note_includes_note_in_response(self, registry, blocked_uow_id):
+        """defer <note> includes the operator note in the response."""
+        note = "waiting on external security review"
+        response = handle_decide(blocked_uow_id, f"defer {note}", registry=registry)
+        assert note in response
+
+    def test_defer_with_note_records_note_in_audit_log(self, registry, blocked_uow_id):
+        """defer <note> persists the note text in the audit_log entry."""
+        import sqlite3
+        import json
+        note = "blocked by upstream API outage"
+        handle_decide(blocked_uow_id, f"defer {note}", registry=registry)
+        conn = sqlite3.connect(str(registry.db_path))
+        row = conn.execute(
+            "SELECT note FROM audit_log WHERE uow_id=? AND event=?",
+            (blocked_uow_id, DECIDE_DEFER_AUDIT_EVENT),
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        note_payload = json.loads(row[0])
+        assert note in note_payload["note"]
+
+    def test_defer_without_note_uses_default_message(self, registry, blocked_uow_id):
+        """defer with no note writes a default audit message — not an empty string."""
+        import sqlite3
+        import json
+        handle_decide(blocked_uow_id, "defer", registry=registry)
+        conn = sqlite3.connect(str(registry.db_path))
+        row = conn.execute(
+            "SELECT note FROM audit_log WHERE uow_id=? AND event=?",
+            (blocked_uow_id, DECIDE_DEFER_AUDIT_EVENT),
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        note_payload = json.loads(row[0])
+        assert note_payload["note"], "default note must be a non-empty string"
+
+    def test_defer_on_non_blocked_uow_returns_error(self, registry):
+        """defer on a non-blocked UoW returns an informative error, not a crash."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        result = registry.upsert(issue_number=310, title="Active defer test", sweep_date=today, success_criteria="Test done.")
+        registry.set_status_direct(result.id, "active")
+        response = handle_decide(result.id, "defer", registry=registry)
+        assert "not currently in" in response.lower() or "could not be" in response.lower()
+
+    def test_defer_does_not_reset_steward_cycles(self, registry):
+        """defer leaves steward_cycles unchanged — it is a record-only operation."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        result = registry.upsert(issue_number=311, title="Cycles defer test", sweep_date=today, success_criteria="Test done.")
+        import sqlite3
+        conn = sqlite3.connect(str(registry.db_path))
+        conn.execute("UPDATE uow_registry SET status='blocked', steward_cycles=4 WHERE id=?", (result.id,))
+        conn.commit()
+        conn.close()
+        handle_decide(result.id, "defer", registry=registry)
+        uow = registry.get(result.id)
+        assert uow.steward_cycles == 4  # unchanged
+
+    def test_defer_is_listed_in_unknown_action_error(self, registry, blocked_uow_id):
+        """The error message for unknown actions lists defer among valid options."""
+        response = handle_decide(blocked_uow_id, "frobnicate", registry=registry)
+        assert "defer" in response.lower()
+
+    def test_handle_decide_defer_standalone_function(self, registry, blocked_uow_id):
+        """handle_decide_defer is callable directly — same semantics as via handle_decide."""
+        response = handle_decide_defer(blocked_uow_id, "direct call test", registry=registry)
+        assert "deferred" in response.lower()
+        uow = registry.get(blocked_uow_id)
+        assert uow.status.value == "blocked"
+
+    def test_defer_idempotent_multiple_calls_each_write_audit_entry(self, registry, blocked_uow_id):
+        """Multiple defer calls each write a separate audit entry — deferral is a log, not a state."""
+        import sqlite3
+        handle_decide(blocked_uow_id, "defer first", registry=registry)
+        handle_decide(blocked_uow_id, "defer second", registry=registry)
+        conn = sqlite3.connect(str(registry.db_path))
+        count = conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE uow_id=? AND event=?",
+            (blocked_uow_id, DECIDE_DEFER_AUDIT_EVENT),
+        ).fetchone()[0]
+        conn.close()
+        assert count == 2, "each defer call must produce a distinct audit entry"
