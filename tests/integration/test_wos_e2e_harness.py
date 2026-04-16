@@ -712,3 +712,181 @@ class TestHarness004HardCap:
             f"notify_dan must be called at least 1 time at escalation (AC-15), "
             f"called {len(notify_dan_calls)} times"
         )
+
+
+# ---------------------------------------------------------------------------
+# HARNESS-005: Read-path isolation and bootup_candidate_gate
+# ---------------------------------------------------------------------------
+
+HARNESS_005_ISSUE_NUMBER = 9005
+HARNESS_005_BOOTUP_ISSUE_NUMBER = 9006
+
+
+@pytest.mark.wos_e2e
+class TestHarness005ReadPathIsolation:
+    """
+    HARNESS-005: executor_uow_view read-path isolation and BOOTUP_CANDIDATE_GATE.
+
+    Covers the two assertions from issue #318 that were not present in
+    HARNESS-001 through HARNESS-004:
+
+    1. executor_uow_view correctly excludes steward_agenda and steward_log —
+       the Executor's read path must never surface Steward-private state.
+    2. BOOTUP_CANDIDATE_GATE can flip: when gate=True and issue carries the
+       'bootup-candidate' label the UoW is skipped; when gate=False it is
+       processed normally.
+    """
+
+    def test_harness_005_executor_view_excludes_steward_private_fields(
+        self, harness_env: dict
+    ) -> None:
+        """
+        executor_uow_view must not expose steward_agenda, steward_log, or notes.
+
+        Procedure:
+        1. Seed a UoW and run one Steward cycle so that steward_agenda is
+           written and the UoW advances to ready-for-executor.
+        2. Query executor_uow_view directly (not uow_registry) and confirm
+           the three Steward-private columns are absent from the result set.
+        3. Confirm the UoW *is* visible in the view (status == ready-for-executor
+           is the view filter), so a passing column-absence check is not vacuous.
+        """
+        registry: Registry = harness_env["registry"]
+        artifact_dir: Path = harness_env["artifact_dir"]
+        db_path: Path = harness_env["db_path"]
+        notify_dan = harness_env["notify_dan"]
+
+        uow_id = _seed_harness_uow(registry, HARNESS_005_ISSUE_NUMBER)
+
+        # Run one Steward cycle to populate steward_agenda and advance to
+        # ready-for-executor.
+        steward_result = run_steward_cycle(
+            registry=registry,
+            github_client=_noop_github_client,
+            artifact_dir=artifact_dir,
+            notify_dan=notify_dan,
+            notify_dan_early_warning=_noop_notify_dan_early_warning,
+            bootup_candidate_gate=False,
+            llm_prescriber=None,
+        )
+        assert steward_result.prescribed == 1, (
+            f"Steward must prescribe 1 UoW, got {steward_result}"
+        )
+
+        uow = registry.get(uow_id)
+        assert uow.status == UoWStatus.READY_FOR_EXECUTOR, (
+            f"After prescription, expected ready-for-executor, got {uow.status}"
+        )
+
+        # executor_uow_view uses status = 'ready-for-executor' as its row filter,
+        # so the UoW must be present.
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM executor_uow_view WHERE id = ?", (uow_id,)
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1, (
+            f"executor_uow_view must return exactly 1 row for {uow_id!r} "
+            f"when status is ready-for-executor. Got {len(rows)} rows."
+        )
+
+        view_columns = set(rows[0].keys())
+        steward_private = {"steward_agenda", "steward_log", "notes"}
+        leaked = steward_private & view_columns
+        assert not leaked, (
+            f"executor_uow_view must NOT expose Steward-private columns. "
+            f"Leaked: {leaked!r}. "
+            f"View columns: {sorted(view_columns)}"
+        )
+
+    def test_harness_005_bootup_candidate_gate_blocks_when_active(
+        self, harness_env: dict
+    ) -> None:
+        """
+        When bootup_candidate_gate=True and the GitHub issue carries the
+        'bootup-candidate' label, the Steward must skip the UoW.
+
+        The UoW remains in ready-for-steward and steward_result.skipped == 1.
+        """
+        registry: Registry = harness_env["registry"]
+        artifact_dir: Path = harness_env["artifact_dir"]
+        notify_dan = harness_env["notify_dan"]
+
+        uow_id = _seed_harness_uow(registry, HARNESS_005_BOOTUP_ISSUE_NUMBER)
+
+        def _bootup_candidate_client(issue_number: int) -> IssueInfo:
+            """Return an IssueInfo whose labels include 'bootup-candidate'."""
+            return IssueInfo(
+                status_code=200,
+                state="open",
+                labels=["bootup-candidate"],
+                body="Harness test issue body — bootup candidate.",
+                title=f"Harness bootup-candidate UoW #{issue_number}",
+            )
+
+        steward_result = run_steward_cycle(
+            registry=registry,
+            github_client=_bootup_candidate_client,
+            artifact_dir=artifact_dir,
+            notify_dan=notify_dan,
+            notify_dan_early_warning=_noop_notify_dan_early_warning,
+            bootup_candidate_gate=True,   # gate active → must skip
+            llm_prescriber=None,
+        )
+        assert steward_result.skipped >= 1, (
+            f"Steward must skip at least 1 bootup-candidate UoW when gate is active. "
+            f"Got skipped={steward_result.skipped}, prescribed={steward_result.prescribed}"
+        )
+
+        uow = registry.get(uow_id)
+        assert uow.status == UoWStatus.READY_FOR_STEWARD, (
+            f"bootup-candidate UoW must remain ready-for-steward when gate is active, "
+            f"got {uow.status}"
+        )
+
+    def test_harness_005_bootup_candidate_gate_passes_when_cleared(
+        self, harness_env: dict
+    ) -> None:
+        """
+        When bootup_candidate_gate=False the Steward must process bootup-candidate
+        UoWs normally — the gate clearing unblocks routing.
+
+        The UoW advances to ready-for-executor and steward_result.prescribed == 1.
+        """
+        registry: Registry = harness_env["registry"]
+        artifact_dir: Path = harness_env["artifact_dir"]
+        notify_dan = harness_env["notify_dan"]
+
+        # Use a fresh issue number to avoid cross-test state (same fixture scope)
+        uow_id = _seed_harness_uow(registry, HARNESS_005_BOOTUP_ISSUE_NUMBER + 100)
+
+        def _bootup_candidate_client(issue_number: int) -> IssueInfo:
+            return IssueInfo(
+                status_code=200,
+                state="open",
+                labels=["bootup-candidate"],
+                body="Harness test issue body — bootup candidate cleared.",
+                title=f"Harness bootup-candidate UoW #{issue_number}",
+            )
+
+        steward_result = run_steward_cycle(
+            registry=registry,
+            github_client=_bootup_candidate_client,
+            artifact_dir=artifact_dir,
+            notify_dan=notify_dan,
+            notify_dan_early_warning=_noop_notify_dan_early_warning,
+            bootup_candidate_gate=False,  # gate cleared → must process
+            llm_prescriber=None,
+        )
+        assert steward_result.prescribed == 1, (
+            f"Steward must prescribe 1 bootup-candidate UoW when gate is cleared. "
+            f"Got prescribed={steward_result.prescribed}, skipped={steward_result.skipped}"
+        )
+
+        uow = registry.get(uow_id)
+        assert uow.status == UoWStatus.READY_FOR_EXECUTOR, (
+            f"bootup-candidate UoW must advance to ready-for-executor when gate is cleared, "
+            f"got {uow.status}"
+        )
