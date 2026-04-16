@@ -2650,6 +2650,23 @@ CREATE TABLE IF NOT EXISTS dispatcher_lock (
         fi
     fi
 
+    # Migration 76: Install logrotate config for dispatch-boundary.jsonl (PR #708 advisory S3P2-E).
+    # The file grows indefinitely without rotation; this caps it at 10M with weekly rotation,
+    # keeping ~4 weeks of history. copytruncate is used because the Python writer opens/closes
+    # the file on each append — no persistent handle to reopen after a rename-based rotation.
+    if [ ! -f /etc/logrotate.d/lobster-dispatch-boundary ]; then
+        if [ -f "$LOBSTER_DIR/logrotate/lobster-dispatch-boundary" ]; then
+            echo "[Migration 76] Installing dispatch-boundary logrotate config..."
+            sudo cp "$LOBSTER_DIR/logrotate/lobster-dispatch-boundary" /etc/logrotate.d/lobster-dispatch-boundary
+            substep "dispatch-boundary logrotate config installed"
+            migrated=$((migrated + 1))
+        else
+            substep "WARN: logrotate/lobster-dispatch-boundary not found in repo — skipping"
+        fi
+    else
+        substep "dispatch-boundary logrotate config already present — skipping"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
