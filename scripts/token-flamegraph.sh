@@ -200,6 +200,82 @@ print(f"  {'TOTAL':<{max_source_len if sorted_sources else 8}}  {'':<{BAR_WIDTH}
 PYEOF
 
 # ---------------------------------------------------------------------------
+# Model breakdown — group by model family, show cost-weighted share.
+# Skipped silently when no records have a model field yet.
+# ---------------------------------------------------------------------------
+python3 - "${LEDGER_FILE}" "${SINCE_S}" "${NOW_S}" "${WINDOW}" <<'PYEOF_MODEL'
+import sys
+import json
+from collections import defaultdict
+
+ledger_path = sys.argv[1]
+since_s = int(sys.argv[2])
+now_s = int(sys.argv[3])
+window = sys.argv[4]
+
+# Cost multipliers relative to opus (opus=1.0x reference).
+MODEL_COST_MULTIPLIERS = {"opus": 1.0, "sonnet": 0.4, "haiku": 0.1}
+MODEL_UNKNOWN_MULTIPLIER = 0.4  # default to sonnet when field absent
+
+
+def model_family(model_str):
+    m = model_str.lower() if model_str else ""
+    if "opus" in m:
+        return "opus"
+    if "haiku" in m:
+        return "haiku"
+    return "sonnet"
+
+
+buckets = defaultdict(lambda: {"cache_read": 0, "count": 0, "cost_units": 0.0})
+
+with open(ledger_path) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ts = entry.get("ts", 0)
+        if ts < since_s or ts > now_s:
+            continue
+        family = model_family(entry.get("model", ""))
+        multiplier = MODEL_COST_MULTIPLIERS.get(family, MODEL_UNKNOWN_MULTIPLIER)
+        total_tokens = (
+            entry.get("input", 0) + entry.get("output", 0) +
+            entry.get("cache_read", 0) + entry.get("cache_write", 0)
+        )
+        buckets[family]["cache_read"] += entry.get("cache_read", 0)
+        buckets[family]["count"] += 1
+        buckets[family]["cost_units"] += total_tokens * multiplier
+
+if not buckets:
+    sys.exit(0)
+
+total_cost_units = sum(b["cost_units"] for b in buckets.values()) or 1.0
+sorted_models = sorted(buckets.items(), key=lambda x: x[1]["cost_units"], reverse=True)
+
+def fmt_num(n):
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}k"
+    return str(n)
+
+print()
+print("  Model breakdown (opus=1.0x ref, sonnet=0.4x, haiku=0.1x):")
+print()
+for family, b in sorted_models:
+    pct = b["cost_units"] / total_cost_units * 100
+    bar_filled = round(12 * pct / 100)
+    bar_filled = max(1, min(bar_filled, 12)) if b["count"] > 0 else 0
+    bar = "█" * bar_filled + "░" * (12 - bar_filled)
+    print(f"  {bar}  {family:<8}  {b['count']:3d} calls | cache_read: {fmt_num(b['cache_read']):<8} | cost share: {pct:.0f}%")
+PYEOF_MODEL
+
+# ---------------------------------------------------------------------------
 # Outcome category breakdown (issue #754)
 # Reads outcome-ledger.jsonl and shows counts per metabolic category in the
 # same time window. Skipped silently if the ledger doesn't exist yet.
