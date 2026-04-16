@@ -1,3 +1,9 @@
+---
+oracle_status: approved
+oracle_pr: https://github.com/dcetlin/Lobster/pull/772
+oracle_date: 2026-04-16
+---
+
 # System Metabolism
 
 *Frontier document — living, evolves as the protocol matures.*
@@ -46,6 +52,7 @@ Direct high-value output. The artifact deserves to exist and is immediately usef
 
 Examples: philosophy sessions that encode a new framework, bugs caught before production, analysis that feeds a decision, a diagnosis that changes behavior. Pearls are what the system is for.
 
+<<<<<<< Updated upstream
 ### Category Transitions
 
 Categories are not permanent. An artifact's classification reflects its current role, not its origin.
@@ -56,6 +63,8 @@ Categories are not permanent. An artifact's classification reflects its current 
 
 **Seed → Shit (rot)**: occurs when a seed has not been germinated in 60-90 days and is no longer viable. See also: Open Questions below, where this threshold is discussed. Hygiene sweeps should flag old seeds for human review.
 
+=======
+>>>>>>> Stashed changes
 ---
 
 ## Grounding Table
@@ -67,7 +76,11 @@ Categories are not permanent. An artifact's classification reflects its current 
 | Compost path | Nightly consolidation job (extracts from session notes → canonical memory), philosophy harvest job |
 | Evisceration path | Hygiene sweep (issues opened but never resolved), manual evisceration on stale frontier docs |
 | Seeds | Infra PRs, new MCP tools, flamegraph Tier 2/3 work, this document |
+<<<<<<< Updated upstream
 | Pearls | philosophy/frontier/ docs actively referenced in bootup *(seed until bootup-embedded; see Category Transitions)*, bugs caught by oracle, canonical memory entries the dispatcher reads |
+=======
+| Pearls | philosophy/frontier/ docs actively referenced in bootup, bugs caught by oracle, canonical memory entries the dispatcher reads |
+>>>>>>> Stashed changes
 | Accumulation threshold | Shit backlog growing faster than composting throughput → escalate |
 
 ---
