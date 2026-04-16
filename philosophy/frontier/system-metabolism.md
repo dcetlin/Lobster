@@ -46,6 +46,16 @@ Direct high-value output. The artifact deserves to exist and is immediately usef
 
 Examples: philosophy sessions that encode a new framework, bugs caught before production, analysis that feeds a decision, a diagnosis that changes behavior. Pearls are what the system is for.
 
+### Category Transitions
+
+Categories are not permanent. An artifact's classification reflects its current role, not its origin.
+
+**Seed → Pearl**: occurs when the artifact is actively embedded in the runtime decision path — included in bootup context, cited in a running agent's working context, or actively driving dispatcher behavior. The trigger is *operational reference*, not mere existence. A frontier doc that sits in the filesystem is a seed; the same doc injected into bootup is a pearl.
+
+**Pearl → Shit**: occurs when the pearl is superseded and no longer the active source of truth — a doc replaced by a newer version, a decision overridden, a canonical entry that has gone stale. Superseded pearls that are not eviscerated become clutter.
+
+**Seed → Shit (rot)**: occurs when a seed has not been germinated in 60-90 days and is no longer viable. See also: Open Questions below, where this threshold is discussed. Hygiene sweeps should flag old seeds for human review.
+
 ---
 
 ## Grounding Table
@@ -57,7 +67,7 @@ Examples: philosophy sessions that encode a new framework, bugs caught before pr
 | Compost path | Nightly consolidation job (extracts from session notes → canonical memory), philosophy harvest job |
 | Evisceration path | Hygiene sweep (issues opened but never resolved), manual evisceration on stale frontier docs |
 | Seeds | Infra PRs, new MCP tools, flamegraph Tier 2/3 work, this document |
-| Pearls | philosophy/frontier/ docs actively referenced in bootup, bugs caught by oracle, canonical memory entries the dispatcher reads |
+| Pearls | philosophy/frontier/ docs actively referenced in bootup *(seed until bootup-embedded; see Category Transitions)*, bugs caught by oracle, canonical memory entries the dispatcher reads |
 | Accumulation threshold | Shit backlog growing faster than composting throughput → escalate |
 
 ---
