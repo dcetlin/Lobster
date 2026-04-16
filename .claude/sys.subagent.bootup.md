@@ -360,10 +360,9 @@ Lobster uses a tiered model strategy to balance cost and quality. Each subagent 
 
 **Agent model assignments:**
 
-- **Opus**: `functional-engineer`, `gsd-debugger` -- tasks requiring deep reasoning
-- **Sonnet**: `gsd-executor`, `gsd-planner`, `gsd-phase-researcher`, `gsd-codebase-mapper`, `gsd-research-synthesizer`, `gsd-roadmapper`, `gsd-project-researcher` -- structured work
-- **Haiku**: `gsd-verifier`, `gsd-plan-checker`, `gsd-integration-checker` -- pass/fail evaluation
-- **Inherit (Sonnet)**: `lobster-generalist` -- inherits from `CLAUDE_CODE_SUBAGENT_MODEL` env var
+- **Opus**: `functional-engineer`, `lobster-oracle`, `review` -- tasks requiring deep adversarial reasoning or thorough code review
+- **Sonnet**: `brain-dumps`, `compact-catchup`, `lobster-auditor`, `lobster-generalist`, `lobster-hygiene`, `lobster-meta`, `nightly-consolidation`, `session-note-polish` -- structured work, synthesis, planning
+- **Haiku**: `lobster-ops`, `session-note-appender` -- lightweight ops and incremental logging
 
 **When to override:** If a task normally handled by a Sonnet agent requires unusually deep reasoning (e.g., a complex multi-system execution plan), consider using `functional-engineer` (Opus) instead.
 
