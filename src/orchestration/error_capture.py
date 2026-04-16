@@ -298,6 +298,7 @@ def run_subprocess_with_error_capture(
     command: list[str],
     timeout_seconds: int,
     check: bool = True,
+    env: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess, SubprocessError | None]:
     """
     Run a subprocess and capture errors if they occur.
@@ -308,6 +309,13 @@ def run_subprocess_with_error_capture(
     - Always captures stderr even on success
     - Never raises subprocess.CalledProcessError
     - Returns error object for caller to handle
+
+    Args:
+        env: Optional environment dict for the subprocess. When provided,
+             replaces the inherited environment entirely. Callers that need
+             to augment (not replace) the current env should pass a merged
+             dict: {**os.environ, "KEY": "value"}. When None (default),
+             the subprocess inherits the parent environment unchanged.
     """
     try:
         proc = subprocess.run(
@@ -316,6 +324,7 @@ def run_subprocess_with_error_capture(
             text=True,
             timeout=timeout_seconds,
             check=False,  # Never auto-raise; we handle errors explicitly
+            env=env,
         )
 
         # Check for error and capture it
