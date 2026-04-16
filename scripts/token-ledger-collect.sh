@@ -16,6 +16,7 @@
 #     "ts": 1712345678,
 #     "source": "steward",
 #     "task_id": "steward-heartbeat-abc",
+#     "model": "claude-sonnet-4-6",
 #     "input": 1234,
 #     "output": 456,
 #     "cache_read": 50000,
@@ -137,6 +138,7 @@ try:
                     if usage and isinstance(usage, dict):
                         last_usage = dict(usage)
                         last_usage['_new_offset'] = f.tell()
+                        last_usage['_model'] = msg.get('model', '')
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
 except Exception as e:
@@ -183,6 +185,7 @@ OUTPUT_TOKENS=$(printf '%s' "${USAGE_JSON}" | jq -r '.output_tokens // 0' 2>/dev
 CACHE_READ=$(printf '%s' "${USAGE_JSON}" | jq -r '.cache_read_input_tokens // 0' 2>/dev/null || echo "0")
 CACHE_WRITE=$(printf '%s' "${USAGE_JSON}" | jq -r '.cache_creation_input_tokens // 0' 2>/dev/null || echo "0")
 NEW_OFFSET=$(printf '%s' "${USAGE_JSON}" | jq -r '._new_offset // 0' 2>/dev/null || echo "0")
+MODEL_VAL=$(printf '%s' "${USAGE_JSON}" | jq -r '._model // ""' 2>/dev/null || true)
 
 # ---------------------------------------------------------------------------
 # Determine source tag from tool_input prompt frontmatter (most reliable)
@@ -279,6 +282,7 @@ ENTRY=$(jq -cn \
   --argjson ts "${NOW_S}" \
   --arg source "${SOURCE_TAG}" \
   --arg task_id "${TASK_ID_VAL}" \
+  --arg model "${MODEL_VAL}" \
   --argjson input_tokens "${INPUT_TOKENS}" \
   --argjson output_tokens "${OUTPUT_TOKENS}" \
   --argjson cache_read "${CACHE_READ}" \
@@ -288,6 +292,7 @@ ENTRY=$(jq -cn \
     "ts": $ts,
     "source": $source,
     "task_id": $task_id,
+    "model": $model,
     "input": $input_tokens,
     "output": $output_tokens,
     "cache_read": $cache_read,

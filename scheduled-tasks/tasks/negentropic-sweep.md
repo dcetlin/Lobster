@@ -117,4 +117,10 @@ When you complete your task, call `write_task_output` with:
 - output: Your results/summary, including the GitHub URL of the pushed sweep file
 - status: "success" or "failed"
 
+Then call `write_result` with:
+- task_id: your task_id
+- chat_id: 0
+- sent_reply_to_user: True
+- outcome_category: "seed" (this job grows compost — structured residue that feeds future synthesis)
+
 Keep output concise. The main Lobster instance will review this later.

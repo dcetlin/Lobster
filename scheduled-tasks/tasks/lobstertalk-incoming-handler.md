@@ -192,5 +192,5 @@ Call `write_task_output` with:
 - output: Brief summary (e.g. "No new queries." or "Handled query about Bob Smith, replied with context from Drive + Gmail.")
 - status: "success" or "failed"
 
-If no new queries, call `write_result` with chat_id=0 (silent).
-If a query was handled, call `write_result` with chat_id=8305714125 and sent_reply_to_user=True.
+If no new queries, call `write_result` with chat_id=0, outcome_category="heat" (silent no-op — polling health check).
+If a query was handled, call `write_result` with chat_id=8305714125, sent_reply_to_user=True, outcome_category="pearl" (direct high-value output — query answered for user).

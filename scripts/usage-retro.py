@@ -26,6 +26,25 @@ ET = timezone(timedelta(hours=-4))
 WORKSPACE = os.environ.get("LOBSTER_WORKSPACE", os.path.expanduser("~/lobster-workspace"))
 LEDGER_PATH = os.path.join(WORKSPACE, "data", "token-ledger.jsonl")
 
+# Cost multipliers relative to opus (opus = 1.0x reference).
+# Haiku is ~10x cheaper than opus; sonnet ~2.5x cheaper.
+MODEL_COST_MULTIPLIERS = {
+    "opus": 1.0,
+    "sonnet": 0.4,
+    "haiku": 0.1,
+}
+MODEL_UNKNOWN_MULTIPLIER = 0.4  # assume sonnet when model field absent or unrecognized
+
+
+def model_family(model_str: str) -> str:
+    """Normalize a full model ID to its family name for cost lookup."""
+    m = model_str.lower() if model_str else ""
+    if "opus" in m:
+        return "opus"
+    if "haiku" in m:
+        return "haiku"
+    return "sonnet"  # sonnet is default; covers blank/unknown
+
 
 def fmt_num(n):
     if n >= 1_000_000:
@@ -82,6 +101,31 @@ def daily_breakdown(records):
     return daily
 
 
+def model_breakdown(records):
+    """Group records by model family, computing weighted cost units for attribution."""
+    models = defaultdict(lambda: {
+        "input": 0, "output": 0,
+        "cache_read": 0, "cache_write": 0, "count": 0,
+        "cost_units": 0.0,
+    })
+    for r in records:
+        family = model_family(r.get("model", ""))
+        multiplier = MODEL_COST_MULTIPLIERS.get(family, MODEL_UNKNOWN_MULTIPLIER)
+        total_tokens = (
+            r.get("input", 0) +
+            r.get("output", 0) +
+            r.get("cache_read", 0) +
+            r.get("cache_write", 0)
+        )
+        models[family]["input"] += r.get("input", 0)
+        models[family]["output"] += r.get("output", 0)
+        models[family]["cache_read"] += r.get("cache_read", 0)
+        models[family]["cache_write"] += r.get("cache_write", 0)
+        models[family]["count"] += 1
+        models[family]["cost_units"] += total_tokens * multiplier
+    return models
+
+
 def source_breakdown(records):
     sources = defaultdict(lambda: {
         "input": 0, "output": 0,
@@ -116,9 +160,13 @@ def main():
 
     daily = daily_breakdown(records)
     sources = source_breakdown(records)
+    models = model_breakdown(records)
 
     # Sort sources by cache_read (dominant cost driver)
     sorted_sources = sorted(sources.items(), key=lambda x: x[1]["cache_read"], reverse=True)
+    # Sort models by cost_units descending
+    sorted_models = sorted(models.items(), key=lambda x: x[1]["cost_units"], reverse=True)
+    total_cost_units = sum(m["cost_units"] for m in models.values()) or 1.0
 
     total_calls = sum(d["count"] for d in daily.values())
     total_cache_read = sum(d["cache_read"] for d in daily.values())
@@ -151,6 +199,16 @@ def main():
             out = fmt_num(b["output"])
             cnt = b["count"]
             lines.append(f"  `{src}` — {cnt} calls | cache\\_read: {cr} | out: {out}")
+
+        lines.append("")
+        lines.append("*Model Breakdown* (cost\\-weighted, opus=1.0x ref, sonnet=0.4x, haiku=0.1x)")
+        for family, m in sorted_models:
+            pct = m["cost_units"] / total_cost_units * 100
+            cr = fmt_num(m["cache_read"])
+            cnt = m["count"]
+            lines.append(
+                f"  `{family}` — {cnt} calls | cache\\_read: {cr} | cost share: {pct:.0f}%"
+            )
 
         lines.append("")
         lines.append(
@@ -192,6 +250,17 @@ def main():
                 f"  {src:<25} {b['count']:>5} "
                 f"{fmt_num(b['cache_read']):>12} "
                 f"{fmt_num(b['output']):>10}"
+            )
+
+        print("\nModel Breakdown (cost-weighted; opus=1.0x ref, sonnet=0.4x, haiku=0.1x):")
+        print(f"  {'Model':<12} {'Calls':>5} {'cache_read':>12} {'cost share':>12}")
+        print("  " + "-" * 44)
+        for family, m in sorted_models:
+            pct = m["cost_units"] / total_cost_units * 100
+            print(
+                f"  {family:<12} {m['count']:>5} "
+                f"{fmt_num(m['cache_read']):>12} "
+                f"{pct:>11.0f}%"
             )
 
         print(
