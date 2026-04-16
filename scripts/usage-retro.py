@@ -20,9 +20,10 @@ import json
 import os
 import argparse
 from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-ET = timezone(timedelta(hours=-4))
+ET = ZoneInfo("America/New_York")
 WORKSPACE = os.environ.get("LOBSTER_WORKSPACE", os.path.expanduser("~/lobster-workspace"))
 LEDGER_PATH = os.path.join(WORKSPACE, "data", "token-ledger.jsonl")
 
