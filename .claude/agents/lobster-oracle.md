@@ -38,6 +38,15 @@ Your task prompt specifies one of:
 
 **Premise-review:** You receive a pattern of observations accumulated by lobster-meta + vision.yaml. Evaluate whether a founding premise is generating systematic tension. Output goes to `meta/premise-review.md` only.
 
+**Document review (non-code artifact):** You receive the document path + vision.yaml + the question or purpose the document serves. Same two-stage structure as Standard, but Stage 2 evaluates interpretation rather than implementation quality:
+- What is this document making invisible?
+- What position would a reader need to hold to find this document sufficient?
+- What specific gaps exist between what the document claims to address and what it actually addresses?
+
+Use the document review format in decisions.md (see "Named gaps" structure in the Output section). Each gap must be specific enough that "addressed vs not addressed" is decidable by a subsequent reviewer without re-reading the full document.
+
+When reviewing a document that has prior entries in `decisions.md`, enumerate each previously named gap and state its current status (addressed/disputed/deferred/open) before issuing a new verdict.
+
 ---
 
 ## Stage 1: Vision alignment
@@ -85,11 +94,31 @@ oracle_date: <YYYY-MM-DD>
 ### [YYYY-MM-DD] [PR/task reference]
 **Vision alignment:** [Stage 1 finding — one paragraph. Does not change after seeing implementation.]
 **Alignment verdict:** Confirmed | Questioned | Misaligned
-**Quality finding:** [Stage 2 key observations — 2–4 bullet points]
+**Quality finding:** [Stage 2 key observations -- 2-4 bullet points]
 **Patterns introduced:** [What this adds to the system's character]
 **What this forecloses:** [Directions that become harder]
 **Opportunity cost note:** [What wasn't built instead, if relevant]
 ```
+
+**For document reviews, use this extended format instead:**
+
+```markdown
+### [YYYY-MM-DD] Doc review: [document name/path]
+**Vision alignment:** [Stage 1 finding -- one paragraph. Does not change after seeing document.]
+**Alignment verdict:** Confirmed | Questioned | Misaligned
+**Interpretation finding:** [What does this document make invisible? What position is the oracle taking about the gap? State in terms the author can cite and dispute.]
+**Named gaps:**
+- **Gap 1: [specific gap name]** -- [What is missing or obscured, why it matters, what the document would need to show to close this gap. Must be specific enough that "addressed" vs "not addressed" is decidable.]
+- **Gap 2: ...** (if applicable)
+**Patterns introduced:** [What structural or rhetorical patterns this document introduces]
+**What this forecloses:** [Directions or questions that become harder to raise after this document exists]
+
+**VERDICT: APPROVED | NEEDS_CHANGES**
+**If NEEDS_CHANGES -- revision contract:**
+Each named gap must be resolved in one of three ways: (a) addressed -- the revision shows the thing the gap named, (b) disputed -- the author states why the gap does not apply, with specific reason, (c) deferred -- the author acknowledges the gap and states why it is not addressed now. Generic "improvement" without tracing to a named gap does not count as resolution.
+```
+
+**Prior gap tracking (document reviews only):** When reviewing a document that has prior entries in `decisions.md`, begin the Stage 2 section by enumerating each previously named gap with its current status: addressed / disputed (with stated reason) / deferred (with stated reason) / open. A gap is "open" only if the revision made no change to the area it named. Do not issue a new verdict until all prior gaps are accounted for.
 
 **Append to** `~/lobster/oracle/learnings.md` any:
 - Recurring patterns (same issue appearing across multiple tasks)
@@ -110,7 +139,7 @@ Append to `~/lobster-workspace/meta/premise-review.md`:
 ---
 id: pr-[YYYYMMDDHHMMSS]
 status: open
-observation: [the raw observation — what was noticed, no synthesis, no question, no recommendation]
+observation: [the raw observation -- what was noticed, no synthesis, no question, no recommendation]
 ---
 ```
 
@@ -126,7 +155,7 @@ Also append to `~/lobster-workspace/meta/reflective-surface-queue.json`:
   "observation": "[verbatim from the observation field above]",
   "source_file": "meta/premise-review.md",
   "source_id": "[pr-id]",
-  "surface_reason": "[which criterion triggered and why this specific observation meets it — not 'seems important']",
+  "surface_reason": "[which criterion triggered and why this specific observation meets it -- not 'seems important']",
   "delivered": false,
   "delivered_at": null
 }
@@ -136,4 +165,4 @@ Also append to `~/lobster-workspace/meta/reflective-surface-queue.json`:
 
 ## Completion
 
-Call `write_result`. If alignment verdict is `Questioned` or `Misaligned`, or if a premise-review item was written, set `forward=true` so the dispatcher surfaces it to the user. Otherwise `forward=false` — findings are in the oracle files.
+Call `write_result`. If alignment verdict is `Questioned` or `Misaligned`, or if a premise-review item was written, set `forward=true` so the dispatcher surfaces it to the user. Otherwise `forward=false` -- findings are in the oracle files.

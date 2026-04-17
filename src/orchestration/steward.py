@@ -163,6 +163,50 @@ _CLAUDE_BIN = "claude"
 # consecutive count.  A successful LLM call resets it to zero.
 _LLM_FALLBACK_WARNING_THRESHOLD = 3
 
+# Path to Claude Code credentials (OAuth tokens).
+_CREDENTIALS_PATH = Path(os.path.expanduser("~/.claude/.credentials.json"))
+
+
+def _build_claude_env() -> dict[str, str]:
+    """Build an environment dict suitable for spawning a `claude -p` subprocess.
+
+    Guarantees that `CLAUDE_CODE_OAUTH_TOKEN` is present so the subprocess can
+    authenticate without a browser session.  Resolution order:
+
+    1. Current process environment — used as-is when `CLAUDE_CODE_OAUTH_TOKEN`
+       is already set (e.g. when the steward runs inside an active CC session).
+    2. `~/.claude/.credentials.json` — used when the parent process is a cron
+       job that has no inherited OAuth token.  Reads the stored `accessToken`
+       from the `claudeAiOauth` sub-object.
+
+    If neither source provides a token the env is returned without
+    `CLAUDE_CODE_OAUTH_TOKEN` and the subprocess will attempt its own refresh
+    (which may fail in headless environments).
+
+    Returns a copy of `os.environ` augmented with the resolved token, ensuring
+    the subprocess inherits all PATH and library paths from the parent while
+    having a valid auth token.
+    """
+    env = dict(os.environ)
+
+    # Fast path: token already present in environment (interactive CC session).
+    if env.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return env
+
+    # Slow path: read token from credentials.json (cron / headless session).
+    try:
+        raw = _CREDENTIALS_PATH.read_text()
+        creds = json.loads(raw)
+        oauth = creds.get("claudeAiOauth", {})
+        token = oauth.get("accessToken", "").strip()
+        if token:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+            log.debug("_build_claude_env: injected CLAUDE_CODE_OAUTH_TOKEN from credentials.json")
+    except (OSError, json.JSONDecodeError, KeyError) as exc:
+        log.warning("_build_claude_env: could not read credentials.json: %s", exc)
+
+    return env
+
 
 # ---------------------------------------------------------------------------
 # Status enum (golden pattern: StrEnum so values serialize as plain strings)
@@ -1505,6 +1549,11 @@ success_criteria_check: <one or two sentences describing exactly how to verify t
 
     command = [_CLAUDE_BIN, "-p", prompt, "--output-format", "text", "--model", model]
 
+    # Build an env dict that guarantees CLAUDE_CODE_OAUTH_TOKEN is present.
+    # Without this, cron-spawned steward instances cannot authenticate since
+    # they inherit a clean environment without the token.
+    claude_env = _build_claude_env()
+
     # Use error capture to detect and log subprocess failures with context
     proc, error = run_subprocess_with_error_capture(
         component="steward_prescription",
@@ -1512,12 +1561,16 @@ success_criteria_check: <one or two sentences describing exactly how to verify t
         command=command,
         timeout_seconds=timeout_secs,
         check=False,  # Don't auto-log; we handle errors gracefully with fallback
+        env=claude_env,
     )
 
     if error:
+        # Log stderr to expose the actual failure reason (e.g. "401 Unauthorized",
+        # "Failed to authenticate") which is otherwise invisible when check=False.
+        stderr_preview = (error.stderr or "<no stderr>")[:500].strip()
         log.warning(
-            "_llm_prescribe: prescription failed for %s — %s (falling back to deterministic)",
-            uow.id, error.summary(),
+            "_llm_prescribe: prescription failed for %s — %s | stderr: %s",
+            uow.id, error.summary(), stderr_preview,
         )
 
         # Check for repeated failures (same error 3+ times in 5 min)
@@ -1531,7 +1584,7 @@ success_criteria_check: <one or two sentences describing exactly how to verify t
 
     if proc is None or proc.returncode != 0:
         log.warning(
-            "_llm_prescribe: claude -p exited %d for %s, falling back",
+            "_llm_prescribe: claude -p exited %d for %s",
             proc.returncode if proc else None, uow.id,
         )
         return None

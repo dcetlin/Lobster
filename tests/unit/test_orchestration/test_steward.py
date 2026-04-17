@@ -3357,6 +3357,131 @@ class TestLlmPrescription:
 
 
 # ---------------------------------------------------------------------------
+# Tests: _build_claude_env — injects CLAUDE_CODE_OAUTH_TOKEN for subprocess auth
+# ---------------------------------------------------------------------------
+
+class TestBuildClaudeEnv:
+    """Unit tests for _build_claude_env.
+
+    Verifies the three observable behaviors:
+    1. When CLAUDE_CODE_OAUTH_TOKEN is already in the environment, return it as-is.
+    2. When CLAUDE_CODE_OAUTH_TOKEN is absent, read it from credentials.json.
+    3. When credentials.json is missing or malformed, return env without the key
+       (let the subprocess attempt its own refresh).
+    """
+
+    def test_returns_existing_token_from_env_unchanged(self, monkeypatch, tmp_path):
+        """When CLAUDE_CODE_OAUTH_TOKEN is in the env, return it unchanged (no file read)."""
+        steward = _import_steward()
+
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-existing-token")
+        # Point credentials path to a non-existent file — should not be read.
+        monkeypatch.setattr(steward, "_CREDENTIALS_PATH", tmp_path / "nonexistent.json")
+
+        env = steward._build_claude_env()
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-existing-token"
+
+    def test_reads_token_from_credentials_json_when_env_absent(self, monkeypatch, tmp_path):
+        """When CLAUDE_CODE_OAUTH_TOKEN is absent from env, read it from credentials.json."""
+        steward = _import_steward()
+
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+        cred_file = tmp_path / ".credentials.json"
+        cred_file.write_text(
+            '{"claudeAiOauth": {"accessToken": "sk-ant-oat01-from-creds", "expiresAt": 9999999999999}}'
+        )
+        monkeypatch.setattr(steward, "_CREDENTIALS_PATH", cred_file)
+
+        env = steward._build_claude_env()
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-from-creds"
+
+    def test_missing_credentials_file_returns_env_without_token(self, monkeypatch, tmp_path):
+        """When credentials.json does not exist, return env without CLAUDE_CODE_OAUTH_TOKEN."""
+        steward = _import_steward()
+
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr(steward, "_CREDENTIALS_PATH", tmp_path / "no-such-file.json")
+
+        env = steward._build_claude_env()
+        # Should not raise; token key absent or empty
+        assert env.get("CLAUDE_CODE_OAUTH_TOKEN", "") == ""
+
+    def test_malformed_credentials_json_returns_env_without_token(self, monkeypatch, tmp_path):
+        """When credentials.json is malformed JSON, return env without token (no exception)."""
+        steward = _import_steward()
+
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+        cred_file = tmp_path / ".credentials.json"
+        cred_file.write_text("not valid json {{{")
+        monkeypatch.setattr(steward, "_CREDENTIALS_PATH", cred_file)
+
+        env = steward._build_claude_env()
+        assert env.get("CLAUDE_CODE_OAUTH_TOKEN", "") == ""
+
+    def test_inherits_full_parent_env(self, monkeypatch, tmp_path):
+        """Returned env contains all keys from os.environ, not just the token."""
+        steward = _import_steward()
+
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+        monkeypatch.setenv("_TEST_MARKER_KEY", "test_value_xyz")
+
+        env = steward._build_claude_env()
+        assert env.get("_TEST_MARKER_KEY") == "test_value_xyz"
+
+    def test_env_var_wins_over_credentials_json(self, monkeypatch, tmp_path):
+        """CLAUDE_CODE_OAUTH_TOKEN from env takes precedence over credentials.json value."""
+        steward = _import_steward()
+
+        # Both env and file present — env must win
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-from-env")
+
+        cred_file = tmp_path / ".credentials.json"
+        cred_file.write_text(
+            '{"claudeAiOauth": {"accessToken": "sk-ant-oat01-from-file", "expiresAt": 9999999999999}}'
+        )
+        monkeypatch.setattr(steward, "_CREDENTIALS_PATH", cred_file)
+
+        env = steward._build_claude_env()
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-from-env"
+
+    def test_llm_prescribe_passes_env_to_subprocess(self, monkeypatch):
+        """_llm_prescribe passes the env dict from _build_claude_env to run_subprocess_with_error_capture."""
+        steward = _import_steward()
+
+        # Capture the env kwarg passed to run_subprocess_with_error_capture
+        captured_env: list[dict] = []
+
+        def mock_run_capture(*args, **kwargs):
+            captured_env.append(kwargs.get("env", {}))
+            import subprocess
+            proc = subprocess.CompletedProcess([], 0, stdout="---\nexecutor_type: functional-engineer\nestimated_cycles: 1\nsuccess_criteria_check: check it\n---\ndo stuff", stderr="")
+            return proc, None
+
+        monkeypatch.setattr(steward, "run_subprocess_with_error_capture", mock_run_capture)
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test-inject")
+
+        from src.orchestration.registry import UoW, UoWStatus
+        uow = UoW(
+            id="uow_test_env",
+            status=UoWStatus.READY_FOR_STEWARD,
+            summary="test",
+            source="github:issue/1",
+            source_issue_number=1,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+            type="executable",
+            success_criteria="pass",
+            steward_cycles=0,
+        )
+        steward._llm_prescribe(uow, "first_execution", "no prior output")
+
+        assert len(captured_env) == 1
+        assert captured_env[0].get("CLAUDE_CODE_OAUTH_TOKEN") == "sk-ant-oat01-test-inject"
+
+
+# ---------------------------------------------------------------------------
 # Tests: _select_executor_type — maps UoW nature to executor type
 # ---------------------------------------------------------------------------
 
