@@ -73,6 +73,14 @@ def call_mcp(mcp_call_description: str) -> str:
     Lobster I/O goes through Claude's tool layer.
     """
     try:
+        # No --mcp-config flag is needed here. The lobster-inbox MCP server is
+        # registered as a user-level Claude server via:
+        #   claude mcp add --transport stdio lobster-inbox -s user ...
+        # This makes it available automatically in all `claude` invocations,
+        # including headless -p subprocesses, without an explicit --mcp-config.
+        # Verified: `claude mcp list` shows lobster-inbox connected; `claude -p`
+        # subprocess can call get_conversation_history and other MCP tools.
+        # (Issue #365 noted MCP failure in Docker staging only — not relevant here.)
         result = subprocess.run(
             [
                 "claude", "-p", mcp_call_description,
