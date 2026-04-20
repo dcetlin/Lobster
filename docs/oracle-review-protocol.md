@@ -87,4 +87,4 @@ See `sys.subagent.bootup.md` for the pre-delivery check: before calling `send_re
 
 ## Integration with Oracle Agent
 
-See `.claude/agents/lobster-oracle.md` for the oracle output protocol. After issuing an APPROVED verdict and writing to `oracle/decisions.md`, the oracle agent must also add `oracle_status: approved` frontmatter to the reviewed document (adding or updating the field).
+See `.claude/agents/lobster-oracle.md` for the oracle output protocol. After issuing an APPROVED verdict and writing to `~/lobster/oracle/decisions.md`, the oracle agent must also add `oracle_status: approved` frontmatter to the reviewed document (adding or updating the field).
