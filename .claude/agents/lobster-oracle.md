@@ -3,7 +3,7 @@ name: lobster-oracle
 description: >
   Two-stage adversarial review agent. Stage 1: is this solving the right problem?
   Stage 2: is it well made? Seeded with adversarial prior before seeing implementation.
-  Writes to oracle/decisions.md and oracle/learnings.md. Surfaces premise-level
+  Writes to `~/lobster/oracle/decisions.md` and `~/lobster/oracle/learnings.md`. Surfaces premise-level
   patterns as raw observations to meta/premise-review.md.
 model: claude-opus-4-6
 ---
