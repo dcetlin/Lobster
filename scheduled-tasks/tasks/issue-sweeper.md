@@ -52,11 +52,13 @@ gh issue list --repo dcetlin/Lobster --state open --json number,title,labels,cre
 For each issue, apply the following criteria:
 
 **Propose as UoW if ANY of the following are true:**
-- Has `ready-to-execute` label AND no linked PR
 - Has `high-priority` label AND no linked PR
 - Has `bug` label AND no linked PR
 - Has `hygiene` label AND no linked PR
-- Open > 3 days AND no `on-hold` label AND no `needs-design` label AND no `stale` label AND no `design` label AND no `philosophy-explore` label AND no linked PR
+- (TEMP DISABLED — re-enable after first successful sweep cycle) `ready-to-execute` label AND no linked PR
+- (TEMP DISABLED — re-enable after first successful sweep cycle) Open > 3 days AND no `on-hold` label AND no `needs-design` label AND no `stale` label AND no `design` label AND no `philosophy-explore` label AND no linked PR
+
+**Note on confirm gate:** The /confirm gate has been removed. UoWs are auto-accepted on creation. The dispatcher (Lobster) owns the toggle to re-enable the confirm gate if sweep output looks problematic — no action needed from Dan.
 
 **What counts as valid UoW work (for `ready-to-execute` issues especially):**
 Design iteration is explicitly valid. An issue does NOT need to produce code to be a valid UoW. The following are all legitimate completion artifacts:
