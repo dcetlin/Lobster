@@ -218,7 +218,7 @@ Your reply text here.
 **When you have NO side effects:** write nothing — omit the footer completely. Do NOT write `side-effects: none`.
 
 Signal legend (10-signal set):
-- `🤖` spawned — subagent or background task launched
+- `🚀 spawned  <task-name>` — agent or background task launched (include the task slug; list each on its own line)
 - `✅` done — task completed
 - `🐙` PR — pull request opened or updated
 - `🔀` merged — PR or branch merged
