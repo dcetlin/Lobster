@@ -166,6 +166,48 @@ _LLM_FALLBACK_WARNING_THRESHOLD = 3
 # Path to Claude Code credentials (OAuth tokens).
 _CREDENTIALS_PATH = Path(os.path.expanduser("~/.claude/.credentials.json"))
 
+# Warn when the token expires within this many seconds (2 hours).
+_TOKEN_EXPIRY_WARN_SECONDS = 2 * 3600
+
+
+def _check_token_expiry(expires_at: object) -> None:
+    """Log a warning or error if the OAuth token is near expiry or already expired.
+
+    Handles both ISO 8601 strings and Unix timestamps (int/float).  If the
+    value is absent, None, or unparseable the function logs at DEBUG level and
+    returns — this is not treated as an error.
+    """
+    if expires_at is None:
+        log.debug("_build_claude_env: expiresAt not present in credentials.json — skipping expiry check")
+        return
+
+    now = datetime.now(timezone.utc)
+
+    try:
+        if isinstance(expires_at, (int, float)):
+            expiry = datetime.fromtimestamp(expires_at, tz=timezone.utc)
+        else:
+            expiry = datetime.fromisoformat(str(expires_at))
+            # Attach UTC if the parsed datetime is naive.
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+    except (ValueError, OSError, OverflowError) as exc:
+        log.debug("_build_claude_env: could not parse expiresAt %r: %s — skipping expiry check", expires_at, exc)
+        return
+
+    hours_remaining = (expiry - now).total_seconds() / 3600
+
+    if hours_remaining < 0:
+        log.error(
+            "Claude API token expired %.1f hours ago — prescription will fail with 401",
+            abs(hours_remaining),
+        )
+    elif hours_remaining * 3600 < _TOKEN_EXPIRY_WARN_SECONDS:
+        log.warning(
+            "Claude API token expires in %.1f hours — refresh credentials before next cycle",
+            hours_remaining,
+        )
+
 
 def _build_claude_env() -> dict[str, str]:
     """Build an environment dict suitable for spawning a `claude -p` subprocess.
@@ -202,6 +244,7 @@ def _build_claude_env() -> dict[str, str]:
         if token:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = token
             log.debug("_build_claude_env: injected CLAUDE_CODE_OAUTH_TOKEN from credentials.json")
+        _check_token_expiry(oauth.get("expiresAt"))
     except (OSError, json.JSONDecodeError, KeyError) as exc:
         log.warning("_build_claude_env: could not read credentials.json: %s", exc)
 
