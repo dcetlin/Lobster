@@ -2685,6 +2685,33 @@ CREATE TABLE IF NOT EXISTS dispatcher_lock (
         warn "cleanup-worktrees-audio.sh not found at $CLEANUP_SCRIPT — skipping Migration 77"
     fi
 
+    # Migration 78: Populate cycle_start_timestamp in rotation-state.json if absent.
+    # Prevents a false vision drift warning on the first Night 7 run after upgrade
+    # (CYCLE_START would be 0, triggering the mtime comparison with a stale result).
+    local ROTATION_STATE="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/hygiene/rotation-state.json"
+    if [ -f "$ROTATION_STATE" ] && ! jq -e '.cycle_start_timestamp' "$ROTATION_STATE" > /dev/null 2>&1; then
+        local CURRENT_TS
+        CURRENT_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        jq --arg ts "$CURRENT_TS" '.cycle_start_timestamp = $ts' "$ROTATION_STATE" > "$ROTATION_STATE.tmp" && \
+            mv "$ROTATION_STATE.tmp" "$ROTATION_STATE" && \
+            substep "Migration 78: Added cycle_start_timestamp=$CURRENT_TS to rotation-state.json" && \
+            migrated=$((migrated + 1)) || \
+            warn "Migration 78: Failed to update rotation-state.json"
+    fi
+
+    # Migration 79: Archive old runtime sweep-context.md (now versioned in repo).
+    # sweep-context.md was moved from ~/lobster-workspace/hygiene/sweep-context.md
+    # (unversioned runtime data) to ~/lobster/memory/canonical-templates/sweep-context.md
+    # (repo, versioned). Archive the old copy so the runtime path is no longer authoritative.
+    local OLD_SWEEP="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/hygiene/sweep-context.md"
+    if [ -f "$OLD_SWEEP" ]; then
+        local ARCHIVED_NAME="$OLD_SWEEP.archived-$(date +%Y%m%d)"
+        mv "$OLD_SWEEP" "$ARCHIVED_NAME" && \
+            substep "Migration 79: Archived old sweep-context.md to $ARCHIVED_NAME" && \
+            migrated=$((migrated + 1)) || \
+            warn "Migration 79: Failed to archive old sweep-context.md"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
