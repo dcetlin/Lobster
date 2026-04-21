@@ -2160,6 +2160,11 @@ def _count_oracle_passes(audit_entries: list[dict]) -> int:
     Each oracle_approved entry represents one complete oracle pass that
     returned APPROVED for this UoW. Used by the Spiral pattern detector.
 
+    NOTE: oracle_pass_count will always be 0 until the oracle agent integration
+    writes event="oracle_approved" to the UoW audit log. The spiral gate is
+    structurally correct but non-functional until that write is wired.
+    See: https://github.com/dcetlin/Lobster/issues/810
+
     Pure function — reads only audit_entries; no side effects.
     """
     return sum(1 for e in audit_entries if e.get("event") == "oracle_approved")
@@ -2199,6 +2204,10 @@ def _check_dispatch_eligibility(
     Pure function — no side effects, no DB writes.
     """
     # Spiral check (highest precedence)
+    # NOTE: oracle_pass_count will always be 0 until the oracle agent integration
+    # writes event="oracle_approved" to the UoW audit log. The spiral gate is
+    # structurally correct but non-functional until that write is wired.
+    # See: https://github.com/dcetlin/Lobster/issues/810
     oracle_passes = _count_oracle_passes(audit_entries)
     if oracle_passes >= SPIRAL_ORACLE_PASS_THRESHOLD:
         log.debug(
@@ -4148,6 +4157,7 @@ def run_steward_cycle(
     skipped = 0
     race_skipped = 0
     wait_for_trace = 0
+    throttle_count = 0
     considered_ids = []
 
     for uow in uows:
@@ -4241,7 +4251,34 @@ def run_steward_cycle(
         # Dispatch eligibility gate (oracle/patterns.md): check for spiral,
         # dead-end, and burst patterns before committing to a prescription cycle.
         _eligibility = _check_dispatch_eligibility(uow, audit_entries, _queue_depth)
-        if _eligibility != "dispatch":
+        if _eligibility == "throttle":
+            if throttle_count < BURST_BATCH_SIZE:
+                # Within the allowed burst batch — dispatch normally and count it.
+                throttle_count += 1
+                log.debug(
+                    "dispatch_eligibility: uow_id=%s throttle allowed "
+                    "(throttle_count=%d/%d)",
+                    uow_id, throttle_count, BURST_BATCH_SIZE,
+                )
+            else:
+                # Beyond BURST_BATCH_SIZE for this cycle — skip.
+                log.info(
+                    "dispatch_eligibility: uow_id=%s skipped — pattern=throttle "
+                    "(throttle_count=%d >= BURST_BATCH_SIZE=%d)",
+                    uow_id, throttle_count, BURST_BATCH_SIZE,
+                )
+                if not dry_run:
+                    registry.append_audit_log(uow_id, {
+                        "event": "dispatch_eligibility_skip",
+                        "actor": _ACTOR_STEWARD,
+                        "uow_id": uow_id,
+                        "steward_cycles": uow.steward_cycles,
+                        "eligibility": _eligibility,
+                        "timestamp": _now_iso(),
+                    })
+                skipped += 1
+                continue
+        elif _eligibility != "dispatch":
             log.info(
                 "dispatch_eligibility: uow_id=%s skipped — pattern=%s",
                 uow_id, _eligibility,
