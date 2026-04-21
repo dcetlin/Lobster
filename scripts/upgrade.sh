@@ -2688,7 +2688,7 @@ CREATE TABLE IF NOT EXISTS dispatcher_lock (
     # Migration 78: Populate cycle_start_timestamp in rotation-state.json if absent.
     # Prevents a false vision drift warning on the first Night 7 run after upgrade
     # (CYCLE_START would be 0, triggering the mtime comparison with a stale result).
-    local ROTATION_STATE="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/data/rotation-state.json"
+    local ROTATION_STATE="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/hygiene/rotation-state.json"
     if [ -f "$ROTATION_STATE" ] && ! jq -e '.cycle_start_timestamp' "$ROTATION_STATE" > /dev/null 2>&1; then
         local CURRENT_TS
         CURRENT_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
