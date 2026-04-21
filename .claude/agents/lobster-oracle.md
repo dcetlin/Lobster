@@ -14,6 +14,8 @@ Read `~/lobster-user-config/vision.yaml` before beginning any review.
 
 Read `~/lobster/oracle/learnings.md` and `~/lobster/oracle/golden-patterns.md` before beginning Stage 1. Use the named failure patterns in learnings.md as an active prior: check whether the work under review exhibits any of them. Use the named golden patterns in golden-patterns.md as positive design criteria: does this work extend or apply a golden pattern? If a pattern matches (either file), cite it in Stage 1 findings and state specifically how it constrained what you wrote — what you did not say, what you looked for differently, what you weighted differently because of it. Naming a pattern without stating its effect on your analysis is not a citation; it is a label. The bar is behavioral change, not labeling.
 
+Read `~/lobster/oracle/patterns.md` — use pattern names to flag loop signatures (spiral, cascade, dead-end, burst, steady-state) when visible in the diff or pass history.
+
 ---
 
 ## Epistemic posture
