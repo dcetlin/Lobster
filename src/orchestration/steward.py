@@ -2132,6 +2132,105 @@ def _count_consecutive_llm_fallbacks(current_log_str: str | None) -> int:
     return consecutive
 
 
+# ---------------------------------------------------------------------------
+# Loop-pattern-aware dispatch eligibility (oracle/patterns.md thresholds)
+# ---------------------------------------------------------------------------
+
+# Spiral: oracle passes >= this value → escalate dispatch
+# Source: oracle/patterns.md §spiral — "oracle_pass_count ≥ 3"
+SPIRAL_ORACLE_PASS_THRESHOLD: int = 3
+
+# Dead-end: failed/blocked transitions >= this value → pause dispatch
+# Source: oracle/patterns.md §dead-end — "failed or blocked state ≥2 times"
+DEAD_END_FAILURE_THRESHOLD: int = 2
+
+# Burst: throttle to this many UoWs per cycle when burst is detected
+# Source: oracle/patterns.md §burst — "batch into groups of 3"
+BURST_BATCH_SIZE: int = 3
+
+# Burst: hard lower bound for the baseline queue depth used in spike detection.
+# Queue depths at or above 2x this value are treated as a burst.
+# Source: oracle/patterns.md §burst — hard lower bound comment
+BURST_BASELINE_QUEUE_DEPTH: int = 6
+
+
+def _count_oracle_passes(audit_entries: list[dict]) -> int:
+    """Count oracle_approved events in the audit log for a UoW.
+
+    Each oracle_approved entry represents one complete oracle pass that
+    returned APPROVED for this UoW. Used by the Spiral pattern detector.
+
+    Pure function — reads only audit_entries; no side effects.
+    """
+    return sum(1 for e in audit_entries if e.get("event") == "oracle_approved")
+
+
+def _count_failed_or_blocked_transitions(audit_entries: list[dict]) -> int:
+    """Count audit entries where the UoW transitioned to failed or blocked.
+
+    Includes both executor-driven failures (to_status='failed') and
+    Steward-driven surface/block transitions (to_status='blocked').
+    Used by the Dead-end pattern detector.
+
+    Pure function — reads only audit_entries; no side effects.
+    """
+    terminal = {"failed", "blocked"}
+    return sum(1 for e in audit_entries if e.get("to_status") in terminal)
+
+
+def _check_dispatch_eligibility(
+    uow: "UoW",
+    audit_entries: list[dict],
+    queue_depth: int,
+) -> str:
+    """Determine whether this UoW should be dispatched, paused, escalated, or throttled.
+
+    Reads UoW history (via audit_entries) and the current queue depth to detect
+    the loop anti-patterns defined in oracle/patterns.md.
+
+    Returns one of:
+    - "dispatch"  — no pattern detected; proceed normally
+    - "pause"     — dead-end detected; suppress re-dispatch, write blocker prescription
+    - "escalate"  — spiral detected; pause dispatch, write escalation prescription
+    - "throttle"  — burst detected; limit batch size to BURST_BATCH_SIZE per cycle
+
+    Precedence when multiple patterns fire: escalate > pause > throttle > dispatch.
+
+    Pure function — no side effects, no DB writes.
+    """
+    # Spiral check (highest precedence)
+    oracle_passes = _count_oracle_passes(audit_entries)
+    if oracle_passes >= SPIRAL_ORACLE_PASS_THRESHOLD:
+        log.debug(
+            "_check_dispatch_eligibility: spiral detected for %s "
+            "(oracle_pass_count=%d >= %d)",
+            uow.id, oracle_passes, SPIRAL_ORACLE_PASS_THRESHOLD,
+        )
+        return "escalate"
+
+    # Dead-end check
+    failures = _count_failed_or_blocked_transitions(audit_entries)
+    if failures >= DEAD_END_FAILURE_THRESHOLD:
+        log.debug(
+            "_check_dispatch_eligibility: dead-end detected for %s "
+            "(failed_or_blocked=%d >= %d)",
+            uow.id, failures, DEAD_END_FAILURE_THRESHOLD,
+        )
+        return "pause"
+
+    # Burst check (lowest precedence above dispatch)
+    burst_spike_threshold = BURST_BASELINE_QUEUE_DEPTH * 2
+    if queue_depth >= burst_spike_threshold:
+        log.debug(
+            "_check_dispatch_eligibility: burst detected for %s "
+            "(queue_depth=%d >= %d)",
+            uow.id, queue_depth, burst_spike_threshold,
+        )
+        return "throttle"
+
+    return "dispatch"
+
+
 def _notify_llm_fallback_warning(
     uow: UoW,
     consecutive_fallbacks: int,
@@ -4038,6 +4137,10 @@ def run_steward_cycle(
 
     log.debug("Steward cycle: %d ready-for-steward UoWs found", len(uows))
 
+    # Queue depth snapshot used by the Burst pattern check in _check_dispatch_eligibility.
+    # Captured once before the loop so all per-UoW checks see the same depth value.
+    _queue_depth = len(uows)
+
     evaluated = 0
     prescribed = 0
     done = 0
@@ -4134,6 +4237,26 @@ def run_steward_cycle(
                     })
                 skipped += 1
                 continue
+
+        # Dispatch eligibility gate (oracle/patterns.md): check for spiral,
+        # dead-end, and burst patterns before committing to a prescription cycle.
+        _eligibility = _check_dispatch_eligibility(uow, audit_entries, _queue_depth)
+        if _eligibility != "dispatch":
+            log.info(
+                "dispatch_eligibility: uow_id=%s skipped — pattern=%s",
+                uow_id, _eligibility,
+            )
+            if not dry_run:
+                registry.append_audit_log(uow_id, {
+                    "event": "dispatch_eligibility_skip",
+                    "actor": _ACTOR_STEWARD,
+                    "uow_id": uow_id,
+                    "steward_cycles": uow.steward_cycles,
+                    "eligibility": _eligibility,
+                    "timestamp": _now_iso(),
+                })
+            skipped += 1
+            continue
 
         evaluated += 1
         try:
