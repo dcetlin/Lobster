@@ -125,6 +125,15 @@ When a finding is notable enough to store as a memory observation, use the `memo
 
 Example: a finding that matches the "coherence-narrative basin" failure pattern would be stored with `valence="smell"`. A finding that identifies a new instance of the "table-as-compaction-resistant encoding" pattern would be stored with `valence="golden"`. Only store observations that are specific and evidence-grounded — not summaries of the sweep.
 
+### Pattern Match
+
+Read `~/lobster/oracle/patterns.md`. For each pattern:
+- **spiral**: count UoWs/PRs with oracle_pass_count ≥ 3 this week. If >2, add prescription: "oracle gate needs earlier spec clarity"
+- **dead-end**: count UoWs that hit failed/blocked ≥2 times. If >3, add prescription: "executor needs better blocker detection"
+- **burst**: note if any sweep generated ≥5 UoWs. If burst UoWs had >50% failure rate, add prescription: "scope UoWs more narrowly"
+- **cascade**: count cascade chains. If chain depth >3 anywhere, add prescription: "spec full chain before starting"
+- **steady-state**: if throughput <1 UoW/day for >3 days, add prescription: "investigate executor starvation"
+
 ### Step 3: Refactor pass
 
 Act autonomously on items that meet the autonomy criteria below. For each action taken, record:
