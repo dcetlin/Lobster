@@ -2691,8 +2691,8 @@ CREATE TABLE IF NOT EXISTS dispatcher_lock (
     local ROTATION_STATE="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/data/rotation-state.json"
     if [ -f "$ROTATION_STATE" ] && ! jq -e '.cycle_start_timestamp' "$ROTATION_STATE" > /dev/null 2>&1; then
         local CURRENT_TS
-        CURRENT_TS=$(date +%s)
-        jq --argjson ts "$CURRENT_TS" '.cycle_start_timestamp = $ts' "$ROTATION_STATE" > "$ROTATION_STATE.tmp" && \
+        CURRENT_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        jq --arg ts "$CURRENT_TS" '.cycle_start_timestamp = $ts' "$ROTATION_STATE" > "$ROTATION_STATE.tmp" && \
             mv "$ROTATION_STATE.tmp" "$ROTATION_STATE" && \
             substep "Migration 78: Added cycle_start_timestamp=$CURRENT_TS to rotation-state.json" && \
             migrated=$((migrated + 1)) || \
