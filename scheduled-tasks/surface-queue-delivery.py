@@ -35,6 +35,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from src.orchestration.paths import SURFACE_QUEUE  # noqa: E402
+from src.utils.inbox_write import _inbox_dir, _task_outputs_dir, write_inbox_message  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -301,47 +302,6 @@ def format_summary(delivered_count: int, archived_count: int, remaining_count: i
 # Inbox / task-output I/O helpers
 # ---------------------------------------------------------------------------
 
-def _inbox_dir() -> Path:
-    """Return the inbox directory path, creating it if needed."""
-    messages_base = os.environ.get("LOBSTER_MESSAGES", str(Path.home() / "messages"))
-    inbox = Path(messages_base) / "inbox"
-    inbox.mkdir(parents=True, exist_ok=True)
-    return inbox
-
-
-def _task_outputs_dir() -> Path:
-    """Return the task-outputs directory path, creating it if needed."""
-    messages_base = os.environ.get("LOBSTER_MESSAGES", str(Path.home() / "messages"))
-    task_outputs = Path(messages_base) / "task-outputs"
-    task_outputs.mkdir(parents=True, exist_ok=True)
-    return task_outputs
-
-
-def write_inbox_message(chat_id: int, text: str, timestamp: str) -> None:
-    """
-    Write a single subagent_result message to the inbox.
-    The dispatcher picks it up and routes it via send_reply.
-    Pure side-effect boundary: all I/O is isolated here.
-    """
-    inbox = _inbox_dir()
-    msg_id = f"surface_queue_delivery_{uuid.uuid4().hex}"
-    msg = {
-        "id": msg_id,
-        "type": "subagent_result",
-        "task_id": msg_id,
-        "chat_id": chat_id,
-        "source": "telegram",
-        "text": text,
-        "status": "success",
-        "sent_reply_to_user": False,
-        "timestamp": timestamp,
-    }
-    out_path = inbox / f"{msg_id}.json"
-    tmp_path = Path(str(out_path) + ".tmp")
-    tmp_path.write_text(json.dumps(msg, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(out_path)
-
-
 def write_task_output(output: str, status: str, timestamp: str) -> None:
     """
     Write a task output record directly to the task-outputs directory.
@@ -374,7 +334,7 @@ def deliver(digest_text: str, job_summary: str) -> None:
     """
     chat_id = int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586"))
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    write_inbox_message(chat_id, digest_text, timestamp)
+    write_inbox_message("surface-queue-delivery", chat_id, digest_text, timestamp)
     write_task_output(job_summary, "success", timestamp)
 
 

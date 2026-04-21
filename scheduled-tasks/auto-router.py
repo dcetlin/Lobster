@@ -37,6 +37,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from src.orchestration.paths import SURFACE_QUEUE  # noqa: E402
+from src.utils.inbox_write import _inbox_dir, _task_outputs_dir, write_inbox_message  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -327,51 +328,6 @@ def apply_routing(
     return [update(i) for i in items]
 
 
-# ---------------------------------------------------------------------------
-# Inbox / task-output I/O helpers
-# ---------------------------------------------------------------------------
-
-def _inbox_dir() -> Path:
-    """Return the inbox directory path, creating it if needed."""
-    messages_base = os.environ.get("LOBSTER_MESSAGES", str(Path.home() / "messages"))
-    inbox = Path(messages_base) / "inbox"
-    inbox.mkdir(parents=True, exist_ok=True)
-    return inbox
-
-
-def _task_outputs_dir() -> Path:
-    """Return the task-outputs directory path, creating it if needed."""
-    messages_base = os.environ.get("LOBSTER_MESSAGES", str(Path.home() / "messages"))
-    task_outputs = Path(messages_base) / "task-outputs"
-    task_outputs.mkdir(parents=True, exist_ok=True)
-    return task_outputs
-
-
-def write_inbox_message(chat_id: int, text: str, timestamp: str) -> str:
-    """
-    Write a single subagent_result message to the inbox using atomic tmp-then-replace.
-    Returns the message ID. Side effects isolated here.
-    """
-    inbox = _inbox_dir()
-    msg_id = f"auto_router_{uuid.uuid4().hex}"
-    msg = {
-        "id": msg_id,
-        "type": "subagent_result",
-        "task_id": msg_id,
-        "chat_id": chat_id,
-        "source": os.environ.get("LOBSTER_DEFAULT_SOURCE", "telegram"),
-        "text": text,
-        "status": "success",
-        "sent_reply_to_user": False,
-        "timestamp": timestamp,
-    }
-    out_path = inbox / f"{msg_id}.json"
-    tmp_path = Path(str(out_path) + ".tmp")
-    tmp_path.write_text(json.dumps(msg, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(out_path)
-    return msg_id
-
-
 def write_task_output(output: str, status: str, timestamp: str) -> None:
     """Write a task output record to the task-outputs directory."""
     task_outputs = _task_outputs_dir()
@@ -444,7 +400,7 @@ def run() -> int:
             msg_text = format_design_surface_message(item)
             design_count += 1
 
-        write_inbox_message(ADMIN_CHAT_ID, msg_text, timestamp_iso)
+        write_inbox_message("auto-router", ADMIN_CHAT_ID, msg_text, timestamp_iso)
 
     # Update queue
     updated_items = apply_routing(items, routed_pairs, timestamp_iso)

@@ -27,6 +27,16 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+# ---------------------------------------------------------------------------
+# Path setup — allow running as a script or via importlib (tests)
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from src.utils.inbox_write import _inbox_dir, _task_outputs_dir, write_inbox_message  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Pure data helpers
@@ -352,40 +362,6 @@ def format_report(
 JOB_NAME = "daily-metrics"
 
 
-def _inbox_dir() -> Path:
-    messages_base = os.environ.get("LOBSTER_MESSAGES", str(Path.home() / "messages"))
-    inbox = Path(messages_base) / "inbox"
-    inbox.mkdir(parents=True, exist_ok=True)
-    return inbox
-
-
-def _task_outputs_dir() -> Path:
-    messages_base = os.environ.get("LOBSTER_MESSAGES", str(Path.home() / "messages"))
-    task_outputs = Path(messages_base) / "task-outputs"
-    task_outputs.mkdir(parents=True, exist_ok=True)
-    return task_outputs
-
-
-def write_inbox_message(chat_id: int, text: str, timestamp: str) -> None:
-    inbox = _inbox_dir()
-    msg_id = f"{JOB_NAME}_{uuid.uuid4().hex}"
-    msg = {
-        "id": msg_id,
-        "type": "subagent_result",
-        "task_id": msg_id,
-        "chat_id": chat_id,
-        "source": "telegram",
-        "text": text,
-        "status": "success",
-        "sent_reply_to_user": False,
-        "timestamp": timestamp,
-    }
-    out_path = inbox / f"{msg_id}.json"
-    tmp_path = Path(str(out_path) + ".tmp")
-    tmp_path.write_text(json.dumps(msg, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(out_path)
-
-
 def write_task_output_record(output: str, status: str, timestamp: str) -> None:
     task_outputs = _task_outputs_dir()
     date_prefix = timestamp[:19].replace(":", "").replace("-", "").replace("T", "-")
@@ -409,7 +385,7 @@ def deliver(summary: str, date: str) -> None:
     """
     chat_id = int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586"))
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    write_inbox_message(chat_id, summary, timestamp)
+    write_inbox_message(JOB_NAME, chat_id, summary, timestamp)
     write_task_output_record(f"Daily metrics for {date} delivered to Telegram.", "success", timestamp)
 
 
