@@ -25,6 +25,16 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+# ---------------------------------------------------------------------------
+# Path setup — allow running as a script or via importlib (tests)
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from src.utils.inbox_write import _inbox_dir, _task_outputs_dir, write_inbox_message  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -198,45 +208,6 @@ def format_task_summary(delivered: int, remaining: int) -> str:
 # Inbox / task-output I/O helpers
 # ---------------------------------------------------------------------------
 
-def _inbox_dir() -> Path:
-    messages_base = os.environ.get("LOBSTER_MESSAGES", str(Path.home() / "messages"))
-    inbox = Path(messages_base) / "inbox"
-    inbox.mkdir(parents=True, exist_ok=True)
-    return inbox
-
-
-def _task_outputs_dir() -> Path:
-    messages_base = os.environ.get("LOBSTER_MESSAGES", str(Path.home() / "messages"))
-    task_outputs = Path(messages_base) / "task-outputs"
-    task_outputs.mkdir(parents=True, exist_ok=True)
-    return task_outputs
-
-
-def write_inbox_message(chat_id: int, text: str, ts: str) -> None:
-    """
-    Write a subagent_result message to the Lobster inbox.
-    The dispatcher picks it up and routes it via send_reply.
-    All I/O is isolated to this function.
-    """
-    inbox = _inbox_dir()
-    msg_id = f"proposals_digest_{uuid.uuid4().hex}"
-    msg = {
-        "id": msg_id,
-        "type": "subagent_result",
-        "task_id": msg_id,
-        "chat_id": chat_id,
-        "source": "telegram",
-        "text": text,
-        "status": "success",
-        "sent_reply_to_user": False,
-        "timestamp": ts,
-    }
-    out_path = inbox / f"{msg_id}.json"
-    tmp_path = Path(str(out_path) + ".tmp")
-    tmp_path.write_text(json.dumps(msg, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(out_path)
-
-
 def write_task_output(output: str, status: str, ts: str) -> None:
     task_outputs = _task_outputs_dir()
     date_prefix = ts[:19].replace(":", "").replace("-", "").replace("T", "-")
@@ -306,7 +277,7 @@ def run() -> int:
     ]
 
     for msg_text in messages:
-        write_inbox_message(chat_id, msg_text, ts)
+        write_inbox_message(JOB_NAME, chat_id, msg_text, ts)
 
     # Mark delivered entries in the file
     updated_content = mark_all_delivered(content, to_deliver, date_today)
