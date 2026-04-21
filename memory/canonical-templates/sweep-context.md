@@ -44,9 +44,10 @@ Format: `{"current_night": N, "last_run": "YYYY-MM-DDTHH:MM:SSZ", "cycle_start_t
   **Vision drift check (Night 7 only):** Before writing the synthesis, check whether `vision.yaml` changed during this cycle:
   ```bash
   VISION_MTIME=$(stat -c %Y ~/lobster-user-config/vision.yaml 2>/dev/null || echo 0)
-  CYCLE_START=$(python3 -c "import json,datetime; d=json.load(open('${HOME}/lobster-workspace/hygiene/rotation-state.json')); ts=d.get('cycle_start_timestamp',''); print(int(datetime.datetime.fromisoformat(ts.replace('Z','+00:00')).timestamp()) if ts else 0)")
+  CYCLE_START=$(uv run python -c "import json,datetime; d=json.load(open('${HOME}/lobster-workspace/hygiene/rotation-state.json')); ts=d.get('cycle_start_timestamp',''); print(int(datetime.datetime.fromisoformat(ts.replace('Z','+00:00')).timestamp()) if ts else 0)")
   ```
-  If `VISION_MTIME > CYCLE_START` (and both are non-zero), add this note to the synthesis output:
+  If `CYCLE_START` equals 0, skip the vision drift check and write: "Vision drift: N/A (first cycle, no baseline)".
+  Otherwise, if `VISION_MTIME > CYCLE_START` (and both are non-zero), add this note to the synthesis output:
   > ⚠️ vision.yaml changed during this 7-night cycle (changed: [human-readable date of mtime], cycle started: [human-readable date of cycle_start_timestamp]) — prior nights operated against the old intent. Review whether findings from earlier nights remain coherent with the updated vision.
 
 ---
@@ -60,7 +61,7 @@ Read `~/lobster-workspace/.claude/agents/lobster-meta.md`. Internalize its epist
 Then read both oracle files as vocabulary before the detection pass:
 
 - `~/lobster/oracle/golden-patterns.md` — named structural wins in this system. Use as vocabulary when classifying findings as golden. If a finding matches or extends a named pattern, cite the pattern name. If a finding suggests a golden pattern is breaking down or being violated, that is an escalation candidate.
-- `~/lobster-workspace/oracle/learnings.md` — named failure patterns. Use as vocabulary when classifying findings as smells. If a finding matches a named failure mode, cite the pattern name.
+- `~/lobster/oracle/learnings.md` — named failure patterns. Use as vocabulary when classifying findings as smells. If a finding matches a named failure mode, cite the pattern name.
 
 Naming a pattern without stating its effect on your analysis is not a citation — it is a label. The bar is behavioral change: what did you weight differently, what did you flag that you would have passed over, what did you not include because of this pattern?
 
@@ -108,7 +109,7 @@ Produce two lists:
 **Dissonance/clutter/smells:**
 - Items where entropy has accumulated: naming drift, stale instructions, orphaned files, behavioral contradictions, dead code, structural redundancy
 - For each: what is it, where is it, how old/stale, what's the smell
-- If a smell matches a named failure pattern from `oracle/learnings.md`, cite the pattern name and state how it constrained your analysis
+- If a smell matches a named failure pattern from `~/lobster/oracle/learnings.md`, cite the pattern name and state how it constrained your analysis
 
 **Golden patterns / elegance / undernamed gems:**
 - Places where structure is working beautifully but the pattern has no name

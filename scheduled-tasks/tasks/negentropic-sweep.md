@@ -135,12 +135,15 @@ Compute a resolution rate for prior sweep escalations:
 
 2. **Find the last sweep date:** Read the most recent sweep file in `~/lobster-workspace/hygiene/` before today's (e.g., `ls -t ~/lobster-workspace/hygiene/20*-sweep.md | sed -n '2p'` to get the second-most-recent). Extract the date from the filename as `last_sweep_date`.
 
-3. **Count closed prior escalations:** Query GitHub for issues closed since the last sweep that carry the `bug` or `hygiene` label:
+3. **Count closed prior escalations:** Query GitHub for issues closed since the last sweep that carry the `bug` OR `hygiene` label (two separate queries to avoid AND semantics):
    ```bash
-   gh issue list --repo dcetlin/Lobster --state closed --label bug,hygiene \
-     --search "closed:>YYYY-MM-DD" --json number,title --limit 100
+   RESOLVED_HYGIENE=$(gh issue list --repo dcetlin/Lobster --state closed --label hygiene \
+     --search "closed:>YYYY-MM-DD" --json number --jq 'length')
+   RESOLVED_BUG=$(gh issue list --repo dcetlin/Lobster --state closed --label bug \
+     --search "closed:>YYYY-MM-DD" --json number --jq 'length')
+   closed_prior_count=$((RESOLVED_HYGIENE + RESOLVED_BUG))
    ```
-   Record `closed_prior_count` — the number of results. Note: this is a proxy metric — not all closed issues necessarily came from sweep escalations, but over time the rate reflects whether sweep-filed issues are being actioned.
+   Record `closed_prior_count` — the sum of the two counts. Note: issues with both labels are double-counted, but that is acceptable for this rate metric. Note: this is a proxy metric — not all closed issues necessarily came from sweep escalations, but over time the rate reflects whether sweep-filed issues are being actioned.
 
 4. **Compute resolution rate:** If `filed_count > 0` from the prior sweep (use the prior sweep's filed_count if available in its output summary, otherwise use `closed_prior_count` directly as an approximation): `resolution_rate = closed_prior_count / prior_filed_count * 100`
 
