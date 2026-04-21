@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RALPH Loop — Recursive Autonomous Loop for Pipeline Health.
+WOS pipeline health loop (ralph-loop).
 
 Runs every 3 hours as a Type A (LLM subagent) scheduled job.
 On each invocation:
@@ -78,7 +78,7 @@ def _is_job_enabled() -> bool:
 
 
 def _load_ralph_state() -> dict:
-    """Return current RALPH state dict, initializing defaults if absent."""
+    """Return current pipeline health state dict, initializing defaults if absent."""
     defaults: dict = {
         "consecutive_clean_runs": 0,
         "total_runs": 0,
@@ -100,7 +100,7 @@ def _task_definition() -> str:
         return TASK_FILE.read_text()
     except Exception as e:
         log.warning("Could not read task file %s: %s", TASK_FILE, e)
-        return f"# RALPH Loop\n\nTask file not found at {TASK_FILE}."
+        return f"# WOS Pipeline Health Loop\n\nTask file not found at {TASK_FILE}."
 
 
 def _write_inbox_message(payload: dict, dry_run: bool) -> Path | None:
@@ -137,7 +137,7 @@ def _build_inbox_message() -> dict:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="RALPH Loop — Pipeline Health Scheduler")
+    parser = argparse.ArgumentParser(description="WOS Pipeline Health Loop Scheduler")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -146,15 +146,15 @@ def main() -> int:
     args = parser.parse_args()
     dry_run: bool = args.dry_run
 
-    log.info("RALPH loop trigger starting%s", " (DRY RUN)" if dry_run else "")
+    log.info("Pipeline health loop trigger starting%s", " (DRY RUN)" if dry_run else "")
 
     if not _is_job_enabled():
-        log.info("RALPH loop: skipped (disabled in jobs.json)")
+        log.info("Pipeline health loop: skipped (disabled in jobs.json)")
         return 0
 
     state = _load_ralph_state()
     log.info(
-        "RALPH state: consecutive_clean=%d total_runs=%d last_run=%s",
+        "Pipeline health state: consecutive_clean=%d total_runs=%d last_run=%s",
         state["consecutive_clean_runs"],
         state["total_runs"],
         state.get("last_run_ts") or "never",
@@ -164,9 +164,9 @@ def main() -> int:
     written = _write_inbox_message(payload, dry_run=dry_run)
 
     if not dry_run and written:
-        log.info("RALPH loop trigger dispatched — subagent will run the full pipeline loop")
+        log.info("Pipeline health loop trigger dispatched — subagent will run the full pipeline loop")
     elif dry_run:
-        log.info("RALPH loop trigger: dry run complete")
+        log.info("Pipeline health loop trigger: dry run complete")
 
     return 0
 

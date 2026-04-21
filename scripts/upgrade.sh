@@ -2234,17 +2234,17 @@ else:
         migrated=$((migrated + 1))
     fi
 
-    # Migration 67: Register RALPH loop — pipeline health autonomous loop.
+    # Migration 67: Register WOS pipeline health loop (ralph-loop).
     # ralph-loop.py runs every 3 hours as a Type A LLM subagent job. It reads
     # jobs.json for the enabled gate, writes an inbox trigger message, and the
     # dispatcher spawns a subagent with the ralph-loop.md task definition.
-    # The subagent performs the full RALPH cycle: inject → execute → observe →
+    # The subagent performs a full WOS test run cycle: inject → execute → observe →
     # report → fix → track. State is persisted in data/ralph-state.json.
     local RALPH_LOOP_MARKER="# LOBSTER-RALPH-LOOP"
     if ! crontab -l 2>/dev/null | grep -q "$RALPH_LOOP_MARKER"; then
         "$LOBSTER_DIR/scripts/cron-manage.sh" add "$RALPH_LOOP_MARKER" \
             "0 */3 * * * cd $HOME && $HOME/.local/bin/uv run $LOBSTER_DIR/scheduled-tasks/ralph-loop.py >> $WORKSPACE_DIR/scheduled-jobs/logs/ralph-loop.log 2>&1 $RALPH_LOOP_MARKER"
-        substep "Added RALPH loop cron entry (ralph-loop.py, every 3 hours)"
+        substep "Added WOS pipeline health loop cron entry (ralph-loop.py, every 3 hours)"
         migrated=$((migrated + 1))
     fi
     # Upsert the ralph-loop entry into jobs.json if not present.
