@@ -77,7 +77,7 @@ esac
 # summary mode: emit JSON with quota window pcts and aggregated token totals
 # ---------------------------------------------------------------------------
 emit_summary() {
-  python3 - "${STATE_FILE}" "${LEDGER_FILE}" "${OUTCOME_LEDGER_FILE}" "${WINDOW}" <<'PYEOF'
+  uv run python - "${STATE_FILE}" "${LEDGER_FILE}" "${OUTCOME_LEDGER_FILE}" "${WINDOW}" <<'PYEOF'
 import sys
 import json
 import os
