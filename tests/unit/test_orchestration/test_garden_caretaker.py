@@ -597,7 +597,265 @@ class TestRun:
 
         assert "seeded" in result
         assert "qualified" in result
+        assert "requalified" in result
         assert "archived" in result
         assert "surfaced_to_steward" in result
         assert "reactivated" in result
         assert "no_change" in result
+
+
+# ---------------------------------------------------------------------------
+# requalify_proposed() integration tests
+# ---------------------------------------------------------------------------
+
+class TestRequalifyProposed:
+    """Proposed UoWs that now pass qualification criteria are auto-advanced.
+
+    This covers the gap where UoWs reset to 'proposed' (e.g. after source
+    reopens) would stay stuck there indefinitely under the old weekly-scan model.
+    """
+
+    def test_proposed_uow_with_qualifying_label_is_auto_advanced(
+        self, registry: Registry
+    ) -> None:
+        """A proposed UoW whose source now carries a qualifying label advances to ready-for-steward."""
+        upsert_result = registry.upsert(
+            issue_number=300, title="Now has bug label", success_criteria="Fix the bug."
+        )
+        snap = _snapshot(
+            source_ref="github:issue/300",
+            labels=("bug",),
+            body="Non-empty body",
+            state="open",
+        )
+        source = _make_source(issue_map={"github:issue/300": snap})
+        caretaker = GardenCaretaker(source=source, registry=registry)
+
+        result = caretaker.requalify_proposed()
+
+        assert result["requalified"] == 1
+        assert registry.query(status="proposed") == []
+        ready = registry.query(status="ready-for-steward")
+        assert len(ready) == 1
+        assert ready[0].id == upsert_result.id
+
+    def test_proposed_uow_aged_without_label_is_not_auto_advanced(
+        self, registry: Registry
+    ) -> None:
+        """Age-only qualification is blocked by require_label=True in requalify_proposed().
+
+        A proposed UoW that is old enough (≥3 days) but carries no qualifying label
+        must NOT be auto-advanced. The od-3 constraint in vision.yaml requires explicit
+        label signal — age alone is not sufficient for requalify_proposed().
+        This is a regression guard: if require_label is accidentally removed, this test fails.
+        """
+        registry.upsert(
+            issue_number=301, title="Old issue", success_criteria="Do something."
+        )
+        snap = _snapshot(
+            source_ref="github:issue/301",
+            labels=(),
+            body="Some body text",
+            state="open",
+            created_at=_iso(5),  # 5 days old — past the 3-day threshold, but no qualifying label
+        )
+        source = _make_source(issue_map={"github:issue/301": snap})
+        caretaker = GardenCaretaker(source=source, registry=registry)
+
+        result = caretaker.requalify_proposed()
+
+        # Age-only UoWs must stay in proposed — label signal is required
+        assert result["requalified"] == 0
+        assert len(registry.query(status="proposed")) == 1
+        assert registry.query(status="ready-for-steward") == []
+
+    def test_proposed_uow_with_blocking_label_is_not_advanced(
+        self, registry: Registry
+    ) -> None:
+        """A proposed UoW with a blocking label must not be auto-advanced regardless of age."""
+        registry.upsert(
+            issue_number=302, title="Blocked issue", success_criteria="Waiting."
+        )
+        snap = _snapshot(
+            source_ref="github:issue/302",
+            labels=("needs-design",),  # blocking label
+            body="Some body text",
+            state="open",
+            created_at=_iso(10),  # old enough to qualify by age, but blocked
+        )
+        source = _make_source(issue_map={"github:issue/302": snap})
+        caretaker = GardenCaretaker(source=source, registry=registry)
+
+        result = caretaker.requalify_proposed()
+
+        assert result["requalified"] == 0
+        assert len(registry.query(status="proposed")) == 1
+
+    def test_proposed_uow_too_new_without_qualifying_label_is_not_advanced(
+        self, registry: Registry
+    ) -> None:
+        """A brand-new proposed UoW without qualifying labels remains proposed."""
+        registry.upsert(
+            issue_number=303, title="New issue", success_criteria="TBD."
+        )
+        snap = _snapshot(
+            source_ref="github:issue/303",
+            labels=(),
+            body="Some body text",
+            state="open",
+            created_at=_iso(0),  # just created — does not meet age threshold
+        )
+        source = _make_source(issue_map={"github:issue/303": snap})
+        caretaker = GardenCaretaker(source=source, registry=registry)
+
+        result = caretaker.requalify_proposed()
+
+        assert result["requalified"] == 0
+        assert len(registry.query(status="proposed")) == 1
+
+    def test_proposed_uow_without_source_ref_is_skipped(
+        self, registry: Registry, db_path: Path
+    ) -> None:
+        """A proposed UoW with no source_ref (empty string) cannot be requalified and is skipped.
+
+        The 'source' column is always set by upsert() (derived from issue_number), so this
+        guard catches legacy rows or direct DB writes where source was not set. We simulate
+        that by writing source='' directly via sqlite3.
+        """
+        import sqlite3
+        upsert_result = registry.upsert(
+            issue_number=304, title="No source ref", success_criteria="Abstract task."
+        )
+        # Blank out the source column to simulate a legacy row
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("UPDATE uow_registry SET source = '' WHERE id = ?", (upsert_result.id,))
+        conn.commit()
+        conn.close()
+
+        # Reload registry so it sees the blanked source
+        from src.orchestration.registry import Registry as _R
+        registry2 = _R(db_path)
+
+        source = _make_source(issue_map={})
+        caretaker = GardenCaretaker(source=source, registry=registry2)
+
+        result = caretaker.requalify_proposed()
+
+        assert result["requalified"] == 0
+        source.get_issue.assert_not_called()
+
+    def test_proposed_uow_with_deleted_source_is_skipped(
+        self, registry: Registry
+    ) -> None:
+        """A proposed UoW whose source returns None is skipped — tend() handles the archive."""
+        registry.upsert(
+            issue_number=305, title="Deleted issue", success_criteria="Gone."
+        )
+        # source.get_issue returns None → deleted
+        source = _make_source(issue_map={"github:issue/305": None})
+        caretaker = GardenCaretaker(source=source, registry=registry)
+
+        result = caretaker.requalify_proposed()
+
+        assert result["requalified"] == 0
+        # Still proposed — tend() will archive it on next pass
+        assert len(registry.query(status="proposed")) == 1
+
+    def test_proposed_uow_source_error_is_skipped_gracefully(
+        self, registry: Registry
+    ) -> None:
+        """A source fetch error does not raise — the UoW is skipped and remains proposed."""
+        registry.upsert(
+            issue_number=306, title="Network error case", success_criteria="Unreachable."
+        )
+        source = MagicMock()
+        source.scan.return_value = iter([])
+        source.get_issue.side_effect = Exception("network timeout")
+        caretaker = GardenCaretaker(source=source, registry=registry)
+
+        # Should not raise
+        result = caretaker.requalify_proposed()
+
+        assert result["requalified"] == 0
+        assert len(registry.query(status="proposed")) == 1
+
+    def test_requalify_writes_auto_qualified_audit_event(
+        self, registry: Registry
+    ) -> None:
+        """Audit log records 'auto_qualified' event to distinguish from seed-time qualification."""
+        import sqlite3
+        upsert_result = registry.upsert(
+            issue_number=307, title="Audit event check", success_criteria="Verify audit."
+        )
+        snap = _snapshot(
+            source_ref="github:issue/307",
+            labels=("bug",),
+            body="Non-empty",
+            state="open",
+        )
+        source = _make_source(issue_map={"github:issue/307": snap})
+        caretaker = GardenCaretaker(source=source, registry=registry)
+        caretaker.requalify_proposed()
+
+        conn = sqlite3.connect(str(registry.db_path))
+        conn.row_factory = sqlite3.Row
+        entries = conn.execute(
+            "SELECT event FROM audit_log WHERE uow_id = ? ORDER BY id",
+            (upsert_result.id,),
+        ).fetchall()
+        conn.close()
+
+        events = [r["event"] for r in entries]
+        assert "auto_qualified" in events
+
+    def test_requalify_does_not_advance_non_proposed_uows(
+        self, registry: Registry
+    ) -> None:
+        """requalify_proposed() only operates on proposed UoWs — other states are untouched."""
+        upsert_result = registry.upsert(
+            issue_number=308, title="Already ready", success_criteria="Done already."
+        )
+        registry.set_status_direct(upsert_result.id, "ready-for-steward")
+
+        snap = _snapshot(
+            source_ref="github:issue/308",
+            labels=("bug",),
+            body="Non-empty",
+            state="open",
+        )
+        source = _make_source(issue_map={"github:issue/308": snap})
+        caretaker = GardenCaretaker(source=source, registry=registry)
+
+        result = caretaker.requalify_proposed()
+
+        assert result["requalified"] == 0
+        # UoW remains in ready-for-steward — requalify_proposed should not touch it
+        ready = registry.query(status="ready-for-steward")
+        assert len(ready) == 1
+        # get_issue should never be called (query only fetches proposed)
+        source.get_issue.assert_not_called()
+
+    def test_run_includes_requalified_count_in_summary(
+        self, registry: Registry
+    ) -> None:
+        """run() merges requalify_proposed() output — 'requalified' key is present and correct."""
+        upsert_result = registry.upsert(
+            issue_number=309, title="Run integration", success_criteria="Check run output."
+        )
+        snap = _snapshot(
+            source_ref="github:issue/309",
+            labels=("bug",),
+            body="Non-empty",
+            state="open",
+        )
+        source = _make_source(
+            scan_issues=[],  # no new seeding
+            issue_map={"github:issue/309": snap},
+        )
+        caretaker = GardenCaretaker(source=source, registry=registry)
+
+        result = caretaker.run()
+
+        assert result["requalified"] == 1
+        assert registry.query(status="proposed") == []
+        assert len(registry.query(status="ready-for-steward")) == 1
