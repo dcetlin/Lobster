@@ -2848,6 +2848,36 @@ CREATE TABLE IF NOT EXISTS dispatcher_lock (
         substep "wos-metabolic-digest cron entry already present — skipping"
     fi
 
+    # Migration 84: Register wos-execute-gate.py PostToolUse hook (issue #855).
+    # Enforces the WOS Execute Gate structurally: detects when mark_processed is
+    # called on a wos_execute message without a prior mark_processing call and
+    # logs a gate violation via write_observation. Never blocks mark_processed.
+    if [ -f "$CLAUDE_SETTINGS" ] && command -v jq >/dev/null 2>&1; then
+        local has_wos_execute_gate
+        has_wos_execute_gate=$(jq -r '
+            [.hooks.PostToolUse[]?.hooks[]?.command // empty]
+            | map(select(contains("wos-execute-gate")))
+            | length
+        ' "$CLAUDE_SETTINGS" 2>/dev/null || echo "0")
+        if [ "${has_wos_execute_gate:-0}" = "0" ] || [ "${has_wos_execute_gate:-0}" = "" ]; then
+            chmod +x "$LOBSTER_DIR/hooks/wos-execute-gate.py" 2>/dev/null || true
+            TMP_SETTINGS=$(mktemp)
+            jq --arg cmd "python3 $LOBSTER_DIR/hooks/wos-execute-gate.py" \
+               '.hooks.PostToolUse = (.hooks.PostToolUse // []) + [{
+                "matcher": "mcp__lobster-inbox__mark_processed",
+                "hooks": [{
+                    "type": "command",
+                    "command": $cmd,
+                    "timeout": 10
+                }]
+            }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+            substep "Registered wos-execute-gate PostToolUse hook (Migration 84)"
+            migrated=$((migrated + 1))
+        else
+            substep "wos-execute-gate hook already registered — skipping Migration 84"
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
