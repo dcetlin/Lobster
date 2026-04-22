@@ -1,3 +1,9 @@
+---
+oracle_status: approved
+oracle_pr: https://github.com/dcetlin/Lobster/pull/835
+oracle_date: 2026-04-22
+---
+
 # Vision Object
 *Design document — first version: 2026-03-27*
 
