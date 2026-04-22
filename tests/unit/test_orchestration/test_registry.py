@@ -108,7 +108,15 @@ class TestUpsert:
         assert row["status"] == "proposed"
         assert row["source_issue_number"] == 1
         assert row["posture"] == "solo"
-        assert row["route_reason"] == "phase1-default: no classifier"
+        # route_reason is now set by the routing classifier at germination time.
+        # The exact value depends on whether classifier.yaml is available:
+        # - With YAML: "Rule 'default' (catch-all) matched" (catch-all rule)
+        # - Without YAML: "classifier-unavailable: defaulting to solo"
+        # In both cases, the legacy "phase1-default: no classifier" value must NOT appear.
+        assert row["route_reason"] is not None
+        assert row["route_reason"] != "phase1-default: no classifier", (
+            "Legacy route_reason still written — classifier not wired in correctly"
+        )
         conn.close()
 
     def test_upsert_stores_success_criteria(self, registry, db_path):
