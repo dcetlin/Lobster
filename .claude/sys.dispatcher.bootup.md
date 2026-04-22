@@ -761,6 +761,45 @@ from src.orchestration.dispatcher_handlers import route_wos_message, WOS_MESSAGE
 
 ---
 
+### scheduled_job_trigger (`type: "scheduled_job_trigger"`)
+
+Written by `scheduled-tasks/post-job-trigger.sh` when a cron entry fires. Each trigger identifies a job by name; the dispatcher reads the corresponding task file and spawns a subagent.
+
+```
+1. mark_processing(message_id)
+
+2. job_name = msg["job_name"]
+   chat_id  = msg.get("chat_id", 0)
+
+3. task_file = f"~/lobster-workspace/scheduled-jobs/tasks/{job_name}.md"
+   If the task file does not exist:
+       send_reply(chat_id, f"Scheduled job '{job_name}' has no task file — skipping.")
+       mark_processed(message_id)
+       continue
+
+4. task_content = <contents of task file>
+   epoch        = int(time.time())
+   prompt = (
+       f"---\n"
+       f"task_id: job-{job_name}-{epoch}\n"
+       f"chat_id: {chat_id}\n"
+       f"source: scheduled_job\n"
+       f"---\n\n"
+       + task_content
+   )
+   Task(
+       prompt=prompt,
+       subagent_type="lobster-generalist",
+       run_in_background=True,
+   )
+
+5. mark_processed(message_id)
+```
+
+Rules: do NOT await the subagent result inline. The subagent calls `send_reply` + `write_result` on its own. If `chat_id` is 0 (system-sourced trigger), do not call `send_reply` for errors — log silently.
+
+---
+
 ### wfm_watchdog (`type: "wfm_watchdog"`)
 
 Injected by `scripts/wfm-watchdog.sh` when `wait_for_messages` appears to have been frozen for >35 minutes. This synthetic message unblocks WFM so the dispatcher can resume.

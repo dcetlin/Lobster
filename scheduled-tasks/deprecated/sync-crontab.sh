@@ -17,7 +17,7 @@ set -e
 WORKSPACE="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}"
 REPO_DIR="${LOBSTER_INSTALL_DIR:-$HOME/lobster}"
 JOBS_FILE="$WORKSPACE/scheduled-jobs/jobs.json"
-RUNNER="$REPO_DIR/scheduled-tasks/dispatch-job.sh"
+RUNNER="$REPO_DIR/scheduled-tasks/post-job-trigger.sh"
 CRONTAB_FILE="/var/spool/cron/crontabs/$(whoami)"
 
 # Check if cron is available at all

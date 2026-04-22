@@ -2822,6 +2822,36 @@ CREATE TABLE IF NOT EXISTS dispatcher_lock (
         fi
     fi
 
+    # Migration 83: Rewrite crontab entries to use post-job-trigger.sh
+    # Cron jobs that previously called dispatch-job.sh now call post-job-trigger.sh,
+    # which writes a scheduled_job_trigger inbox message (vs scheduled_reminder).
+    # The dispatcher handles both types, so existing jobs continue to work during
+    # the transition. run-job.sh entries (older installs) are also caught.
+    if crontab -l 2>/dev/null | grep -qE '(run-job|dispatch-job)\.sh.*# LOBSTER-SCHEDULED'; then
+        log_step "83" "Rewriting crontab entries: run-job.sh / dispatch-job.sh → post-job-trigger.sh"
+        crontab -l 2>/dev/null | sed 's|run-job\.sh|post-job-trigger.sh|g; s|dispatch-job\.sh|post-job-trigger.sh|g' | crontab -
+        log_ok "Crontab entries updated"
+        migrated=$((migrated + 1))
+    else
+        substep "Migration 83: no run-job.sh / dispatch-job.sh LOBSTER-SCHEDULED crontab entries — skipping"
+    fi
+
+    # Migration 84: [PHASE 3 — apply only after 7 clean days] Remove block-claude-p hook
+    #
+    # PHASE 3 NOTE: This step is a stub. Run manually after post-job-trigger.sh
+    # has been in production for ≥7 days with zero new entries in
+    # ~/lobster-workspace/logs/claude-p-blocks.jsonl.
+    # Uncomment and run when ready:
+    #
+    # log_step "84" "Phase 3: removing block-claude-p hook from settings.json"
+    # SETTINGS=~/.claude/settings.json
+    # if [ -f "$SETTINGS" ]; then
+    #   TMP_SETTINGS=$(mktemp)
+    #   jq 'del(.hooks[] | select(. | tostring | contains("block-claude-p")))' \
+    #       "$SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$SETTINGS"
+    #   log_ok "block-claude-p hook removed from settings.json"
+    # fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
