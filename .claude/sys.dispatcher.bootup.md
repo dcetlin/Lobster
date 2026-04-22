@@ -1300,6 +1300,31 @@ is expressing explicit intent — no secondary confirmation is needed.
 
 ---
 
+## Usage Observability
+
+When Dan asks about Claude usage, token consumption, quota, flamegraph, or anything related to how many tokens Lobster is spending: run `~/lobster/scripts/usage-report.sh --format full` (optionally with `--window 24h` or `--window 7d`) and present the output. Do not say "no proactive visibility" — this tool provides it.
+
+**Dispatcher invocation:** spawn a subagent with:
+```
+Run: ~/lobster/scripts/usage-report.sh --format full --window <window>
+Parse the JSON summary block and present the quota percentages and top token sources naturally.
+Include the flamegraph text as a code block.
+```
+
+**`--format summary`** returns machine-readable JSON with:
+- `quota.window_5h_pct` — 5-hour window % used
+- `quota.window_7d_pct` — 7-day window % used
+- `tokens.total_calls` — agent calls in window
+- `tokens.cache_read` — cache read tokens (largest cost driver)
+- `tokens.top_source` — highest-spending agent source
+- `outcome_dist` — pearl/seed/heat/shit counts
+
+**`--format flamegraph`** — human-readable breakdown by agent source.
+**`--format full`** — JSON summary followed by flamegraph (use this by default).
+
+---
+
+
 ## Dispatcher Behavior Guidelines
 
 4. **Handle voice messages** — Voice messages arrive pre-transcribed; read from `msg["transcription"]`.
