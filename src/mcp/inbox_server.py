@@ -469,6 +469,13 @@ def _emit_mcp_event(
         pass  # observability must never block the caller
 
 
+# Populated from event_bus when available — used by handle_emit_event below.
+try:
+    from event_bus import VALID_SEVERITIES as _VALID_SEVERITIES
+except ImportError:
+    _VALID_SEVERITIES = frozenset({"debug", "info", "warn", "error", "critical"})  # type: ignore[assignment]
+
+
 # ---------------------------------------------------------------------------
 # User model context injection heuristic
 # ---------------------------------------------------------------------------
@@ -874,12 +881,13 @@ HEARTBEAT_FILE = _WORKSPACE / "logs" / "claude-heartbeat"
 # tests can verify it matches the health-check's WFM_ACTIVE_STALE_SECONDS.
 WAIT_HEARTBEAT_INTERVAL = 60
 
-# WFM-active signal file (issue #949): written with a Unix epoch timestamp
-# when wait_for_messages begins blocking, refreshed every WAIT_HEARTBEAT_INTERVAL
-# seconds, and deleted when WFM returns.  The health check reads this file to
-# distinguish "dispatcher alive, waiting for messages" from "dispatcher frozen/dead"
-# — suppressing the heartbeat-stale RED that would otherwise fire after 20 minutes
-# of zero-message quiet.
+# WFM-active signal file (issue #1713 / #949): written with a Unix epoch
+# timestamp when wait_for_messages begins blocking, refreshed every
+# WAIT_HEARTBEAT_INTERVAL seconds, and deleted when WFM returns.
+#
+# The health check reads this file to distinguish "dispatcher alive, waiting
+# for messages" from "dispatcher frozen/dead" — suppressing the
+# heartbeat-stale RED that would otherwise fire after 20 minutes of quiet.
 #
 # Path: ~/lobster-workspace/logs/dispatcher-wfm-active
 # Content: single Unix epoch integer (e.g. "1713456789\n"), same format as
@@ -888,7 +896,7 @@ WAIT_HEARTBEAT_INTERVAL = 60
 WFM_ACTIVE_FILE = Path(
     os.environ.get(
         "LOBSTER_WFM_ACTIVE_OVERRIDE",
-        _WORKSPACE / "logs" / "dispatcher-wfm-active",
+        str(_WORKSPACE / "logs" / "dispatcher-wfm-active"),
     )
 )
 
@@ -1534,7 +1542,7 @@ def touch_heartbeat():
 
 
 def _write_wfm_active_signal() -> None:
-    """Write the WFM-active heartbeat signal atomically (issue #949).
+    """Write the WFM-active heartbeat signal atomically (issue #1713 / #949).
 
     Called at the start of the wait_for_messages blocking loop and refreshed
     on every WAIT_HEARTBEAT_INTERVAL tick so the health check sees a fresh
@@ -1543,7 +1551,7 @@ def _write_wfm_active_signal() -> None:
     Content: single Unix epoch integer — same format as dispatcher-heartbeat —
     so health-check-v3.sh can parse it with the same integer comparison logic.
 
-    Atomic write (tmp → rename) prevents partial reads by the health check.
+    Atomic write (tmp -> rename) prevents partial reads by the health check.
     Silently swallowed on failure: health check degrades gracefully when absent.
     """
     try:
@@ -1553,6 +1561,40 @@ def _write_wfm_active_signal() -> None:
         os.rename(str(tmp), str(WFM_ACTIVE_FILE))
     except Exception:
         pass  # Never block wait_for_messages on a heartbeat write failure
+
+
+# Tombstone value written to WFM_ACTIVE_FILE when WFM exits (Fix 2, issue #1730).
+# Using a non-integer string means:
+#   - The file is NEVER absent between the health check's -f gate and its cat read
+#     (closing the TOCTOU race that caused the 2026-04-22 00:00Z false restart).
+#   - The health check's existing integer guard ([[ "$ts" =~ ^[0-9]+$ ]]) rejects
+#     this value and treats it as "WFM not active" — the correct semantic.
+WFM_ACTIVE_TOMBSTONE = "exited"
+
+
+def _clear_wfm_active_signal() -> None:
+    """Write a tombstone to WFM_ACTIVE_FILE instead of deleting it (issue #1730).
+
+    Replaces the previous WFM_ACTIVE_FILE.unlink() in the WFM finally block.
+    Writing a non-integer tombstone ("exited") instead of deleting ensures the
+    file is never transiently absent — closing the TOCTOU race between:
+      1. The health check's existence test  (if [[ -f ... ]])
+      2. The health check's content read    (cat ...)
+    If the file disappears between those two operations, cat returns empty and
+    the health check falls through to RED, triggering a false-positive restart.
+
+    The tombstone is parsed by the health check's integer regex guard and treated
+    as absent (WFM not active), which is the correct semantic.
+
+    Silently swallowed on failure: this runs in a finally block and must never
+    mask the original exception that caused WFM to exit.
+    """
+    try:
+        WFM_ACTIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        WFM_ACTIVE_FILE.write_text(WFM_ACTIVE_TOMBSTONE + "\n")
+    except Exception:
+        pass  # Never propagate errors from a finally-block cleanup
+
 
 
 # ---------------------------------------------------------------------------
@@ -1785,6 +1827,7 @@ async def list_tools() -> list[Tool]:
                     },
                 },
             },
+            _meta={"anthropic/alwaysLoad": True},
         ),
         Tool(
             name="check_inbox",
@@ -1812,6 +1855,7 @@ async def list_tools() -> list[Tool]:
                     },
                 },
             },
+            _meta={"anthropic/alwaysLoad": True},
         ),
         Tool(
             name="send_reply",
@@ -1880,6 +1924,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["chat_id", "text"],
             },
+            _meta={"anthropic/alwaysLoad": True},
         ),
         Tool(
             name="send_whatsapp_reply",
@@ -1935,6 +1980,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["message_id"],
             },
+            _meta={"anthropic/alwaysLoad": True},
         ),
         Tool(
             name="mark_processing",
@@ -1949,6 +1995,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["message_id"],
             },
+            _meta={"anthropic/alwaysLoad": True},
         ),
         Tool(
             name="mark_failed",
@@ -2102,6 +2149,7 @@ async def list_tools() -> list[Tool]:
                     },
                 },
             },
+            _meta={"anthropic/alwaysLoad": True},
         ),
         # Telegram Message Lookup Tool
         Tool(
@@ -2239,6 +2287,7 @@ async def list_tools() -> list[Tool]:
                     },
                 },
             },
+            _meta={"anthropic/alwaysLoad": True},
         ),
         Tool(
             name="add_rule",
@@ -2558,13 +2607,23 @@ async def list_tools() -> list[Tool]:
                     "text": {
                         "type": "string",
                         "description": (
-                            "The result text to deliver to the user. "
-                            "Keep this to a concise summary (ideally under ~4KB / ~500 words). "
+                            "Dispatcher-internal summary of this result. "
+                            "Kept short (ideally under ~500 words) so the dispatcher's context does not grow. "
+                            "Not shown to the user when reply_text is provided. "
                             "For large outputs — reports, diffs, full analysis — write the content "
                             "to ~/lobster-workspace/reports/<task_id>.md and pass the path in "
-                            "`artifacts` instead. The dispatcher reads artifact files and inlines "
-                            "their content in the reply. Never put raw file paths in text — they "
-                            "are server-side references that are useless to mobile users."
+                            "`artifacts` instead."
+                        ),
+                    },
+                    "reply_text": {
+                        "type": "string",
+                        "description": (
+                            "Optional user-facing reply text. When provided and "
+                            "sent_reply_to_user is False, the dispatcher sends this to the user "
+                            "instead of text. Use this to keep text as a terse internal summary "
+                            "while sending a richer or differently-phrased message to the user. "
+                            "Omit if text is already the right user-facing message. "
+                            "Do not include raw file paths — use relative paths or descriptions instead."
                         ),
                     },
                     "source": {
@@ -2662,6 +2721,55 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["chat_id", "text", "category"],
+            },
+        ),
+        # Event Bus Tool (issue #1665)
+        Tool(
+            name="emit_event",
+            description=(
+                "Emit a structured event into the Lobster event bus. "
+                "Use this to record lifecycle events, errors, or observations from "
+                "dispatchers and subagents. Events are written to events.jsonl and "
+                "forwarded to listeners (including CriticalAlertListener for critical-level events). "
+                "This is a fire-and-forget call — it never blocks and never raises."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "event_type": {
+                        "type": "string",
+                        "description": (
+                            "Dot-separated event type string. "
+                            "Examples: 'agent.spawn', 'agent.complete', 'memory.write', "
+                            "'system.error', 'debug.observation'."
+                        ),
+                    },
+                    "level": {
+                        "type": "string",
+                        "description": "Severity level. One of: debug, info, warn, error, critical.",
+                        "enum": ["debug", "info", "warn", "error", "critical"],
+                    },
+                    "msg": {
+                        "type": "string",
+                        "description": "Human-readable message describing the event.",
+                    },
+                    "payload": {
+                        "type": "object",
+                        "description": "Optional additional structured data for the event.",
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Optional task identifier to associate with this event.",
+                    },
+                    "chat_id": {
+                        "oneOf": [
+                            {"type": "integer"},
+                            {"type": "string"},
+                        ],
+                        "description": "Optional chat/channel ID to associate with this event.",
+                    },
+                },
+                "required": ["event_type", "level", "msg"],
             },
         ),
         # Pending Agent Tracker Tools
@@ -2880,6 +2988,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["agent_id", "description", "chat_id"],
             },
+            _meta={"anthropic/alwaysLoad": True},
         ),
         Tool(
             name="session_end",
@@ -4049,6 +4158,8 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         return await handle_write_result(arguments)
     elif name == "write_observation":
         return await handle_write_observation(arguments)
+    elif name == "emit_event":
+        return await handle_emit_event(arguments)
     # Pending Agent Tracker Tools (register/unregister kept as aliases)
     elif name == "register_agent":
         return await handle_register_agent(arguments)
@@ -4377,24 +4488,14 @@ async def handle_wait_for_messages(args: dict) -> list[TextContent]:
     # transient mode, calling wait_for_messages means Claude is up and running.
     _write_lobster_state(LOBSTER_STATE_FILE, "active")
 
-    # Write WFM active timestamp so the external watchdog can detect freezes.
-    # The watchdog (scripts/wfm-watchdog.sh) runs every 10 minutes via cron and
-    # injects a synthetic wfm_watchdog message if WFM has been running for longer
-    # than 35 minutes (2100s — 5 min past the default 1800s WFM timeout).
-    # We clear this file in the finally block so the watchdog only fires when
-    # WFM is genuinely blocked and has not returned normally.
-    _wfm_active_file = CONFIG_DIR / "wfm-active.json"
-    try:
-        _wfm_start_ts = datetime.now(timezone.utc)
-        _wfm_active_payload = {
-            "started_at": _wfm_start_ts.isoformat(),
-            "pid": os.getpid(),
-        }
-        _wfm_tmp = _wfm_active_file.parent / f".wfm-active-{os.getpid()}.tmp"
-        _wfm_tmp.write_text(json.dumps(_wfm_active_payload))
-        _wfm_tmp.rename(_wfm_active_file)
-    except Exception as _wfm_exc:
-        log.warning(f"[wfm-watchdog] Failed to write wfm-active.json: {_wfm_exc}")
+    # Write WFM-active signal so the health check can distinguish a healthy
+    # idle-blocking dispatcher from a frozen one (issue #1713 / #949).
+    # The health check treats a fresh WFM-active signal as GREEN even when
+    # dispatcher-heartbeat is stale — PostToolUse hooks don't fire during a
+    # blocking MCP call, so the heartbeat inevitably goes stale after 20 min.
+    # We clear this file in the finally block so the signal only persists while
+    # WFM is actually blocking.
+    _write_wfm_active_signal()
 
     # Recover stale processing and retryable failed messages
     _recover_stale_processing()
@@ -4449,9 +4550,8 @@ async def handle_wait_for_messages(args: dict) -> list[TextContent]:
             inbox_results = await handle_check_inbox({"limit": 10})
             return _prepend_sessions_prefix(sessions_prefix, inbox_results)
         # Wait with periodic heartbeats (every WAIT_HEARTBEAT_INTERVAL seconds).
-        # Write the WFM-active signal file before entering the blocking loop so
-        # the health check knows the dispatcher is alive and waiting, not frozen.
-        # The file is refreshed on every iteration and deleted in the finally block.
+        # Refresh WFM-active on every iteration so the health check sees a
+        # fresh signal even during long quiet periods (issue #1713 / #949).
         heartbeat_interval = WAIT_HEARTBEAT_INTERVAL
         elapsed = 0
         _write_wfm_active_signal()
@@ -4467,8 +4567,7 @@ async def handle_wait_for_messages(args: dict) -> list[TextContent]:
             if arrived:
                 break
 
-            # Touch heartbeat to show we're still alive; refresh WFM-active so
-            # the health check sees a fresh signal even after many quiet iterations.
+            # Touch heartbeat and refresh WFM-active to show we're still alive.
             touch_heartbeat()
             _write_wfm_active_signal()
             elapsed += wait_time
@@ -4515,20 +4614,13 @@ async def handle_wait_for_messages(args: dict) -> list[TextContent]:
     finally:
         observer.stop()
         observer.join(timeout=1)
-        # Clear WFM active file so the watchdog knows WFM returned normally.
-        try:
-            _wfm_active_file = CONFIG_DIR / "wfm-active.json"
-            if _wfm_active_file.exists():
-                _wfm_active_file.unlink()
-        except Exception as _wfm_clear_exc:
-            log.warning(f"[wfm-watchdog] Failed to clear wfm-active.json: {_wfm_clear_exc}")
-        # Clear WFM-active heartbeat signal so the health check stops treating
-        # the dispatcher as "alive in WFM" once WFM returns (issue #949).
-        try:
-            if WFM_ACTIVE_FILE.exists():
-                WFM_ACTIVE_FILE.unlink()
-        except Exception as _wfm_active_clear_exc:
-            log.warning(f"[wfm-active] Failed to clear WFM-active signal: {_wfm_active_clear_exc}")
+        # Write tombstone to WFM_ACTIVE_FILE instead of deleting it (issue #1730).
+        # Deleting the file creates a TOCTOU race: the health check's -f gate can
+        # pass just before unlink(), then cat returns empty and declares RED.
+        # Writing the non-integer tombstone WFM_ACTIVE_TOMBSTONE means the file is
+        # never transiently absent — the health check treats non-integer content as
+        # "WFM not active" (same as absent), with no race window.
+        _clear_wfm_active_signal()
 
 
 def _is_report_command(text: str) -> bool:
@@ -7615,6 +7707,7 @@ async def handle_write_result(args: dict) -> list[TextContent]:
     task_id = args.get("task_id", "").strip()
     chat_id = args.get("chat_id")
     text = args.get("text", "").strip()
+    reply_text = (args.get("reply_text") or "").strip() or None
     source = args.get("source", "telegram").strip() or "telegram"
     status = args.get("status", "success")
     artifacts = args.get("artifacts") or []
@@ -7695,6 +7788,11 @@ async def handle_write_result(args: dict) -> list[TextContent]:
     }
     if msg_type == "subagent_notification":
         message["warning"] = "User already received the subagent's reply. Don't summarize it. If you respond, add new value only — a question, a correction, missing context."
+    # reply_text: user-facing reply separate from the internal dispatcher summary (text).
+    # Only stored when there is an active user relay path: sent_reply_to_user=False and
+    # chat_id not in (0, "0") (chat_id 0 is dispatcher-internal; no user reply is ever sent).
+    if reply_text and not sent_reply_to_user and chat_id not in (0, "0"):
+        message["reply_text"] = reply_text
     if artifacts:
         message["artifacts"] = artifacts
     if thread_ts:
@@ -7902,6 +8000,60 @@ async def handle_write_observation(args: dict) -> list[TextContent]:
         type="text",
         text=f"Observation queued (id={message_id}, category={category}). The dispatcher will route it.",
     )]
+
+
+# =============================================================================
+# emit_event MCP tool handler (issue #1665)
+# =============================================================================
+
+
+async def handle_emit_event(args: dict) -> list[TextContent]:
+    """
+    MCP tool handler for emit_event (issue #1665).
+
+    Validates the level field against VALID_SEVERITIES, constructs a LobsterEvent,
+    and emits it fire-and-forget. Never raises — validation errors are returned as
+    error text in the response rather than exceptions.
+
+    Functional design: pure input validation (returns early on error), then a
+    single side-effect call to the bus.
+    """
+    event_type = args.get("event_type", "")
+    level = args.get("level", "")
+    msg = args.get("msg", "")
+    payload_extra: dict = args.get("payload") or {}
+    task_id: str | None = args.get("task_id")
+    chat_id = args.get("chat_id")
+
+    # Validate level — reject unknown values with a descriptive error
+    if level not in _VALID_SEVERITIES:
+        valid = sorted(_VALID_SEVERITIES)
+        return [TextContent(
+            type="text",
+            text=(
+                f"emit_event: unknown level {level!r}. "
+                f"Valid levels: {valid}. Event was not emitted."
+            ),
+        )]
+
+    if not _EVENT_BUS_AVAILABLE:
+        return [TextContent(type="text", text="emit_event: event bus unavailable; event not emitted.")]
+
+    try:
+        payload = {"msg": msg, **payload_extra}
+        event = LobsterEvent(
+            event_type=event_type,
+            severity=level,
+            source="mcp-tool",
+            payload=payload,
+            task_id=task_id,
+            chat_id=chat_id,
+        )
+        get_event_bus().emit_sync(event)
+    except Exception:
+        pass  # emit_event must never crash the caller
+
+    return [TextContent(type="text", text=f"emit_event: emitted {event_type!r} [{level}]")]
 
 
 # =============================================================================
