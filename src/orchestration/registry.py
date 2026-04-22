@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import sqlite3
 import uuid
 from collections.abc import Callable
@@ -23,6 +24,8 @@ from datetime import datetime, timezone, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
+
+log = logging.getLogger("registry")
 
 
 # ---------------------------------------------------------------------------
@@ -57,10 +60,14 @@ class UoWStatus(StrEnum):
     DONE = "done"
     FAILED = "failed"
     EXPIRED = "expired"
+    # CANCELLED: terminal status used when a UoW is explicitly cancelled.
+    # Treated as terminal (allows re-proposal). Previously a legacy DB-only value
+    # not covered by the enum — UoWStatus('cancelled') raised ValueError.
+    CANCELLED = "cancelled"
 
     def is_terminal(self) -> bool:
-        """True for statuses that allow re-proposal (done, failed, expired)."""
-        return self in {UoWStatus.DONE, UoWStatus.FAILED, UoWStatus.EXPIRED}
+        """True for statuses that allow re-proposal (done, failed, expired, cancelled)."""
+        return self in {UoWStatus.DONE, UoWStatus.FAILED, UoWStatus.EXPIRED, UoWStatus.CANCELLED}
 
     def is_in_flight(self) -> bool:
         """True for statuses that block re-proposal (active, executing, pending, ready-for-steward, ready-for-executor, diagnosing)."""
@@ -466,8 +473,8 @@ class Registry:
             conn.execute("BEGIN IMMEDIATE")
 
             # Cross-sweep-date pre-check: any non-terminal record for this issue?
-            # 'cancelled' is a legacy status (not in UoWStatus enum) treated as terminal
-            # so that re-proposal is allowed after a cancellation.
+            # 'cancelled' is a terminal status (UoWStatus.CANCELLED) that allows
+            # re-proposal after a cancellation.
             existing = conn.execute(
                 """
                 SELECT id, status FROM uow_registry
@@ -522,6 +529,24 @@ class Registry:
             # Use source_ref from IssueSnapshot if provided; fall back for backwards compatibility.
             source = source_ref if source_ref else f"github:issue/{issue_number}"
 
+            # Classify posture and route_reason via routing_classifier.
+            # Runs the first-match-wins rules from classifier.yaml against the
+            # prescription metadata available at germination time (type, and any
+            # other fields callers choose to provide in the future).
+            # Falls back to solo/classifier-unavailable if the YAML is absent.
+            try:
+                from orchestration.routing_classifier import classify_posture
+                classifier_result = classify_posture({"type": uow_type})
+                germination_posture = classifier_result.posture
+                germination_route_reason = classifier_result.route_reason
+            except Exception as _classifier_exc:
+                log.warning(
+                    "routing_classifier failed for UoW (issue #%s) — using legacy defaults: %s",
+                    issue_number, _classifier_exc,
+                )
+                germination_posture = "solo"
+                germination_route_reason = _LEGACY_ROUTE_REASON
+
             # Audit entry is written BEFORE the INSERT (Principle 1: audit first).
             # If the INSERT fails, both roll back together.
             self._write_audit(conn, uow_id=uow_id, event="created", to_status="proposed")
@@ -536,7 +561,7 @@ class Registry:
                     status, posture, created_at, updated_at, summary,
                     success_criteria, route_reason, route_evidence, trigger,
                     issue_url, register, uow_mode, source_ref
-                ) VALUES (?, ?, ?, ?, ?, 'proposed', 'solo', ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}', ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}', ?, ?, ?, ?)
                 """,
                 (
                     uow_id,
@@ -544,11 +569,12 @@ class Registry:
                     source,
                     issue_number,
                     sweep_date,
+                    germination_posture,
                     now,
                     now,
                     title,
                     success_criteria,
-                    _LEGACY_ROUTE_REASON,
+                    germination_route_reason,
                     resolved_issue_url,
                     register,
                     register,  # uow_mode mirrors register at germination time

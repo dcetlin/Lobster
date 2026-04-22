@@ -1576,6 +1576,9 @@ EOF
                 }]
             }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
             substep "Registered on-fresh-start SessionStart hook in settings.json"
+            migrated=$((migrated + 1))
+        fi
+    fi
 
     # Migration 37: Create proprioceptive memory directory.
     # Stores concrete semantic mirroring instances (alignment/misalignment moments)

@@ -24,9 +24,21 @@ import json
 import sqlite3
 import subprocess
 import sys
+import textwrap
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import pytest
+
+# Minimal classifier YAML used in tests that need deterministic route_reason output.
+# Contains only a catch-all rule so any metadata produces "classifier-test: catch-all matched".
+_TEST_CLASSIFIER_YAML = textwrap.dedent("""\
+    rules:
+      - name: test-catch-all
+        priority: 0
+        conditions: []
+        posture: solo
+        route_reason_template: "classifier-test: catch-all matched"
+""")
 
 # Path to the registry module under src/orchestration/
 REPO_ROOT = Path(__file__).parent.parent.parent.parent
@@ -95,8 +107,16 @@ class TestSchemaInit:
 # ---------------------------------------------------------------------------
 
 class TestUpsert:
-    def test_insert_new_proposed_record(self, registry, db_path):
+    def test_insert_new_proposed_record(self, registry, db_path, tmp_path, monkeypatch):
         from src.orchestration.registry import UpsertInserted
+        # Point WOS_CLASSIFIER_YAML at a known test fixture so the classifier fires
+        # with deterministic output. This distinguishes correct wiring (catch-all rule
+        # produces "classifier-test: catch-all matched") from silent fallback
+        # ("classifier-unavailable: defaulting to solo").
+        classifier_yaml = tmp_path / "test_classifier.yaml"
+        classifier_yaml.write_text(_TEST_CLASSIFIER_YAML)
+        monkeypatch.setenv("WOS_CLASSIFIER_YAML", str(classifier_yaml))
+
         today = datetime.now(timezone.utc).date().isoformat()
         result = registry.upsert(issue_number=1, title="First issue", sweep_date=today, success_criteria="Test completion.")
         assert isinstance(result, UpsertInserted)
@@ -108,7 +128,12 @@ class TestUpsert:
         assert row["status"] == "proposed"
         assert row["source_issue_number"] == 1
         assert row["posture"] == "solo"
-        assert row["route_reason"] == "phase1-default: no classifier"
+        # The classifier must fire and use the catch-all rule from the test fixture.
+        # "classifier-unavailable: defaulting to solo" would indicate the env var
+        # override did not reach classify_posture — i.e., the classifier is not wired.
+        assert row["route_reason"] == "classifier-test: catch-all matched", (
+            f"Expected classifier to fire with test fixture, got: {row['route_reason']!r}"
+        )
         conn.close()
 
     def test_upsert_stores_success_criteria(self, registry, db_path):
