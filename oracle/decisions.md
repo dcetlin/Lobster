@@ -2025,3 +2025,25 @@ Pattern citations with behavioral effect: learnings.md PR #826 ("external API on
 
 **VERDICT: APPROVED**
 
+---
+
+### [2026-04-22] PR #845 (commit 42587fa9) — fix: wire result_text from write_result handler to maybe_complete_wos_uow
+
+**Vision alignment:** This is a narrowly scoped wiring commit. The prior oracle decision on PR #845 explicitly named this step as deferred: "the close-out feature's full value is deferred to the inbox_server.py wiring." The adversarial prior — this implementation is solving the wrong problem or foreclosing better paths — finds no foothold here. The close-out comment classifier, the comment poster, and the UoW registry transition were already approved. This commit adds the missing arrow between `handle_write_result` (which holds the subagent's text output) and `maybe_complete_wos_uow` (which builds the GitHub comment). Vision.yaml principle-4 ("wire what exists before building more — the missing arrows between existing systems are the velocity multiplier") is the direct positive anchor. The change is inert to non-WOS messages and backward-compatible to the existing close-out protocol.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **`text or None` extraction is correct.** Empty string converts to `None` before forwarding, which is the correct behavior: an empty write_result text should not produce a misleading comment with a blank summary or a spurious `seed` classification.
+- **Parameter forwarding is complete.** The chain `handle_write_result` → `_maybe_complete_wos_uow(result_text=...)` → `maybe_complete_wos_uow(result_text=...)` → `_post_closeout_comment_if_github(result_text=...)` → `classify_uow_output(result_text=...)` passes the parameter at each link with no silent drop. The PR #717 failure mode ("Public method accepts new parameter but does not forward it") does not apply here — each call site is explicit.
+- **Integration test is genuinely end-to-end.** `test_result_text_with_pr_produces_pearl_classification_in_comment` uses a real SQLite-backed Registry, seeds a full UoW lifecycle, and asserts the specific string `"**Output type:** pearl"` in the captured gh comment body. The assertion is specific enough that it would fail before this commit (classification defaulted to `seed`) and pass after. This satisfies the learnings.md bar against "not-legacy-value" assertion softening.
+- **Non-WOS message behavior is unchanged.** The new `result_text` parameter defaults to `None` and the prefix guard in `_maybe_complete_wos_uow` returns immediately for non-WOS task_ids. No existing behavior is affected.
+
+**Patterns introduced:** None new. This commit applies the seam-first pattern already in the codebase — the seam (function signature with `result_text=None`) was the right design at the first commit; this commit completes the wiring through that seam.
+
+**What this forecloses:** Nothing. The wiring is additive and the parameter defaults preserve backward compatibility at every layer.
+
+**Opportunity cost note:** None. This commit closes the explicit gap named by the prior oracle review.
+
+**VERDICT: APPROVED**
+
