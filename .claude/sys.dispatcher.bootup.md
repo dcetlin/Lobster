@@ -745,11 +745,12 @@ from src.orchestration.dispatcher_handlers import route_wos_message, WOS_MESSAGE
    # routing["action"]      == "spawn_subagent"
    # routing["task_id"]     == f"wos-{uow_id}"
    # routing["prompt"]      == full subagent prompt
+   # routing["agent_type"]  == subagent type from UoW register (e.g. "functional-engineer", "lobster-generalist", "lobster-meta")
    # routing["message_type"] == "wos_execute"
 
 3. Task(
        prompt=routing["prompt"],
-       subagent_type="functional-engineer",
+       subagent_type=routing["agent_type"],
        run_in_background=True,
        task_id=routing["task_id"],
    )

@@ -541,6 +541,12 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
         ``prompt`` (str):
             The prompt string to pass to the background subagent Task call.
 
+        ``agent_type`` (str):
+            The subagent_type to pass to the Task tool (e.g. ``"functional-engineer"``,
+            ``"lobster-generalist"``, ``"lobster-meta"``). Taken from ``msg["agent_type"]``
+            if present; defaults to ``"functional-engineer"`` for backward compatibility
+            with messages written before issue #842.
+
         ``message_type`` (str):
             Echo of ``msg["type"]`` — lets callers confirm which branch fired.
 
@@ -585,11 +591,17 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
                 / f"{uow_id}.result.json"
             ),
         )
+        # agent_type identifies which subagent_type to spawn (issue #842).
+        # Executor embeds this in the message based on the UoW register.
+        # Default: functional-engineer for backward compatibility with messages
+        # written before this field was added.
+        agent_type: str = msg.get("agent_type", "functional-engineer")
         prompt = handle_wos_execute(uow_id, instructions, output_ref)
         return {
             "action": "spawn_subagent",
             "task_id": f"wos-{uow_id}",
             "prompt": prompt,
+            "agent_type": agent_type,
             "message_type": msg_type,
         }
 

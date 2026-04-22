@@ -1,17 +1,19 @@
 """
 Tests for WOS executor register-appropriate routing dispatch table.
 
-Updated for issue #664: the production dispatch path for functional-engineer,
-lobster-ops, and general executor types is now _dispatch_via_inbox (event-driven
-MCP inbox pattern) instead of _dispatch_via_claude_p (subprocess).
+Updated for issue #842: each executor_type now maps to a typed inbox dispatcher
+(_dispatch_via_inbox_<agent>) that embeds agent_type in the wos_execute message,
+allowing the Lobster dispatcher to spawn the correct subagent_type.
 
 Coverage:
-- functional-engineer executor_type routes to _dispatch_via_inbox (primary path)
-- lobster-ops executor_type routes to _dispatch_via_inbox (same mechanism)
-- general executor_type routes to _dispatch_via_inbox
+- functional-engineer executor_type routes to _dispatch_via_inbox_functional_engineer
+- lobster-ops executor_type routes to _dispatch_via_inbox_lobster_ops
+- general executor_type routes to _dispatch_via_inbox_general
+- lobster-generalist executor_type routes to _dispatch_via_inbox_lobster_generalist
+- lobster-meta executor_type routes to _dispatch_via_inbox_lobster_meta
 - frontier-writer executor_type routes to _dispatch_via_frontier_writer (not inbox)
 - design-review executor_type routes to _dispatch_via_design_review (not inbox)
-- unknown executor_type falls back to _dispatch_via_inbox (safe default)
+- unknown executor_type falls back to _dispatch_via_inbox_lobster_generalist (safe default)
 - injected dispatcher on Executor.__init__ takes precedence over dispatch table
 - _dispatch_via_claude_p remains available as a named legacy fallback for CI/dev
 - _dispatch_via_frontier_writer preamble differs from _FUNCTIONAL_ENGINEER_PREAMBLE
@@ -34,6 +36,11 @@ from orchestration.executor import (
     ExecutorOutcome,
     _noop_dispatcher,
     _dispatch_via_inbox,
+    _dispatch_via_inbox_functional_engineer,
+    _dispatch_via_inbox_lobster_ops,
+    _dispatch_via_inbox_general,
+    _dispatch_via_inbox_lobster_generalist,
+    _dispatch_via_inbox_lobster_meta,
     _dispatch_via_claude_p,
     _FUNCTIONAL_ENGINEER_PREAMBLE,
     _FRONTIER_WRITER_PREAMBLE,
@@ -118,24 +125,35 @@ def _get_output_ref(db_path: Path, uow_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 class TestResolveDispatcher:
-    """_resolve_dispatcher maps executor_type to the correct dispatcher function.
+    """_resolve_dispatcher maps executor_type to the correct typed inbox dispatcher.
 
-    After issue #664: primary operational types route to _dispatch_via_inbox
-    (event-driven MCP inbox path). _dispatch_via_claude_p is a legacy fallback
-    only — it is not referenced by the dispatch table.
+    After issue #842: each operational type maps to a typed inbox dispatcher
+    (_dispatch_via_inbox_<agent>) that embeds agent_type in the wos_execute
+    message. Unknown types fall back to _dispatch_via_inbox_lobster_generalist.
+    _dispatch_via_claude_p is a legacy fallback only — not referenced by the table.
     """
 
-    def test_functional_engineer_resolves_to_inbox(self) -> None:
+    def test_functional_engineer_resolves_to_typed_inbox(self) -> None:
         dispatcher = _resolve_dispatcher("functional-engineer")
-        assert dispatcher is _dispatch_via_inbox
+        assert dispatcher is _dispatch_via_inbox_functional_engineer
 
-    def test_lobster_ops_resolves_to_inbox(self) -> None:
+    def test_lobster_ops_resolves_to_typed_inbox(self) -> None:
         dispatcher = _resolve_dispatcher("lobster-ops")
-        assert dispatcher is _dispatch_via_inbox
+        assert dispatcher is _dispatch_via_inbox_lobster_ops
 
-    def test_general_resolves_to_inbox(self) -> None:
+    def test_general_resolves_to_typed_inbox(self) -> None:
         dispatcher = _resolve_dispatcher("general")
-        assert dispatcher is _dispatch_via_inbox
+        assert dispatcher is _dispatch_via_inbox_general
+
+    def test_lobster_generalist_resolves_to_typed_inbox(self) -> None:
+        """lobster-generalist (human-judgment register) routes to its typed inbox dispatcher."""
+        dispatcher = _resolve_dispatcher("lobster-generalist")
+        assert dispatcher is _dispatch_via_inbox_lobster_generalist
+
+    def test_lobster_meta_resolves_to_typed_inbox(self) -> None:
+        """lobster-meta (philosophical register) routes to its typed inbox dispatcher."""
+        dispatcher = _resolve_dispatcher("lobster-meta")
+        assert dispatcher is _dispatch_via_inbox_lobster_meta
 
     def test_frontier_writer_resolves_to_frontier_writer_dispatcher(self) -> None:
         dispatcher = _resolve_dispatcher("frontier-writer")
@@ -145,18 +163,22 @@ class TestResolveDispatcher:
         dispatcher = _resolve_dispatcher("design-review")
         assert dispatcher is _dispatch_via_design_review
 
-    def test_unknown_executor_type_falls_back_to_inbox(self) -> None:
-        """Unknown executor_type must fall back to _dispatch_via_inbox (safe default)."""
+    def test_unknown_executor_type_falls_back_to_lobster_generalist_inbox(self) -> None:
+        """Unknown executor_type must fall back to _dispatch_via_inbox_lobster_generalist."""
         dispatcher = _resolve_dispatcher("unknown-type")
-        assert dispatcher is _dispatch_via_inbox
+        assert dispatcher is _dispatch_via_inbox_lobster_generalist
 
-    def test_empty_string_falls_back_to_inbox(self) -> None:
+    def test_empty_string_falls_back_to_lobster_generalist_inbox(self) -> None:
         dispatcher = _resolve_dispatcher("")
-        assert dispatcher is _dispatch_via_inbox
+        assert dispatcher is _dispatch_via_inbox_lobster_generalist
 
     def test_claude_p_remains_importable_as_legacy_fallback(self) -> None:
         """_dispatch_via_claude_p must remain importable for CI/dev use."""
         assert callable(_dispatch_via_claude_p)
+
+    def test_generic_inbox_remains_importable(self) -> None:
+        """_dispatch_via_inbox remains importable for backward compatibility."""
+        assert callable(_dispatch_via_inbox)
 
 
 # ---------------------------------------------------------------------------
@@ -198,34 +220,34 @@ class TestDispatchTableRoutingViaCapturedInstructions:
     whether it was called. After execute_uow returns, assert that the
     correct stub was called and the wrong stubs were not.
 
-    After issue #664: functional-engineer, lobster-ops, and general route to
-    _dispatch_via_inbox. The stub patches _dispatch_via_inbox, not _dispatch_via_claude_p.
+    After issue #842: each executor_type maps to a typed inbox dispatcher.
+    Tests patch the typed dispatcher (e.g. _dispatch_via_inbox_functional_engineer),
+    not the generic _dispatch_via_inbox.
     """
 
-    def test_functional_engineer_routes_to_inbox_dispatcher(
+    def test_functional_engineer_routes_to_typed_inbox_dispatcher(
         self, registry: Registry, db_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """functional-engineer uses the inbox dispatch path (event-driven, no subprocess)."""
+        """functional-engineer routes to _dispatch_via_inbox_functional_engineer."""
         uow_id = "route_fe_001"
         _insert_uow(db_path, uow_id, executor_type="functional-engineer")
 
         called_with: list[tuple[str, str]] = []
 
-        def capture_inbox(instructions: str, uid: str) -> str:
+        def capture(instructions: str, uid: str) -> str:
             called_with.append((instructions, uid))
             return "inbox-msg-id-fe"
 
-        # Patch the module-level function the dispatch table references
         import orchestration.executor as executor_mod
-        monkeypatch.setattr(executor_mod, "_dispatch_via_inbox", capture_inbox)
+        monkeypatch.setattr(executor_mod, "_dispatch_via_inbox_functional_engineer", capture)
 
         executor = Executor(registry)
         executor.execute_uow(uow_id)
 
-        assert len(called_with) == 1, "_dispatch_via_inbox must be called exactly once"
+        assert len(called_with) == 1, "_dispatch_via_inbox_functional_engineer must be called once"
         assert called_with[0][1] == uow_id
 
-    def test_lobster_ops_routes_to_inbox_dispatcher(
+    def test_lobster_ops_routes_to_typed_inbox_dispatcher(
         self, registry: Registry, db_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         uow_id = "route_lops_001"
@@ -233,17 +255,75 @@ class TestDispatchTableRoutingViaCapturedInstructions:
 
         called_with: list[tuple[str, str]] = []
 
-        def capture_inbox(instructions: str, uid: str) -> str:
+        def capture(instructions: str, uid: str) -> str:
             called_with.append((instructions, uid))
             return "inbox-msg-id-lops"
 
         import orchestration.executor as executor_mod
-        monkeypatch.setattr(executor_mod, "_dispatch_via_inbox", capture_inbox)
+        monkeypatch.setattr(executor_mod, "_dispatch_via_inbox_lobster_ops", capture)
 
         executor = Executor(registry)
         executor.execute_uow(uow_id)
 
         assert len(called_with) == 1
+        assert called_with[0][1] == uow_id
+
+    def test_lobster_generalist_routes_to_typed_inbox_dispatcher(
+        self, registry: Registry, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """lobster-generalist (human-judgment register) routes to its typed dispatcher."""
+        uow_id = "route_lg_001"
+        _insert_uow(db_path, uow_id, executor_type="lobster-generalist", register="human-judgment")
+
+        called_with: list[tuple[str, str]] = []
+        other_called: list[str] = []
+
+        def capture(instructions: str, uid: str) -> str:
+            called_with.append((instructions, uid))
+            return "inbox-msg-id-lg"
+
+        def other(instructions: str, uid: str) -> str:
+            other_called.append(uid)
+            return "wrong"
+
+        import orchestration.executor as executor_mod
+        monkeypatch.setattr(executor_mod, "_dispatch_via_inbox_lobster_generalist", capture)
+        monkeypatch.setattr(executor_mod, "_dispatch_via_inbox_functional_engineer", other)
+
+        executor = Executor(registry)
+        executor.execute_uow(uow_id)
+
+        assert len(called_with) == 1, "_dispatch_via_inbox_lobster_generalist must be called"
+        assert len(other_called) == 0, "_dispatch_via_inbox_functional_engineer must NOT be called"
+        assert called_with[0][1] == uow_id
+
+    def test_lobster_meta_routes_to_typed_inbox_dispatcher(
+        self, registry: Registry, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """lobster-meta (philosophical register) routes to its typed dispatcher."""
+        uow_id = "route_lm_001"
+        _insert_uow(db_path, uow_id, executor_type="lobster-meta", register="philosophical")
+
+        called_with: list[tuple[str, str]] = []
+        other_called: list[str] = []
+
+        def capture(instructions: str, uid: str) -> str:
+            called_with.append((instructions, uid))
+            return "inbox-msg-id-lm"
+
+        def other(instructions: str, uid: str) -> str:
+            other_called.append(uid)
+            return "wrong"
+
+        import orchestration.executor as executor_mod
+        monkeypatch.setattr(executor_mod, "_dispatch_via_inbox_lobster_meta", capture)
+        monkeypatch.setattr(executor_mod, "_dispatch_via_inbox_functional_engineer", other)
+
+        executor = Executor(registry)
+        executor.execute_uow(uow_id)
+
+        assert len(called_with) == 1, "_dispatch_via_inbox_lobster_meta must be called"
+        assert len(other_called) == 0, "_dispatch_via_inbox_functional_engineer must NOT be called"
         assert called_with[0][1] == uow_id
 
     def test_frontier_writer_routes_to_frontier_writer_dispatcher(
@@ -266,13 +346,13 @@ class TestDispatchTableRoutingViaCapturedInstructions:
 
         import orchestration.executor as executor_mod
         monkeypatch.setattr(executor_mod, "_dispatch_via_frontier_writer", capture_frontier_writer)
-        monkeypatch.setattr(executor_mod, "_dispatch_via_inbox", capture_inbox)
+        monkeypatch.setattr(executor_mod, "_dispatch_via_inbox_functional_engineer", capture_inbox)
 
         executor = Executor(registry)
         executor.execute_uow(uow_id)
 
         assert len(fw_called) == 1, "_dispatch_via_frontier_writer must be called for frontier-writer"
-        assert len(inbox_called) == 0, "_dispatch_via_inbox must NOT be called for frontier-writer"
+        assert len(inbox_called) == 0, "_dispatch_via_inbox_functional_engineer must NOT be called"
         assert fw_called[0][1] == uow_id
 
     def test_design_review_routes_to_design_review_dispatcher(
@@ -295,16 +375,16 @@ class TestDispatchTableRoutingViaCapturedInstructions:
 
         import orchestration.executor as executor_mod
         monkeypatch.setattr(executor_mod, "_dispatch_via_design_review", capture_design_review)
-        monkeypatch.setattr(executor_mod, "_dispatch_via_inbox", capture_inbox)
+        monkeypatch.setattr(executor_mod, "_dispatch_via_inbox_functional_engineer", capture_inbox)
 
         executor = Executor(registry)
         executor.execute_uow(uow_id)
 
         assert len(dr_called) == 1, "_dispatch_via_design_review must be called for design-review"
-        assert len(inbox_called) == 0, "_dispatch_via_inbox must NOT be called for design-review"
+        assert len(inbox_called) == 0, "_dispatch_via_inbox_functional_engineer must NOT be called"
         assert dr_called[0][1] == uow_id
 
-    def test_general_routes_to_inbox_dispatcher(
+    def test_general_routes_to_typed_inbox_dispatcher(
         self, registry: Registry, db_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         uow_id = "route_gen_001"
@@ -312,12 +392,12 @@ class TestDispatchTableRoutingViaCapturedInstructions:
 
         called_with: list[str] = []
 
-        def capture_inbox(instructions: str, uid: str) -> str:
+        def capture(instructions: str, uid: str) -> str:
             called_with.append(uid)
             return "inbox-msg-id-gen"
 
         import orchestration.executor as executor_mod
-        monkeypatch.setattr(executor_mod, "_dispatch_via_inbox", capture_inbox)
+        monkeypatch.setattr(executor_mod, "_dispatch_via_inbox_general", capture)
 
         executor = Executor(registry)
         executor.execute_uow(uow_id)
@@ -399,7 +479,7 @@ class TestInjectedDispatcherPrecedence:
 class TestOperationalUoWInboxDispatch:
     """
     For operational UoWs with functional-engineer executor_type, the dispatch
-    path is now _dispatch_via_inbox. Outcome and result.json format are unchanged.
+    path is _dispatch_via_inbox_functional_engineer. Outcome and result.json format are unchanged.
     """
 
     def test_operational_uow_complete_outcome(
@@ -409,7 +489,7 @@ class TestOperationalUoWInboxDispatch:
         _insert_uow(db_path, uow_id, executor_type="functional-engineer", register="operational")
 
         import orchestration.executor as executor_mod
-        monkeypatch.setattr(executor_mod, "_dispatch_via_inbox", lambda i, u: "inbox-msg-id")
+        monkeypatch.setattr(executor_mod, "_dispatch_via_inbox_functional_engineer", lambda i, u: "inbox-msg-id")
 
         executor = Executor(registry)
         result = executor.execute_uow(uow_id)
@@ -426,7 +506,7 @@ class TestOperationalUoWInboxDispatch:
         _insert_uow(db_path, uow_id, executor_type="functional-engineer", register="operational")
 
         import orchestration.executor as executor_mod
-        monkeypatch.setattr(executor_mod, "_dispatch_via_inbox", lambda i, u: "inbox-msg-id")
+        monkeypatch.setattr(executor_mod, "_dispatch_via_inbox_functional_engineer", lambda i, u: "inbox-msg-id")
 
         executor = Executor(registry)
         executor.execute_uow(uow_id)
