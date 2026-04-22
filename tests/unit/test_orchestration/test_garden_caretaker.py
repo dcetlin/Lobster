@@ -639,11 +639,17 @@ class TestRequalifyProposed:
         assert len(ready) == 1
         assert ready[0].id == upsert_result.id
 
-    def test_proposed_uow_that_aged_past_threshold_is_auto_advanced(
+    def test_proposed_uow_aged_without_label_is_not_auto_advanced(
         self, registry: Registry
     ) -> None:
-        """A proposed UoW whose issue is now old enough (≥3 days) advances without a qualifying label."""
-        upsert_result = registry.upsert(
+        """Age-only qualification is blocked by require_label=True in requalify_proposed().
+
+        A proposed UoW that is old enough (≥3 days) but carries no qualifying label
+        must NOT be auto-advanced. The od-3 constraint in vision.yaml requires explicit
+        label signal — age alone is not sufficient for requalify_proposed().
+        This is a regression guard: if require_label is accidentally removed, this test fails.
+        """
+        registry.upsert(
             issue_number=301, title="Old issue", success_criteria="Do something."
         )
         snap = _snapshot(
@@ -651,15 +657,17 @@ class TestRequalifyProposed:
             labels=(),
             body="Some body text",
             state="open",
-            created_at=_iso(5),  # 5 days old — past the 3-day threshold
+            created_at=_iso(5),  # 5 days old — past the 3-day threshold, but no qualifying label
         )
         source = _make_source(issue_map={"github:issue/301": snap})
         caretaker = GardenCaretaker(source=source, registry=registry)
 
         result = caretaker.requalify_proposed()
 
-        assert result["requalified"] == 1
-        assert len(registry.query(status="ready-for-steward")) == 1
+        # Age-only UoWs must stay in proposed — label signal is required
+        assert result["requalified"] == 0
+        assert len(registry.query(status="proposed")) == 1
+        assert registry.query(status="ready-for-steward") == []
 
     def test_proposed_uow_with_blocking_label_is_not_advanced(
         self, registry: Registry
