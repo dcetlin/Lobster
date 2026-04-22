@@ -35,14 +35,7 @@ if TYPE_CHECKING:
     from .registry import Registry
 
 from .registry import ApproveConfirmed, ApproveExpired, ApproveNotFound, ApproveSkipped
-from .paths import LOBSTER_WORKSPACE as _LOBSTER_WORKSPACE, WOS_CONFIG as _WOS_CONFIG_PATH_FROM_PATHS
-
-
-# ---------------------------------------------------------------------------
-# Gate-cleared flag path — mirrors _GATE_CLEARED_FLAG in steward.py
-# ---------------------------------------------------------------------------
-
-_GATE_CLEARED_FLAG: Path = _LOBSTER_WORKSPACE / "data" / "wos-gate-cleared"
+from .paths import LOBSTER_WORKSPACE as _LOBSTER_WORKSPACE, WOS_CONFIG as _WOS_CONFIG_PATH_FROM_PATHS, WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG
 
 
 # ---------------------------------------------------------------------------

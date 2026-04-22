@@ -36,6 +36,7 @@ LOBSTER_REPO = Path(
 
 REGISTRY_DB = Path(os.environ["REGISTRY_DB_PATH"]) if os.environ.get("REGISTRY_DB_PATH") else LOBSTER_WORKSPACE / "orchestration" / "registry.db"
 WOS_CONFIG = LOBSTER_WORKSPACE / "data" / "wos-config.json"
+WOS_GATE_CLEARED_FLAG = LOBSTER_WORKSPACE / "data" / "wos-gate-cleared"
 
 # ---------------------------------------------------------------------------
 # Meta / reflective surface queue

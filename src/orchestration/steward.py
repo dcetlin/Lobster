@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from src.orchestration.registry import UoW
+from src.orchestration.paths import WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG
 from src.orchestration.error_capture import (
     run_subprocess_with_error_capture,
     log_subprocess_error,
@@ -45,6 +46,7 @@ from src.orchestration.error_capture import (
 )
 from src.orchestration.config import TimeoutConfig
 from src.orchestration.vision_routing import resolve_vision_route
+from src.ooda.fast_thorough_selector import select_path as _ooda_select_path, cite_basis as _ooda_cite_basis
 
 log = logging.getLogger("steward")
 
@@ -608,12 +610,8 @@ class CycleResult:
 # Module-level constants
 # ---------------------------------------------------------------------------
 
-# Path to the file-flag that clears BOOTUP_CANDIDATE_GATE.
-# When this file exists, the gate is cleared and bootup-candidate UoWs are
-# processed normally. Create via `/wos unblock` dispatcher command.
-_GATE_CLEARED_FLAG: Path = Path(
-    os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
-) / "data" / "wos-gate-cleared"
+# _GATE_CLEARED_FLAG is imported from src.orchestration.paths (WOS_GATE_CLEARED_FLAG).
+# See paths.py for the single canonical definition.
 
 
 def is_bootup_candidate_gate_active() -> bool:
@@ -1449,6 +1447,13 @@ def _build_prescription_route_reason(
 
     When vision_ref is absent, falls back to the steward heuristic string.
 
+    Fast/Thorough Path gate (OODA Decide layer):
+    Before building the route_reason, the meta-selector from
+    src/ooda/fast_thorough_selector.py is consulted. If "fast" is selected,
+    routing proceeds immediately (Decide is logged but non-blocking). If
+    "thorough" is selected, the route_reason is annotated to signal that
+    explicit Decide traceability is required before Action.
+
     Pure function: produces no side effects, safe to call from tests.
     """
     if executor_outcome == "partial" and partial_steps_context:
@@ -1459,13 +1464,42 @@ def _build_prescription_route_reason(
     else:
         heuristic_reason = f"steward: {reentry_posture} — {completion_rationale[:120]}"
 
+    # Fast/Thorough Path gate: consult meta-selector before routing.
+    # Derives vision_anchor and prior_decisions from UoW fields.
+    vision_anchor = None
+    if uow.vision_ref and isinstance(uow.vision_ref, dict):
+        field = uow.vision_ref.get("field")
+        layer = uow.vision_ref.get("layer")
+        if field and layer:
+            vision_anchor = f"vision.{layer}.{field}"
+
+    # Derive stakes from the UoW register: high-stakes registers require Thorough Path
+    _HIGH_STAKES_REGISTERS = frozenset({"philosophical_register", "human-judgment"})
+    stakes = "high" if uow.register in _HIGH_STAKES_REGISTERS else "low"
+
+    selector_context = {
+        "situation_class": reentry_posture,
+        "stakes": stakes,
+        "prior_decisions": [],  # future: populate from steward_log audit entries
+        "vision_anchor": vision_anchor,
+    }
+    ooda_path = _ooda_select_path(selector_context)
+    ooda_basis = _ooda_cite_basis(selector_context)
+
+    if ooda_path == "thorough":
+        # Thorough Path: annotate route_reason to require explicit Decide traceability.
+        heuristic_reason = f"[thorough-path-required] {heuristic_reason}"
+
     # Vision-anchored path: when vision_ref is present, prepend vision routing result.
     # This changes the route_reason from a pure heuristic string to one that references
     # the vision anchor — a real pipeline decision, not just metadata.
     if uow.vision_ref is not None:
         vision_result = resolve_vision_route(uow, log_fallback=False)
         if vision_result.anchored:
-            return f"{vision_result.route_reason} | {heuristic_reason}"
+            route_reason = f"{vision_result.route_reason} | {heuristic_reason}"
+            if ooda_path == "fast" and ooda_basis:
+                route_reason += f" | ooda:fast-path basis={ooda_basis}"
+            return route_reason
 
     return heuristic_reason
 
