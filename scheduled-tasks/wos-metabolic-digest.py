@@ -14,7 +14,8 @@ Classification heuristics (from the audit doc and WOS architecture):
            close_reason mentions 'pr' or 'implementation')
   heat  — UoW produced a review or analysis (output_ref has content, outcome 'complete',
            close_reason mentions 'review' or 'analysis' or 'design')
-  seed  — UoW created a new issue or follow-up (close_reason mentions 'issue' or 'seeded')
+  seed  — UoW created a new issue or follow-up (close_reason matches phrase-level patterns
+           like 'opened issue #N', 'spawned issue', 'created uow', 'seeded', 'follow-up')
   shit  — UoW failed, expired, hit TTL, or produced no verifiable output
 
 Cron schedule (daily at 09:00 UTC):
@@ -34,6 +35,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import uuid
@@ -161,9 +163,26 @@ def classify_uow(uow: dict) -> str:
     if status != "done":
         return OUTCOME_SHIT  # any non-terminal status that reached here is unexpected
 
-    # seed: spawned a new issue or seeded future work
-    seed_keywords = {"issue", "seed", "seeded", "spawn", "follow-up", "follow_up"}
-    if any(kw in close_reason for kw in seed_keywords):
+    # seed: spawned a new issue or seeded future work.
+    # Use phrase-level patterns to avoid false positives from close_reason values
+    # that merely reference a source issue without creating a new one.
+    # "issue" as a bare substring is too broad — "issue #456 was referenced in this
+    # pr" or "issue analysis complete" would incorrectly classify as seed.
+    _SEED_ISSUE_PATTERN = re.compile(
+        r"(opened|created|filed|new|spawned)\s+issue\s*#?\d*",
+        re.IGNORECASE,
+    )
+    _SEED_UOW_PATTERN = re.compile(
+        r"(spawned|created|spawn)\s+(uow|new\s+uow)",
+        re.IGNORECASE,
+    )
+    if (
+        _SEED_ISSUE_PATTERN.search(close_reason)
+        or _SEED_UOW_PATTERN.search(close_reason)
+        or "seeded" in close_reason
+        or "follow-up" in close_reason
+        or "follow_up" in close_reason
+    ):
         return OUTCOME_SEED
 
     # pearl: produced a PR, implementation, or code change
