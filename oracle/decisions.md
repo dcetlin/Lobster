@@ -1846,3 +1846,30 @@ The "path fix completeness" learning from PR #796 oracle entry (2026-04-20, lear
 **What this forecloses:** Nothing structural. The section is additive specification with no code surface. The enforcement mechanism (how agents verify the criterion at runtime) remains unbuilt; this document does not foreclose any implementation path for enforcement.
 
 **VERDICT: APPROVED**
+
+---
+
+### [2026-04-22] PR #800 re-review — fix: implement OAuth token refresh in _build_claude_env
+
+**Prior gap tracking:** The 2026-04-20 oracle entry named two quality gaps that were accepted as non-blocking before merge. Status at re-review:
+
+- **Gap 1: Locally-declared mirror of production constant (`_MILLIS_THRESHOLD = 1e11` in test file).** Status: **open.** The diff still contains `_MILLIS_THRESHOLD = 1e11` at line 296 of `test_token_refresh.py` rather than importing `steward._MILLISECOND_TIMESTAMP_THRESHOLD`. The learning is in learnings.md (PR #800, 2026-04-20). The test does not fail, but the divergence risk is live. No resolution attempted; the gap was accepted before merge and carries forward.
+- **Gap 2: `expires_in: 0` default creates a refresh loop.** Status: **open.** `data.get("expires_in", 0)` remains at the `new_expiry_ts` computation in `_refresh_oauth_token`. The learning is in learnings.md (PR #800, 2026-04-20). No fix or guard added. The gap was accepted before merge and carries forward as a known follow-on item.
+
+**Vision alignment:** PR #800 is the completion of the token refresh arc begun in PR #798. The adversarial prior — whether refresh is a symptom-fix while the real cause is WOS runs exceeding token lifetime — was addressed in the 2026-04-20 entry and does not strengthen at re-review. The vision.yaml current_focus (WOS execution health as primary) and the graceful-degradation design (on failure, continue with old token, no worse than baseline) both sustain the alignment verdict. The two known open gaps do not alter alignment: they are quality concerns in the refresh loop path, not in the primary authentication path. The seam-first abstraction golden pattern (golden-patterns.md, 2026-03-30) is correctly applied here — `_normalise_timestamp` is placed exactly at the boundary between the external credential store (milliseconds) and the Python datetime subsystem (seconds). The epoch-scale normalisation pattern from golden-patterns.md (2026-04-20 — itself derived from this PR's prior oracle review) is the canonical reference.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **Both prior gaps remain open and unaddressed in the merged code.** Gap 1 (local mirror constant) and Gap 2 (`expires_in: 0` default) were accepted as non-blocking before merge. They are now established follow-on items, not regression targets. The oracle vocabulary from learnings.md was operative before the diff was read — the locally-mirrored constant pattern caused me to search specifically for locally-declared constants in the test file before scanning for other issues, which is the behavioral change the pattern citation requires. Without that prior, the `_MILLIS_THRESHOLD = 1e11` declaration at line 296 would likely have been read as a convenience constant rather than a mirroring defect.
+- **`_TokenStatus` is a namespace class, not an Enum. The PR description calls it an "enum."** The class provides string constants via class attributes with no exhaustiveness enforcement. The return type annotation is `str`, not `_TokenStatus`. Callers cannot use `isinstance` or `match` with exhaustiveness checking. The description is inaccurate: this is a string-namespace pattern, not an enum. The behavioral consequence is low (string comparison works correctly), but future callers who expect enum behavior will be surprised.
+- **The refresh loop path is tested for network failure but not for `expires_in: 0` endpoint response.** The test suite covers `URLError`, `HTTPError`, malformed JSON, and missing `access_token`. No test exercises the case where the endpoint returns `expires_in: 0` or omits `expires_in`. The test helper `_make_token_refresh_response` hardcodes `expires_in_seconds=28800` — a non-zero default that does not expose Gap 2 in any test. The loop is exercisable in production but has no test coverage.
+- **The `_normalise_timestamp` function and its module-level threshold constant are correctly implemented and reusable.** The function is the canonical seam for epoch-scale normalisation in this codebase (documented in golden-patterns.md, 2026-04-20). The constant is documented with its rationale. This is the highest-quality addition in the PR and the one with the broadest reuse surface.
+
+**Patterns introduced:** The `_normalise_timestamp` seam pattern is already in golden-patterns.md. No new patterns warrant golden-pattern status at re-review. The `_TokenStatus` namespace class is functional but inferior to `enum.Enum` for this use case; it does not merit propagation.
+
+**What this forecloses:** The undocumented Anthropic OAuth endpoint is now load-bearing in the production path. If Anthropic changes this endpoint, the system degrades silently to the pre-refresh baseline. This was noted in the prior entry and carries forward unchanged.
+
+**Opportunity cost note:** On-path for current_focus.this_week.primary. The two open gaps are low-cost follow-on fixes addressable in a targeted patch PR without blocking current WOS execution health work.
+
+**VERDICT: APPROVED**
