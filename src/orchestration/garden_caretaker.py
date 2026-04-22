@@ -171,11 +171,79 @@ class GardenCaretaker:
     # -----------------------------------------------------------------------
 
     def run(self) -> dict[str, Any]:
-        """Main entry point. Returns merged summary of scan, tend, and trigger-check actions."""
+        """Main entry point. Returns merged summary of scan, tend, trigger-check, and requalify actions."""
         seed_results = self.scan()
+        requalify_results = self.requalify_proposed()
         tend_results = self.tend()
         trigger_results = self._check_pending_triggers()
-        return {**seed_results, **tend_results, **trigger_results}
+        return {**seed_results, **requalify_results, **tend_results, **trigger_results}
+
+    def requalify_proposed(self) -> dict[str, int]:
+        """Re-evaluate all proposed UoWs and auto-advance those that now pass qualification criteria.
+
+        This closes the gap where UoWs that were reset to 'proposed' (e.g. by tend() reactivation
+        after source reopens) would stay stuck there indefinitely unless manually approved.
+
+        For each UoW in 'proposed' state with a source_ref:
+          - Fetch the current IssueSnapshot from source
+          - If the snapshot passes _qualifies() → transition to 'ready-for-steward'
+          - If source returns None (deleted/not found) → skip (tend() handles cleanup)
+          - If source fetch errors → skip with a warning (don't block the cycle)
+
+        UoWs without a source_ref are skipped — they have no snapshot to evaluate against.
+        The blocking_labels check inside _qualifies() ensures that explicitly-blocked UoWs
+        (wip, blocked, needs-design, etc.) are never auto-advanced.
+
+        Returns:
+            {"requalified": int}
+        """
+        requalified = 0
+        proposed_uows = self.registry.query(str(UoWStatus.PROPOSED))
+
+        for uow in proposed_uows:
+            if not uow.source:
+                logger.debug("requalify_proposed: skipping UoW %s — no source_ref", uow.id)
+                continue
+
+            try:
+                snapshot = self.source.get_issue(uow.source)
+            except Exception as exc:
+                logger.warning(
+                    "requalify_proposed: error fetching source for UoW %s: %s — skipping",
+                    uow.id, exc,
+                )
+                continue
+
+            if snapshot is None:
+                # Source deleted — tend() will archive this on its next pass
+                logger.debug("requalify_proposed: UoW %s source not found — skipping (tend will archive)", uow.id)
+                continue
+
+            if not _qualifies(snapshot, self.config):
+                logger.debug("requalify_proposed: UoW %s does not qualify yet — skipping", uow.id)
+                continue
+
+            rows = self.registry.transition(
+                uow_id=uow.id,
+                to_status=UoWStatus.READY_FOR_STEWARD,
+                where_status=UoWStatus.PROPOSED,
+            )
+            if rows == 1:
+                self.registry.append_audit_log(uow.id, {
+                    "event": "auto_qualified",
+                    "actor": "garden_caretaker",
+                    "from_status": "proposed",
+                    "to_status": "ready-for-steward",
+                    "source_ref": uow.source,
+                    "timestamp": _now_iso(),
+                })
+                requalified += 1
+                logger.info(
+                    "requalify_proposed: auto-qualified UoW %s → ready-for-steward (source_ref=%s)",
+                    uow.id, uow.source,
+                )
+
+        return {"requalified": requalified}
 
     def scan(self) -> dict[str, int]:
         """Discover new issues from source and seed UoWs.

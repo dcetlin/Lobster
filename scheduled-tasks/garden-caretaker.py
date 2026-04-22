@@ -148,9 +148,10 @@ def main() -> int:
         result = caretaker.run()
         log.info(
             "GardenCaretaker cycle complete: "
-            "seeded=%d qualified=%d archived=%d surfaced_to_steward=%d reactivated=%d no_change=%d",
+            "seeded=%d qualified=%d requalified=%d archived=%d surfaced_to_steward=%d reactivated=%d no_change=%d",
             result.get("seeded", 0),
             result.get("qualified", 0),
+            result.get("requalified", 0),
             result.get("archived", 0),
             result.get("surfaced_to_steward", 0),
             result.get("reactivated", 0),
