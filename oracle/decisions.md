@@ -2,6 +2,38 @@
 
 ---
 
+### [2026-04-22] Post-merge re-oracle PR #804 — enhancement: negentropic sweep process improvements (artifact types, vision drift, stall signal, resolution rate)
+
+**Note:** PR #804 was previously reviewed in three rounds (2026-04-20 original, 2026-04-21 v2, 2026-04-21 v3) and received a final APPROVED verdict at v3. This re-oracle was requested with the observation that "the live copy at ~/lobster-workspace/hygiene/sweep-context.md will remain authoritative until manually updated" — pointing at a live deployment state concern, not a code quality concern.
+
+**Prior gap tracking (all previously closed):**
+- **Gap 1 (AND-vs-OR label semantics):** Closed at v2 — OR semantics implemented via two separate queries in the diff.
+- **Gap 2 (wrong oracle learnings path):** Closed at v2 — canonical paths confirmed in `memory/canonical-templates/sweep-context.md`.
+- **Gap 3 (no migration for cycle_start_timestamp):** Closed at v3 — Migration 78 targets `hygiene/rotation-state.json` with the correct path. Code is correct.
+- **Gap 4 (no migration for sweep-context.md path change):** Closed at v2 — Migration 79 archives old runtime copy.
+
+**Stage 1 — Vision alignment:** The adversarial prior — this implementation is solving the wrong problem, or solving the right problem in a direction that forecloses better paths — does not find purchase on the PR direction. This is explicitly current_focus.secondary per vision.yaml ("Negentropic sweep results available for review"). All five improvements serve the system's negentropic practice: three add detection capability (artifact-type sub-classification, vision drift check, learnings stall signal), one adds self-monitoring (resolution rate metric), and one adds structural integrity (versioned canonical for sweep-context.md). The work is additive, non-blocking, and correctly scoped. The re-review was triggered by the live deployment state observation, not by new implementation concerns. Stage 1 question: is the deployment gap a code problem or an operational problem? The code is correct and was approved through three oracle rounds. The gap is operational: upgrade.sh was not run on the live instance after the PR merged.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **The PR code is correct and unchanged from the v3 approved state.** All four prior gaps are resolved in the diff: OR-semantics queries, canonical oracle paths, Migration 78 targeting `hygiene/rotation-state.json`, Migration 79 archiving the old runtime copy. No regressions from the prior approval.
+- **The live instance has not had upgrade.sh run after this PR merged.** Confirmed by live state inspection: `~/lobster-workspace/hygiene/sweep-context.md` exists (17355 bytes, dated 2026-04-22 11:57) without an `.archived-*` counterpart — Migration 79 did not execute. `rotation-state.json` contains `{"current_night": 2, "last_run": "2026-04-22T02:00:00Z"}` with no `cycle_start_timestamp` field — Migration 78 did not execute. The old runtime `sweep-context.md` is the pre-PR-#804 version: it references `~/lobster-workspace/oracle/learnings.md` (the wrong path that was Gap 2) and has no artifact-type sub-classification, no vision drift check, no stall signal, and no resolution rate metric.
+- **The live instance deployment gap has two concrete consequences.** First: if any sweep run were to read from the old `hygiene/sweep-context.md` path (e.g., a task file that was not updated, or a cached task invocation), it would operate on the stale pre-PR instructions without error or warning. The updated `negentropic-sweep.md` now points to the canonical path, so new scheduled runs should use the correct file — but the old path being live creates ambiguity. Second: the next Night 7 sweep will fire a false vision drift warning because `cycle_start_timestamp` is absent from `rotation-state.json` (the `CYCLE_START=0` branch triggers the mtime comparison as if cycle started at epoch 0). The false warning was the exact failure mode Migration 78 was written to prevent.
+- **The task prompt's "flagged gap" framing describes the current live state, not the PR code.** The PR includes the correct migrations. The gap is that they have not been executed. Running `~/lobster/scripts/upgrade.sh` on the live instance would close both deployment gaps. This is an operational action, not a code change.
+
+**Patterns introduced:** No new patterns beyond those named in the three prior review entries. The deployment-gap-after-APPROVED-PR is an operational observation, not a new structural pattern for this codebase.
+
+**What this forecloses:** Nothing. The PR code is correct. The deployment gap is operational and fully reversible by running upgrade.sh.
+
+**Opportunity cost note:** The re-oracle review itself is the only cost here. The PR is already merged and approved. The actionable output is operational: run upgrade.sh on the live instance.
+
+**VERDICT: APPROVED**
+
+*(Post-merge record. The code is correct and unchanged. The deployment gap — upgrade.sh not run post-merge — is an operational action item, not a code defect. Running `~/lobster/scripts/upgrade.sh` will execute Migrations 78 and 79 and close the live state gap.)*
+
+---
+
 ### [2026-04-22] PR #830 re-oracle — feat(orient): proprioceptive gate-miss logging and nightly consolidation summary
 
 **Prior NEEDS_CHANGES verdict:** [2026-04-22] PR #830. One gap named.
