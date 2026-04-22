@@ -636,3 +636,52 @@ class TestCloseoutProtocolIntegration:
             maybe_complete_wos_uow(task_id, WRITE_RESULT_SUCCESS_STATUS, result_text="Done.")
 
         mock_run.assert_not_called()
+
+    def test_result_text_with_pr_produces_pearl_classification_in_comment(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        result_text containing a PR reference must flow through to the gh comment
+        body with output_type 'pearl'.
+
+        This verifies the end-to-end wiring: write_result text → maybe_complete_wos_uow
+        result_text → classify_uow_output → comment body. Before this fix, inbox_server.py
+        called maybe_complete_wos_uow without result_text, so classification always
+        defaulted to 'seed' regardless of the actual subagent output.
+        """
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = self._seed_uow_with_source(
+            registry, output_dir, source="github:issue/55", issue_number=55
+        )
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        captured_comment_body: list[str] = []
+
+        def _capture_run(cmd, **kwargs):
+            # Capture the --body argument passed to gh issue comment
+            body_idx = cmd.index("--body") + 1 if "--body" in cmd else None
+            if body_idx is not None:
+                captured_comment_body.append(cmd[body_idx])
+            return MagicMock(returncode=0)
+
+        with patch("orchestration.wos_completion.subprocess.run", side_effect=_capture_run), \
+             patch.dict(os.environ, {
+                 "REGISTRY_DB_PATH": str(db_path),
+                 "LOBSTER_WOS_REPO": "dcetlin/Lobster",
+             }):
+            maybe_complete_wos_uow(
+                task_id,
+                WRITE_RESULT_SUCCESS_STATUS,
+                result_text="PR #123 opened on dcetlin/Lobster.",
+            )
+
+        assert len(captured_comment_body) == 1, "Expected exactly one gh comment call"
+        body = captured_comment_body[0]
+        assert "**Output type:** pearl" in body, (
+            f"result_text mentioning a PR must produce 'pearl' classification in the "
+            f"close-out comment. Got comment body:\n{body}"
+        )
