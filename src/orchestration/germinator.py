@@ -145,7 +145,11 @@ _PHILOSOPHICAL_TERMS = frozenset({
     "pearl",
     "aletheia",
     "thrownness",
-    "clearing",
+    # "clearing" was removed — causes false positives on engineering issues mentioning
+    # flag-clearing, state-clearing, cache-clearing, etc. Replaced with Heidegger-specific
+    # compound and German term that only appear in phenomenological context.
+    "lichtung",            # Heidegger's German term for the clearing-of-being
+    "ontological clearing", # compound only used in phenomenological discourse
     "givenness",
     "dwelling",
     "presencing",
@@ -176,9 +180,18 @@ _PHILOSOPHICAL_ORIGIN_RE = re.compile(
 def _is_philosophical(title: str, body: str) -> bool:
     """Return True if the UoW originates from philosophical/phenomenological register."""
     combined = (title + " " + body).lower()
-    # Check for phenomenological vocabulary (at least one strong term)
+    # Check for phenomenological vocabulary (at least one strong term).
+    # Single-word terms are matched via word-token intersection; multi-word phrases
+    # (e.g. "ontological clearing") are matched via substring search against the
+    # lowercased combined text to preserve their identity as compounds.
+    single_word_terms = frozenset(t for t in _PHILOSOPHICAL_TERMS if " " not in t)
+    multi_word_terms  = frozenset(t for t in _PHILOSOPHICAL_TERMS if " " in t)
+
     word_tokens = set(re.findall(r"\b\w+\b", combined))
-    vocab_hit = bool(word_tokens & _PHILOSOPHICAL_TERMS)
+    single_word_hit = bool(word_tokens & single_word_terms)
+    multi_word_hit  = any(phrase in combined for phrase in multi_word_terms)
+    vocab_hit = single_word_hit or multi_word_hit
+
     # Check for structural origin signals
     origin_hit = bool(_PHILOSOPHICAL_ORIGIN_RE.search(title + " " + body))
     return vocab_hit or origin_hit
