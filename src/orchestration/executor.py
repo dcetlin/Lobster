@@ -83,7 +83,13 @@ _OUTPUT_DIR_TEMPLATE: str = os.environ.get(
 
 # UoWs stuck in 'active' state longer than this are considered TTL-exceeded
 # and marked 'failed' by recover_ttl_exceeded_uows() at heartbeat startup.
-TTL_EXCEEDED_HOURS: int = 4
+#
+# This is the orphan safety net — the hard ceiling for UoWs that somehow
+# evaded heartbeat-based recovery. Increased from 4h to 24h because
+# heartbeat locking (migration 0009) now detects stalls within heartbeat_ttl
+# + 3min poll (~8min), making the old 4h window redundant and overly aggressive.
+# The 24h threshold catches definitively orphaned UoWs only.
+TTL_EXCEEDED_HOURS: int = 24
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +489,24 @@ class Executor:
                 (timeout_at, uow_id),
             )
 
+            # Step 5b: Initialize heartbeat_at and heartbeat_ttl at claim time.
+            # heartbeat_ttl is derived from estimated_runtime with a minimum of 300s.
+            # Capped at 1/4 of the total timeout so the observation loop catches
+            # stalls well before the task deadline.
+            # heartbeat_at is pre-populated with now() so that the first observation
+            # loop pass has a non-NULL baseline to measure silence from. Without this,
+            # the UoW would appear to have "never sent a heartbeat" until the agent
+            # writes its first one (~60s after claim).
+            heartbeat_ttl = max(300, min(timeout_seconds // 4, 300))
+            # For short tasks (timeout <= 1200s), prefer 300s.
+            # For longer tasks, allow up to 300s (current design uses fixed 300s default;
+            # this can be tuned per-UoW in a future iteration).
+            heartbeat_ttl = 300  # Fixed default for now; per-UoW tuning deferred.
+            conn.execute(
+                "UPDATE uow_registry SET heartbeat_at = ?, heartbeat_ttl = ? WHERE id = ?",
+                (now, heartbeat_ttl, uow_id),
+            )
+
             # Step 6: INSERT audit_log (must be in same transaction, before COMMIT)
             conn.execute(
                 """
@@ -497,6 +521,7 @@ class Executor:
                         "started_at": now,
                         "output_ref": output_ref,
                         "timeout_at": timeout_at,
+                        "heartbeat_ttl": heartbeat_ttl,
                     }),
                 ),
             )

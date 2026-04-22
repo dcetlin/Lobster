@@ -184,6 +184,16 @@ class _StallReason(StrEnum):
 
 
 # ---------------------------------------------------------------------------
+# Named constants — heartbeat staleness detection
+# ---------------------------------------------------------------------------
+
+# Grace period added to heartbeat_ttl before declaring a stall.
+# Absorbs minor scheduling jitter between the agent's heartbeat write and
+# the observation loop's check interval. Must be < steward heartbeat period (3 min).
+HEARTBEAT_STALL_BUFFER_SECONDS: int = 30
+
+
+# ---------------------------------------------------------------------------
 # Named result type for the observation loop
 # ---------------------------------------------------------------------------
 
@@ -192,6 +202,14 @@ class ObservationResult:
     """Pure result value returned by run_observation_loop."""
     checked: int
     stalled: int
+    skipped_dry_run: int
+
+
+@dataclass(frozen=True, slots=True)
+class HeartbeatStallResult:
+    """Pure result value returned by recover_stale_heartbeat_uows."""
+    checked: int
+    recovered: int
     skipped_dry_run: int
 
 
@@ -494,6 +512,104 @@ def run_observation_loop(
 
 
 # ---------------------------------------------------------------------------
+# Heartbeat stall recovery (migration 0009) — separate from timeout_at loop
+# ---------------------------------------------------------------------------
+
+def recover_stale_heartbeat_uows(
+    registry,
+    dry_run: bool = False,
+    buffer_seconds: int = HEARTBEAT_STALL_BUFFER_SECONDS,
+) -> HeartbeatStallResult:
+    """
+    Scan for UoWs whose heartbeat has gone stale and re-queue them.
+
+    Called in the observation phase (Phase 2) alongside run_observation_loop.
+    This handles UoWs that have written at least one heartbeat — the signal-driven
+    path. UoWs with heartbeat_at=NULL continue to use the timeout_at-based path
+    in run_observation_loop.
+
+    Stall condition:
+    - status IN ('active', 'executing')
+    - heartbeat_at IS NOT NULL
+    - (now - heartbeat_at) > heartbeat_ttl + buffer_seconds
+
+    Recovery action: transition to 'ready-for-steward' via record_heartbeat_stall,
+    which writes a stall_detected audit entry with stall_type='heartbeat_stall'.
+    The Steward's re-entry classifier distinguishes this from 'stall_detected'
+    (timeout-based) via the audit entry's stall_type field.
+
+    In dry_run mode: detects stale UoWs but does NOT write audit entries or
+    transition status. Returns recovered count in skipped_dry_run.
+
+    Returns HeartbeatStallResult(checked, recovered, skipped_dry_run).
+    """
+    try:
+        stale_uows = registry.get_stale_heartbeat_uows(buffer_seconds=buffer_seconds)
+    except Exception as e:
+        log.warning("Heartbeat stall recovery: failed to query stale UoWs — %s", e)
+        return HeartbeatStallResult(checked=0, recovered=0, skipped_dry_run=0)
+
+    recovered = 0
+    skipped_dry_run = 0
+
+    for uow in stale_uows:
+        uow_id = uow.id
+        heartbeat_at = uow.heartbeat_at
+        heartbeat_ttl = uow.heartbeat_ttl
+
+        # Compute silence duration for logging.
+        silence_seconds: float = 0.0
+        try:
+            if heartbeat_at:
+                silence_seconds = (_utc_now() - _parse_iso(heartbeat_at)).total_seconds()
+        except (ValueError, TypeError):
+            pass
+
+        if dry_run:
+            log.info(
+                "Heartbeat stall (DRY RUN): UoW %s would be re-queued "
+                "(heartbeat_at=%s, heartbeat_ttl=%ds, silence=%.0fs)",
+                uow_id, heartbeat_at, heartbeat_ttl, silence_seconds,
+            )
+            skipped_dry_run += 1
+            continue
+
+        try:
+            rows = registry.record_heartbeat_stall(
+                uow_id=uow_id,
+                heartbeat_at=heartbeat_at,
+                heartbeat_ttl=heartbeat_ttl,
+                silence_seconds=silence_seconds,
+            )
+        except Exception as e:
+            log.warning(
+                "Heartbeat stall: failed to record stall for UoW %s — %s",
+                uow_id, e,
+            )
+            continue
+
+        if rows == 1:
+            recovered += 1
+            log.info(
+                "Heartbeat stall: UoW %s re-queued to ready-for-steward "
+                "(stall_type=heartbeat_stall, silence=%.0fs, ttl=%ds)",
+                uow_id, silence_seconds, heartbeat_ttl,
+            )
+        else:
+            log.debug(
+                "Heartbeat stall: race on UoW %s — already advanced by another "
+                "component (rows_affected=0)",
+                uow_id,
+            )
+
+    return HeartbeatStallResult(
+        checked=len(stale_uows),
+        recovered=recovered,
+        skipped_dry_run=skipped_dry_run,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -578,6 +694,21 @@ def main() -> int:
         )
     except Exception:
         log.exception("Observation loop failed — continuing to Steward main loop")
+
+    # Phase 2b: Heartbeat stall recovery — signal-driven path (migration 0009).
+    # Checks UoWs with non-NULL heartbeat_at for silence exceeding heartbeat_ttl.
+    # Complements the timeout_at-based path above: that path handles UoWs without
+    # heartbeat_at; this path handles UoWs that have written at least one heartbeat.
+    log.info("--- Phase 2b: Heartbeat stall recovery ---")
+    try:
+        hb_result = recover_stale_heartbeat_uows(registry, dry_run=dry_run)
+        log.info(
+            "Heartbeat stall recovery complete: %d checked, %d recovered, "
+            "%d skipped (dry-run)",
+            hb_result.checked, hb_result.recovered, hb_result.skipped_dry_run,
+        )
+    except Exception:
+        log.exception("Heartbeat stall recovery failed — continuing to Steward main loop")
 
     # execution_enabled gate — mirrors the executor-heartbeat pattern.
     # Phases 0–2 (stale agent cleanup, startup sweep, observation loop) always
