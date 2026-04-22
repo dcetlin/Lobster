@@ -6,6 +6,21 @@
 
 ---
 
+## Related docs
+
+- [WOS-INDEX.md](WOS-INDEX.md) — Component glossary: authoritative naming reference for Germinator, Cultivator, Registry, Steward, and Executor
+- [wos-vision.md](wos-vision.md) — Vision and premises (human-readable companion; authoritative intent is in `vision.yaml`)
+- [wos-constitution.md](wos-constitution.md) — The founding metaphor and naming constraints that govern all WOS design decisions
+- [wos-v3-proposal.md](wos-v3-proposal.md) — V3 design proposal: register taxonomy, corrective traces, delivery vs. closure
+- [wos-v3-steward-executor-spec.md](wos-v3-steward-executor-spec.md) — Steward/Executor contract spec
+- [wos-dispatch-failure-modes.md](wos-dispatch-failure-modes.md) — Known failure modes and mitigations in the dispatch path
+- [wos-registry-reference.md](wos-registry-reference.md) — Registry schema and field reference
+- [wos-design-audit-2026-04-08.md](wos-design-audit-2026-04-08.md) — April 2026 design audit findings
+- [executor-contract.md](executor-contract.md) — Executor contract (in `docs/`)
+- GH issue [#194](https://github.com/dcetlin/Lobster/issues/194) — Philosophy pipeline: multi-register coupling and behavioral gate architecture
+
+---
+
 ## Pipeline Flowchart
 
 ```mermaid

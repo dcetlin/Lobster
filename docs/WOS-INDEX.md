@@ -3,6 +3,8 @@
 
 # WOS Component Glossary (V3)
 
+**See also:** [wos-pipeline-architecture-20260422.md](wos-pipeline-architecture-20260422.md) — Full pipeline flowchart with all components, feedback loops, lifecycle states, register types, and posture types.
+
 This document is the authoritative component glossary for the Work Orchestration
 System. It resolves naming ambiguities introduced across V1, V2, and V3 design
 documents.
