@@ -21,9 +21,10 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -35,6 +36,9 @@ if str(_SRC) not in sys.path:
 from orchestration.wos_completion import (
     WOS_TASK_ID_PREFIX,
     WRITE_RESULT_SUCCESS_STATUS,
+    _build_closeout_comment,
+    _extract_github_issue,
+    classify_uow_output,
     maybe_complete_wos_uow,
 )
 from orchestration.registry import Registry, UoWStatus, UpsertInserted
@@ -338,4 +342,346 @@ class TestMaybeCompleteWosUow:
         """
         assert WRITE_RESULT_SUCCESS_STATUS == "success", (
             f"WRITE_RESULT_SUCCESS_STATUS must be 'success', got {WRITE_RESULT_SUCCESS_STATUS!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# classify_uow_output — pure function, no I/O
+# ---------------------------------------------------------------------------
+
+class TestClassifyUowOutput:
+    """Behavioral tests for the output classification heuristic."""
+
+    def test_pull_request_mention_is_pearl(self) -> None:
+        result = classify_uow_output(output_ref=None, result_text="Opened PR #42 on dcetlin/Lobster.")
+        assert result == "pearl"
+
+    def test_pull_request_long_form_is_pearl(self) -> None:
+        result = classify_uow_output(output_ref=None, result_text="Created a pull request with the fix.")
+        assert result == "pearl"
+
+    def test_merged_keyword_is_pearl(self) -> None:
+        result = classify_uow_output(output_ref=None, result_text="PR merged successfully.")
+        assert result == "pearl"
+
+    def test_nothing_to_do_is_heat(self) -> None:
+        result = classify_uow_output(output_ref=None, result_text="Nothing to do — issue is already resolved.")
+        assert result == "heat"
+
+    def test_no_changes_is_heat(self) -> None:
+        result = classify_uow_output(output_ref=None, result_text="No changes required in the codebase.")
+        assert result == "heat"
+
+    def test_skipped_is_heat(self) -> None:
+        result = classify_uow_output(output_ref=None, result_text="Skipped — precondition not met.")
+        assert result == "heat"
+
+    def test_empty_result_defaults_to_seed(self) -> None:
+        result = classify_uow_output(output_ref=None, result_text=None)
+        assert result == "seed"
+
+    def test_analysis_without_pr_defaults_to_seed(self) -> None:
+        result = classify_uow_output(
+            output_ref=None,
+            result_text="Completed analysis and wrote design doc to output_ref.",
+        )
+        assert result == "seed"
+
+
+# ---------------------------------------------------------------------------
+# _extract_github_issue — pure function
+# ---------------------------------------------------------------------------
+
+class TestExtractGithubIssue:
+    """Behavioral tests for GitHub issue source parsing."""
+
+    def test_github_issue_source_returns_repo_and_number(self) -> None:
+        with patch.dict(os.environ, {"LOBSTER_WOS_REPO": "dcetlin/Lobster"}):
+            result = _extract_github_issue("github:issue/123")
+        assert result == ("dcetlin/Lobster", 123)
+
+    def test_telegram_source_returns_none(self) -> None:
+        result = _extract_github_issue("telegram")
+        assert result is None
+
+    def test_system_source_returns_none(self) -> None:
+        result = _extract_github_issue("system")
+        assert result is None
+
+    def test_empty_source_returns_none(self) -> None:
+        result = _extract_github_issue("")
+        assert result is None
+
+    def test_malformed_github_source_returns_none(self) -> None:
+        result = _extract_github_issue("github:issue/not-a-number")
+        assert result is None
+
+    def test_uses_lobster_wos_repo_env_var(self) -> None:
+        with patch.dict(os.environ, {"LOBSTER_WOS_REPO": "myorg/myrepo"}):
+            result = _extract_github_issue("github:issue/42")
+        assert result == ("myorg/myrepo", 42)
+
+    def test_defaults_to_dcetlin_lobster_when_env_absent(self) -> None:
+        env_without_repo = {k: v for k, v in os.environ.items() if k != "LOBSTER_WOS_REPO"}
+        with patch.dict(os.environ, env_without_repo, clear=True):
+            result = _extract_github_issue("github:issue/7")
+        assert result is not None
+        assert result[0] == "dcetlin/Lobster"
+        assert result[1] == 7
+
+
+# ---------------------------------------------------------------------------
+# _build_closeout_comment — pure builder
+# ---------------------------------------------------------------------------
+
+class TestBuildCloseoutComment:
+    """The close-out comment body follows the spec template exactly."""
+
+    def test_comment_contains_uow_id(self) -> None:
+        body = _build_closeout_comment(
+            uow_id="uow_20260422_abc123",
+            output_classification="pearl",
+            result_text="PR #99 opened.",
+            agent_type="functional-engineer",
+            date_str="2026-04-22",
+        )
+        assert "uow_20260422_abc123" in body
+
+    def test_comment_contains_output_type(self) -> None:
+        body = _build_closeout_comment(
+            uow_id="uow_x",
+            output_classification="seed",
+            result_text="Analysis complete.",
+            agent_type="operational",
+            date_str="2026-04-22",
+        )
+        assert "**Output type:** seed" in body
+
+    def test_comment_contains_agent_type_and_date(self) -> None:
+        body = _build_closeout_comment(
+            uow_id="uow_x",
+            output_classification="heat",
+            result_text="Nothing to do.",
+            agent_type="frontier-writer",
+            date_str="2026-04-22",
+        )
+        assert "frontier-writer" in body
+        assert "2026-04-22" in body
+
+    def test_comment_contains_result_json_reference(self) -> None:
+        body = _build_closeout_comment(
+            uow_id="uow_abc",
+            output_classification="pearl",
+            result_text="Done.",
+            agent_type="functional-engineer",
+            date_str="2026-01-01",
+        )
+        assert "uow_abc.result.json" in body
+
+    def test_long_result_text_is_truncated(self) -> None:
+        long_text = "x" * 400
+        body = _build_closeout_comment(
+            uow_id="uow_x",
+            output_classification="seed",
+            result_text=long_text,
+            agent_type="operational",
+            date_str="2026-01-01",
+        )
+        # The body must not contain the full 400-char string verbatim
+        assert long_text not in body
+
+
+# ---------------------------------------------------------------------------
+# Close-out protocol integration — source-routing and gh invocation
+# ---------------------------------------------------------------------------
+
+class TestCloseoutProtocolIntegration:
+    """
+    Verifies that maybe_complete_wos_uow posts a close-out comment to the
+    source GitHub issue when source="github:issue/N", and skips silently for
+    non-GitHub sources.
+    """
+
+    def _seed_uow_with_source(
+        self,
+        registry: Registry,
+        output_dir: Path,
+        source: str,
+        issue_number: int = 9901,
+    ) -> str:
+        """Seed a UoW with a given source and advance to executing."""
+        result = registry.upsert(
+            issue_number=issue_number,
+            title="Close-out test UoW",
+            success_criteria="Closeout comment posted.",
+        )
+        assert isinstance(result, UpsertInserted)
+        uow_id = result.id
+        registry.approve(uow_id)
+
+        output_ref = str(output_dir / f"{uow_id}.json")
+        registry.set_status_direct(uow_id, "active")
+        conn = sqlite3.connect(str(registry.db_path))
+        conn.execute(
+            "UPDATE uow_registry SET output_ref = ?, source = ? WHERE id = ?",
+            (output_ref, source, uow_id),
+        )
+        conn.commit()
+        conn.close()
+        registry.transition_to_executing(uow_id, "mock-executor-001")
+        return uow_id
+
+    def test_github_source_posts_comment(self, tmp_path: Path) -> None:
+        """
+        When source="github:issue/42", a gh issue comment subprocess is spawned
+        with the correct repo and issue number.
+        """
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = self._seed_uow_with_source(
+            registry, output_dir, source="github:issue/42", issue_number=42
+        )
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        with patch("orchestration.wos_completion.subprocess.run") as mock_run, \
+             patch.dict(os.environ, {
+                 "REGISTRY_DB_PATH": str(db_path),
+                 "LOBSTER_WOS_REPO": "dcetlin/Lobster",
+             }):
+            mock_run.return_value = MagicMock(returncode=0)
+            maybe_complete_wos_uow(task_id, WRITE_RESULT_SUCCESS_STATUS, result_text="PR #7 opened.")
+
+        # gh issue comment must have been called with the correct repo + issue
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args
+        cmd = call_args[0][0]
+        assert "gh" in cmd[0]
+        assert "issue" in cmd
+        assert "comment" in cmd
+        assert "42" in cmd
+        assert "--repo" in cmd
+        assert "dcetlin/Lobster" in cmd
+
+    def test_telegram_source_skips_comment(self, tmp_path: Path) -> None:
+        """
+        When source="telegram", no subprocess is spawned — close-out comment
+        is silently skipped for non-GitHub sources.
+        """
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = self._seed_uow_with_source(
+            registry, output_dir, source="telegram", issue_number=9901
+        )
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        with patch("orchestration.wos_completion.subprocess.run") as mock_run, \
+             patch.dict(os.environ, {"REGISTRY_DB_PATH": str(db_path)}):
+            maybe_complete_wos_uow(task_id, WRITE_RESULT_SUCCESS_STATUS, result_text="Done.")
+
+        mock_run.assert_not_called()
+
+    def test_gh_failure_does_not_block_registry_transition(self, tmp_path: Path) -> None:
+        """
+        If the gh subprocess fails (non-zero exit), the UoW must still transition
+        to ready-for-steward — comment failure is non-fatal.
+        """
+        import subprocess as sp
+
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = self._seed_uow_with_source(
+            registry, output_dir, source="github:issue/99", issue_number=99
+        )
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        with patch("orchestration.wos_completion.subprocess.run",
+                   side_effect=sp.CalledProcessError(1, "gh", stderr=b"error")), \
+             patch.dict(os.environ, {
+                 "REGISTRY_DB_PATH": str(db_path),
+                 "LOBSTER_WOS_REPO": "dcetlin/Lobster",
+             }):
+            # Must not raise even when gh fails
+            maybe_complete_wos_uow(task_id, WRITE_RESULT_SUCCESS_STATUS, result_text="Done.")
+
+        # Registry must have transitioned despite comment failure
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.status == UoWStatus.READY_FOR_STEWARD, (
+            f"Registry transition must succeed even when gh comment fails. Got: {uow.status}"
+        )
+
+    def test_system_source_skips_comment(self, tmp_path: Path) -> None:
+        """source='system' must not trigger a gh comment."""
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = self._seed_uow_with_source(
+            registry, output_dir, source="system", issue_number=9901
+        )
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        with patch("orchestration.wos_completion.subprocess.run") as mock_run, \
+             patch.dict(os.environ, {"REGISTRY_DB_PATH": str(db_path)}):
+            maybe_complete_wos_uow(task_id, WRITE_RESULT_SUCCESS_STATUS, result_text="Done.")
+
+        mock_run.assert_not_called()
+
+    def test_result_text_with_pr_produces_pearl_classification_in_comment(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        result_text containing a PR reference must flow through to the gh comment
+        body with output_type 'pearl'.
+
+        This verifies the end-to-end wiring: write_result text → maybe_complete_wos_uow
+        result_text → classify_uow_output → comment body. Before this fix, inbox_server.py
+        called maybe_complete_wos_uow without result_text, so classification always
+        defaulted to 'seed' regardless of the actual subagent output.
+        """
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = self._seed_uow_with_source(
+            registry, output_dir, source="github:issue/55", issue_number=55
+        )
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        captured_comment_body: list[str] = []
+
+        def _capture_run(cmd, **kwargs):
+            # Capture the --body argument passed to gh issue comment
+            body_idx = cmd.index("--body") + 1 if "--body" in cmd else None
+            if body_idx is not None:
+                captured_comment_body.append(cmd[body_idx])
+            return MagicMock(returncode=0)
+
+        with patch("orchestration.wos_completion.subprocess.run", side_effect=_capture_run), \
+             patch.dict(os.environ, {
+                 "REGISTRY_DB_PATH": str(db_path),
+                 "LOBSTER_WOS_REPO": "dcetlin/Lobster",
+             }):
+            maybe_complete_wos_uow(
+                task_id,
+                WRITE_RESULT_SUCCESS_STATUS,
+                result_text="PR #123 opened on dcetlin/Lobster.",
+            )
+
+        assert len(captured_comment_body) == 1, "Expected exactly one gh comment call"
+        body = captured_comment_body[0]
+        assert "**Output type:** pearl" in body, (
+            f"result_text mentioning a PR must produce 'pearl' classification in the "
+            f"close-out comment. Got comment body:\n{body}"
         )

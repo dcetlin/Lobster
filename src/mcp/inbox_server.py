@@ -7667,7 +7667,7 @@ async def handle_write_task_output(args: dict) -> list[TextContent]:
 # WOS registry completion helper (issue #669)
 # =============================================================================
 
-def _maybe_complete_wos_uow(task_id: str, status: str) -> None:
+def _maybe_complete_wos_uow(task_id: str, status: str, result_text: str | None = None) -> None:
     """
     Transition a WOS UoW from 'executing' to 'ready-for-steward' when its subagent
     calls write_result with status='success'.
@@ -7675,6 +7675,10 @@ def _maybe_complete_wos_uow(task_id: str, status: str) -> None:
     Delegates to orchestration.wos_completion.maybe_complete_wos_uow — see that
     module for full documentation. Imported lazily so inbox_server's heavy import
     chain does not block if the orchestration package is unavailable.
+
+    result_text is forwarded to maybe_complete_wos_uow so the output classifier
+    can distinguish pearl (PR opened), heat (nothing to do), and seed (default)
+    outcomes when building the GitHub close-out comment.
 
     Errors are logged but never raised — write_result delivery must not be blocked
     by registry update failures.
@@ -7687,7 +7691,7 @@ def _maybe_complete_wos_uow(task_id: str, status: str) -> None:
         if _src not in _sys.path:
             _sys.path.insert(0, _src)
         from orchestration.wos_completion import maybe_complete_wos_uow
-        maybe_complete_wos_uow(task_id, status)
+        maybe_complete_wos_uow(task_id, status, result_text=result_text)
     except Exception as exc:
         log.warning("_maybe_complete_wos_uow: unexpected error — %s: %s", type(exc).__name__, exc)
 
@@ -7852,7 +7856,9 @@ async def handle_write_result(args: dict) -> list[TextContent]:
     # false-complete bug where UoWs appeared done before any work was done.
     #
     # task_id convention: "wos-{uow_id}" (set by route_wos_message in dispatcher_handlers.py)
-    _maybe_complete_wos_uow(task_id, status)
+    # result_text is forwarded so the output classifier can build an accurate close-out
+    # comment (pearl for PR opened, heat for nothing to do, seed as default).
+    _maybe_complete_wos_uow(task_id, status, result_text=text or None)
 
     # Notify wire server so SSE clients update within 40ms
     asyncio.create_task(_notify_wire_server())
