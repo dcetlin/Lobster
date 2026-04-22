@@ -595,3 +595,42 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
 
     # Unreachable given the guard above, but satisfies exhaustiveness checkers
     raise ValueError(f"route_wos_message: no branch for type {msg_type!r}")
+
+
+# ---------------------------------------------------------------------------
+# Vision Object callback handler — vision_accept / vision_decline
+# ---------------------------------------------------------------------------
+
+
+def handle_vision_callback(callback_data: str, chat_id: int = 6036) -> str | None:
+    """
+    Handle Telegram inline keyboard callbacks for the Vision Object inlet.
+
+    Parses ``callback_data`` for ``vision_accept:<field_path>:<hash>`` and
+    ``vision_decline:<field_path>:<hash>`` prefixes and routes to the accept or
+    decline handler in ``src.harvest.vision_inlet``.
+
+    Returns a reply string if this is a vision callback, or ``None`` if the
+    callback_data does not match a vision prefix (so the caller can route other
+    callbacks normally).
+
+    Dispatcher integration — add to the callback handling branch::
+
+        from src.orchestration.dispatcher_handlers import handle_vision_callback
+
+        if msg.get("type") == "callback":
+            callback_data = msg.get("callback_data", "")
+            reply = handle_vision_callback(callback_data, chat_id=msg.get("chat_id", 6036))
+            if reply is not None:
+                send_reply(chat_id=msg["chat_id"], text=reply, message_id=msg["id"])
+                return  # mark processed and continue main loop
+    """
+    if not (callback_data.startswith("vision_accept:") or callback_data.startswith("vision_decline:")):
+        return None
+
+    try:
+        from src.harvest.vision_inlet import handle_vision_callback as _vi_callback  # type: ignore[import]
+    except ImportError:
+        return "vision_inlet module unavailable — cannot process vision callback."
+
+    return _vi_callback(callback_data, chat_id=chat_id)
