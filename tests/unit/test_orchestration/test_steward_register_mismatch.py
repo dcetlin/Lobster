@@ -11,7 +11,8 @@ Covers:
 - Compatible: philosophical→frontier-writer returns (True, "")
 - Compatible: human-judgment→design-review returns (True, "")
 - Unknown register: treated as compatible (conservative pass-through)
-- Gate fires in prescribe branch: philosophical UoW → Surfaced(register_mismatch)
+- Philosophical UoW now routes to lobster-meta (fix #842) → no mismatch → Prescribed
+- Gate fires when executor type is forcibly mismatched (monkeypatched _select_executor_type)
 - Gate blocks artifact write: mismatch → no workflow artifact written
 - Gate observability: mismatch_observation logged to audit_log
 - No mismatch for operational UoWs: prescribes normally
@@ -171,12 +172,18 @@ class TestRegisterMismatchGateIntegration:
         registry = Registry(db_path=db_path)
         return registry, db_path
 
-    def test_philosophical_uow_triggers_mismatch_surface(self, tmp_path):
-        """Philosophical UoW with functional-engineer keyword → register_mismatch surface."""
+    def test_philosophical_uow_prescribes_via_lobster_meta(self, tmp_path):
+        """Philosophical UoW routes to lobster-meta (compatible) → no mismatch → Prescribed.
+
+        After the register-routing fix (issue #842), _select_executor_type returns
+        lobster-meta for philosophical register. lobster-meta IS compatible, so the
+        mismatch gate does not fire. The UoW prescribes normally.
+
+        This test replaces the old test that verified the mismatch gate caught the
+        philosophical→functional-engineer routing bug. That bug no longer exists.
+        """
         registry, db_path = self._make_registry(tmp_path)
 
-        # UoW with philosophical register and a summary that would route to functional-engineer
-        # (has 'implement' keyword → _select_executor_type → functional-engineer)
         conn = _open_db(db_path)
         _insert_uow(conn, "uow-phil", register="philosophical",
                     summary="implement philosophical exploration of consciousness",
@@ -188,7 +195,7 @@ class TestRegisterMismatchGateIntegration:
         def fake_notify(uow, condition, surface_log=None, return_reason=None):
             surfaced.append((uow.id, condition))
 
-        from src.orchestration.steward import _process_uow, _fetch_audit_entries, Surfaced
+        from src.orchestration.steward import _process_uow, _fetch_audit_entries, Prescribed
 
         uow = registry.get("uow-phil")
         audit_entries = _fetch_audit_entries(registry, "uow-phil")
@@ -200,34 +207,85 @@ class TestRegisterMismatchGateIntegration:
             llm_prescriber=lambda *a, **k: LLMPrescription(instructions="x", success_criteria_check="y", estimated_cycles=1),
         )
 
-        assert isinstance(result, Surfaced), f"Expected Surfaced, got {result}"
+        assert isinstance(result, Prescribed), (
+            f"philosophical UoW should prescribe normally (routes to lobster-meta, which is "
+            f"compatible). Got {result!r}. If this is Surfaced(register_mismatch), the "
+            f"register-routing fix (issue #842) may have been reverted."
+        )
+        assert len(surfaced) == 0, f"No mismatch notification expected, got: {surfaced}"
+
+    def test_mismatch_gate_fires_when_executor_type_is_incompatible(self, tmp_path):
+        """Mismatch gate fires when _select_executor_type returns an incompatible type.
+
+        The gate mechanism is intact — it fires when the selected executor_type is
+        incompatible with the UoW register. We verify this by monkeypatching
+        _select_executor_type to return functional-engineer for a philosophical UoW,
+        simulating a hypothetical future regression or manual override.
+        """
+        import unittest.mock as mock
+        registry, db_path = self._make_registry(tmp_path)
+
+        conn = _open_db(db_path)
+        _insert_uow(conn, "uow-phil-mismatch", register="philosophical",
+                    summary="philosophical exploration",
+                    steward_cycles=0)
+        conn.close()
+
+        surfaced: list[tuple] = []
+
+        def fake_notify(uow, condition, surface_log=None, return_reason=None):
+            surfaced.append((uow.id, condition))
+
+        import src.orchestration.steward as steward_mod
+        from src.orchestration.steward import _process_uow, _fetch_audit_entries, Surfaced
+
+        uow = registry.get("uow-phil-mismatch")
+        audit_entries = _fetch_audit_entries(registry, "uow-phil-mismatch")
+
+        with mock.patch.object(steward_mod, "_select_executor_type", return_value="functional-engineer"):
+            result = _process_uow(
+                uow=uow, registry=registry, audit_entries=audit_entries,
+                issue_info=IssueInfo(status_code=1, state="open", labels=[], body="", title=""),
+                dry_run=True, artifact_dir=tmp_path, notify_dan=fake_notify,
+                llm_prescriber=lambda *a, **k: LLMPrescription(instructions="x", success_criteria_check="y", estimated_cycles=1),
+            )
+
+        assert isinstance(result, Surfaced), f"Expected Surfaced when gate fires, got {result}"
         assert result.condition == "register_mismatch"
         assert len(surfaced) == 1
-        assert surfaced[0] == ("uow-phil", "register_mismatch")
+        assert surfaced[0] == ("uow-phil-mismatch", "register_mismatch")
 
     def test_mismatch_gate_blocks_artifact_write(self, tmp_path):
-        """When register_mismatch fires, no workflow artifact is written to disk."""
+        """When register_mismatch fires, no workflow artifact is written to disk.
+
+        We force a mismatch by monkeypatching _select_executor_type to return
+        functional-engineer for a philosophical UoW — verifying the gate still
+        prevents the artifact write even when triggered artificially.
+        """
+        import unittest.mock as mock
         registry, db_path = self._make_registry(tmp_path)
         artifact_dir = tmp_path / "artifacts"
         artifact_dir.mkdir()
 
         conn = _open_db(db_path)
         _insert_uow(conn, "uow-block", register="philosophical",
-                    summary="implement philosophical work",
+                    summary="philosophical work",
                     steward_cycles=0)
         conn.close()
 
+        import src.orchestration.steward as steward_mod
         from src.orchestration.steward import _process_uow, _fetch_audit_entries, Surfaced
 
         uow = registry.get("uow-block")
         audit_entries = _fetch_audit_entries(registry, "uow-block")
 
-        result = _process_uow(
-            uow=uow, registry=registry, audit_entries=audit_entries,
-            issue_info=IssueInfo(status_code=1, state="open", labels=[], body="", title=""),
-            dry_run=True, artifact_dir=artifact_dir, notify_dan=lambda *a, **k: None,
-            llm_prescriber=lambda *a, **k: LLMPrescription(instructions="x", success_criteria_check="y", estimated_cycles=1),
-        )
+        with mock.patch.object(steward_mod, "_select_executor_type", return_value="functional-engineer"):
+            result = _process_uow(
+                uow=uow, registry=registry, audit_entries=audit_entries,
+                issue_info=IssueInfo(status_code=1, state="open", labels=[], body="", title=""),
+                dry_run=True, artifact_dir=artifact_dir, notify_dan=lambda *a, **k: None,
+                llm_prescriber=lambda *a, **k: LLMPrescription(instructions="x", success_criteria_check="y", estimated_cycles=1),
+            )
 
         assert isinstance(result, Surfaced)
         # No artifact file should exist in artifact_dir
@@ -235,26 +293,33 @@ class TestRegisterMismatchGateIntegration:
         assert len(artifact_files) == 0, f"Unexpected artifact files: {artifact_files}"
 
     def test_mismatch_observation_logged_to_steward_log(self, tmp_path):
-        """register_mismatch event appears in steward_log after gate fires."""
+        """register_mismatch event appears in steward_log after gate fires.
+
+        We force a mismatch by monkeypatching _select_executor_type to return
+        functional-engineer for a philosophical UoW.
+        """
+        import unittest.mock as mock
         registry, db_path = self._make_registry(tmp_path)
 
         conn = _open_db(db_path)
         _insert_uow(conn, "uow-obs", register="philosophical",
-                    summary="implement philosophical analysis",
+                    summary="philosophical analysis",
                     steward_cycles=0)
         conn.close()
 
+        import src.orchestration.steward as steward_mod
         from src.orchestration.steward import _process_uow, _fetch_audit_entries
 
         uow = registry.get("uow-obs")
         audit_entries = _fetch_audit_entries(registry, "uow-obs")
 
-        _process_uow(
-            uow=uow, registry=registry, audit_entries=audit_entries,
-            issue_info=IssueInfo(status_code=1, state="open", labels=[], body="", title=""),
-            dry_run=False, artifact_dir=tmp_path, notify_dan=lambda *a, **k: None,
-            llm_prescriber=lambda *a, **k: LLMPrescription(instructions="x", success_criteria_check="y", estimated_cycles=1),
-        )
+        with mock.patch.object(steward_mod, "_select_executor_type", return_value="functional-engineer"):
+            _process_uow(
+                uow=uow, registry=registry, audit_entries=audit_entries,
+                issue_info=IssueInfo(status_code=1, state="open", labels=[], body="", title=""),
+                dry_run=False, artifact_dir=tmp_path, notify_dan=lambda *a, **k: None,
+                llm_prescriber=lambda *a, **k: LLMPrescription(instructions="x", success_criteria_check="y", estimated_cycles=1),
+            )
 
         uow_after = registry.get("uow-obs")
         log_str = uow_after.steward_log or ""
@@ -296,26 +361,33 @@ class TestRegisterMismatchGateIntegration:
         assert isinstance(result, Prescribed), f"Expected Prescribed, got {result}"
 
     def test_mismatch_observation_in_audit_log(self, tmp_path):
-        """register_mismatch_observation entry written to audit_log on mismatch."""
+        """register_mismatch_observation entry written to audit_log on mismatch.
+
+        We force a mismatch by monkeypatching _select_executor_type to return
+        functional-engineer for a philosophical UoW.
+        """
+        import unittest.mock as mock
         registry, db_path = self._make_registry(tmp_path)
 
         conn = _open_db(db_path)
         _insert_uow(conn, "uow-audit", register="philosophical",
-                    summary="implement philosophical deep work",
+                    summary="philosophical deep work",
                     steward_cycles=0)
         conn.close()
 
+        import src.orchestration.steward as steward_mod
         from src.orchestration.steward import _process_uow, _fetch_audit_entries
 
         uow = registry.get("uow-audit")
         audit_entries = _fetch_audit_entries(registry, "uow-audit")
 
-        _process_uow(
-            uow=uow, registry=registry, audit_entries=audit_entries,
-            issue_info=IssueInfo(status_code=1, state="open", labels=[], body="", title=""),
-            dry_run=False, artifact_dir=tmp_path, notify_dan=lambda *a, **k: None,
-            llm_prescriber=lambda *a, **k: LLMPrescription(instructions="x", success_criteria_check="y", estimated_cycles=1),
-        )
+        with mock.patch.object(steward_mod, "_select_executor_type", return_value="functional-engineer"):
+            _process_uow(
+                uow=uow, registry=registry, audit_entries=audit_entries,
+                issue_info=IssueInfo(status_code=1, state="open", labels=[], body="", title=""),
+                dry_run=False, artifact_dir=tmp_path, notify_dan=lambda *a, **k: None,
+                llm_prescriber=lambda *a, **k: LLMPrescription(instructions="x", success_criteria_check="y", estimated_cycles=1),
+            )
 
         # Read audit log directly
         audit_conn = _open_db(db_path)

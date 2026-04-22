@@ -648,10 +648,15 @@ class TestTraceInjectionIntegration:
     def test_philosophical_no_philosophical_register_surface_on_first_execution(self, tmp_path):
         """philosophical_register stuck condition does NOT fire on first_execution.
 
-        The register_mismatch gate fires first (philosophical has no auto-selectable executor),
-        so the result is Surfaced — but the condition is register_mismatch, not philosophical_register.
-        philosophical_register only fires on reentry (cycles > 0, execution_complete posture).
+        After fix #842, philosophical UoWs route to lobster-meta (compatible), so neither
+        register_mismatch nor philosophical_register fires on first execution. The UoW
+        prescribes normally.
+
+        philosophical_register only fires on reentry (cycles > 0, execution_complete posture)
+        — that behavior is unchanged.
         """
+        from src.orchestration.steward import _process_uow, _fetch_audit_entries, Prescribed
+
         registry, db_path = _make_registry(tmp_path)
         conn = _open_db(db_path)
         _insert_uow(conn, "uow-phil-first", register="philosophical",
@@ -662,8 +667,6 @@ class TestTraceInjectionIntegration:
 
         def fake_notify(uow, condition, surface_log=None, return_reason=None):
             surfaced.append((uow.id, condition))
-
-        from src.orchestration.steward import _process_uow, _fetch_audit_entries
 
         uow = registry.get("uow-phil-first")
         audit_entries = _fetch_audit_entries(registry, "uow-phil-first")
@@ -681,6 +684,9 @@ class TestTraceInjectionIntegration:
 
         # philosophical_register must NOT fire on first_execution
         assert not any(c == "philosophical_register" for _, c in surfaced)
-        # The register_mismatch gate fires first (no compatible auto-selected executor for philosophical)
-        assert isinstance(result, Surfaced), f"Expected Surfaced (register_mismatch), got {result}"
-        assert result.condition == "register_mismatch"
+        # After fix #842: philosophical → lobster-meta (compatible) → no mismatch → Prescribed
+        assert isinstance(result, Prescribed), (
+            f"philosophical UoW should Prescribe on first execution (routes to lobster-meta). "
+            f"Got {result!r}. If Surfaced(register_mismatch), the #842 routing fix may have been reverted."
+        )
+        assert not any(c == "register_mismatch" for _, c in surfaced)

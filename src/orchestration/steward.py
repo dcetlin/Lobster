@@ -691,6 +691,22 @@ _STEWARD_REQUIRED_FIELDS = frozenset({
 _EXECUTOR_TYPE_GENERAL = "general"
 _EXECUTOR_TYPE_FUNCTIONAL_ENGINEER = "functional-engineer"
 _EXECUTOR_TYPE_LOBSTER_OPS = "lobster-ops"
+_EXECUTOR_TYPE_LOBSTER_GENERALIST = "lobster-generalist"
+_EXECUTOR_TYPE_LOBSTER_META = "lobster-meta"
+
+#: Register → executor_type mapping (issue #842).
+#: Register is the primary routing signal — it is classified at germination time
+#: by the Germinator and is stable. Keyword-matching on the summary was the prior
+#: approach; it is replaced by this declarative table.
+#:
+#: Fallback for unknown registers: lobster-generalist (safe default — generalist
+#: handles ambiguous cases without risking implementation work on philosophical UoWs).
+_REGISTER_TO_EXECUTOR_TYPE: dict[str, str] = {
+    "operational": _EXECUTOR_TYPE_FUNCTIONAL_ENGINEER,
+    "iterative-convergent": _EXECUTOR_TYPE_FUNCTIONAL_ENGINEER,
+    "human-judgment": _EXECUTOR_TYPE_LOBSTER_GENERALIST,
+    "philosophical": _EXECUTOR_TYPE_LOBSTER_META,
+}
 
 # Return reason classifications
 _CLASSIFICATION_NORMAL = "normal"
@@ -1347,41 +1363,37 @@ def _build_initial_agenda(uow: "UoW", issue_body: str) -> list[dict[str, Any]]:
 
 def _select_executor_type(uow: "UoW") -> str:
     """
-    Select the executor type appropriate to the UoW's nature.
+    Select the executor type for the UoW based on its register field.
 
-    Mapping:
-    - GitHub issues about code bugs, features, or PRs → functional-engineer
-    - Infrastructure or ops issues → lobster-ops
-    - General or unclear → general
+    The register is the primary routing signal — it is classified at germination
+    time by the Germinator and is stable across the UoW lifecycle. Keyword-
+    matching on the summary was the prior approach (issue #842 — a philosophical
+    UoW with "fix" in the summary would incorrectly route to functional-engineer).
+
+    Mapping (see _REGISTER_TO_EXECUTOR_TYPE):
+        operational          → functional-engineer
+        iterative-convergent → functional-engineer
+        human-judgment       → lobster-generalist
+        philosophical        → lobster-meta
+        <unknown>            → lobster-generalist  (safe fallback, warns in log)
 
     Returns one of the _EXECUTOR_TYPE_* constants.
     """
-    summary_lower = uow.summary.lower()
-    source = (uow.source or "").lower()
+    register = uow.register or ""
+    executor_type = _REGISTER_TO_EXECUTOR_TYPE.get(register)
+    if executor_type is not None:
+        return executor_type
 
-    # Code / feature / bug signals checked first — these are strong indicators
-    # that win over incidental ops-adjacent terms (e.g. "fix: setup script fails"
-    # should route to functional-engineer, not lobster-ops).
-    code_keywords = (
-        "bug", "fix", "feat", "feature", "implement", "refactor", "test",
-        "pr", "pull request", "issue", "error", "crash", "regression",
+    # Unknown register — warn and fall back to lobster-generalist (safe default).
+    # lobster-generalist handles ambiguous work without risking implementation
+    # on philosophical or human-judgment UoWs that need different treatment.
+    log.warning(
+        "_select_executor_type: unknown register %r for UoW %s — falling back to %s",
+        register,
+        getattr(uow, "id", "<unknown>"),
+        _EXECUTOR_TYPE_LOBSTER_GENERALIST,
     )
-    if any(kw in summary_lower for kw in code_keywords):
-        return _EXECUTOR_TYPE_FUNCTIONAL_ENGINEER
-
-    # Infrastructure / ops signals — checked after code keywords
-    ops_keywords = (
-        "install", "deploy", "cron", "systemd", "migration", "upgrade",
-        "ops", "infra", "server", "config", "script", "setup", "lobster-ops",
-    )
-    if any(kw in summary_lower for kw in ops_keywords):
-        return _EXECUTOR_TYPE_LOBSTER_OPS
-
-    # Default: functional-engineer for anything sourced from a GitHub issue
-    if "github:issue" in source:
-        return _EXECUTOR_TYPE_FUNCTIONAL_ENGINEER
-
-    return _EXECUTOR_TYPE_GENERAL
+    return _EXECUTOR_TYPE_LOBSTER_GENERALIST
 
 
 # Register → compatible executor types mapping (spec: Change 3).
@@ -1392,8 +1404,8 @@ def _select_executor_type(uow: "UoW") -> str:
 _REGISTER_COMPATIBLE_EXECUTORS: dict[str, frozenset[str]] = {
     "operational": frozenset({"functional-engineer", "lobster-ops", "general"}),
     "iterative-convergent": frozenset({"functional-engineer", "lobster-ops"}),
-    "philosophical": frozenset({"frontier-writer"}),
-    "human-judgment": frozenset({"design-review"}),
+    "philosophical": frozenset({"lobster-meta", "frontier-writer"}),
+    "human-judgment": frozenset({"lobster-generalist", "design-review"}),
 }
 
 

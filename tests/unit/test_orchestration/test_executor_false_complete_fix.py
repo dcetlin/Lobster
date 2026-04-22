@@ -226,7 +226,7 @@ class TestAsyncDispatchStatusTransitions:
 
         dispatched: list[str] = []
 
-        def fake_inbox_dispatcher(instructions: str, uid: str) -> str:
+        def fake_inbox_dispatcher(instructions: str, uid: str, **kwargs: object) -> str:
             dispatched.append(uid)
             return f"msg-{uid}"
 
@@ -255,7 +255,7 @@ class TestAsyncDispatchStatusTransitions:
         uow_id = "uow_async_002"
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id, "lobster-ops"))
 
-        def fake_inbox_dispatcher(instructions: str, uid: str) -> str:
+        def fake_inbox_dispatcher(instructions: str, uid: str, **kwargs: object) -> str:
             return f"msg-{uid}"
 
         import orchestration.executor as executor_mod
@@ -280,7 +280,7 @@ class TestAsyncDispatchStatusTransitions:
         uow_id = "uow_async_003"
         _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id, "general"))
 
-        def fake_inbox_dispatcher(instructions: str, uid: str) -> str:
+        def fake_inbox_dispatcher(instructions: str, uid: str, **kwargs: object) -> str:
             return f"msg-{uid}"
 
         import orchestration.executor as executor_mod

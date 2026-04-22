@@ -1137,26 +1137,28 @@ def _dispatch_via_design_review(instructions: str, uow_id: str) -> str:
 #: CURRENT module attribute at call time — this ensures monkeypatching in tests
 #: is respected (a captured function reference would bypass the patch).
 #:
-#: Production path (inbox): functional-engineer, lobster-ops, and general all use
-#: _dispatch_via_inbox — the event-driven MCP inbox pattern that eliminates the
-#: 0–3 minute polling hop. The Lobster dispatcher picks up the wos_execute message
-#: on its next cycle and spawns a background subagent via the Task tool.
+#: Production path (inbox): each executor type maps to a typed inbox dispatcher
+#: (created by _make_inbox_dispatcher) that embeds agent_type in the wos_execute
+#: message. The Lobster dispatcher picks up the message and uses routing["agent_type"]
+#: as the subagent_type for the Task tool call.
 #:
 #: Legacy subprocess path (_dispatch_via_claude_p): retained for CI/dev environments
 #: without a live Lobster dispatcher. Activate by passing
 #: dispatcher=_dispatch_via_claude_p to Executor.__init__ explicitly.
 #:
-#: frontier-writer and design-review use their own dispatchers as stubs for
-#: future register-specific model/mechanism differentiation.
+#: frontier-writer and design-review are stub dispatchers retained for backward
+#: compatibility — new code should route through lobster-meta and lobster-generalist.
 _EXECUTOR_TYPE_TO_DISPATCHER: dict[str, str] = {
-    "functional-engineer": "_dispatch_via_inbox",
-    "lobster-ops": "_dispatch_via_inbox",
-    "general": "_dispatch_via_inbox",
+    "functional-engineer": "_dispatch_via_inbox_functional_engineer",
+    "lobster-ops": "_dispatch_via_inbox_lobster_ops",
+    "general": "_dispatch_via_inbox_general",
+    "lobster-generalist": "_dispatch_via_inbox_lobster_generalist",
+    "lobster-meta": "_dispatch_via_inbox_lobster_meta",
     "frontier-writer": "_dispatch_via_frontier_writer",
     "design-review": "_dispatch_via_design_review",
 }
 
-#: Executor types that use the async inbox dispatch path (_dispatch_via_inbox).
+#: Executor types that use the async inbox dispatch path.
 #: For these types, the executor transitions to 'executing' at dispatch time;
 #: complete_uow (execution_complete) fires only when write_result arrives.
 #: Types absent from this set use synchronous subprocess dispatch — complete_uow
@@ -1165,6 +1167,8 @@ _ASYNC_EXECUTOR_TYPES: frozenset[str] = frozenset({
     "functional-engineer",
     "lobster-ops",
     "general",
+    "lobster-generalist",
+    "lobster-meta",
 })
 
 
@@ -1192,9 +1196,9 @@ def _resolve_dispatcher(executor_type: str) -> SubagentDispatcher:
     Dispatch table lookup: executor_type → SubagentDispatcher.
 
     Returns the dispatcher registered for executor_type, or falls back to
-    _dispatch_via_inbox for unknown types (safe default — operational UoWs
-    always work via the event-driven inbox path; unknown register types get
-    functional-engineer behavior until a specialized dispatcher is registered).
+    _dispatch_via_inbox_lobster_generalist for unknown types (safe default —
+    lobster-generalist handles ambiguous work without risking implementation
+    on philosophical UoWs that require a different agent).
 
     Resolves via globals() at call time so that monkeypatching the module
     attribute in tests is respected — the dict stores attribute names, not
@@ -1203,7 +1207,7 @@ def _resolve_dispatcher(executor_type: str) -> SubagentDispatcher:
     Called by _run_execution() when no dispatcher was explicitly injected
     via Executor.__init__.
     """
-    name = _EXECUTOR_TYPE_TO_DISPATCHER.get(executor_type, "_dispatch_via_inbox")
+    name = _EXECUTOR_TYPE_TO_DISPATCHER.get(executor_type, "_dispatch_via_inbox_lobster_generalist")
     return globals()[name]  # type: ignore[return-value]
 
 
@@ -1273,7 +1277,43 @@ def _log_dispatch_boundary(
         )
 
 
-def _dispatch_via_inbox(instructions: str, uow_id: str) -> str:
+def _make_inbox_dispatcher(agent_type: str) -> "SubagentDispatcher":
+    """
+    Factory: return a SubagentDispatcher that writes a wos_execute inbox message
+    tagged with the given agent_type.
+
+    The returned dispatcher is a closure over ``agent_type``. It conforms to the
+    SubagentDispatcher protocol (instructions: str, uow_id: str) -> str, so it
+    is directly usable in _EXECUTOR_TYPE_TO_DISPATCHER and as a dispatcher
+    override in tests.
+
+    The ``agent_type`` field is read by ``route_wos_message`` in
+    dispatcher_handlers.py, which returns it in the routing dict. The dispatcher
+    (main Claude loop) uses ``routing["agent_type"]`` as the ``subagent_type``
+    argument to the Task tool — allowing different registers to spawn different
+    agent types without hardcoding "functional-engineer" in the dispatcher prose.
+
+    Example:
+        _dispatch_via_inbox_lobster_meta = _make_inbox_dispatcher("lobster-meta")
+    """
+    def _dispatch(instructions: str, uow_id: str) -> str:
+        return _dispatch_via_inbox(instructions, uow_id, agent_type=agent_type)
+    _dispatch.__name__ = f"_dispatch_via_inbox_{agent_type.replace('-', '_')}"
+    _dispatch.__qualname__ = _dispatch.__name__
+    return _dispatch  # type: ignore[return-value]
+
+
+#: Named inbox dispatchers for each executor type that uses the inbox path.
+#: These are module-level names so they can be referenced by string in
+#: _EXECUTOR_TYPE_TO_DISPATCHER and monkeypatched in tests.
+_dispatch_via_inbox_functional_engineer: "SubagentDispatcher" = _make_inbox_dispatcher("functional-engineer")
+_dispatch_via_inbox_lobster_ops: "SubagentDispatcher" = _make_inbox_dispatcher("lobster-ops")
+_dispatch_via_inbox_general: "SubagentDispatcher" = _make_inbox_dispatcher("general")
+_dispatch_via_inbox_lobster_generalist: "SubagentDispatcher" = _make_inbox_dispatcher("lobster-generalist")
+_dispatch_via_inbox_lobster_meta: "SubagentDispatcher" = _make_inbox_dispatcher("lobster-meta")
+
+
+def _dispatch_via_inbox(instructions: str, uow_id: str, agent_type: str = "functional-engineer") -> str:
     """
     Production dispatcher: write a wos_execute message to the Lobster inbox.
 
@@ -1282,6 +1322,13 @@ def _dispatch_via_inbox(instructions: str, uow_id: str) -> str:
     reads ~/messages/inbox/ on each cycle. When it sees a message with
     type='wos_execute', it spawns a background subagent via the Task tool
     with the prescribed instructions.
+
+    The ``agent_type`` field is included in the message so the dispatcher can
+    spawn the correct subagent_type (e.g. "lobster-meta" for philosophical UoWs,
+    "lobster-generalist" for human-judgment UoWs). Callers should use the typed
+    dispatcher factory (``_make_inbox_dispatcher``) or one of the named
+    dispatchers (``_dispatch_via_inbox_lobster_meta``, etc.) rather than calling
+    this function directly — this preserves the SubagentDispatcher protocol.
 
     This eliminates the 0–3 minute polling hop from the heartbeat: dispatch
     happens on the next dispatcher cycle (~seconds) rather than the next
@@ -1317,6 +1364,7 @@ def _dispatch_via_inbox(instructions: str, uow_id: str) -> str:
         "type": "wos_execute",
         "chat_id": _DISPATCH_CHAT_ID,
         "uow_id": uow_id,
+        "agent_type": agent_type,
         "instructions": instructions,
         "timestamp": _now_iso(),
     }
