@@ -12,6 +12,7 @@ Usage:
 Environment variables honored:
     LOBSTER_WORKSPACE  — workspace root (default: ~/lobster-workspace)
     LOBSTER_REPO       — repo root (default: ~/lobster)
+    REGISTRY_DB_PATH   — override path for registry.db (default: <workspace>/orchestration/registry.db)
 """
 
 import os
@@ -33,7 +34,7 @@ LOBSTER_REPO = Path(
 # WOS / orchestration
 # ---------------------------------------------------------------------------
 
-REGISTRY_DB = LOBSTER_WORKSPACE / "orchestration" / "registry.db"
+REGISTRY_DB = Path(os.environ["REGISTRY_DB_PATH"]) if os.environ.get("REGISTRY_DB_PATH") else LOBSTER_WORKSPACE / "orchestration" / "registry.db"
 WOS_CONFIG = LOBSTER_WORKSPACE / "data" / "wos-config.json"
 
 # ---------------------------------------------------------------------------
@@ -46,6 +47,7 @@ SURFACE_QUEUE = META_DIR / "reflective-surface-queue.json"
 # Oracle files live in the repo, not the workspace
 ORACLE_DECISIONS = LOBSTER_REPO / "oracle" / "decisions.md"
 ORACLE_LEARNINGS = LOBSTER_REPO / "oracle" / "learnings.md"
+ORACLE_PATTERNS = LOBSTER_REPO / "oracle" / "patterns.md"
 
 # ---------------------------------------------------------------------------
 # Hygiene / auto-router queue

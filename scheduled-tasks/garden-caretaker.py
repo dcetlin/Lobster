@@ -43,6 +43,8 @@ _SRC_ROOT = _REPO_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
+from src.orchestration.paths import REGISTRY_DB
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -60,18 +62,6 @@ log = logging.getLogger("garden-caretaker")
 
 _REPO = "dcetlin/Lobster"
 _JOB_NAME = "garden-caretaker"
-
-
-# ---------------------------------------------------------------------------
-# Path helpers — mirrors executor-heartbeat.py convention
-# ---------------------------------------------------------------------------
-
-def _default_db_path() -> Path:
-    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-    env_override = os.environ.get("REGISTRY_DB_PATH")
-    if env_override:
-        return Path(env_override)
-    return workspace / "orchestration" / "registry.db"
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +120,7 @@ def main() -> int:
         return 0
 
     # Resolve DB path and verify it exists
-    db_path = _default_db_path()
+    db_path = REGISTRY_DB
     if not db_path.exists():
         log.error("Registry DB not found at %s — run install/migrate first", db_path)
         return 1

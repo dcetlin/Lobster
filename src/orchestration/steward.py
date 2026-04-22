@@ -166,6 +166,191 @@ _LLM_FALLBACK_WARNING_THRESHOLD = 3
 # Path to Claude Code credentials (OAuth tokens).
 _CREDENTIALS_PATH = Path(os.path.expanduser("~/.claude/.credentials.json"))
 
+# Warn (and attempt refresh) when the token expires within this many seconds (2 hours).
+_TOKEN_EXPIRY_WARN_SECONDS = 2 * 3600
+
+# Unix timestamps above this threshold are assumed to be in milliseconds rather
+# than seconds.  A value of 1e11 seconds would be ~year 5138, so any realistic
+# "seconds since epoch" value will be well below this.  Claude Code's credentials
+# store uses milliseconds (matching JS Date.now()), so we normalise those here.
+_MILLISECOND_TIMESTAMP_THRESHOLD = 1e11
+
+# Anthropic OAuth 2.0 token refresh endpoint.
+_ANTHROPIC_OAUTH_TOKEN_ENDPOINT = "https://platform.claude.com/v1/oauth/token"
+
+# Timeout for the token refresh HTTP request (seconds).
+_TOKEN_REFRESH_HTTP_TIMEOUT = 10
+
+
+class _TokenStatus:
+    """Return values for _check_token_expiry — distinguishes actionable states."""
+    FRESH = "fresh"          # token valid, no refresh needed
+    NEAR_EXPIRY = "near_expiry"  # within warning window — attempt refresh
+    EXPIRED = "expired"      # already expired — attempt refresh
+    UNKNOWN = "unknown"      # expiresAt absent or unparseable — do nothing
+
+
+def _normalise_timestamp(expires_at: int | float) -> float:
+    """Convert a numeric expiresAt to Unix seconds, handling millisecond values.
+
+    Claude Code's credentials.json stores expiresAt as a JavaScript timestamp
+    (milliseconds since epoch).  Python's datetime.fromtimestamp() expects
+    seconds.  Values above _MILLISECOND_TIMESTAMP_THRESHOLD are divided by
+    1000 before conversion.
+
+    Returns a float Unix timestamp in seconds.
+    """
+    if expires_at > _MILLISECOND_TIMESTAMP_THRESHOLD:
+        return expires_at / 1000
+    return float(expires_at)
+
+
+def _check_token_expiry(expires_at: object) -> str:
+    """Check whether the OAuth token is near expiry or already expired.
+
+    Handles ISO 8601 strings, Unix timestamps in seconds (int/float), and
+    Unix timestamps in milliseconds (detected by magnitude).  If the value is
+    absent, None, or unparseable, logs at DEBUG level and returns UNKNOWN —
+    this is not treated as an error.
+
+    Returns one of the _TokenStatus constants.
+    """
+    if expires_at is None:
+        log.debug("_build_claude_env: expiresAt not present in credentials.json — skipping expiry check")
+        return _TokenStatus.UNKNOWN
+
+    now = datetime.now(timezone.utc)
+
+    try:
+        if isinstance(expires_at, (int, float)):
+            expiry = datetime.fromtimestamp(_normalise_timestamp(expires_at), tz=timezone.utc)
+        else:
+            expiry = datetime.fromisoformat(str(expires_at))
+            # Attach UTC if the parsed datetime is naive.
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+    except (ValueError, OSError, OverflowError) as exc:
+        log.debug(
+            "_build_claude_env: could not parse expiresAt %r: %s — skipping expiry check",
+            expires_at,
+            exc,
+        )
+        return _TokenStatus.UNKNOWN
+
+    hours_remaining = (expiry - now).total_seconds() / 3600
+
+    if hours_remaining < 0:
+        log.error(
+            "Claude API token expired %.1f hours ago — attempting refresh",
+            abs(hours_remaining),
+        )
+        return _TokenStatus.EXPIRED
+    elif hours_remaining * 3600 < _TOKEN_EXPIRY_WARN_SECONDS:
+        log.warning(
+            "Claude API token expires in %.1f hours — attempting refresh",
+            hours_remaining,
+        )
+        return _TokenStatus.NEAR_EXPIRY
+    else:
+        return _TokenStatus.FRESH
+
+
+def _refresh_oauth_token(refresh_token: str, credentials_path: Path) -> str | None:
+    """Exchange a refresh token for a new access token via the Anthropic OAuth endpoint.
+
+    Sends a standard OAuth 2.0 refresh_token grant to
+    https://platform.claude.com/v1/oauth/token, writes the new accessToken
+    and expiresAt back to credentials_path (preserving all other fields), and
+    returns the new access token string.
+
+    On any failure (network error, HTTP error, malformed response) logs an
+    error and returns None — the caller should fall back to the existing token.
+    This function never raises.
+
+    Args:
+        refresh_token:     The long-lived refresh token from credentials.json.
+        credentials_path:  Path to the credentials.json file to update on success.
+
+    Returns:
+        New access token string on success, None on failure.
+    """
+    import urllib.request
+
+    payload = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }).encode()
+
+    req = urllib.request.Request(
+        _ANTHROPIC_OAUTH_TOKEN_ENDPOINT,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=_TOKEN_REFRESH_HTTP_TIMEOUT) as resp:
+            body = resp.read()
+        data = json.loads(body)
+    except urllib.error.HTTPError as exc:
+        log.error(
+            "_refresh_oauth_token: HTTP %d from Anthropic token endpoint — refresh failed",
+            exc.code,
+        )
+        return None
+    except urllib.error.URLError as exc:
+        log.error(
+            "_refresh_oauth_token: network error contacting Anthropic token endpoint: %s",
+            exc,
+        )
+        return None
+    except json.JSONDecodeError as exc:
+        log.error(
+            "_refresh_oauth_token: could not parse response from token endpoint: %s",
+            exc,
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        log.error("_refresh_oauth_token: unexpected error during refresh: %s", exc)
+        return None
+
+    new_access_token = data.get("access_token", "").strip()
+    if not new_access_token:
+        log.error(
+            "_refresh_oauth_token: token endpoint response missing 'access_token' field"
+        )
+        return None
+
+    # Compute new expiresAt from the expires_in field (seconds) returned by the
+    # server.  Store as a Unix timestamp in seconds (float) — callers that need
+    # the millisecond format used by Claude Code can multiply by 1000; we prefer
+    # the simpler seconds format here so that _check_token_expiry handles it
+    # without ambiguity.
+    expires_in: int = data.get("expires_in", 0)
+    new_expiry_ts: float = (datetime.now(timezone.utc).timestamp() + expires_in)
+
+    # Merge into the existing credentials.json, preserving all other fields.
+    try:
+        raw = credentials_path.read_text()
+        creds = json.loads(raw)
+        creds.setdefault("claudeAiOauth", {})
+        creds["claudeAiOauth"]["accessToken"] = new_access_token
+        creds["claudeAiOauth"]["expiresAt"] = new_expiry_ts
+        credentials_path.write_text(json.dumps(creds, indent=2))
+        log.info(
+            "_refresh_oauth_token: credentials.json updated with new token (expires in %dh)",
+            expires_in // 3600,
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        # Disk write failed — we still have the new token in memory.  Log the
+        # error but return the token so the caller can use it for this cycle.
+        log.error(
+            "_refresh_oauth_token: could not write updated credentials.json: %s",
+            exc,
+        )
+
+    return new_access_token
+
 
 def _build_claude_env() -> dict[str, str]:
     """Build an environment dict suitable for spawning a `claude -p` subprocess.
@@ -178,6 +363,12 @@ def _build_claude_env() -> dict[str, str]:
     2. `~/.claude/.credentials.json` — used when the parent process is a cron
        job that has no inherited OAuth token.  Reads the stored `accessToken`
        from the `claudeAiOauth` sub-object.
+
+    When the slow path reads a token, it also checks `expiresAt`.  If the token
+    is within _TOKEN_EXPIRY_WARN_SECONDS of expiry (or already expired) AND a
+    `refreshToken` is present, a refresh is attempted before returning.  On a
+    successful refresh the new token is used; on failure the old token is
+    returned with an error logged.
 
     If neither source provides a token the env is returned without
     `CLAUDE_CODE_OAUTH_TOKEN` and the subprocess will attempt its own refresh
@@ -202,6 +393,27 @@ def _build_claude_env() -> dict[str, str]:
         if token:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = token
             log.debug("_build_claude_env: injected CLAUDE_CODE_OAUTH_TOKEN from credentials.json")
+
+        status = _check_token_expiry(oauth.get("expiresAt"))
+
+        # Attempt refresh when the token is near expiry or already expired.
+        if status in (_TokenStatus.NEAR_EXPIRY, _TokenStatus.EXPIRED):
+            refresh_token = oauth.get("refreshToken", "").strip()
+            if refresh_token:
+                new_token = _refresh_oauth_token(refresh_token, _CREDENTIALS_PATH)
+                if new_token:
+                    env["CLAUDE_CODE_OAUTH_TOKEN"] = new_token
+                    log.info("_build_claude_env: token refreshed successfully")
+                else:
+                    log.error(
+                        "_build_claude_env: token refresh failed — proceeding with existing token"
+                    )
+            else:
+                log.warning(
+                    "_build_claude_env: token near expiry but no refreshToken in credentials.json"
+                    " — cannot refresh automatically"
+                )
+
     except (OSError, json.JSONDecodeError, KeyError) as exc:
         log.warning("_build_claude_env: could not read credentials.json: %s", exc)
 
@@ -1918,6 +2130,114 @@ def _count_consecutive_llm_fallbacks(current_log_str: str | None) -> int:
             break
 
     return consecutive
+
+
+# ---------------------------------------------------------------------------
+# Loop-pattern-aware dispatch eligibility (oracle/patterns.md thresholds)
+# ---------------------------------------------------------------------------
+
+# Spiral: oracle passes >= this value → escalate dispatch
+# Source: oracle/patterns.md §spiral — "oracle_pass_count ≥ 3"
+SPIRAL_ORACLE_PASS_THRESHOLD: int = 3
+
+# Dead-end: failed/blocked transitions >= this value → pause dispatch
+# Source: oracle/patterns.md §dead-end — "failed or blocked state ≥2 times"
+DEAD_END_FAILURE_THRESHOLD: int = 2
+
+# Burst: throttle to this many UoWs per cycle when burst is detected
+# Source: oracle/patterns.md §burst — "batch into groups of 3"
+BURST_BATCH_SIZE: int = 3
+
+# Burst: hard lower bound for the baseline queue depth used in spike detection.
+# Queue depths at or above 2x this value are treated as a burst.
+# Source: oracle/patterns.md §burst — hard lower bound comment
+BURST_BASELINE_QUEUE_DEPTH: int = 6
+
+
+def _count_oracle_passes(audit_entries: list[dict]) -> int:
+    """Count oracle_approved events in the audit log for a UoW.
+
+    Each oracle_approved entry represents one complete oracle pass that
+    returned APPROVED for this UoW. Used by the Spiral pattern detector.
+
+    NOTE: oracle_pass_count will always be 0 until the oracle agent integration
+    writes event="oracle_approved" to the UoW audit log. The spiral gate is
+    structurally correct but non-functional until that write is wired.
+    See: https://github.com/dcetlin/Lobster/issues/810
+
+    Pure function — reads only audit_entries; no side effects.
+    """
+    return sum(1 for e in audit_entries if e.get("event") == "oracle_approved")
+
+
+def _count_failed_or_blocked_transitions(audit_entries: list[dict]) -> int:
+    """Count audit entries where the UoW transitioned to failed or blocked.
+
+    Includes both executor-driven failures (to_status='failed') and
+    Steward-driven surface/block transitions (to_status='blocked').
+    Used by the Dead-end pattern detector.
+
+    Pure function — reads only audit_entries; no side effects.
+    """
+    terminal = {"failed", "blocked"}
+    return sum(1 for e in audit_entries if e.get("to_status") in terminal)
+
+
+def _check_dispatch_eligibility(
+    uow: "UoW",
+    audit_entries: list[dict],
+    queue_depth: int,
+) -> str:
+    """Determine whether this UoW should be dispatched, paused, escalated, or throttled.
+
+    Reads UoW history (via audit_entries) and the current queue depth to detect
+    the loop anti-patterns defined in oracle/patterns.md.
+
+    Returns one of:
+    - "dispatch"  — no pattern detected; proceed normally
+    - "pause"     — dead-end detected; suppress re-dispatch, write blocker prescription
+    - "escalate"  — spiral detected; pause dispatch, write escalation prescription
+    - "throttle"  — burst detected; limit batch size to BURST_BATCH_SIZE per cycle
+
+    Precedence when multiple patterns fire: escalate > pause > throttle > dispatch.
+
+    Pure function — no side effects, no DB writes.
+    """
+    # Spiral check (highest precedence)
+    # NOTE: oracle_pass_count will always be 0 until the oracle agent integration
+    # writes event="oracle_approved" to the UoW audit log. The spiral gate is
+    # structurally correct but non-functional until that write is wired.
+    # See: https://github.com/dcetlin/Lobster/issues/810
+    oracle_passes = _count_oracle_passes(audit_entries)
+    if oracle_passes >= SPIRAL_ORACLE_PASS_THRESHOLD:
+        log.debug(
+            "_check_dispatch_eligibility: spiral detected for %s "
+            "(oracle_pass_count=%d >= %d)",
+            uow.id, oracle_passes, SPIRAL_ORACLE_PASS_THRESHOLD,
+        )
+        return "escalate"
+
+    # Dead-end check
+    failures = _count_failed_or_blocked_transitions(audit_entries)
+    if failures >= DEAD_END_FAILURE_THRESHOLD:
+        log.debug(
+            "_check_dispatch_eligibility: dead-end detected for %s "
+            "(failed_or_blocked=%d >= %d)",
+            uow.id, failures, DEAD_END_FAILURE_THRESHOLD,
+        )
+        return "pause"
+
+    # Burst check (lowest precedence above dispatch)
+    burst_spike_threshold = BURST_BASELINE_QUEUE_DEPTH * 2
+    if queue_depth >= burst_spike_threshold:
+        log.debug(
+            "_check_dispatch_eligibility: burst detected for %s "
+            "(queue_depth=%d >= %d)",
+            uow.id, queue_depth, burst_spike_threshold,
+        )
+        return "throttle"
+
+    return "dispatch"
 
 
 def _notify_llm_fallback_warning(
@@ -3826,6 +4146,10 @@ def run_steward_cycle(
 
     log.debug("Steward cycle: %d ready-for-steward UoWs found", len(uows))
 
+    # Queue depth snapshot used by the Burst pattern check in _check_dispatch_eligibility.
+    # Captured once before the loop so all per-UoW checks see the same depth value.
+    _queue_depth = len(uows)
+
     evaluated = 0
     prescribed = 0
     done = 0
@@ -3833,6 +4157,7 @@ def run_steward_cycle(
     skipped = 0
     race_skipped = 0
     wait_for_trace = 0
+    throttle_count = 0
     considered_ids = []
 
     for uow in uows:
@@ -3922,6 +4247,53 @@ def run_steward_cycle(
                     })
                 skipped += 1
                 continue
+
+        # Dispatch eligibility gate (oracle/patterns.md): check for spiral,
+        # dead-end, and burst patterns before committing to a prescription cycle.
+        _eligibility = _check_dispatch_eligibility(uow, audit_entries, _queue_depth)
+        if _eligibility == "throttle":
+            if throttle_count < BURST_BATCH_SIZE:
+                # Within the allowed burst batch — dispatch normally and count it.
+                throttle_count += 1
+                log.debug(
+                    "dispatch_eligibility: uow_id=%s throttle allowed "
+                    "(throttle_count=%d/%d)",
+                    uow_id, throttle_count, BURST_BATCH_SIZE,
+                )
+            else:
+                # Beyond BURST_BATCH_SIZE for this cycle — skip.
+                log.info(
+                    "dispatch_eligibility: uow_id=%s skipped — pattern=throttle "
+                    "(throttle_count=%d >= BURST_BATCH_SIZE=%d)",
+                    uow_id, throttle_count, BURST_BATCH_SIZE,
+                )
+                if not dry_run:
+                    registry.append_audit_log(uow_id, {
+                        "event": "dispatch_eligibility_skip",
+                        "actor": _ACTOR_STEWARD,
+                        "uow_id": uow_id,
+                        "steward_cycles": uow.steward_cycles,
+                        "eligibility": _eligibility,
+                        "timestamp": _now_iso(),
+                    })
+                skipped += 1
+                continue
+        elif _eligibility != "dispatch":
+            log.info(
+                "dispatch_eligibility: uow_id=%s skipped — pattern=%s",
+                uow_id, _eligibility,
+            )
+            if not dry_run:
+                registry.append_audit_log(uow_id, {
+                    "event": "dispatch_eligibility_skip",
+                    "actor": _ACTOR_STEWARD,
+                    "uow_id": uow_id,
+                    "steward_cycles": uow.steward_cycles,
+                    "eligibility": _eligibility,
+                    "timestamp": _now_iso(),
+                })
+            skipped += 1
+            continue
 
         evaluated += 1
         try:

@@ -53,6 +53,8 @@ _SRC_ROOT = _REPO_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
+from src.orchestration.paths import REGISTRY_DB
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -117,20 +119,6 @@ def _warn_if_legacy_registry_exists() -> None:
 # ---------------------------------------------------------------------------
 
 RECOVERY_STALE_MINUTES: int = 5
-
-
-# ---------------------------------------------------------------------------
-# DB path helper — mirrors steward-heartbeat.py
-# ---------------------------------------------------------------------------
-
-def _default_db_path() -> Path:
-    workspace = Path(os.environ.get(
-        "LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"
-    ))
-    env_override = os.environ.get("REGISTRY_DB_PATH")
-    if env_override:
-        return Path(env_override)
-    return workspace / "orchestration" / "registry.db"
 
 
 # ---------------------------------------------------------------------------
@@ -451,7 +439,7 @@ def main() -> int:
 
     from src.orchestration.registry import Registry
 
-    db_path = _default_db_path()
+    db_path = REGISTRY_DB
     if not db_path.exists():
         log.error("Registry DB not found at %s — run install/migrate first", db_path)
         return 1

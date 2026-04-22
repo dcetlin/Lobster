@@ -33,6 +33,8 @@ from orchestration.executor import (
     ExecutorOutcome,
     _result_json_path,
     _noop_dispatcher,
+    _dispatch_via_claude_p,
+    _dispatch_via_stub,
 )
 
 
@@ -349,3 +351,92 @@ class TestHappyPath:
         output_ref = _get_output_ref(db_path, uow_id)
         data = _read_result_json(output_ref)
         assert data.get("executor_id") == "task-xyz-run-id"
+
+
+# ---------------------------------------------------------------------------
+# Auth token passthrough — CLAUDE_CODE_OAUTH_TOKEN must reach the subprocess
+# ---------------------------------------------------------------------------
+
+class TestAuthTokenPassthrough:
+    """
+    _dispatch_via_claude_p and _dispatch_via_stub must pass CLAUDE_CODE_OAUTH_TOKEN
+    to run_subprocess_with_error_capture via the env= kwarg.
+
+    Cron strips the inherited environment, so without explicit env injection the
+    subprocess never receives the OAuth token and fails authentication. The fix
+    calls _build_claude_env() — which reads the token from the process environment
+    or falls back to ~/.claude/.credentials.json — and passes the result as env=.
+
+    These tests patch run_subprocess_with_error_capture inside the executor module
+    and capture the env kwarg to confirm the token is present.
+    """
+
+    def test_dispatch_via_claude_p_passes_oauth_token_in_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_dispatch_via_claude_p passes CLAUDE_CODE_OAUTH_TOKEN to the subprocess env."""
+        import orchestration.executor as executor_mod
+
+        captured_envs: list[dict] = []
+
+        def mock_run_capture(*args, **kwargs):
+            captured_envs.append(kwargs.get("env") or {})
+            proc = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            return proc, None
+
+        monkeypatch.setattr(executor_mod, "run_subprocess_with_error_capture", mock_run_capture)
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test-token-executor")
+
+        _dispatch_via_claude_p("do the thing", "uow-test-auth-001")
+
+        assert len(captured_envs) == 1, "Expected exactly one subprocess call"
+        assert captured_envs[0].get("CLAUDE_CODE_OAUTH_TOKEN") == "sk-ant-oat01-test-token-executor"
+
+    def test_dispatch_via_stub_passes_oauth_token_in_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_dispatch_via_stub passes CLAUDE_CODE_OAUTH_TOKEN to the subprocess env."""
+        import orchestration.executor as executor_mod
+
+        captured_envs: list[dict] = []
+
+        def mock_run_capture(*args, **kwargs):
+            captured_envs.append(kwargs.get("env") or {})
+            proc = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            return proc, None
+
+        monkeypatch.setattr(executor_mod, "run_subprocess_with_error_capture", mock_run_capture)
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test-token-stub")
+
+        _dispatch_via_stub("frontier-writer", "do the thing", "uow-test-auth-002")
+
+        assert len(captured_envs) == 1, "Expected exactly one subprocess call"
+        assert captured_envs[0].get("CLAUDE_CODE_OAUTH_TOKEN") == "sk-ant-oat01-test-token-stub"
+
+    def test_dispatch_via_claude_p_falls_back_to_credentials_json(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """When CLAUDE_CODE_OAUTH_TOKEN is absent from env, _build_claude_env reads it from credentials.json."""
+        import orchestration.executor as executor_mod
+        import orchestration.steward as steward_mod
+
+        captured_envs: list[dict] = []
+
+        def mock_run_capture(*args, **kwargs):
+            captured_envs.append(kwargs.get("env") or {})
+            proc = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            return proc, None
+
+        # Write a credentials.json in a temp dir and point _CREDENTIALS_PATH at it
+        creds_file = tmp_path / ".credentials.json"
+        creds_file.write_text(
+            '{"claudeAiOauth": {"accessToken": "sk-ant-oat01-from-credentials-json"}}'
+        )
+        monkeypatch.setattr(steward_mod, "_CREDENTIALS_PATH", creds_file)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr(executor_mod, "run_subprocess_with_error_capture", mock_run_capture)
+
+        _dispatch_via_claude_p("do the thing", "uow-test-auth-003")
+
+        assert len(captured_envs) == 1
+        assert captured_envs[0].get("CLAUDE_CODE_OAUTH_TOKEN") == "sk-ant-oat01-from-credentials-json"

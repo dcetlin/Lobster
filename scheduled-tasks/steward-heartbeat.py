@@ -55,6 +55,7 @@ _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from src.orchestration.paths import REGISTRY_DB
 from src.orchestration.steward import is_bootup_candidate_gate_active, run_steward_cycle
 from src.orchestration.github_sync import run_post_completion_sync
 
@@ -204,18 +205,6 @@ class _Clock(Protocol):
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _default_db_path() -> Path:
-    workspace = Path(os.environ.get(
-        "LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"
-    ))
-    # Primary: orchestration/registry.db (used by registry_cli.py and the Executor)
-    # Fallback: REGISTRY_DB_PATH env override (used in tests and alternate installs)
-    env_override = os.environ.get("REGISTRY_DB_PATH")
-    if env_override:
-        return Path(env_override)
-    return workspace / "orchestration" / "registry.db"
 
 
 def _warn_if_legacy_registry_exists() -> None:
@@ -541,7 +530,7 @@ def main() -> int:
 
     from src.orchestration.registry import Registry
 
-    db_path = _default_db_path()
+    db_path = REGISTRY_DB
     if not db_path.exists():
         log.error("Registry DB not found at %s — run install/migrate first", db_path)
         return 1

@@ -223,6 +223,28 @@ def inbox_server_dirs(isolate_inbox_server_paths):
     return isolate_inbox_server_paths
 
 
+@pytest.fixture(autouse=True)
+def isolate_executor_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect WOS executor output files away from the production outputs dir.
+
+    Sets the WOS_OUTPUTS_DIR environment variable to a per-test tmpdir so that
+    ``_output_ref_path()`` in executor.py writes to tmp_path instead of
+    ``~/lobster-workspace/orchestration/outputs/``.
+
+    This prevents test artifacts (including intentional failure cases) from
+    contaminating the production record.  See issue #819.
+
+    The redirect is transparent to tests: they can still inspect the output
+    files via the returned path if needed.  Tests that already monkeypatch
+    ``_OUTPUT_DIR_TEMPLATE`` directly continue to work — the env var is only
+    the *default* fallback inside ``_output_ref_path``.
+    """
+    outputs_dir = tmp_path / "orchestration" / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("WOS_OUTPUTS_DIR", str(outputs_dir))
+    return outputs_dir
+
+
 # =============================================================================
 # Directory Fixtures
 # =============================================================================
