@@ -39,13 +39,18 @@ from typing import Any
 
 log = logging.getLogger("routing_classifier")
 
-# Default classifier YAML path — overridable via env var for tests.
-_DEFAULT_CLASSIFIER_PATH = Path(
-    os.environ.get(
-        "WOS_CLASSIFIER_YAML",
-        Path.home() / "lobster-user-config" / "orchestration" / "classifier.yaml",
-    )
+# Default classifier YAML path fallback — used when WOS_CLASSIFIER_YAML is not set.
+# NOT read at import time; _default_classifier_path() is called lazily at classify_posture
+# call time so that monkeypatch.setenv("WOS_CLASSIFIER_YAML", ...) takes effect in tests.
+_CLASSIFIER_YAML_DEFAULT_FALLBACK = (
+    Path.home() / "lobster-user-config" / "orchestration" / "classifier.yaml"
 )
+
+
+def _default_classifier_path() -> Path:
+    """Return the default classifier path, reading WOS_CLASSIFIER_YAML at call time."""
+    env_val = os.environ.get("WOS_CLASSIFIER_YAML")
+    return Path(env_val) if env_val else _CLASSIFIER_YAML_DEFAULT_FALLBACK
 
 # Written to route_reason when the classifier file is absent or cannot be parsed.
 FALLBACK_ROUTE_REASON = "classifier-unavailable: defaulting to solo"
@@ -160,7 +165,7 @@ def classify_posture(
         ClassifierResult with posture and route_reason. Never raises — falls
         back to solo on any error so germination is never blocked.
     """
-    path = classifier_path or _DEFAULT_CLASSIFIER_PATH
+    path = classifier_path if classifier_path is not None else _default_classifier_path()
     rules = _load_classifier_yaml(path)
 
     if rules is None:
