@@ -74,8 +74,12 @@ from orchestration.steward import _build_claude_env
 
 LOBSTER_ADMIN_CHAT_ID: str = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
 
-# Output directory for executor result and work files
-_OUTPUT_DIR_TEMPLATE = "~/lobster-workspace/orchestration/outputs"
+# Output directory for executor result and work files.
+# Overridable via WOS_OUTPUTS_DIR env var so tests can redirect to a tmpdir
+# without contaminating the production outputs directory.
+_OUTPUT_DIR_TEMPLATE: str = os.environ.get(
+    "WOS_OUTPUTS_DIR", "~/lobster-workspace/orchestration/outputs"
+)
 
 # UoWs stuck in 'active' state longer than this are considered TTL-exceeded
 # and marked 'failed' by recover_ttl_exceeded_uows() at heartbeat startup.
@@ -180,8 +184,14 @@ def _now_iso() -> str:
 
 
 def _output_ref_path(uow_id: str) -> str:
-    """Return the absolute output_ref path for a UoW."""
-    expanded = os.path.expanduser(_OUTPUT_DIR_TEMPLATE)
+    """Return the absolute output_ref path for a UoW.
+
+    Reads WOS_OUTPUTS_DIR from the environment at call time so that tests can
+    redirect output to a tmpdir by setting the env var — without needing to
+    monkeypatch the module-level constant.
+    """
+    outputs_dir = os.environ.get("WOS_OUTPUTS_DIR", _OUTPUT_DIR_TEMPLATE)
+    expanded = os.path.expanduser(outputs_dir)
     return str(Path(expanded) / f"{uow_id}.json")
 
 
