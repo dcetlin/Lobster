@@ -210,6 +210,14 @@ class UoW:
     # to produce vision-anchored route_reason values.
     # NULL = created before Vision Object existed or no vision anchor found.
     vision_ref: dict | None = None
+    # Heartbeat locking fields (populated after migration 0009)
+    # heartbeat_at: ISO timestamp updated periodically by the executing agent to prove
+    #   liveness. NULL until first heartbeat write. The observation loop uses this
+    #   (when non-NULL) instead of started_at for staleness detection.
+    # heartbeat_ttl: Maximum seconds of silence before the steward treats the UoW as
+    #   stalled. Set at claim time from estimated_runtime; default 300 (5 minutes).
+    heartbeat_at: str | None = None
+    heartbeat_ttl: int = 300
 
 
 def _now_iso() -> str:
@@ -362,6 +370,8 @@ class Registry:
             closed_at=d.get("closed_at"),
             close_reason=d.get("close_reason"),
             vision_ref=vision_ref,
+            heartbeat_at=d.get("heartbeat_at"),
+            heartbeat_ttl=d.get("heartbeat_ttl") or 300,
         )
 
     def _write_audit(
@@ -1775,6 +1785,184 @@ class Registry:
             if rows_affected == 0:
                 raise ValueError(f"uow_id not found: {uow_id}")
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    # -----------------------------------------------------------------------
+    # Heartbeat locking methods (migration 0009)
+    # -----------------------------------------------------------------------
+
+    def write_heartbeat(self, uow_id: str) -> int:
+        """
+        Update heartbeat_at for an executing UoW to prove agent liveness.
+
+        Uses an optimistic lock on status IN ('active', 'executing') so that
+        a heartbeat write after the UoW has been recovered (transitioned to
+        ready-for-steward) is a no-op rather than a silent overwrite.
+
+        Returns rowcount: 1 on success, 0 if the UoW is no longer in an
+        executing state (e.g. already recovered by the observation loop).
+
+        The write is fire-and-forget from the agent's perspective — agents
+        call this unconditionally on a regular interval (every 60–90s) and
+        do not need to act on the return value.
+        """
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            cursor = conn.execute(
+                """
+                UPDATE uow_registry
+                SET heartbeat_at = ?, updated_at = ?
+                WHERE id = ? AND status IN ('active', 'executing')
+                """,
+                (now, now, uow_id),
+            )
+            conn.commit()
+            return cursor.rowcount
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def set_heartbeat_ttl(self, uow_id: str, heartbeat_ttl: int) -> None:
+        """
+        Set heartbeat_ttl and initialize heartbeat_at at claim time.
+
+        Called by the Executor after claiming a UoW (after started_at is written).
+        Sets heartbeat_ttl to the provided value (derived from estimated_runtime
+        or the default 300s). Also writes the initial heartbeat_at timestamp so
+        the observation loop has a baseline from which to measure silence.
+
+        Args:
+            uow_id: The UoW identifier.
+            heartbeat_ttl: Maximum silence threshold in seconds before the
+                observation loop considers this UoW stalled.
+        """
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE uow_registry
+                SET heartbeat_at = ?, heartbeat_ttl = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, heartbeat_ttl, now, uow_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_stale_heartbeat_uows(self, buffer_seconds: int = 30) -> list["UoW"]:
+        """
+        Return UoWs where the heartbeat has gone stale.
+
+        Staleness condition (all must hold):
+        1. status IN ('active', 'executing') — UoW is in-flight
+        2. heartbeat_at IS NOT NULL — agent has written at least one heartbeat
+        3. (now - heartbeat_at) > heartbeat_ttl + buffer_seconds
+
+        The buffer_seconds argument adds a grace period on top of heartbeat_ttl
+        to absorb minor clock skew and scheduling jitter between the agent's
+        heartbeat write and the steward's observation check. Default: 30s.
+
+        UoWs with heartbeat_at = NULL are NOT returned — those use the legacy
+        started_at-based TTL path in the existing observation loop.
+
+        Args:
+            buffer_seconds: Grace period added to heartbeat_ttl before declaring
+                a stall. Default 30 to absorb scheduling jitter.
+
+        Returns:
+            List of UoW objects with stale heartbeats (may be empty).
+        """
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            rows = conn.execute(
+                """
+                SELECT * FROM uow_registry
+                WHERE status IN ('active', 'executing')
+                  AND heartbeat_at IS NOT NULL
+                  AND (
+                    CAST((julianday(?) - julianday(heartbeat_at)) * 86400 AS INTEGER)
+                    > heartbeat_ttl + ?
+                  )
+                ORDER BY heartbeat_at ASC
+                """,
+                (now, buffer_seconds),
+            ).fetchall()
+            return [self._row_to_uow(r) for r in rows]
+        finally:
+            conn.close()
+
+    def record_heartbeat_stall(
+        self,
+        uow_id: str,
+        heartbeat_at: str | None,
+        heartbeat_ttl: int,
+        silence_seconds: float,
+    ) -> int:
+        """
+        Atomically write a heartbeat_stall audit entry and transition the UoW
+        from ('active' or 'executing') to 'ready-for-steward'.
+
+        Follows the same optimistic-lock + audit pattern as record_stall_detected:
+        - Transition first (optimistic lock on status IN ('active', 'executing')).
+        - Audit INSERT only if rows_affected == 1 (prevents phantom audit on race).
+        - Both roll back together if either fails.
+
+        Returns 1 if the transition succeeded; 0 if another component already
+        advanced this UoW (race-safe — no audit entry written in that case).
+        """
+        now = _now_iso()
+        note_payload = json.dumps({
+            "event": "stall_detected",
+            "stall_type": "heartbeat_stall",
+            "actor": "observation_loop",
+            "uow_id": uow_id,
+            "heartbeat_at": heartbeat_at,
+            "heartbeat_ttl": heartbeat_ttl,
+            "silence_seconds": silence_seconds,
+            "timestamp": now,
+        })
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            cursor = conn.execute(
+                """
+                UPDATE uow_registry
+                SET status = 'ready-for-steward', updated_at = ?
+                WHERE id = ? AND status IN ('active', 'executing')
+                """,
+                (now, uow_id),
+            )
+            rows_affected = cursor.rowcount
+
+            if rows_affected == 1:
+                conn.execute(
+                    """
+                    INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                    VALUES (?, ?, 'stall_detected', 'active', 'ready-for-steward',
+                            'observation_loop', ?)
+                    """,
+                    (now, uow_id, note_payload),
+                )
+
+            conn.commit()
+            return rows_affected
+
         except Exception:
             conn.rollback()
             raise

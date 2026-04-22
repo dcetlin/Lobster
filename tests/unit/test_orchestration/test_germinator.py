@@ -182,6 +182,80 @@ class TestGate3Philosophical:
         assert result.register == "operational"
         assert result.gate_matched == "1"
 
+    def test_lichtung_triggers_philosophical(self):
+        from src.orchestration.germinator import classify_register
+        # "lichtung" (Heidegger's German term) should still route philosophical
+        result = classify_register(
+            title="Explore lichtung in the Steward's diagnostic act",
+            body="The lichtung is the opening of presence in Heidegger's phenomenology.",
+            success_criteria="Synthesis document written.",
+        )
+        assert result.register == "philosophical"
+        assert result.gate_matched == "3"
+
+    def test_ontological_clearing_triggers_philosophical(self):
+        from src.orchestration.germinator import classify_register
+        # "ontological clearing" as a compound should route philosophical
+        result = classify_register(
+            title="Ontological clearing and the ground of disclosure",
+            body="The ontological clearing precedes all presence.",
+            success_criteria="Notes written.",
+        )
+        assert result.register == "philosophical"
+        assert result.gate_matched == "3"
+
+
+# ---------------------------------------------------------------------------
+# Germinator false-positive regression — "clearing" in engineering context
+# ---------------------------------------------------------------------------
+
+class TestClearingFalsePositiveRegression:
+    """
+    Regression guard: "clearing" alone must NOT trigger philosophical classification.
+
+    The word "clearing" was removed from _PHILOSOPHICAL_TERMS because it caused
+    false positives on any engineering issue mentioning flag-clearing, state-clearing,
+    or cache-clearing. These tests verify that the fix holds.
+    """
+
+    def test_gate_cleared_flag_dedup_is_operational_not_philosophical(self):
+        """
+        An issue about _GATE_CLEARED_FLAG dedup must classify as operational,
+        not philosophical. This is the live-test false positive that motivated the fix.
+        """
+        from src.orchestration.germinator import classify_register
+        result = classify_register(
+            title="Fix _GATE_CLEARED_FLAG dedup",
+            body=(
+                "The _GATE_CLEARED_FLAG is being set before the dedup check runs. "
+                "After clearing the flag, the system reprocesses duplicates it should skip. "
+                "Fix the flag-clearing order in the dedup handler."
+            ),
+            success_criteria="Dedup handler does not reprocess cleared entries.",
+        )
+        assert result.register != "philosophical", (
+            f"'clearing' in engineering context must NOT be classified as philosophical. "
+            f"Got register={result.register!r}, gate={result.gate_matched!r}"
+        )
+
+    def test_cache_clearing_is_not_philosophical(self):
+        from src.orchestration.germinator import classify_register
+        result = classify_register(
+            title="Cache clearing on deploy",
+            body="Add a step to clearing the Redis cache on each deploy to avoid stale reads.",
+            success_criteria="Cache cleared on deploy.",
+        )
+        assert result.register != "philosophical"
+
+    def test_state_clearing_is_not_philosophical(self):
+        from src.orchestration.germinator import classify_register
+        result = classify_register(
+            title="Add state clearing between test runs",
+            body="Each test run should begin with a full clearing of the in-memory state.",
+            success_criteria="State cleared before each test run.",
+        )
+        assert result.register != "philosophical"
+
 
 # ---------------------------------------------------------------------------
 # Gate 4: human-judgment signal in success_criteria

@@ -326,7 +326,7 @@ class TestRunExecutorCycleDispatchEligibility:
         import src.orchestration.executor as src_executor_mod
         monkeypatch.setattr(
             src_executor_mod, "_dispatch_via_inbox",
-            lambda i, u: inbox_called.append(u) or "msg-id",
+            lambda i, u, **kw: inbox_called.append(u) or "msg-id",
         )
 
     def test_fresh_uow_dispatched_immediately(
