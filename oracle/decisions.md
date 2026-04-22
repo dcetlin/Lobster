@@ -2,6 +2,32 @@
 
 ---
 
+### [2026-04-22] PR #830 — feat(orient): proprioceptive gate-miss logging and nightly consolidation summary
+
+**Vision alignment:** The adversarial prior — this implementation is solving the wrong problem, or solving the right problem in a direction that forecloses better paths — finds the most significant tension not in the direction but in the mechanism. The theory of change is: if gate misses are logged via `write_observation`, nightly consolidation surfaces them, and Orient improves over time. The prior asks what would have to be true for this to generate useful signal. The critical condition: the dispatcher must be oriented enough to recognize a gate miss as a gate miss before the logging instruction fires. A dispatcher that reliably identifies gate misses has already half-corrected the failure; the logging is then diagnostic. If the dispatcher misses the gate because it lacks sufficient Orient state, it will also miss the logging instruction — the same failure mode the logging is meant to surface. The issue (#193) notes "zero behavioral-miss observations in 2984 events," which is consistent with either gates being honored or gates being missed without self-recognition. This PR addresses the former case and partially addresses the latter on the margin (it expands the orientation surface the dispatcher reads). The direction is correct: vision.yaml constraint-3 names OODA Orient as the schwerpunkt; current_focus.after_that names the proprioceptive pulse explicitly; principle-5 names discriminator improvement over rule addition. The mechanism is not the cheapest available test of the underlying assumption, but it is strictly additive: even partial signal is better than no signal, and the instruction is placed in the correct location (immediately after the gate table). The larger concern is a concrete implementation defect in nightly-consolidation.md (see Stage 2) that would prevent the consolidation leg of the feedback loop from working.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **`bare python3` in nightly-consolidation.md step 1c violates the `uv` convention and matches a named failure pattern.** The embedded `python3 -c "..."` block in the new step 1c is the exact pattern named in learnings.md PR #804 and PR #821: "bare python3 in instruction documents" and "bare python3 in bash scripts." If `python3` is absent from PATH (because `uv` manages the Python installation), the script silently produces empty output, `gate_miss_summary` is empty, and the proprioceptive bullet is never written. The PR would appear to work (no errors), but the nightly consolidation leg of the feedback loop would produce no signal — which is worse than the pre-PR state because it would suppress even a "no gate misses" confirmation. The fix is to replace `python3 -c` with `uv run python -c` or equivalent. This is a NEEDS_CHANGES finding: the Python invocation convention is a documented system rule (CLAUDE.md), and this PR violates it in the highest-consequence location (the log-reader that closes the feedback loop).
+- **CLAUDE.md gate-miss logging section is correctly structured.** The vocabulary of 8 named gates maps 1:1 to the Tier-1 Gate Register rows. The examples are concrete and unambiguous. The instruction correctly places logging alongside recovery rather than instead of it. No behavioral compression is lost — the table-as-compaction-resistant-encoding golden pattern (2026-03-27) is honored: the new subsection uses prose rather than a table row, but this is appropriate because the subsection is a procedure (when/how to call write_observation), not a gate trigger.
+- **`sys.dispatcher.bootup.md` pseudocode expansion is unambiguous and internally consistent.** The full branch tree for `subagent_observation` is now explicit. The `memory_store` conditional correctly requires both `gate=` and `outcome=miss` in the text, preventing non-gate system_error observations from being routed into the gate-miss memory pipeline. The Bash log-write idiom (`Bash(f'echo ...')`) is consistent with existing dispatcher pseudocode patterns.
+- **No canonical-templates counterpart gap.** `nightly-consolidation.md` has no counterpart in `memory/canonical-templates/` (confirmed by directory listing). The PR #811 learning (runtime edit without canonical-templates update creates installation-class divergence) does not apply here.
+
+**Patterns introduced:** Proprioceptive feedback loop as a three-layer instruction-layer structure: (1) point-of-miss logging in CLAUDE.md; (2) memory routing in the `subagent_observation` handler; (3) nightly consolidation step reading the accumulated log. This layering is a correct application of the existing observation pipeline — it does not introduce new infrastructure, only new use of existing infrastructure.
+
+**What this forecloses:** Nothing structural. The gate table rows are unchanged. The logging instruction is additive. If the proprioceptive signal turns out to be low-volume (because the dispatcher rarely self-diagnoses), the nightly step still runs harmlessly.
+
+**Opportunity cost note:** The proprioceptive pulse was explicitly named in current_focus.after_that — not current_focus.primary (which is WOS executor starvation). The PR is correctly scoped to the instruction layer with zero Python changes, minimizing cost. The `uv` fix is one line and does not change the approach.
+
+**VERDICT: NEEDS_CHANGES**
+
+**Revision contract:**
+- **Gap 1: bare `python3` in nightly-consolidation.md step 1c.** The `python3 -c "..."` invocation must be replaced with `uv run python -c "..."` or `uv run python3 -c "..."`. Resolution criteria: (a) addressed — the revision shows `uv run` at the invocation site; (b) disputed — the author states why `python3` is guaranteed to be in PATH on this instance independent of `uv`, with a specific reason; (c) deferred — the author acknowledges the gap and states why it is not addressed now. The `|| echo 0` pattern is not a sufficient fallback because the failure mode is the entire `python3` invocation producing empty output, not a nonzero exit code.
+
+
+---
+
 ### [2026-04-22] PR #799 — fix: use absolute paths for all oracle/decisions.md references in agent instructions
 
 **Note:** PR #799 was MERGED before oracle review was requested. The following is a post-merge record.
