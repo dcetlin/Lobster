@@ -925,3 +925,11 @@ When an oracle agent's instruction file specifies path A for output and the code
 **Learning: Assertion fixes at the correct line without docstring corrections leave the gate contract undocumented**
 When `approve()` was updated to advance `proposed → pending → ready-for-steward` atomically, the integration test assertion was updated to expect `ready-for-steward`. But the `TestBootupCandidateGate` class docstring still reads "stays in 'pending' until the gate is cleared" and `_seed_uow`'s docstring still reads "approve-to-pending steps." Both are now wrong. The PR #607 learning (comment/code mismatch at state-machine transitions causes silent state divergence) applies at the docstring level as well as the code level. A test assertion that is correct but whose surrounding docstring is wrong gives the next reader an incorrect mental model of the gate contract. Detection: when a PR updates a status assertion from state A to state B, also scan the class docstring and any helper function docstrings that describe the state being tested.
 
+
+---
+
+### [2026-04-22] Relay filter gate is not hook-enforceable
+
+The Relay filter gate ("key signal in paragraph 1 of send_reply") cannot be promoted to a PreToolUse/PostToolUse hook. The rule requires semantic judgment — "key signal" is not a string pattern but a rhetorical concept (what matters most to the reader in context). Attempting mechanical enforcement via paragraph-split position would generate false positives for any multi-paragraph reply where the first paragraph is legitimately framing. The gate remains advisory.
+
+Design gates and Bias to Action are similarly not hook-enforceable for the same reason (mode classification requires understanding intent, not matching text patterns).
