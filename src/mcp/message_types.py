@@ -55,6 +55,7 @@ INBOX_SYSTEM_TYPES: frozenset[str] = frozenset({
     "task-output",            # DEPRECATED alias — normalizes to "health_check" on ingest (scripts/daily-health-check.sh)
     "debug_observation",      # debug output from inbox_server.py internals; excluded from skill processing
     "session_note_reminder",  # MCP counter reached 20 user messages — dispatcher should spawn session-note-appender
+    "wos_execute",            # WOS executor dispatched a UoW — dispatcher must call route_wos_message() to spawn subagent (issue #856)
 })
 
 # ---------------------------------------------------------------------------

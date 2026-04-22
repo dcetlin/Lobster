@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import pytest
 
-from src.orchestration.dispatcher_handlers import handle_approve, handle_confirm, handle_decide, handle_decide_defer, handle_wos_execute, handle_wos_status, handle_wos_unblock
+from src.orchestration.dispatcher_handlers import handle_approve, handle_confirm, handle_decide, handle_decide_defer, handle_wos_execute, handle_wos_status, handle_wos_unblock, route_wos_message, WOS_MESSAGE_TYPE_DISPATCH
 
 
 @pytest.fixture
@@ -435,3 +435,113 @@ class TestHandleDecideDefer:
         ).fetchone()[0]
         conn.close()
         assert count == 2, "each defer call must produce a distinct audit entry"
+
+
+# ---------------------------------------------------------------------------
+# route_wos_message structural dispatch tests — issue #856
+#
+# These tests verify that wos_execute messages are routed through
+# route_wos_message() which returns a spawn_subagent action. This is the
+# structural path the dispatcher must follow — calling route_wos_message
+# unconditionally for any message type in WOS_MESSAGE_TYPE_DISPATCH ensures
+# correctness even after context compaction.
+# ---------------------------------------------------------------------------
+
+# Named constant: the only message type the WOS executor produces.
+WOS_EXECUTE_MESSAGE_TYPE = "wos_execute"
+
+# Named constant: the action that route_wos_message must return for wos_execute.
+WOS_SPAWN_ACTION = "spawn_subagent"
+
+
+class TestRouteWosMessage:
+    """route_wos_message must structurally dispatch wos_execute to spawn_subagent."""
+
+    _SAMPLE_MSG = {
+        "type": "wos_execute",
+        "uow_id": "uow_test_001",
+        "instructions": "Run the linter and fix any errors found.",
+        "output_ref": "/home/lobster/lobster-workspace/orchestration/outputs/uow_test_001.result.json",
+    }
+
+    def test_wos_execute_registered_in_dispatch_table(self):
+        """wos_execute must appear in WOS_MESSAGE_TYPE_DISPATCH.
+
+        Absence means the dispatcher's type-based routing table cannot fire for
+        wos_execute messages — the root cause of the starvation described in the
+        wos-starvation-diagnosis-20260422.md audit.
+        """
+        assert WOS_EXECUTE_MESSAGE_TYPE in WOS_MESSAGE_TYPE_DISPATCH, (
+            f"{WOS_EXECUTE_MESSAGE_TYPE!r} must be registered in WOS_MESSAGE_TYPE_DISPATCH "
+            "so the dispatcher routes it structurally, not via prose that is lost on compaction"
+        )
+
+    def test_route_wos_message_returns_spawn_subagent_action(self):
+        """route_wos_message for wos_execute must return action='spawn_subagent'."""
+        result = route_wos_message(self._SAMPLE_MSG)
+        assert result["action"] == WOS_SPAWN_ACTION, (
+            f"Expected action={WOS_SPAWN_ACTION!r}, got {result['action']!r}. "
+            "The dispatcher must call Task() when this action is returned."
+        )
+
+    def test_route_wos_message_returns_task_id_with_wos_prefix(self):
+        """task_id must use the wos- prefix for dispatcher correlation."""
+        result = route_wos_message(self._SAMPLE_MSG)
+        assert result["task_id"] == f"wos-{self._SAMPLE_MSG['uow_id']}"
+
+    def test_route_wos_message_returns_non_empty_prompt(self):
+        """prompt must be a non-empty string — it is the subagent Task input."""
+        result = route_wos_message(self._SAMPLE_MSG)
+        assert isinstance(result["prompt"], str)
+        assert len(result["prompt"]) > 0
+
+    def test_route_wos_message_prompt_contains_uow_id(self):
+        """The subagent prompt must embed the UoW ID for result correlation."""
+        result = route_wos_message(self._SAMPLE_MSG)
+        assert self._SAMPLE_MSG["uow_id"] in result["prompt"]
+
+    def test_route_wos_message_prompt_contains_instructions(self):
+        """The prescribed instructions must be embedded verbatim in the prompt."""
+        result = route_wos_message(self._SAMPLE_MSG)
+        assert self._SAMPLE_MSG["instructions"] in result["prompt"]
+
+    def test_route_wos_message_defaults_agent_type_to_functional_engineer(self):
+        """When agent_type is absent from the message, default to functional-engineer."""
+        msg = {**self._SAMPLE_MSG}
+        msg.pop("agent_type", None)
+        result = route_wos_message(msg)
+        assert result["agent_type"] == "functional-engineer"
+
+    def test_route_wos_message_respects_explicit_agent_type(self):
+        """When agent_type is present in the message, use it — not the default."""
+        msg = {**self._SAMPLE_MSG, "agent_type": "lobster-generalist"}
+        result = route_wos_message(msg)
+        assert result["agent_type"] == "lobster-generalist"
+
+    def test_route_wos_message_echoes_message_type(self):
+        """result['message_type'] must echo the input type so callers can confirm routing."""
+        result = route_wos_message(self._SAMPLE_MSG)
+        assert result["message_type"] == WOS_EXECUTE_MESSAGE_TYPE
+
+    def test_route_wos_message_raises_for_unknown_type(self):
+        """route_wos_message must raise ValueError for types not in WOS_MESSAGE_TYPE_DISPATCH."""
+        bad_msg = {**self._SAMPLE_MSG, "type": "totally_not_a_wos_type"}
+        with pytest.raises(ValueError, match="unrecognised message type"):
+            route_wos_message(bad_msg)
+
+    def test_route_wos_message_is_pure_same_inputs_same_output(self):
+        """route_wos_message is a pure function — identical inputs produce identical outputs."""
+        r1 = route_wos_message(self._SAMPLE_MSG)
+        r2 = route_wos_message(self._SAMPLE_MSG)
+        assert r1 == r2
+
+    def test_route_wos_message_uses_default_output_ref_when_absent(self):
+        """When output_ref is absent, route_wos_message derives it from uow_id."""
+        msg = {
+            "type": "wos_execute",
+            "uow_id": "uow_no_ref_test",
+            "instructions": "Do something.",
+        }
+        result = route_wos_message(msg)
+        # The derived path must contain the uow_id so the Steward can find it
+        assert "uow_no_ref_test" in result["prompt"]
