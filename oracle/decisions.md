@@ -2,6 +2,22 @@
 
 ---
 
+### [2026-04-22] Post-merge bug findings — PR #804 (negentropic sweep process improvements)
+
+**Context:** PR #804 was reviewed across three rounds and received a final APPROVED verdict on 2026-04-21. This entry records two bugs found in a stale post-merge oracle review of the merged code. The PR is already merged; these findings are filed as GitHub issues for follow-on fix.
+
+**Gap 1: `--label bug,hygiene` applies AND semantics — resolution rate metric broken**
+
+The negentropic sweep's resolution rate metric constructs a `gh` CLI query using `--label bug,hygiene`. The `gh` CLI applies AND semantics to comma-separated labels: only issues carrying both labels are returned. The intended behavior is OR (issues with either label). Live test confirms: `bug,hygiene` returns 1 result; `hygiene` alone returns 5. The resolution rate metric therefore produces near-zero rates, triggering false ENTROPY ACCUMULATION escalations. The fix is to use separate `--label` flags or union two queries. This is a correctness defect in the metric logic, not a boundary case.
+
+**Gap 2: `sweep-context.md` references non-canonical oracle learnings path**
+
+`memory/canonical-templates/sweep-context.md` (added in PR #804) references `~/lobster-workspace/oracle/learnings.md`. The canonical path established by PR #796 is `~/lobster/oracle/learnings.md`. Any agent reading sweep-context.md will be directed to a non-existent or stale file. The fix is to update the path in the canonical template.
+
+**Post-merge disposition:** Both gaps are filed as GitHub issues. No code changes in this oracle entry.
+
+---
+
 ### [2026-04-22] PR #805 — refactor: consolidate write_inbox_message() into shared utility (closes #781)
 
 **Vision alignment:** The adversarial prior entering Stage 1 — this implementation is solving the wrong problem, or solving the right problem in a direction that forecloses better paths — finds no foothold here. The problem statement is concrete: six scripts each define an identical `write_inbox_message()` function, creating a schema-drift risk whenever the inbox format changes. For this to be the wrong path, the inbox format would need to be permanently stable (making the risk theoretical), or the consolidation would need to compete with the higher-priority WOS execution health work. Neither holds: the PR description explicitly states that executor.py, registry.py, and WOS orchestration files were not modified, and this change is a side-seam refactor orthogonal to the starvation work. The consolidation directly instantiates vision.yaml principle-4 ("wire what exists before building more") and principle-1 ("structural prevention over reactive recovery"): six diverged copies produce a silent-inconsistency failure mode at the first partial update; one canonical implementation prevents it structurally. The `seam-first abstraction` golden pattern is confirmed here: `write_inbox_message()` is placed precisely at the boundary where six callers with shared evolutionary fate meet a single schema contract.
