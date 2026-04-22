@@ -450,6 +450,26 @@ def main() -> int:
     # that stalled active UoWs are recovered even when dispatch is paused.
     run_ttl_recovery(registry, dry_run=dry_run)
 
+    # Phase 1b: Heartbeat sidecar — write heartbeats for all in-flight UoWs.
+    # Structural enforcement: heartbeats are written by the cron-driven executor
+    # heartbeat regardless of whether the executing subagent calls write_heartbeat()
+    # itself. This prevents false stall detection in the observation loop.
+    # Runs always (regardless of execution_enabled) because active/executing UoWs
+    # need heartbeats even when new dispatch is paused.
+    if not dry_run:
+        try:
+            from src.orchestration.heartbeat_sidecar import write_heartbeats_for_active_uows
+            hb_sidecar = write_heartbeats_for_active_uows(registry)
+            if hb_sidecar.checked > 0 or hb_sidecar.errors > 0:
+                log.info(
+                    "Heartbeat sidecar: checked=%d written=%d skipped=%d errors=%d",
+                    hb_sidecar.checked, hb_sidecar.written, hb_sidecar.skipped, hb_sidecar.errors,
+                )
+        except Exception:
+            log.exception("Heartbeat sidecar failed — continuing (heartbeats are best-effort)")
+    else:
+        log.info("Heartbeat sidecar (DRY RUN): skipped")
+
     if not execution_enabled:
         log.info(
             "Executor heartbeat: execution disabled (wos-config.json execution_enabled=false) "
