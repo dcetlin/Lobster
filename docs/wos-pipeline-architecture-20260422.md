@@ -3,6 +3,7 @@
 **Date:** 2026-04-22
 **Status:** Canonical (v2 — locking, recurrence, lifecycle, loops)
 **Scope:** Full cultivator-to-executor pipeline, including germinator register classification, routing classifier posture assignment, executor dispatch, lifecycle stages, and feedback loops.
+**Workstream:** `~/lobster-workspace/workstreams/wos/README.md`
 
 ---
 
