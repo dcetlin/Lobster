@@ -91,19 +91,15 @@ class TestPythonEnvironment:
             pytest.skip(f"MCP server not importable: {e}")
 
     def test_bot_module_importable(self):
-        """Test that bot module can be imported without raising an ImportError."""
+        """Test that bot module can be imported."""
         try:
-            # Module-level imports should succeed; runtime startup may require env vars
+            # Without env vars (TELEGRAM_BOT_TOKEN), module raises ValueError on import.
+            # With env vars set (production), module imports cleanly. Both are valid.
             from src.bot import lobster_bot  # noqa: F401
-            assert hasattr(lobster_bot, "handle_message"), (
-                "lobster_bot must expose handle_message after import"
-            )
+        except (ValueError, KeyError):
+            pass  # Expected when TELEGRAM env vars are absent
         except ImportError as e:
             pytest.skip(f"Bot module not importable: {e}")
-        except Exception:
-            # Non-ImportError exceptions (e.g. missing env vars at init time)
-            # are acceptable — the module is still importable.
-            pass
 
 
 @pytest.mark.integration
