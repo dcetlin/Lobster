@@ -360,3 +360,71 @@ A substrate change changes what agents do structurally — which work they route
 A content change changes what agents say — the words in a routing rationale, the framing of a priority explanation. Content changes are cheaper to produce and easier to mistake for substrate changes, because they look similar from the outside.
 
 The Vision Object has succeeded as a substrate change when: removing it would cause routing decisions to degrade structurally, not just become less eloquently justified.
+
+---
+
+## Field Specificity and the Unfakeability Criterion
+
+*Design constraint documented 2026-04-22, based on compliance failure mode identified 2026-03-28.*
+
+### The Failure Mode: Post-Hoc Citation
+
+A Vision Object field that carries a citation does not automatically constitute a filter-modification. An agent can decide first — based on ambient context, general intent, or plausible inference — and then locate a field that supports the decision it already made. The citation is present. The structural test (`citation present`) passes. But the field did not actually modify the routing decision; it was recruited to justify a decision that would have been made without it.
+
+This is the post-hoc citation failure mode. It is structurally silent: the structural criterion (citation present) can pass while the functional criterion (routing was modified by the field) fails. The field appears load-bearing in the audit log. It is not.
+
+The distinction matters because the Vision Object exists to make routing decisions *traceable and defensible* — not merely *justified in retrospect*. A field that an agent cites but did not consult beforehand provides the appearance of intent-anchoring without the substance.
+
+---
+
+### The Bootup Candidate Test
+
+Every Vision Object field must pass this test before being considered load-bearing:
+
+> **"Does this field produce verifiably different routing decisions that would not have appeared without it?"**
+
+Fields that fail this test are context-enrichment with a citation label, not filter-modifications. They may still have value as orientation prose, but they do not qualify as structural constraints in the Vision Object's routing layer.
+
+**How to apply the test:** Imagine an agent reading the Vision Object with the candidate field present, then with it absent. If the routing output — which UoWs are prioritized, which are excluded, which decisions are escalated — would be identical in both cases, the field is not load-bearing. The agent could reconstruct its effect from broader context.
+
+---
+
+### The Design Implication: Specificity Over Fluency
+
+Field content should favor specificity over fluency. These are distinct properties and they are not correlated.
+
+**Unfakeable content (preferred for load-bearing fields):**
+
+- Named exclusions: `what_not_to_touch` lists specific domains, projects, or system components an agent must not touch. An agent cannot reconstruct the specific items from ambient context — they must be stated.
+- Inviolable constraints naming specific behaviors: "No system change that increases screen dependency or atrophies Dan's own perception." The constraint is non-derivable from general intent.
+- Hard stops with named conditions: explicit triggers that must halt agent action, tied to named artifacts or states.
+
+These fields are unfakeable because their content cannot be reconstructed from context. An agent citing `what_not_to_touch` either read it and altered routing accordingly, or it did not. There is no third option.
+
+**Fakeable content (insufficient as sole load-bearing content):**
+
+- Well-articulated general intent statements: "Build the substrate that lets every agent make intent-anchored decisions." This is true and useful orientation, but a capable reasoning agent could derive it from the project name, the CLAUDE.md description, and the WOS architecture. The field is citable without being consulted.
+- Fluent descriptions of approach or philosophy that follow predictably from the stated goals.
+- Explanatory rationale that restates what is already implied by the schema structure.
+
+Fluent general content has value in the Vision Object — it aids human legibility and provides orientation context. But it cannot serve as the sole load-bearing element of a field that is expected to produce traceable routing modifications.
+
+---
+
+### Scope Clarification
+
+This criterion governs field authorship — what to write when adding or updating a Vision Object field — not a verdict on the current state of `vision.yaml`.
+
+Existing fields that are well-articulated but general should be noted as needing a **specificity audit**: does each field contain at least one named, non-reconstructable constraint that could not appear in the routing output unless the agent read and applied it? Fields that lack this may be enriched with a named constraint rather than replaced. The goal is to add structural weight to existing orientation prose, not to discard content that provides genuine context.
+
+---
+
+### Audit Checklist
+
+Apply this checklist when writing or reviewing Vision Object fields:
+
+- [ ] Would an agent reading only this field make a different routing decision than without it?
+- [ ] Does the field contain at least one named, non-reconstructable constraint?
+- [ ] Is the field's filtering effect verifiable from a behavioral diff (before/after)?
+
+A field that cannot pass the first check is context-enrichment. A field that passes the first check but fails the second is at risk of post-hoc citation. A field that passes all three is structurally load-bearing.
