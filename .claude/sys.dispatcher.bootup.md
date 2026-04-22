@@ -573,13 +573,30 @@ Side-channel signals from subagents via `write_observation(chat_id, text, catego
 |---|---|
 | `user_context` | `send_reply` to user + take action if actionable |
 | `system_context` | `memory_store` silently — do NOT send_reply (inbox_server.py routes to debug channel when LOBSTER_DEBUG=true) |
-| `system_error` | Append JSON line to `~/lobster-workspace/logs/observations.log`; also `send_reply` if `LOBSTER_DEBUG=true` |
+| `system_error` | Append JSON line to `~/lobster-workspace/logs/observations.log`; also `send_reply` if `LOBSTER_DEBUG=true`; if text contains `gate=` and `outcome=miss`, also call `memory_store(content=msg["text"], metadata={"type": "gate_miss", "category": "system_error"})` |
 
 ```
 1. mark_processing(message_id)
 2. category = msg["category"]
 3. debug_on = os.environ.get("LOBSTER_DEBUG", "").lower() == "true"
-4. Route per table above
+4. Route per table above:
+
+   if category == "user_context":
+       send_reply(chat_id, text=msg["text"])
+       # take action if actionable
+   elif category == "system_context":
+       memory_store(content=msg["text"], metadata={"category": "system_context"})
+       # do NOT send_reply
+   elif category == "system_error":
+       # Append to log
+       log_entry = json.dumps({"ts": now, "category": "system_error", "content": msg["text"]})
+       Bash(f'echo \'{log_entry}\' >> ~/lobster-workspace/logs/observations.log')
+       # Route gate-miss observations into pattern memory pipeline
+       if "gate=" in msg["text"] and "outcome=miss" in msg["text"]:
+           memory_store(content=msg["text"], metadata={"type": "gate_miss", "category": "system_error"})
+       if debug_on:
+           send_reply(chat_id, text=f"[system_error observation] {msg['text']}")
+
 5. mark_processed(message_id)
 ```
 

@@ -27,6 +27,48 @@ Read each file. Extract:
 
 Merge this context with the memory_recent results from step 1. Session files often contain richer conversational context than memory events — prefer session file content for narrative synthesis (steps 3-6) when available.
 
+**1c. Read gate-miss observations from the past 24 hours.**
+Run:
+```bash
+obs_log=~/lobster-workspace/logs/observations.log
+if [ -f "$obs_log" ]; then
+    cutoff=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -u -v-24H +%Y-%m-%dT%H:%M:%S)
+    python3 -c "
+import json, sys
+cutoff = '$cutoff'
+gate_misses = []
+try:
+    with open('$obs_log') as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+                if entry.get('ts', '') >= cutoff and 'gate=' in entry.get('content', '') and 'outcome=miss' in entry.get('content', ''):
+                    gate_misses.append(entry)
+            except json.JSONDecodeError:
+                pass
+except FileNotFoundError:
+    pass
+if gate_misses:
+    print(f'Gate misses in past 24h: {len(gate_misses)}')
+    from collections import Counter
+    import re
+    gate_counts = Counter()
+    for e in gate_misses:
+        m = re.search(r'gate=(\S+)', e.get('content', ''))
+        if m:
+            gate_counts[m.group(1)] += 1
+    for gate, count in gate_counts.most_common():
+        print(f'  {gate}: {count} miss(es)')
+else:
+    print('No gate misses in past 24h.')
+"
+fi
+```
+
+Collect this output as `gate_miss_summary`. Include it in step 3 (rolling-summary.md) under a **Proprioceptive** bullet: `gate_miss_summary` content verbatim if any misses occurred. If zero misses, include a single bullet: `Proprioceptive: no gate misses logged in past 24h.`
+
+Also include `gate_miss_summary` in step 4 (daily-digest.md): append one sentence after the prose summary if any gate misses occurred — e.g., "Proprioceptive note: N gate miss(es) detected (gate=X: M times)."
+
 2. **Search for key mentions.**
    Call `memory_search()` for any prominent project names, person names, or topics that appeared in step 1. This surfaces related older context that might be relevant to the synthesis.
 
