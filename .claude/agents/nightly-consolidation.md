@@ -33,7 +33,7 @@ Run:
 obs_log=~/lobster-workspace/logs/observations.log
 if [ -f "$obs_log" ]; then
     cutoff=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -u -v-24H +%Y-%m-%dT%H:%M:%S)
-    python3 -c "
+    uv run python -c "
 import json, sys
 cutoff = '$cutoff'
 gate_misses = []
