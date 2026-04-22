@@ -2766,6 +2766,62 @@ CREATE TABLE IF NOT EXISTS dispatcher_lock (
         fi
     fi
 
+    # Migration 81: Register dispatch-template-check.py PreToolUse hook (uow_20260421_715745).
+    # Enforces Dispatch template gate: every Agent call from the dispatcher must include
+    # 'Minimum viable output:' and 'Boundary:' in the prompt, surviving context compaction.
+    if [ -f "$CLAUDE_SETTINGS" ] && command -v jq >/dev/null 2>&1; then
+        local has_dispatch_template_check
+        has_dispatch_template_check=$(jq -r '
+            [.hooks.PreToolUse[]?.hooks[]?.command // empty]
+            | map(select(contains("dispatch-template-check")))
+            | length
+        ' "$CLAUDE_SETTINGS" 2>/dev/null || echo "0")
+        if [ "${has_dispatch_template_check:-0}" = "0" ] || [ "${has_dispatch_template_check:-0}" = "" ]; then
+            TMP_SETTINGS=$(mktemp)
+            jq --arg cmd "python3 $LOBSTER_DIR/hooks/dispatch-template-check.py" \
+               '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
+                "matcher": "Agent",
+                "hooks": [{
+                    "type": "command",
+                    "command": $cmd,
+                    "timeout": 5
+                }]
+            }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+            substep "Registered dispatch-template-check PreToolUse hook (Migration 81)"
+            migrated=$((migrated + 1))
+        else
+            substep "dispatch-template-check hook already registered — skipping Migration 81"
+        fi
+    fi
+
+    # Migration 82: Register pr-merge-gate.py PreToolUse hook (uow_20260421_715745).
+    # Enforces PR Merge Gate: 'gh pr merge' commands require a VERDICT: APPROVED entry in
+    # oracle/decisions.md for that PR number, surviving context compaction.
+    if [ -f "$CLAUDE_SETTINGS" ] && command -v jq >/dev/null 2>&1; then
+        local has_pr_merge_gate
+        has_pr_merge_gate=$(jq -r '
+            [.hooks.PreToolUse[]?.hooks[]?.command // empty]
+            | map(select(contains("pr-merge-gate")))
+            | length
+        ' "$CLAUDE_SETTINGS" 2>/dev/null || echo "0")
+        if [ "${has_pr_merge_gate:-0}" = "0" ] || [ "${has_pr_merge_gate:-0}" = "" ]; then
+            TMP_SETTINGS=$(mktemp)
+            jq --arg cmd "python3 $LOBSTER_DIR/hooks/pr-merge-gate.py" \
+               '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": $cmd,
+                    "timeout": 5
+                }]
+            }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+            substep "Registered pr-merge-gate PreToolUse hook (Migration 82)"
+            migrated=$((migrated + 1))
+        else
+            substep "pr-merge-gate hook already registered — skipping Migration 82"
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
