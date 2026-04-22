@@ -87,6 +87,108 @@ Before linear issue reading for Night 4, run a structural pre-scan:
 
 This replaces O(n) linear reading with a structural pass that improves signal-to-noise before any reading occurs.
 
+### Step 1d: Pipeline Layer — Mode B Ripeness Classifier (Night 4 only)
+
+**Gate: Run this step only on Night 4.** Skip entirely on all other nights.
+
+After completing Step 1c (Issue Pre-Scan), run the ripeness classifier on the open issue set. This step classifies issues by advancement readiness and posts structured ripeness notes on classification changes.
+
+#### 1d-0. Prerequisites
+
+Ensure the `pipeline-reviewed` label exists before the first classification pass:
+```bash
+gh label create "pipeline-reviewed" --color "0075ca" --description "Issue has been assessed by the pipeline ripeness classifier" --repo dcetlin/Lobster 2>/dev/null || true
+```
+
+Read the state file: `~/lobster-workspace/hygiene/pipeline-ripeness-state.json`
+If the file does not exist, treat all issues as having no prior classification.
+
+#### 1d-1. Input: issue list
+
+Use the issue list from Step 1c. Exclude any issue carrying the `stale` label (Mode A output — if Mode A has not yet run, no issues will carry this label; proceed with the full list). Also exclude issues with the `on-hold` label.
+
+#### 1d-2. For each remaining open issue, gather:
+
+1. Full issue body and all comments: `gh issue view <N> --repo dcetlin/Lobster --json body,comments`
+2. Design doc linkage check:
+   - Search `~/lobster-workspace/hygiene/` for files matching `design-*.md` whose filename or content plausibly relates to the issue (keyword match on issue title/body words)
+   - If a candidate file is found, apply LLM judgment to confirm whether it documents design for this issue
+   - Record: linked design doc path (or "none found")
+   - Note: a `Design doc: hygiene/design-*.md` line in the issue body is the recommended convention but is not enforced. Absence is not a hard blocker for any classification — record "none found" and continue.
+3. Recent escalation list check: scan the most recent completed sweep file (`~/lobster-workspace/hygiene/YYYY-MM-DD-sweep.md` — the last one before today) for the issue number in any Escalation List section
+4. Oracle outputs check: scan `~/lobster/oracle/decisions.md` for the issue number
+
+#### 1d-3. Classification logic
+
+Classify each issue into **exactly one** of:
+
+| Classification | Criteria |
+|---|---|
+| `design-settled` | Linked design doc found AND confirmed by LLM AND all questions in the issue body have answers in comments (LLM judgment) AND a clear next step is identifiable |
+| `observation-ready` | Issue was surfaced in a sweep escalation list or oracle output AND no design doc linked AND no comments from the assignee/author indicating design work started |
+| `stale-despite-activity` | Comments exist but LLM judges all comments are unanswered questions (no resolutions) AND the last comment is > 30 days old |
+| `actionable-unassigned` | Issue has the `implementation-ready` label AND no linked open PR |
+
+**Tie-breaking rule:** If multiple classifications could apply, use this priority order: `design-settled` > `actionable-unassigned` > `observation-ready` > `stale-despite-activity`.
+
+**Unclassifiable:** If an issue fits none of the four categories, classify it as `unclassifiable` and note why. Do not post a GitHub comment for unclassifiable issues.
+
+#### 1d-4. Post GitHub comments (on classification change only)
+
+For each issue where the new classification differs from the stored classification in `pipeline-ripeness-state.json` (or no prior entry exists):
+
+Post a comment:
+```
+**[Pipeline Review] Ripeness classification: `<classification>`**
+
+- Design doc: <path or "none found">
+- Sweep escalation: <yes/no>
+- Oracle reference: <yes/no>
+- Assessed: <YYYY-MM-DD>
+
+_This is an automated ripeness note from the Lobster pipeline layer. It updates when classification changes._
+```
+
+Apply the `pipeline-reviewed` label:
+```bash
+gh issue edit <N> --repo dcetlin/Lobster --add-label pipeline-reviewed
+```
+
+Do not post comments or apply labels for `unclassifiable` issues.
+
+#### 1d-5. Write state
+
+Update `~/lobster-workspace/hygiene/pipeline-ripeness-state.json` with all classified issues:
+```json
+{
+  "last_run": "YYYY-MM-DDTHH:MM:SSZ",
+  "issues": {
+    "<issue_number>": {
+      "classification": "design-settled|observation-ready|stale-despite-activity|actionable-unassigned",
+      "classified_at": "YYYY-MM-DDTHH:MM:SSZ",
+      "comment_posted": true
+    }
+  }
+}
+```
+
+#### 1d-6. Write ripeness report to sweep file
+
+Append a `## Pipeline Layer — Ripeness Report` section to today's sweep file (`~/lobster-workspace/hygiene/YYYY-MM-DD-sweep.md`):
+
+```markdown
+## Pipeline Layer — Ripeness Report
+
+*Mode B classifier — Night 4 pipeline layer. Run: YYYY-MM-DD.*
+
+| Issue | Title | Classification | Design Doc | Changed? |
+|-------|-------|---------------|-----------|----------|
+| #N | <title> | design-settled | hygiene/design-foo.md | yes |
+| #N | <title> | observation-ready | none | no |
+
+**Summary:** N issues classified. N classification changes (comments posted). N `pipeline-reviewed` labels applied.
+```
+
 ### Step 2: Detection pass
 
 **Cross-file contradiction check (Night 2 only):** Cross-reference behavioral rules, gates, and heuristics that appear in more than one document — flag divergences. Scope this to concepts with behavioral consequence (gates, rules, heuristics) — not all concepts.
