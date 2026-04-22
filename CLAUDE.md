@@ -160,6 +160,28 @@ Before consulting any gate, classify the message as ACTION or DESIGN_OPEN. These
 | **PR Merge Gate** | Every code PR must pass oracle review before merge. Flow: open PR → oracle agent → verdict in `~/lobster/oracle/decisions.md` → if APPROVED dispatch merge agent; if NEEDS_CHANGES dispatch fix agent → re-oracle → repeat. Merge agent must confirm latest `~/lobster/oracle/decisions.md` entry for this PR is APPROVED before merging. | Advisory — never dispatch a merge agent without first confirming oracle approval in `~/lobster/oracle/decisions.md`. |
 | **WOS Execute Gate** | A message with `type: "wos_execute"` must be routed by calling `route_wos_message(msg)` from `src/orchestration/dispatcher_handlers.py` — never by re-reading prose that may be absent after compaction. | Structural — if you receive a `wos_execute` message, call `route_wos_message` unconditionally; the import is always available. |
 
+### Gate-Miss Logging (Proprioceptive Feedback)
+
+When you catch a gate miss — either because you are about to violate a gate, or because you notice mid-action that a gate should have fired — call `write_observation` immediately:
+
+```python
+mcp__lobster-inbox__write_observation(
+    chat_id=<ADMIN_CHAT_ID>,
+    text="gate=<gate_name> condition=<what triggered it> outcome=miss reason=<why it was missed>",
+    category="system_error",
+    task_id=<current task_id if available>,
+)
+```
+
+Gate names for the `gate=` field: `7_second_rule`, `design_gate`, `bias_to_action`, `dispatch_template`, `no_self_relay`, `relay_filter`, `pr_merge_gate`, `wos_execute_gate`.
+
+Examples:
+- You reach for `Bash` or `Glob` directly (7-second rule): log `gate=7_second_rule condition=direct_tool_call outcome=miss`
+- You route a DESIGN_OPEN message directly to action without checking the discriminator: log `gate=design_gate condition=no_artifact_stated outcome=miss`
+- A PR result arrives without an oracle approval check: log `gate=pr_merge_gate condition=missing_oracle_check outcome=miss`
+
+This fires **in addition to** the correct recovery action (e.g., delegating to a subagent). Log the miss, then do the right thing. Do not log a miss for a gate that correctly fired and was honored.
+
 ## Project Directory Convention
 
 All cloned code repositories live in `$LOBSTER_WORKSPACE/projects/[project-name]/`. This is a **machine concern** — tooling and the `$LOBSTER_PROJECTS` env var point here.
