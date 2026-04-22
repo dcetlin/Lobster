@@ -26,6 +26,7 @@ Patterns and antipatterns surfaced through oracle review. These inform future de
 |------|----|----------|
 | 2026-04-04 | #602 | Boolean frozenset intersection over-eager for shared vocabulary — use weighted scoring or frequency thresholds instead of presence-only detection |
 | 2026-04-04 | #602 | Classification results should be typed frozen dataclasses with observability fields — not bare return values |
+| 2026-04-22 | #735 | Instruction-accumulation pattern (adding stronger rules when a rule fails) was addressed at the discriminator level for Design Gate / Bias to Action. The root cause — mode misidentification — was fixed by converting the signal list from informal examples to a mechanical checklist with Step 1 / Step 2 ordering and a default-to-DESIGN_OPEN fallback. The Bias to Action gate row's redundant classification clause ("fire only after DESIGN_OPEN has been ruled out") was removed because the classifier is now the entry point, not the gate table. Rule migrated: Bias to Action trigger classification work → absorbed into Mode Recognition classifier. |
 
 ### Test Design
 
