@@ -39,6 +39,16 @@ _DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 # ---------------------------------------------------------------------------
+# requalify_proposed() rate-limit constants
+# ---------------------------------------------------------------------------
+
+# Maximum number of proposed UoWs requalify_proposed() will check per cycle.
+# UoWs are processed oldest-updated_at-first so the longest-unchecked records
+# are prioritized. This caps GitHub API calls to REQUALIFY_BATCH_SIZE per
+# 15-minute cycle regardless of how many proposed UoWs exist.
+REQUALIFY_BATCH_SIZE = 20
+
+# ---------------------------------------------------------------------------
 # Surface-to-Steward audit classification constants
 # ---------------------------------------------------------------------------
 
@@ -114,13 +124,26 @@ def _is_old_enough(created_at_iso: str, min_days: int) -> bool:
         return False
 
 
-def _qualifies(snapshot: IssueSnapshot, config: dict[str, Any]) -> bool:
+def _qualifies(
+    snapshot: IssueSnapshot,
+    config: dict[str, Any],
+    require_label: bool = False,
+) -> bool:
     """Pure predicate: does this snapshot meet qualification criteria?
 
     A proposed UoW qualifies (→ ready) if:
     - The issue has a non-empty body (when require_body is set)
     - AND no blocking labels are present
-    - AND: has at least one qualifying label, OR has been open ≥ qualify_after_days_open
+    - AND: has at least one qualifying label, OR (when require_label is False)
+      has been open ≥ qualify_after_days_open
+
+    Args:
+        snapshot: Current state of the source issue.
+        config: Qualification configuration dict.
+        require_label: When True, age-only qualification is suppressed — the issue
+            MUST carry a qualifying label to advance. Used by requalify_proposed() to
+            prevent auto-advancement of issues the Steward has not yet reviewed via
+            label signal (see vision.yaml od-3).
     """
     qualifying_labels: set[str] = set(config.get("qualifying_labels", _DEFAULT_CONFIG["qualifying_labels"]))
     blocking_labels: set[str] = set(config.get("blocking_labels", _DEFAULT_CONFIG["blocking_labels"]))
@@ -135,6 +158,12 @@ def _qualifies(snapshot: IssueSnapshot, config: dict[str, Any]) -> bool:
 
     if _has_qualifying_label(snapshot.labels, qualifying_labels):
         return True
+
+    if require_label:
+        # Age-only qualification is not sufficient when label signal is required.
+        # This enforces the vision.yaml od-3 constraint: auto-advancement in
+        # requalify_proposed() requires a qualifying label, not just age.
+        return False
 
     return _is_old_enough(snapshot.created_at, qualify_after_days)
 
@@ -179,14 +208,14 @@ class GardenCaretaker:
         return {**seed_results, **requalify_results, **tend_results, **trigger_results}
 
     def requalify_proposed(self) -> dict[str, int]:
-        """Re-evaluate all proposed UoWs and auto-advance those that now pass qualification criteria.
+        """Re-evaluate proposed UoWs and auto-advance those with a qualifying label.
 
         This closes the gap where UoWs that were reset to 'proposed' (e.g. by tend() reactivation
         after source reopens) would stay stuck there indefinitely unless manually approved.
 
-        For each UoW in 'proposed' state with a source_ref:
+        For each UoW in 'proposed' state with a source_ref (up to REQUALIFY_BATCH_SIZE per cycle):
           - Fetch the current IssueSnapshot from source
-          - If the snapshot passes _qualifies() → transition to 'ready-for-steward'
+          - If the snapshot passes _qualifies(require_label=True) → transition to 'ready-for-steward'
           - If source returns None (deleted/not found) → skip (tend() handles cleanup)
           - If source fetch errors → skip with a warning (don't block the cycle)
 
@@ -194,11 +223,31 @@ class GardenCaretaker:
         The blocking_labels check inside _qualifies() ensures that explicitly-blocked UoWs
         (wip, blocked, needs-design, etc.) are never auto-advanced.
 
+        **Rate limiting:** Only REQUALIFY_BATCH_SIZE UoWs are checked per cycle to bound
+        GitHub API calls. UoWs are sorted oldest-updated_at-first so the longest-unchecked
+        records are prioritized on each 15-minute cycle.
+
+        **Label-only qualification (vision.yaml od-3):** Age-only qualification is suppressed
+        here. A proposed UoW must carry a qualifying label (ready-to-execute, high-priority,
+        or bug) to be auto-advanced. Issues that are only "old enough" require explicit Steward
+        or Dan input — auto-advancement on age alone would promote issues the Steward has not
+        yet reviewed via label signal.
+
         Returns:
             {"requalified": int}
         """
         requalified = 0
-        proposed_uows = self.registry.query(str(UoWStatus.PROPOSED))
+        all_proposed = self.registry.query(str(UoWStatus.PROPOSED))
+
+        # Process oldest-updated_at-first, capped at REQUALIFY_BATCH_SIZE, to bound
+        # GitHub API calls per cycle regardless of proposed-queue depth.
+        proposed_uows = sorted(all_proposed, key=lambda u: u.updated_at or "")[:REQUALIFY_BATCH_SIZE]
+
+        if len(all_proposed) > REQUALIFY_BATCH_SIZE:
+            logger.debug(
+                "requalify_proposed: %d proposed UoWs exist — processing oldest %d (batch_size=%d)",
+                len(all_proposed), len(proposed_uows), REQUALIFY_BATCH_SIZE,
+            )
 
         for uow in proposed_uows:
             if not uow.source:
@@ -219,7 +268,10 @@ class GardenCaretaker:
                 logger.debug("requalify_proposed: UoW %s source not found — skipping (tend will archive)", uow.id)
                 continue
 
-            if not _qualifies(snapshot, self.config):
+            # require_label=True: age-only qualification is suppressed per vision.yaml od-3.
+            # Only issues with a qualifying label (ready-to-execute, high-priority, bug)
+            # are auto-advanced. Age-only qualification requires explicit Steward input.
+            if not _qualifies(snapshot, self.config, require_label=True):
                 logger.debug("requalify_proposed: UoW %s does not qualify yet — skipping", uow.id)
                 continue
 
