@@ -466,11 +466,13 @@ class Registry:
             conn.execute("BEGIN IMMEDIATE")
 
             # Cross-sweep-date pre-check: any non-terminal record for this issue?
+            # 'cancelled' is a legacy status (not in UoWStatus enum) treated as terminal
+            # so that re-proposal is allowed after a cancellation.
             existing = conn.execute(
                 """
                 SELECT id, status FROM uow_registry
                 WHERE source_issue_number = ?
-                  AND status NOT IN ('done', 'failed', 'expired')
+                  AND status NOT IN ('done', 'failed', 'expired', 'cancelled')
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,

@@ -219,6 +219,23 @@ class TestUpsert:
         second = registry.upsert(issue_number=22, title="Issue 22", sweep_date=tomorrow, success_criteria="Test completion.")
         assert isinstance(second, UpsertInserted)
 
+    def test_reinsert_after_cancelled(self, registry, db_path):
+        """Legacy 'cancelled' status must be treated as terminal, allowing re-proposal."""
+        from src.orchestration.registry import UpsertInserted
+        today = datetime.now(timezone.utc).date().isoformat()
+        tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
+        first = registry.upsert(issue_number=23, title="Issue 23", sweep_date=today, success_criteria="Test completion.")
+        # Inject legacy 'cancelled' status directly (not in UoWStatus enum but exists in prod DB)
+        conn = _open_db(db_path)
+        conn.execute("UPDATE uow_registry SET status='cancelled' WHERE id=?", (first.id,))
+        conn.commit()
+        conn.close()
+        # Re-proposal on next sweep date must succeed — cancelled is terminal
+        second = registry.upsert(issue_number=23, title="Issue 23", sweep_date=tomorrow, success_criteria="Test completion.")
+        assert isinstance(second, UpsertInserted), (
+            f"Expected UpsertInserted after cancelled, got {type(second).__name__}: {getattr(second, 'reason', '')}"
+        )
+
     def test_unique_conflict_does_not_overwrite_non_proposed(self, registry, db_path):
         """Same issue_number + sweep_date conflict must not overwrite pending/active."""
         today = datetime.now(timezone.utc).date().isoformat()

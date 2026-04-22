@@ -2742,6 +2742,30 @@ CREATE TABLE IF NOT EXISTS dispatcher_lock (
             warn "Migration 79: Failed to archive old sweep-context.md"
     fi
 
+    # Migration 80: Clean up duplicate proposed UoWs in the WOS registry.
+    # Before the idempotency guard was hardened, repeated sweeps could create
+    # multiple proposed UoWs for the same GitHub issue on different sweep_dates.
+    # This migration expires older duplicates, keeping the newest proposed record.
+    local registry_db
+    registry_db="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/orchestration/registry.db"
+    local dedup_script="$LOBSTER_DIR/scripts/migrate_dedup_proposed_uows.py"
+    if [ -f "$registry_db" ] && [ -f "$dedup_script" ]; then
+        substep "Migration 80: Expiring duplicate proposed UoWs..."
+        if uv run "$dedup_script" --db-path "$registry_db" 2>&1 | grep -q "Nothing to do\|expired\|No duplicate"; then
+            success "Migration 80: Duplicate proposed UoW cleanup complete"
+        else
+            uv run "$dedup_script" --db-path "$registry_db" && \
+                substep "Migration 80: complete" && \
+                migrated=$((migrated + 1)) || \
+                warn "Migration 80: migrate_dedup_proposed_uows.py failed — run manually"
+        fi
+        migrated=$((migrated + 1))
+    else
+        if [ ! -f "$registry_db" ]; then
+            info "Migration 80: skipped — registry.db not found (WOS not active on this install)"
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
