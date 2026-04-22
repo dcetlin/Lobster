@@ -179,3 +179,28 @@ StartupSweepResult = _sweep_mod.StartupSweepResult
 
 **Reuse guidance:** Apply to any classification function that (a) can misclassify and (b) whose misclassification rate matters. The minimum set of observability fields: `result` (the classification), `gate_matched` or `rule_matched` (which branch fired), `confidence` (high/medium/low), `rationale` (one sentence). Do not return bare strings from classifiers that operate on real data — the string is undebuggable at scale. The frozen dataclass is the return type; the string value is extractable in one attribute access.
 
+
+---
+
+### [2026-04-20] Pattern: self-applying Stage 2 check as structural correctness test
+
+**Pattern:** When adding a new named check to the oracle's Stage 2 criteria, apply the check to the PR that introduces it. If the check passes reflexively (the PR meets the criterion it is adding), the check is correctly scoped. If the check does not pass reflexively, either the criterion is over-broad or the PR introducing it is itself underanchored.
+
+**Why it works:** Any oracle criterion that cannot be satisfied by the PR introducing it is structurally suspect — it either imposes requirements the codebase hasn't yet met, or it is poorly specified. The self-applying test catches both failure modes at authoring time rather than at first application to a downstream PR. For the Encoded Orientation check (PR #797): the PR encodes a new behavioral orientation into lobster-oracle.md; the check fires on the PR itself; the check passes (vision.yaml constraint-3 is the anchor, "or equivalent" covers the prior decision); the check is correctly scoped.
+
+**Where it appears:** PR #797 — Encoded Orientation check added to lobster-oracle.md Stage 2. The check applies to "agent definitions, bootup files, gate tables, vision.yaml, CLAUDE.md" — and the PR itself modifies an agent definition, triggering the check.
+
+**Reuse guidance:** Apply when authoring any new Stage 2 named check for the oracle. Before writing the check into a PR, ask: does this PR satisfy the check I'm adding? If yes, proceed. If no, either (a) the criterion is over-broad and needs refinement, or (b) this PR is itself the example of what the criterion is meant to catch — in which case it should not be the PR that introduces the criterion.
+
+
+---
+
+### [2026-04-20] Pattern: epoch-scale normalisation as an isolated seam function
+
+**Pattern:** When consuming a numeric timestamp from an external system that may use either seconds or milliseconds, isolate the epoch-scale detection in a named function (`_normalise_timestamp`) that accepts the raw value and returns a canonical seconds float. The detection logic is a simple magnitude threshold (`> 1e11`). All downstream callers use the normalised output.
+
+**Why it works:** Epoch-scale ambiguity (seconds vs. milliseconds) is a recurring defect surface for any system that consumes timestamps from Node.js/Electron producers (which use `Date.now()` in milliseconds). Isolating the detection into one function means: (a) the threshold is defined in one place; (b) tests can exercise the normalisation independently; (c) all callers get the correct scale without each implementing the threshold check. The alternative — inline `if ts > 1e11: ts /= 1000` at each call site — passes code review but creates multiple divergence points when the threshold or logic changes. The seam-first pattern from golden-patterns.md applies here: the normalisation function is a minimal abstraction placed precisely at the boundary where two systems with different epoch conventions meet.
+
+**Where it appears:** `src/orchestration/steward.py` — `_normalise_timestamp()` introduced in PR #800. Threshold constant `_MILLISECOND_TIMESTAMP_THRESHOLD = 1e11` defined at module scope. Called by `_check_token_expiry` for int/float `expiresAt` values.
+
+**Reuse guidance:** Apply whenever a system reads a timestamp from any external source (credential files, API responses, webhooks) where the epoch scale is not contractually guaranteed. The threshold `1e11` is the correct choice: Unix seconds will not exceed `1e11` until year 5138; any current Unix milliseconds value is already above `1e11`. Document the threshold in a module-level comment with the rationale (as PR #800 does). Import this constant in tests rather than re-declaring it locally.

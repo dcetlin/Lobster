@@ -2,6 +2,247 @@
 
 ---
 
+### [2026-04-22] PR #822 — fix: pass CLAUDE_CODE_OAUTH_TOKEN env to claude -p in executor subprocess dispatch
+
+**Vision alignment:** This fix directly addresses the named `current_focus.current_constraint` in vision.yaml: "WOS executor is dispatching UoWs but pipeline has starvation symptoms." Issue #820 traced 47% of UoW failures to `CLAUDE_CODE_OAUTH_TOKEN` being stripped by cron — exactly the starvation mechanism the current focus names. The adversarial prior (is this solving the wrong problem, or foreclosing a better path?) was actively tested. The alternative — adding the token to the cron environment block directly — would couple authentication to cron config, a less portable and less auditable pattern than explicit env injection at the subprocess boundary. The seam-first golden pattern (place abstraction at the boundary where two systems with different evolutionary rates meet) supports the chosen approach: the subprocess spawn is the correct injection point, and `_build_claude_env()` already existed for this exact purpose. The fix is minimal and precise — it solves the active starvation cause without broadening scope.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **`_dispatch_via_inbox` correctly excluded.** Confirmed by reading the implementation: `_dispatch_via_inbox` writes a JSON file to the filesystem inbox and returns immediately — no subprocess spawned, no OAuth token needed. The cron env-stripping problem does not apply to it. The PR's exclusion of this path is structurally sound, not a coverage gap.
+- **No circular import.** `steward.py` contains zero imports of `orchestration.executor` or any executor module. The dependency direction is unidirectional: executor imports from steward. `_build_claude_env` is a pure utility function (reads env + credentials.json, returns a dict copy) that belongs to the credential management concern already housed in steward.py. The import is clean.
+- **`_build_claude_env` handles the cron case correctly.** The credentials.json fallback reads `creds["claudeAiOauth"]["accessToken"]` — exactly matching the structure written by Claude Code. The test for this path (`test_dispatch_via_claude_p_falls_back_to_credentials_json`) patches `steward_mod._CREDENTIALS_PATH` to a temp file, deletes the env var, and asserts the captured env contains the token from the file. The test JSON structure matches the production code's extraction path. All 3 new `TestAuthTokenPassthrough` tests pass on the PR branch.
+- **Pre-existing `TestOptimisticLock` failures confirmed.** Ran against `main` directly: 3 failures, identical error messages, unrelated to auth token injection. The PR did not introduce them.
+
+**Patterns introduced:** The `_build_claude_env()` reuse across executor.py and steward.py confirms the seam-first pattern from golden-patterns.md — a named function at the auth-injection boundary that handles both the interactive and cron cases. No new structural patterns introduced; this PR correctly extends an existing one.
+
+**What this forecloses:** Nothing of significance. The `_dispatch_via_claude_p` / `_dispatch_via_stub` paths are explicitly non-default in production (default is `_dispatch_via_inbox`). The env injection adds no behavioral change for interactive sessions (fast path returns immediately if token is already in env).
+
+**Opportunity cost note:** Fix is two call sites + one import. Minimal surface. The only alternative (cron environment block) would require cron config changes per-deploy and would not benefit from the token refresh logic already present in `_build_claude_env`. The chosen approach is strictly better.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-22] Re-oracle PR #821 — feat: unified usage-report.sh API with dispatcher wiring
+
+**Prior NEEDS_CHANGES verdict:** [2026-04-22] PR #821. One gap identified.
+
+**Prior gap status:**
+
+- **Gap 1: `python3` bare invocation in `emit_summary`** — ADDRESSED. Commit 190cc7ce replaces `python3 -` with `uv run python -` in the `emit_summary` function in `scripts/usage-report.sh`. The diff shows `uv run python - "${STATE_FILE}" "${LEDGER_FILE}" "${OUTCOME_LEDGER_FILE}" "${WINDOW}" <<'PYEOF'` — the exact substitution named in the revision contract. No remaining bare `python3` references appear anywhere in the PR diff. The learnings.md pattern "Bare `python3` in bash scripts recurred" (2026-04-22, PR #821) names this failure mode and the detection rule; the fix satisfies the detection criterion: `scripts/usage-report.sh` now contains `uv run python -` at the invocation site.
+
+**Vision alignment:** The Stage 1 finding from the original review is carried forward unchanged: the work serves `current_focus.secondary` (usage observability, "cc-budget attribution so WOS parallelism and quota burn are measurable, not guessed"). The adversarial prior — this implementation is solving the wrong problem — was not confirmed by the original review and is not reasserted now. The single-line fix at commit 190cc7ce does not change the scope, architecture, or alignment of the work. Stage 1 verdict stands.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **Gap 1 is cleanly closed.** `uv run python -` now appears at the `emit_summary` invocation site. The fix matches the revision contract exactly — "the revision shows `uv run` in the heredoc invocation line."
+- **No new issues introduced.** The fix is a single-token substitution (`python3` → `uv run python`) on one line. No other lines in the diff were modified. Regression surface is zero.
+- **No remaining `python3` references in the diff.** The grep against the full PR diff for `python3` returned no output. The fix is complete, not partial.
+- **The learnings.md pattern (CLI Query Semantics, 2026-04-22) was the active prior.** It constrained my Stage 2 check by directing me to grep the full diff for `python3` — not just check the changed line — because the named failure pattern applies to any `scripts/*.sh` file, not only the specific line fixed. No other `python3` instances exist. The pattern confirmed the fix is sufficient.
+
+**Patterns introduced:** None new. The fix removes the antipattern named in learnings.md (bare `python3` in a bash script). No new structural patterns are introduced.
+
+**What this forecloses:** Nothing. The fix does not change script behavior, output schema, or calling conventions.
+
+**Opportunity cost note:** Single-line fix. Negligible.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-22] PR #821 — feat: unified usage-report.sh API with dispatcher wiring
+
+**Vision alignment:** The theory of change in vision.yaml is that usage observability should make "quota tradeoffs measurable, not guessed" (`current_focus.secondary`). The horizon field names "cc-budget JSONL fix" as the specific blocker — which implies the underlying data may be unreliable before the fix is applied. The Stage 1 question is whether a reporting wrapper built on top of potentially unfixed data is the right path, or whether the cc-budget JSONL fix should land first. On examination, this threat scenario does not hold: the PR description says the tests ran against live runtime data with valid quota percentages (15.5%/22.3%), and the state.json field path `.rate_limits.five_hour.pct` is confirmed correct against the live file. The "cc-budget JSONL fix" in the horizon appears to refer to attribution metadata, not to the quota state data this script reads. The wrapper does not foreclose the JSONL fix — it reads independently from the state.json and ledger files. The work is correctly aligned with `current_focus.secondary`. The morning briefing omission (no proactive quota surfacing, only reactive query handling) is a scope decision, not a misalignment — the PR description explicitly scopes to dispatcher-query response, and the horizon names it as follow-on. One structural defect applies: `emit_summary` invokes `python3` directly, violating CLAUDE.md's "always use uv" convention. The learnings.md entry (2026-04-20, PR #804) names this failure pattern exactly: bare `python3` silently produces empty output if uv manages the Python installation and `python3` is not in PATH. This is a NEEDS_CHANGES defect, not a misalignment.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **`emit_summary` invokes `python3 -` directly — CLAUDE.md violation and learnings.md named failure.** The learnings.md entry from 2026-04-20 (PR #804) states: "Bash inline `python3 -c "..."` in a scheduled task instruction document violates the `uv` convention. The failure mode is silent: if python3 is not in PATH (because uv manages the Python installation), the inline script produces empty output." This PR reproduces the exact pattern. The fix is to replace `python3 -` with `uv run python -` (or equivalent). This pattern constrained what I wrote: rather than flagging this as a style note, the learnings.md entry elevated it to a structural correctness defect with a named failure mode (silent empty output). Without the prior, this would have been a style observation; with it, it is the NEEDS_CHANGES trigger.
+- **Field path `.rate_limits.five_hour.pct` confirmed correct.** Live inspection of `~/.claude/cc-budget/state.json` confirms the field path: `rate_limits.five_hour.pct = 15.5`, `rate_limits.seven_day.pct = 22.3`. The `emit_summary` Python block reads `state.get("rate_limits", {}).get("five_hour") or {}` then `.get("pct")` — this matches the live schema.
+- **`--window` flag threading is correct.** `emit_flamegraph` delegates as `token-flamegraph.sh --window "${WINDOW}"`. Confirmed `token-flamegraph.sh` accepts `--window 1h|24h|7d`. Argument parsing in the wrapper uses the canonical shift-plus-bottom-shift pattern; no off-by-one. The `--window=` (equals-syntax) form is also handled. Both forms tested against the arg table in the diff.
+- **Feature-bundling check passes.** 240 additions, 0 deletions, 2 files changed: `scripts/usage-report.sh` (new) and `.claude/sys.dispatcher.bootup.md` (new section). Both files are explicitly accounted for in the PR description. The learnings.md mechanical check (count files, cross-reference PR description) is negative — no undocumented scope in the diff.
+
+**Patterns introduced:** Wrapper-script entry point for multi-script tooling: a single callable (`usage-report.sh`) that delegates to `cc-usage-collect.sh` state and `token-flamegraph.sh` without modifying either. The Python inline is embedded via heredoc (`<<'PYEOF'`) rather than a separate script file, which keeps the implementation self-contained but couples the Python runtime dependency to the bash script's execution environment.
+
+**What this forecloses:** Nothing structurally. The wrapper is read-only with no state writes. The dispatcher bootup section documents a subagent invocation pattern, which can be updated without a schema migration. Morning briefing integration (proactive quota surfacing) is not foreclosed — it would be an additive wiring step.
+
+**Opportunity cost note:** Usage observability is explicitly named in `current_focus.secondary` and the `current_constraint` field names it as a source of guesswork. This is correctly prioritized per vision.yaml. The primary constraint (WOS executor starvation) is separate and not blocked by this work.
+
+**VERDICT: NEEDS_CHANGES**
+
+**Revision contract:**
+- **Gap 1: `python3` bare invocation in `emit_summary`.** Replace `python3 -` with `uv run python -` (or `uv run -`) in the `emit_summary` function in `scripts/usage-report.sh`. Resolution is decidable: the revision shows `uv run` in the heredoc invocation line. Generic "fixed python invocation" without the specific substitution visible in the diff does not close this gap.
+
+---
+
+### [2026-04-21] Re-oracle v3 PR #804 — enhancement: negentropic sweep process improvements (artifact types, vision drift, stall signal, resolution rate)
+
+**Prior NEEDS_CHANGES verdict (v2):** [2026-04-21] Re-oracle PR #804. One remaining gap.
+
+**Prior gap status:**
+
+- **Gap 3 (remaining from v2 — Migration 78 path mismatch):** ADDRESSED. Commit e3dae685 corrects the `ROTATION_STATE` variable in Migration 78 from `${LOBSTER_WORKSPACE}/data/rotation-state.json` to `${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/hygiene/rotation-state.json`. Verification: `hygiene/rotation-state.json` exists at the canonical path; `data/rotation-state.json` does not exist. The `[ -f "$ROTATION_STATE" ]` guard will now evaluate true; `jq -e '.cycle_start_timestamp'` will find the field absent (confirmed: file contains only `current_night` and `last_run`); the migration will write the ISO timestamp and increment `migrated`. The learnings.md pattern "Migration path mismatch produces silent no-op" (2026-04-21) named this defect precisely — tracing the reader rather than trusting the writer's path assumption is what confirmed the fix is now correct.
+
+- **Gaps 1, 2, 4:** Still intact. Confirmed by diff inspection: OR-semantics label queries (`RESOLVED_HYGIENE` + `RESOLVED_BUG` as separate `--label` flags), canonical oracle paths (`~/lobster/oracle/learnings.md` and `~/lobster/oracle/golden-patterns.md`), and Migration 79 archival of `hygiene/sweep-context.md` are all unchanged. Commit e3dae685 touched only `scripts/upgrade.sh` — no regressions possible in other files.
+
+**Vision alignment:** The adversarial prior for this third pass — this implementation is solving the wrong problem, or solving the right problem in a direction that forecloses better paths — was applied to a single-path-variable correction. The threat scenario that could make this wasted effort: if the real problem is that `rotation-state.json` is written in a location that future code might move, then a migration pointing to the current location defers a future breakage rather than structurally preventing it. This scenario does not survive scrutiny: the path is referenced by the document itself (`~/lobster-workspace/hygiene/rotation-state.json`) and the reader code, and the migration now matches both. The fix is correctly pointed at the defect the prior oracle named. Stage 1 verdict: alignment confirmed.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **Gap 3 is cleanly closed.** Migration 78 now targets `hygiene/rotation-state.json`. The file exists there. The field is absent. The migration will fire, write the timestamp, and increment `migrated`. The `[ -f ]` guard that previously silently no-oped will now evaluate true.
+- **The fix is surgical — one variable, one file, one commit.** Commit e3dae685 modified only `scripts/upgrade.sh`. No other files were touched. The risk surface for regression is zero.
+- **Gaps 1, 2, and 4 are confirmed still intact.** No regressions from the path fix.
+- **The learnings.md "Migration path mismatch produces silent no-op" pattern (2026-04-21) was the active prior that constrained this verification.** It directed me to trace the reader (what code reads `rotation-state.json` and from where) rather than trusting the writer's assumption. That trace confirmed the fix targets the correct file. Without this prior, verification might have stopped at "the path string changed" without confirming the file exists at the new path.
+
+**Patterns introduced:** None new beyond those named in the v1 and v2 verdicts.
+
+**What this forecloses:** Nothing. The path fix does not introduce new constraints or close off directions.
+
+**Opportunity cost note:** Single-variable path fix. Opportunity cost is negligible. No alternative path was blocked.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-21] Re-oracle PR #804 — enhancement: negentropic sweep process improvements (artifact types, vision drift, stall signal, resolution rate)
+
+**Prior NEEDS_CHANGES verdict:** [2026-04-20] PR #804. Four gaps named.
+
+**Prior gap status:**
+
+- **Gap 1 (`--label bug,hygiene` AND semantics):** ADDRESSED. The resolution rate metric now uses two separate queries — `RESOLVED_HYGIENE` and `RESOLVED_BUG` — summed as `closed_prior_count`. OR semantics via separate invocations. The diff confirms this is explicit in the bash block.
+
+- **Gap 2 (wrong oracle learnings path `~/lobster-workspace/oracle/learnings.md`):** ADDRESSED. The new versioned `memory/canonical-templates/sweep-context.md` references `~/lobster/oracle/learnings.md` and `~/lobster/oracle/golden-patterns.md` in Step 1. The string `~/lobster-workspace/oracle/learnings.md` does not appear in the new file.
+
+- **Gap 3 (no migration for `cycle_start_timestamp`):** PARTIALLY ADDRESSED — path mismatch makes the migration a silent no-op on existing instances. Migration 78 exists in `upgrade.sh` and correctly writes an ISO 8601 string (not a Unix integer — the follow-up fix is confirmed). However, Migration 78 targets `${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/data/rotation-state.json`. The actual runtime file is at `~/lobster-workspace/hygiene/rotation-state.json` — confirmed by live inspection. The `data/rotation-state.json` path does not exist. The migration's `[ -f "$ROTATION_STATE" ]` guard will evaluate false, the migration will silently no-op, and the first Night 7 post-upgrade will still fire a false drift warning. The gap named in the prior verdict (false drift warning on first Night 7) is not closed.
+
+- **Gap 4 (no migration for sweep-context.md path change):** ADDRESSED. Migration 79 archives the old runtime copy at `~/lobster-workspace/hygiene/sweep-context.md` to `$OLD_SWEEP.archived-$(date +%Y%m%d)`. The `uv run python` convention fix is present in the vision drift bash snippet in the new sweep-context.md.
+
+**Vision alignment:** The adversarial prior — this implementation is solving the wrong problem, or solving the right problem in a direction that forecloses better paths — was re-evaluated with attention to whether the re-oracle fixes themselves introduce new defects. The prior Stage 1 finding (alignment verdict: Confirmed) stands unchanged. The revision contract was mostly met; one defect was introduced in correcting Gap 3 — the migration was written targeting the wrong runtime path.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **Gap 3 correction introduced a path mismatch.** Migration 78 targets `${LOBSTER_WORKSPACE}/data/rotation-state.json` but the live state file is at `~/lobster-workspace/hygiene/rotation-state.json`. The mismatch is confirmed by live inspection: `data/rotation-state.json` does not exist; `hygiene/rotation-state.json` exists and lacks `cycle_start_timestamp`. The migration will silently no-op — `substep` will never fire and `migrated` will not increment.
+- **Gaps 1, 2, and 4 are fully resolved.** The two-query OR semantics for the resolution rate, the canonical oracle path in sweep-context.md, the `uv run python` convention fix, and the Migration 79 archival of the old runtime copy are all correct and present in the diff.
+- **The new sweep-context.md is otherwise clean.** The file consistently uses the correct oracle paths, the artifact-type sub-classification table is present and structurally sound, the stall signal logic is complete, and the rotation-state.json path is consistent within the document (the document correctly references `~/lobster-workspace/hygiene/rotation-state.json` — which is the right path; the migration is the one that has the wrong path).
+- **double-counting note in the resolution rate metric is correctly self-documented.** The comment "issues with both labels are double-counted, but that is acceptable for this rate metric" is present and accurate — this is not a defect.
+
+**Patterns introduced:** No new patterns introduced by this revision beyond those named in the original 2026-04-20 verdict.
+
+**What this forecloses:** Same as prior verdict — nothing significant.
+
+**Opportunity cost note:** Same as prior verdict.
+
+**VERDICT: NEEDS_CHANGES**
+
+**Revision contract (single remaining gap):**
+
+- **Gap 3 (path mismatch in Migration 78):** Correct the `ROTATION_STATE` variable in Migration 78 to target `${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/hygiene/rotation-state.json` (not `data/rotation-state.json`). Addressed: the path in Migration 78 matches the actual location of rotation-state.json, confirmed by `ls ~/lobster-workspace/hygiene/rotation-state.json` returning the file. Gaps 1, 2, and 4 do not require re-review — they are closed and this verdict does not reopen them.
+
+---
+
+### [2026-04-21] PR #805 — refactor: consolidate write_inbox_message() into shared utility (closes #781)
+
+**Vision alignment:** The adversarial prior — this implementation is solving the wrong problem, or solving the right problem in a direction that forecloses better paths — was applied against the threat scenario that a deduplication refactor consumes agent cycles while the executor pipeline has starvation symptoms named as this week's primary constraint in current_focus. vision.yaml current_focus.primary is "WOS execution health: fix executor dispatch starvation, resolve RALPH Cycle 7 failures, drain 106 proposed UoWs." This PR addresses none of those. The horizon line explicitly names only executor starvation and cc-budget attribution as next priorities — maintenance refactoring is not listed. That said, the adversarial prior did not survive into a full "Misaligned" verdict because: (1) the work does not foreclose any execution health paths — deduplication is non-blocking and fully reversible; (2) the problem being solved is real (six-way copy-paste of a critical inbox write function creates drift risk on any schema change); (3) `what_not_to_touch` does not name scheduled-task utility consolidation; (4) the scope is cleanly bounded and the implementation correctly defers the structurally different cases (write_task_output, ralph-loop, lobstertalk_unified). The work is questioned on timing, not direction.
+
+**Alignment verdict:** Questioned
+
+**Quality finding:**
+- **Feature-bundling check passes (mechanical, per learnings.md PR #712/#717 pattern).** 8 files changed: 6 script updates removing local duplicates, 1 new canonical module, 1 test file. All 8 are accounted for in the PR description. No files outside the stated scope appear in the diff. The check cost 30 seconds and is negative — recorded here because the learnings.md pattern states this check has caught bundling in 4 prior PRs and should be applied every review.
+- **Interface migration caller enumeration passes.** The learnings.md pattern from PR #720 requires a repo-wide grep for the function name under migration before the first round. Applied: `grep -r "write_inbox_message"` across the codebase surfaces `lobstertalk_unified.py` (`_write_inbox_message`, different signature — full dict), `ralph-loop.py` (`_write_inbox_message`, different signature — dry_run param), `oom-monitor.py` (different signature — inbox_dir param), and test helpers (inline implementations for test isolation). None of these are parallel implementations of the 6-script pattern; all have structurally different signatures that justify separate treatment. The PR correctly left them out of scope.
+- **Return type standardization to `str` is backward-compatible.** Five callers previously ignored the `None` return value; they continue to compile and run without modification. The sixth (auto-router.py) already returned `str` and called the function identically. No TypeError, no silent breakage. The `job_name` parameter addition changes the call signature — all six call sites were updated in the same diff. No missed callers in production scheduled-tasks.
+- **Source field fix (`LOBSTER_DEFAULT_SOURCE` vs. hardcoded `"telegram"`) has one behavioral consequence on non-Telegram instances: messages from five scripts that previously hardcoded `"telegram"` will now correctly use the configured source.** This is the only non-zero behavioral change in the PR. It is correct by design and matches the behavior `auto-router.py` already had. No test covers the case where `LOBSTER_DEFAULT_SOURCE` is absent and verifies the default is `"telegram"` — this is covered by `test_source_defaults_to_telegram_when_env_absent`, which passes. No gap.
+
+**Patterns introduced:** Canonical shared utility at `src/utils/inbox_write.py` for the inbox write seam across scheduled-task scripts. This is an application of the seam-first abstraction golden pattern: the function is placed precisely at the boundary where 6 producers with identical output contracts meet the inbox filesystem. The `job_name` parameter in the message ID prefix (e.g., `daily-metrics_<uuid>`) adds traceability that the per-script implementations approximated (some used `{JOB_NAME}_`, some used hardcoded prefixes like `proposals_digest_`) but the shared module standardizes.
+
+**What this forecloses:** Nothing. The shared module is not a one-way door. Scripts can revert to local implementations if the shared module's interface becomes unsuitable. The `write_task_output` functions were correctly left local — the PR description documents the per-script filename convention reason, which is the right basis for the scope boundary.
+
+**Opportunity cost note:** Agent cycle on utility consolidation while current_focus.primary is WOS executor starvation (106 proposed UoWs, RALPH Cycle 7 all-failed, executor dispatch starvation). The PR is correctly scoped and cleanly executed, but the timing is not aligned with this week's stated priority line. This is not a veto on the work; it is a question the builder should hold for future prioritization decisions: hygiene work before the primary constraint is cleared has implicit opportunity cost.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-20] PR #804 — enhancement: negentropic sweep process improvements (artifact types, vision drift, stall signal, resolution rate)
+
+**Vision alignment:** The adversarial prior — this implementation is solving the wrong problem, or solving the right problem in a direction that forecloses better paths — was applied with the specific threat scenario: if the sweep's core failure is that escalations aren't being actioned (not that thresholds are undifferentiated), then artifact-type tiers and vision drift detection address symptoms while the actual feedback loop remains broken. This threat scenario partially collapses on examination: improvement #4 (resolution rate + ENTROPY ACCUMULATION signal) directly addresses whether escalations are being actioned — the PR is not blind to the feedback loop failure, it measures it. This is on-vision with principle-3 ("Determinism over judgment for conditionals"). The constraint-3 Encoded Orientation concern was the surviving Stage 1 tension: the artifact-type sub-classification adds three new autonomous action tiers (14/30/60-day thresholds) without a prior logged decision in vision.yaml or decisions.md explicitly authorizing them. However, the prior sweep context already authorized autonomous file removal; this PR adds type differentiation within an existing autonomous category — refinement of encoded behavior, not a new class. The opportunity cost question is clean: this is current_focus.secondary ("Negentropic sweep results available for review"). The adversarial prior did not survive scrutiny on vision alignment. It survives on implementation quality — three defects found that require changes before this PR achieves its stated goal.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **`--label bug,hygiene` is AND semantics, not OR (confirmed by live gh CLI test).** `gh issue list --label bug,hygiene` returns only issues tagged with BOTH labels. Sweep-filed issues are tagged `hygiene` or `bug` but rarely both. The resolution rate metric will systematically undercount closed escalations, producing artificially low or zero rates that would incorrectly trigger ENTROPY ACCUMULATION. This is a false positive generator in the metric's core signal. Correct form is two separate `--label` invocations or a search query with OR logic.
+- **Wrong oracle learnings path in the versioned sweep-context.md.** Step 1 of the new `memory/canonical-templates/sweep-context.md` instructs the sweep to read `~/lobster-workspace/oracle/learnings.md` — the legacy workspace path that PR #796 established as non-canonical. Canonical path is `~/lobster/oracle/learnings.md`. Since the PR's stated rationale is making sweep improvements versionable and authoritative, shipping the wrong oracle path in the versioned copy undermines the goal. Both paths exist on this instance, so this is not a crash — but it reads from the potentially stale workspace copy rather than the git-tracked repo copy.
+- **No migration for `cycle_start_timestamp` causes a false drift warning on first Night 7 post-merge.** `rotation-state.json` currently has no `cycle_start_timestamp` field. When Night 7 runs, the python3 inline script returns `0` for CYCLE_START (the `if ts else 0` branch); `VISION_MTIME > 0` is always true, so the drift warning fires for every Night 7 until a Night 1 writes the field. A migration step populating `cycle_start_timestamp` in the existing rotation-state.json would prevent one guaranteed false positive per instance on the first Night 7.
+- **No migration for sweep-context.md path change in upgrade.sh (confirmed absent).** The old runtime copy at `~/lobster-workspace/hygiene/sweep-context.md` remains on disk and authoritative for any instance running a pre-upgrade task file. A migration step that either removes the old copy or writes a redirect notice would seal this gap. `python3` vs `uv run python3` in the vision drift bash snippet is a convention gap (CLAUDE.md: "Always use uv"); failure mode is silent if python3 is not in PATH.
+
+**Patterns introduced:** Artifact-type sub-classification as a named autonomy calibration structure — this is a direct application of the "determinism over judgment for conditionals" principle (principle-3) to the sweep's file-removal decisions. The table format (type/patterns/threshold) follows the table-as-compaction-resistant encoding golden pattern. The resolution rate metric introduces a sweep self-monitoring loop — the sweep now watches its own effectiveness rather than only describing entropy. The ENTROPY ACCUMULATION signal names a failure mode that previously had no detection path. The learnings stall signal names another previously undetectable condition. These are structurally sound additions.
+
+**What this forecloses:** Nothing significant. The versioned sweep-context.md enables future sweep improvements to be PR-reviewed — this is an additive structural change. The artifact-type thresholds can be tuned. The resolution rate metric can be corrected to OR semantics.
+
+**Opportunity cost note:** Sweep infrastructure improvements while WOS executor starvation is current_focus.primary. This is explicitly current_focus.secondary per vision.yaml — within stated scope.
+
+**VERDICT: NEEDS_CHANGES**
+
+**Revision contract:**
+
+- **Gap 1: `--label bug,hygiene` AND-vs-OR defect** — the resolution rate gh query must use OR semantics. Addressed: revise the `gh issue list` command to use two separate `--label` flags (`--label bug --label hygiene`) or an equivalent OR query. "Addressed" is decidable if the revised query returns hygiene-only issues and bug-only issues when tested against dcetlin/Lobster.
+
+- **Gap 2: wrong oracle learnings path in versioned sweep-context.md** — Step 1 must reference `~/lobster/oracle/learnings.md` not `~/lobster-workspace/oracle/learnings.md`. Addressed: the string `~/lobster-workspace/oracle/learnings.md` must not appear in `memory/canonical-templates/sweep-context.md`.
+
+- **Gap 3: no migration for `cycle_start_timestamp`** — upgrade.sh (or user-update.sh for instance-specific) must populate `cycle_start_timestamp` with the current timestamp in rotation-state.json if the field is absent. Addressed: migration step exists and the field is present in rotation-state.json post-upgrade. Alternatively, the bash snippet can be made robust to the absent-field case by treating `CYCLE_START=0` as "drift check not applicable this cycle" and skipping the warning rather than always firing it. Either resolution closes this gap; the PR author may choose which path.
+
+- **Gap 4: no migration for sweep-context.md path change** — upgrade.sh must include a step that removes or tombstones `~/lobster-workspace/hygiene/sweep-context.md` so the old copy is not treated as authoritative. Addressed: a migration step exists that removes or clearly marks the old path as superseded. `python3` → `uv run python3` is a convention fix that may be bundled in the same revision.
+
+---
+
+### [2026-04-20] PR #798 — fix: warn when Claude API token near expiry in _build_claude_env
+
+**Vision alignment:** The PR's theory of change is that a silent 401 failure when a Claude OAuth token expires is indistinguishable from other subprocess errors until logs are examined post-failure, and that earlier warning via structured logging closes this observability gap. The adversarial prior: is this solving the wrong problem? The competing hypothesis is that detection-only is an inferior intermediate state — the root cause (token expiry in a long-running unattended system) should be solved by auto-refresh, not warning logging. Under this reading, the PR adds code complexity while leaving the failure structurally unresolved. However, auto-refresh requires credential management surface that is outside current WOS Phase 1 scope (current_focus.primary is executor starvation and pipeline drain). The PR explicitly defers refresh logic. Detection does not foreclose refresh — any future refresh implementation would need the same expiry-parsing path internally. Vision principle-1 ("Structural prevention is preferred over reactive recovery") supports early detection over post-401 diagnosis; principle-3 ("Determinism over judgment for conditionals — if-then logic and field checks are code") supports encoding the check in the data path rather than expecting it to surface through log archaeology. The feature-bundling learnings.md pattern (recurring across PRs #498, #712, #714, #717) was checked: the diff touches exactly two files (steward.py and a new test file), both enumerated in the PR description — pattern does not apply. The constraint-3 Encoded Orientation check was considered: this PR modifies a production helper function, not an agent definition, bootup file, gate table, or vision.yaml. The check does not apply at this register. Stage 1 verdict: the adversarial prior did not survive scrutiny.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **Fast-path exemption is architecturally correct.** When `CLAUDE_CODE_OAUTH_TOKEN` is already set in the environment, it was explicitly injected by the operator or a prior rotation step — the assumption is that the caller knows the token's validity. Reading credentials.json to second-guess an externally-supplied token would be surprising behavior with no action path (the env var is already in flight). The test `test_build_claude_env_fast_path_skips_expiry_check` confirms this path produces no expiry warnings, which is the correct contract.
+- **Silent swallow of unreadable credentials is acceptable here.** `_check_token_expiry` is called inside the existing `try/except (OSError, json.JSONDecodeError, KeyError)` block that guards the entire credentials.json read. If the file is unreadable, the outer handler already logs a WARNING — adding a second warning for the expiry check that can't fire is correct omission. The risk is that a corrupt `expiresAt` field (readable JSON, parseable file, but malformed expiry value) silently skips the check; this is handled separately by the inner `except (ValueError, OSError, OverflowError)` in `_check_token_expiry` itself, which falls back to DEBUG. The degradation chain is complete.
+- **Unix timestamp handling via `datetime.fromtimestamp(ts, tz=timezone.utc)` is correct for the Claude credential store.** The Claude Code credential store writes `expiresAt` as a Unix millisecond integer in some versions. The PR uses `datetime.fromtimestamp(expires_at, tz=timezone.utc)` which interprets the value as Unix *seconds*. If Claude Code's credential store uses milliseconds (a common Node.js convention), a value like `1745000000000` would be parsed as year 57,000 — producing no warning for an actually-expired token. The PR description states it handles "Unix timestamps (int/float)" but does not specify the epoch scale. This is the one unverified assumption in the implementation. The test uses `datetime.now().timestamp()` which produces seconds — it would not catch a milliseconds mismatch. This is flagged as a quality risk, not a blocker, because: (a) the failure mode is silent omission of a warning (no false positive, no crash), and (b) the ISO 8601 string path is the more common expiresAt format in modern Claude Code credential files.
+- **Test coverage is thorough for the stated scope.** 6 pure unit tests for `_check_token_expiry` and 4 integration-style tests for `_build_claude_env`. The fast path, ISO string, Unix timestamp, None, and malformed cases are all covered. The only gap is the milliseconds-vs-seconds ambiguity noted above, which requires inspection of the actual Claude credential store format to resolve definitively.
+
+**Patterns introduced:** Pure helper function pattern (`_check_token_expiry`) with explicit input/output contract isolated from I/O, side effects contained in the helper, and graceful degradation for all malformed inputs. This is a correct application of the functional decomposition principle already present in steward.py. The named constant `_TOKEN_EXPIRY_WARN_SECONDS = 2 * 3600` follows the companion-constant convention (cf. PR #696 learning: "document the invariant the pair is meant to maintain"). No new behavioral patterns at the system level.
+
+**What this forecloses:** Nothing. Detection-only is a one-way step toward full refresh handling, not away from it. The `_check_token_expiry` function is the natural foundation for a future refresh hook at the same call site.
+
+**Opportunity cost note:** The PR is self-bounded to an unaddressed observability gap. The current_focus is WOS executor starvation (106 proposed UoWs awaiting execution, RALPH Cycle 7 failures). This PR does not address the starvation symptoms directly, but the silent 401 failure mode it detects is a candidate cause of executor failures when the OAuth token lapses during a long-running execution window — making it marginally on-path.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-20] PR #796 — fix: replace relative oracle/decisions.md references with absolute paths
+
+**Vision alignment:** The PR's theory of change is that relative `oracle/decisions.md` references in three agent instruction files resolved to a stale git worktree path instead of `~/lobster/oracle/decisions.md` (the live, git-tracked file). The symptom — merge gate agents reporting "no APPROVED entry" after oracle approval — is precisely what would occur if the reading agent resolved the relative path against a different working directory than the writing agent. The adversarial prior entering Stage 1: is this solving the wrong problem? The alternative failure hypothesis is that context compaction after a long session caused the merge gate instruction to be lost, and the blocking was an orientation failure rather than a path failure. However, the PR cites three specific PRs blocked on 2026-04-09 (#717, #720, #724), which is the same date PR #727 was reviewed for a closely related path inconsistency. The learnings.md entry for PR #727 (2026-04-09) documents the exact failure class: "any time an oracle file path appears in both an instruction document and a code constant, verify they point to the same resolved location." PR #727 closed the `~/lobster-workspace/oracle/` to `~/lobster/oracle/` split; PR #796 closes the residual relative-path references in the same files. The two PRs address different but related expressions of the same underlying problem. Reading learnings.md first caused me to check whether PR #727's noted residual inconsistency (negentropic-sweep.md line 57) was still open — it is not; `negentropic-sweep.md` line 57 now reads `~/lobster/oracle/learnings.md`. One remaining inconsistency exists outside PR #796's scope: `lobster-meta.md` line 14 still reads from `~/lobster-workspace/oracle/learnings.md`. This is not in the PR's stated scope, does not affect the merge gate, and is not a defect introduced by this PR. The adversarial prior did not survive scrutiny. The feature-bundling pattern from learnings.md (PRs #498, #712, #714, #717) was checked first: all three changed files are explicitly enumerated in the PR description — bundling pattern does not apply.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **All three relative references are correctly targeted and the replacements are complete.** CLAUDE.md PR Merge Gate row now uses `~/lobster/oracle/decisions.md` in all three places (Trigger, Enforcement, and the "must confirm" clause). `sys.subagent.bootup.md` adds a new line explicitly directing merge agents to the absolute path. `lobster-oracle.md` description prose is updated for consistency. The diff is minimal and precisely scoped — 4 additions, 2 deletions across three files.
+- **The sys.subagent.bootup.md change is additive, not a replacement.** The PR adds a new explicit PR-merge instruction line rather than changing an existing reference. This means the merge gate is now reinforced in two places in the subagent bootup: the original frontmatter review context and the new explicit absolute-path reference. This is structurally correct — the additional line serves as a discriminator specifically for the merge-agent case.
+- **The PR's own verification grep is complete and appropriate.** The PR states a grep across target files confirmed zero remaining relative `oracle/decisions.md` references without the `~/lobster/` prefix. Current repo state confirms this: only `lobster-oracle.md` line 6 description prose retains `oracle/decisions.md` (non-operative context), and that is the exact line this PR changes.
+- **One residual path inconsistency remains outside this PR's scope.** `lobster-meta.md` line 14 reads from `~/lobster-workspace/oracle/learnings.md` — the legacy workspace path. This affects the negentropic sweep's cross-reference signal (lobster-meta reads workspace learnings, oracle agent now writes to repo learnings) but does not affect the PR merge gate. Not a blocker for this PR; should be a follow-on fix.
+
+**Patterns introduced:** Pure document correction — no new behavioral patterns introduced. The fix extends the "absolute path over relative path for cross-role agent instruction files" convention that PR #727 established. When an agent instruction file must reference a file at a known absolute location, use the absolute path. Relative paths in instruction text are unreliable when the agent's working directory is not the repo root.
+
+**What this forecloses:** Nothing. The fix does not prevent future path changes — if `~/lobster/oracle/decisions.md` moves, all three references would need updating, which is the correct behavior. No alternative path resolution strategy is foreclosed.
+
+**Opportunity cost note:** Three-file document correction with four changed lines. The cost is negligible relative to the operational impact of merge gate blockage on multiple PRs.
+
+**VERDICT: APPROVED**
+
+---
+
 ### [2026-04-15] PR #753 — fix(observability): compact JSONL ledger format + usage-retro.py (Tier 1)
 
 **Vision alignment:** The active_project phase_intent is "Build the substrate that lets every agent make intent-anchored decisions" — WOS Phase 1 + Vision Object substrate. The current_focus.what_not_to_touch does not name observability, but principle-4 ("Integration rate before new feature rate — wire what exists before building more") is the relevant test. The PR bundles two distinct things: a one-character bug fix (`jq -n` → `jq -cn`) that restores data integrity on 468 existing records, and a new analytical tool (usage-retro.py) that adds surface area outside the current critical path. The adversarial prior: the usage-retro.py component is building a new analytical capability on top of a data layer that has been broken since the ledger was introduced — raising the question of whether the analysis is premature given that the data integrity baseline was never confirmed. However, the bug fix is self-evidently correct: a JSONL format that silently drops all records is a data integrity defect regardless of phase. For usage-retro.py, the vision alignment question is whether the analytical tool serves a decision Dan cannot currently make — the PR's own retroactive findings (oracle subagents and merge subagents are the dominant quota consumers) are a direct input to the kind of intent-anchored routing decisions the Vision Object substrate is meant to support. The world in which the retro tool is wasted effort: the findings it produces are already visible by reading the raw JSONL, or they don't change any routing or budget decision. The PR's own retroactive output (April 7-8 crash day correlation with 191 calls) suggests the data is actionable. Stage 1 verdict: the bug fix is clearly aligned; the retro tool is adjacent to the critical path but serves a real observability gap that the PR demonstrates with concrete findings. One genuine concern: the PR modifies two bootup docs (sys.debug.dispatcher.bootup.md and sys.subagent.bootup.md) without mentioning these changes in the PR description — this is the feature-bundling pattern documented in learnings.md, which has recurred in PRs #498, #712, #714, and #717. The unbundled changes are a subagent type rename (`general-purpose` → `lobster-generalist`), which is a valid maintenance correction but not part of the stated PR scope.
@@ -990,5 +1231,370 @@ PR #727 is approved for merge. Three path references correctly updated. One rema
 **What this forecloses:** Open-ended "improve it" review cycles where a document can be revised without tracing revisions to named gaps. This is the primary failure mode the protocol exists to prevent -- generic improvement that satisfies the form of revision without closing the specific interpretive gap the oracle identified.
 
 **Opportunity cost note:** No tooling, automation, or new files were built. The protocol is entirely expressed in the oracle agent definition and this decisions.md entry. The cost of not having this: document artifacts in the system accumulate without accountable review, and the oracle has no decision-procedural basis for document verdicts. This has been true since the oracle was introduced. The cost was diffuse (every document reviewed without the named-gap structure) rather than acute.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-20] PR #795 — fix(bootup): align spawned-agent signal with user.base.bootup.md
+
+**Vision alignment:** The active_project phase_intent is "Build the substrate that lets every agent make intent-anchored decisions." PR #795 does not touch that substrate directly — it corrects a behavioral inconsistency in a bootup document. The adversarial prior: is this solving the wrong problem? The signal legend in sys.subagent.bootup.md specifies the footer format that subagents emit when reporting side effects. A mismatch between this file (`🤖 spawned`) and user.base.bootup.md (`🚀 spawned  <task-name>`) means subagents reading the system file produce footers that (a) use the wrong emoji and (b) omit the task slug — the information the dispatcher would use to identify which task was spawned. This is not cosmetic: the footer is a structured signal in a protocol, and user.base.bootup.md line 201 explicitly says "Never `🤖 spawned`." The world in which this work is wasted: no subagent actually reads and follows the signal legend. That concern is not trivially dismissible — LLMs do not execute format specs mechanically — but the fix is a single line and costs essentially nothing. principle-1 (proactive resilience over reactive recovery) supports catching protocol-level discrepancies before they cause downstream parsing confusion. Stage 1 verdict: alignment confirmed. The fix is not strategic work, but it is the right problem and it is cheap.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **The diff is exactly what the PR claims.** Single line changed in the signal legend: `🤖` spawned replaced by `🚀 spawned  <task-name>` including the double-space separator and task-slug instruction. The PR's self-test (`grep -n "🤖" .claude/sys.subagent.bootup.md`) confirms only the GitHub attribution lines remain — those are a structurally distinct use of `🤖` (PR body prefix, not spawned-agent signal) and are correctly left unchanged.
+- **Cross-file consistency verified.** The new text matches user.base.bootup.md line 190 exactly and line 201 explicitly reinforces it ("Never `🤖 spawned`"). No ambiguity remains between the two files.
+- **No side effects.** Documentation-only change. No code paths, no test surface, no MCP tools, no cron entries, no migration required.
+- **One residual observation: the signal legend still says "10-signal set."** After this change, the legend entry count is still 10 (the spawned entry was replaced, not added or removed), so the count remains accurate. Not a defect — confirming this is correct.
+
+**Patterns introduced:** None. This is a correction to an existing pattern (the signal-legend protocol), not the introduction of a new one.
+
+**What this forecloses:** Nothing. The fix is a one-line document correction with no architectural consequence.
+
+**Opportunity cost note:** The opportunity cost is negligible — a single-line documentation fix that closes a behavioral specification gap. Not relevant to WOS execution health or the vision substrate, but also not competing with them.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-20] PR #797 — oracle: wire OODA constraint-3 Encoded Orientation check into Stage 2
+
+**Vision alignment:** The theory of change in vision.yaml is that all agents should make decisions anchored to specific fields — constraint-2 (every priority decision must be traceable to a specific field, not inferred from conversational texture) and constraint-3 (Encoded Orientation decisions require a prior logged decision and a traceable vision.yaml anchor) jointly define a structural anchoring requirement. Until this PR, constraint-3 was orphaned: vision.yaml defined it, but no agent enforced it. The oracle is the correct enforcement point because it gates every PR before merge. The adversarial prior here was: does adding a named check to an LLM agent's instruction document actually change oracle behavior on future PRs, or does it only label a criterion the oracle was already informally applying? This prior was active because of the "library with no wiring" failure pattern from learnings.md (any new check is inert until it changes a verdict). The world in which this work is wasted effort: the oracle was already denying Encoded Orientation PRs without the named check, making this instruction redundant. Having read the existing Stage 2 criteria (five questions with no explicit constraint-3 reference), that scenario is disconfirmed. The prior oracle criteria did not direct the oracle to look for decisions.md anchors. The check closes a real structural gap. The golden-patterns.md "adversarial prior seeding" pattern caused me to hold the question "does the oracle actually apply this mechanically?" as the primary evaluation axis — not whether the wording is elegant.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **The check is self-applying and passes its own criteria.** This PR encodes a new behavioral orientation into lobster-oracle.md (an agent definition), which triggers the Encoded Orientation check. The vision.yaml anchor is unambiguous: `inviolable_constraints[constraint-3]` directly and verbatim motivates the change. For the "prior logged decision" anchor, the check provides "or equivalent" relief — the vision.yaml constraint itself is the equivalent logged intent. The check passes reflexively, which is the correct behavior.
+- **The artifact-type enumeration is concrete and mechanical.** "Agent definitions, bootup files, gate tables, vision.yaml, CLAUDE.md" gives the oracle a specific list to check against. This prevents the oracle from treating the classification as a pure judgment call. Most PRs touch code files and will pass the check automatically; the check fires only when the diff includes one of the named artifact types.
+- **The "mechanical" exception has one ambiguous edge case.** "No new orientation encoded" is the operative phrase for passing refactors through without the check. A refactor that moves an existing behavioral instruction from one artifact to another — without changing it — could be classified either way. The check does not provide a test for this edge case. The failure mode is inconsistency across oracle runs, not false positives or false negatives on clear cases.
+- **"Or equivalent" in anchor (a) is undefined.** The check requires "a prior logged decision in oracle/decisions.md or equivalent" — but "equivalent" is not specified. Future oracle runs might accept conversational context, GitHub issue descriptions, or vision.yaml constraints themselves as equivalents inconsistently. Tightening this to enumerate valid equivalents (vision.yaml constraint entries, resolved open decisions) would improve consistency, but this is a minor improvement, not a blocker.
+
+**Patterns introduced:** Named check as a bold paragraph within Stage 2 — establishes the format for future Stage 2 criteria additions. The self-applying property (the check applies to the PR that introduces it) is a structural feature worth preserving: any future Stage 2 criterion added via PR should be checked against itself.
+
+**What this forecloses:** Behavioral orientation changes that were previously light-touch (touching an agent definition without justifying the change against vision.yaml and a prior decision) now require the justification to be present before the oracle approves. This is the correct friction. It does not foreclose legitimate orientation changes; it requires them to be deliberate.
+
+**Opportunity cost note:** Two lines against a 169-line file; low cost. The current_focus priority is WOS execution health, not oracle improvements. However, the oracle gates all PRs — improving it protects the WOS work from misaligned behavioral drift. The opportunity cost of not doing this was accumulating Encoded Orientation changes without structural accountability.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-20] PR #799 — fix: use absolute paths for all oracle/decisions.md references in agent instructions
+
+**Vision alignment:** The theory of change in vision.yaml is structural anchoring — agents making decisions from explicit, locatable references, not inferred context. A path reference that resolves to the wrong location (or no location) after context compaction is exactly the failure mode constraint-2 ("every agent decision must be traceable to a specific field — not inferred from conversational texture") exists to prevent. The path-fix sweep is the right problem: fixing the reference precision that makes oracle review enforceably structural rather than advisory. The adversarial prior: is there a scenario in which all of this work is wasted? Yes — if PR #796 already fixed the same locations, PR #799's diff applies against a stale base and cannot merge cleanly. That scenario requires examination before Stage 1 can be called confirmed.
+
+The "path fix completeness" learning from PR #796 oracle entry (2026-04-20, learnings.md) was the active prior here. That learning states: "when fixing a path inconsistency, enumerate all path-reference forms — not just the form observed in the failing case." Applying this, I enumerated all path forms across all agent instruction files before evaluating the PR's scope. This produced a concrete finding: PR #799 is CONFLICTING with main (mergeStateStatus: DIRTY), meaning its diff was computed against a pre-PR-#796 base. PR #796 already fixed several of the same locations that PR #799 targets.
+
+**Alignment verdict:** Questioned
+
+**Quality finding:**
+- **PR #799 cannot merge: merge conflict with main.** `gh pr view 799 --json mergeable,mergeStateStatus` returns `CONFLICTING / DIRTY`. PR #796 merged first and fixed the same CLAUDE.md PR Merge Gate row and the same lobster-oracle.md frontmatter line. The diffs are not identical (PR #796 used backtick-wrapped paths in frontmatter; PR #799 removes the backticks), but they touch the same lines, creating a conflict the PR cannot resolve automatically.
+- **Post-PR #796 main is already substantially fixed.** After PR #796 merges, the locations PR #799 targets in CLAUDE.md (3 occurrences in the PR Merge Gate row) are already at `~/lobster/oracle/decisions.md`. The lobster-oracle.md frontmatter is also already fixed. PR #799's additions are redundant for those locations and cannot be applied as-is.
+- **One remaining unfixed reference exists that neither PR addresses.** `lobster-oracle.md` line 77 (Encoded Orientation check) reads `oracle/decisions.md` — a bare relative reference inside the behavioral prose of the Encoded Orientation check. This is a read-reference: the oracle is instructed to "check `oracle/decisions.md`" when verifying a prior logged decision. Post-merge of both PRs, this reference remains unfixed. An oracle agent checking for a prior decision via this reference would search relative to cwd rather than `~/lobster/oracle/decisions.md`.
+- **docs/oracle-review-protocol.md line 90 also has a remaining bare reference.** After PR #796 and PR #799 both merge, `docs/oracle-review-protocol.md:90` still reads `oracle/decisions.md` (without the `~/lobster/` prefix). This is a documentation file, not an agent instruction — lower severity — but the sweep's stated definition of done ("No relative oracle/decisions.md references remain in agent instructions") does not cover it.
+
+**Patterns introduced:** The conflict scenario confirms a new failure mode: two sequential fix-sweep PRs branched off the same base independently fixing the same locations, where the second PR becomes unapplicable after the first merges. This is a variant of the "feature bundling" pattern in learnings.md but operating in reverse: two PRs too narrowly scoped, fixing overlapping subsets from different branch points rather than coordinating as a single sweep.
+
+**What this forecloses:** Nothing structural — the path-fix work is purely corrective and introduces no architectural commitment.
+
+**Opportunity cost note:** Not relevant — path fixes are zero-opportunity-cost corrections. The cost here is the conflict resolution needed before PR #799 can be applied.
+
+**VERDICT: NEEDS_CHANGES**
+**Revision contract:**
+- **Gap 1: Merge conflict with main** — PR #799 must be rebased onto current main (post-PR #796) before it can be evaluated for merge. The conflict is on the CLAUDE.md PR Merge Gate row and the lobster-oracle.md frontmatter — both lines already changed by PR #796. The rebased PR should retain only the changes not already present on main.
+- **Gap 2: lobster-oracle.md Encoded Orientation check (line ~77) still references bare `oracle/decisions.md`** — after rebase, this remaining reference should be fixed in the same PR since it is in scope of the sweep's stated definition of done. Addressed = the line reads `~/lobster/oracle/decisions.md` after the fix. Not addressed = the sweep remains incomplete.
+- **Gap 3 (optional, lower priority): docs/oracle-review-protocol.md line 90** — bare `oracle/decisions.md` in the "After issuing an APPROVED verdict" sentence. This is documentation, not an agent instruction, so it is not a blocker, but the sweep's definition of done should state whether documentation files are in or out of scope.
+
+
+---
+
+### [2026-04-20] PR #799 (re-review) — fix: use absolute paths for all oracle/decisions.md references in agent instructions
+
+**Prior gap tracking:**
+- **Gap 1: Merge conflict with main** — ADDRESSED. PR rebased onto main post-PR #796 merge. Single commit remains, touching only the two locations not already fixed by PR #796.
+- **Gap 2: lobster-oracle.md Encoded Orientation check (line ~77) bare `oracle/decisions.md`** — ADDRESSED. The diff changes `oracle/decisions.md` → `~/lobster/oracle/decisions.md` in the Encoded Orientation check prose of `.claude/agents/lobster-oracle.md`. The specific instruction ("a prior logged decision exists in `oracle/decisions.md` or equivalent") now reads the absolute path.
+- **Gap 3: docs/oracle-review-protocol.md line 90** — ADDRESSED. The diff changes `oracle/decisions.md` → `~/lobster/oracle/decisions.md` in the "After issuing an APPROVED verdict" sentence. The author chose to include it in scope, satisfying the gap's framing question ("state whether documentation files are in or out of scope") by including them.
+
+**Vision alignment:** The theory of change is identical to the prior review: path references that do not resolve to the live oracle file undermine the structural enforceability of oracle review, which is the mechanism by which constraint-2 ("every agent decision must be traceable — not inferred") and constraint-3 (Encoded Orientation requires a prior logged decision) are structurally enforced rather than advisory. This re-review's adversarial prior: is there a scenario in which the rebased PR still fails to complete the sweep? The residual-reference question from the prior review remains relevant — are there other bare references not covered by this PR and not covered by PR #796? The sweep's definition of done is "no relative `oracle/decisions.md` references remain in agent instructions." The PR covers the two locations its description claims. Whether other bare references exist in agent instruction files (as opposed to documentation or non-operative prose) determines whether the sweep's stated definition of done is met. Examining the committed repo state (lobster-oracle.md line 6 frontmatter description still reads "Writes to oracle/decisions.md") and sys.dispatcher.bootup.md context note — these are non-operative context strings (frontmatter description, a quoted note), not instructions the agent acts on. The lobster-oracle.md line 6 reference is in the agent card's own `description` field, which describes the agent's function to a reader, not a path the agent traverses. This passes the operative-reference test. The adversarial prior does not survive: this PR completes the sweep's operative scope.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **Both changes are precisely targeted and correct.** The Encoded Orientation check in lobster-oracle.md is an agent instruction the oracle acts on (step (a): "a prior logged decision exists in [path]") — making it absolute is operationally necessary, not cosmetic. The docs/oracle-review-protocol.md change is in the "Integration with Oracle Agent" section that instructs the oracle agent on its post-APPROVED action; it is semi-operative and the fix is appropriate.
+- **Encoded Orientation check passes as mechanical.** The PR modifies an agent definition file (.claude/agents/lobster-oracle.md), which triggers the Encoded Orientation check. However, the change is purely a path string fix: the behavioral orientation encoded (verify prior logged decision and vision.yaml anchor before allowing Encoded Orientation PRs) is unchanged. No new orientation is encoded; no old orientation is removed. The check passes automatically as a mechanical path correction. Citing golden-patterns.md "self-applying Stage 2 check as structural correctness test" (2026-04-20): the Encoded Orientation check does not fire on itself here because the PR encodes no new behavioral orientation — it only corrects the path string the check uses.
+- **No residual operative bare references after this PR applies.** The non-absolute references remaining in the repo (lobster-oracle.md line 6 description field, sys.dispatcher.bootup.md OODA note, various design/retro docs) are non-operative: they are prose descriptions, architectural references in documentation, or quoted context — not path instructions the agent follows when doing its work. The sweep's definition of done ("no relative references in agent instructions") is satisfied.
+- **The learnings.md entry for PR #799 ("sequential fix-sweep PR conflict") is confirmed as correctly scoped.** The rebase strategy (drop conflicting commits, keep only the residual) is the correct resolution: the rebased PR is exactly 1 commit ahead of main touching exactly the 2 unfixed locations. No over-application, no under-application.
+
+**Patterns introduced:** None new. This PR extends the absolute-path convention established by PR #796 and PR #727. No new behavioral or structural patterns.
+
+**What this forecloses:** Nothing. The correction is additive precision on path strings; it does not constrain future changes to the oracle infrastructure.
+
+**Opportunity cost note:** Two-line documentation correction. Zero opportunity cost.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-20] PR #800 — fix: implement OAuth token refresh in _build_claude_env
+
+**Vision alignment:** PR #800 is the natural continuation of PR #798, which added expiry detection but explicitly deferred refresh. Issue #775 named the full fix: when a WOS run exceeds ~8 hours, the OAuth token expires and steward cycles fail with a 401 that is indistinguishable from other subprocess errors. The adversarial prior entering Stage 1: is refresh the right fix, or is this addressing a symptom — with the root cause being WOS runs that exceed the token lifetime? Under the symptom-fix hypothesis, the correct fix would be reducing steward cycle duration or frequency, not adding a refresh mechanism that depends on an undocumented Anthropic endpoint discovered by binary inspection. However, this hypothesis collapses for two reasons: (1) WOS execution health is the explicit `current_focus.this_week.primary` in vision.yaml — "fix executor dispatch starvation" — and unforced 401 failures are a direct starvation contributor; (2) the graceful degradation path (on failure, log ERROR and continue with old token) means endpoint instability does not make the system worse than the pre-PR baseline. The endpoint instability concern is real — `_ANTHROPIC_OAUTH_TOKEN_ENDPOINT` was discovered from the Claude CLI binary, not documentation, so Anthropic could change it without notice. But the response to this risk is correct: treat refresh as best-effort. The constraint-3 Encoded Orientation check applies here because `_refresh_oauth_token` writes credentials.json without Dan's per-cycle input. The prior logged decision is Issue #775 (closed by this PR). The vision.yaml anchor is `current_focus.this_week.primary` ("fix executor dispatch starvation" — 401 failures are a starvation contributor). Both are present. The adversarial prior did not survive scrutiny.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **The millisecond timestamp fix (primary bug) is correctly implemented and well-tested.** `_normalise_timestamp()` applies the `> 1e11` threshold to detect ms-format values — the exact threshold documented in the learnings.md entry for PR #798. The two ms-specific tests (`test_ms_timestamp_near_expiry_triggers_refresh`, `test_ms_timestamp_fresh_does_not_trigger_refresh`) exercise the exact scenario the PR #798 oracle review flagged as uncovered. This directly closes the quality gap named in the PR #798 decision entry.
+- **Credential write-back field preservation is tested and correct.** `test_preserves_other_credential_fields_on_write` verifies that `refreshToken`, `scopes`, `subscriptionType`, and `rateLimitTier` survive the write. The merge logic (`creds.setdefault("claudeAiOauth", {})` then field assignment) is sound. The `setdefault` defense for a missing `claudeAiOauth` key is logically unreachable given that the caller extracted `refreshToken` from `oauth` before calling `_refresh_oauth_token` — but it does not harm correctness.
+- **Locally-declared mirror of production constant in test file.** `test_token_refresh.py` line 296 declares `_MILLIS_THRESHOLD = 1e11` locally, mirroring `_MILLISECOND_TIMESTAMP_THRESHOLD = 1e11` from steward.py. This is the divergence-risk pattern named in learnings.md (PR #696: "A locally-declared mirror of a production constant creates a divergence risk"). Because learnings.md was read before the diff, I specifically searched for locally-mirrored constants — this is the behavioral change the pattern citation constrains. The correct form is to import `steward._MILLISECOND_TIMESTAMP_THRESHOLD` directly. This is a quality gap, not a blocker: the test does not verify the threshold value itself, only uses it to branch ms vs. seconds parsing in an assertion. If the threshold changes, this test silently tests against the stale value.
+- **`expires_in: 0` creates a refresh loop.** `_refresh_oauth_token` uses `data.get("expires_in", 0)` with a default of 0. If the Anthropic endpoint returns a response without `expires_in` or with `expires_in: 0`, the written `expiresAt` equals the current timestamp — immediately expired. On the next steward cycle, `_check_token_expiry` returns `EXPIRED`, triggering another refresh attempt. This loop resolves only when the endpoint returns a valid `expires_in` or the refresh itself fails. A non-zero default (e.g., 28800 — 8 hours) or a `> 0` validation before writing would prevent this. This is a minor gap that only fires on malformed endpoint responses; no test covers it.
+
+**Patterns introduced:** `_normalise_timestamp` as an isolated unit responsible for epoch-scale detection introduces a clean seam: any future caller parsing externally-sourced timestamps can use this function rather than re-implementing the threshold check. The `_TokenStatus` class-level string constants pattern is functional but does not provide exhaustiveness checking — future callers should use `if status in (...)` (as `_build_claude_env` correctly does) rather than chained equality checks that silently pass through on an unknown status.
+
+**What this forecloses:** The endpoint dependency `_ANTHROPIC_OAUTH_TOKEN_ENDPOINT` is now embedded in production code with no change-notification path. If Anthropic changes this endpoint, the system degrades silently to the pre-PR #798 baseline (continue with old token, log ERROR). This forecloses a proactive credential-rotation signal to Dan as an alternative fix — that alternative would require no undocumented endpoint. The graceful degradation makes this acceptable, but the dependency on a binary-discovered endpoint is now a permanent fixture in the production path unless explicitly removed.
+
+**Opportunity cost note:** This PR is directly on-path for `current_focus.this_week.primary` ("WOS execution health"). The 401-failure mode for long-running WOS cycles is a documented starvation contributor. No opportunity cost relative to stated priorities.
+
+**VERDICT: APPROVED**
+
+
+---
+
+### [2026-04-20] PR #786 — hygiene: update dispatch-job.sh tombstone with Phase 2 tracking issue and eligibility date
+
+**Vision alignment:** PR #786 is a tombstone comment update for `dispatch-job.sh`, adding a concrete Phase 2 eligibility date (2026-04-26), a live tracking issue reference (#785), and a dependency note about `bot-talk-check-dispatch.sh`'s 6 `exec` calls that must be replaced before archival. The adversarial prior entering Stage 1: is this solving the wrong problem? Specifically — is an underspecified tombstone comment the actual bottleneck, or is this PR spending oracle attention on commentary when `current_focus.this_week.primary` is WOS execution health? The prior does not survive scrutiny. The vision.yaml `horizon` field explicitly names "confirm PRs #786/#787 oracle-approved and merged" as an immediate next step. The tombstone's original defect was real: it referenced a closed issue (#1083) with no eligibility date, leaving a future engineer without an actionable pointer to Phase 2 conditions. Fixing that is infrastructure hygiene, not distraction — it encodes context that would otherwise require reconstruction, which is directly aligned with `constraint-4` ("minimize metabolic cost of cybernetic engagement"). The "adversarial prior seeding before implementation review" golden pattern (golden-patterns.md, 2026-03-27) constrained this analysis by requiring the Stage 1 finding to be formed before reading the diff — enforcing the check that alignment verdict is about the problem being solved, not the quality of the solution.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **The change is exactly scoped.** Six lines added, two lines modified — all comment text. No logic, no test surface, no behavior change. The syntax checks (`bash -n`) are the appropriate verification. The PR description correctly characterizes this as "pure comment-only change; no logic affected."
+- **The three additions are individually load-bearing.** The Phase 1 merge date (`2026-04-12`) makes the 2-week clock unambiguous. The eligibility date (`2026-04-26`) is computable from the merge date, but encoding it in the file removes the computation from a future engineer. The `bot-talk-check-dispatch.sh` dependency note with the specific count (6 `exec` calls) encodes a discovery that would otherwise require a grep — this is the highest-value addition.
+- **Constraint-3 Encoded Orientation check: not triggered.** This PR modifies only a comment in a shell script — it does not change any agent instruction, behavioral gate, bootup file, or vision.yaml field. No Encoded Orientation audit is required.
+- **No failure patterns from learnings.md apply.** The feature-bundling pattern was the active prior (learnings.md documents it as recurring in the same sprint). The diff contains exactly what the PR description says: one file, three comment additions. No bundling detected.
+
+**Patterns introduced:** None new. The practice of tombstoning with explicit eligibility dates and live tracking issue references is an extension of the infrastructure hygiene discipline already present in the codebase. No new behavioral or structural patterns are introduced.
+
+**What this forecloses:** Nothing. Comment-only change. All paths remain open.
+
+**Opportunity cost note:** This PR was explicitly placed on the vision.yaml horizon as a gate before pipeline restoration. Oracle review is therefore on-path, not bureaucratic overhead.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-21] PR #806 — Remove RALPH acronym from active job descriptions and code
+
+**Vision alignment:** PR #806 retires the RALPH label (Recursive Autonomous Loop for Pipeline Health) from human-readable prose — comments, docstrings, task descriptions, log messages — while explicitly preserving functional identifiers (`ralph-loop`, `ralph-test`, `ralph-state.json`, `ralph-reports/`) for a separate migration. The adversarial prior: is cosmetic naming cleanup the right expenditure of scope while `current_focus.this_week.primary` names "fix executor dispatch starvation, resolve RALPH Cycle 7 failures"? The prior weakens for two reasons. First, Dan explicitly directed the retirement — this is not an agent-initiated cleanup. Second, `constraint-4` ("minimize metabolic cost of cybernetic engagement") is served by removing a cute acronym with no semantic load; the RALPH name adds cognitive overhead without adding orientation. The incremental scope is correct: attempting a full rename including DB/cron identifiers mid-starvation investigation would add operational risk. The vision.yaml `principle-4` ("wire what exists before building more") supports the bounded scope. The adversarial prior does not survive scrutiny on the naming retirement itself. However, the diff contains a material out-of-scope deletion (Migrations 78 and 79 from upgrade.sh) that was not in the PR description — this is a quality issue, not an alignment issue.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **All RALPH prose substitutions are correct and complete within stated scope.** `ralph-loop.md` (task definition) and `ralph-loop.py` (dispatch script) consistently replace "RALPH" with neutral descriptive language ("WOS test run cycle", "WOS pipeline health loop", "pipeline health state"). No behavioral change — functional identifiers (`source = 'ralph-test'`, `ralph-state.json`, path variables) are unchanged throughout both files, consistent with the PR's explicit out-of-scope declaration.
+- **Migrations 78 and 79 are removed from upgrade.sh with no mention in the PR description.** PR #804 (merged 2026-04-21 at 02:34 UTC, before this PR was opened) added Migrations 78 and 79: (78) populate `cycle_start_timestamp` in `rotation-state.json` to prevent false vision-drift warnings on first Night 7 run; (79) archive the old `sweep-context.md` from the runtime path to prevent it being treated as authoritative. Both are functional migrations with downstream effects. PR #806 removes them silently as part of the RALPH naming diff. The `mergeStateStatus: CLEAN` confirms no merge conflict — this is an active deletion, not a merge artifact. Any install that runs upgrade.sh for the first time after this PR merges will never execute these migrations. This is the feature-bundling pattern from learnings.md (PR #714, PR #712, PR #717: "always cross-check diff file list against PR description to detect undocumented scope expansion") — applied here as *undescribed deletion* rather than undescribed addition. Detection was triggered by the oracle vocabulary loaded from learnings.md before the diff was read; without that vocabulary the upgrade.sh deletions would likely have read as an unrelated cleanup and passed.
+- **The `success_criteria` string for type-A UoW changes from `'RALPH test output'` to `'WOS test output'`.** This is a behavioral change: any in-flight type-A UoW at the time of upgrade will have the old `success_criteria` string in the DB; the executor will evaluate against it correctly because success_criteria is read from the DB record, not from the script. But future injected type-A UoWs will write `'WOS test output'` as the target string and write to `/tmp/ralph-test-{run_id}.md` with the old filename pattern. The file path (`/tmp/ralph-test-{run_id}.md`) is unchanged — so the success criteria references a file name that still contains "ralph". This is a minor internal inconsistency that does not affect operational behavior but would not survive a strict naming-consistency audit in a follow-on PR.
+- **Constraint-3 Encoded Orientation check: not triggered.** This PR modifies a task definition document (ralph-loop.md) and a dispatcher script (ralph-loop.py), but all behavioral logic is unchanged. No agent behavioral instruction, gate table, bootup file, or vision.yaml field is modified. The substitutions are prose-only.
+
+**Patterns introduced:** The partial-rename pattern — retire human-readable labels first, migrate functional identifiers in a follow-on PR requiring DB/cron coordination — is now established for future label retirements in this codebase. This is a deliberate and sensible approach for cases where full rename is operationally risky.
+
+**What this forecloses:** If the partial rename ships and the follow-on identifier migration (ralph-loop → wos-health-loop, ralph-state.json → wos-health-state.json, ralph-reports/ → wos-health-reports/, ralph-test source marker) is not tracked in an issue, the identifier migration is likely to be forgotten. The codebase will have WOS-labeled prose pointing at ralph-* identifiers for an extended period. This is an acceptable risk Dan chose by directing incremental retirement; it is not foreclosure by the PR itself.
+
+**Opportunity cost note:** Low-cost housekeeping directed by Dan. The migration deletion is the substantive concern — it is not about opportunity cost but about correctness.
+
+**VERDICT: NEEDS_CHANGES**
+
+**Revision contract:**
+- **Gap 1: Silent deletion of Migrations 78 and 79** — `upgrade.sh` must restore Migrations 78 and 79 exactly as they appeared after PR #804 merged to main. The RALPH naming PR has no standing to remove functional migration steps. Addressed: the restored migrations appear in the diff. Disputed: author provides a specific reason why removing them is correct (e.g., they were superseded by a later migration or are now no-ops). Deferred: author acknowledges the gap and states why restoration is not being done now. Generic removal without tracing to a reason does not count as resolution.
+
+---
+
+### [2026-04-21] Re-oracle: PR #806 — Remove RALPH acronym from active job descriptions and code (pass 2)
+
+**Prior gap tracking:**
+- **Gap 1: Silent deletion of Migrations 78 and 79** — STATUS: ADDRESSED. Commit 82b4f63 restored both migrations verbatim from main. Verified: the PR branch (`retire-ralph-naming`) contains Migrations 78 and 79 at lines 2688–2712 of `scripts/upgrade.sh`, byte-for-byte identical to main. The diff for this PR shows zero deletions in the Migration 78/79 region. The prior gap is fully closed.
+
+**Vision alignment:** No change from the first oracle entry (2026-04-21). The Stage 1 finding locks before seeing the implementation and does not change after. PR #806 retires RALPH human-readable labels as directed by Dan — alignment verdict was Confirmed in the first pass and remains Confirmed. The restoration of Migrations 78 and 79 does not touch vision alignment; it was a quality issue.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **Gap 1 is closed.** Migrations 78 and 79 are present on the PR branch, verified against the main branch blob. The upgrade.sh diff for this PR touches only the Migration 67 comment block (three lines of cosmetic label text). No functional migration content is added or removed.
+- **RALPH prose substitutions carry forward unchanged from pass 1.** All findings from the first oracle pass remain accurate: the naming changes are complete within stated scope, functional identifiers (`source = 'ralph-test'`, path variables, cron marker `LOBSTER-RALPH-LOOP`) are correctly preserved, and no behavioral logic is modified. The `success_criteria` partial-inconsistency noted in pass 1 (file path still contains `ralph-test` while content string now says `WOS test output`) remains — it is not a blocker and does not require a new gap.
+- **Feature-bundling-as-deletion pattern from learnings.md (2026-04-21, PR #806):** the pattern was written into learnings.md from the first oracle pass. Reading it now before the second diff confirms the detection vocabulary was correctly applied in pass 1: the PR diff no longer exhibits the deletion pattern. The oracle vocabulary loaded from learnings.md constrained this pass by focusing scrutiny on the upgrade.sh diff first — the fastest confirmation or refutation of the named gap.
+- **No new regressions.** Three files changed: `scheduled-jobs/tasks/ralph-loop.md`, `scheduled-tasks/ralph-loop.py`, `scripts/upgrade.sh`. This matches the PR description exactly. The upgrade.sh hunk is a single contiguous block in the Migration 67 region — no other migration regions are touched. No new patterns, deletions, or bundled changes detected.
+
+**Patterns introduced:** No new patterns. The first oracle pass established the partial-rename pattern (retire prose labels first, migrate functional identifiers in a separate PR). This pass adds no structural novelty.
+
+**What this forecloses:** No change from pass 1.
+
+**Opportunity cost note:** No change from pass 1.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-21] PR #811 — feat: WOS pattern register (oracle/patterns.md) wired into oracle and sweep
+
+**Vision alignment:** The WOS Pattern Register extends the oracle's detection vocabulary with named WOS execution loop signatures (spiral, cascade, burst, dead-end, steady-state). The vision's theory of change requires agents to make intent-anchored decisions without asking Dan — and recognition of systemic execution patterns is a precondition for the steward and oracle to route or escalate correctly. The oracle-vocabulary-as-detection-precondition golden pattern applies: this PR adds a named vocabulary layer the oracle reads before scanning a diff, which is precisely what that pattern specifies as the correct approach. The adversarial prior — all of this is solving the wrong problem — does not survive for the patterns.md addition itself: the patterns are currently unnamed across oracle, steward, and sweep, and naming them in a single document reduces the "different names for the same thing" coordination cost. The adversarial concern that does survive Stage 1: the PR description claims it updates `hygiene/sweep-context.md` to add a Pattern Match step, but this is a runtime file change, not a repo change. PR #804 moved sweep-context.md into `memory/canonical-templates/sweep-context.md` as the versioned canonical. The Pattern Match step was applied to the runtime copy but not to the canonical template — meaning a new install seeded from the canonical will not have Pattern Match. This is the exact failure mode named in the 2026-04-20 learnings.md Document Review entry: "Moving an instruction document from a runtime path to a versioned repo path requires the new versioned copy to be updated when new steps are added." The Stage 1 question — is this solving the right problem in a direction that forecloses better paths? — is confirmed for the repo changes (oracle/patterns.md, lobster-oracle.md), but the runtime-only sweep-context.md update is incomplete: the canonical template is the authoritative file post-PR-#804, and it was not updated.
+
+**Alignment verdict:** Confirmed (for repo changes) / NEEDS_CHANGES (for sweep-context.md wiring)
+
+**Quality finding:**
+- **oracle/patterns.md is well-formed.** Five patterns, each with signal threshold and explicit responses for steward, oracle, and sweep. The "Notes on evolution" section correctly identifies that thresholds are initial estimates adjusted via oracle decisions. The citation bar (behavioral change, not labeling) matches the existing learnings.md and golden-patterns.md standard. The table-as-compaction-resistant-encoding golden pattern is not violated here — the markdown section format is appropriate for a reference document read pre-review, not a bootup doc.
+- **lobster-oracle.md wiring is correct in scope.** The two-line addition is additive, correctly positioned after the existing vocabulary read instructions, and sets the same behavioral bar ("flag loop signatures when visible"). No conflicts with existing oracle instructions.
+- **Gap: Pattern Match step is in the wrong file.** PR #804 (merged 2026-04-21) moved sweep-context.md from `hygiene/` to `memory/canonical-templates/sweep-context.md`. The Pattern Match step was applied to the runtime copy at `~/lobster-workspace/hygiene/sweep-context.md` but NOT to `memory/canonical-templates/sweep-context.md`. Confirmed by grep: the canonical-templates version has no "Pattern Match" section, no reference to `~/lobster/oracle/patterns.md`. The runtime copy has it at line 118. Future installations seeded from the canonical template will not have Pattern Match — the patterns.md vocabulary will be unconnected to the sweep agent on new instances.
+- **Encoded Orientation check (constraint-3):** The lobster-oracle.md change is an Encoded Orientation decision — it changes a behavioral default for an agent definition durably. Prior logged decision: PR #804 established `memory/canonical-templates/sweep-context.md` as the versioned canonical. The oracle-vocabulary-as-detection-precondition golden pattern (2026-03-29) is the traceable vision.yaml anchor (constraint-3, orient is the schwerpunkt). Both conditions are satisfied for the oracle read instruction. The sweep-context.md runtime edit lacks the same anchor because it went to the deprecated file.
+
+**Patterns introduced:** WOS loop taxonomy as shared pre-review vocabulary (three consumers: oracle, steward, sweep) — a "single source of truth for pattern names" architectural decision. This is the correct structural form for cross-agent vocabulary.
+
+**What this forecloses:** The patterns.md file is declared read-only, human-editable only. This forecloses programmatic generation of patterns from learnings data — which may be desirable eventually but is correctly deferred per the PR's explicit statement.
+
+**Opportunity cost note:** The sweep-context.md canonical template update was the higher-value half of this PR's stated goals. The oracle read instruction is live; the sweep Pattern Match is live on this instance. But the canonical template gap means the two are disconnected for future installs.
+
+**VERDICT: NEEDS_CHANGES**
+**Revision contract:**
+- **Gap 1: Pattern Match step absent from canonical template** — `memory/canonical-templates/sweep-context.md` must include the Pattern Match section (read `~/lobster/oracle/patterns.md`, apply each pattern's threshold, generate prescriptions) between the detection pass and the refactor pass, matching what was applied to the runtime copy at `~/lobster-workspace/hygiene/sweep-context.md` lines 118+. The gap is closed when `grep "Pattern Match" memory/canonical-templates/sweep-context.md` returns a match. This is the only required gap; the oracle/patterns.md and lobster-oracle.md changes are approved as-is.
+
+
+---
+
+### [2026-04-21] Re-oracle v2 PR #811 — feat: WOS pattern register (oracle/patterns.md) wired into oracle and sweep
+
+**Prior NEEDS_CHANGES verdict (v1):** [2026-04-21] PR #811. One gap: Pattern Match step was applied to the runtime copy of sweep-context.md but omitted from `memory/canonical-templates/sweep-context.md`. New installs seeded from the canonical would not have sweep-pattern integration.
+
+**Prior gap status:**
+
+- **Gap 1 (canonical template missing Pattern Match step):** ADDRESSED. Commit 2a2490c8 adds the Pattern Match section to `memory/canonical-templates/sweep-context.md` at line 128. Verification: `grep -n "Pattern Match"` on the PR branch returns `128:### Pattern Match`. The section is substantively identical to the runtime sweep-context.md Pattern Match step. Installation-class divergence is closed.
+
+**Vision alignment:** The adversarial prior — this implementation is solving the wrong problem, or solving the right problem in a direction that forecloses better paths — was held through both passes of this PR. The threat scenario: creating oracle/patterns.md establishes a shared vocabulary for loop signatures, but if the vocabulary is never consumed by the oracle's detection pass in practice (the oracle reads it but does not change its behavior because the pattern names are too coarse), the file becomes a decorative document rather than a functional discriminator. This scenario cannot be fully resolved without a live oracle run, but the design addresses it structurally: the citation bar ("behavioral change, not labeling") is the same bar applied to learnings.md and golden-patterns.md — if the oracle names a pattern without stating how it constrained analysis, that is the failure mode, and it is catchable at meta-review. The canonical-template gap that triggered v1 NEEDS_CHANGES was the only structural defect. With it closed, the PR is correctly pointed at a real operational need (shared WOS pipeline vocabulary). Stage 1 verdict: alignment confirmed.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **Gap 1 closed cleanly.** The Pattern Match section in the canonical template matches the runtime version. The fix commit is minimal (9 lines added to canonical template) and introduces no side effects. The canonical template is now a complete version of sweep-context.md including the Pattern Match step.
+- **oracle/patterns.md content is correctly scoped.** Five patterns (spiral, cascade, burst, dead-end, steady-state) with signal thresholds, and three-role response tables (steward, oracle, sweep). The thresholds are labeled as initial estimates with an explicit evolution note. This is appropriate epistemic humility for a new vocabulary.
+- **lobster-oracle.md diff is additions-only with no regressions.** The document-review mode, Encoded Orientation Stage 2 check, and patterns.md load instruction are all well-anchored. The Encoded Orientation check passes its own self-applying test (constraint-3 in vision.yaml is the direct anchor). The document-review format adds named-gap tracking that makes future re-reviews decidable without re-reading the full document.
+- **Feature-bundling check (learnings.md 2026-04-08 pattern):** The branch diff shows 90+ files changed vs. main — this is a long-lived branch with significant divergence. However, the claimed PR scope is three files (lobster-oracle.md, sweep-context.md, oracle/patterns.md), and the diff against main for those three files is clean with no unexpected deletions. The branch divergence is pre-existing, not introduced by this PR. No regression introduced in the three claimed files.
+
+**Patterns introduced:** Named-vocabulary pattern register as a standalone file (`oracle/patterns.md`) composable with the existing learnings.md + golden-patterns.md reads. Three-role response tables (steward/oracle/sweep) as the encoding format for each pattern — this format makes it clear which system is responsible for detecting, flagging, and prescribing for each loop signature.
+
+**What this forecloses:** Using informal pattern naming in oracle reviews — the oracle is now expected to use the vocabulary in patterns.md when flagging loop signatures, which increases consistency but also means the pattern register must stay current or drift from actual usage.
+
+**Opportunity cost note:** Issue #810 (steward pattern-aware dispatch) is explicitly out of scope and tracked separately. This PR is correctly bounded to the vocabulary and documentation layer.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-21] PR #813 — fix: correct stale oracle learnings.md path in lobster-meta.md
+
+**Vision alignment:** This PR is a one-line path correction in an agent instruction file. The adversarial prior entering Stage 1: is the path fix the actual problem, or is there a deeper structural issue being papered over with a string correction? The scenario where this work is wasted: the wrong-path problem is a symptom of a broader oracle directory split that remains unaddressed, and fixing one reference leaves the agent reading from an older version of a file that exists at both the workspace and repo paths. The prior survives partial scrutiny — both `~/lobster-workspace/oracle/learnings.md` and `~/lobster/oracle/learnings.md` exist on the live filesystem (contra the PR description's claim that the workspace path "does not exist"). However, the repo copy is the canonical, version-controlled, up-to-date location (1017 lines vs. 824 in the workspace copy). Pointing to the repo copy is unambiguously correct. This PR is also the explicit follow-on action named in the PR #796 oracle verdict (decisions.md line ~159): "lobster-meta.md line 14 reads from ~/lobster-workspace/oracle/learnings.md — should be a follow-on fix." The work is tightly scoped, correctly targeted, and directly serves the vision by restoring one of the lobster-meta agent's two cross-reference signals. Alignment verdict is Confirmed.
+**Alignment verdict:** Confirmed
+**Quality finding:**
+- The diff is exactly one line, touching only the stale path reference in `.claude/agents/lobster-meta.md`. The scope constraint holds.
+- The PR description incorrectly states the workspace oracle path "does not exist" — `~/lobster-workspace/oracle/learnings.md` exists and contains 824 lines of real content (older learnings from PRs #696–#720). The actual defect was that the agent was reading a stale subset copy instead of the canonical repo version. This does not affect the fix's correctness but means the PR description mischaracterizes the failure mode.
+- The corrected path `~/lobster/oracle/learnings.md` is verified to exist and is the canonical location used by the oracle agent's own read instructions (`lobster-oracle.md` line 18).
+- The same line in lobster-meta.md already had the correct prefix for `golden-patterns.md` (`~/lobster/oracle/golden-patterns.md`), confirming this was a half-corrected line — a localized inconsistency, not a systemic one remaining after this fix.
+**Patterns introduced:** None. This is a path correctness fix with no behavioral pattern introduced.
+**What this forecloses:** Nothing of substance. The workspace oracle directory continues to exist as a runtime artifact; this fix simply routes the lobster-meta agent to the canonical version.
+**Opportunity cost note:** None. This is a correctness fix directly named in a prior oracle verdict. The cost of not shipping it is a persistently degraded lobster-meta cross-reference signal.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-21] PR #788 — Remove duplicated _default_db_path() from heartbeat scripts
+
+**Vision alignment:** The adversarial prior entering Stage 1: this implementation is solving the wrong problem, or solving the right problem in a direction that forecloses better paths. The PR removes three identical copies of `_default_db_path()` from `executor-heartbeat.py`, `steward-heartbeat.py`, and `garden-caretaker.py`, consolidating to `REGISTRY_DB` in `src/orchestration/paths.py`. The threat scenario that could make this wasted effort: the shared DB path should be part of a richer config layer, not a module-level constant, and consolidating to a constant forecloses that move. This scenario does not survive scrutiny — `paths.py` already exists and is explicitly designed to centralize exactly this class of path derivation (its own module docstring names inline re-derivation as the prior bug pattern). The learnings.md "Migration path mismatch produces silent no-op" pattern (2026-04-21) was the load-bearing prior: it specifically names divergent path references across files as a defect class. This PR eliminates three independent divergence points, directly preventing that failure mode. The work is maintenance-class hygiene that reduces future surface area — consistent with operating principle-1 (proactive resilience over reactive recovery). The timing concern (current_focus is WOS execution health, not cleanup) is real but does not constitute misalignment: the PR description notes no new behavior, no new wiring, and no scope expansion.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- The critical behavioral correctness issue was correctly identified and fixed in the PR itself: `paths.py` previously lacked `REGISTRY_DB_PATH` env override support, while all three inline functions honored it. The PR fixes `paths.py` before doing the consolidation, making the consolidation behavior-preserving. This is the right sequence.
+- The `REGISTRY_DB` constant is now module-level — computed once at import time. For cron-dispatched scripts (each invocation is a fresh process), this is equivalent to the prior call-per-invocation pattern. No regression exists in production. However, any test that imports the heartbeat module and then attempts to set `REGISTRY_DB_PATH` via `monkeypatch.setenv` would not affect the already-frozen constant — this is a latent test-authoring trap, not a current defect. No existing test exercises this path.
+- Tests pass (22 + 122 = 144 reported) but do not exercise `main()` — they inject `tmp_path`-based DB paths directly into `Registry`. The change from `_default_db_path()` call to `REGISTRY_DB` in `main()` has no test coverage. This is a pre-existing gap in test design (tests never called `main()`), not introduced by this PR. The PR's feature-bundling-as-check ("grep -n REGISTRY_DB — exactly one import + one usage per file") is an appropriate mechanical verification for this change class.
+- No `test_paths.py` exists; `REGISTRY_DB`'s `REGISTRY_DB_PATH` branch has no dedicated test. Pre-existing gap surfaced by this PR but not created by it.
+
+**Patterns introduced:** Module-level constant (not callable) as the canonical form for env-derived paths in `paths.py`. This differs from the callable pattern the inline functions used. The module docstring already establishes this as the intended pattern for paths.py, so this is pattern extension, not a new pattern introduction.
+
+**What this forecloses:** The heartbeat scripts can no longer independently override DB path resolution logic without modifying `paths.py`. This is the intended outcome, not a foreclosure risk — the point is that path logic lives in one place.
+
+**Opportunity cost note:** Three review slots consumed for hygiene. The PR is correctly scoped and clean, so the per-slot cost is low. The vision.yaml current_focus is WOS execution health; this PR does not advance that focus but also does not compete with it. No missed higher-priority alternative is visible.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-21] PR #814 — feat: pattern-aware dispatch eligibility check in steward
+
+**Vision alignment:** The adversarial prior entering Stage 1: this implementation is solving the wrong problem, or solving the right problem in a direction that forecloses better paths. The theory of change is that the steward, by detecting spiral/dead-end/burst loop patterns before dispatching, becomes self-governing rather than requiring manual rescue. This maps to learnings.md's named failure pattern "execution capability built ahead of governing structures produces recurring need for manual rescue" (2026-04-08) — this PR is a governing structure. That alignment is real. However, two signals cut against it. First, vision.yaml `current_focus.what_not_to_touch` explicitly states "New detection or classification rules — improve Orient routing before adding more detection." The spiral/dead-end/burst checks are new detection rules, placed in a field that functions as the system's declared scope boundary for the current week. The oracle cannot waive a what_not_to_touch field because the implementation is well-executed — the field exists precisely to hold this boundary against good-looking work that is out of scope. Second, Gap 1 (spiral gate reads `oracle_approved` audit events not yet written anywhere) means the most architecturally significant of the three gates silently reads zero at every invocation and never fires. Shipping a gate whose primary signal source does not exist is not staged delivery — it is a library without wiring, which learnings.md names explicitly as a recurring failure mode (2026-04-08: "any production routing path that requires a new caller to be added is not effective until the caller is added"). The orbit of this PR is the right problem class, but the timing and the silent-zero defect are Stage 1 concerns that the implementation quality does not resolve.
+
+**Alignment verdict:** Questioned
+
+**Quality finding:**
+- **Throttle verdict is a skip, not a batch-size reduction.** `BURST_BATCH_SIZE = 3` is defined as a named constant and cited in the function docstring ("limit batch size to BURST_BATCH_SIZE per cycle"), but the integration in `run_steward_cycle` unconditionally routes all non-`dispatch` verdicts to `skipped += 1; continue`. There is no batch-size tracking, no per-cycle count of throttled vs. allowed UoWs, no partial pass-through. The constant is exported, tested for its face value (`assert BURST_BATCH_SIZE == 3`), but never consumed in logic. This is the patterns.md documentation mismatch failure at the contract layer — the docstring and the patterns.md spec both say "batch into groups of 3" but the implementation says "skip unconditionally." A UoW in a queue of 12 will be skipped on every steward heartbeat until the queue drops below 12, which may never happen organically. The "throttle" verdict label overpromises the behavior delivered.
+- **Spiral gate is silently non-functional.** `_count_oracle_passes` counts `event == "oracle_approved"` entries in the audit log. No code in the codebase writes that event today (the PR description acknowledges this as Gap 1). The gate will return 0 oracle passes for every UoW in every steward cycle until the `oracle_approved` audit write is wired. This means the gate providing highest-precedence protection against the spiral pattern — the one most relevant to the current RALPH Cycle 7 failures — cannot fire. Tests are correct (they test the gate's logic with injected audit entries) but they do not and cannot test whether the event is ever written in practice.
+- **Dead-end gate is functional as specified.** `_count_failed_or_blocked_transitions` reads `to_status` in `{"failed", "blocked"}` from real audit entries that are written today. This gate will fire on real data. The threshold (2) matches patterns.md and is imported by tests rather than re-declared, consistent with the learnings.md constant-mirroring failure pattern (2026-04-20 PR #800 and PR #696).
+- **Test design is sound where it can be.** Pure function decomposition (`_count_oracle_passes`, `_count_failed_or_blocked_transitions`) allows tests to exercise counting logic independently. Threshold constants are imported from production, not re-declared locally. Precedence tests cover all three pairwise combinations. The 29 tests cover what the implementation does. The gap is that what the implementation does does not fully match what the PR description and patterns.md spec say it does — the tests validate the implementation accurately, not the spec faithfully.
+
+**Patterns introduced:** Dispatch gate as a pre-`_process_uow` eligibility check in `run_steward_cycle` — a new structural slot in the loop that future pattern detectors can occupy. The audit entry `dispatch_eligibility_skip` with `eligibility` field establishes a queryable signal for observability of gate firings. Named constants for pattern thresholds with `# Source: oracle/patterns.md §...` comments establish traceability from code to pattern vocabulary.
+
+**What this forecloses:** Until the throttle verdict is implemented as actual batch-size gating (not a skip), the burst response cannot be tuned without a code change. The current behavior — skip all UoWs in a burst queue — is more aggressive than the spec intends, which means the throttle label masks a potential starvation outcome.
+
+**Opportunity cost note:** This PR was built while vision.yaml `current_focus.what_not_to_touch` names "New detection or classification rules" as out of scope. The dead-end gate is the most immediately useful component and is directly relevant to the RALPH Cycle 7 starvation constraint. Splitting: shipping only the dead-end gate (functionally correct, in-scope by the narrowest reading) vs. all three gates (two non-functional or misspecified) would have been the lower-risk staging decision. The PR as submitted installs a gate slot that is partially wired — better than nothing, but the spiral gate cannot protect against the pattern it names until the audit write is added.
+
+**VERDICT: NEEDS_CHANGES**
+**Revision contract:**
+- **Gap A (blocking): Throttle behavior mismatch.** The throttle verdict must either (a) implement actual batch-size limiting — allow up to `BURST_BATCH_SIZE` UoWs through per cycle even during burst, skip the rest — or (b) rename the verdict to `skip_burst` and update `BURST_BATCH_SIZE`'s docstring and patterns.md reference to remove the "batch into groups of 3" claim. The current implementation silently delivers harder behavior than specified. This is "addressed" when the behavior matches the docstring and the patterns.md §burst Steward response.
+- **Gap B (advisory): Spiral gate silent zero.** Either (a) add a `# TODO(#NNN): oracle_approved audit write not yet wired — this gate will always return 0 until that integration ships` comment in `_count_oracle_passes` and in the `_check_dispatch_eligibility` spiral branch so future readers are not confused, or (b) defer the entire spiral detection block (with its threshold constant) to the PR that wires the audit write. "Addressed" means the code's behavior and the documentation of its current behavior are consistent — a reader should not have to read the PR description to know the gate is not yet functional.
+
+---
+
+### [2026-04-21] Re-oracle PR #814 — feat: loop-pattern-aware dispatch eligibility check in Steward
+
+**Prior NEEDS_CHANGES verdict:** [2026-04-21] PR #814. Two gaps named.
+
+**Prior gap status:**
+
+- **Gap A (throttle batch-size — blocking):** ADDRESSED. `throttle_count = 0` is introduced before the loop. The `throttle` branch in `run_steward_cycle` now checks `if throttle_count < BURST_BATCH_SIZE: throttle_count += 1` (allow through, fall through to `_process_uow`) vs. `else: skipped += 1; continue` (skip beyond batch limit). The first `BURST_BATCH_SIZE` (3) UoWs that receive a `throttle` verdict are dispatched normally; subsequent ones are skipped. The audit entry is written only on the skip path. The behavior now matches the `BURST_BATCH_SIZE` constant's docstring and the patterns.md §burst Steward response specification. The prior defect (unconditional skip on any throttle verdict) is closed.
+
+- **Gap B (spiral gate silent zero — advisory):** ADDRESSED. Two locations now document the non-functional state: (1) the `_count_oracle_passes` docstring carries a NOTE that oracle_pass_count will always be 0 until the oracle agent integration writes `event="oracle_approved"`, with the issue reference `#810`; (2) the spiral check branch in `_check_dispatch_eligibility` repeats the same NOTE inline. A reader of either the helper or the top-level gate function encounters the documentation without consulting the PR description. The revision contract criterion ("a reader should not have to read the PR description to know the gate is not yet functional") is met.
+
+**Vision alignment:** The adversarial prior — this implementation is solving the wrong problem, or solving the right problem in a direction that forecloses better paths — was re-examined against the updated context. The `what_not_to_touch` exception for "WOS dispatch loop pattern gating (spiral/dead-end/burst)" in vision.yaml removes the Stage 1 scope-boundary concern from the original verdict. The theory of change (steward becomes self-governing against loop patterns) maps directly to `current_focus.primary` ("WOS execution health: fix executor dispatch starvation"). The two fixes are targeted at real behavioral mismatches from the prior verdict and do not introduce new problems. The opportunity cost note from the original verdict is no longer applicable: the in-scope exception resolves the timing concern. Stage 1 verdict: Confirmed.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **Gap A fix is behaviorally correct.** The `throttle_count` variable accumulates across the cycle (not reset per-UoW), which is the correct semantic for a per-cycle batch limit. The allowed-through path falls through to `evaluated += 1` and `_process_uow` without a `continue`, so throttle-allowed UoWs are dispatched normally. The skip path writes `dispatch_eligibility_skip` with `eligibility: "throttle"`. The pure-function tests for `_check_dispatch_eligibility` correctly test the return value; the `throttle_count` integration is in `run_steward_cycle` and not unit-tested in isolation — this is acceptable for an integration-level accumulator.
+- **Gap B documentation is present at both call sites.** `_count_oracle_passes` docstring and the spiral branch in `_check_dispatch_eligibility` both carry the NOTE with `#810` reference. The documentation is discoverable by any reader of either function without PR history.
+- **Feature-bundling check passes.** Three files changed: `paths.py` (+1 constant), `steward.py` (new code), test file (new). All three are within stated scope. Mechanical check cost 30 seconds; negative result recorded per learnings.md PR #712/#717/#806 pattern.
+- **`_queue_depth` snapshot before the loop is correct.** The burst check is consistent across the cycle — all UoWs see the same depth. Inline comment documents the reason. No per-UoW re-query.
+
+**Patterns introduced:** No patterns introduced beyond those named in the original [2026-04-21] PR #814 verdict. The batch-size gating pattern (allow first N, skip rest, count with a per-cycle accumulator) is an application of the existing steward loop pattern already established in `run_steward_cycle`.
+
+**What this forecloses:** The spiral gate remains non-functional until `event="oracle_approved"` is written by the oracle integration. This is now explicitly documented in code, so the foreclosure is legible. The dead-end gate and burst batch-size gate are both functional.
+
+**Opportunity cost note:** With the `what_not_to_touch` exception in place, the opportunity cost question is resolved. These gates are in scope as part of WOS execution health.
+
+**VERDICT: APPROVED**
+
+
+---
+
+### [2026-04-22] PR #823 — fix: redirect test output artifacts away from production outputs dir (#819)
+
+**Vision alignment:** The adversarial prior — this implementation is solving the wrong problem, or solving the right problem in a direction that forecloses better paths — finds no purchase here. The contamination is empirically grounded (154 of 295 failed UoWs in the production record are test artifacts), the impact on observability is real (apparent failure rate inflated from ~21% to ~44%), and this kind of corrupted signal directly impairs the WOS execution health work that is the current_focus.primary. The theory of change is: move test writes to isolated tmpdir, production record becomes accurate. The question is whether the env-var seam is the right lever or an over-extension. An env-var seam adds a production-facing runtime knob for path override — a capability not stated in the issue and not required for the fix. A fixture-only approach (monkeypatching the constant in conftest.py) would achieve the same isolation without adding a new env-var contract. However, the env-var approach has a defensible advantage: it makes the redirect mechanism explicit and inspectable at process level (visible in `ps -e` / environment introspection), whereas a monkeypatch is invisible outside the Python runtime. This is not a direction-foreclosing choice. The alignment verdict is Confirmed.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **`_OUTPUT_DIR_TEMPLATE` env-var read at import time is effectively vestigial in the fixture path.** The fixture sets `WOS_OUTPUTS_DIR` via `monkeypatch.setenv` at test setup time — after module import. At import time, `_OUTPUT_DIR_TEMPLATE` will have already captured the production path (env var not yet set). The call-time read in `_output_ref_path()` is what actually achieves the redirect. The module-level env-var read matters only if `WOS_OUTPUTS_DIR` is set in the process environment before Python starts (e.g., CI env var injection). The PR's stated purpose for the dual read — "existing tests that monkeypatch it directly continue to work unchanged" — is correct but the reasoning is reversed: those tests continue to work because they monkeypatch the attribute after import (overriding whatever value the import captured), not because of the env-var read at import time. This is a documentation accuracy issue, not a correctness defect.
+- **Three existing tests that monkeypatch `_OUTPUT_DIR_TEMPLATE` directly now have their explicit monkeypatching silently superseded by the autouse fixture.** `_output_ref_path()` checks `WOS_OUTPUTS_DIR` from the environment first, so when the autouse fixture is active (every test), `_OUTPUT_DIR_TEMPLATE`'s value is irrelevant to `_output_ref_path()`'s behavior. Those tests' explicit monkeypatching is now dead code. They continue to pass (both the autouse redirect and the monkeypatch point to non-production tmpdirs), but any assertion in those tests that infers `_output_ref_path()` behavior from `_OUTPUT_DIR_TEMPLATE`'s value is testing a now-unreachable code path. Severity: advisory. Tests pass; the risk is future confusion when someone changes `_OUTPUT_DIR_TEMPLATE` in a test and wonders why `_output_ref_path()` ignores it.
+- **Env var cleanup between tests is correctly handled.** `monkeypatch.setenv` in `isolate_executor_outputs` uses pytest's `monkeypatch` fixture, which restores all patched values on test teardown. No env pollution between tests.
+- **Production count verification (1788 before/after) is meaningful for the stated claim.** It confirms the test run wrote zero new artifacts to the production directory. It does not address the already-present ~154 contaminating artifacts — issue #819's impact statement described those as existing contamination, not something the fix would remove retroactively. The verification scope matches the fix scope.
+
+**Patterns introduced:** Autouse conftest fixture using `monkeypatch.setenv` for filesystem isolation. This extends the existing conftest isolation pattern (e.g., `isolate_inbox_server_paths`) to the executor output path. The autouse scope means no test can accidentally write to production without explicitly opting out — a correct default.
+
+**What this forecloses:** The env-var contract (`WOS_OUTPUTS_DIR`) is now a public interface point. Future changes to the production output path must update both `_OUTPUT_DIR_TEMPLATE`'s default string and document the env-var override. The "belt-and-suspenders" double-read pattern (constant at import, env at call time) introduces a subtle precedence order that future contributors may misread. If a future engineer monkeypatches `_OUTPUT_DIR_TEMPLATE` expecting it to override `_output_ref_path()` behavior, they will be silently wrong.
+
+**Opportunity cost note:** The existing ~154 contaminating artifacts remain in the production directory after this fix. The fix prevents future contamination; it does not clean up past contamination. If production failure-rate metrics are being used for decision-making now, a one-time cleanup of the production directory (or a timestamp-based filter from the fix's merge date) would be needed to get a clean signal. Not a PR scope issue — this is an issue-level gap.
 
 **VERDICT: APPROVED**

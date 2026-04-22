@@ -33,6 +33,7 @@ Patterns and antipatterns surfaced through oracle review. These inform future de
 |------|----|----------|
 | 2026-04-09 | #738 | Spec assertion softening (>= N instead of == N) masks cycle-count regressions — prefer exact assertions with a documented tolerance comment only when the tolerance is a deliberate design choice, not an implementation quirk |
 | 2026-04-09 | #738 | Direct SQL field injection in tests signals an unsealed public API seam — when a field must be set via SQL because the upsert API doesn't accept it yet, document the seam explicitly so a future API addition is not a surprise |
+| 2026-04-20 | #800 | Locally-declared mirror of a production constant (e.g., `_MILLIS_THRESHOLD = 1e11` in test file mirroring `_MILLISECOND_TIMESTAMP_THRESHOLD = 1e11` in steward.py) creates a divergence risk: when the production constant changes, the test constant does not, causing the test to silently validate against a stale value. This is the same pattern named in PR #696 but recurring in a different form — the test uses the local constant only for branching in an assertion, so the test does not fail, but its branching logic silently uses the wrong threshold. Import production constants from the module under test rather than re-declaring them. |
 
 
 ### Timezone Handling
@@ -40,11 +41,28 @@ Patterns and antipatterns surfaced through oracle review. These inform future de
 | Date | PR | Learning |
 |------|----|----------|
 | 2026-04-15 | #753 | Hardcoded UTC offset `timezone(timedelta(hours=-4))` drifts during EST (November through mid-March) — use `zoneinfo.ZoneInfo("America/New_York")` instead |
+| 2026-04-20 | #798 | `datetime.fromtimestamp(ts, tz=timezone.utc)` interprets `ts` as Unix *seconds*; Node.js credential stores commonly write Unix *milliseconds*. A milliseconds value parsed as seconds produces a year ~57000 — no warning fires for an actually-expired token. Tests using `datetime.now().timestamp()` (seconds) do not catch this mismatch. When parsing an externally-sourced Unix timestamp, verify the epoch scale from the producing system's documentation before choosing `fromtimestamp`. |
+| 2026-04-20 | #800 | `data.get("expires_in", 0)` default of 0 in an OAuth refresh response handler causes the written `expiresAt` to equal the current timestamp — immediately expired. On the next call, the expiry check returns EXPIRED again, triggering another refresh attempt. This creates a refresh loop that resolves only when the endpoint returns a valid `expires_in` or the refresh fails entirely. Use a non-zero default (e.g., the expected token lifetime) or validate `expires_in > 0` before writing. Detection: whenever an OAuth token response is merged into stored credentials, check whether the `expires_in` default produces an immediately-expired value. |
+
+### CLI Query Semantics
+
+| Date | PR | Learning |
+|------|----|----------|
+| 2026-04-20 | #804 | `gh issue list --label bug,hygiene` uses AND semantics — only issues with BOTH labels are returned. For OR semantics across labels, use two separate `--label` flags or a `--search` query with OR logic. When a metric's core signal depends on a gh CLI query with multi-label filtering, verify AND vs OR semantics by running the query against the live repo before finalizing the instruction. A query that silently undercounts will produce false ENTROPY ACCUMULATION escalations when resolution rate stays near zero. |
+| 2026-04-20 | #804 | Bash inline `python3 -c "..."` in a scheduled task instruction document violates the `uv` convention (CLAUDE.md: "Always use uv instead of bare python3"). The failure mode is silent: if python3 is not in PATH (because uv manages the Python installation), the inline script produces empty output, a downstream variable is empty, and the conditional that depends on it is silently skipped. The `|| echo 0` fallback pattern is insufficient if it is only applied to one half of a two-variable comparison — verify both variables have fallbacks. |
+| 2026-04-22 | #821 | Bare `python3` in bash scripts recurred — `emit_summary` in `usage-report.sh` uses `python3 - args <<'PYEOF'`. This is the second instance of the same pattern (first: PR #804). The pattern now spans shell scripts that embed inline Python, not just instruction documents. Detection: any new or modified `scripts/*.sh` file that embeds Python must use `uv run python -` or `uv run -` at the invocation site. Apply at oracle review whenever a bash script contains `python3` (bare) — do not limit the check to instruction documents. |
 
 ### Document Review
 
 | Date | Context | Learning |
 |------|---------|----------|
+| 2026-04-20 | PR #804 | Moving an instruction document from a runtime path to a versioned repo path requires: (a) a migration step removing or tombstoning the old runtime copy so it is not treated as authoritative, (b) a migration step updating any state files that the document's new behavior requires (e.g., adding new fields to a rotation-state.json), and (c) verifying that the new versioned copy does not perpetuate stale paths from the old runtime copy. Failure to migrate (a) leaves the old version authoritative for pre-upgrade instances. Failure to migrate (b) causes immediate false signals on first run (e.g., absent `cycle_start_timestamp` causes vision drift to fire unconditionally). Failure to check (c) ships the wrong path in the canonically correct file. |
+| 2026-04-21 | PR #804 re-oracle | Migration path mismatch produces silent no-op: a migration added to fix Gap 3 (absent `cycle_start_timestamp`) targeted `${LOBSTER_WORKSPACE}/data/rotation-state.json` but the actual runtime file is at `${LOBSTER_WORKSPACE}/hygiene/rotation-state.json`. The `[ -f "$ROTATION_STATE" ]` guard evaluated false (file not found at the wrong path), the migration silently no-oped, `migrated` did not increment, and the original gap remained unclosed. Detection pattern: after writing a migration that targets a specific file path, verify the path resolves to an existing file on the canonical instance before committing. For state files, the canonical location is determined by the runtime code that reads them — trace the reader, not the writer's assumption about where the file should be. |
+| 2026-04-21 | PR #806 | Feature-bundling-as-deletion: a narrowly-scoped cosmetic PR (RALPH label retirement, prose-only) silently deleted two functional upgrade.sh migrations (78 and 79) that had been added by a just-prior PR (#804, merged same day). The deletions appeared because the branch was cut from a pre-#804 state but never rebased, so the migrations looked like the branch's own deletions. Detection: `gh pr diff` shows deletions; cross-check against the PR description; if deleted content is not mentioned, flag it. The feature-bundling check (count changed files, compare against PR description) applies to deletions as well as additions. |
+| 2026-04-21 | PR #811 | Runtime instruction edit without updating canonical-templates counterpart creates installation-class divergence — when a runtime instruction file has a versioned canonical counterpart in `memory/canonical-templates/`, both must be updated in the same PR. Edit to runtime copy only means new installs seeded from canonical will not have the change. |
+| 2026-04-20 | PR #804 | When a new versioned copy of an instruction document is created from a runtime original, search the new copy for all path references and verify each against the current canonical paths — do not assume the runtime copy is current. The runtime copy may have accumulated legacy paths (e.g., `~/lobster-workspace/oracle/learnings.md`) that were corrected in the repo but not backported to the runtime copy. |
+| 2026-04-20 | PR #796 | Path fix completeness: when fixing a path inconsistency, enumerate all path-reference forms (wrong prefix, bare-relative, partial) — not just the form observed in the failing case. A single grep for the observed wrong path misses other wrong forms in the same files. |
+| 2026-04-20 | PR #799 | Sequential fix-sweep PR conflict: two PRs independently fixing overlapping subsets of the same path inconsistency from the same branch point produce a merge conflict when the first merges before the second is rebased. The second PR's diff base is stale; the locations it targets are already changed. Detection: before opening a follow-on sweep PR, verify whether a sibling PR has already merged to main and touched the same files. `gh pr view --json mergeable,mergeStateStatus` is the mechanical check. |
 | 2026-04-09 | PR #720 R4 | Ad-hoc caller enumeration produces per-round discovery in typed interface migrations: four oracle rounds were needed because each round found a new missed file (R2: steward-heartbeat + steward_cycle_trace, R3: register_aware_diagnosis, R4: startup-sweep + register_mismatch, R5: execution_gate). The correct mitigation is a one-time repo-wide grep for the function name under migration before the first round, not after each rejection. Detection rule: when a PR changes a public function's return type, the oracle's first action before reading the diff is `grep -r 'function_name' tests/` to enumerate all files that mock or return values of the changed type. Any file returning a plain dict for a function now returning a typed dataclass is a missed caller. The engineer's stated test count ("87 passed across 3 files") is not evidence of completeness when the total test file count exceeds 3. |
 | 2026-04-08 | PR #720 | Interface migration without updating all callers: `run_steward_cycle` return type changed from `dict[str, Any]` to `CycleResult` frozen dataclass, but `scheduled-tasks/steward-heartbeat.py` was not in the PR diff and still uses `result["prescribed"]` dict subscript access. The `CycleResult` dataclass provides an `as_dict()` backward-compat method, but the heartbeat does not call it. Result: every production steward cycle raises `TypeError: 'CycleResult' object is not subscriptable`. Detection rule: when a PR changes a public function's return type from dict to a typed class, enumerate all production callers (not just test files) and verify each uses attribute access, not subscript access. Test files may pass because they mock the function; the mock return value (still a dict) satisfies the test's assertions without exercising the real return type. The production caller is the failure surface that matters. |
 | 2026-04-08 | PR #720 | Test file not updated when interface changes: `tests/unit/test_orchestration/test_steward_cycle_trace.py` was not in the PR diff. Its `_mock_github_client_open` still returns a plain dict. After the PR, `_process_uow` calls `issue_info.body` on that dict, raising `AttributeError`. This is the sister pattern to the production-caller defect: interface migrations in the module under test must enumerate all test helpers in all test files that mock or return values of the changed type — not just the test file in the PR diff. |
@@ -920,6 +938,32 @@ When an oracle agent's instruction file specifies path A for output and the code
 
 ---
 
+### [2026-04-20] uow_20260420_e98621 — Escalation gate generalized to lifetime_cycles
+
+The escalation-to-opus gate in steward.py was using `steward_cycles` (per-attempt),
+which resets to 0 on each `decide_retry`. This mirrors the exact failure mode fixed in
+Sprint 2 (2026-04-08) for the HARD_CAP gate. Fix: use `lifetime_cycles >= ESCALATION_THRESHOLD`.
+
+Rationale: a UoW that has failed repeatedly across retries has demonstrated persistent
+difficulty — that is what lifetime_cycles captures. Per-attempt escalation was not
+serving a real design goal; it was an oversight when the HARD_CAP fix was applied.
+
+Detection: when a threshold gate is changed from one counter field to another (e.g.,
+HARD_CAP migrated from `steward_cycles` to `lifetime_cycles`), enumerate all other
+threshold gates in the same file and verify they use the appropriate counter. Gates
+that measure lifetime difficulty should use `lifetime_cycles`; gates that measure
+per-attempt behavior (e.g., crash surface) should use `steward_cycles`.
+
+Cross-reference: uow_20260420_e98621, learnings.md 2026-04-08 (PR #714 R2 / PR #687).
+
+---
+
+### [2026-04-20] PR #796 — path fix completeness: enumerate all path-reference forms when fixing a path inconsistency
+
+When fixing a path inconsistency in instruction files, enumerate all forms a wrong path can take — not just the form observed in the failing case. PR #727 fixed the `~/lobster-workspace/oracle/` prefix (wrong base directory), but did not fix bare-relative `oracle/decisions.md` references (no prefix at all) in the same files. Both forms are wrong for the same reason: they resolve against the agent's working directory rather than the live repo root. PR #796 closed the second form three weeks later, after the same merge gate failure recurred. The repair sequence (two PRs for the same underlying problem) was caused by enumerating only the observed failure form rather than all possible failure forms. Detection: when a PR fixes a path reference from form A to form B in a set of files, grep the same files for all other path forms that refer to the same file — including bare-relative paths, paths with different base directories, and partial matches. A single grep for the literal wrong path is insufficient. The correct verification is: does any reference in these files resolve to a different location than the intended file? Apply this to every file touched, not just the file where the failure was observed.
+
+---
+
 ### [2026-04-09] PR #739 — state machine transition propagation to test docstrings
 
 **Learning: Assertion fixes at the correct line without docstring corrections leave the gate contract undocumented**
@@ -933,3 +977,85 @@ When `approve()` was updated to advance `proposed → pending → ready-for-stew
 The Relay filter gate ("key signal in paragraph 1 of send_reply") cannot be promoted to a PreToolUse/PostToolUse hook. The rule requires semantic judgment — "key signal" is not a string pattern but a rhetorical concept (what matters most to the reader in context). Attempting mechanical enforcement via paragraph-split position would generate false positives for any multi-paragraph reply where the first paragraph is legitimately framing. The gate remains advisory.
 
 Design gates and Bias to Action are similarly not hook-enforceable for the same reason (mode classification requires understanding intent, not matching text patterns).
+
+---
+
+### [2026-04-20] PR #798 — Unix timestamp epoch scale ambiguity in external credential stores
+
+When parsing a Unix timestamp from an externally-produced credential store, `datetime.fromtimestamp(ts, tz=timezone.utc)` interprets `ts` as Unix *seconds*. Node.js and Electron-based tools (including Claude Code's credential writer) commonly store timestamps as Unix *milliseconds*. A milliseconds value (e.g., `1745000000000`) parsed as seconds produces a datetime in the year ~57,000 — meaning the expiry check fires no warning for a token that may already be expired. The test coverage gap: tests that construct timestamps using `datetime.now(timezone.utc).timestamp()` generate values in seconds-since-epoch and do not exercise the milliseconds case. Detection: when adding a parser for an externally-sourced Unix timestamp, (1) identify the producing system and its timestamp convention from documentation or source, (2) add a test that uses a plausible milliseconds value (current time in ms) and asserts the parsed datetime is not in the far future. If the producing system is undocumented, prefer accepting both scales: if `ts > 1e10`, treat as milliseconds (seconds-since-epoch values will exceed 1e10 in 2001 and beyond; milliseconds values exceed 1e12). Applied in PR #798 (`_check_token_expiry`): `datetime.fromtimestamp(expires_at, tz=timezone.utc)` is used for int/float — the epoch scale of Claude Code's credential store was not verified against the production credential file.
+
+---
+
+### [2026-04-20] PR #799 — Sequential sweep PR conflict: stale base produces unapplicable diff
+
+**Learning: A follow-on sweep PR can be rendered unapplicable by its sibling landing first**
+
+PR #799 was a completion sweep for path fixes started in PR #796. Both were branched from a pre-PR-#796 base. PR #796 merged first, fixing several of the same locations (CLAUDE.md PR Merge Gate row, lobster-oracle.md frontmatter). By the time PR #799 went to oracle review, `gh pr view 799 --json mergeable,mergeStateStatus` returned `CONFLICTING / DIRTY` — the diff cannot be applied to main cleanly.
+
+The compounding issue: after the conflict, two locations remain unfixed that neither PR addressed in its current form — `lobster-oracle.md` line ~77 (Encoded Orientation check prose, bare `oracle/decisions.md` read-reference) and `docs/oracle-review-protocol.md` line 90 (lower-severity documentation reference). The sweep's own definition of done (`grep -rn "oracle/decisions\.md" .claude/ CLAUDE.md | grep -v '~/lobster/oracle/decisions\.md'` returns zero) would pass post-merge of both PRs only if line ~77 of lobster-oracle.md is checked with the same grep — it would be caught, not pass silently.
+
+**Detection rule:** Before opening a follow-on sweep PR (or opening any PR as part of a multi-PR fix sequence), confirm the current state of main for the files in scope. `gh api repos/<owner>/<repo>/contents/<file>` is the mechanical check — read the current file content and verify whether the targeted locations already differ from the PR's expected base. The `mergeStateStatus: DIRTY` signal from GitHub is confirmatory, not the first detection point; it fires only after the PR is already open.
+
+**Mitigation:** The follow-on sweep PR should rebase onto current main before oracle review, retain only the changes not already present, and add any newly discovered remaining unfixed references (like line ~77) in the same PR to close the sweep completely.
+
+
+---
+
+### [2026-04-20] PR #800 — OAuth refresh `expires_in: 0` default creates a refresh loop
+
+When an OAuth token refresh response is parsed with `data.get("expires_in", 0)` and the default is 0, the computed `new_expiry_ts = now.timestamp() + 0` equals the current timestamp — making the written `expiresAt` immediately expired. On the next call to `_build_claude_env`, `_check_token_expiry` returns `EXPIRED` and triggers another refresh attempt. This loop continues until the Anthropic endpoint returns a valid `expires_in` or the refresh call itself fails (network error, HTTP error). In practice, the loop imposes a `_TOKEN_REFRESH_HTTP_TIMEOUT`-second blocking delay on every steward cycle. Use a non-zero default matching the expected token lifetime (e.g., 28800 — Claude's standard 8-hour token) or validate `expires_in > 0` before computing the expiry write. Detection: whenever a refresh response's `expires_in` is used to compute a stored expiry, trace through the `expires_in=0` case. If the result is `now` or earlier, the default creates a re-trigger. Applied in PR #800 (`_refresh_oauth_token`, line `expires_in: int = data.get("expires_in", 0)`).
+
+---
+
+### [2026-04-20] PR #800 — Locally-declared threshold mirror in test creates silent divergence on constant change
+
+`test_token_refresh.py` declares `_MILLIS_THRESHOLD = 1e11` to branch between ms and seconds parsing in `test_writes_updated_expiry_to_credentials_file`. The production module defines `_MILLISECOND_TIMESTAMP_THRESHOLD = 1e11` at module scope. When `_MILLISECOND_TIMESTAMP_THRESHOLD` changes in steward.py, the test's branching logic uses the stale local value. The test does not fail — it merely branches incorrectly, silently validating the wrong datetime conversion path. This is a second occurrence of the PR #696 pattern ("Import production constants from the module under test; never re-declare them locally") in a different form. The distinguishing feature: in PR #696 the locally-declared constant was a cap threshold and its staleness caused test assertions to fail at the wrong cycle count. In PR #800 the locally-declared constant is used only in test assertion branching — so it produces no test failure, just incorrect validation. Both forms carry the same root risk: production constant change invalidates test without breaking it. Detection: whenever a test file declares a numeric literal that also appears as a named constant in the module under test, verify the test imports the module constant rather than re-declaring it.
+
+---
+
+### [2026-04-21] PR #811 — Pattern Match step added to runtime copy, not canonical template
+
+**Learning: When a new step is added to a runtime instruction document that has a versioned canonical counterpart, the canonical must be updated in the same PR.**
+
+PR #804 moved `sweep-context.md` from `~/lobster-workspace/hygiene/` (runtime) to `memory/canonical-templates/sweep-context.md` (versioned canonical). PR #811 added a Pattern Match step by editing the runtime copy at `~/lobster-workspace/hygiene/sweep-context.md`, not the canonical. The canonical template has no Pattern Match step. New installations seeded from the canonical will not have sweep-pattern integration even though oracle/patterns.md ships in the repo.
+
+Detection: after any runtime instruction file edit, check whether a canonical-templates counterpart exists in the repo. If it does, both must be updated in the same PR. The canonical-templates path is the authoritative copy for future seeding; the runtime copy is the live copy for this instance only. Divergence between the two silently creates installation-class differences.
+
+Layer 1 index entry:
+| 2026-04-21 | #811 | Runtime instruction edit without updating canonical-templates counterpart creates installation-class divergence — edit both in the same PR |
+
+
+---
+
+### [2026-04-21] PR #814 — Throttle verdict label overpromises when batch-size logic is not implemented
+
+When a dispatch gate returns a verdict labeled "throttle" but the integration unconditionally routes the verdict to `skipped += 1; continue`, the label implies partial pass-through (batch-size limiting) but delivers complete suppression. A named constant `BURST_BATCH_SIZE = 3` that is exported, tested for face value, and cited in the function docstring but never consumed in logic is the signature of this defect: the constant and the label are coherent with the spec; the integration is not. Detection: when a verdict value has an associated "batch to N" constant, verify the integration uses that constant to bound how many UoWs the gate allows through per cycle — not just whether it skips all non-dispatch verdicts uniformly.
+
+---
+
+### [2026-04-21] PR #814 — Silent non-functional gate from missing audit event write is distinct from an intentional stub
+
+A gate that reads an audit event type that is not yet written by any production code will silently count zero for every UoW at every invocation. This is structurally different from a gate with a known functional stub: the code is present, the threshold is checked, the precedence fires correctly in tests — but the production signal source does not exist. The failure is invisible without tracing the event name through all audit write call sites. Detection pattern: for any new gate that reads a named audit event, grep the production codebase for `"event": "<event_name>"` to confirm at least one write site exists before treating the gate as live. If no write site exists, the gate is dead code with a governance label — not a staged feature.
+
+
+## WOS Failure Triage Protocol (2026-04-22)
+
+When a WOS pipeline shows high failure rates, use this protocol before assuming the worst:
+
+1. **Sample broadly** — `grep -rl '"outcome": "failed"' outputs/uow_*.result.json | shuf | head -20` avoids recency bias
+2. **Extract reason fields** — read each result's `reason` or error text; categorize by distinct pattern
+3. **Count distribution** — grep across all failures for each category to get true proportions
+4. **Cross-reference traces** — `.trace.json` companions have full stack context for ambiguous cases
+5. **Check environment** — `which claude`, env vars, cron context; failures are often environmental, not logic bugs
+6. **Check logs** — steward.log, executor-heartbeat.log often show the same errors in aggregate
+
+Applied: 295 "failed" UoWs decomposed into test contamination (154, env bug), cron auth missing CLAUDE_CODE_OAUTH_TOKEN (140, fixable), SIGTERM (1, normal). True production failure rate: ~21%, not 44%.
+
+**Key insight**: High aggregate failure rates in distributed pipelines are often multi-cause. Sampling before fixing prevents chasing the wrong root cause.
+
+### Test Infrastructure
+
+| Date | PR | Learning |
+|------|----|----------|
+| 2026-04-22 | #823 | An autouse conftest fixture that sets an env var via `monkeypatch.setenv` silently supersedes any per-test `monkeypatch.setattr` of the module-level constant that the env var also controls. When `_output_ref_path()` checks env var first (env var wins), existing tests that patch `_OUTPUT_DIR_TEMPLATE` directly are still passing but their explicit monkeypatching has become dead code. Future contributors who monkeypatch the constant expecting to influence `_output_ref_path()` behavior will be silently wrong. Detection: when an autouse fixture and a per-test fixture both control the same effective seam (one via env var, one via attribute patch), the precedence order in the production function determines which wins — document that order in the function's docstring. |
+| 2026-04-22 | #823 | A module-level constant that reads from an env var at import time does not capture env vars set by pytest fixtures, because fixtures run after module import. The redirect achieved by `monkeypatch.setenv` in a fixture is only visible to code that reads the env var at call time (not import time). When a PR explains backward-compat for existing monkeypatch tests as depending on the import-time env-var read, the explanation is technically correct (the constant captures whatever the env was at import) but the mechanism is inverted: the existing tests work because they overwrite the attribute after import, not because of the import-time env-var read. |
