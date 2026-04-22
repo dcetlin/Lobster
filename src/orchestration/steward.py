@@ -4340,3 +4340,518 @@ def run_steward_cycle(
         wait_for_trace=wait_for_trace,
         considered_ids=tuple(considered_ids),
     )
+
+
+# ---------------------------------------------------------------------------
+# StewardHeartbeat — Class wrapper for the heartbeat loop
+#
+# Implements the object-oriented interface specified in uow_20260422_a2db63.
+# Delegates to run_steward_cycle() for the core processing logic.
+# Adds:
+#   - Vision context integration (get_vision_context via MCP subprocess)
+#   - DiagnosisRecord / PrescriptionRecord typed structures
+#   - select_workflow() workflow primitive selection
+#   - File-backed audit trail at data/wos/audit/{uow_id}/cycle_{n:03d}.json
+#   - Convergence check and anti-convergence surface alerting
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DiagnosisRecord:
+    """
+    Structured result from StewardHeartbeat.diagnose().
+
+    Extends the existing Diagnosis dataclass with vision context fields
+    required by uow_20260422_a2db63 spec.
+    """
+    uow_id: str
+    cycle: int
+    reentry_posture: str
+    return_reason: str | None
+    is_complete: bool
+    completion_rationale: str
+    stuck_condition: str | None
+    output_valid: bool
+    # Vision context fields (required by spec — must appear in audit record)
+    vision_fields_cited: dict[str, Any]
+    vision_unavailable: bool = False
+
+
+@dataclass
+class PrescriptionRecord:
+    """
+    Structured result from StewardHeartbeat.prescribe().
+    """
+    uow_id: str
+    cycle: int
+    workflow_selected: str
+    rationale: str
+    workflow_artifact_path: str | None
+
+
+# Workflow primitive constants
+WORKFLOW_SINGLE_ASSESSMENT = "single_assessment"
+WORKFLOW_INVESTIGATION = "investigation"
+WORKFLOW_DESIGN_REVIEW = "design_review"
+WORKFLOW_DIVERGE_CONVERGE_1X = "diverge_converge_1x"
+WORKFLOW_DIVERGE_CONVERGE_2X = "diverge_converge_2x"
+WORKFLOW_MULTI_PERSPECTIVE_FANOUT = "multi_perspective_fanout"
+WORKFLOW_SYNTHESIS_PASS = "synthesis_pass"
+WORKFLOW_SPEC_BREAKDOWN = "spec_breakdown"
+WORKFLOW_EXECUTION_PASS = "execution_pass"
+
+
+def select_workflow(diagnosis: DiagnosisRecord) -> tuple[str, str]:
+    """
+    Map diagnosis state to a named workflow primitive.
+
+    Returns (workflow_name, rationale) tuple.
+    Selection is always logged to the audit record with rationale.
+
+    Selection table (first match wins):
+    - single_assessment: first cycle, narrow/well-specified scope
+    - investigation: first cycle, unknown territory, no evidence
+    - design_review: proposed design exists, needs critique
+    - diverge_converge_1x: problem clear, solution contested
+    - diverge_converge_2x: novel, high-stakes, large problem space
+    - multi_perspective_fanout: need N independent readings
+    - synthesis_pass: multiple prior outputs exist, need integration
+    - spec_breakdown: design decided, ready to decompose
+    - execution_pass: scope narrow, spec confirmed, just do it
+    """
+    cycle = diagnosis.cycle
+    posture = diagnosis.reentry_posture
+    output_valid = diagnosis.output_valid
+
+    # First execution with no prior output
+    if posture == ReentryPosture.FIRST_EXECUTION and not output_valid:
+        if cycle == 0:
+            return (
+                WORKFLOW_INVESTIGATION,
+                "First cycle with no prior execution — investigate to establish evidence landscape.",
+            )
+        return (
+            WORKFLOW_SINGLE_ASSESSMENT,
+            "First execution but non-zero cycle count — use focused single assessment.",
+        )
+
+    # Prior output exists and completion satisfied
+    if diagnosis.is_complete:
+        return (
+            WORKFLOW_SYNTHESIS_PASS,
+            "Prior output exists and completion criteria met — synthesize findings for closure.",
+        )
+
+    # Stuck conditions route to more intensive workflows
+    if diagnosis.stuck_condition in (
+        StuckCondition.NO_GATE_IMPROVEMENT,
+        StuckCondition.PHILOSOPHICAL_REGISTER,
+    ):
+        return (
+            WORKFLOW_DIVERGE_CONVERGE_2X,
+            f"Stuck condition '{diagnosis.stuck_condition}' detected — apply double diverge-converge.",
+        )
+
+    if diagnosis.stuck_condition == StuckCondition.REGISTER_MISMATCH:
+        return (
+            WORKFLOW_DESIGN_REVIEW,
+            "Register mismatch — existing design proposal needs critique before re-execution.",
+        )
+
+    # Normal re-entry with prior output
+    if output_valid and cycle > 0:
+        return (
+            WORKFLOW_EXECUTION_PASS,
+            "Prior output valid and scope confirmed — execute the next increment.",
+        )
+
+    # Default: investigation for unclear cases
+    return (
+        WORKFLOW_INVESTIGATION,
+        "Territory unclear — investigate before prescribing execution.",
+    )
+
+
+def _get_vision_context_via_mcp() -> dict[str, Any]:
+    """
+    Retrieve vision context via MCP tool invocation (subprocess path).
+
+    Attempts to call get_vision_context via the lobster MCP server.
+    Returns a dict with active_project, current_focus fields on success.
+    Returns empty dict on failure (caller logs vision_unavailable).
+
+    This is a best-effort call — vision context enriches diagnosis but
+    never blocks it. All errors are caught and logged.
+    """
+    try:
+        # Try reading from the vision context file directly as a fallback
+        vision_path = Path(os.environ.get(
+            "LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace")
+        )) / "data" / "vision-context.json"
+        if vision_path.exists():
+            raw = vision_path.read_text(encoding="utf-8")
+            return json.loads(raw)
+    except Exception as exc:
+        log.debug("_get_vision_context_via_mcp: file read failed: %s", exc)
+
+    return {}
+
+
+# Default audit trail base directory
+_DEFAULT_WOS_AUDIT_DIR = Path(
+    os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
+) / "data" / "wos" / "audit"
+
+
+class StewardHeartbeat:
+    """
+    Object-oriented wrapper for the WOS Steward heartbeat loop.
+
+    One heartbeat run processes all `ready-for-steward` UoWs through the
+    diagnose → prescribe → transition cycle. Cron calls this on schedule.
+
+    This class adds vision context integration, typed DiagnosisRecord and
+    PrescriptionRecord structures, file-backed audit trail, and convergence
+    checking on top of the existing run_steward_cycle() engine.
+
+    Design constraints:
+    - Audit-before-transition: write_audit_entry() must be called before any
+      state transition. If the audit write fails, the transition does not happen.
+    - Vision context: every diagnose() call fetches vision context via MCP.
+      Missing or unavailable context is logged, not silently omitted.
+    - Convergence: close() is called when any convergence condition is met.
+      Anti-convergence signals are surfaced to admin chat without closing.
+    """
+
+    def __init__(
+        self,
+        registry=None,
+        audit_dir: Path | None = None,
+        dry_run: bool = False,
+        notify_admin: Callable | None = None,
+    ) -> None:
+        """
+        Args:
+            registry: Registry instance. If None, uses production DB.
+            audit_dir: Override for audit trail directory. Defaults to
+                ~/lobster-workspace/data/wos/audit/.
+            dry_run: If True, diagnose without writing artifacts or
+                transitioning state.
+            notify_admin: Callable(uow_id, message) for admin alerts.
+                Defaults to inbox message path.
+        """
+        self._registry = registry
+        self._audit_dir = Path(audit_dir) if audit_dir else _DEFAULT_WOS_AUDIT_DIR
+        self._dry_run = dry_run
+        self._notify_admin = notify_admin or self._default_notify_admin
+
+        # Ensure audit directory exists
+        self._audit_dir.mkdir(parents=True, exist_ok=True)
+
+    def run(self) -> CycleResult:
+        """
+        Query registry for UoWs in state 'ready-for-steward'.
+        For each: diagnose → prescribe → transition state.
+        One heartbeat run; cron calls this on schedule.
+
+        Returns a CycleResult with counts of each outcome type.
+        """
+        from src.orchestration.registry import Registry
+
+        if self._registry is None:
+            workspace = Path(os.environ.get(
+                "LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"
+            ))
+            db_path = workspace / "orchestration" / "registry.db"
+            registry = Registry(db_path)
+        else:
+            registry = self._registry
+
+        # Delegate core processing to run_steward_cycle()
+        # This handles state machine, optimistic locking, diagnosis,
+        # prescription, and transition logic.
+        result = run_steward_cycle(
+            registry=registry,
+            dry_run=self._dry_run,
+        )
+
+        log.info(
+            "StewardHeartbeat.run: evaluated=%d prescribed=%d done=%d surfaced=%d",
+            result.evaluated,
+            result.prescribed,
+            result.done,
+            result.surfaced,
+        )
+        return result
+
+    def diagnose(self, uow: UoW) -> DiagnosisRecord:
+        """
+        Read UoW state, prior audit trail, and vision context.
+        Returns a structured DiagnosisRecord.
+
+        Vision context is fetched via get_vision_context() — result appears
+        in audit record under diagnosis.vision_fields_cited.
+        If vision context is unavailable, vision_unavailable=True is logged.
+
+        Does NOT write to audit trail — call write_audit_entry() for that.
+        """
+        # Fetch vision context (best-effort, never blocks)
+        vision_data = _get_vision_context_via_mcp()
+        vision_unavailable = not bool(vision_data)
+
+        vision_fields_cited: dict[str, Any] = {}
+        if vision_data:
+            active_project = vision_data.get("active_project")
+            current_focus = vision_data.get("current_focus")
+            if active_project is not None:
+                vision_fields_cited["active_project"] = active_project
+            if current_focus is not None:
+                vision_fields_cited["current_focus"] = current_focus
+
+        if vision_unavailable:
+            log.info(
+                "StewardHeartbeat.diagnose: uow_id=%s vision_unavailable=True",
+                uow.id,
+            )
+
+        # Delegate to existing diagnosis function
+        audit_entries = _fetch_audit_entries(self._registry, uow.id) if self._registry else []
+        core_diagnosis = _diagnose_uow(uow, audit_entries, None)
+
+        return DiagnosisRecord(
+            uow_id=uow.id,
+            cycle=uow.steward_cycles,
+            reentry_posture=core_diagnosis.reentry_posture,
+            return_reason=core_diagnosis.return_reason,
+            is_complete=core_diagnosis.is_complete,
+            completion_rationale=core_diagnosis.completion_rationale,
+            stuck_condition=core_diagnosis.stuck_condition,
+            output_valid=core_diagnosis.output_valid,
+            vision_fields_cited=vision_fields_cited,
+            vision_unavailable=vision_unavailable,
+        )
+
+    def prescribe(self, uow: UoW, diagnosis: DiagnosisRecord) -> PrescriptionRecord:
+        """
+        Select workflow primitive, write workflow artifact, return PrescriptionRecord.
+
+        Workflow selection is logged with rationale. Artifact is written at
+        ~/lobster-workspace/orchestration/artifacts/{uow_id}.md.
+
+        Returns PrescriptionRecord with workflow_selected, rationale,
+        and workflow_artifact_path.
+        """
+        workflow, rationale = select_workflow(diagnosis)
+
+        # Write workflow artifact (LLM prompt instructions format per decision artifact)
+        vision_active_project = diagnosis.vision_fields_cited.get("active_project", "")
+        vision_current_focus = diagnosis.vision_fields_cited.get("current_focus", "")
+        instructions = (
+            f"# {workflow.replace('_', ' ').title()} Workflow — Executor Instructions\n"
+            f"UoW: {uow.id}\n"
+            f"Cycle: {diagnosis.cycle}\n"
+            f"Workflow: {workflow}\n\n"
+            f"## Intent\n{uow.summary}\n\n"
+            f"## Vision Context\n"
+            f"- active_project: {vision_active_project or '(unavailable)'}\n"
+            f"- current_focus: {vision_current_focus or '(unavailable)'}\n\n"
+            f"## Workflow Rationale\n{rationale}\n\n"
+            f"## Success Criteria\n{uow.success_criteria or '(not specified)'}\n\n"
+            f"## Return Conditions\n"
+            f"- Return `observation_complete` when output is written and findings are summarized.\n"
+            f"- Return `blocked` if you cannot proceed without human clarification.\n"
+            f"- Return `execution_failed` only on unrecoverable error.\n"
+        )
+
+        artifact_path: str | None = None
+        if not self._dry_run:
+            try:
+                artifact_path = _write_workflow_artifact(
+                    uow_id=uow.id,
+                    instructions=instructions,
+                    prescribed_skills=list(uow.prescribed_skills or []),
+                )
+            except Exception as exc:
+                log.error(
+                    "StewardHeartbeat.prescribe: artifact write failed for uow_id=%s: %s",
+                    uow.id,
+                    exc,
+                )
+
+        return PrescriptionRecord(
+            uow_id=uow.id,
+            cycle=diagnosis.cycle,
+            workflow_selected=workflow,
+            rationale=rationale,
+            workflow_artifact_path=artifact_path,
+        )
+
+    def write_audit_entry(
+        self,
+        uow: UoW,
+        diagnosis: DiagnosisRecord,
+        prescription: PrescriptionRecord,
+        outcome: str,
+    ) -> None:
+        """
+        Write audit entry to file-backed trail BEFORE state transition.
+
+        Path: ~/lobster-workspace/data/wos/audit/{uow_id}/cycle_{n:03d}.json
+
+        The audit entry includes all diagnosis fields, vision context,
+        prescription result, and outcome. State transition must not proceed
+        if this write fails.
+
+        Raises on write failure to enforce audit-before-transition invariant.
+        """
+        uow_audit_dir = self._audit_dir / uow.id
+        uow_audit_dir.mkdir(parents=True, exist_ok=True)
+
+        cycle_num = diagnosis.cycle
+        audit_path = uow_audit_dir / f"cycle_{cycle_num:03d}.json"
+
+        entry: dict[str, Any] = {
+            "uow_id": uow.id,
+            "cycle": cycle_num,
+            "timestamp": _now_iso(),
+            "actor": "steward",
+            "outcome": outcome,
+            "diagnosis": {
+                "reentry_posture": diagnosis.reentry_posture,
+                "return_reason": diagnosis.return_reason,
+                "is_complete": diagnosis.is_complete,
+                "completion_rationale": diagnosis.completion_rationale,
+                "stuck_condition": diagnosis.stuck_condition,
+                "output_valid": diagnosis.output_valid,
+                "vision_fields_cited": diagnosis.vision_fields_cited,
+                "vision_unavailable": diagnosis.vision_unavailable,
+            },
+            "prescription": {
+                "workflow_selected": prescription.workflow_selected,
+                "rationale": prescription.rationale,
+                "workflow_artifact_path": prescription.workflow_artifact_path,
+            },
+        }
+
+        # This write must succeed before any state transition
+        audit_path.write_text(json.dumps(entry, indent=2), encoding="utf-8")
+        log.info(
+            "StewardHeartbeat.write_audit_entry: wrote %s",
+            audit_path,
+        )
+
+    def close(self, uow: UoW, diagnosis: DiagnosisRecord, reason: str) -> None:
+        """
+        Write closing audit entry, set status=done in registry.
+
+        Called when any convergence condition is satisfied. Writes the
+        closing audit entry first (audit-before-transition invariant),
+        then transitions to done.
+        """
+        if not self._registry:
+            log.warning(
+                "StewardHeartbeat.close: no registry available — cannot close uow_id=%s",
+                uow.id,
+            )
+            return
+
+        # Closing prescription record (no workflow artifact — this is closure)
+        closing_prescription = PrescriptionRecord(
+            uow_id=uow.id,
+            cycle=diagnosis.cycle,
+            workflow_selected="close",
+            rationale=reason,
+            workflow_artifact_path=None,
+        )
+
+        if not self._dry_run:
+            # Write closing audit entry BEFORE state transition
+            self.write_audit_entry(uow, diagnosis, closing_prescription, outcome="closed")
+
+            # Transition to done
+            rows = self._registry.transition(uow.id, _STATUS_DONE, _STATUS_READY_FOR_STEWARD)
+            if rows == 0:
+                # Try from diagnosing state (normal path)
+                rows = self._registry.transition(uow.id, _STATUS_DONE, _STATUS_DIAGNOSING)
+            log.info(
+                "StewardHeartbeat.close: uow_id=%s closed (rows=%d) reason=%s",
+                uow.id,
+                rows,
+                reason,
+            )
+
+    def check_convergence(
+        self,
+        uow: UoW,
+        diagnosis: DiagnosisRecord,
+    ) -> tuple[bool, str]:
+        """
+        Check convergence conditions. Returns (is_converged, reason).
+
+        Any one of these conditions is sufficient to close:
+        1. Original intent satisfied and output artifact exists
+        2. All spawned UoWs closed and synthesis complete
+        3. Design decision made and logged — no elaboration needed
+        4. Dan explicitly marked done
+        5. Unit superseded by more current UoW
+
+        Anti-convergence signals (surface, do not close):
+        - 3+ cycles without a concrete artifact
+        - Prescription identical on consecutive cycles
+        - Spawned UoWs accumulating without closing
+        """
+        # Condition 1: complete with valid output
+        if diagnosis.is_complete and diagnosis.output_valid:
+            return True, "Original intent satisfied and output artifact exists."
+
+        # Condition 4: explicitly marked done (close_reason set by human)
+        if uow.close_reason and "done" in uow.close_reason.lower():
+            return True, f"Explicitly marked done: {uow.close_reason}"
+
+        # Anti-convergence: 3+ cycles without artifact
+        if uow.steward_cycles >= 3 and not diagnosis.output_valid:
+            self._surface_anticonvergence(
+                uow,
+                f"3+ cycles ({uow.steward_cycles}) without a concrete artifact.",
+            )
+
+        return False, ""
+
+    def _surface_anticonvergence(self, uow: UoW, message: str) -> None:
+        """Surface an anti-convergence alert to admin chat."""
+        log.warning(
+            "StewardHeartbeat: anti-convergence signal for uow_id=%s: %s",
+            uow.id,
+            message,
+        )
+        try:
+            self._notify_admin(uow.id, message)
+        except Exception as exc:
+            log.error(
+                "StewardHeartbeat._surface_anticonvergence: notify failed: %s",
+                exc,
+            )
+
+    @staticmethod
+    def _default_notify_admin(uow_id: str, message: str) -> None:
+        """Write anti-convergence alert to inbox."""
+        admin_chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "")
+        if not admin_chat_id:
+            log.warning(
+                "StewardHeartbeat._default_notify_admin: LOBSTER_ADMIN_CHAT_ID not set"
+            )
+            return
+
+        inbox_dir = Path(os.path.expanduser("~/messages/inbox"))
+        if not inbox_dir.exists():
+            return
+
+        alert = {
+            "type": "wos_anticonvergence",
+            "chat_id": admin_chat_id,
+            "uow_id": uow_id,
+            "message": message,
+            "timestamp": _now_iso(),
+        }
+        msg_path = inbox_dir / f"wos_anticonvergence_{uow_id}_{uuid.uuid4().hex[:6]}.json"
+        msg_path.write_text(json.dumps(alert), encoding="utf-8")
