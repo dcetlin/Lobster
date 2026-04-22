@@ -31,9 +31,9 @@ But it introduces a new coupling: executor dispatch success now depends on inbox
 
 **Detection:**
 - Immediate: The failure is logged to `~/lobster-workspace/logs/dispatch-boundary.jsonl` with `outcome: failure` and the specific `failure_reason`.
-- Downstream: The dispatcher sees no `wos_execute` message. The 4-hour TTL recovery eventually marks the UoW as `failed`.
+- Downstream: The dispatcher sees no `wos_execute` message. The steward's heartbeat observation loop detects the stall within `heartbeat_ttl` + 3 min poll (default: ~8 minutes) and returns the UoW to `ready-for-steward`. The 24h orphan safety net in `recover_ttl_exceeded_uows` is the backstop if the observation loop also misses it.
 
-**Recovery time bound:** 4 hours (TTL_EXCEEDED_HOURS).
+**Recovery time bound:** ~8 minutes (heartbeat_ttl 300s + 3-minute poll), down from 4 hours.
 
 **Observability record:**
 ```json
@@ -57,9 +57,9 @@ But it introduces a new coupling: executor dispatch success now depends on inbox
 **Detection:**
 - The dispatch boundary log shows `outcome: success` with a valid `msg_id`.
 - No corresponding Task call appears in dispatcher logs.
-- TTL recovery fires after 4 hours.
+- Steward observation loop detects heartbeat silence and fires stall recovery within ~8 minutes (heartbeat_ttl 300s + 3-minute poll).
 
-**Recovery time bound:** 4 hours (TTL_EXCEEDED_HOURS).
+**Recovery time bound:** ~8 minutes (heartbeat stall detection), down from 4 hours.
 
 ---
 
@@ -149,7 +149,7 @@ The inbox dispatch pattern was chosen over subprocess dispatch for several reaso
 2. **Architectural alignment:** All subagent dispatch routes through the same inbox→dispatcher→Task path.
 3. **No subprocess management:** The executor does not need to spawn, monitor, or clean up `claude -p` processes.
 
-The tradeoff is inbox coupling. The 4-hour TTL recovery is the safety net, but it is reactive, not proactive. The dispatch boundary log closes the observability gap: failures are visible immediately even if recovery is delayed.
+The tradeoff is inbox coupling. The steward's heartbeat observation loop is the primary stall detection mechanism (detects silence within `heartbeat_ttl` + poll interval, default ~8 minutes). The 24h TTL orphan safety net is the last-resort backstop. The dispatch boundary log closes the observability gap: failures are visible immediately even if stall detection has a latency window.
 
 ---
 
