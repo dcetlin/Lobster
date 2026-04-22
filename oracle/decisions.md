@@ -2,6 +2,34 @@
 
 ---
 
+### [2026-04-22] PR #830 re-oracle — feat(orient): proprioceptive gate-miss logging and nightly consolidation summary
+
+**Prior NEEDS_CHANGES verdict:** [2026-04-22] PR #830. One gap named.
+
+**Prior gap tracking:**
+
+- **Gap 1 (bare `python3` in nightly-consolidation.md step 1c):** ADDRESSED. The diff shows `uv run python -c "..."` at the invocation site in step 1c. Confirmed by `gh pr diff 830 | grep python`: the only Python invocation added is `uv run python -c`. No bare `python3` appears anywhere in the diff. Resolution criterion (a) from the revision contract is satisfied: the revision shows `uv run` at the invocation site.
+
+**Vision alignment:** The adversarial prior for this re-review is unchanged from the original: this implementation is solving the wrong problem, or solving the right problem in a direction that forecloses better paths. The re-review is a single-line fix to a named implementation defect; it introduces no new direction, no new assumption, and no new foreclosure. The vision alignment finding from the original entry stands without revision: direction is Confirmed against vision.yaml constraint-3 (OODA Orient as schwerpunkt), principle-5 (discriminator improvement over rule addition), and current_focus.after_that (proprioceptive pulse named explicitly). The fix closes the only gap that was blocking approval; no new gaps are introduced by the change.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **Gap 1 is closed.** `uv run python -c` replaces the former `python3 -c` at exactly the invocation site named in the revision contract. The fix is a one-token change at the correct location. The surrounding logic (cutoff computation, JSON parsing, gate-miss filtering, Counter aggregation) is unchanged from the original submission and was previously assessed as correct.
+- **No new content was added beyond the `uv run` fix.** The diff is identical in scope to the original PR — three files (`nightly-consolidation.md`, `sys.dispatcher.bootup.md`, `CLAUDE.md`) — confirming no feature bundling was introduced during the revision.
+- **All other Stage 2 findings from the original entry remain valid.** The `sys.dispatcher.bootup.md` pseudocode expansion is correct; the CLAUDE.md gate-miss logging subsection is correctly structured; no canonical-templates counterpart gap applies.
+- **The bare-python3-in-instruction-layer pattern (learnings.md PR #804, #821, #830) is now correctly applied.** This re-review checked for recurrence: no other Python invocation in the three changed files uses a bare `python3`. The pattern that constrained this review: reading the learnings.md entry for PR #830 before examining the diff confirmed that the only thing to verify was `uv run` at the invocation site — which prevented a pass-through approval based on surface-level diff reading.
+
+**Patterns introduced:** No new patterns beyond those named in the original entry.
+
+**What this forecloses:** Nothing beyond what was noted in the original entry.
+
+**Opportunity cost note:** Single-line fix closing a named revision contract gap. Negligible cost.
+
+**VERDICT: APPROVED**
+
+---
+
 ### [2026-04-22] PR #830 — feat(orient): proprioceptive gate-miss logging and nightly consolidation summary
 
 **Vision alignment:** The adversarial prior — this implementation is solving the wrong problem, or solving the right problem in a direction that forecloses better paths — finds the most significant tension not in the direction but in the mechanism. The theory of change is: if gate misses are logged via `write_observation`, nightly consolidation surfaces them, and Orient improves over time. The prior asks what would have to be true for this to generate useful signal. The critical condition: the dispatcher must be oriented enough to recognize a gate miss as a gate miss before the logging instruction fires. A dispatcher that reliably identifies gate misses has already half-corrected the failure; the logging is then diagnostic. If the dispatcher misses the gate because it lacks sufficient Orient state, it will also miss the logging instruction — the same failure mode the logging is meant to surface. The issue (#193) notes "zero behavioral-miss observations in 2984 events," which is consistent with either gates being honored or gates being missed without self-recognition. This PR addresses the former case and partially addresses the latter on the margin (it expands the orientation surface the dispatcher reads). The direction is correct: vision.yaml constraint-3 names OODA Orient as the schwerpunkt; current_focus.after_that names the proprioceptive pulse explicitly; principle-5 names discriminator improvement over rule addition. The mechanism is not the cheapest available test of the underlying assumption, but it is strictly additive: even partial signal is better than no signal, and the instruction is placed in the correct location (immediately after the gate table). The larger concern is a concrete implementation defect in nightly-consolidation.md (see Stage 2) that would prevent the consolidation leg of the feedback loop from working.
