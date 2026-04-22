@@ -26,10 +26,11 @@ Detection decision table:
 ## Failure policy
 
 Gate misses are logged (never block — blocking could cause stuck messages).
-A gate miss writes to the log file and calls the `write_observation` MCP tool
-via HTTP so the dispatcher is informed.
+A gate miss writes to the log file and writes a subagent_observation JSON file
+directly to the inbox so the dispatcher is informed without requiring an MCP
+session handshake.
 
-On any error (malformed input, missing file, HTTP failure) the hook appends a
+On any error (malformed input, missing file, I/O failure) the hook appends a
 timestamped line to hook-failures.log and exits 0 — gate enforcement never
 disrupts normal operation.
 
@@ -52,8 +53,7 @@ Add to ~/.claude/settings.json under "hooks" -> "PostToolUse":
 import json
 import os
 import sys
-import time
-import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -75,8 +75,6 @@ FAILURE_LOG = _WORKSPACE / "logs" / "hook-failures.log"
 WOS_EXECUTE_TYPE = "wos_execute"
 MARK_PROCESSED_TOOL = "mcp__lobster-inbox__mark_processed"
 
-# MCP server URL — same as other hooks that call MCP tools directly.
-_MCP_URL = os.environ.get("LOBSTER_MCP_URL", "http://localhost:8765")
 _ADMIN_CHAT_ID = int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586"))
 
 # ---------------------------------------------------------------------------
@@ -149,42 +147,43 @@ def _read_message(message_id: str) -> "dict | None":
 # ---------------------------------------------------------------------------
 
 
-def _call_write_observation(message_id: str) -> None:
-    """Call write_observation via the MCP HTTP server to surface the gate miss.
-
-    Uses the JSON-RPC 2.0 protocol that the lobster-inbox MCP server speaks.
-    On any error, logs to hook-failures.log and returns — never raises.
-    """
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "write_observation",
-            "arguments": {
-                "chat_id": _ADMIN_CHAT_ID,
-                "text": (
-                    f"gate=wos_execute_gate "
-                    f"condition=mark_processed_without_mark_processing "
-                    f"outcome=miss "
-                    f"message_id={message_id}"
-                ),
-                "category": "system_error",
-            },
-        },
+def _build_observation_payload(message_id: str) -> dict:
+    """Build a subagent_observation inbox payload for a gate miss (pure)."""
+    now = datetime.now(timezone.utc)
+    ts_ms = int(now.timestamp() * 1000)
+    obs_id = f"{ts_ms}_observation_{uuid.uuid4().hex[:8]}"
+    return {
+        "id": obs_id,
+        "type": "subagent_observation",
+        "source": "hook",
+        "chat_id": _ADMIN_CHAT_ID,
+        "text": (
+            f"gate=wos_execute_gate "
+            f"condition=mark_processed_without_mark_processing "
+            f"outcome=miss "
+            f"message_id={message_id}"
+        ),
+        "category": "system_error",
+        "timestamp": now.isoformat(),
     }
+
+
+def _call_write_observation(message_id: str) -> None:
+    """Write a gate-miss observation directly to the inbox as a JSON file.
+
+    Avoids the MCP session handshake entirely — the dispatcher picks up the
+    file on its next inbox poll.  On any I/O error, logs to hook-failures.log
+    and returns — never raises.
+    """
     try:
-        body = json.dumps(payload).encode()
-        req = urllib.request.Request(
-            f"{_MCP_URL}/mcp",
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            resp.read()  # drain response
+        payload = _build_observation_payload(message_id)
+        INBOX_DIR.mkdir(parents=True, exist_ok=True)
+        dest = INBOX_DIR / f"{payload['id']}.json"
+        tmp = dest.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+        tmp.replace(dest)
     except Exception as exc:  # noqa: BLE001
-        _log_failure("write_observation HTTP call failed", exc)
+        _log_failure("write_observation inbox write failed", exc)
 
 
 # ---------------------------------------------------------------------------

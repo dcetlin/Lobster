@@ -12,6 +12,8 @@ Tests cover:
 - main(): calls write_observation on gate miss
 - main(): exits 0 when message file not found
 - main(): exits 0 on malformed stdin
+- _call_write_observation(): writes a JSON file to the inbox directory (not MCP POST)
+- _build_observation_payload(): returns correct payload shape
 """
 
 import importlib.util
@@ -368,3 +370,117 @@ class TestCheckGatePureFunction:
         """wos_execute_result (distinct from wos_execute) passes the gate."""
         passed, _ = self.mod.check_gate({"type": "wos_execute_result"})
         assert passed is True
+
+
+# ---------------------------------------------------------------------------
+# Tests: _build_observation_payload (pure function)
+# ---------------------------------------------------------------------------
+
+class TestBuildObservationPayload:
+    """_build_observation_payload() returns a correctly shaped inbox payload."""
+
+    @pytest.fixture(autouse=True)
+    def _mod(self):
+        self.mod = _load_hook()
+
+    def test_payload_has_required_fields(self):
+        """Payload contains all fields the dispatcher expects for subagent_observation."""
+        payload = self.mod._build_observation_payload("msg-abc")
+        assert payload["type"] == "subagent_observation"
+        assert payload["category"] == "system_error"
+        assert "gate=wos_execute_gate" in payload["text"]
+        assert "msg-abc" in payload["text"]
+        assert "id" in payload
+        assert "timestamp" in payload
+        assert "chat_id" in payload
+
+    def test_payload_text_contains_gate_miss_fields(self):
+        """Observation text includes all required gate-miss key=value pairs."""
+        payload = self.mod._build_observation_payload("msg-xyz")
+        text = payload["text"]
+        assert "condition=mark_processed_without_mark_processing" in text
+        assert "outcome=miss" in text
+        assert "message_id=msg-xyz" in text
+
+    def test_payload_id_is_unique_per_call(self):
+        """Each call produces a unique payload ID."""
+        p1 = self.mod._build_observation_payload("msg-1")
+        p2 = self.mod._build_observation_payload("msg-2")
+        assert p1["id"] != p2["id"]
+
+    def test_payload_source_is_hook(self):
+        """Payload source is 'hook' to distinguish from MCP-written observations."""
+        payload = self.mod._build_observation_payload("msg-src")
+        assert payload["source"] == "hook"
+
+
+# ---------------------------------------------------------------------------
+# Tests: _call_write_observation writes inbox file (not MCP POST)
+# ---------------------------------------------------------------------------
+
+class TestCallWriteObservationInboxWrite:
+    """_call_write_observation() writes a JSON file to the inbox — no HTTP call."""
+
+    @pytest.fixture(autouse=True)
+    def _mod(self):
+        self.mod = _load_hook()
+
+    def test_writes_json_file_to_inbox(self, tmp_path):
+        """A gate miss observation lands as a .json file in the inbox directory."""
+        inbox_dir = tmp_path / "inbox"
+        with patch.object(self.mod, "INBOX_DIR", inbox_dir):
+            self.mod._call_write_observation("msg-write-test")
+
+        json_files = list(inbox_dir.glob("*.json"))
+        assert len(json_files) == 1, "Expected exactly one observation file in inbox"
+
+    def test_written_file_is_valid_json(self, tmp_path):
+        """The inbox file is parseable JSON."""
+        inbox_dir = tmp_path / "inbox"
+        with patch.object(self.mod, "INBOX_DIR", inbox_dir):
+            self.mod._call_write_observation("msg-json-valid")
+
+        json_file = next(inbox_dir.glob("*.json"))
+        payload = json.loads(json_file.read_text())
+        assert isinstance(payload, dict)
+
+    def test_written_payload_contains_message_id(self, tmp_path):
+        """The observation payload references the triggering message_id."""
+        inbox_dir = tmp_path / "inbox"
+        with patch.object(self.mod, "INBOX_DIR", inbox_dir):
+            self.mod._call_write_observation("msg-id-check")
+
+        json_file = next(inbox_dir.glob("*.json"))
+        payload = json.loads(json_file.read_text())
+        assert "msg-id-check" in payload["text"]
+
+    def test_written_payload_type_is_subagent_observation(self, tmp_path):
+        """The inbox file has type=subagent_observation so the dispatcher routes it."""
+        inbox_dir = tmp_path / "inbox"
+        with patch.object(self.mod, "INBOX_DIR", inbox_dir):
+            self.mod._call_write_observation("msg-type-check")
+
+        json_file = next(inbox_dir.glob("*.json"))
+        payload = json.loads(json_file.read_text())
+        assert payload["type"] == "subagent_observation"
+        assert payload["category"] == "system_error"
+
+    def test_no_urllib_import_used(self):
+        """urllib.request is not imported — no HTTP call can occur."""
+        import sys
+        # The module should not have urllib.request as an attribute
+        assert not hasattr(self.mod, "urllib"), \
+            "urllib should not be imported in the hook after the fix"
+
+    def test_write_failure_is_silent(self, tmp_path):
+        """I/O failure in _call_write_observation is caught — never raises."""
+        # Point INBOX_DIR at a path where mkdir will fail (a file, not a dir)
+        bad_path = tmp_path / "not_a_dir"
+        bad_path.write_text("I am a file, not a directory")
+        inbox_dir = bad_path / "inbox"  # mkdir will fail: parent is a file
+        with patch.object(self.mod, "INBOX_DIR", inbox_dir), \
+             patch.object(self.mod, "_log_failure") as mock_log:
+            # Must not raise
+            self.mod._call_write_observation("msg-fail-test")
+        # Failure was logged
+        assert mock_log.call_count == 1
