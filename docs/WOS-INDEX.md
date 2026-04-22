@@ -130,4 +130,16 @@ Diagnoses UoWs and prescribes workflow primitives. In V3, the Steward:
 
 ---
 
-*Last updated: 2026-04-04 (WOS V3 PR1 — Germinator)*
+*Last updated: 2026-04-22 (WOS V3 — archived stale design docs)*
+
+---
+
+## Historical Archive
+
+The following documents have been moved to `docs/archive/` and are preserved for reference only. They reflect earlier design stages and should not be treated as current specifications.
+
+- `docs/archive/wos-v2-design.md` — V2 design document (superseded by V3)
+- `docs/archive/wos-v3-proposal.md` — V3 proposal draft (superseded by implemented V3)
+- `docs/archive/sprint2-uow-pipeline-report.md` — Sprint 2 pipeline report
+- `docs/archive/wos-sprint2-retro.md` — Sprint 2 retrospective
+- `docs/archive/wos-design-audit-2026-04-08.md` — Design audit from 2026-04-08
