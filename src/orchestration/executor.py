@@ -65,6 +65,7 @@ from orchestration.error_capture import (
     classify_error,
     has_repeated_error,
 )
+from orchestration.steward import _build_claude_env
 
 
 # ---------------------------------------------------------------------------
@@ -933,13 +934,16 @@ def _dispatch_via_claude_p(instructions: str, uow_id: str) -> str:
         "--max-turns", "40",
     ]
 
-    # Use error capture to detect and log subprocess failures with context
+    # Use error capture to detect and log subprocess failures with context.
+    # Pass an explicit env so CLAUDE_CODE_OAUTH_TOKEN is present even when
+    # this function is called from a cron job that strips the parent env.
     proc, error = run_subprocess_with_error_capture(
         component="executor",
         uow_id=uow_id,
         command=command,
         timeout_seconds=_get_claude_p_timeout(),
         check=True,  # Log errors at ERROR level for fatal issues
+        env=_build_claude_env(),
     )
 
     # If error occurred, classify and decide whether to raise
@@ -1064,12 +1068,15 @@ def _dispatch_via_stub(register_name: str, instructions: str, uow_id: str) -> st
         "--max-turns", "40",
     ]
 
+    # Pass an explicit env so CLAUDE_CODE_OAUTH_TOKEN is present even when
+    # called from a cron job that strips the parent environment.
     proc, error = run_subprocess_with_error_capture(
         component="executor",
         uow_id=uow_id,
         command=command,
         timeout_seconds=_get_claude_p_timeout(),
         check=True,
+        env=_build_claude_env(),
     )
 
     if error:
