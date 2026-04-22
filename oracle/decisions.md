@@ -2,6 +2,28 @@
 
 ---
 
+### [2026-04-22] PR #805 — refactor: consolidate write_inbox_message() into shared utility (closes #781)
+
+**Vision alignment:** The adversarial prior entering Stage 1 — this implementation is solving the wrong problem, or solving the right problem in a direction that forecloses better paths — finds no foothold here. The problem statement is concrete: six scripts each define an identical `write_inbox_message()` function, creating a schema-drift risk whenever the inbox format changes. For this to be the wrong path, the inbox format would need to be permanently stable (making the risk theoretical), or the consolidation would need to compete with the higher-priority WOS execution health work. Neither holds: the PR description explicitly states that executor.py, registry.py, and WOS orchestration files were not modified, and this change is a side-seam refactor orthogonal to the starvation work. The consolidation directly instantiates vision.yaml principle-4 ("wire what exists before building more") and principle-1 ("structural prevention over reactive recovery"): six diverged copies produce a silent-inconsistency failure mode at the first partial update; one canonical implementation prevents it structurally. The `seam-first abstraction` golden pattern is confirmed here: `write_inbox_message()` is placed precisely at the boundary where six callers with shared evolutionary fate meet a single schema contract.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **Consolidation is complete and correct.** All six callers now import from `src/utils/inbox_write.py`. The `_inbox_dir()` and `_task_outputs_dir()` helpers are re-exported from the shared module so scripts' local `write_task_output` functions (intentionally left out of scope) continue to work without modification — a clean scoping decision that avoids over-reach.
+- **The `job_name` parameter is a genuine improvement over the old per-script prefixes.** The old implementations hardcoded job-specific prefix strings inside each local function. The new canonical implementation takes `job_name` as an explicit parameter, making the message ID prefix declarative at the call site. Every caller passes a stable literal (e.g., `JOB_NAME`, `"auto-router"`, `"surface-queue-delivery"`). This is the correct direction for future observability — log entries are traceable to their origin without opening the source file.
+- **Test coverage is solid for its scope.** 12 tests cover schema correctness, atomicity (no `.tmp` left behind), `LOBSTER_DEFAULT_SOURCE` env var, `LOBSTER_MESSAGES` env var, uniqueness, return type, and job_name prefix in the msg_id. The tests use `monkeypatch.setenv("LOBSTER_MESSAGES", ...)` to redirect writes to `tmp_path`, which is the correct env-var-at-call-time pattern (not the module-level constant anti-pattern named in learnings.md PR #839). No locally-declared mirror of production constants; no assertion softening.
+- **One minor observation: `_inbox_dir()` and `_task_outputs_dir()` are marked as private (underscore prefix) in the module but are exported in the public API docstring and re-imported by callers.** This is a naming inconsistency — they function as semi-public utilities. It is not a defect, and the current behavior is correct; the naming does not affect correctness or future change paths.
+
+**Patterns introduced:** The `write_inbox_message(job_name, ...)` signature where the caller declares its own identity (rather than the function hardcoding it) is a clean interface design. It extends the traceable-origin principle: any future analysis of inbox messages can bucket by `job_name` prefix without reading script code. This pattern should be maintained for any future expansion of the shared utility.
+
+**What this forecloses:** Nothing structural. The `write_task_output` functions remain per-script with their per-script filename conventions — the PR description correctly identifies this as a follow-on that requires a different consolidation approach. The approach taken here does not make that follow-on harder.
+
+**Opportunity cost note:** The work is scoped narrowly and does not compete with WOS execution health. The pre-existing test failure (`test_dispatch_job_sh.py`) is documented as confirmed-on-main before this branch — not introduced here.
+
+**VERDICT: APPROVED**
+
+---
+
 ### [2026-04-22] PR #839 re-oracle v2 — fix: resolve two test gaps (lazy classifier path lookup + controlled fixture assertion)
 
 **Prior gap tracking:**

@@ -146,6 +146,18 @@ Applied in WOS Phase 2 design (2026-03-30):
 
 ---
 
+### [2026-04-22] Pattern: caller-declared identity in shared utilities
+
+**Pattern:** When consolidating copy-pasted functions into a shared utility, add a `job_name` (or equivalent identity) parameter at the call site rather than hardcoding the prefix inside the shared function or inspecting the call stack. Each caller passes its own stable identifier literal, and the shared function uses it as-is.
+
+**Why it works:** The alternative — letting the shared function hardcode a generic prefix or inspect call stack frames — produces opaque message IDs not traceable to origin. Caller-declared identity makes the origin explicit in the function signature, observable in every output (msg_id prefix), and searchable in logs without reading source code. It also makes the shared function a pure transformation: given the same inputs, it produces the same output. No hidden coupling between the function's behavior and the script that calls it. The `job_name` parameter was the distinguishing design choice in PR #805's consolidation: six scripts each passed their own literal, and every inbox message ID is now prefixed with the originating script name.
+
+**Where it appears:** `src/utils/inbox_write.py` — `write_inbox_message(job_name, chat_id, text, timestamp)` introduced in PR #805. All six callers pass a stable literal: `"auto-router"`, `"surface-queue-delivery"`, `JOB_NAME` constant.
+
+**Reuse guidance:** Apply whenever extracting a utility function that produces identifiable outputs (IDs, log entries, file names). The identity should flow in as a parameter, not be inferred inside the function. Test: if you grepped every output of this function for its job origin, would the origin be unambiguous without reading source? If yes, the pattern is applied correctly.
+
+---
+
 ### [2026-03-30] Pattern: importlib re-export bridge for backward-compatible file splits
 
 **Pattern:** When splitting a monolithic script into two files (concern A in file-A.py, concern B stays in file-B.py), use `importlib.util.spec_from_file_location` at module scope in file-B.py to load file-A.py and bind its exported symbols as top-level names in file-B.py. Register the loaded module in `sys.modules` before `exec_module` to prevent double-execution and ensure `@dataclass __module__` resolution works correctly.
