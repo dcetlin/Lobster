@@ -1,7 +1,7 @@
 # WOS Pipeline Architecture
 
 **Date:** 2026-04-22
-**Status:** Canonical (v2 — locking, recurrence, lifecycle, loops)
+**Status:** Canonical (v3 — heartbeat locking, recurrence, lifecycle, loops)
 **Scope:** Full cultivator-to-executor pipeline, including germinator register classification, routing classifier posture assignment, executor dispatch, lifecycle stages, and feedback loops.
 **Workstream:** `~/lobster-workspace/workstreams/wos/README.md`
 
@@ -79,7 +79,7 @@ flowchart TD
     subgraph EXECUTOR_LOOP ["Executor Loop (every 3 min, +90s offset)"]
         HB["Executor Heartbeat\nexecutor-heartbeat.py\nevery 3 min via cron\n(90s after steward)"]
         WOS_GATE{wos-config.json\nexecution_enabled?}
-        TTL["Phase 1: TTL Recovery\nrecover_ttl_exceeded_uows()\n4h TTL — fails stuck 'active'/'executing' UoWs"]
+        TTL["Phase 1: Orphan Safety Net\nrecover_ttl_exceeded_uows()\n24h TTL — orphaned UoWs evading observation loop"]
         PRIMARY["Primary Dispatch Path\n_dispatch_via_inbox\nwrites wos_execute message\nto ~/messages/inbox/\n(fire-and-forget, seconds latency)"]
         RECOVERY["Recovery Dispatch\n(heartbeat catches missed dispatches\n>5 min in ready-for-executor)"]
 
@@ -148,7 +148,7 @@ The WOS pipeline contains several explicit feedback loops:
 
 2. **Oracle → fix → re-oracle loop** — For code UoWs that open a PR: oracle agent reviews the diff, writes a verdict to `oracle/decisions.md`. A NEEDS_CHANGES verdict dispatches a fix agent which opens a new PR revision; the oracle re-runs. This loop repeats until APPROVED.
 
-3. **TTL recovery loop** — The executor heartbeat's TTL recovery (4h) marks stalled `active`/`executing` UoWs as `failed`, returning them to the Steward for re-diagnosis. This is the safety net for crashed or orphaned subagents.
+3. **Heartbeat stall detection loop** — The steward's observation loop checks `active` UoWs every 3 minutes. If `heartbeat_at` has been silent for more than `heartbeat_ttl` seconds (default: 300s), the UoW is transitioned back to `ready-for-steward` for re-diagnosis. The executor heartbeat retains a 24h TTL orphan safety net (`recover_ttl_exceeded_uows`) as a last-resort backstop for UoWs that somehow evade the observation loop, but it is no longer the primary stall detection mechanism.
 
 4. **Startup sweep loop** — On every 3-minute steward heartbeat invocation, the startup sweep scans for orphaned UoWs in `active`, `executing`, and `diagnosing` states and resets them to `ready-for-steward`. This catches crashes between heartbeat cycles.
 
@@ -158,16 +158,44 @@ The WOS pipeline contains several explicit feedback loops:
 
 ## 8 Reflections Answered
 
-### 1. Locking mechanism — preventing duplicate execution
+### 1. Locking mechanism — heartbeat-based locking (PR #848, merged 2026-04-22)
 
-The Executor performs a **6-step atomic claim sequence** inside a `BEGIN IMMEDIATE` SQLite transaction. Step 2 is the optimistic lock:
+The locking model has three coordinated components:
+
+**Claim (atomic, optimistic lock):** The Executor performs a **6-step atomic claim sequence** inside a `BEGIN IMMEDIATE` SQLite transaction. Step 2 is the optimistic lock:
 
 ```sql
-UPDATE uow_registry SET status='active', updated_at=?
+UPDATE uow_registry SET status='active', updated_at=?, heartbeat_ttl=?
 WHERE id=? AND status='ready-for-executor'
 ```
 
-If `rowcount=0` (another executor claimed first or status changed), the transaction rolls back and `ClaimRejected` is returned — the UoW is untouched. This prevents any two executor instances from claiming the same UoW simultaneously. The heartbeat's `_filter_stale_uows` adds a second layer: previously-orphaned UoWs require a 5-minute staleness gate before the heartbeat attempts recovery dispatch, avoiding races with the primary event-driven path.
+If `rowcount=0` (another executor claimed first or status changed), the transaction rolls back and `ClaimRejected` is returned. At claim time, `heartbeat_ttl` is set (derived from `estimated_runtime`, default 300 seconds / 5 minutes).
+
+**Heartbeat (continuous liveness signal):** The executing subagent writes a heartbeat every 60–90 seconds:
+
+```sql
+UPDATE uow_registry SET heartbeat_at=?, updated_at=?
+WHERE id=? AND status IN ('active', 'executing')
+```
+
+`heartbeat_at` is proof-of-life. A silent agent is a stalled agent. The heartbeat is a fire-and-forget update — no transaction held open.
+
+**Stall detection (steward observation loop):** The steward's observation loop runs every 3 minutes. It computes staleness using `heartbeat_at` if non-null, falling back to `started_at` for UoWs that predate the migration:
+
+```python
+reference = uow.heartbeat_at or uow.started_at
+staleness_seconds = (now - reference).total_seconds()
+if staleness_seconds > uow.heartbeat_ttl:
+    registry.record_stall_detected(uow.id, stall_type="heartbeat")
+```
+
+A stall transitions the UoW from `active` → `ready-for-steward` for re-diagnosis. The `stall_type` field distinguishes heartbeat stalls (agent crash / network failure → re-execute) from TTL stalls (legacy path for pre-migration UoWs).
+
+**Orphan safety net:** The executor heartbeat retains `recover_ttl_exceeded_uows()` with a **24h threshold** (not 4h) as a last-resort backstop for UoWs that evade the observation loop. This fires only on definitively orphaned UoWs.
+
+**Summary:** Claim is atomic (optimistic lock), execution is continuously observed (heartbeat), release is transactional (`write_result`). The 4-hour fixed TTL has been retired as the primary mechanism; it lives only as a 24h orphan safety net.
+
+The heartbeat's `_filter_stale_uows` adds a second layer for recovery dispatch: previously-orphaned UoWs require a 5-minute staleness gate before the heartbeat attempts recovery dispatch, avoiding races with the primary event-driven path.
 
 ### 2. Recurrence / trigger for each component
 
@@ -196,7 +224,7 @@ In production, the GardenCaretaker heartbeat is the live polling component; the 
 
 The **primary dispatch path is not the heartbeat** — it is event-driven. When the Steward prescribes a UoW, it transitions to `ready-for-executor` and the `_dispatch_via_inbox` function writes a `wos_execute` message directly to `~/messages/inbox/`. The Lobster dispatcher picks this up on its next cycle (seconds, not minutes).
 
-The executor heartbeat exists as a **recovery net**, not the primary trigger. Its two roles are: (1) TTL recovery — marking UoWs stuck in `active`/`executing` for more than 4 hours as `failed`, and (2) recovery dispatch — catching `ready-for-executor` UoWs that the primary event-driven path missed (e.g., due to dispatcher downtime). The heartbeat deliberately runs 90 seconds after the steward heartbeat to give the steward time to prescribe before the executor checks for ready UoWs.
+The executor heartbeat exists as a **recovery net**, not the primary trigger. Its two roles are: (1) orphan safety net — marking UoWs stuck in `active`/`executing` for more than 24 hours as `failed` (last-resort backstop; primary stall detection is the steward's observation loop using heartbeat signals), and (2) recovery dispatch — catching `ready-for-executor` UoWs that the primary event-driven path missed (e.g., due to dispatcher downtime). The heartbeat deliberately runs 90 seconds after the steward heartbeat to give the steward time to prescribe before the executor checks for ready UoWs.
 
 The cultivator (GardenCaretaker) and executor operate at different pipeline stages and are fully decoupled. The cultivator populates the registry with new UoWs from GitHub; the executor dispatches them only after the Steward has diagnosed and prescribed. They do not call each other.
 
@@ -247,8 +275,8 @@ The parallel to the pipeline diagram: WOS has the cycles (the heartbeats, the sw
 | **Germinator** | `src/orchestration/germinator.py` | Classifies the attentional *register* of each UoW at germination time using a 4-gate ordered algorithm. Register is immutable after germination. Runs synchronously on insert. |
 | **Routing Classifier** | `src/orchestration/routing_classifier.py` | Loads `~/lobster-user-config/orchestration/classifier.yaml` and applies first-match-wins rules to assign a *posture* (solo, sequential, review-loop, fan-out) and a `route_reason`. Falls back to `solo` if classifier YAML is absent. Runs synchronously on insert. |
 | **Registry** | `src/orchestration/registry.py` | SQLite-backed UoW store. `_upsert_typed` inserts new UoWs with `register`, `posture`, and `route_reason` fields; idempotent on active UoWs. |
-| **Steward Heartbeat** | `scheduled-tasks/steward-heartbeat.py` | Every 3 min via cron. Runs startup sweep (orphan recovery), observation loop (stall detection), and Steward main loop (diagnose → prescribe/close/surface). |
-| **Executor Heartbeat** | `scheduled-tasks/executor-heartbeat.py` | Every 3 min via cron (+90s offset). Checks `wos-config.json` execution gate, runs TTL recovery (Phase 1, always), then recovery-dispatches ready UoWs missed by the primary event-driven path (Phase 2). |
+| **Steward Heartbeat** | `scheduled-tasks/steward-heartbeat.py` | Every 3 min via cron. Runs startup sweep (orphan recovery), observation loop (heartbeat stall detection — compares `heartbeat_at` or `started_at` against `heartbeat_ttl`), and Steward main loop (diagnose → prescribe/close/surface). |
+| **Executor Heartbeat** | `scheduled-tasks/executor-heartbeat.py` | Every 3 min via cron (+90s offset). Checks `wos-config.json` execution gate, runs orphan safety net (`recover_ttl_exceeded_uows`, 24h threshold — Phase 1, always), then recovery-dispatches ready UoWs missed by the primary event-driven path (Phase 2). Primary stall detection is the steward's heartbeat observation loop, not this component. |
 | **Executor** | `src/orchestration/executor.py` | Performs the 6-step atomic claim sequence (optimistic lock on `ready-for-executor` → `active`). Primary path: writes `wos_execute` inbox message and returns immediately (async/event-driven). Legacy path: `claude -p` subprocess (CI/dev). |
 | **Register-Appropriate Subagent** | Dispatched by Lobster | functional-engineer (code), frontier-writer (philosophical synthesis), design-review (human-judgment analysis). Executes the UoW, writes `result.json` and `trace.json`. |
 | **Oracle** | `oracle/` | Reviews PR diffs and writes APPROVED / NEEDS_CHANGES verdicts to `oracle/decisions.md`. PR Merge Gate requires an APPROVED verdict before merge. |
