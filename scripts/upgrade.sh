@@ -2825,6 +2825,29 @@ CREATE TABLE IF NOT EXISTS dispatcher_lock (
         fi
     fi
 
+    # Migration 83: Add cron entries for wos-health-check and wos-metabolic-digest
+    # (issue #849). Both are Type C cron-direct scripts committed to scheduled-tasks/.
+    local WOS_HEALTH_MARKER="# LOBSTER-WOS-HEALTH-CHECK"
+    local WOS_DIGEST_MARKER="# LOBSTER-WOS-METABOLIC-DIGEST"
+    if ! crontab -l 2>/dev/null | grep -qF "$WOS_HEALTH_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$WOS_HEALTH_MARKER" \
+            "0 */6 * * * cd $LOBSTER_DIR && uv run scheduled-tasks/wos-health-check.py >> $LOBSTER_WORKSPACE/scheduled-jobs/logs/wos-health-check.log 2>&1 $WOS_HEALTH_MARKER" \
+            && substep "Added wos-health-check cron entry (Migration 83)" \
+            || warn "Could not add wos-health-check cron entry — check cron-manage.sh"
+        migrated=$((migrated + 1))
+    else
+        substep "wos-health-check cron entry already present — skipping"
+    fi
+    if ! crontab -l 2>/dev/null | grep -qF "$WOS_DIGEST_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$WOS_DIGEST_MARKER" \
+            "0 9 * * * cd $LOBSTER_DIR && uv run scheduled-tasks/wos-metabolic-digest.py >> $LOBSTER_WORKSPACE/scheduled-jobs/logs/wos-metabolic-digest.log 2>&1 $WOS_DIGEST_MARKER" \
+            && substep "Added wos-metabolic-digest cron entry (Migration 83)" \
+            || warn "Could not add wos-metabolic-digest cron entry — check cron-manage.sh"
+        migrated=$((migrated + 1))
+    else
+        substep "wos-metabolic-digest cron entry already present — skipping"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
