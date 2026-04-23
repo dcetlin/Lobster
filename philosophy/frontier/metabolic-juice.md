@@ -1,5 +1,7 @@
 ---
-oracle_status: pending
+oracle_status: approved
+oracle_pr: https://github.com/dcetlin/Lobster/pull/885
+oracle_date: 2026-04-23
 ---
 
 # Frontier: Metabolic Juice — Pre-Cadential Aliveness
