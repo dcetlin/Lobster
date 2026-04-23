@@ -8783,6 +8783,32 @@ CANONICAL_DIR = _USER_CONFIG / "memory" / "canonical"
 HANDOFF_PATH = CANONICAL_DIR / "handoff.md"
 
 
+
+# ---------------------------------------------------------------------------
+# Memory ingestion filter — noise event exclusion
+#
+# These event types are pure operational noise for semantic retrieval.
+# health_check fires ~380 times/day (health-check-v3 every 4 min).
+# Exclude them before any embedding computation or DB insertion.
+# ---------------------------------------------------------------------------
+MEMORY_EXCLUDED_TYPES: frozenset[str] = frozenset({
+    "health_check",      # canonical type written by health-check-v3.sh and daily-health-check.sh
+    "health_probe",      # forward-compat alias in case producers adopt this name
+    "cron_heartbeat",    # executor/steward heartbeat noise
+})
+MEMORY_EXCLUDED_SUBTYPES: frozenset[str] = frozenset({
+    "health_check",      # subtype variant from some producers
+})
+
+
+def _should_skip_memory_write(event_type: str, event_subtype: str | None) -> bool:
+    """Return True if this event should be silently dropped from memory ingestion."""
+    return (
+        event_type in MEMORY_EXCLUDED_TYPES
+        or (event_subtype is not None and event_subtype in MEMORY_EXCLUDED_SUBTYPES)
+    )
+
+
 async def handle_memory_store(arguments: dict[str, Any]) -> list[TextContent]:
     """Store an event in memory."""
     if _memory_provider is None:
@@ -8791,6 +8817,16 @@ async def handle_memory_store(arguments: dict[str, Any]) -> list[TextContent]:
     content = arguments.get("content", "")
     if not content:
         return [TextContent(type="text", text="Error: content is required.")]
+
+    # Filter gate: drop operational noise events before embedding or DB write.
+    event_type = arguments.get("type", "note")
+    event_subtype = arguments.get("subtype")
+    if _should_skip_memory_write(event_type, event_subtype):
+        log.debug(
+            "memory_store: skipping noise event (type=%r, subtype=%r)",
+            event_type, event_subtype,
+        )
+        return [TextContent(type="text", text=f"Skipped: event type '{event_type}' is excluded from memory ingestion.")]
 
     from memory.provider import VALENCE_VALUES
     raw_valence = arguments.get("valence", "neutral")
