@@ -8,6 +8,8 @@ oracle_date: 2026-04-16
 
 *Frontier document — living, evolves as the protocol matures.*
 
+See also: [metabolic-juice.md](metabolic-juice.md) — pre-cadential aliveness and the compaction risk.
+
 ## The Frame
 
 Every action the system takes produces something. The metabolic taxonomy is a classification of what that something is — not by task type, but by outcome. An oracle cycle can be a pearl (found a real bug) or heat (clean pass, nothing to surface). The same job, different result, different category.
