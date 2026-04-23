@@ -23,7 +23,6 @@ No network calls, no subprocess spawning.
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import sqlite3
 import sys
@@ -50,13 +49,9 @@ from orchestration.executor import (
 )
 from orchestration.steward import IssueInfo
 
-# startup-sweep.py has a hyphen in the filename — not directly importable as a module.
-# Use importlib to load it by file path and register it in sys.modules.
-_STARTUP_SWEEP_PATH = _REPO_ROOT / "scheduled-tasks" / "startup-sweep.py"
-_spec = importlib.util.spec_from_file_location("startup_sweep", _STARTUP_SWEEP_PATH)
-_startup_sweep_mod = importlib.util.module_from_spec(_spec)
-sys.modules["startup_sweep"] = _startup_sweep_mod
-_spec.loader.exec_module(_startup_sweep_mod)  # type: ignore[union-attr]
+_SCHEDULED_TASKS = str(_REPO_ROOT / "scheduled-tasks")
+if _SCHEDULED_TASKS not in sys.path:
+    sys.path.insert(0, _SCHEDULED_TASKS)
 
 from startup_sweep import run_startup_sweep, StartupSweepResult  # noqa: E402
 
