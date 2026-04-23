@@ -4169,12 +4169,7 @@ def run_steward_cycle(
     from src.orchestration.registry import Registry
 
     if registry is None:
-        if db_path is None:
-            workspace = Path(os.environ.get(
-                "LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"
-            ))
-            db_path = workspace / "orchestration" / "registry.db"
-        registry = Registry(db_path)
+        registry = Registry(db_path)  # db_path=None → Registry resolves canonical path
 
     _github_client = github_client or _default_github_client
     _gate = bootup_candidate_gate if bootup_candidate_gate is not None else BOOTUP_CANDIDATE_GATE
