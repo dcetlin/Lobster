@@ -89,7 +89,7 @@ flowchart TD
     LOBSTER["Lobster Dispatcher\npicks up wos_execute message\non next cycle (~seconds)"]
     SUBAGENT["Register-Appropriate Subagent\nfunctional-engineer / frontier-writer / design-review\nexecutes UoW\nstate: active → executing"]
     RESULT["result.json + trace.json written\noutcome: complete / partial / failed / blocked\nstate: executing → ready-for-steward"]
-    ORACLE["Oracle Review\noracle/\nPR diff reviewed by oracle agent\nverdict written to oracle/decisions.md"]
+    ORACLE["Oracle Review\noracle/verdicts/\nPR diff reviewed by oracle agent\nverdict written to oracle/verdicts/pr-NNN.md"]
     ORACLE_VERDICT{Verdict?}
     MERGE["Merge Agent\nmerges PR\nstate: → done"]
     FIX["Fix Agent\naddresses NEEDS_CHANGES"]
@@ -173,7 +173,7 @@ The WOS pipeline contains several explicit feedback loops:
 
 1. **Steward re-prescription loop** — After a subagent writes `result.json`, the UoW transitions to `ready-for-steward`. The Steward re-evaluates success criteria; if unsatisfied, it re-prescribes and the UoW cycles back through the executor. This is the primary loop for iterative-convergent UoWs.
 
-2. **Oracle → fix → re-oracle loop** — For code UoWs that open a PR: oracle agent reviews the diff, writes a verdict to `oracle/decisions.md`. A NEEDS_CHANGES verdict dispatches a fix agent which opens a new PR revision; the oracle re-runs. This loop repeats until APPROVED.
+2. **Oracle → fix → re-oracle loop** — For code UoWs that open a PR: oracle agent reviews the diff, writes a verdict to `oracle/verdicts/pr-NNN.md`. A NEEDS_CHANGES verdict dispatches a fix agent which opens a new PR revision; the oracle re-runs. This loop repeats until APPROVED.
 
 3. **Heartbeat stall detection loop** — The steward's observation loop checks `active` UoWs every 3 minutes. If `heartbeat_at` has been silent for more than `heartbeat_ttl` seconds (default: 300s), the UoW is transitioned back to `ready-for-steward` for re-diagnosis. The executor heartbeat retains a 24h TTL orphan safety net (`recover_ttl_exceeded_uows`) as a last-resort backstop for UoWs that somehow evade the observation loop, but it is no longer the primary stall detection mechanism.
 
@@ -308,7 +308,7 @@ The parallel to the pipeline diagram: WOS has the cycles (the heartbeats, the sw
 | **Executor Heartbeat** | `scheduled-tasks/executor-heartbeat.py` | Every 3 min via cron (+90s offset). Checks `wos-config.json` execution gate, runs orphan safety net (`recover_ttl_exceeded_uows`, 24h threshold — Phase 1, always), then recovery-dispatches ready UoWs missed by the primary event-driven path (Phase 2). Primary stall detection is the steward's heartbeat observation loop, not this component. |
 | **Executor** | `src/orchestration/executor.py` | Performs the 6-step atomic claim sequence (optimistic lock on `ready-for-executor` → `active`). Primary path: writes `wos_execute` inbox message and returns immediately (async/event-driven). Legacy path: `claude -p` subprocess (CI/dev). |
 | **Register-Appropriate Subagent** | Dispatched by Lobster | functional-engineer (code), frontier-writer (philosophical synthesis), design-review (human-judgment analysis). Executes the UoW, writes `result.json` and `trace.json`. |
-| **Oracle** | `oracle/` | Reviews PR diffs and writes APPROVED / NEEDS_CHANGES verdicts to `oracle/decisions.md`. PR Merge Gate requires an APPROVED verdict before merge. |
+| **Oracle** | `oracle/verdicts/` | Reviews PR diffs and writes APPROVED / NEEDS_CHANGES verdicts to `oracle/verdicts/pr-NNN.md`. PR Merge Gate requires an APPROVED verdict before merge. |
 | **Steward** | `src/orchestration/steward.py` | Evaluates completed UoWs against success criteria, diagnoses failures, re-prescribes, or surfaces to Dan. The only component authorized to mark a UoW `done`. |
 
 ---
