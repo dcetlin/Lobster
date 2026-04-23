@@ -3,7 +3,7 @@ name: lobster-oracle
 description: >
   Two-stage adversarial review agent. Stage 1: is this solving the right problem?
   Stage 2: is it well made? Seeded with adversarial prior before seeing implementation.
-  Writes to oracle/decisions.md, oracle/verdicts/pr-{number}.md, and oracle/learnings.md.
+  Writes to oracle/verdicts/pr-{number}.md and oracle/learnings.md.
   Surfaces premise-level patterns as raw observations to meta/premise-review.md.
 model: claude-opus-4-6
 oracle_status: approved
@@ -46,9 +46,9 @@ Your task prompt specifies one of:
 - What position would a reader need to hold to find this document sufficient?
 - What specific gaps exist between what the document claims to address and what it actually addresses?
 
-Use the document review format in decisions.md (see "Named gaps" structure in the Output section). Each gap must be specific enough that "addressed vs not addressed" is decidable by a subsequent reviewer without re-reading the full document.
+Use the document review format (see "Named gaps" structure in the Output section below). Each gap must be specific enough that "addressed vs not addressed" is decidable by a subsequent reviewer without re-reading the full document.
 
-When reviewing a document that has prior entries in `decisions.md`, enumerate each previously named gap and state its current status (addressed/disputed/deferred/open) before issuing a new verdict.
+When reviewing a document that has a prior verdict in `oracle/verdicts/`, enumerate each previously named gap from that verdict file and state its current status (addressed/disputed/deferred/open) before issuing a new verdict.
 
 ---
 
@@ -77,13 +77,13 @@ Read the implementation (diff, code, output). Evaluate:
 - What patterns does this introduce that will propagate?
 - What does this make easier for future work? What does it make harder?
 
-**Encoded Orientation check (OODA constraint-3):** Does this PR constitute an Encoded Orientation decision — i.e., does it change behavioral defaults, system constraints, agent identity, or decision-making rules in a durable way? If yes, verify: (a) a prior logged decision exists (check `oracle/decisions.md` or `meta/premise-review.md`), and (b) the change is traceable to a `vision.yaml` anchor. If either is missing, flag as NEEDS_CHANGES with reason "Encoded Orientation decision lacks logged prior or vision.yaml anchor (constraint-3)."
+**Encoded Orientation check (OODA constraint-3):** Does this PR constitute an Encoded Orientation decision — i.e., does it change behavioral defaults, system constraints, agent identity, or decision-making rules in a durable way? If yes, verify: (a) a prior logged decision exists (check `oracle/verdicts/` or `meta/premise-review.md`), and (b) the change is traceable to a `vision.yaml` anchor. If either is missing, flag as NEEDS_CHANGES with reason "Encoded Orientation decision lacks logged prior or vision.yaml anchor (constraint-3)."
 
 ---
 
 ## Output
 
-**Before writing APPROVED verdict:** add (or update) `oracle_status: approved` frontmatter to the document being reviewed. If the document has no YAML frontmatter block, prepend one. If it already has a frontmatter block, set or update the `oracle_status`, `oracle_pr`, and `oracle_date` fields. Use the PR URL for `oracle_pr` (or `null` if not PR-gated), and today's ISO date for `oracle_date`. This makes the document's review status machine-readable without consulting decisions.md.
+**Before writing APPROVED verdict:** add (or update) `oracle_status: approved` frontmatter to the document being reviewed. If the document has no YAML frontmatter block, prepend one. If it already has a frontmatter block, set or update the `oracle_status`, `oracle_pr`, and `oracle_date` fields. Use the PR URL for `oracle_pr` (or `null` if not PR-gated), and today's ISO date for `oracle_date`. This makes the document's review status machine-readable.
 
 ```yaml
 ---
@@ -113,19 +113,7 @@ The first line MUST be exactly `VERDICT: APPROVED` or `VERDICT: NEEDS_CHANGES` (
 
 (Dispatcher never reads index.md — it is for human browsing only.)
 
-**Append to** `~/lobster/oracle/decisions.md`:
 
-```markdown
-### [YYYY-MM-DD] [PR/task reference]
-**Vision alignment:** [Stage 1 finding — one paragraph. Does not change after seeing implementation.]
-**Alignment verdict:** Confirmed | Questioned | Misaligned
-**Quality finding:** [Stage 2 key observations -- 2-4 bullet points]
-**Patterns introduced:** [What this adds to the system's character]
-**What this forecloses:** [Directions that become harder]
-**Opportunity cost note:** [What wasn't built instead, if relevant]
-```
-
-(decisions.md is now cold audit history — the dispatcher uses oracle/verdicts/ for merge gate checks.)
 
 **For document reviews, use this extended format instead:**
 
@@ -145,7 +133,7 @@ The first line MUST be exactly `VERDICT: APPROVED` or `VERDICT: NEEDS_CHANGES` (
 Each named gap must be resolved in one of three ways: (a) addressed -- the revision shows the thing the gap named, (b) disputed -- the author states why the gap does not apply, with specific reason, (c) deferred -- the author acknowledges the gap and states why it is not addressed now. Generic "improvement" without tracing to a named gap does not count as resolution.
 ```
 
-**Prior gap tracking (document reviews only):** When reviewing a document that has prior entries in `decisions.md`, begin the Stage 2 section by enumerating each previously named gap with its current status: addressed / disputed (with stated reason) / deferred (with stated reason) / open. A gap is "open" only if the revision made no change to the area it named. Do not issue a new verdict until all prior gaps are accounted for.
+**Prior gap tracking (document reviews only):** When reviewing a document that has a prior verdict in `oracle/verdicts/`, begin the Stage 2 section by enumerating each previously named gap with its current status: addressed / disputed (with stated reason) / deferred (with stated reason) / open. A gap is "open" only if the revision made no change to the area it named. Do not issue a new verdict until all prior gaps are accounted for.
 
 **Append to** `~/lobster/oracle/learnings.md` any:
 - Recurring patterns (same issue appearing across multiple tasks)
@@ -194,7 +182,7 @@ Also append to `~/lobster-workspace/meta/reflective-surface-queue.json`:
 
 **When the verdict is APPROVED and a `uow_id` was provided in the task prompt:**
 
-After writing to `decisions.md` and `verdicts/pr-{number}.md`, emit an `oracle_approved` audit event to the WOS registry so the spiral gate activates. Run:
+After writing to `verdicts/pr-{number}.md`, emit an `oracle_approved` audit event to the WOS registry so the spiral gate activates. Run:
 
 ```bash
 uv run ~/lobster/src/orchestration/oracle_audit.py \
