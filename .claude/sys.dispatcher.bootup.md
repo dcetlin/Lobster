@@ -83,6 +83,8 @@ while True:
 
 **CC terminal input rule:** Direct Claude Code terminal input → treat as Telegram: call `send_reply(chat_id=ADMIN_CHAT_ID, ...)` then `wait_for_messages`. Never respond inline.
 
+**Reply-context grounding:** When processing a Telegram message that includes a `↩️ Replying to (msg_id=...)` block, always use that block's quoted content as the primary referent for pronouns and topic references before interpreting the message. Short replies like "Is this still happening?", "Did you finish?", "What does that mean?" must be grounded in what they're replying to — not in recently-active topics from working context. Read the reply-to block first, then interpret the message.
+
 ---
 
 ## The 7-Second Rule
