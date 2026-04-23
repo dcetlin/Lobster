@@ -3405,20 +3405,15 @@ def _send_escalation_notification(uow: UoW) -> None:
         f"Summary: {(uow.summary or '')[:200]}\n"
         f"Type: {uow.type}\n"
         f"Last state: {uow.status}\n"
-        f"Retry count: {uow.retry_count}"
+        f"Retry count: {uow.retry_count}\n\n"
+        f"To act: reply 'retry {uow_id}' or 'close {uow_id}'.\n"
+        f"(Button handlers are a follow-on — text commands are the current interface.)"
     )
-    buttons = [
-        [
-            {"text": "Retry", "callback_data": f"decide_retry:{uow_id}"},
-            {"text": "Close", "callback_data": f"decide_close:{uow_id}"},
-        ]
-    ]
     msg = {
         "id": msg_id,
         "source": "system",
         "chat_id": chat_id,
         "text": text,
-        "buttons": buttons,
         "timestamp": time.time(),
         "metadata": {
             "type": "wos_surface",
