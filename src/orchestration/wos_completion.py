@@ -34,6 +34,32 @@ from pathlib import Path
 
 log = logging.getLogger("wos_completion")
 
+# Lazy import — only imported when a GitHub issue source is detected.
+# This avoids pulling in the lifecycle module in test environments that
+# don't have a real gh CLI available.
+_lifecycle_imported = False
+_stamp_issue_complete_fn = None
+_stamp_issue_unverifiable_fn = None
+
+
+def _import_lifecycle() -> None:
+    """Import wos_issue_lifecycle functions on first use (lazy, non-blocking)."""
+    global _lifecycle_imported, _stamp_issue_complete_fn, _stamp_issue_unverifiable_fn
+    if _lifecycle_imported:
+        return
+    try:
+        from orchestration.wos_issue_lifecycle import (
+            stamp_issue_complete as _sic,
+            stamp_issue_unverifiable as _siu,
+        )
+        _stamp_issue_complete_fn = _sic
+        _stamp_issue_unverifiable_fn = _siu
+    except ImportError as exc:
+        log.debug("wos_completion: could not import wos_issue_lifecycle — %s", exc)
+    finally:
+        _lifecycle_imported = True
+
+
 #: Prefix used by route_wos_message to form the task_id for wos_execute dispatches.
 WOS_TASK_ID_PREFIX = "wos-"
 
@@ -375,6 +401,58 @@ def _post_closeout_comment_if_github(
 
 
 # ---------------------------------------------------------------------------
+# Issue lifecycle stamp — bidirectional GitHub state sync on completion
+# ---------------------------------------------------------------------------
+
+def _stamp_issue_on_completion(
+    uow_id: str,
+    source: str,
+    issue_number: int | None,
+    output_ref: str | None,
+    result_text: str | None,
+    gh_bin: str = "gh",
+) -> None:
+    """
+    Call the appropriate lifecycle stamp based on output classification.
+
+    pearl / heat → stamp_issue_complete (closes the issue — verified done)
+    seed          → stamp_issue_unverifiable (leaves open — no artifact trail)
+    Non-GitHub sources or missing issue_number → no-op.
+    Import or gh failures are non-fatal.
+    """
+    parsed = _extract_github_issue(source)
+    if parsed is None or issue_number is None:
+        return
+
+    repo, _ = parsed
+    _import_lifecycle()
+
+    classification = classify_uow_output(output_ref, result_text)
+    summary = (result_text or "").strip()[:200]
+
+    if classification in ("pearl", "heat"):
+        if _stamp_issue_complete_fn is not None:
+            _stamp_issue_complete_fn(issue_number, uow_id, summary, repo=repo, gh_bin=gh_bin)
+        else:
+            log.debug(
+                "wos_completion: _stamp_issue_on_completion skipped for %s#%d "
+                "(lifecycle module not available)",
+                repo, issue_number,
+            )
+    else:
+        # "seed" — conservative default: artifact has potential future value
+        # but is not yet a verified deliverable. Leave the issue open.
+        if _stamp_issue_unverifiable_fn is not None:
+            _stamp_issue_unverifiable_fn(issue_number, uow_id, repo=repo, gh_bin=gh_bin)
+        else:
+            log.debug(
+                "wos_completion: _stamp_issue_on_completion (unverifiable) skipped for %s#%d "
+                "(lifecycle module not available)",
+                repo, issue_number,
+            )
+
+
+# ---------------------------------------------------------------------------
 # Main entry point — called by inbox_server.py on every write_result
 # ---------------------------------------------------------------------------
 
@@ -493,6 +571,17 @@ def maybe_complete_wos_uow(
             output_ref=output_ref,
             result_text=result_text,
             agent_type=agent_type,
+            gh_bin=gh_bin,
+        )
+
+        # Lifecycle stamp: update GitHub issue state based on output classification.
+        # Non-GitHub sources are silently skipped. Stamp failure is non-fatal.
+        _stamp_issue_on_completion(
+            uow_id=uow_id,
+            source=uow_source,
+            issue_number=uow.source_issue_number,
+            output_ref=output_ref,
+            result_text=result_text,
             gh_bin=gh_bin,
         )
 
