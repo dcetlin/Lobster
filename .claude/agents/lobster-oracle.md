@@ -190,6 +190,22 @@ Also append to `~/lobster-workspace/meta/reflective-surface-queue.json`:
 
 ---
 
+## WOS Spiral Gate — emit oracle_approved audit event
+
+**When the verdict is APPROVED and a `uow_id` was provided in the task prompt:**
+
+After writing to `decisions.md` and `verdicts/pr-{number}.md`, emit an `oracle_approved` audit event to the WOS registry so the spiral gate activates. Run:
+
+```bash
+uv run ~/lobster/src/orchestration/oracle_audit.py \
+    --uow-id <uow_id> \
+    --pr-ref "PR #<number>"
+```
+
+This is a fire-and-forget call. If it fails (DB absent, UoW not found), log the error and continue — the oracle verdict delivery must not be blocked by an audit write failure.
+
+**When no `uow_id` was provided:** skip this step silently. Not all oracle reviews are for WOS UoWs.
+
 ## Completion
 
 Call `write_result`. If alignment verdict is `Questioned` or `Misaligned`, or if a premise-review item was written, set `forward=true` so the dispatcher surfaces it to the user. Otherwise `forward=false` -- findings are in the oracle files.
