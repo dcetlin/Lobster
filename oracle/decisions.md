@@ -2,6 +2,219 @@
 
 ---
 
+### [2026-04-23] PR #871 — feat: inject UoW ID into subagent prompts for bidirectional artifact provenance (#868)
+
+Pure function `_build_wos_context_block` + three-line injection in `_run_execution`. Vision alignment confirmed — approved design decision already in flight; bounded scope, no foreclosure. Quality findings: pure function well-formed, injection order correct, both dispatch paths covered, 18 tests with named constants. No wiring issues. **VERDICT: APPROVED**
+
+---
+
+### [2026-04-23] PR #870 — chore: commit 10 LLM scheduled job systemd unit files and add Migration 87
+
+**Vision alignment:** The adversarial prior: this implementation is solving the wrong problem, or solving the right problem in a direction that forecloses better paths. The PR canonicalizes systemd unit files for 10 LLM scheduled jobs that are already live on the running instance. Vision.yaml `current_focus.current_constraint` names WOS execution pipeline starvation as the live blocking constraint, and `what_not_to_touch` lists "Cron Phase 2+3 (#138)" — but issue #869 is not #138, and the work is repo-state catch-up (byte-for-byte copies of live files), not new scheduling infrastructure. The premise holds: closing the installation gap is correctly scoped and forecloses nothing.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- Migration 87 m87_count double-increments per timer (cosmetic): the loop increments after `sudo cp` and again after `systemctl enable --now`, inflating the reported count by up to 2x. Not blocking.
+- Content-only idempotency gap (latent debt): the `[ ! -f "$dst/$timer_name" ]` check skips copy if the file already exists regardless of content. Future unit file schedule changes require a new migration step to reach existing instances. Consistent with other file-based migrations in upgrade.sh; acceptable for this PR since all files are new to a second instance.
+- All 20 unit files are correctly formed: `Type=oneshot`, `User=lobster`, `Persistent=true`, `WantedBy=timers.target`. The double-prefix `lobster-lobster-hygiene` matches live system (confirmed by engineer). Feature-bundling check passes: all 22 changed items are named in the PR description.
+- Golden-pattern doc is correct and well-scoped. No path errors detected.
+
+**Patterns introduced:** Systemd unit files as committed repo artifacts with a corresponding upgrade.sh migration for idempotent install. This is now the canonical pattern for LLM scheduled jobs, documented in `docs/scheduled-jobs-golden-pattern.md`.
+
+**What this forecloses:** Future unit file content changes require a new migration step to push to existing instances. Not architecturally foreclosing.
+
+**Opportunity cost note:** Low-risk infrastructure canonicalization during an execution-pipeline-focused sprint. Closes a real installation gap without blocking higher-priority work.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-23] PR #863 — feat: ScalingGovernor — cap WOS executor dispatch based on Attunement load
+
+**Vision alignment:** The adversarial prior: this implementation is solving the wrong problem, or solving the right problem in a direction that forecloses better paths. The PR addresses a failure mode named explicitly in vision.yaml `current_focus.current_constraint`: executor dispatch starvation and RALPH Cycle 7 failures. The precipitating event (50-run failure with 252 injected UoWs and 250 failures at 0.8% success, caused by "success triggers collapse") is specific and named. Two credible alternative root causes exist: queue composition (wrong UoWs in ready-for-executor) versus dispatch volume, and a new cap pathology when workload mix changes structurally. Neither defeats the premise — they constrain evaluation criteria: the governor must be auditable, overridable, and fail-safe. The learnings.md PR #714 wiring check was the active prior: I verified the governor is correctly imported in the production dispatch path before examining test coverage. Constraint-3 (Encoded Orientation) was checked: `current_focus.what_not_to_touch` explicitly includes dispatch loop pattern gating as in-scope; `current_focus.this_week.primary` names executor starvation as primary work. Both the prior decision anchor and vision.yaml anchor are present.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- Wiring is correct and complete. The governor is imported inside `run_executor_cycle()`, called before the dispatch loop, and its decision slices `eligible_uows` in the production path. The PR #714 "library with no wiring" failure mode does not apply.
+- Pure function separation is clean. `_compute_decision()` is I/O-free. `GovernorDecision` carries all five observability fields from the "classification result as typed frozen dataclass" golden pattern (PR #602). Decision is fully auditable at log time.
+- One performance debt: `WHERE status IN ('done','failed') ORDER BY updated_at DESC LIMIT 500` without an index on `updated_at` does a full table scan every heartbeat cycle. Not blocking, but a known latency surface as the registry grows.
+- Power-of-2 attunement window behavior with DESC-ordered rows is correctly documented in `test_cap_fires_when_proposed_is_4` — the most recent failure resets attunement at scale 1 regardless of overall success rate. Correct per spec; the test comment is the documentation.
+- 22 tests cover empty DB, mixed windows, override flag, DB failure (nonexistent and corrupt), proposed_n=1, and pure function isolation. `_patch_inbox` extension correctly stubs the governor in dispatch-eligibility tests.
+
+**Patterns introduced:** Governor-as-gate: a pure-function decision layer between eligibility filtering and dispatch, with a frozen dataclass carrying all observability fields. This extends the "classification result as typed frozen dataclass" golden pattern to the dispatch layer. Override flag as escape hatch in wos-config.json, consistent with existing `execution_enabled` pattern.
+
+**What this forecloses:** The power-of-2 window heuristic is now the canonical attunement signal. Future window shape changes (rolling average, exponential decay) require changing `_query_attunement_scale()` or adding a sibling governor class. The pure function seam makes this a straightforward extension, not a refactor.
+
+**Opportunity cost note:** Directly enables the vision.yaml `current_focus` goal of draining 106 proposed UoWs through the pipeline by preventing the dispatch collapse that produced 250 failures in 252 dispatches.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-23] PR #862 — fix: rename startup-sweep.py to startup_sweep.py and replace importlib
+
+**Vision alignment:** The adversarial prior entering Stage 1: this PR is solving the wrong problem, or solving the right problem in a direction that forecloses better paths. The PR retires the `importlib` dynamic-load bridge that golden-patterns.md ([2026-03-30], "importlib re-export bridge for backward-compatible file splits") documented as a designed workaround. That golden pattern explicitly stated: "Do not use for src/ package modules where normal relative imports are available — importlib bridging is a script-context workaround, not a general-purpose import pattern." It was a workaround for a filename with a hyphen, not a design intention. The PR removes the workaround by fixing the root cause (the filename). The golden pattern citation here constrained what I looked for: I checked specifically whether the `sys.modules` pre-registration (critical for `@dataclass` forward reference resolution under importlib) would be lost. It will not be: standard Python import machinery handles `sys.modules` registration automatically, so this is not a regression. The adversarial prior found no foothold. This is maintenance cleanup, correctly scoped, fixing a hygiene issue (finding 5.4 from wos-hygiene-scan-2026-03-30) that the codebase itself had documented as outstanding.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- The rename and import replacement are mechanically correct. `sys.path.insert(0, _SWEEP_DIR)` in `steward-heartbeat.py` and `sys.path.insert(0, _SCHEDULED_TASKS)` in the integration test are idiomatic for script-context module loading; both guard against double-insertion with `if ... not in sys.path`. The standard `from startup_sweep import` replaces the bridge with no behavioral difference for callers.
+- The integration test simplification is correct and complete. The test previously maintained its own independent `importlib` workaround (the comment "startup-sweep.py has a hyphen in the filename — not directly importable" is now deleted). Both the production import block and the test import block now use the same pattern. No stranded workaround code remains.
+- Encoded Orientation check (constraint-3): this PR does not change behavioral defaults, system constraints, agent identity, or decision-making rules. It is a pure naming and import-mechanics fix. Constraint-3 does not apply.
+- Feature-bundling check (learnings.md PR #712, #717): 5 files changed — `oracle/decisions.md`, `oracle/learnings.md`, `scheduled-tasks/startup_sweep.py` (rename only), `scheduled-tasks/steward-heartbeat.py`, `tests/integration/test_wos_ttl_recovery.py`. All five are named or implied by the PR description. No undocumented scope expansion. The oracle file additions are prior oracle verdicts committed by a preceding WOS unit-of-work, not additions from this PR's author — the diff shows they were bundled into the same branch. This is a branch-bundling artifact, not scope expansion by the fix author.
+
+**Patterns introduced:** None new. This PR retires the "importlib re-export bridge" golden pattern for this specific instance by applying the upstream fix the golden pattern itself recommended (fix the filename).
+
+**What this forecloses:** Nothing architecturally foreclosed. The importlib bridge pattern remains documented in golden-patterns.md for cases where renaming is not possible (third-party scripts, legacy compatibility requirements). Removing it here does not remove the pattern from the vocabulary.
+
+**Opportunity cost note:** Minimal. This is a hygiene fix explicitly tracked in the scan document. Leaving the importlib workaround active would not have blocked any other work, but its removal reduces maintenance surface for future readers who encounter the bridge and must understand why it exists.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-23] PR #861 Round 2 — fix(pr-merge-gate): read per-PR verdict files with legacy fallback
+
+**Vision alignment:** Round 2 is a targeted enforcement fix. Stage 1 finding is locked from Round 1: the premise is valid and the alignment verdict is Confirmed. The adversarial prior for Round 2 was whether the fix introduced a new gap — broken legacy fallback or a new failure mode at the hook layer. Neither was confirmed: the legacy path is preserved intact; the primary path correctly reads `oracle/verdicts/pr-{number}.md` first line with exact string equality; path construction resolves consistently with oracle agent write instructions.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- Round 1 gap fully closed: `find_oracle_verdict()` now checks `VERDICTS_DIR / f"pr-{pr_number}.md"` first, reads first line with `.splitlines()[0].strip()`, compares by exact string equality. Path resolves to `~/lobster/oracle/verdicts/pr-{N}.md` — consistent with oracle agent write instruction.
+- Legacy fallback preserved: `oracle/decisions.md` prose search is intact for pre-861 PRs. Only cosmetic change (removed now-unused `pr_token` variable, updated warning messages).
+- `splitlines()[0]` IndexError on empty file is real but safe: an empty file implies a failed oracle write; an uncaught exception in a PreToolUse hook blocks the tool call (conservative direction for a safety gate). Simple guard (`lines[0] if lines else ""`) would be cleaner but is not blocking.
+- Scope check: 7 files, all named in PR description. No undocumented scope expansion. Hook/structural-enforcer-synchronization learning (learnings.md 2026-04-23) names this exact pattern; this PR is its direct remediation.
+
+**Patterns introduced:** Per-artifact verdict file read as the primary approval signal in the structural enforcer, with graceful legacy fallback. The archive step (move verdict file on merge) makes post-merge state unambiguous without querying a log.
+
+**What this forecloses:** The prose-grep path on `decisions.md` is now a legacy fallback, not the primary check. Future oracle reviews that write only to `decisions.md` and not to `oracle/verdicts/` will be checked only via the fallback. The instruction layer (lobster-oracle.md) now mandates both writes — the split is correctly specified.
+
+**Opportunity cost note:** None. This closes the single blocking gap from Round 1 and is directly in scope.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-23] PR #861 — feat(oracle): per-PR verdict files replace decisions.md approval check
+
+**Vision alignment:** PR #861 addresses a real structural problem: the old PR Merge Gate check relied on grepping `oracle/decisions.md` for the latest entry for a given PR, fragile under multi-round reviews and ordering ambiguity. The fix — per-PR verdict files with a machine-readable first line — directly serves vision.yaml principle-3 (determinism over judgment for conditionals) and principle-1 (structural prevention over reactive recovery). The adversarial prior I held: is decisions.md bloat the root problem, or is the root failure that the gate is Advisory and enforcement depends on context-loaded prose? Investigation confirmed the gate was already promoted to a PreToolUse hook (PR #825). The hook reads `oracle/decisions.md` — so signal quality is load-bearing for the hook's correctness. The premise of PR #861 is valid: a fragile grep over a growing prose file is the correct thing to fix, and the new format is a legitimate improvement. However, the hook itself was not updated to read the new signal, which is the enforcement gap this verdict names.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **Critical gap: `hooks/pr-merge-gate.py` not updated.** The hook still reads `oracle/decisions.md` via `DECISIONS_FILE` and parses `**VERDICT: APPROVED**` prose. After this PR ships, the oracle writes verdicts to `oracle/verdicts/pr-{number}.md`, but the structural enforcer (the hook) reads the old file. The new per-PR format is written but never checked by the hook. The benefit (deterministic first-line read, no grep, no ordering ambiguity) is unrealized at the enforcement layer. Since decisions.md still receives full prose appends, the hook continues to function — but against the old signal, not the new one.
+- **Instruction-layer changes are consistent and correct.** lobster-oracle.md, sys.dispatcher.bootup.md, and CLAUDE.md are all updated to reference `oracle/verdicts/pr-{number}.md`. The first-line format contract is precisely specified. The Round 2+ overwrite instruction preserves the first-line invariant.
+- **CLAUDE.md gate row is compaction-safe.** The updated PR Merge Gate row captures both branches (APPROVED→merge with archive move, NEEDS_CHANGES→fix→re-oracle→repeat), the file path, and enforcement type. Applies the table-as-compaction-resistant-encoding golden pattern correctly.
+- **Migration 85 is idempotent and correctly numbered** (83: PR #851, 84: PR #856, 85: this PR). Minor: `touch .gitkeep` after `mkdir -p` is redundant but harmless. No `index.md` seed exists in the repo, but the first oracle agent will create it on write — non-blocking.
+
+**Patterns introduced:** Per-artifact verdict file as the machine-readable approval signal, replacing prose-grep on a shared log. The archive step (move verdict file on merge) makes post-merge state unambiguous without querying a log. The pattern is sound and should be extended to other gate checks that currently rely on prose parsing.
+
+**What this forecloses:** The hook must also be updated in the follow-on PR. Shipping this without the hook update creates a period where the instruction layer and the enforcement layer describe different checks — which increases the risk of compaction-related gate confusion (an agent reading the CLAUDE.md table sees the new check; the hook enforces the old check; if the agent writes only to the new file and not to decisions.md, the hook finds no verdict and warns but does not block).
+
+**Opportunity cost note:** None — this is directly in scope of the current oracle infrastructure maintenance, not a diversion from WOS execution health.
+
+**VERDICT: NEEDS_CHANGES**
+
+---
+
+### [2026-04-22] PR #860 — refactor(wos): simplify inline callers now that Registry has canonical default
+
+**Vision alignment:** This PR is a companion cleanup completing the caller migration from PR #859. The theory of change: once `Registry.__init__` centralizes path resolution, duplicated inline derivations in callers become dead weight that accumulates future drift risk. This directly serves vision principle-4 ("Integration rate before new feature rate — wire what exists before building more") and principle-1 ("Structural prevention is preferred over reactive recovery"). The learnings.md pattern "interface migration without updating all callers" (PR #720) named this exact failure mode — a central interface change that leaves callers unreachable. PR #860 is the structural response: completing the migration rather than leaving callers stranded. Before seeing the diff, the adversarial prior was: did PR #859 change the interface in a way that creates undiscovered callers? The answer after review is no — the three callers enumerated by the engineer (steward.py, wos_completion.py, executor-heartbeat.py) are the correct population.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- `steward.py` change is clean and correct: `Registry(db_path)` where `db_path=None` flows directly to `Registry.__init__`'s call-time env-var resolution, which explicitly avoids the module-scope-constant problem named in learnings.md PR #839. The inline 4-line block is dead weight and its removal is correct.
+- `wos_completion.py` introduces a subtle inconsistency: the existence guard uses `REGISTRY_DB` (module-scope constant, computed at `orchestration.paths` import time), while `Registry()` uses the call-time env-var read. In production these always agree. In tests, `patch.dict(os.environ, {"REGISTRY_DB_PATH": ...})` works for `Registry()` but not for the already-computed `REGISTRY_DB`. The test file exercises this path via `test_missing_db_does_not_raise` using `patch.dict` — the test passes because `REGISTRY_DB` typically resolves to a non-existent canonical path in CI (no WOS install), so the guard fires correctly without needing the patch to affect `REGISTRY_DB`. This is fragile but not currently broken.
+- The local import (`from orchestration.paths import REGISTRY_DB` inside the `try` block) does not escape the module-scope problem — `orchestration.paths.REGISTRY_DB` is frozen at the first import of `orchestration.paths`, regardless of where the `from ... import` appears in the callee's code. This is a known trade-off documented in the PR comment.
+- 5 pre-existing test failures confirmed unchanged: `TestRepoFromIssueUrl` (x4) and `test_approve_idempotent_on_pending` (x1) are pre-existing gaps not introduced by this PR.
+
+**Patterns introduced:** Existence-guard-before-construction pattern for optional WOS dependencies — using `REGISTRY_DB` for the existence check separates "is WOS installed?" from "construct the registry." This is a correct seam but is now slightly asymmetric with the construction call.
+
+**What this forecloses:** Inline path derivation in these two callers. Future callers of `Registry()` should follow the same pattern: pass `db_path` explicitly if they have one, or pass no args to use the canonical default. The inline derivation pattern is now clearly deprecated.
+
+**Opportunity cost note:** None. This is the correct companion PR to #859 and completes the stated migration.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-22] PR #859 re-oracle (commit bbedcf86) — fix: executing_swept added to heartbeat log
+
+**Prior gap tracking:**
+- **Gap 1: executing_swept missing from heartbeat log** — Status: **Addressed.** `steward-heartbeat.py` log format string at lines 675–681 now includes `executing_orphans=%d` as the fifth field in the format string, with `sweep_result.executing_swept` as the corresponding argument. The field name in the format (`executing_orphans`) is consistent with the existing field naming convention (`executor_orphans`, `diagnosing`). The field reference (`sweep_result.executing_swept`) matches the `executing_swept` field added to `StartupSweepResult` in the same PR. No mismatch.
+
+**Vision alignment:** Stage 1 finding is locked from the prior oracle pass. The fix is a one-line log format update that surfaces the Population 4 counter to operator logs. It serves vision operating principle-1 (proactive resilience over reactive recovery) by making the crash recovery path visible without requiring DB queries. The revision is narrower than the prior revision contract specified — it adds exactly the named field and nothing else.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- Gap 1 is closed exactly as specified. The format string and the argument list are consistent: five `%d` placeholders and five integer arguments, in the correct order. No argument ordering bug (a common risk when inserting into the middle of a format string — this insertion is at the end, which is the correct and lower-risk location).
+- No regressions introduced. The diff touches only the log format line in `steward-heartbeat.py`; no logic, no state transitions, no counter resets.
+- The original bugs (#857 DB path default, #858 executing orphan recovery) remain correctly fixed. The registry `__init__` default-path resolution and `record_startup_sweep_executing` are unchanged in this commit.
+- Tests added in the prior round cover the new population: `TestRecordStartupSweepExecuting` (three cases: transition, audit entry, idempotency) and `TestStartupSweepExecutingPopulation` (above threshold, below threshold, dry run). The fix commit introduces no new test changes — the tests were already in the PR and remain valid.
+
+**Patterns introduced:** None new. The fix is a log format extension following the existing pattern of `field_name=%d` format specifiers in the heartbeat sweep-complete log line.
+
+**What this forecloses:** Nothing.
+
+**Opportunity cost note:** None. One-line fix, correctly scoped.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-22] PR #859 — fix(wos): registry default path + executing orphan recovery
+
+**Vision alignment:** This PR repairs two correctness gaps in WOS crash recovery: (1) `Registry()` required a positional argument, enabling path drift when callers derived the path inline rather than using `paths.REGISTRY_DB`; (2) the startup sweep handled three orphan populations but not `executing`, leaving UoWs whose subagents never called `write_result` stuck indefinitely with no recovery path. Both gaps directly serve `current_focus.this_week.primary` ("WOS execution health: fix executor dispatch starvation"). The work is narrow, traceable to the current operational constraint, and does not foreclose any path. The adversarial prior ("this implementation is solving the wrong problem") is not confirmed: the `executing` orphan is a real structural gap — a stuck state with no recovery path is a correctness defect, not a performance tuning issue. There is no cheaper test of the assumption that hasn't been run; the orphan `uow_20260422_b7623c` already surfaced in production. The `src.ooda` vendor package absence is a pre-existing environment issue correctly routed around.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **Optimistic-lock WHERE clause is correct.** `record_startup_sweep_executing` gates `UPDATE` on `status = 'executing'`, making it idempotent: `rows_affected == 0` on a race silently no-ops, and the audit INSERT is gated on `rows_affected == 1`. This is the same pattern used by all other `record_startup_sweep_*` methods.
+- **Population 4 age comparison and None-started_at handling are correct.** Age comparison uses `<=` (boundary exclusion: must exceed threshold, not merely meet it). None-started_at falls back to `updated_at` with timezone-aware handling consistent with the other populations. The exception block on datetime parsing is a skip (warning + continue), not a crash.
+- **All six steward.py touch points are consistent.** `ReentryPosture.EXECUTING_ORPHAN`, `_RETURN_REASON_CLASSIFICATIONS`, `_determine_reentry_posture`, `_determine_trace_posture`, `_posture_rationale` (two locations, each for different `trace_posture` branches), `_posture_prediction`, and `_build_deterministic_prescription_instructions` are all extended. The dual `_posture_rationale` entries are intentional: the first fires when `trace_posture == "scope_challenged"` (the expected path, since `_determine_trace_posture` includes `"executing_orphan"` in the `scope_challenged` tuple); the second is defensive coverage for the unreachable-from-production case.
+- **Heartbeat log does not include `executing_swept`.** `steward-heartbeat.py` logs sweep results at lines 675–681 but the log format string lists only four fields: `active_swept`, `executor_orphans`, `diagnosing`, `skipped_dry_run`. The new `executing_swept` field is absent. This is not a correctness defect — the sweep fires and transitions UoWs correctly — but it is an observability gap: operators monitoring heartbeat logs have no visibility into Population 4 activity without querying the DB directly. This matches the pattern in learnings.md (PR #717: "interface extended, consumer not updated"). Vision principle 1 (proactive resilience over reactive recovery) requires the operator surface to reflect the recovery path. Fix: one-line log message update in steward-heartbeat.py to include `executing_orphans=%d` with `sweep_result.executing_swept`.
+
+**Patterns introduced:** The four-population startup sweep pattern with per-population counters and a shared `dry_run` gate. The `executing` status is now part of the crash recovery surface. The `src.ooda` stub pattern (`_stub_ooda_if_missing`) is a documented test workaround for a vendor package absent in CI — not a golden pattern, but correctly scoped and documented.
+
+**What this forecloses:** Nothing structurally. The `executing_orphan` classification is additive. The heartbeat staleness check (`get_stale_heartbeat_uows`) remains the primary recovery path for most executing orphans; Population 4 covers the subset where `heartbeat_at` was never written.
+
+**Opportunity cost note:** None. This is a narrow correctness fix directly in the path of the stated execution health priority.
+
+**VERDICT: NEEDS_CHANGES**
+**Revision contract:**
+- **Gap 1: executing_swept missing from heartbeat log** — `steward-heartbeat.py` log format string at the sweep completion log must include `executing_orphans=%d` and `sweep_result.executing_swept`. Addressed when the log line is updated to include the new counter. Disputed if the author demonstrates the field is surfaced via another operator-visible channel. Deferred if the author acknowledges the gap with a stated reason.
+
+---
+
+### [2026-04-22] PR #856 re-oracle (commit a3fe852b) — fix: write_observation via direct inbox write
+
+**Prior gap tracking:**
+- **Gap 1: write_observation broken protocol** — Status: **Addressed.** `urllib.request` import removed entirely. `_call_write_observation` now writes directly to `INBOX_DIR` using `tmp.write_text()` followed by `tmp.replace(dest)` (POSIX-atomic). No HTTP call possible; test `test_no_urllib_import_used` confirms `urllib` not present as a module attribute.
+
+**Vision alignment:** This is a defect repair on the proprioceptive feedback path for a Tier-1 gate. Vision operating principle-1 (proactive resilience over reactive recovery) and constraint-3 (OODA loop integrity) both require that gate-miss observations actually reach the dispatcher. The fix removes the broken protocol path and replaces it with the established direct-inbox-write pattern. No foundational assumption changes from the prior oracle pass. Stage 1 verdict remains: Confirmed. The implementation is solving the right problem and the fix is the right solution.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **Fix is complete and correct.** `_call_write_observation` body is replaced wholesale — the tmp→rename write pattern (`dest.with_suffix(".tmp")` → `tmp.replace(dest)`) is POSIX-atomic. `INBOX_DIR` path resolution uses the same `LOBSTER_MESSAGES` env var override pattern established in PR #805 (golden-patterns.md: caller-declared identity in shared utilities). No urllib import remains.
+- **New tests exercise the actual I/O path.** `TestCallWriteObservationInboxWrite` patches only `INBOX_DIR` to a temp directory, then calls `_call_write_observation` directly. The tests verify file is written, is valid JSON, contains the message_id in text, has `type=subagent_observation` and `category=system_error`. This is the correct level of fidelity — not a mock of the function under test.
+- **`source="hook"` does not disrupt dispatcher routing.** The dispatcher routes `subagent_observation` by `type` field, not `source`. The `source` field is metadata. Confirmed from inbox_server.py formatting path context (PR #854 review).
+- **`python3` in Migration 84 command string is advisory.** Consistent with Migrations 75 and 76 for dispatch-template-check.py and pr-merge-gate.py in the same codebase. Systemic hook pattern, not unique to this PR. learnings.md PR #830 entry applies; flagged as recurring but not a blocker given codebase-wide consistency.
+
+**Patterns introduced:** Direct inbox file write as the canonical write_observation path for hooks and cron-direct scripts. The tmp→rename atomicity pattern is now applied in a hook context. The `_build_observation_payload` pure function separation (computable and testable without I/O) is a reusable structural split for any future hook that needs to produce an inbox observation.
+
+**What this forecloses:** The broken HTTP-call path is gone. Nothing architecturally foreclosed — a future refactor to a shared hook utility library would absorb `_build_observation_payload` cleanly.
+
+**Opportunity cost note:** None. This is the minimum viable repair of the defect identified in the prior oracle pass.
+
+**VERDICT: APPROVED**
+
+---
+
 ### [2026-04-22] PR #856 — feat: PostToolUse hook enforcing WOS Execute Gate structurally (closes #855)
 
 **Vision alignment:** The adversarial prior — this implementation is solving the wrong problem, or solving the right problem in a direction that forecloses better paths — has a specific surface here: issue #855 explicitly asked for a hook that "blocks the mark_processed call and logs a gate violation," and the PR delivers monitoring-only (always exits 0). Vision operating principle-1 ("proactive resilience over reactive recovery — structural prevention is preferred over better correction mechanisms") is the relevant anchor: a PostToolUse hook that fires after `mark_processed` has already committed cannot prevent the gate miss — it can only detect it. The `advisory-to-hook promotion` golden pattern (2026-04-22, PR #825) is directly applicable: that pattern explicitly distinguished PreToolUse hooks (blocking, structural) from PostToolUse hooks (observational), and identified the test for promotability as "can the enforcement condition be expressed as a string search on tool_input without false positives." A PreToolUse hook on `mark_processed` with message_id lookup and type check would give structural blocking. The PR's stated reason for PostToolUse over PreToolUse is "blocking mark_processed could cause stuck messages." This is a real tradeoff, but it means the gate remains behavioral at the prevention layer and structural only at the detection layer. The PR is correctly described as "observational" — it is not correctly described as "structural enforcement." The work is on the right problem and on the correct workstream priority (WOS execution health). However, the write_observation side effect — the mechanism by which the dispatcher would be informed — is built on a broken protocol path.
@@ -2202,5 +2415,49 @@ Pattern citations with behavioral effect: learnings.md PR #826 ("external API on
 **What this forecloses:** Agent-side heartbeat calls (from PR #851 prompt templates) are now non-load-bearing. This is explicitly correct: the sidecar handles the requirement structurally. If the cron stops firing, both heartbeats and dispatch are affected — so the failure mode is detectable by any monitoring that watches cron health, not buried in individual agent behavior.
 
 **Opportunity cost note:** None. This directly closes the structural gap named in #849 and questioned in the PR #851 oracle review. The implementation is the minimum scope to close the gap.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-23] PR #865 — feat: wire oracle_approved audit events to activate steward spiral gate
+
+**Vision alignment:** This PR is directly named in vision.yaml `current_focus.this_week.secondary` ("wire oracle_approved audit event writes so steward spiral gate activates") and in `current_focus.horizon.next` ("steward processes at least one UoW end-to-end with oracle_approved audit event visible"). The adversarial prior — is this solving the wrong problem — has two attack surfaces. First: if no UoWs are completing oracle review, the emission call wired here will never fire and the gate will remain zero for a different reason. This is a real risk but is not a reason to withhold the wiring — the gate cannot activate without the emission, and wiring the emission is the minimum necessary step. Second: the spiral gate is instruction-layer only (lobster-oracle.md is a prompt document, not a hook). The wiring depends on the oracle agent reading and following the new section. This is a genuine structural gap — it is not structural enforcement in the sense of principle-3. However, the PR description explicitly frames this as instruction-layer wiring, and the spiral gate test scenario (3 approved events required) makes this a low-frequency path where instruction-layer reliability is adequate. The work directly applies vision.yaml operating principle-4 ("wire what exists before building more") — the spiral gate has been structurally correct since PR #814; the missing arrow is the emission call.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **End-to-end data flow is verified and correct.** `emit_oracle_approved` calls `registry.append_audit_log(uow_id, entry)` which writes `entry.get("event", "unknown")` to the `event` column of `audit_log`. `_fetch_audit_entries` in steward.py reads `SELECT * FROM audit_log` and returns `dict(r)` for each row. `_count_oracle_passes` checks `e.get("event") == "oracle_approved"` — this reads the `event` column, not the JSON note. The write path and the read path agree: `oracle_approved` flows from emit call to spiral counter correctly.
+- **The env-var path resolution correctly avoids the PR #839 anti-pattern.** `_default_registry_db_path()` is a function that reads `os.environ.get("REGISTRY_DB_PATH")` at call time — not a module-level constant computed at import. The `test_env_var_db_path_resolution` test using `monkeypatch.setenv` is therefore valid. The learnings.md pattern is applied in the positive direction here: the design explicitly avoids the frozen-constant problem.
+- **One cosmetic dead code finding in `_main`.** The return statement `return 0 if success or True else 1` always evaluates to 0 (the `or True` makes the condition unconditionally true). The comment `# always 0 — errors are logged, not fatal` makes the intent clear and the behavior correct, but the dead branch (`else 1`) adds noise. This is advisory, not blocking.
+- **Instruction-layer wiring carries compliance risk.** The new "WOS Spiral Gate" section in lobster-oracle.md instructs the oracle agent to call the CLI after APPROVED when `uow_id` is present in the task prompt. This is behavioral instruction, not code enforcement (no hook, no structural gate). This is an accepted tradeoff for low-frequency paths (spiral gates require >= 3 oracle passes). The PR #861 learnings.md pattern ("when a PR changes where or how an approval signal is written, enumerate all readers — both instruction-layer and structural") was checked: there are no hooks in .claude/ that enforce the oracle_approved write, so there is no hook to update. The instruction-layer-only approach is the full scope of enforcement available here.
+
+**Patterns introduced:** `emit_oracle_approved()` with fire-and-forget CLI invocation establishes the pattern for oracle-to-registry audit event wiring: a standalone CLI-callable function that reads env vars at call time (not at import), verifies UoW existence before writing, and never raises. This is the minimum viable wiring pattern for any future oracle→registry integration.
+
+**What this forecloses:** Nothing structurally. The instruction-layer approach leaves room for a future structural enforcement path (hook or wrapper) if the spiral gate proves unreliable at the instruction level. The idempotency decision (no dedup guard, duplicate APPROVED writes increment the counter) is correct for the spiral gate use case and is explicitly documented.
+
+**Opportunity cost note:** None. This is the smallest possible PR that closes the named gap in vision.yaml current_focus.this_week.secondary. No competing work is deferred.
+
+**VERDICT: APPROVED**
+
+---
+
+### [2026-04-23] PR #866 — feat: WOS pipeline fixes — dynamic burst batch, sweep schedule, result enrichment, legacy DB
+
+**Vision alignment:** The adversarial prior — is this solving the wrong problem — has a real attack surface here. The vision.yaml `current_constraint` names "44% pipeline failure rate (binary path + timeout causes identified)" as the primary constraint. This PR addresses throughput starvation (BURST_BATCH_SIZE=3 couldn't drain a 150-item queue) and sweep schedule. If the 44% failure rate is still live, dynamic BURST_BATCH_SIZE dispatches more work into a broken executor — throughput fix into a fault. However, the PR context states that PRs #862/#863 (ScalingGovernor) are live and the execution pipeline they govern is starved at the dispatch level, not the execution level. The starvation description (steward ran 481 cycles with 0 prescriptions) is a dispatch-level symptom: the BURST_BATCH_SIZE cap prevented any prescriptions from firing, which is logically distinct from executor failure rate. The sweep schedule change (15m → 2h) directly prevents the bulk-germination that created the 150-item queue in the first place, and is the most directly aligned item to vision.yaml principle-1 (proactive resilience). Fix 3 (result enrichment) is not anchored to any current_focus item and represents incremental feature scope, but is non-fatal by design and does not foreclose anything. Fix 4 (legacy DB warning) is hygiene with low alignment cost.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- **Dynamic BURST_BATCH_SIZE is correctly implemented as a pure function computed once before the dispatch loop.** The threshold escalation (>50→15, >20→8, default 3) is sensible and observable via the new log.info statement. The function is pure (no side effects), named, and easily testable. The constant `BURST_BATCH_SIZE` is preserved as the default fallback, maintaining backward compatibility with the oracle/patterns.md §burst anchor.
+- **Bare `python3 -c "..."` in upgrade.sh Migration 86 is the third recurrence of the named failure pattern** (learnings.md PRs #804, #821, #830). Detection scope per learnings.md explicitly extends to "ALL contexts where Python is invoked inline in any Lobster-managed text." The `uv run python -` form should have been used. In this specific case the failure mode is safe (Migration 86 skips if python3 not in PATH, legacy file remains and generates a warning rather than silent data loss), but the pattern is named and recurring. This is advisory — not blocking given the safe fallback — but should be fixed in a follow-on commit before upgrade.sh grows a fourth instance.
+- **`_enrich_result_file` contains duplicate `import json; import tempfile` declarations** — the imports appear once inside the read `try` block and again inside the write `try` block. Both blocks use the already-imported names. The redundancy is a dead-code smell (learnings.md "dead code immediately before an unconditional override" pattern applied loosely). The fix is to move both imports to module top-level. Advisory, not blocking.
+- **Path-derivation logic in `_enrich_result_file` duplicates `result_writer._result_json_path`** — the enrichment function computes the result file path inline rather than calling the canonical source. This is the synchronization debt pattern from learnings.md (PR #848). Failure mode is gracefully handled: if the paths diverge, `result_path.exists()` returns False and the function silently no-ops. The enrichment is non-blocking by design, so silent no-op is the correct failure mode. Advisory, not blocking.
+
+**Patterns introduced:** The `_dynamic_burst_batch_size(queue_depth)` function establishes the pattern for queue-aware dispatch throttling: a pure function that reads queue depth and returns a scaled limit, computed once before the dispatch loop. The "compute once, use throughout the loop" invariant prevents the batch size from changing mid-cycle as items are processed. Worth propagating to any future dispatch-rate governance.
+
+**What this forecloses:** The 2-hour garden-caretaker sweep cadence reduces issue-to-UoW germination responsiveness from 15 minutes to 2 hours. If a high-priority issue is labeled `ready-to-execute`, it will take up to 2 hours for GardenCaretaker to germinate it. This is an acceptable tradeoff given the bulk-germination problem, but it means the pipeline latency ceiling for new work has increased from ~15m to ~2h. A future optimization could use label-triggered germination (webhook) rather than polling to get back sub-hour latency for high-priority items without bulk-germination risk.
+
+**Opportunity cost note:** Fix 3 (result file enrichment) is not anchored to any current_focus item in vision.yaml — it is quality-of-life work on the completion path. Vision principle-4 ("integration rate before new feature rate") suggests this could have waited. The feature is non-fatal by design and bounded in scope, so the cost is limited. The opportunity cost of the time spent on Fix 3 vs. directly investigating the 44% failure rate root cause is the more meaningful question.
 
 **VERDICT: APPROVED**
