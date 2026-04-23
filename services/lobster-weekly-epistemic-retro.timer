@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly epistemic retro — reflect on beliefs, predictions, and learning
+# LOBSTER-MANAGED
+
+[Timer]
+OnCalendar=Sun *-*-* 08:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

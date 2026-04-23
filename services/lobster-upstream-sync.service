@@ -1,0 +1,8 @@
+[Unit]
+Description=Twice-daily upstream sync — pull from upstream lobster repo
+# LOBSTER-MANAGED
+
+[Service]
+Type=oneshot
+User=lobster
+ExecStart=/home/lobster/lobster/scheduled-tasks/dispatch-job.sh upstream-sync

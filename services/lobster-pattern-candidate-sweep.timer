@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly pattern candidate sweep — identify recurring themes for IFTTT rules
+# LOBSTER-MANAGED
+
+[Timer]
+OnCalendar=Wed *-*-* 08:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=WOS hourly observation — monitor pipeline health 06-12 UTC
+# LOBSTER-MANAGED
+
+[Service]
+Type=oneshot
+User=lobster
+ExecStart=/home/lobster/lobster/scheduled-tasks/dispatch-job.sh wos-hourly-observation

@@ -1,0 +1,8 @@
+[Unit]
+Description=Lobster hygiene — system maintenance and cleanup every 3 days
+# LOBSTER-MANAGED
+
+[Service]
+Type=oneshot
+User=lobster
+ExecStart=/home/lobster/lobster/scheduled-tasks/dispatch-job.sh lobster-hygiene

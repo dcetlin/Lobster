@@ -1,0 +1,10 @@
+[Unit]
+Description=Biweekly lobster hygiene — extended maintenance on 1st and 15th
+# LOBSTER-MANAGED
+
+[Timer]
+OnCalendar=*-*-01,15 10:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
