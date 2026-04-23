@@ -136,6 +136,33 @@ flowchart TD
     ORACLE_VERDICT -->|NEEDS_CHANGES| FIX
     FIX --> SUBAGENT
     MERGE --> DONE
+
+    subgraph METABOLIC ["Metabolic Output Layer (outcome_refs — Issue #880)"]
+        OREFS["outcome_refs\n[{type, ref, category}]\nwritten by subagent in write_result\nprovenance carrier — makes stock traversable"]
+
+        PEARL["Pearl\noutcome_category: pearl\nTyped stock with address\n(PR URL, file path, doc link)"]
+        SEED["Seed\noutcome_category: seed\nTyped stock with address\n(GitHub Issue URL)"]
+        HEAT["Heat\noutcome_category: heat\nEnergy with log entry\n(no downstream stock)"]
+        SHIT["Shit\noutcome_category: shit\nEnergy with log entry\n(no downstream stock)"]
+
+        PEARL_OUT["Artifact delivered\nSystem state changes\nObservable in repo / docs"]
+        SEED_ISSUE["New Issue filed\n(ref in outcome_refs)"]
+        SEED_UOW["New UoW\n(via Cultivator on next cycle)"]
+        HEAT_LOG["Log entry only\nWork done, no artifact\n(healthy no-op)"]
+        SHIT_LOG["Waste account entry\nFuture cleanup work\n(stale notes, accumulation)"]
+    end
+
+    RESULT --> OREFS
+    OREFS -->|category=pearl| PEARL
+    OREFS -->|category=seed| SEED
+    OREFS -->|category=heat| HEAT
+    OREFS -->|category=shit| SHIT
+    PEARL --> PEARL_OUT
+    SEED --> SEED_ISSUE
+    SEED_ISSUE --> SEED_UOW
+    SEED_UOW -.->|generative loop| GH
+    HEAT --> HEAT_LOG
+    SHIT --> SHIT_LOG
 ```
 
 ---
@@ -240,6 +267,8 @@ The `sequential` posture (assigned by the routing classifier for seed-type work)
 
 ### 6. Lifecycle stages — seed, pearl, heat, and shit
 
+See also: the **Metabolic Output Layer** subgraph in the Pipeline Flowchart above, and the Outcome Categories table below. The formal `outcome_refs` schema is specified in [Issue #880](https://github.com/dcetlin/Lobster/issues/880).
+
 WOS uses two complementary vocabularies for lifecycle:
 
 **Biological vocabulary (design/philosophy register):**
@@ -304,12 +333,18 @@ The parallel to the pipeline diagram: WOS has the cycles (the heartbeats, the sw
 
 ## Outcome Categories (write_result metabolic tags)
 
-| Category | Meaning |
-|----------|---------|
-| `seed` | Intentional investment in future capability (infra fixes, tooling, instrumentation) |
-| `pearl` | Direct high-value output (bugs caught, frameworks encoded, analysis acted on) |
-| `heat` | Pure dissipation, no residue (empty checks, healthy no-ops) |
-| `shit` | Organic waste that persists and must be processed (stale notes, unread accumulation) |
+Spec: [Issue #880](https://github.com/dcetlin/Lobster/issues/880) — `outcome_refs` schema and traversal contract.
+
+The metabolic primitives are **typed stock** that move through flows after UoW execution. Seeds and pearls carry addresses (refs) that make them machine-traceable; heat and shit are energy expenditure with log entries only — no downstream stock is created.
+
+| Category | Stock type | `outcome_refs` required? | Downstream flow |
+|----------|------------|--------------------------|-----------------|
+| `pearl` | Artifact delivered | Yes — PR URL, file path, or doc link | System state changes; observable in repo/docs |
+| `seed` | Future work spawned | Yes — GitHub Issue URL | New Issue → New UoW via Cultivator (generative loop) |
+| `heat` | Pure dissipation | No | Log entry only; no artifact, no issue |
+| `shit` | Organic waste | No | Waste account entry; signals future cleanup work |
+
+**Key principle:** seeds and pearls are stock with addresses (refs); heat and shit are energy with logs (no downstream stock).
 
 ## UoW Lifecycle States
 
