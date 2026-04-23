@@ -700,3 +700,60 @@ class TestCloseoutProtocolIntegration:
             f"result_text mentioning a PR must produce 'pearl' classification in the "
             f"close-out comment. Got close-out comment body:\n{closeout_body}"
         )
+
+    def test_seed_classified_result_closes_issue(self, tmp_path: Path) -> None:
+        """
+        A UoW whose result_text classifies as 'seed' (the default — no PR mention,
+        no heat signals) must still close the source GitHub issue.
+
+        Rationale: metabolic classification (seed/pearl/heat) describes what the UoW
+        PRODUCED, not whether the source issue was ADDRESSED. A seed UoW that filed a
+        follow-up absolutely addressed the source issue. Lifecycle decisions must be
+        driven by completion status (success vs fail), not by output category.
+
+        Before this fix, seed-classified results called stamp_issue_unverifiable,
+        leaving the issue OPEN. This test confirms the corrected behavior: any
+        successful completion triggers stamp_issue_complete (which closes the issue).
+        """
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = self._seed_uow_with_source(
+            registry, output_dir, source="github:issue/77", issue_number=77
+        )
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        close_calls: list[list[str]] = []
+
+        def _capture_run(cmd, **kwargs):
+            # Track 'gh issue close' calls
+            if "close" in cmd:
+                close_calls.append(list(cmd))
+            return MagicMock(returncode=0)
+
+        # result_text has no PR mention and no heat signals → classifies as 'seed'
+        seed_result_text = "Filed follow-up issue #88 for remaining work."
+
+        with patch("orchestration.wos_completion.subprocess.run", side_effect=_capture_run), \
+             patch.dict(os.environ, {
+                 "REGISTRY_DB_PATH": str(db_path),
+                 "LOBSTER_WOS_REPO": "dcetlin/Lobster",
+             }):
+            maybe_complete_wos_uow(
+                task_id,
+                WRITE_RESULT_SUCCESS_STATUS,
+                result_text=seed_result_text,
+            )
+
+        # The source issue must be closed regardless of seed classification.
+        assert len(close_calls) >= 1, (
+            "A seed-classified UoW must still close the source GitHub issue. "
+            "Metabolic category (seed/pearl/heat) does not determine whether the "
+            "issue was addressed — completion status does."
+        )
+        # Confirm the close targeted the correct issue number
+        assert any("77" in str(call) for call in close_calls), (
+            f"gh issue close must target issue 77. Close calls observed: {close_calls}"
+        )

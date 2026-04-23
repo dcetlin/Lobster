@@ -244,7 +244,7 @@ class TestStampIssueExecuting:
 # ---------------------------------------------------------------------------
 
 class TestStampIssueComplete:
-    """Tests for the UoW-completion (pearl) lifecycle stamp."""
+    """Tests for the UoW-completion lifecycle stamp (called for any successful outcome)."""
 
     def test_success_path_removes_label_closes_and_comments(self) -> None:
         """
@@ -276,6 +276,38 @@ class TestStampIssueComplete:
         comment_args = mock_run.call_args_list[2][0][0]
         assert "issue" in comment_args
         assert "comment" in comment_args
+
+    def test_comment_body_says_successful_completion_not_pearl(self) -> None:
+        """
+        stamp_issue_complete is now called for all successful outcomes (pearl,
+        heat, seed). The comment body must say 'successful completion' — not
+        'pearl (verified artifact)' — because metabolic category is not what
+        drives lifecycle decisions.
+        """
+        remove_label_result = _make_completed_process(returncode=0)
+        close_result = _make_completed_process(returncode=0)
+        comment_result = _make_completed_process(returncode=0)
+
+        captured_body: list[str] = []
+
+        def _capture(cmd, **kwargs):
+            if "--body" in cmd:
+                captured_body.append(cmd[cmd.index("--body") + 1])
+            return _make_completed_process(returncode=0)
+
+        with patch("subprocess.run", side_effect=_capture):
+            stamp_issue_complete(_TEST_ISSUE, _TEST_UOW_ID, _TEST_SUMMARY, repo=_TEST_REPO)
+
+        assert len(captured_body) == 1, "Expected exactly one comment"
+        body = captured_body[0]
+        assert "successful completion" in body, (
+            "Comment body must say 'successful completion' — not pearl-specific language. "
+            f"Got: {body!r}"
+        )
+        assert "pearl" not in body, (
+            "Comment body must not mention 'pearl' — metabolic category does not drive "
+            f"lifecycle decisions. Got: {body!r}"
+        )
 
     def test_already_closed_issue_returns_true_gracefully(self) -> None:
         """

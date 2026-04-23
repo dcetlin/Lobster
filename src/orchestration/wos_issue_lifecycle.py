@@ -302,7 +302,13 @@ def stamp_issue_complete(
     gh_bin: str = "gh",
 ) -> bool:
     """
-    Stamp a GitHub issue as completed after a successful (pearl) UoW.
+    Stamp a GitHub issue as completed after a successful UoW execution.
+
+    Called for any successful UoW outcome — pearl, heat, or seed. The
+    lifecycle decision (close the issue) is orthogonal to the metabolic
+    taxonomy (what was produced). Any successful completion means the
+    source issue was addressed; the metabolic category is recorded
+    separately in the close-out comment posted by wos_completion.py.
 
     Steps:
     1. Remove wos:executing label from the issue.
@@ -345,7 +351,7 @@ def stamp_issue_complete(
         truncated_summary = summary[:200] + ("…" if len(summary) > 200 else "")
         comment_body = (
             f"## WOS UoW Complete — {uow_id}\n"
-            f"**Outcome:** pearl (verified artifact)\n"
+            f"**Outcome:** successful completion\n"
             f"**Summary:** {truncated_summary}\n"
             f"This issue was closed automatically by the Work Orchestration System."
         )

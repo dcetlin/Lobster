@@ -413,10 +413,19 @@ def _stamp_issue_on_completion(
     gh_bin: str = "gh",
 ) -> None:
     """
-    Call the appropriate lifecycle stamp based on output classification.
+    Call stamp_issue_complete for any successful UoW completion.
 
-    pearl / heat → stamp_issue_complete (closes the issue — verified done)
-    seed          → stamp_issue_unverifiable (leaves open — no artifact trail)
+    The source issue is closed regardless of metabolic classification
+    (pearl, heat, or seed). A seed UoW — one that filed a follow-up — still
+    addressed the source issue and should close it. The metabolic category
+    is recorded in the separate close-out comment posted by
+    _post_closeout_comment_if_github; it does not drive lifecycle decisions.
+
+    stamp_issue_unverifiable is NOT called here. That function is reserved
+    for future cases where a UoW completes but cannot be verified (no artifact
+    trail AND no subagent confirmation). All write_result=success paths call
+    stamp_issue_complete unconditionally.
+
     Non-GitHub sources or missing issue_number → no-op.
     Import or gh failures are non-fatal.
     """
@@ -427,29 +436,16 @@ def _stamp_issue_on_completion(
     repo, _ = parsed
     _import_lifecycle()
 
-    classification = classify_uow_output(output_ref, result_text)
     summary = (result_text or "").strip()[:200]
 
-    if classification in ("pearl", "heat"):
-        if _stamp_issue_complete_fn is not None:
-            _stamp_issue_complete_fn(issue_number, uow_id, summary, repo=repo, gh_bin=gh_bin)
-        else:
-            log.debug(
-                "wos_completion: _stamp_issue_on_completion skipped for %s#%d "
-                "(lifecycle module not available)",
-                repo, issue_number,
-            )
+    if _stamp_issue_complete_fn is not None:
+        _stamp_issue_complete_fn(issue_number, uow_id, summary, repo=repo, gh_bin=gh_bin)
     else:
-        # "seed" — conservative default: artifact has potential future value
-        # but is not yet a verified deliverable. Leave the issue open.
-        if _stamp_issue_unverifiable_fn is not None:
-            _stamp_issue_unverifiable_fn(issue_number, uow_id, repo=repo, gh_bin=gh_bin)
-        else:
-            log.debug(
-                "wos_completion: _stamp_issue_on_completion (unverifiable) skipped for %s#%d "
-                "(lifecycle module not available)",
-                repo, issue_number,
-            )
+        log.debug(
+            "wos_completion: _stamp_issue_on_completion skipped for %s#%d "
+            "(lifecycle module not available)",
+            repo, issue_number,
+        )
 
 
 # ---------------------------------------------------------------------------
