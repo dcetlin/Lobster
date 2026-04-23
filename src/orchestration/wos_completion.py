@@ -191,6 +191,123 @@ def _enrich_result_file(output_ref: str, result_text: str | None) -> None:
         )
 
 # ---------------------------------------------------------------------------
+# Back-propagation — write result text to executor output file (issue #867)
+# ---------------------------------------------------------------------------
+
+def _backpropagate_result_to_output_file(
+    uow_id: str,
+    output_ref: str,
+    result_text: str | None,
+) -> None:
+    """
+    Write the write_result payload to the executor output file when none exists.
+
+    Problem (issue #867): when a WOS subagent calls write_result, the result
+    text is stored in the MCP/session layer but the executor output file
+    ({output_ref}.result.json) is never updated. The Steward reads that file to
+    determine completion, so UoWs whose subagents did not explicitly write a
+    result file are classified as 'outcome_unverifiable'.
+
+    Fix: when maybe_complete_wos_uow fires (write_result confirmed), check
+    whether {output_ref}.result.json already exists. If not, write a minimal
+    conforming result file so the Steward can verify the outcome.
+
+    The result file schema follows executor-contract.md:
+    - uow_id: the UoW ID (validated by the Steward before reading other fields)
+    - outcome: "complete" (write_result status="success" implies success)
+    - success: true
+    - reason: the write_result text (truncated to 500 chars)
+    - executor_id: "write_result_backprop" (identifies this synthetic record)
+
+    Also writes result_text to the primary output_ref path when that file is
+    missing or empty (sentinel-only), so agent-status.sh and the steward have
+    human-readable content to display.
+
+    Non-fatal: failures are logged and swallowed — back-propagation must never
+    block the UoW transition or cause write_result to fail.
+
+    Args:
+        uow_id: The WOS unit-of-work ID.
+        output_ref: The output_ref path for this UoW (absolute path).
+        result_text: The text field from the write_result call. May be None or empty.
+    """
+    if not output_ref:
+        return
+
+    try:
+        import json as _json
+        import tempfile as _tempfile
+
+        p = Path(output_ref)
+        # Derive result.json path — mirrors executor._result_json_path
+        if p.suffix:
+            result_path = p.with_suffix(".result.json")
+        else:
+            result_path = Path(str(p) + ".result.json")
+
+        if result_path.exists():
+            # Already present — _enrich_result_file will add summary/refs
+            log.debug(
+                "_backpropagate_result_to_output_file: result file already exists at %s — skipping",
+                result_path,
+            )
+            return
+
+        # Write a minimal conforming result.json
+        reason = (result_text or "").strip()[:500] or "completed via write_result"
+        payload = {
+            "uow_id": uow_id,
+            "outcome": "complete",
+            "success": True,
+            "reason": reason,
+            "executor_id": "write_result_backprop",
+        }
+
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic write: tmp → rename so the Steward never reads a partial file
+        tmp_fd, tmp_name = _tempfile.mkstemp(
+            dir=result_path.parent,
+            prefix=f".{result_path.name}.backprop.",
+            suffix=".json",
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                fh.write(_json.dumps(payload, indent=2))
+            tmp_path.rename(result_path)
+            log.info(
+                "_backpropagate_result_to_output_file: wrote result.json for UoW %r at %s",
+                uow_id,
+                result_path,
+            )
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+        # Also write result_text to the primary output_ref when it is missing
+        # or still a sentinel (zero-byte file written by the executor to guard
+        # against crashed_output_ref_missing detection).
+        if result_text:
+            primary = p
+            if not primary.exists() or primary.stat().st_size == 0:
+                primary.parent.mkdir(parents=True, exist_ok=True)
+                primary.write_text(result_text, encoding="utf-8")
+                log.info(
+                    "_backpropagate_result_to_output_file: wrote result_text to primary output %s",
+                    primary,
+                )
+
+    except Exception as exc:
+        log.warning(
+            "_backpropagate_result_to_output_file: failed for UoW %r — %s: %s",
+            uow_id, type(exc).__name__, exc,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Output classification — pure function
 # ---------------------------------------------------------------------------
 
@@ -541,6 +658,12 @@ def maybe_complete_wos_uow(
             "(execution_complete written on write_result confirmation)",
             uow_id,
         )
+
+        # Back-propagation (issue #867): write result_text to the executor output
+        # file when the subagent did not write one itself. Must run BEFORE
+        # _enrich_result_file so the file exists for enrichment to update.
+        if output_ref:
+            _backpropagate_result_to_output_file(uow_id, output_ref, result_text)
 
         # Enrich result file with summary + extracted artifact refs from agent output.
         # Non-fatal — enrichment failure never blocks the UoW transition.

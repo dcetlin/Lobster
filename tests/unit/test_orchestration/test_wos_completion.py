@@ -36,6 +36,7 @@ if str(_SRC) not in sys.path:
 from orchestration.wos_completion import (
     WOS_TASK_ID_PREFIX,
     WRITE_RESULT_SUCCESS_STATUS,
+    _backpropagate_result_to_output_file,
     _build_closeout_comment,
     _extract_github_issue,
     classify_uow_output,
@@ -757,3 +758,156 @@ class TestCloseoutProtocolIntegration:
         assert any("77" in str(call) for call in close_calls), (
             f"gh issue close must target issue 77. Close calls observed: {close_calls}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Back-propagation — issue #867
+# ---------------------------------------------------------------------------
+
+class TestBackpropagateResultToOutputFile:
+    """
+    Unit tests for _backpropagate_result_to_output_file (issue #867).
+
+    This function writes a minimal conforming result.json when the subagent
+    did not write one, so the Steward can verify UoW completion.
+    """
+
+    def test_writes_result_json_when_missing(self, tmp_path: Path) -> None:
+        """
+        When no result.json exists, a conforming file must be written with
+        outcome='complete', success=True, and the uow_id matching the UoW.
+        """
+        output_ref = str(tmp_path / "abc123.json")
+        result_text = "Opened PR #42 on dcetlin/Lobster."
+
+        _backpropagate_result_to_output_file("abc123", output_ref, result_text)
+
+        result_path = tmp_path / "abc123.result.json"
+        assert result_path.exists(), "result.json must be created by back-propagation"
+        payload = json.loads(result_path.read_text())
+        assert payload["uow_id"] == "abc123"
+        assert payload["outcome"] == "complete"
+        assert payload["success"] is True
+        assert payload["executor_id"] == "write_result_backprop"
+        assert result_text[:500] in payload.get("reason", "")
+
+    def test_does_not_overwrite_existing_result_json(self, tmp_path: Path) -> None:
+        """
+        When result.json already exists (written by the subagent), back-propagation
+        must leave it untouched — the existing file has higher fidelity.
+        """
+        output_ref = str(tmp_path / "abc456.json")
+        result_path = tmp_path / "abc456.result.json"
+        original_payload = {
+            "uow_id": "abc456",
+            "outcome": "partial",
+            "success": False,
+            "reason": "only 3 of 5 steps completed",
+        }
+        result_path.write_text(json.dumps(original_payload))
+
+        _backpropagate_result_to_output_file("abc456", output_ref, "some text")
+
+        payload = json.loads(result_path.read_text())
+        assert payload == original_payload, (
+            "_backpropagate_result_to_output_file must not overwrite an existing result file"
+        )
+
+    def test_no_op_when_output_ref_is_empty(self, tmp_path: Path) -> None:
+        """
+        When output_ref is empty, the function must return silently without writing
+        any result.json or primary output file.
+        """
+        # The function must not write any result file — verify no .result.json is created
+        result_path = tmp_path / "abc789.result.json"
+        primary_path = tmp_path / "abc789.json"
+        _backpropagate_result_to_output_file("abc789", "", "some text")
+        assert not result_path.exists(), "No result.json must be written for empty output_ref"
+        assert not primary_path.exists(), "No primary output must be written for empty output_ref"
+
+    def test_writes_result_text_to_primary_output_when_missing(self, tmp_path: Path) -> None:
+        """
+        When the primary output_ref file is missing (never written, not even a
+        sentinel), the result_text must be written there so agent-status.sh
+        has human-readable content.
+        """
+        output_ref = str(tmp_path / "abc999.json")
+        result_text = "Task completed — no changes needed."
+
+        _backpropagate_result_to_output_file("abc999", output_ref, result_text)
+
+        primary_path = tmp_path / "abc999.json"
+        assert primary_path.exists(), "Primary output file must be written when missing"
+        assert primary_path.read_text() == result_text
+
+    def test_writes_result_text_to_primary_output_when_sentinel_zero_bytes(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The executor writes a zero-byte sentinel to output_ref at dispatch time
+        to guard against crashed_output_ref_missing detection. Back-propagation
+        must overwrite it with the actual result text.
+        """
+        output_ref = str(tmp_path / "sentinel.json")
+        sentinel_path = tmp_path / "sentinel.json"
+        sentinel_path.write_text("")  # zero-byte sentinel
+        result_text = "Work done."
+
+        _backpropagate_result_to_output_file("sentinel", output_ref, result_text)
+
+        assert sentinel_path.read_text() == result_text, (
+            "Zero-byte sentinel must be replaced by result_text"
+        )
+
+    def test_result_json_conforms_to_executor_contract(self, tmp_path: Path) -> None:
+        """
+        The synthetic result.json must contain all required fields from
+        executor-contract.md: uow_id, outcome, success. Optional fields
+        (reason, executor_id) improve observability but are not contractually
+        required here — this test validates required fields only.
+        """
+        output_ref = str(tmp_path / "contract_uow.json")
+        _backpropagate_result_to_output_file("contract_uow", output_ref, "Done.")
+
+        result_path = tmp_path / "contract_uow.result.json"
+        payload = json.loads(result_path.read_text())
+        assert "uow_id" in payload, "result.json must have uow_id"
+        assert "outcome" in payload, "result.json must have outcome"
+        assert "success" in payload, "result.json must have success"
+
+    def test_maybe_complete_wos_uow_writes_result_json_via_backprop(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        End-to-end: when a WOS subagent calls write_result and no result.json
+        exists, maybe_complete_wos_uow must create one via back-propagation
+        so the Steward can verify completion.
+        """
+        import sqlite3
+
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = _seed_uow_at_status(registry, "executing", output_dir)
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+        result_text = "PR #55 opened."
+
+        with patch("orchestration.wos_completion.subprocess.run"), \
+             patch.dict(os.environ, {"REGISTRY_DB_PATH": str(db_path)}):
+            maybe_complete_wos_uow(task_id, WRITE_RESULT_SUCCESS_STATUS, result_text=result_text)
+
+        uow = registry.get(uow_id)
+        output_ref = uow.output_ref
+        assert output_ref, "UoW must have output_ref after execution"
+
+        result_path = Path(output_ref).with_suffix(".result.json")
+        assert result_path.exists(), (
+            "result.json must be created by back-propagation when the subagent "
+            "did not write one itself"
+        )
+        payload = json.loads(result_path.read_text())
+        assert payload["uow_id"] == uow_id
+        assert payload["outcome"] == "complete"
+        assert payload["success"] is True
