@@ -2890,6 +2890,39 @@ CREATE TABLE IF NOT EXISTS dispatcher_lock (
         substep "oracle/verdicts/ already exists — skipping Migration 85"
     fi
 
+    # Migration 86: Remove legacy wos-registry.db if it contains no UoWs.
+    # The canonical registry moved to ~/lobster-workspace/orchestration/registry.db.
+    # The legacy file at ~/lobster-workspace/data/wos-registry.db is safe to remove
+    # when its uow_registry table is empty (migrated installs have 0 rows there).
+    # A non-empty file is left in place with a renamed .obsolete suffix to prevent
+    # accidental data loss; the operator should inspect it manually.
+    local legacy_db="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/data/wos-registry.db"
+    if [ -f "$legacy_db" ]; then
+        local uow_count
+        uow_count=$(python3 -c "
+import sqlite3, sys
+try:
+    conn = sqlite3.connect('$legacy_db')
+    n = conn.execute('SELECT COUNT(*) FROM uow_registry').fetchone()[0]
+    print(n)
+except Exception as e:
+    print(-1)
+" 2>/dev/null)
+        if [ "$uow_count" = "0" ]; then
+            rm -f "$legacy_db"
+            substep "Migration 86: removed empty legacy wos-registry.db (0 UoWs)"
+            migrated=$((migrated + 1))
+        elif [ "$uow_count" = "-1" ]; then
+            substep "Migration 86: could not read legacy wos-registry.db — skipping"
+        else
+            mv "$legacy_db" "${legacy_db}.obsolete"
+            substep "Migration 86: legacy wos-registry.db has $uow_count UoWs — renamed to .obsolete, inspect manually"
+            migrated=$((migrated + 1))
+        fi
+    else
+        substep "Migration 86: legacy wos-registry.db not present — skipping"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
