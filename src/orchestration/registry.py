@@ -64,6 +64,10 @@ class UoWStatus(StrEnum):
     # Treated as terminal (allows re-proposal). Previously a legacy DB-only value
     # not covered by the enum — UoWStatus('cancelled') raised ValueError.
     CANCELLED = "cancelled"
+    # NEEDS_HUMAN_REVIEW: UoW has exceeded MAX_RETRIES re-dispatch attempts.
+    # Steward escalates to Dan rather than continuing to re-dispatch.
+    # Treated as non-terminal (does not allow automatic re-proposal).
+    NEEDS_HUMAN_REVIEW = "needs-human-review"
 
     def is_terminal(self) -> bool:
         """True for statuses that allow re-proposal (done, failed, expired, cancelled)."""
@@ -218,6 +222,10 @@ class UoW:
     #   stalled. Set at claim time from estimated_runtime; default 300 (5 minutes).
     heartbeat_at: str | None = None
     heartbeat_ttl: int = 300
+    # retry_count: number of steward re-dispatch attempts (populated after migration 0010).
+    #   Incremented each time the steward re-dispatches after a failed execution.
+    #   When retry_count >= MAX_RETRIES, escalates to needs-human-review.
+    retry_count: int = 0
 
 
 def _now_iso() -> str:
@@ -391,6 +399,7 @@ class Registry:
             vision_ref=vision_ref,
             heartbeat_at=d.get("heartbeat_at"),
             heartbeat_ttl=d.get("heartbeat_ttl") or 300,
+            retry_count=d.get("retry_count") or 0,
         )
 
     def _write_audit(

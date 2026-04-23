@@ -437,6 +437,8 @@ class UoWStatus(StrEnum):
     BLOCKED = "blocked"
     FAILED = "failed"
     EXPIRED = "expired"
+    # NEEDS_HUMAN_REVIEW: retry cap exceeded; UoW awaits human decision.
+    NEEDS_HUMAN_REVIEW = "needs-human-review"
 
     def is_terminal(self) -> bool:
         return self in {UoWStatus.DONE, UoWStatus.FAILED, UoWStatus.EXPIRED}
@@ -638,6 +640,7 @@ _STATUS_DIAGNOSING = UoWStatus.DIAGNOSING
 _STATUS_READY_FOR_EXECUTOR = UoWStatus.READY_FOR_EXECUTOR
 _STATUS_DONE = UoWStatus.DONE
 _STATUS_BLOCKED = UoWStatus.BLOCKED
+_STATUS_NEEDS_HUMAN_REVIEW = UoWStatus.NEEDS_HUMAN_REVIEW
 
 # Actor identifier written to audit entries
 _ACTOR_STEWARD = "steward"
@@ -646,6 +649,11 @@ _ACTOR_STEWARD = "steward"
 # lifetime_cycles accumulates across all decide-retry resets, so this is a true
 # per-UoW-lifetime circuit breaker. steward_cycles (per-attempt) is NOT used here.
 _HARD_CAP_CYCLES = 9
+
+# Retry cap: maximum number of re-dispatch attempts before escalating a UoW to
+# needs-human-review. Applied at re-dispatch time (when the steward would otherwise
+# prescribe again after a failed/partial/blocked execution).
+MAX_RETRIES: int = 3
 
 # close_reason written by the cleanup arc when a UoW hits the hard cap.
 # Used to gate decide-retry: bare retry is rejected; explicit override required.
@@ -2575,6 +2583,7 @@ def _write_steward_fields(
     completed_at: str | None = None,
     closed_at: str | None = None,
     close_reason: str | None = None,
+    retry_count: int | None = None,
 ) -> None:
     """
     Write Steward-private and Steward-managed fields to the UoW row.
@@ -2602,6 +2611,8 @@ def _write_steward_fields(
         updates["closed_at"] = closed_at
     if close_reason is not None:
         updates["close_reason"] = close_reason
+    if retry_count is not None:
+        updates["retry_count"] = retry_count
 
     if not updates:
         return
@@ -3370,6 +3381,65 @@ def _default_notify_dan_early_warning(
 
 
 # ---------------------------------------------------------------------------
+# Escalation notification (retry cap reached)
+# ---------------------------------------------------------------------------
+
+def _send_escalation_notification(uow: UoW) -> None:
+    """
+    Send a Telegram notification to Dan when a UoW has exhausted MAX_RETRIES
+    re-dispatch attempts and is being transitioned to needs-human-review.
+
+    Uses the same inbox-write pattern as _default_notify_dan so the dispatcher
+    surfaces the message to Dan via Telegram.
+    """
+    uow_id = uow.id
+    chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", _DAN_CHAT_ID)
+    log.warning(
+        "WOS ESCALATION: UoW %s exhausted %d retries — transitioning to needs-human-review",
+        uow_id, MAX_RETRIES,
+    )
+    msg_id = str(uuid.uuid4())
+    text = (
+        f"WOS: UoW `{uow_id}` needs human review after {MAX_RETRIES} failed retries.\n\n"
+        f"ID: {uow_id}\n"
+        f"Summary: {(uow.summary or '')[:200]}\n"
+        f"Type: {uow.type}\n"
+        f"Last state: {uow.status}\n"
+        f"Retry count: {uow.retry_count}"
+    )
+    buttons = [
+        [
+            {"text": "Retry", "callback_data": f"decide_retry:{uow_id}"},
+            {"text": "Close", "callback_data": f"decide_close:{uow_id}"},
+        ]
+    ]
+    msg = {
+        "id": msg_id,
+        "source": "system",
+        "chat_id": chat_id,
+        "text": text,
+        "buttons": buttons,
+        "timestamp": time.time(),
+        "metadata": {
+            "type": "wos_surface",
+            "uow_id": uow_id,
+            "condition": "retry_cap",
+            "retry_count": uow.retry_count,
+            "steward_cycles": uow.steward_cycles,
+        },
+    }
+    inbox_dir = Path(os.path.expanduser("~/messages/inbox"))
+    try:
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        (inbox_dir / f"{msg_id}.json").write_text(
+            json.dumps(msg, indent=2), encoding="utf-8"
+        )
+        log.info("WOS escalation message written to inbox: %s", msg_id)
+    except OSError as e:
+        log.error("Failed to write WOS escalation message to inbox: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # DB fetch helpers
 # ---------------------------------------------------------------------------
 
@@ -3668,6 +3738,60 @@ def _process_uow(
     # steps_completed/steps_total from the result file so the prescription
     # reflects how far the previous execution got. For `failed`, re-diagnose
     # with `reason` as the primary input (already in completion_rationale).
+
+    # 4c-retry-cap: check retry_count before prescribing again.
+    # On the first execution (cycles == 0, reentry_posture == "first_execution"),
+    # skip the cap — it only applies to re-dispatches after a failed attempt.
+    # On re-entry (cycles > 0), increment retry_count and check against MAX_RETRIES.
+    if cycles > 0 and reentry_posture != "first_execution":
+        new_retry_count = uow.retry_count + 1
+        if new_retry_count > MAX_RETRIES:
+            # Cap exceeded — escalate to needs-human-review.
+            escalation_entry = {
+                "event": "retry_cap_exceeded",
+                "uow_id": uow_id,
+                "steward_cycles": cycles,
+                "retry_count": uow.retry_count,
+                "max_retries": MAX_RETRIES,
+                "return_reason": return_reason,
+            }
+            current_log_str = _append_steward_log_entry(
+                registry, uow_id, current_log_str, escalation_entry
+            )
+            if not dry_run:
+                _write_steward_fields(
+                    registry, uow_id,
+                    steward_log=current_log_str,
+                    retry_count=uow.retry_count,  # do not increment at cap
+                )
+                registry.append_audit_log(uow_id, {
+                    "event": "retry_cap_exceeded",
+                    "actor": _ACTOR_STEWARD,
+                    "uow_id": uow_id,
+                    "steward_cycles": cycles,
+                    "retry_count": uow.retry_count,
+                    "max_retries": MAX_RETRIES,
+                    "timestamp": _now_iso(),
+                })
+                registry.transition(uow_id, _STATUS_NEEDS_HUMAN_REVIEW, _STATUS_DIAGNOSING)
+            _send_escalation_notification(uow)
+            _append_cycle_trace(
+                uow_id=uow_id,
+                cycle_num=cycles,
+                subagent_excerpt=_read_output_ref(uow.output_ref),
+                return_reason=return_reason or "",
+                next_action="escalated",
+                artifact_dir=artifact_dir,
+            )
+            return Surfaced(uow_id=uow_id, condition="retry_cap")
+        else:
+            # Increment retry_count before proceeding with prescription.
+            if not dry_run:
+                _write_steward_fields(registry, uow_id, retry_count=new_retry_count)
+            log.info(
+                "_process_uow: UoW %s re-dispatch attempt %d/%d",
+                uow_id, new_retry_count, MAX_RETRIES,
+            )
 
     # 4c-gate: Corrective trace one-cycle temporal gate (cristae-junction delay).
     # Before prescribing again after an executor return, the executor must have

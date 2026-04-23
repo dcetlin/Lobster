@@ -82,6 +82,13 @@ CREATE TABLE IF NOT EXISTS uow_registry (
     --   Executor-accessible (included in executor_uow_view).
     issue_url           TEXT    DEFAULT NULL,
 
+    -- retry_count: number of steward re-dispatch attempts for the current attempt.
+    --   Incremented each time the steward re-dispatches (prescribes again after
+    --   a failed/partial/blocked execution). When retry_count >= MAX_RETRIES (3),
+    --   the steward transitions the UoW to needs-human-review instead of re-dispatching.
+    --   Steward-private (excluded from executor_uow_view).
+    retry_count         INTEGER NOT NULL DEFAULT 0,
+
     UNIQUE(source_issue_number, sweep_date)
 );
 -- vision_ref: JSON {layer, field, statement, anchored_at}
