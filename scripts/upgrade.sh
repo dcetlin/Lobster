@@ -2878,6 +2878,18 @@ CREATE TABLE IF NOT EXISTS dispatcher_lock (
         fi
     fi
 
+    # Migration 85: Create oracle/verdicts/ and oracle/verdicts/archive/ directories.
+    local oracle_verdicts_dir="${LOBSTER_REPO:-$HOME/lobster}/oracle/verdicts"
+    if [ ! -d "$oracle_verdicts_dir" ]; then
+        mkdir -p "$oracle_verdicts_dir/archive"
+        touch "$oracle_verdicts_dir/.gitkeep"
+        touch "$oracle_verdicts_dir/archive/.gitkeep"
+        substep "Created oracle/verdicts/ directory structure (Migration 85)"
+        migrated=$((migrated + 1))
+    else
+        substep "oracle/verdicts/ already exists — skipping Migration 85"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

@@ -3,12 +3,12 @@ name: lobster-oracle
 description: >
   Two-stage adversarial review agent. Stage 1: is this solving the right problem?
   Stage 2: is it well made? Seeded with adversarial prior before seeing implementation.
-  Writes to oracle/decisions.md and oracle/learnings.md. Surfaces premise-level
-  patterns as raw observations to meta/premise-review.md.
+  Writes to oracle/decisions.md, oracle/verdicts/pr-{number}.md, and oracle/learnings.md.
+  Surfaces premise-level patterns as raw observations to meta/premise-review.md.
 model: claude-opus-4-6
 oracle_status: approved
-oracle_pr: https://github.com/dcetlin/Lobster/pull/811
-oracle_date: "2026-04-21"
+oracle_pr: https://github.com/SiderealPress/lobster/pull/864
+oracle_date: "2026-04-23"
 ---
 
 You are a Lobster subagent. Do NOT call `wait_for_messages`. Call `send_reply` and `write_result` when complete.
@@ -93,6 +93,26 @@ oracle_date: <YYYY-MM-DD>
 ---
 ```
 
+**Write (overwrite each review round)** `~/lobster/oracle/verdicts/pr-{number}.md` for PR-gated reviews:
+
+```markdown
+VERDICT: APPROVED
+PR: {number}
+Round: N
+
+[Full prose findings — Stage 1 and Stage 2 — below this line]
+```
+
+The first line MUST be exactly `VERDICT: APPROVED` or `VERDICT: NEEDS_CHANGES` (no other text on that line). The dispatcher reads this file and checks the first line — no grepping, no parsing. When writing Round 2+, keep all previous round content below a `## Round N — [YYYY-MM-DD]` header and prepend the new round at the top.
+
+**Append one line** to `~/lobster/oracle/verdicts/index.md`:
+
+```
+| [YYYY-MM-DD] | PR #{number} | Round N | APPROVED \| NEEDS_CHANGES |
+```
+
+(Dispatcher never reads index.md — it is for human browsing only.)
+
 **Append to** `~/lobster/oracle/decisions.md`:
 
 ```markdown
@@ -104,6 +124,8 @@ oracle_date: <YYYY-MM-DD>
 **What this forecloses:** [Directions that become harder]
 **Opportunity cost note:** [What wasn't built instead, if relevant]
 ```
+
+(decisions.md is now cold audit history — the dispatcher uses oracle/verdicts/ for merge gate checks.)
 
 **For document reviews, use this extended format instead:**
 
