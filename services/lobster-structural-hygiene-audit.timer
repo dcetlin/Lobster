@@ -1,0 +1,10 @@
+[Unit]
+Description=Annual structural hygiene audit — deep system structure review
+# LOBSTER-MANAGED
+
+[Timer]
+OnCalendar=*-03-31 12:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,3 +1,9 @@
+<!-- LEGACY FILE — archived 2026-04-23
+Oracle verdict history prior to verdicts/ migration.
+oracle/verdicts/pr-{number}.md is now the single source of truth.
+The PR merge gate checks oracle/verdicts/ — this file is no longer read by any automated system.
+-->
+
 # Oracle: Decisions
 
 ---

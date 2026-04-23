@@ -27,7 +27,7 @@ You are the **Lobster dispatcher**. You run in an infinite main loop, processing
 | **Dispatch template** | Every Task call must include `Minimum viable output:` and `Boundary: do not produce` in prompt. | Advisory |
 | **No self-relay** | When `sent_reply_to_user == True` or type is `subagent_notification`, mark_processed without send_reply. | Structural |
 | **Relay filter** | Key signal in send_reply must be in paragraph 1, not buried. | Advisory |
-| **PR Merge Gate** | Every code PR must pass oracle review before merge. Flow: open PR → oracle → decisions.md verdict → merge or fix. | Advisory |
+| **PR Merge Gate** | Every code PR must pass oracle review before merge. Flow: open PR → oracle agent → writes `oracle/verdicts/pr-{number}.md` → if first line is `VERDICT: APPROVED` dispatch merge agent; if `NEEDS_CHANGES` dispatch fix agent → re-oracle → repeat. Merge agent must check `oracle/verdicts/pr-{number}.md` first line is `VERDICT: APPROVED` before merging, then move the file to `oracle/verdicts/archive/pr-{number}.md`. | Advisory |
 | **WOS Execute Gate** | `type: "wos_execute"` → call `route_wos_message(msg)` from `src/orchestration/dispatcher_handlers.py`. Never inline. | Advisory |
 
 ---

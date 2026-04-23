@@ -720,6 +720,9 @@ class Executor:
             _write_trace_json(output_ref, trace)
             _insert_corrective_trace(self.registry.db_path, trace)
             self.registry.fail_uow(uow_id, reason)
+            # Lifecycle stamp: remove wos:executing label and post failure comment.
+            # Non-blocking — any gh failure is logged and ignored.
+            _stamp_failed_if_github(self.registry, uow_id)
             raise
 
     def _run_execution(
@@ -739,17 +742,22 @@ class Executor:
             self._skill_activator(skill_id)
 
         # Step 2: Dispatch LLM subagent via register-appropriate dispatcher.
-        # If a dispatcher was explicitly injected (tests, CI), use it directly
-        # with the raw instructions (no preamble prepended — caller's responsibility).
-        # Otherwise, resolve from the dispatch table and prepend the register-appropriate
-        # preamble from _EXECUTOR_TYPE_TO_PREAMBLE before passing to the dispatcher.
+        # Build the WOS context block (UoW ID + artifact stamping instructions, issue #868)
+        # and inject it into every dispatched prompt regardless of dispatcher path.
+        #
+        # For the production dispatch table path: preamble + wos_context + raw_instructions.
+        # For the injected dispatcher path (tests, CI): wos_context + raw_instructions
+        # (caller owns the preamble, but the UoW ID block is always injected so subagents
+        # have provenance context available even in test/CI environments).
         raw_instructions = artifact["instructions"]
+        wos_context = _build_wos_context_block(uow_id)
         if self._dispatcher_override is not None:
-            executor_id = self._dispatcher_override(raw_instructions, uow_id)
+            instructions_with_context = wos_context + raw_instructions
+            executor_id = self._dispatcher_override(instructions_with_context, uow_id)
         else:
             executor_type = artifact.get("executor_type", "functional-engineer")
             preamble = _EXECUTOR_TYPE_TO_PREAMBLE.get(executor_type, "")
-            instructions = preamble + raw_instructions
+            instructions = preamble + wos_context + raw_instructions
             dispatcher = _resolve_dispatcher(executor_type)
             executor_id = dispatcher(instructions, uow_id)
 
@@ -796,6 +804,9 @@ class Executor:
         executor_type = artifact.get("executor_type", "functional-engineer")
         if _dispatcher_is_async(self._dispatcher_override, executor_type):
             self.registry.transition_to_executing(uow_id, executor_id or "")
+            # Lifecycle stamp: add wos:executing label and comment to the source issue.
+            # Non-blocking — any gh failure is logged and ignored.
+            _stamp_executing_if_github(self.registry, uow_id)
         else:
             self.registry.complete_uow(uow_id, output_ref)
 
@@ -938,6 +949,48 @@ Write result via: mcp__lobster-inbox__write_result
 
 Prescription:
 """
+
+
+# ---------------------------------------------------------------------------
+# WOS context block — UoW ID injection (issue #868)
+# ---------------------------------------------------------------------------
+
+def _build_wos_context_block(uow_id: str) -> str:
+    """
+    Build the WOS context block injected into every subagent prompt at dispatch time.
+
+    Pure function — no side effects, no I/O. Returns a formatted block that:
+    - Identifies the UoW ID so the subagent knows which unit of work it is executing
+    - Instructs the subagent to stamp all created artifacts with the UoW ID
+      for bidirectional provenance (issue #868)
+
+    Artifact stamping instructions:
+    - PR description footer: include a line ``WOS-UoW: {uow_id}`` in every PR opened
+    - Issue labels: apply label ``wos:uow_{uow_id}`` to every GitHub issue created
+      (create the label first if it does not exist)
+    - Commit messages: optionally include ``WOS-UoW: {uow_id}`` in commit footers
+
+    The block is prepended before the prescription body so it is always visible
+    regardless of preamble type or prompt length.
+
+    Args:
+        uow_id: The WOS unit-of-work ID (e.g. "uow_abc123").
+
+    Returns:
+        Formatted WOS context block string.
+    """
+    return (
+        f"---\n"
+        f"WOS Context:\n"
+        f"  UoW ID: {uow_id}\n"
+        f"---\n"
+        f"Artifact stamping: stamp every artifact you create with this UoW ID.\n"
+        f"  - PR descriptions: include a footer line: WOS-UoW: {uow_id}\n"
+        f"  - GitHub issues you create: apply label wos:uow_{uow_id} "
+        f"(create the label if it does not exist)\n"
+        f"  - Commit messages: optionally include WOS-UoW: {uow_id} in the footer\n"
+        f"---\n"
+    )
 
 
 def _dispatch_via_claude_p(instructions: str, uow_id: str) -> str:
@@ -1423,6 +1476,62 @@ def _dispatch_via_inbox(instructions: str, uow_id: str, agent_type: str = "funct
             pass
 
     return msg_id
+
+
+# ---------------------------------------------------------------------------
+# Issue lifecycle stamps — non-blocking GitHub state sync
+# ---------------------------------------------------------------------------
+
+def _stamp_executing_if_github(registry: "Registry", uow_id: str) -> None:
+    """
+    Call stamp_issue_executing for a UoW that just transitioned to 'executing'.
+
+    Fetches source_issue_number from the registry. No-op when:
+    - UoW not found
+    - source_issue_number is None (non-GitHub source)
+    - wos_issue_lifecycle is not importable
+    - Any gh CLI call fails
+
+    Non-blocking: any exception is logged at WARNING level.
+    """
+    try:
+        from orchestration.wos_issue_lifecycle import stamp_issue_executing
+        uow = registry.get(uow_id)
+        if uow is None or uow.source_issue_number is None:
+            return
+        repo = os.environ.get("LOBSTER_WOS_REPO", "dcetlin/Lobster")
+        stamp_issue_executing(uow.source_issue_number, uow_id, repo=repo)
+    except Exception as exc:
+        log.warning(
+            "executor: _stamp_executing_if_github failed for UoW %s — %s: %s",
+            uow_id, type(exc).__name__, exc,
+        )
+
+
+def _stamp_failed_if_github(registry: "Registry", uow_id: str) -> None:
+    """
+    Call stamp_issue_failed for a UoW that just transitioned to 'failed'.
+
+    Fetches source_issue_number from the registry. No-op when:
+    - UoW not found
+    - source_issue_number is None (non-GitHub source)
+    - wos_issue_lifecycle is not importable
+    - Any gh CLI call fails
+
+    Non-blocking: any exception is logged at WARNING level.
+    """
+    try:
+        from orchestration.wos_issue_lifecycle import stamp_issue_failed
+        uow = registry.get(uow_id)
+        if uow is None or uow.source_issue_number is None:
+            return
+        repo = os.environ.get("LOBSTER_WOS_REPO", "dcetlin/Lobster")
+        stamp_issue_failed(uow.source_issue_number, uow_id, repo=repo)
+    except Exception as exc:
+        log.warning(
+            "executor: _stamp_failed_if_github failed for UoW %s — %s: %s",
+            uow_id, type(exc).__name__, exc,
+        )
 
 
 # ---------------------------------------------------------------------------

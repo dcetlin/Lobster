@@ -2841,6 +2841,163 @@ CREATE TABLE IF NOT EXISTS dispatcher_lock (
         fi
     fi
 
+    # Migration 83: Add cron entries for wos-health-check and wos-metabolic-digest
+    # (issue #849). Both are Type C cron-direct scripts committed to scheduled-tasks/.
+    local WOS_HEALTH_MARKER="# LOBSTER-WOS-HEALTH-CHECK"
+    local WOS_DIGEST_MARKER="# LOBSTER-WOS-METABOLIC-DIGEST"
+    if ! crontab -l 2>/dev/null | grep -qF "$WOS_HEALTH_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$WOS_HEALTH_MARKER" \
+            "0 */6 * * * cd $LOBSTER_DIR && uv run scheduled-tasks/wos-health-check.py >> $LOBSTER_WORKSPACE/scheduled-jobs/logs/wos-health-check.log 2>&1 $WOS_HEALTH_MARKER" \
+            && substep "Added wos-health-check cron entry (Migration 83)" \
+            || warn "Could not add wos-health-check cron entry — check cron-manage.sh"
+        migrated=$((migrated + 1))
+    else
+        substep "wos-health-check cron entry already present — skipping"
+    fi
+    if ! crontab -l 2>/dev/null | grep -qF "$WOS_DIGEST_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$WOS_DIGEST_MARKER" \
+            "0 9 * * * cd $LOBSTER_DIR && uv run scheduled-tasks/wos-metabolic-digest.py >> $LOBSTER_WORKSPACE/scheduled-jobs/logs/wos-metabolic-digest.log 2>&1 $WOS_DIGEST_MARKER" \
+            && substep "Added wos-metabolic-digest cron entry (Migration 83)" \
+            || warn "Could not add wos-metabolic-digest cron entry — check cron-manage.sh"
+        migrated=$((migrated + 1))
+    else
+        substep "wos-metabolic-digest cron entry already present — skipping"
+    fi
+
+    # Migration 84: Register wos-execute-gate.py PostToolUse hook (issue #855).
+    # Enforces the WOS Execute Gate structurally: detects when mark_processed is
+    # called on a wos_execute message without a prior mark_processing call and
+    # logs a gate violation via write_observation. Never blocks mark_processed.
+    if [ -f "$CLAUDE_SETTINGS" ] && command -v jq >/dev/null 2>&1; then
+        local has_wos_execute_gate
+        has_wos_execute_gate=$(jq -r '
+            [.hooks.PostToolUse[]?.hooks[]?.command // empty]
+            | map(select(contains("wos-execute-gate")))
+            | length
+        ' "$CLAUDE_SETTINGS" 2>/dev/null || echo "0")
+        if [ "${has_wos_execute_gate:-0}" = "0" ] || [ "${has_wos_execute_gate:-0}" = "" ]; then
+            chmod +x "$LOBSTER_DIR/hooks/wos-execute-gate.py" 2>/dev/null || true
+            TMP_SETTINGS=$(mktemp)
+            jq --arg cmd "python3 $LOBSTER_DIR/hooks/wos-execute-gate.py" \
+               '.hooks.PostToolUse = (.hooks.PostToolUse // []) + [{
+                "matcher": "mcp__lobster-inbox__mark_processed",
+                "hooks": [{
+                    "type": "command",
+                    "command": $cmd,
+                    "timeout": 10
+                }]
+            }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+            substep "Registered wos-execute-gate PostToolUse hook (Migration 84)"
+            migrated=$((migrated + 1))
+        else
+            substep "wos-execute-gate hook already registered — skipping Migration 84"
+        fi
+    fi
+
+    # Migration 85: Create oracle/verdicts/ and oracle/verdicts/archive/ directories.
+    local oracle_verdicts_dir="${LOBSTER_REPO:-$HOME/lobster}/oracle/verdicts"
+    if [ ! -d "$oracle_verdicts_dir" ]; then
+        mkdir -p "$oracle_verdicts_dir/archive"
+        touch "$oracle_verdicts_dir/.gitkeep"
+        touch "$oracle_verdicts_dir/archive/.gitkeep"
+        substep "Created oracle/verdicts/ directory structure (Migration 85)"
+        migrated=$((migrated + 1))
+    else
+        substep "oracle/verdicts/ already exists — skipping Migration 85"
+    fi
+
+    # Migration 86: Remove legacy wos-registry.db if it contains no UoWs.
+    # The canonical registry moved to ~/lobster-workspace/orchestration/registry.db.
+    # The legacy file at ~/lobster-workspace/data/wos-registry.db is safe to remove
+    # when its uow_registry table is empty (migrated installs have 0 rows there).
+    # A non-empty file is left in place with a renamed .obsolete suffix to prevent
+    # accidental data loss; the operator should inspect it manually.
+    local legacy_db="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/data/wos-registry.db"
+    if [ -f "$legacy_db" ]; then
+        local uow_count
+        uow_count=$(python3 -c "
+import sqlite3, sys
+try:
+    conn = sqlite3.connect('$legacy_db')
+    n = conn.execute('SELECT COUNT(*) FROM uow_registry').fetchone()[0]
+    print(n)
+except Exception as e:
+    print(-1)
+" 2>/dev/null)
+        if [ "$uow_count" = "0" ]; then
+            rm -f "$legacy_db"
+            substep "Migration 86: removed empty legacy wos-registry.db (0 UoWs)"
+            migrated=$((migrated + 1))
+        elif [ "$uow_count" = "-1" ]; then
+            substep "Migration 86: could not read legacy wos-registry.db — skipping"
+        else
+            mv "$legacy_db" "${legacy_db}.obsolete"
+            substep "Migration 86: legacy wos-registry.db has $uow_count UoWs — renamed to .obsolete, inspect manually"
+            migrated=$((migrated + 1))
+        fi
+    else
+        substep "Migration 86: legacy wos-registry.db not present — skipping"
+    fi
+
+    # Migration 87: Install systemd timer+service units for 10 LLM scheduled jobs
+    # previously run via cron (issue #869). Copies unit files from services/ in the
+    # repo to /etc/systemd/system/, then enables and starts each timer. Idempotent:
+    # skips any timer that is already installed and enabled.
+    local llm_jobs=(
+        weekly-epistemic-retro
+        lobster-hygiene
+        pattern-candidate-sweep
+        morning-briefing
+        uow-reflection
+        structural-hygiene-audit
+        upstream-sync
+        lobster-hygiene-biweekly
+        github-issue-cultivator
+        wos-hourly-observation
+    )
+    local m87_count=0
+    for job in "${llm_jobs[@]}"; do
+        local timer_name="lobster-${job}.timer"
+        local service_name="lobster-${job}.service"
+        local src_timer="$LOBSTER_DIR/services/${timer_name}"
+        local src_service="$LOBSTER_DIR/services/${service_name}"
+        local dst="/etc/systemd/system"
+
+        # Copy unit files if source exists and destination differs or is absent
+        if [ -f "$src_timer" ] && [ -f "$src_service" ]; then
+            local needs_install=false
+            if [ ! -f "$dst/$timer_name" ]; then
+                needs_install=true
+            fi
+            if $needs_install; then
+                if sudo cp "$src_timer" "$dst/$timer_name" && sudo cp "$src_service" "$dst/$service_name"; then
+                    substep "Installed $timer_name (Migration 87)"
+                    m87_count=$((m87_count + 1))
+                else
+                    warn "Could not install $timer_name — check sudo permissions"
+                    continue
+                fi
+            fi
+            # Enable and start if not already active
+            if ! systemctl is-enabled --quiet "$timer_name" 2>/dev/null; then
+                sudo systemctl daemon-reload 2>/dev/null || true
+                sudo systemctl enable --now "$timer_name" 2>/dev/null \
+                    && substep "Enabled $timer_name" \
+                    || warn "Could not enable $timer_name"
+                m87_count=$((m87_count + 1))
+            fi
+        else
+            substep "Unit file $timer_name not found in repo — skipping (run after git pull)"
+        fi
+    done
+    if [ "$m87_count" -gt 0 ]; then
+        sudo systemctl daemon-reload 2>/dev/null || true
+        success "Migration 87: installed/enabled $m87_count LLM job timer unit(s)"
+        migrated=$((migrated + m87_count))
+    else
+        substep "Migration 87: all LLM job timers already installed — skipping"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

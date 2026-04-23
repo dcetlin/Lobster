@@ -1,0 +1,8 @@
+[Unit]
+Description=Weekly pattern candidate sweep — identify recurring themes for IFTTT rules
+# LOBSTER-MANAGED
+
+[Service]
+Type=oneshot
+User=lobster
+ExecStart=/home/lobster/lobster/scheduled-tasks/dispatch-job.sh pattern-candidate-sweep

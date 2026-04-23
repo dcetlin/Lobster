@@ -505,6 +505,7 @@ class ReentryPosture(StrEnum):
     EXECUTION_FAILED = "execution_failed"
     EXECUTOR_ORPHAN = "executor_orphan"
     DIAGNOSING_ORPHAN = "diagnosing_orphan"
+    EXECUTING_ORPHAN = "executing_orphan"  # subagent dispatched via inbox, write_result never received (#858)
 
 
 class ReturnReasonClassification(StrEnum):
@@ -727,6 +728,7 @@ _RETURN_REASON_CLASSIFICATIONS: dict[str, str] = {
     "crashed_output_ref_missing": _CLASSIFICATION_ERROR,
     "executor_orphan": _CLASSIFICATION_ORPHAN,
     "diagnosing_orphan": _CLASSIFICATION_ORPHAN,
+    "executing_orphan": _CLASSIFICATION_ORPHAN,  # subagent dispatched but write_result never received (#858)
 }
 
 
@@ -950,6 +952,8 @@ def _determine_reentry_posture(
                     return "executor_orphan"
                 elif clf == "diagnosing_orphan":
                     return "diagnosing_orphan"
+                elif clf == "executing_orphan":
+                    return "executing_orphan"
             elif event == "execution_failed":
                 return "execution_failed"
 
@@ -1134,6 +1138,8 @@ def _posture_rationale(diagnosis: Diagnosis, cycles: int, trace_posture: str | N
                 return "Executor crash detected — analyzing failure for recovery."
             if posture == "executor_orphan":
                 return "Executor never claimed UoW — re-prescribing."
+            if posture == "executing_orphan":
+                return "Subagent dispatched but write_result never received — re-prescribing."
             return "Unexpected state encountered — investigating."
         elif trace_posture == "closing_with_discovery":
             return "Completion criteria satisfied — closing with findings documented."
@@ -1152,6 +1158,8 @@ def _posture_rationale(diagnosis: Diagnosis, cycles: int, trace_posture: str | N
             return "UoW stuck in ready-for-executor beyond threshold — executor never claimed."
         case "diagnosing_orphan":
             return "Steward crashed mid-diagnosis — re-diagnosing from current state."
+        case "executing_orphan":
+            return "UoW stuck in executing — subagent dispatched but write_result never received (#858)."
         case "steward_cycle_cap":
             return f"Steward cycle cap reached ({cycles} cycles) — surfacing to Dan."
         case _:
@@ -1199,6 +1207,8 @@ def _posture_prediction(diagnosis: Diagnosis) -> str | None:
             return "Re-prescription will be issued after failure analysis."
         case "executor_orphan":
             return "Re-prescription will be issued — executor never claimed UoW."
+        case "executing_orphan":
+            return "Re-prescription will be issued — subagent dispatched but write_result never received."
         case _:
             return "Next prescription will be determined from diagnosis output."
 
@@ -1253,6 +1263,7 @@ def _determine_trace_posture(diagnosis: Diagnosis) -> str:
         "execution_failed",
         "executor_orphan",
         "diagnosing_orphan",
+        "executing_orphan",
         "stall_detected",
     ):
         return "scope_challenged"
@@ -2190,9 +2201,28 @@ SPIRAL_ORACLE_PASS_THRESHOLD: int = 3
 # Source: oracle/patterns.md §dead-end — "failed or blocked state ≥2 times"
 DEAD_END_FAILURE_THRESHOLD: int = 2
 
-# Burst: throttle to this many UoWs per cycle when burst is detected
-# Source: oracle/patterns.md §burst — "batch into groups of 3"
+# Burst: throttle to this many UoWs per cycle when burst is detected.
+# Default is 3 (oracle/patterns.md §burst — "batch into groups of 3").
+# When queue depth exceeds thresholds, a larger batch size is used to drain
+# faster without losing the throttle protection.
 BURST_BATCH_SIZE: int = 3
+
+
+def _dynamic_burst_batch_size(queue_depth: int) -> int:
+    """Return the appropriate BURST_BATCH_SIZE given the current queue depth.
+
+    Thresholds (applied in order, first match wins):
+    - queue_depth > 50  → batch size 15
+    - queue_depth > 20  → batch size 8
+    - default           → BURST_BATCH_SIZE (3)
+
+    Pure function — no side effects.
+    """
+    if queue_depth > 50:
+        return 15
+    if queue_depth > 20:
+        return 8
+    return BURST_BATCH_SIZE
 
 # Burst: hard lower bound for the baseline queue depth used in spike detection.
 # Queue depths at or above 2x this value are treated as a burst.
@@ -2402,6 +2432,7 @@ def _build_deterministic_prescription_instructions(
         "execution_failed": "Previous execution failed. Diagnose the failure and re-execute.",
         "executor_orphan": "Executor never ran on this UoW. Execute fresh.",
         "diagnosing_orphan": "Steward crashed mid-diagnosis. Re-diagnosing from current state.",
+        "executing_orphan": "Subagent was dispatched but never called write_result (crashed or lost context). Re-execute fresh.",
     }
 
     posture_msg = posture_context.get(reentry_posture, "Continue from previous attempt.")
@@ -4157,12 +4188,7 @@ def run_steward_cycle(
     from src.orchestration.registry import Registry
 
     if registry is None:
-        if db_path is None:
-            workspace = Path(os.environ.get(
-                "LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"
-            ))
-            db_path = workspace / "orchestration" / "registry.db"
-        registry = Registry(db_path)
+        registry = Registry(db_path)  # db_path=None → Registry resolves canonical path
 
     _github_client = github_client or _default_github_client
     _gate = bootup_candidate_gate if bootup_candidate_gate is not None else BOOTUP_CANDIDATE_GATE
@@ -4195,6 +4221,14 @@ def run_steward_cycle(
     # Queue depth snapshot used by the Burst pattern check in _check_dispatch_eligibility.
     # Captured once before the loop so all per-UoW checks see the same depth value.
     _queue_depth = len(uows)
+
+    # Dynamic batch size: scale up when queue is deep so bursts drain faster.
+    _effective_burst_batch_size = _dynamic_burst_batch_size(_queue_depth)
+    if _effective_burst_batch_size != BURST_BATCH_SIZE:
+        log.info(
+            "Steward cycle: dynamic burst batch size=%d (queue_depth=%d, default=%d)",
+            _effective_burst_batch_size, _queue_depth, BURST_BATCH_SIZE,
+        )
 
     evaluated = 0
     prescribed = 0
@@ -4298,20 +4332,20 @@ def run_steward_cycle(
         # dead-end, and burst patterns before committing to a prescription cycle.
         _eligibility = _check_dispatch_eligibility(uow, audit_entries, _queue_depth)
         if _eligibility == "throttle":
-            if throttle_count < BURST_BATCH_SIZE:
+            if throttle_count < _effective_burst_batch_size:
                 # Within the allowed burst batch — dispatch normally and count it.
                 throttle_count += 1
                 log.debug(
                     "dispatch_eligibility: uow_id=%s throttle allowed "
                     "(throttle_count=%d/%d)",
-                    uow_id, throttle_count, BURST_BATCH_SIZE,
+                    uow_id, throttle_count, _effective_burst_batch_size,
                 )
             else:
-                # Beyond BURST_BATCH_SIZE for this cycle — skip.
+                # Beyond _effective_burst_batch_size for this cycle — skip.
                 log.info(
                     "dispatch_eligibility: uow_id=%s skipped — pattern=throttle "
-                    "(throttle_count=%d >= BURST_BATCH_SIZE=%d)",
-                    uow_id, throttle_count, BURST_BATCH_SIZE,
+                    "(throttle_count=%d >= burst_batch_size=%d)",
+                    uow_id, throttle_count, _effective_burst_batch_size,
                 )
                 if not dry_run:
                     registry.append_audit_log(uow_id, {

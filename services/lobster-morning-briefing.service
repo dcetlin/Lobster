@@ -1,0 +1,8 @@
+[Unit]
+Description=Daily morning briefing — daily synthesis and priorities
+# LOBSTER-MANAGED
+
+[Service]
+Type=oneshot
+User=lobster
+ExecStart=/home/lobster/lobster/scheduled-tasks/dispatch-job.sh morning-briefing

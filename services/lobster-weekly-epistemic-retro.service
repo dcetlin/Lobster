@@ -1,0 +1,8 @@
+[Unit]
+Description=Weekly epistemic retro — reflect on beliefs, predictions, and learning
+# LOBSTER-MANAGED
+
+[Service]
+Type=oneshot
+User=lobster
+ExecStart=/home/lobster/lobster/scheduled-tasks/dispatch-job.sh weekly-epistemic-retro

@@ -2,7 +2,7 @@
 """
 GardenCaretaker Heartbeat — cron-driven scan-and-tend cycle for WOS registry.
 
-Runs every 15 minutes. On each invocation:
+Runs every 2 hours. On each invocation:
 1. Checks the enabled gate in jobs.json (Type C job — cron-direct dispatch).
 2. Instantiates GardenCaretaker with the GitHubIssueSource for dcetlin/Lobster.
 3. Calls run_reconciliation_cycle() — which runs scan() then tend() in sequence.
@@ -13,8 +13,8 @@ a single infrastructure polling loop. This is a Type C job (pure Python script
 invoked directly by cron — no inbox message written, no LLM round-trip). The
 enabled gate in jobs.json controls runtime enable/disable without touching cron.
 
-Cron schedule (every 15 minutes):
-    */15 * * * * cd $HOME && uv run ~/lobster/scheduled-tasks/garden-caretaker.py >> ~/lobster-workspace/logs/garden-caretaker.log 2>&1
+Cron schedule (every 2 hours — was every 15 minutes before migration d12):
+    0 */2 * * * cd $HOME && uv run ~/lobster/scheduled-tasks/garden-caretaker.py >> ~/lobster-workspace/logs/garden-caretaker.log 2>&1
 
 Run standalone:
     uv run ~/lobster/scheduled-tasks/garden-caretaker.py [--dry-run]

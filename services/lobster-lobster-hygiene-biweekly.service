@@ -1,0 +1,8 @@
+[Unit]
+Description=Biweekly lobster hygiene — extended maintenance on 1st and 15th
+# LOBSTER-MANAGED
+
+[Service]
+Type=oneshot
+User=lobster
+ExecStart=/home/lobster/lobster/scheduled-tasks/dispatch-job.sh lobster-hygiene-biweekly
