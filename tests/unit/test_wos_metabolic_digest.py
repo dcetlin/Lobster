@@ -254,14 +254,27 @@ class TestClassifyUow:
         uow = _uow(status="done", close_reason="", output_ref="")
         assert md.classify_uow(uow) == OUTCOME_SHIT
 
-    def test_seed_takes_priority_over_heat(self):
-        # "issue" and "analysis" both present — seed wins because it's checked first
+    def test_source_issue_mention_without_creation_is_not_seed(self):
+        # "issue analysis complete" mentions an issue being worked on, not a new issue
+        # created. Bare "issue" substring must NOT classify as seed — this is the
+        # false-positive the phrase-level matching is designed to prevent.
         uow = _uow(status="done", close_reason="issue analysis complete")
+        assert md.classify_uow(uow) == OUTCOME_HEAT
+
+    def test_pr_closing_source_issue_is_pearl_not_seed(self):
+        # "issue referenced in pr" describes a PR that closes a source issue —
+        # the UoW produced a PR (pearl), not a new seed issue.
+        # Bare "issue" substring must NOT win over "pr" here.
+        uow = _uow(status="done", close_reason="issue referenced in pr")
+        assert md.classify_uow(uow) == OUTCOME_PEARL
+
+    def test_creation_phrase_opened_issue_is_seed(self):
+        # Explicit creation verb + "issue" → seed, regardless of other keywords
+        uow = _uow(status="done", close_reason="opened issue #789 for follow-up")
         assert md.classify_uow(uow) == OUTCOME_SEED
 
-    def test_seed_takes_priority_over_pearl(self):
-        # "issue" and "pr" both present — seed wins because it's checked first
-        uow = _uow(status="done", close_reason="issue referenced in pr")
+    def test_creation_phrase_created_issue_is_seed(self):
+        uow = _uow(status="done", close_reason="created issue #100 to track regressions")
         assert md.classify_uow(uow) == OUTCOME_SEED
 
 

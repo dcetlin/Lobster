@@ -674,11 +674,12 @@ def main() -> int:
         sweep_result = run_startup_sweep(registry, dry_run=dry_run, bootup_candidate_gate=gate_active)
         log.info(
             "Startup sweep complete: active_swept=%d executor_orphans=%d "
-            "diagnosing=%d skipped_dry_run=%d",
+            "diagnosing=%d skipped_dry_run=%d executing_orphans=%d",
             sweep_result.active_swept,
             sweep_result.executor_orphans_swept,
             sweep_result.diagnosing_swept,
             sweep_result.skipped_dry_run,
+            sweep_result.executing_swept,
         )
     except Exception:
         log.exception("Startup sweep failed — continuing to observation loop")
