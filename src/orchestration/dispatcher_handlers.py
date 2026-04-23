@@ -327,6 +327,11 @@ def handle_wos_execute(uow_id: str, instructions: str, output_ref: str) -> str:
     If the subagent fails to write the result file before timeout_at, the Observation
     Loop detects the stall and surfaces it to the user.
 
+    The subagent is also required to write periodic heartbeats to the registry so the
+    Observation Loop can detect stalls before the 4h TTL (issue #849). Heartbeats must
+    be written every 60-90 seconds — before reading the issue, after implementation,
+    before PR creation. The heartbeat is a single registry call, documented below.
+
     Args:
         uow_id:       The Unit of Work identifier (used as task_id and in the result file).
         instructions: The prescribed instructions from the WorkflowArtifact — what the
@@ -349,6 +354,28 @@ def handle_wos_execute(uow_id: str, instructions: str, output_ref: str) -> str:
         f"---\n\n"
         f"You are executing a Work Order System (WOS) unit of work on behalf of the Steward.\n"
         f"UoW ID: {uow_id}\n\n"
+        f"## Heartbeat contract (REQUIRED)\n\n"
+        f"You must write a liveness heartbeat to the registry every 60-90 seconds throughout\n"
+        f"execution. The heartbeat proves you are alive — without it, the Observation Loop\n"
+        f"will detect a stall and re-queue this UoW for re-execution.\n\n"
+        f"Call write_heartbeat at these checkpoints (at minimum):\n"
+        f"  - Before starting work (immediately after receiving this prompt)\n"
+        f"  - After reading/understanding the issue or task\n"
+        f"  - After completing the implementation\n"
+        f"  - Before opening a PR or writing the result file\n\n"
+        f"How to write a heartbeat:\n"
+        f"  import sys; sys.path.insert(0, '/home/lobster/lobster')\n"
+        f"  from src.orchestration.registry import WOSRegistry\n"
+        f"  WOSRegistry().write_heartbeat('{uow_id}')\n\n"
+        f"Or equivalently using the Registry class directly:\n"
+        f"  import sys; sys.path.insert(0, '/home/lobster/lobster')\n"
+        f"  from src.orchestration.paths import REGISTRY_DB\n"
+        f"  from src.orchestration.registry import Registry\n"
+        f"  Registry(REGISTRY_DB).write_heartbeat('{uow_id}')\n\n"
+        f"The write_heartbeat call is a fire-and-forget single SQL UPDATE. It returns the\n"
+        f"number of rows affected (1 on success, 0 if the UoW status changed). A return\n"
+        f"value of 0 means the Steward has already re-queued this UoW — stop execution\n"
+        f"immediately and call write_result with outcome=failed.\n\n"
         f"## Instructions\n\n"
         f"{instructions}\n\n"
         f"## Result contract (REQUIRED)\n\n"

@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from src.orchestration.analytics import prescription_quality_summary
+from src.orchestration.paths import REGISTRY_DB
 
 # ── fpdf2 ──────────────────────────────────────────────────────────────────────
 try:
@@ -43,10 +44,8 @@ except ImportError:
     sys.exit(1)
 
 # ── constants ─────────────────────────────────────────────────────────────────
-REGISTRY_DB = Path(os.environ.get(
-    "WOS_REGISTRY_DB",
-    Path.home() / "lobster-workspace" / "orchestration" / "registry.db"
-))
+# REGISTRY_DB is imported from src.orchestration.paths — resolved via REGISTRY_DB_PATH
+# env var, falling back to <workspace>/orchestration/registry.db.
 OUTBOX_DIR = Path(os.environ.get(
     "LOBSTER_OUTBOX",
     Path.home() / "messages" / "outbox"

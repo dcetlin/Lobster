@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily GitHub issue cultivator — triage and enrich open issues
+# LOBSTER-MANAGED
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

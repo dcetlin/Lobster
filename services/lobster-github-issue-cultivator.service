@@ -1,0 +1,8 @@
+[Unit]
+Description=Daily GitHub issue cultivator — triage and enrich open issues
+# LOBSTER-MANAGED
+
+[Service]
+Type=oneshot
+User=lobster
+ExecStart=/home/lobster/lobster/scheduled-tasks/dispatch-job.sh github-issue-cultivator

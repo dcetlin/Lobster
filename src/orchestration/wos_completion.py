@@ -34,6 +34,32 @@ from pathlib import Path
 
 log = logging.getLogger("wos_completion")
 
+# Lazy import — only imported when a GitHub issue source is detected.
+# This avoids pulling in the lifecycle module in test environments that
+# don't have a real gh CLI available.
+_lifecycle_imported = False
+_stamp_issue_complete_fn = None
+_stamp_issue_unverifiable_fn = None
+
+
+def _import_lifecycle() -> None:
+    """Import wos_issue_lifecycle functions on first use (lazy, non-blocking)."""
+    global _lifecycle_imported, _stamp_issue_complete_fn, _stamp_issue_unverifiable_fn
+    if _lifecycle_imported:
+        return
+    try:
+        from orchestration.wos_issue_lifecycle import (
+            stamp_issue_complete as _sic,
+            stamp_issue_unverifiable as _siu,
+        )
+        _stamp_issue_complete_fn = _sic
+        _stamp_issue_unverifiable_fn = _siu
+    except ImportError as exc:
+        log.debug("wos_completion: could not import wos_issue_lifecycle — %s", exc)
+    finally:
+        _lifecycle_imported = True
+
+
 #: Prefix used by route_wos_message to form the task_id for wos_execute dispatches.
 WOS_TASK_ID_PREFIX = "wos-"
 
@@ -43,6 +69,126 @@ WRITE_RESULT_SUCCESS_STATUS = "success"
 #: Pattern that identifies a GitHub issue source reference.
 #: Format: "github:issue/<number>" (integer issue number, no leading zeros required).
 _GITHUB_ISSUE_SOURCE_RE = re.compile(r"^github:issue/(\d+)$")
+
+# ---------------------------------------------------------------------------
+# Result file enrichment — summary + artifact extraction
+# ---------------------------------------------------------------------------
+
+#: Maximum characters to capture from result_text as the summary field.
+_RESULT_SUMMARY_MAX_CHARS: int = 300
+
+#: Regex patterns for extracting artifact references from agent output.
+_PR_REF_RE = re.compile(r"PR\s*#(\d+)", re.IGNORECASE)
+_ISSUE_REF_RE = re.compile(r"issue\s*#(\d+)", re.IGNORECASE)
+_FILE_PATH_RE = re.compile(r"(~/[^\s,;\"']+\.(?:md|json|py|sh|txt|yaml|yml))")
+
+
+def _extract_artifact_refs(text: str) -> dict:
+    """
+    Extract PR numbers, issue numbers, and file paths from agent output text.
+
+    Pure function — no side effects.
+
+    Returns a dict with keys:
+    - "pr_numbers": list of int PR numbers found (e.g. [42, 99])
+    - "issue_numbers": list of int issue numbers found (e.g. [123])
+    - "file_paths": list of str file paths found (e.g. ["~/lobster-workspace/foo.md"])
+    """
+    pr_numbers = [int(m) for m in _PR_REF_RE.findall(text)]
+    issue_numbers = [int(m) for m in _ISSUE_REF_RE.findall(text)]
+    file_paths = _FILE_PATH_RE.findall(text)
+    return {
+        "pr_numbers": pr_numbers,
+        "issue_numbers": issue_numbers,
+        "file_paths": file_paths,
+    }
+
+
+def _enrich_result_file(output_ref: str, result_text: str | None) -> None:
+    """
+    Read the existing result.json at output_ref, add 'summary' and 'refs' fields,
+    and rewrite it atomically.
+
+    Called after a successful UoW completion (outcome=complete) to capture:
+    - summary: first _RESULT_SUMMARY_MAX_CHARS chars of result_text
+    - refs: extracted PR numbers, issue numbers, and file paths from result_text
+
+    No-op when:
+    - result_text is None or empty
+    - result file does not exist (subagent skipped result_writer)
+    - result file is unreadable or not valid JSON
+
+    Side effects are isolated to this function. Failures are logged and swallowed
+    — result file enrichment must never block the UoW transition.
+    """
+    if not result_text:
+        return
+
+    # Derive result file path (mirrors result_writer._result_json_path)
+    p = Path(os.path.expanduser(output_ref))
+    if p.suffix:
+        result_path = p.with_suffix(".result.json")
+    else:
+        result_path = Path(str(p) + ".result.json")
+
+    if not result_path.exists():
+        log.debug(
+            "_enrich_result_file: result file not found at %s — skipping enrichment",
+            result_path,
+        )
+        return
+
+    try:
+        import json
+        import tempfile
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning(
+            "_enrich_result_file: could not read result file %s — %s: %s",
+            result_path, type(exc).__name__, exc,
+        )
+        return
+
+    try:
+        import json
+        import tempfile
+
+        summary = result_text[:_RESULT_SUMMARY_MAX_CHARS]
+        refs = _extract_artifact_refs(result_text)
+
+        # Only add fields not already present (subagent may have set summary itself)
+        if "summary" not in payload:
+            payload["summary"] = summary
+        if "refs" not in payload and any(refs.values()):
+            payload["refs"] = refs
+
+        # Atomic rewrite
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            dir=result_path.parent,
+            prefix=f".{result_path.name}.enrich.",
+            suffix=".json",
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, indent=2))
+            tmp_path.rename(result_path)
+            log.debug(
+                "_enrich_result_file: enriched %s (summary_len=%d, refs=%s)",
+                result_path, len(summary), refs,
+            )
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+    except Exception as exc:
+        log.warning(
+            "_enrich_result_file: failed to enrich result file %s — %s: %s",
+            result_path, type(exc).__name__, exc,
+        )
 
 # ---------------------------------------------------------------------------
 # Output classification — pure function
@@ -255,6 +401,54 @@ def _post_closeout_comment_if_github(
 
 
 # ---------------------------------------------------------------------------
+# Issue lifecycle stamp — bidirectional GitHub state sync on completion
+# ---------------------------------------------------------------------------
+
+def _stamp_issue_on_completion(
+    uow_id: str,
+    source: str,
+    issue_number: int | None,
+    output_ref: str | None,
+    result_text: str | None,
+    gh_bin: str = "gh",
+) -> None:
+    """
+    Call stamp_issue_complete for any successful UoW completion.
+
+    The source issue is closed regardless of metabolic classification
+    (pearl, heat, or seed). A seed UoW — one that filed a follow-up — still
+    addressed the source issue and should close it. The metabolic category
+    is recorded in the separate close-out comment posted by
+    _post_closeout_comment_if_github; it does not drive lifecycle decisions.
+
+    stamp_issue_unverifiable is NOT called here. That function is reserved
+    for future cases where a UoW completes but cannot be verified (no artifact
+    trail AND no subagent confirmation). All write_result=success paths call
+    stamp_issue_complete unconditionally.
+
+    Non-GitHub sources or missing issue_number → no-op.
+    Import or gh failures are non-fatal.
+    """
+    parsed = _extract_github_issue(source)
+    if parsed is None or issue_number is None:
+        return
+
+    repo, _ = parsed
+    _import_lifecycle()
+
+    summary = (result_text or "").strip()[:200]
+
+    if _stamp_issue_complete_fn is not None:
+        _stamp_issue_complete_fn(issue_number, uow_id, summary, repo=repo, gh_bin=gh_bin)
+    else:
+        log.debug(
+            "wos_completion: _stamp_issue_on_completion skipped for %s#%d "
+            "(lifecycle module not available)",
+            repo, issue_number,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main entry point — called by inbox_server.py on every write_result
 # ---------------------------------------------------------------------------
 
@@ -308,11 +502,12 @@ def maybe_complete_wos_uow(
     uow_id = task_id[len(WOS_TASK_ID_PREFIX):]
     try:
         from orchestration.registry import Registry, UoWStatus
+        from orchestration.paths import REGISTRY_DB
 
-        workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-        env_override = os.environ.get("REGISTRY_DB_PATH")
-        db_path = Path(env_override) if env_override else workspace / "orchestration" / "registry.db"
-
+        # Use canonical REGISTRY_DB path (honours REGISTRY_DB_PATH env override).
+        # Existence check before Registry() so we skip gracefully in test envs
+        # that have no WOS install.
+        db_path = REGISTRY_DB
         if not db_path.exists():
             log.debug(
                 "maybe_complete_wos_uow: registry DB not found at %s — "
@@ -321,7 +516,7 @@ def maybe_complete_wos_uow(
             )
             return
 
-        registry = Registry(db_path)
+        registry = Registry()
         uow = registry.get(uow_id)
         if uow is None:
             log.debug(
@@ -347,6 +542,17 @@ def maybe_complete_wos_uow(
             uow_id,
         )
 
+        # Enrich result file with summary + extracted artifact refs from agent output.
+        # Non-fatal — enrichment failure never blocks the UoW transition.
+        if output_ref:
+            try:
+                _enrich_result_file(output_ref, result_text)
+            except Exception as enrich_exc:
+                log.warning(
+                    "maybe_complete_wos_uow: result file enrichment failed for UoW %r — %s: %s",
+                    uow_id, type(enrich_exc).__name__, enrich_exc,
+                )
+
         # Close-out protocol: post a structured comment to the source GitHub issue.
         # Non-GitHub sources are silently skipped. Comment failure is non-fatal.
         uow_source = uow.source or ""
@@ -361,6 +567,17 @@ def maybe_complete_wos_uow(
             output_ref=output_ref,
             result_text=result_text,
             agent_type=agent_type,
+            gh_bin=gh_bin,
+        )
+
+        # Lifecycle stamp: update GitHub issue state based on output classification.
+        # Non-GitHub sources are silently skipped. Stamp failure is non-fatal.
+        _stamp_issue_on_completion(
+            uow_id=uow_id,
+            source=uow_source,
+            issue_number=uow.source_issue_number,
+            output_ref=output_ref,
+            result_text=result_text,
             gh_bin=gh_bin,
         )
 

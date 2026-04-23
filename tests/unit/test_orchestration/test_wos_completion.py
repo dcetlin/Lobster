@@ -533,8 +533,12 @@ class TestCloseoutProtocolIntegration:
 
     def test_github_source_posts_comment(self, tmp_path: Path) -> None:
         """
-        When source="github:issue/42", a gh issue comment subprocess is spawned
-        with the correct repo and issue number.
+        When source="github:issue/42", at least one gh issue comment subprocess is
+        spawned with the correct repo and issue number.
+
+        Note: after the lifecycle stamp addition (#874), GitHub sources produce
+        multiple gh calls (close-out comment + lifecycle stamp). This test verifies
+        that at least one comment reaches the right issue/repo — not the exact count.
         """
         db_path = tmp_path / "registry.db"
         output_dir = tmp_path / "outputs"
@@ -554,16 +558,17 @@ class TestCloseoutProtocolIntegration:
             mock_run.return_value = MagicMock(returncode=0)
             maybe_complete_wos_uow(task_id, WRITE_RESULT_SUCCESS_STATUS, result_text="PR #7 opened.")
 
-        # gh issue comment must have been called with the correct repo + issue
-        mock_run.assert_called_once()
-        call_args = mock_run.call_args
-        cmd = call_args[0][0]
-        assert "gh" in cmd[0]
-        assert "issue" in cmd
-        assert "comment" in cmd
-        assert "42" in cmd
-        assert "--repo" in cmd
-        assert "dcetlin/Lobster" in cmd
+        # gh must have been called at least once (close-out comment + lifecycle stamp)
+        assert mock_run.called, "subprocess.run must be called for GitHub sources"
+
+        # At least one call must be a comment targeting the correct issue/repo
+        comment_calls = [
+            c for c in mock_run.call_args_list
+            if "comment" in c[0][0] and "42" in c[0][0] and "dcetlin/Lobster" in c[0][0]
+        ]
+        assert len(comment_calls) >= 1, (
+            "At least one gh issue comment must target issue 42 in dcetlin/Lobster"
+        )
 
     def test_telegram_source_skips_comment(self, tmp_path: Path) -> None:
         """
@@ -679,9 +684,76 @@ class TestCloseoutProtocolIntegration:
                 result_text="PR #123 opened on dcetlin/Lobster.",
             )
 
-        assert len(captured_comment_body) == 1, "Expected exactly one gh comment call"
-        body = captured_comment_body[0]
-        assert "**Output type:** pearl" in body, (
+        # After lifecycle stamp addition (#874), GitHub sources produce two comment calls:
+        # 1. close-out comment with "**Output type:**" (from _post_closeout_comment_if_github)
+        # 2. lifecycle stamp comment with "**Outcome:**" (from stamp_issue_complete)
+        # Verify the close-out comment (the one with "**Output type:** pearl") is present.
+        assert len(captured_comment_body) >= 1, "Expected at least one gh comment call"
+        closeout_body = next(
+            (b for b in captured_comment_body if "**Output type:**" in b),
+            None,
+        )
+        assert closeout_body is not None, (
+            "A close-out comment with '**Output type:**' must be posted for GitHub sources"
+        )
+        assert "**Output type:** pearl" in closeout_body, (
             f"result_text mentioning a PR must produce 'pearl' classification in the "
-            f"close-out comment. Got comment body:\n{body}"
+            f"close-out comment. Got close-out comment body:\n{closeout_body}"
+        )
+
+    def test_seed_classified_result_closes_issue(self, tmp_path: Path) -> None:
+        """
+        A UoW whose result_text classifies as 'seed' (the default — no PR mention,
+        no heat signals) must still close the source GitHub issue.
+
+        Rationale: metabolic classification (seed/pearl/heat) describes what the UoW
+        PRODUCED, not whether the source issue was ADDRESSED. A seed UoW that filed a
+        follow-up absolutely addressed the source issue. Lifecycle decisions must be
+        driven by completion status (success vs fail), not by output category.
+
+        Before this fix, seed-classified results called stamp_issue_unverifiable,
+        leaving the issue OPEN. This test confirms the corrected behavior: any
+        successful completion triggers stamp_issue_complete (which closes the issue).
+        """
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = self._seed_uow_with_source(
+            registry, output_dir, source="github:issue/77", issue_number=77
+        )
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        close_calls: list[list[str]] = []
+
+        def _capture_run(cmd, **kwargs):
+            # Track 'gh issue close' calls
+            if "close" in cmd:
+                close_calls.append(list(cmd))
+            return MagicMock(returncode=0)
+
+        # result_text has no PR mention and no heat signals → classifies as 'seed'
+        seed_result_text = "Filed follow-up issue #88 for remaining work."
+
+        with patch("orchestration.wos_completion.subprocess.run", side_effect=_capture_run), \
+             patch.dict(os.environ, {
+                 "REGISTRY_DB_PATH": str(db_path),
+                 "LOBSTER_WOS_REPO": "dcetlin/Lobster",
+             }):
+            maybe_complete_wos_uow(
+                task_id,
+                WRITE_RESULT_SUCCESS_STATUS,
+                result_text=seed_result_text,
+            )
+
+        # The source issue must be closed regardless of seed classification.
+        assert len(close_calls) >= 1, (
+            "A seed-classified UoW must still close the source GitHub issue. "
+            "Metabolic category (seed/pearl/heat) does not determine whether the "
+            "issue was addressed — completion status does."
+        )
+        # Confirm the close targeted the correct issue number
+        assert any("77" in str(call) for call in close_calls), (
+            f"gh issue close must target issue 77. Close calls observed: {close_calls}"
         )
