@@ -144,37 +144,49 @@ You are the **compact_catchup** subagent. Your job is to:
 
 After Phase 2, update the rolling summary file at `~/lobster-user-config/memory/canonical/rolling-summary.md`.
 
-14. Read `~/lobster-user-config/memory/canonical/rolling-summary.md` if it exists. If it does not exist, create it with the following empty structure and continue:
+**Policy: overwrite, not append.** rolling-summary.md is a current-state snapshot. Each run replaces the entire file with a fresh ~50-line snapshot. Do NOT prepend or append to prior content — rewrite from scratch each time.
+
+14. Read `~/lobster-user-config/memory/canonical/rolling-summary.md` if it exists (to extract the Stable Context section, which rarely changes, so it can be carried forward). If the file does not exist, treat Stable Context as empty.
+
+15. Synthesize the new rolling-summary.md content from:
+    - The inbox scan results (catchup window)
+    - The session file content (Phase 2)
+    - The existing Stable Context section (carry forward unchanged unless inbox scan shows explicit changes to infra, contacts, or long-term goals)
+    - Live GitHub state from step 7 (for PR status)
+
+    Structure the new file as follows (target: ~50 lines total):
 
     ```markdown
     # Rolling Summary
     **Last updated:** <ISO timestamp>
+    **Policy:** Overwrite-only — this file is a current-state snapshot, not an append log. Each update replaces the entire file.
 
     ## Active PRs & Decisions
-    <!-- current open PRs and their states -->
+
+    - <bullet per open PR or key pending decision>
 
     ## Open Threads / Commitments
-    <!-- unresolved items promised or agreed upon -->
 
-    ## Recent Decisions
-    <!-- design choices, last 7 days -->
+    - <bullet per unresolved thread or commitment>
+
+    ## Recent Decisions (last 7 days)
+
+    - <YYYY-MM-DDTHH:MMZ> — <brief decision description>
 
     ## Stable Context
-    <!-- contacts, infra, long-term goals -- rarely changes -->
+
+    - <infra, contacts, long-term goals — carried from prior file>
     ```
 
-15. Merge updates from the inbox scan into the rolling summary sections:
+    Rules for each section:
+    - **Active PRs & Decisions**: Include only PRs that are currently OPEN or were resolved this session. PRs confirmed MERGED/CLOSED by the live check (step 7) should be listed as "MERGED" or removed. Do not carry stale open-PR entries forward.
+    - **Open Threads / Commitments**: Include any new unresolved threads from the inbox scan. Remove threads confirmed done/shipped. Carry forward existing threads not visibly resolved.
+    - **Recent Decisions**: Include only decisions from the past 7 days. Max 5 bullets; drop older ones.
+    - **Stable Context**: Carry forward verbatim from the prior file unless the inbox scan contains an explicit change to infrastructure, contacts, or long-term goals.
 
-    - **Active PRs & Decisions**: Add any new PRs or design decisions mentioned in the catchup window. If a PR appears to have been merged or closed (keywords: "merged", "closed", "LGTM + merged"), mark it as resolved or remove it. Also apply the live GitHub state verified in step 7: remove or mark resolved any PRs confirmed MERGED or CLOSED.
-    - **Open Threads / Commitments**: Add any new unresolved threads visible in the catchup window. Remove threads that appear resolved (keywords: "done", "resolved", "shipped", explicit closure).
-    - **Recent Decisions**: Add design decisions from this session. Prune any entries older than 7 days from today's UTC date.
-    - **Stable Context**: Do not change unless inbox scan contains an explicit change to infrastructure, contacts, or long-term goals.
+16. Size enforcement: the new file must not exceed 75 lines. If the draft exceeds this, compress in this order: (1) drop the oldest bullets in Recent Decisions beyond 3; (2) merge closely related Open Thread items; (3) abbreviate long Stable Context entries. Never drop all entries from any section if content exists.
 
-    Update the `**Last updated:**` line to the current UTC ISO timestamp.
-
-16. Size check: if the file would exceed 100 lines after writing, compress the oldest entries in **Recent Decisions** (entries beyond the most recent 5) into a single one-line summary: `<!-- [older decisions compressed: <N> entries, last: <YYYY-MM-DD>] -->`.
-
-17. Write back atomically: write to a temp file (same directory, `.rolling-summary.tmp.md`), then rename to `rolling-summary.md`. If the write fails, note it in `write_result` and continue.
+17. Write atomically: write to a temp file (same directory, `.rolling-summary.tmp.md`), then rename to `rolling-summary.md`. If the write fails, note it in `write_result` and continue.
 
 Update the `write_result` call (step 13) to include a footer line confirming the rolling summary was updated:
 ```
@@ -308,7 +320,7 @@ Keep each line to one sentence. The dispatcher is on mobile -- brevity matters.
 - Never truncate Open Threads or Notable Events from the existing session file without good reason -- carry them forward.
 - If the session file cannot be found or written (permissions, path not found), note the failure in `write_result` and continue -- do not crash the entire catchup.
 - If `rolling-summary.md` cannot be read or written, note the failure in `write_result` and continue -- do not abort catchup.
-- Never remove content from rolling-summary.md unless there is clear evidence in the inbox scan that the item is resolved. When in doubt, carry it forward.
+- rolling-summary.md is always fully rewritten (overwrite pattern). Never append to it. Only the Stable Context section is carried forward from the prior file; all other sections are synthesized fresh from the inbox scan and session context.
 - If `rolling-summary.md` cannot be read or written during Phase 4, note the failure in `write_result` and continue -- do not abort catchup (this is separate from the Phase 3 rolling summary update).
 - The `gh pr view` calls in step 7 are best-effort: if `gh` is unavailable or the repo cannot be determined, skip step 7 silently and omit the "PR sign-off status" section from output.
 

@@ -90,15 +90,45 @@ gh issue list --repo SiderealPress/lobster --state all --limit 30 --json number,
 Include the GitHub activity summary in the synthesis for rolling-summary.md and daily-digest.md. List merged PRs under a "Code shipped" bullet. List new/closed issues under an "Issues" bullet. If no GitHub activity, omit this section.
 
 3. **Update `rolling-summary.md`.**
-   Read `~/lobster-user-config/memory/canonical/rolling-summary.md`.
-   Prepend a new dated entry (format: `## YYYY-MM-DD`) that summarizes:
-   - Key decisions or conclusions reached
-   - Active work streams that progressed
-   - Unresolved threads or blockers
-   - Any notable mood or energy signals
-   - **Code shipped** bullet: merged PRs from step 2b (if any)
-   - **Issues** bullet: opened/closed issues from step 2b (if any)
-   Keep each entry concise — 5-10 bullet points max. Do NOT rewrite past entries.
+
+   **Policy: overwrite, not append.** rolling-summary.md is a current-state snapshot. Rewrite the entire file each run — do NOT prepend, append, or preserve prior content except the Stable Context section.
+
+   Read `~/lobster-user-config/memory/canonical/rolling-summary.md` if it exists (to extract the Stable Context section for carry-forward). Then write a fresh file with this structure (target: ~50 lines):
+
+   ```markdown
+   # Rolling Summary
+   **Last updated:** <ISO timestamp>
+   **Policy:** Overwrite-only — this file is a current-state snapshot, not an append log. Each update replaces the entire file.
+
+   ## Active PRs & Decisions
+
+   - <bullet per open/recently-resolved PR or key pending decision>
+
+   ## Open Threads / Commitments
+
+   - <bullet per unresolved thread or commitment>
+
+   ## Recent Decisions (last 7 days)
+
+   - <YYYY-MM-DDTHH:MMZ> — <brief decision description>
+
+   ## Stable Context
+
+   - <carried verbatim from prior file unless changed>
+   ```
+
+   Section rules:
+   - **Active PRs**: include only open PRs or PRs resolved today; drop stale merged entries.
+   - **Open Threads**: include unresolved items from today's memory events; drop anything confirmed done/shipped.
+   - **Recent Decisions**: include the key decisions or conclusions from today (5-10 bullets max); prune any decisions older than 7 days.
+   - **Code shipped** bullet: merged PRs from step 2b (if any) — add to Recent Decisions or Active PRs section as appropriate.
+   - **Issues** bullet: opened/closed issues from step 2b (if any) — add as bullets in Open Threads or Recent Decisions.
+   - **Stable Context**: carry forward verbatim from the prior file unless today's events show an explicit change.
+   - **Proprioceptive**: if gate_miss_summary contains gate misses, add one bullet in Open Threads: `Proprioceptive: <gate_miss_summary content>`. If zero misses, add: `Proprioceptive: no gate misses in past 24h.`
+
+   Size enforcement: the file must not exceed 75 lines. If the draft exceeds this, drop oldest Recent Decisions bullets first, then merge related Open Thread items.
+
+   Write atomically: write to `.rolling-summary.tmp.md` in the same directory, then rename to `rolling-summary.md`.
 
 4. **Update `daily-digest.md`.**
    Read `~/lobster-user-config/memory/canonical/daily-digest.md`.
@@ -258,7 +288,7 @@ Include the GitHub activity summary in the synthesis for rolling-summary.md and 
 
 ### What NOT to do
 
-- Do NOT rewrite past entries in rolling-summary.md or daily-digest.md — prepend only.
+- Do NOT append or prepend to rolling-summary.md — overwrite the entire file each run (see step 3). Do NOT rewrite past entries in daily-digest.md — prepend only.
 - Do NOT rewrite project or people files — only prepend/append new dated sections.
 - Do NOT send any message to the user — this is a silent background operation.
 - Do NOT call `send_reply` under any circumstances.
