@@ -739,17 +739,22 @@ class Executor:
             self._skill_activator(skill_id)
 
         # Step 2: Dispatch LLM subagent via register-appropriate dispatcher.
-        # If a dispatcher was explicitly injected (tests, CI), use it directly
-        # with the raw instructions (no preamble prepended — caller's responsibility).
-        # Otherwise, resolve from the dispatch table and prepend the register-appropriate
-        # preamble from _EXECUTOR_TYPE_TO_PREAMBLE before passing to the dispatcher.
+        # Build the WOS context block (UoW ID + artifact stamping instructions, issue #868)
+        # and inject it into every dispatched prompt regardless of dispatcher path.
+        #
+        # For the production dispatch table path: preamble + wos_context + raw_instructions.
+        # For the injected dispatcher path (tests, CI): wos_context + raw_instructions
+        # (caller owns the preamble, but the UoW ID block is always injected so subagents
+        # have provenance context available even in test/CI environments).
         raw_instructions = artifact["instructions"]
+        wos_context = _build_wos_context_block(uow_id)
         if self._dispatcher_override is not None:
-            executor_id = self._dispatcher_override(raw_instructions, uow_id)
+            instructions_with_context = wos_context + raw_instructions
+            executor_id = self._dispatcher_override(instructions_with_context, uow_id)
         else:
             executor_type = artifact.get("executor_type", "functional-engineer")
             preamble = _EXECUTOR_TYPE_TO_PREAMBLE.get(executor_type, "")
-            instructions = preamble + raw_instructions
+            instructions = preamble + wos_context + raw_instructions
             dispatcher = _resolve_dispatcher(executor_type)
             executor_id = dispatcher(instructions, uow_id)
 
@@ -938,6 +943,48 @@ Write result via: mcp__lobster-inbox__write_result
 
 Prescription:
 """
+
+
+# ---------------------------------------------------------------------------
+# WOS context block — UoW ID injection (issue #868)
+# ---------------------------------------------------------------------------
+
+def _build_wos_context_block(uow_id: str) -> str:
+    """
+    Build the WOS context block injected into every subagent prompt at dispatch time.
+
+    Pure function — no side effects, no I/O. Returns a formatted block that:
+    - Identifies the UoW ID so the subagent knows which unit of work it is executing
+    - Instructs the subagent to stamp all created artifacts with the UoW ID
+      for bidirectional provenance (issue #868)
+
+    Artifact stamping instructions:
+    - PR description footer: include a line ``WOS-UoW: {uow_id}`` in every PR opened
+    - Issue labels: apply label ``wos:uow_{uow_id}`` to every GitHub issue created
+      (create the label first if it does not exist)
+    - Commit messages: optionally include ``WOS-UoW: {uow_id}`` in commit footers
+
+    The block is prepended before the prescription body so it is always visible
+    regardless of preamble type or prompt length.
+
+    Args:
+        uow_id: The WOS unit-of-work ID (e.g. "uow_abc123").
+
+    Returns:
+        Formatted WOS context block string.
+    """
+    return (
+        f"---\n"
+        f"WOS Context:\n"
+        f"  UoW ID: {uow_id}\n"
+        f"---\n"
+        f"Artifact stamping: stamp every artifact you create with this UoW ID.\n"
+        f"  - PR descriptions: include a footer line: WOS-UoW: {uow_id}\n"
+        f"  - GitHub issues you create: apply label wos:uow_{uow_id} "
+        f"(create the label if it does not exist)\n"
+        f"  - Commit messages: optionally include WOS-UoW: {uow_id} in the footer\n"
+        f"---\n"
+    )
 
 
 def _dispatch_via_claude_p(instructions: str, uow_id: str) -> str:
