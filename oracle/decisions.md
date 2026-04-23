@@ -2,6 +2,49 @@
 
 ---
 
+### [2026-04-23] PR #884 — fix(hooks): relocate smell-patterns.yaml from data/ to oracle/
+
+**Vision alignment:** The relocation of `smell-patterns.yaml` from `data/` to `oracle/` is correctly motivated by the semantic argument: oracle config belongs alongside oracle artifacts. The PR's stated motivation (pre-commit hook blockage) is factually incorrect — the hook only checks execute bits on scripts/ and hooks/, not data/ files. The action would be correct regardless. Vision alignment is confirmed: this is low-friction housekeeping that closes debt from PR #882's NEEDS_CHANGES verdict without touching any execution-pipeline components.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- The Encoded Orientation gap from PR #882 Gap 3 is re-triggered. `oracle/smell-patterns.yaml` contains `github_label`, `issue_template`, and `detection_heuristic` fields that encode behavioral defaults for automated smell detection and issue filing — a system that has not been designed or oracle-reviewed. Constraint-3 requires a prior logged decision and vision.yaml anchor; neither exists.
+- The relocation itself is correct and the path references in the retrospective document are completely and correctly updated.
+- Feature-bundling check passes: exactly two files changed, both described in the PR body.
+- The hook misdiagnosis is self-disclosed in the PR body. The PR is self-aware about it.
+
+**Patterns introduced:** None new. The Encoded Orientation-in-data-layer detection pattern (learnings.md 2026-04-23 PR #882) continues to apply.
+
+**What this forecloses:** Nothing. The relocation is correct and reversible. The Encoded Orientation concern blocks merge, not the path decision.
+
+**Opportunity cost note:** Resolution is straightforward: either log the design decision for the automated feedback loop, or strip automation-implying fields to make the file a documentation artifact. Either path takes less than one session.
+
+**VERDICT: NEEDS_CHANGES** — See `/home/lobster/lobster/oracle/verdicts/pr-884.md` for revision contract.
+
+---
+
+### [2026-04-23] PR #884 re-review — fix committed (automation fields stripped)
+
+**Vision alignment:** Same as original PR #884 entry above. Confirmed. The fix correctly chose revision path (b) — strip automation-implying fields rather than provide a design decision — which correctly defers the automated retrospective system to a future design decision without blocking the legitimate relocation. Learnings.md pattern "resolution-by-absence is not resolution-by-fix" was the active prior constraining this review: the gap was treated as open when the file reappeared (PR #884 reintroduced what PR #883 removed), and the review confirmed that only field-level fixing closes the gap.
+
+**Alignment verdict:** Confirmed
+
+**Quality finding:**
+- Automation-implying fields (`detection_heuristic`, `threshold`, `issue_template`, `github_label`) removed from all five pattern entries. File is now a documentation artifact with no operative behavior.
+- Deferred field set documented in file header comment with explicit reason ("pending a logged design decision").
+- `severity` field retained as descriptive — correctly not in the automation-field list.
+- Retrospective document prose describing future automated system is not operative — no Encoded Orientation concern.
+- Feature-bundling: two files changed, both described in PR body. Clean.
+
+**Patterns introduced:** None new. The deferred automation field set establishes a clean extension point for the future automated retrospective PR.
+
+**What this forecloses:** Merging the stripped file forecloses nothing. The deferred fields can be re-added in a future PR when the automated retrospective system is oracle-reviewed.
+
+**VERDICT: APPROVED** — Gap 1 addressed via path (b). Authorized to merge.
+
+---
+
 ### [2026-04-23] PR #871 — feat: inject UoW ID into subagent prompts for bidirectional artifact provenance (#868)
 
 Pure function `_build_wos_context_block` + three-line injection in `_run_execution`. Vision alignment confirmed — approved design decision already in flight; bounded scope, no foreclosure. Quality findings: pure function well-formed, injection order correct, both dispatch paths covered, 18 tests with named constants. No wiring issues. **VERDICT: APPROVED**
