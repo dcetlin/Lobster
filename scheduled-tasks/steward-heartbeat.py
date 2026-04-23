@@ -7,7 +7,7 @@ Runs every 3 minutes. On each invocation executes three functions in order:
 1. Startup sweep — crash recovery. Scans `active`, `ready-for-executor`, and
    `diagnosing` UoWs and surfaces orphans back to the Steward via
    'ready-for-steward' transitions with 'startup_sweep' audit entries.
-   Implementation lives in startup-sweep.py. Full spec: #307.
+   Implementation lives in startup_sweep.py. Full spec: #307.
 
 2. Observation Loop — detect stalled `active` UoWs by checking `timeout_at`.
    Surfaces stalled UoWs back to the Steward via the 'ready-for-steward'
@@ -60,23 +60,13 @@ from src.orchestration.steward import is_bootup_candidate_gate_active, run_stewa
 from src.orchestration.github_sync import run_post_completion_sync
 
 # ---------------------------------------------------------------------------
-# Startup sweep — imported from startup-sweep.py (Phase 1 concern)
-# Re-exported here so tests that load this module via importlib can still
-# access run_startup_sweep, StartupSweepResult, and _classify_active_uow
-# by name without change.
+# Startup sweep — imported from startup_sweep.py (Phase 1 concern)
 # ---------------------------------------------------------------------------
 
-import importlib.util as _ilu
-
-_SWEEP_PATH = Path(__file__).parent / "startup-sweep.py"
-_sweep_spec = _ilu.spec_from_file_location("startup_sweep", _SWEEP_PATH)
-_sweep_mod = _ilu.module_from_spec(_sweep_spec)
-sys.modules["startup_sweep"] = _sweep_mod
-_sweep_spec.loader.exec_module(_sweep_mod)
-
-run_startup_sweep = _sweep_mod.run_startup_sweep
-StartupSweepResult = _sweep_mod.StartupSweepResult
-_classify_active_uow = _sweep_mod._classify_active_uow
+_SWEEP_DIR = str(Path(__file__).parent)
+if _SWEEP_DIR not in sys.path:
+    sys.path.insert(0, _SWEEP_DIR)
+from startup_sweep import run_startup_sweep, StartupSweepResult, _classify_active_uow
 
 # ---------------------------------------------------------------------------
 # Logging
