@@ -817,7 +817,12 @@ class Registry:
         Direct status set — bypasses the confirm flow.
         Used in tests and for terminal status transitions (done, failed, expired).
         Writes an audit entry in the same transaction.
+
+        Raises ValueError if new_status is not a valid UoWStatus value.
         """
+        # Coerce via UoWStatus to catch invalid strings early — raises ValueError
+        # for any value not in the enum (e.g. "complete", "completed").
+        UoWStatus(new_status)
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
