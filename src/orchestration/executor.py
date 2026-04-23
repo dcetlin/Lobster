@@ -720,6 +720,9 @@ class Executor:
             _write_trace_json(output_ref, trace)
             _insert_corrective_trace(self.registry.db_path, trace)
             self.registry.fail_uow(uow_id, reason)
+            # Lifecycle stamp: remove wos:executing label and post failure comment.
+            # Non-blocking — any gh failure is logged and ignored.
+            _stamp_failed_if_github(self.registry, uow_id)
             raise
 
     def _run_execution(
@@ -801,6 +804,9 @@ class Executor:
         executor_type = artifact.get("executor_type", "functional-engineer")
         if _dispatcher_is_async(self._dispatcher_override, executor_type):
             self.registry.transition_to_executing(uow_id, executor_id or "")
+            # Lifecycle stamp: add wos:executing label and comment to the source issue.
+            # Non-blocking — any gh failure is logged and ignored.
+            _stamp_executing_if_github(self.registry, uow_id)
         else:
             self.registry.complete_uow(uow_id, output_ref)
 
@@ -1470,6 +1476,62 @@ def _dispatch_via_inbox(instructions: str, uow_id: str, agent_type: str = "funct
             pass
 
     return msg_id
+
+
+# ---------------------------------------------------------------------------
+# Issue lifecycle stamps — non-blocking GitHub state sync
+# ---------------------------------------------------------------------------
+
+def _stamp_executing_if_github(registry: "Registry", uow_id: str) -> None:
+    """
+    Call stamp_issue_executing for a UoW that just transitioned to 'executing'.
+
+    Fetches source_issue_number from the registry. No-op when:
+    - UoW not found
+    - source_issue_number is None (non-GitHub source)
+    - wos_issue_lifecycle is not importable
+    - Any gh CLI call fails
+
+    Non-blocking: any exception is logged at WARNING level.
+    """
+    try:
+        from orchestration.wos_issue_lifecycle import stamp_issue_executing
+        uow = registry.get(uow_id)
+        if uow is None or uow.source_issue_number is None:
+            return
+        repo = os.environ.get("LOBSTER_WOS_REPO", "dcetlin/Lobster")
+        stamp_issue_executing(uow.source_issue_number, uow_id, repo=repo)
+    except Exception as exc:
+        log.warning(
+            "executor: _stamp_executing_if_github failed for UoW %s — %s: %s",
+            uow_id, type(exc).__name__, exc,
+        )
+
+
+def _stamp_failed_if_github(registry: "Registry", uow_id: str) -> None:
+    """
+    Call stamp_issue_failed for a UoW that just transitioned to 'failed'.
+
+    Fetches source_issue_number from the registry. No-op when:
+    - UoW not found
+    - source_issue_number is None (non-GitHub source)
+    - wos_issue_lifecycle is not importable
+    - Any gh CLI call fails
+
+    Non-blocking: any exception is logged at WARNING level.
+    """
+    try:
+        from orchestration.wos_issue_lifecycle import stamp_issue_failed
+        uow = registry.get(uow_id)
+        if uow is None or uow.source_issue_number is None:
+            return
+        repo = os.environ.get("LOBSTER_WOS_REPO", "dcetlin/Lobster")
+        stamp_issue_failed(uow.source_issue_number, uow_id, repo=repo)
+    except Exception as exc:
+        log.warning(
+            "executor: _stamp_failed_if_github failed for UoW %s — %s: %s",
+            uow_id, type(exc).__name__, exc,
+        )
 
 
 # ---------------------------------------------------------------------------
