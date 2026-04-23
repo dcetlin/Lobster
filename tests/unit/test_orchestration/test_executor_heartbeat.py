@@ -318,6 +318,9 @@ class TestRunExecutorCycleDispatchEligibility:
 
         The heartbeat imports from src.orchestration.executor (not
         orchestration.executor), so the patch must target that module object.
+
+        Also patches ScalingGovernor to return a no-cap decision so tests
+        verify dispatch eligibility logic without governor interference.
         """
         import importlib
         # Ensure src.orchestration.executor is loaded so we can patch it
@@ -328,6 +331,24 @@ class TestRunExecutorCycleDispatchEligibility:
             src_executor_mod, "_dispatch_via_inbox",
             lambda i, u, **kw: inbox_called.append(u) or "msg-id",
         )
+
+        # Patch ScalingGovernor so it does not cap in dispatch-eligibility tests.
+        # These tests verify staleness-gate logic; governor logic is tested separately.
+        import src.orchestration.scaling_governor as _sg_mod
+        from src.orchestration.scaling_governor import GovernorDecision
+
+        class _NoCapGovernor:
+            def __init__(self, *a, **kw): pass
+            def check(self, proposed_n: int) -> GovernorDecision:
+                return GovernorDecision(
+                    proposed_n=proposed_n,
+                    allowed_n=proposed_n,
+                    capped=False,
+                    cap_reason=None,
+                    attunement_scale=proposed_n,
+                )
+
+        monkeypatch.setattr(_sg_mod, "ScalingGovernor", _NoCapGovernor)
 
     def test_fresh_uow_dispatched_immediately(
         self, registry, db_path: Path, monkeypatch: pytest.MonkeyPatch

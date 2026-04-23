@@ -292,6 +292,11 @@ def run_executor_cycle(registry, dry_run: bool = False) -> dict:
             ineligible_count, RECOVERY_STALE_MINUTES,
         )
 
+    # Scaling governor — cap dispatch when no Attunement evidence at this scale.
+    from src.orchestration.scaling_governor import ScalingGovernor
+    governor = ScalingGovernor(registry.db_path)
+    decision = governor.check(proposed_n=eligible_count)
+
     dispatched = 0
     skipped = 0
     errors = 0
@@ -302,6 +307,11 @@ def run_executor_cycle(registry, dry_run: bool = False) -> dict:
             "%d eligible — skipping all (dry-run mode)",
             ready_count, eligible_count,
         )
+        if decision.capped:
+            log.info(
+                "ScalingGovernor (DRY RUN): would cap from %d to %d (reason: %s)",
+                decision.proposed_n, decision.allowed_n, decision.cap_reason,
+            )
         return {
             "evaluated": ready_count,
             "ready": ready_count,
@@ -309,7 +319,17 @@ def run_executor_cycle(registry, dry_run: bool = False) -> dict:
             "dispatched": 0,
             "skipped": ready_count,
             "errors": 0,
+            "governor_cap": decision.allowed_n if decision.capped else None,
+            "attunement_scale": decision.attunement_scale,
         }
+
+    if decision.capped:
+        eligible_uows = eligible_uows[:decision.allowed_n]
+        eligible_count = decision.allowed_n
+        log.info(
+            "ScalingGovernor: cap applied — %d eligible, dispatching %d (reason: %s)",
+            decision.proposed_n, decision.allowed_n, decision.cap_reason,
+        )
 
     if eligible_count == 0:
         log.debug("Executor cycle: no eligible UoWs to dispatch")
