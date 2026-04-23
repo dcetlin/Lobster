@@ -308,11 +308,12 @@ def maybe_complete_wos_uow(
     uow_id = task_id[len(WOS_TASK_ID_PREFIX):]
     try:
         from orchestration.registry import Registry, UoWStatus
+        from orchestration.paths import REGISTRY_DB
 
-        workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-        env_override = os.environ.get("REGISTRY_DB_PATH")
-        db_path = Path(env_override) if env_override else workspace / "orchestration" / "registry.db"
-
+        # Use canonical REGISTRY_DB path (honours REGISTRY_DB_PATH env override).
+        # Existence check before Registry() so we skip gracefully in test envs
+        # that have no WOS install.
+        db_path = REGISTRY_DB
         if not db_path.exists():
             log.debug(
                 "maybe_complete_wos_uow: registry DB not found at %s — "
@@ -321,7 +322,7 @@ def maybe_complete_wos_uow(
             )
             return
 
-        registry = Registry(db_path)
+        registry = Registry()
         uow = registry.get(uow_id)
         if uow is None:
             log.debug(
