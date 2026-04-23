@@ -874,3 +874,24 @@ LEARNINGS_PROPOSALS_TASK
         substep "learnings-proposals crontab entry already present"
     fi
 
+    # d12: Update garden-caretaker cron schedule from every 15 minutes to every 2 hours.
+    # The 15-minute sweep caused bulk germination of 150+ UoWs at once when GitHub issues
+    # were scanned on every cycle. A 2-hour cadence spreads the load without losing coverage.
+    local GC_MARKER="# LOBSTER-GARDEN-CARETAKER"
+    local GC_OLD_SCHEDULE="*/15 \* \* \* \*"
+    local GC_NEW_SCHEDULE="0 \*/2 \* \* \*"
+    if crontab -l 2>/dev/null | grep -q "$GC_MARKER"; then
+        if crontab -l 2>/dev/null | grep "$GC_MARKER" | grep -q "^\*/15"; then
+            # Remove old 15-min entry and add new 2-hour entry
+            "$LOBSTER_DIR/scripts/cron-manage.sh" remove "$GC_MARKER"
+            "$LOBSTER_DIR/scripts/cron-manage.sh" add "$GC_MARKER" \
+                "0 */2 * * * cd \$HOME && uv run $LOBSTER_DIR/scheduled-tasks/garden-caretaker.py >> $WORKSPACE_DIR/logs/garden-caretaker.log 2>&1 $GC_MARKER"
+            substep "Updated garden-caretaker cron: every 15 min → every 2 hours (d12)"
+            migrated=$((migrated + 1))
+        else
+            substep "garden-caretaker cron already updated — skipping d12"
+        fi
+    else
+        substep "garden-caretaker cron entry not found — skipping d12"
+    fi
+

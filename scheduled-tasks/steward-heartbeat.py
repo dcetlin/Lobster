@@ -216,17 +216,42 @@ def _utc_now() -> datetime:
 
 
 def _warn_if_legacy_registry_exists() -> None:
-    """Log a warning if the deprecated legacy registry path exists and is non-empty."""
+    """Log a warning if the deprecated legacy registry path exists and is non-empty.
+
+    The canonical registry lives at ~/lobster-workspace/orchestration/registry.db.
+    The legacy path (data/wos-registry.db) is removed by upgrade.sh Migration 86
+    when its uow_registry table is empty. This function fires only if the file
+    survived migration (non-empty or migration not yet run).
+    """
     workspace = Path(os.environ.get(
         "LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"
     ))
     legacy_path = workspace / "data" / "wos-registry.db"
-    if legacy_path.exists() and legacy_path.stat().st_size > 0:
+    if not legacy_path.exists():
+        return
+    size = legacy_path.stat().st_size
+    if size == 0:
+        # Zero-byte file — safe to ignore; Migration 86 handles non-zero files.
+        return
+    # Count UoWs to distinguish an empty-schema file from one with actual data.
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(legacy_path), timeout=5.0)
+        uow_count = conn.execute("SELECT COUNT(*) FROM uow_registry").fetchone()[0]
+        conn.close()
+    except Exception:
+        uow_count = -1
+    if uow_count == 0:
+        log.info(
+            "Legacy registry DB at %s exists (%d bytes) but has 0 UoWs — "
+            "run upgrade.sh to apply Migration 86 and remove it.",
+            legacy_path, size,
+        )
+    else:
         log.warning(
-            "Legacy registry DB at %s exists and is non-empty (%d bytes). "
-            "Canonical path is %s. Investigate and remove the legacy file.",
-            legacy_path,
-            legacy_path.stat().st_size,
+            "Legacy registry DB at %s exists and is non-empty (%d bytes, %d UoWs). "
+            "Canonical path is %s. Run upgrade.sh (Migration 86) to safely relocate.",
+            legacy_path, size, uow_count,
             workspace / "orchestration" / "registry.db",
         )
 

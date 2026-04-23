@@ -45,6 +45,126 @@ WRITE_RESULT_SUCCESS_STATUS = "success"
 _GITHUB_ISSUE_SOURCE_RE = re.compile(r"^github:issue/(\d+)$")
 
 # ---------------------------------------------------------------------------
+# Result file enrichment — summary + artifact extraction
+# ---------------------------------------------------------------------------
+
+#: Maximum characters to capture from result_text as the summary field.
+_RESULT_SUMMARY_MAX_CHARS: int = 300
+
+#: Regex patterns for extracting artifact references from agent output.
+_PR_REF_RE = re.compile(r"PR\s*#(\d+)", re.IGNORECASE)
+_ISSUE_REF_RE = re.compile(r"issue\s*#(\d+)", re.IGNORECASE)
+_FILE_PATH_RE = re.compile(r"(~/[^\s,;\"']+\.(?:md|json|py|sh|txt|yaml|yml))")
+
+
+def _extract_artifact_refs(text: str) -> dict:
+    """
+    Extract PR numbers, issue numbers, and file paths from agent output text.
+
+    Pure function — no side effects.
+
+    Returns a dict with keys:
+    - "pr_numbers": list of int PR numbers found (e.g. [42, 99])
+    - "issue_numbers": list of int issue numbers found (e.g. [123])
+    - "file_paths": list of str file paths found (e.g. ["~/lobster-workspace/foo.md"])
+    """
+    pr_numbers = [int(m) for m in _PR_REF_RE.findall(text)]
+    issue_numbers = [int(m) for m in _ISSUE_REF_RE.findall(text)]
+    file_paths = _FILE_PATH_RE.findall(text)
+    return {
+        "pr_numbers": pr_numbers,
+        "issue_numbers": issue_numbers,
+        "file_paths": file_paths,
+    }
+
+
+def _enrich_result_file(output_ref: str, result_text: str | None) -> None:
+    """
+    Read the existing result.json at output_ref, add 'summary' and 'refs' fields,
+    and rewrite it atomically.
+
+    Called after a successful UoW completion (outcome=complete) to capture:
+    - summary: first _RESULT_SUMMARY_MAX_CHARS chars of result_text
+    - refs: extracted PR numbers, issue numbers, and file paths from result_text
+
+    No-op when:
+    - result_text is None or empty
+    - result file does not exist (subagent skipped result_writer)
+    - result file is unreadable or not valid JSON
+
+    Side effects are isolated to this function. Failures are logged and swallowed
+    — result file enrichment must never block the UoW transition.
+    """
+    if not result_text:
+        return
+
+    # Derive result file path (mirrors result_writer._result_json_path)
+    p = Path(os.path.expanduser(output_ref))
+    if p.suffix:
+        result_path = p.with_suffix(".result.json")
+    else:
+        result_path = Path(str(p) + ".result.json")
+
+    if not result_path.exists():
+        log.debug(
+            "_enrich_result_file: result file not found at %s — skipping enrichment",
+            result_path,
+        )
+        return
+
+    try:
+        import json
+        import tempfile
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning(
+            "_enrich_result_file: could not read result file %s — %s: %s",
+            result_path, type(exc).__name__, exc,
+        )
+        return
+
+    try:
+        import json
+        import tempfile
+
+        summary = result_text[:_RESULT_SUMMARY_MAX_CHARS]
+        refs = _extract_artifact_refs(result_text)
+
+        # Only add fields not already present (subagent may have set summary itself)
+        if "summary" not in payload:
+            payload["summary"] = summary
+        if "refs" not in payload and any(refs.values()):
+            payload["refs"] = refs
+
+        # Atomic rewrite
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            dir=result_path.parent,
+            prefix=f".{result_path.name}.enrich.",
+            suffix=".json",
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, indent=2))
+            tmp_path.rename(result_path)
+            log.debug(
+                "_enrich_result_file: enriched %s (summary_len=%d, refs=%s)",
+                result_path, len(summary), refs,
+            )
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+    except Exception as exc:
+        log.warning(
+            "_enrich_result_file: failed to enrich result file %s — %s: %s",
+            result_path, type(exc).__name__, exc,
+        )
+
+# ---------------------------------------------------------------------------
 # Output classification — pure function
 # ---------------------------------------------------------------------------
 
@@ -347,6 +467,17 @@ def maybe_complete_wos_uow(
             "(execution_complete written on write_result confirmation)",
             uow_id,
         )
+
+        # Enrich result file with summary + extracted artifact refs from agent output.
+        # Non-fatal — enrichment failure never blocks the UoW transition.
+        if output_ref:
+            try:
+                _enrich_result_file(output_ref, result_text)
+            except Exception as enrich_exc:
+                log.warning(
+                    "maybe_complete_wos_uow: result file enrichment failed for UoW %r — %s: %s",
+                    uow_id, type(enrich_exc).__name__, enrich_exc,
+                )
 
         # Close-out protocol: post a structured comment to the source GitHub issue.
         # Non-GitHub sources are silently skipped. Comment failure is non-fatal.

@@ -2201,9 +2201,28 @@ SPIRAL_ORACLE_PASS_THRESHOLD: int = 3
 # Source: oracle/patterns.md §dead-end — "failed or blocked state ≥2 times"
 DEAD_END_FAILURE_THRESHOLD: int = 2
 
-# Burst: throttle to this many UoWs per cycle when burst is detected
-# Source: oracle/patterns.md §burst — "batch into groups of 3"
+# Burst: throttle to this many UoWs per cycle when burst is detected.
+# Default is 3 (oracle/patterns.md §burst — "batch into groups of 3").
+# When queue depth exceeds thresholds, a larger batch size is used to drain
+# faster without losing the throttle protection.
 BURST_BATCH_SIZE: int = 3
+
+
+def _dynamic_burst_batch_size(queue_depth: int) -> int:
+    """Return the appropriate BURST_BATCH_SIZE given the current queue depth.
+
+    Thresholds (applied in order, first match wins):
+    - queue_depth > 50  → batch size 15
+    - queue_depth > 20  → batch size 8
+    - default           → BURST_BATCH_SIZE (3)
+
+    Pure function — no side effects.
+    """
+    if queue_depth > 50:
+        return 15
+    if queue_depth > 20:
+        return 8
+    return BURST_BATCH_SIZE
 
 # Burst: hard lower bound for the baseline queue depth used in spike detection.
 # Queue depths at or above 2x this value are treated as a burst.
@@ -4203,6 +4222,14 @@ def run_steward_cycle(
     # Captured once before the loop so all per-UoW checks see the same depth value.
     _queue_depth = len(uows)
 
+    # Dynamic batch size: scale up when queue is deep so bursts drain faster.
+    _effective_burst_batch_size = _dynamic_burst_batch_size(_queue_depth)
+    if _effective_burst_batch_size != BURST_BATCH_SIZE:
+        log.info(
+            "Steward cycle: dynamic burst batch size=%d (queue_depth=%d, default=%d)",
+            _effective_burst_batch_size, _queue_depth, BURST_BATCH_SIZE,
+        )
+
     evaluated = 0
     prescribed = 0
     done = 0
@@ -4305,20 +4332,20 @@ def run_steward_cycle(
         # dead-end, and burst patterns before committing to a prescription cycle.
         _eligibility = _check_dispatch_eligibility(uow, audit_entries, _queue_depth)
         if _eligibility == "throttle":
-            if throttle_count < BURST_BATCH_SIZE:
+            if throttle_count < _effective_burst_batch_size:
                 # Within the allowed burst batch — dispatch normally and count it.
                 throttle_count += 1
                 log.debug(
                     "dispatch_eligibility: uow_id=%s throttle allowed "
                     "(throttle_count=%d/%d)",
-                    uow_id, throttle_count, BURST_BATCH_SIZE,
+                    uow_id, throttle_count, _effective_burst_batch_size,
                 )
             else:
-                # Beyond BURST_BATCH_SIZE for this cycle — skip.
+                # Beyond _effective_burst_batch_size for this cycle — skip.
                 log.info(
                     "dispatch_eligibility: uow_id=%s skipped — pattern=throttle "
-                    "(throttle_count=%d >= BURST_BATCH_SIZE=%d)",
-                    uow_id, throttle_count, BURST_BATCH_SIZE,
+                    "(throttle_count=%d >= burst_batch_size=%d)",
+                    uow_id, throttle_count, _effective_burst_batch_size,
                 )
                 if not dry_run:
                     registry.append_audit_log(uow_id, {
