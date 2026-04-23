@@ -243,7 +243,26 @@ class Registry:
     connection, executes within a BEGIN IMMEDIATE transaction, and closes.
     """
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path | None = None) -> None:
+        # Centralise the canonical path resolution here so callers that pass
+        # no argument always reach the live registry.
+        #
+        # Resolution order (first match wins):
+        # 1. Explicit db_path argument from caller.
+        # 2. REGISTRY_DB_PATH env var (overrides canonical default for tests/CI).
+        # 3. Canonical default: ~/lobster-workspace/orchestration/registry.db
+        #
+        # The env var is re-read at call time (not at module import time) so that
+        # tests can set it via monkeypatch before constructing a Registry instance
+        # without needing to reload the paths module.
+        if db_path is None:
+            import os
+            env_override = os.environ.get("REGISTRY_DB_PATH")
+            if env_override:
+                db_path = Path(env_override)
+            else:
+                from src.orchestration.paths import REGISTRY_DB  # local to avoid circular imports
+                db_path = REGISTRY_DB
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._run_migrations()
@@ -1262,6 +1281,81 @@ class Registry:
                     """
                     INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
                     VALUES (?, ?, 'startup_sweep', 'diagnosing', 'ready-for-steward',
+                            'steward', ?)
+                    """,
+                    (now, uow_id, note_json),
+                )
+
+            conn.commit()
+            return rows_affected
+
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def record_startup_sweep_executing(
+        self,
+        uow_id: str,
+        started_at: str | None,
+        age_seconds: float,
+        threshold_seconds: int,
+    ) -> int:
+        """
+        Atomically write a startup_sweep audit entry and transition an
+        `executing` UoW to `ready-for-steward`.
+
+        Used for UoWs that have been stuck in `executing` for longer than
+        threshold_seconds without a heartbeat — i.e. the subagent that was
+        dispatched never called write_result (crashed, lost context, or used
+        the wrong task_id). These UoWs are invisible to the normal
+        ready-for-steward processing loop.
+
+        Follows the optimistic-lock + audit pattern (Principle 1):
+        - UPDATE uses WHERE status = 'executing'.
+        - Audit INSERT written in same transaction only if rows == 1.
+        - Returns 1 on success, 0 if another process already advanced this UoW.
+
+        Args:
+            uow_id: The UoW identifier.
+            started_at: ISO timestamp when the UoW was claimed (for audit note).
+            age_seconds: How long the UoW has been in executing status.
+            threshold_seconds: The threshold that was exceeded (for audit note).
+        """
+        now = _now_iso()
+        note_json = json.dumps({
+            "event": "startup_sweep",
+            "actor": "steward",
+            "classification": "executing_orphan",
+            "output_ref": None,
+            "uow_id": uow_id,
+            "timestamp": now,
+            "prior_status": "executing",
+            "started_at": started_at,
+            "age_seconds": age_seconds,
+            "threshold_seconds": threshold_seconds,
+        })
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            cursor = conn.execute(
+                """
+                UPDATE uow_registry
+                SET status = 'ready-for-steward', updated_at = ?
+                WHERE id = ? AND status = 'executing'
+                """,
+                (now, uow_id),
+            )
+            rows_affected = cursor.rowcount
+
+            if rows_affected == 1:
+                conn.execute(
+                    """
+                    INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                    VALUES (?, ?, 'startup_sweep', 'executing', 'ready-for-steward',
                             'steward', ?)
                     """,
                     (now, uow_id, note_json),
