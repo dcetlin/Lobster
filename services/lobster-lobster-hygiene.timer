@@ -1,0 +1,10 @@
+[Unit]
+Description=Lobster hygiene — system maintenance and cleanup every 3 days
+# LOBSTER-MANAGED
+
+[Timer]
+OnCalendar=*-*-1,4,7,10,13,16,19,22,25,28,31 06:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

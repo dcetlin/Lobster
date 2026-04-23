@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily UoW reflection — review WOS unit-of-work progress
+# LOBSTER-MANAGED
+
+[Timer]
+OnCalendar=*-*-* 06:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=Daily UoW reflection — review WOS unit-of-work progress
+# LOBSTER-MANAGED
+
+[Service]
+Type=oneshot
+User=lobster
+ExecStart=/home/lobster/lobster/scheduled-tasks/dispatch-job.sh uow-reflection

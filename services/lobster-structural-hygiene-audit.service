@@ -1,0 +1,8 @@
+[Unit]
+Description=Annual structural hygiene audit — deep system structure review
+# LOBSTER-MANAGED
+
+[Service]
+Type=oneshot
+User=lobster
+ExecStart=/home/lobster/lobster/scheduled-tasks/dispatch-job.sh structural-hygiene-audit

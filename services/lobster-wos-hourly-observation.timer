@@ -1,0 +1,10 @@
+[Unit]
+Description=WOS hourly observation — monitor pipeline health 06-12 UTC
+# LOBSTER-MANAGED
+
+[Timer]
+OnCalendar=*-*-* 06,07,08,09,10,11,12:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -2923,6 +2923,65 @@ except Exception as e:
         substep "Migration 86: legacy wos-registry.db not present — skipping"
     fi
 
+    # Migration 87: Install systemd timer+service units for 10 LLM scheduled jobs
+    # previously run via cron (issue #869). Copies unit files from services/ in the
+    # repo to /etc/systemd/system/, then enables and starts each timer. Idempotent:
+    # skips any timer that is already installed and enabled.
+    local llm_jobs=(
+        weekly-epistemic-retro
+        lobster-hygiene
+        pattern-candidate-sweep
+        morning-briefing
+        uow-reflection
+        structural-hygiene-audit
+        upstream-sync
+        lobster-hygiene-biweekly
+        github-issue-cultivator
+        wos-hourly-observation
+    )
+    local m87_count=0
+    for job in "${llm_jobs[@]}"; do
+        local timer_name="lobster-${job}.timer"
+        local service_name="lobster-${job}.service"
+        local src_timer="$LOBSTER_DIR/services/${timer_name}"
+        local src_service="$LOBSTER_DIR/services/${service_name}"
+        local dst="/etc/systemd/system"
+
+        # Copy unit files if source exists and destination differs or is absent
+        if [ -f "$src_timer" ] && [ -f "$src_service" ]; then
+            local needs_install=false
+            if [ ! -f "$dst/$timer_name" ]; then
+                needs_install=true
+            fi
+            if $needs_install; then
+                if sudo cp "$src_timer" "$dst/$timer_name" && sudo cp "$src_service" "$dst/$service_name"; then
+                    substep "Installed $timer_name (Migration 87)"
+                    m87_count=$((m87_count + 1))
+                else
+                    warn "Could not install $timer_name — check sudo permissions"
+                    continue
+                fi
+            fi
+            # Enable and start if not already active
+            if ! systemctl is-enabled --quiet "$timer_name" 2>/dev/null; then
+                sudo systemctl daemon-reload 2>/dev/null || true
+                sudo systemctl enable --now "$timer_name" 2>/dev/null \
+                    && substep "Enabled $timer_name" \
+                    || warn "Could not enable $timer_name"
+                m87_count=$((m87_count + 1))
+            fi
+        else
+            substep "Unit file $timer_name not found in repo — skipping (run after git pull)"
+        fi
+    done
+    if [ "$m87_count" -gt 0 ]; then
+        sudo systemctl daemon-reload 2>/dev/null || true
+        success "Migration 87: installed/enabled $m87_count LLM job timer unit(s)"
+        migrated=$((migrated + m87_count))
+    else
+        substep "Migration 87: all LLM job timers already installed — skipping"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
