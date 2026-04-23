@@ -505,6 +505,7 @@ class ReentryPosture(StrEnum):
     EXECUTION_FAILED = "execution_failed"
     EXECUTOR_ORPHAN = "executor_orphan"
     DIAGNOSING_ORPHAN = "diagnosing_orphan"
+    EXECUTING_ORPHAN = "executing_orphan"  # subagent dispatched via inbox, write_result never received (#858)
 
 
 class ReturnReasonClassification(StrEnum):
@@ -727,6 +728,7 @@ _RETURN_REASON_CLASSIFICATIONS: dict[str, str] = {
     "crashed_output_ref_missing": _CLASSIFICATION_ERROR,
     "executor_orphan": _CLASSIFICATION_ORPHAN,
     "diagnosing_orphan": _CLASSIFICATION_ORPHAN,
+    "executing_orphan": _CLASSIFICATION_ORPHAN,  # subagent dispatched but write_result never received (#858)
 }
 
 
@@ -950,6 +952,8 @@ def _determine_reentry_posture(
                     return "executor_orphan"
                 elif clf == "diagnosing_orphan":
                     return "diagnosing_orphan"
+                elif clf == "executing_orphan":
+                    return "executing_orphan"
             elif event == "execution_failed":
                 return "execution_failed"
 
@@ -1134,6 +1138,8 @@ def _posture_rationale(diagnosis: Diagnosis, cycles: int, trace_posture: str | N
                 return "Executor crash detected — analyzing failure for recovery."
             if posture == "executor_orphan":
                 return "Executor never claimed UoW — re-prescribing."
+            if posture == "executing_orphan":
+                return "Subagent dispatched but write_result never received — re-prescribing."
             return "Unexpected state encountered — investigating."
         elif trace_posture == "closing_with_discovery":
             return "Completion criteria satisfied — closing with findings documented."
@@ -1152,6 +1158,8 @@ def _posture_rationale(diagnosis: Diagnosis, cycles: int, trace_posture: str | N
             return "UoW stuck in ready-for-executor beyond threshold — executor never claimed."
         case "diagnosing_orphan":
             return "Steward crashed mid-diagnosis — re-diagnosing from current state."
+        case "executing_orphan":
+            return "UoW stuck in executing — subagent dispatched but write_result never received (#858)."
         case "steward_cycle_cap":
             return f"Steward cycle cap reached ({cycles} cycles) — surfacing to Dan."
         case _:
@@ -1199,6 +1207,8 @@ def _posture_prediction(diagnosis: Diagnosis) -> str | None:
             return "Re-prescription will be issued after failure analysis."
         case "executor_orphan":
             return "Re-prescription will be issued — executor never claimed UoW."
+        case "executing_orphan":
+            return "Re-prescription will be issued — subagent dispatched but write_result never received."
         case _:
             return "Next prescription will be determined from diagnosis output."
 
@@ -1253,6 +1263,7 @@ def _determine_trace_posture(diagnosis: Diagnosis) -> str:
         "execution_failed",
         "executor_orphan",
         "diagnosing_orphan",
+        "executing_orphan",
         "stall_detected",
     ):
         return "scope_challenged"
@@ -2402,6 +2413,7 @@ def _build_deterministic_prescription_instructions(
         "execution_failed": "Previous execution failed. Diagnose the failure and re-execute.",
         "executor_orphan": "Executor never ran on this UoW. Execute fresh.",
         "diagnosing_orphan": "Steward crashed mid-diagnosis. Re-diagnosing from current state.",
+        "executing_orphan": "Subagent was dispatched but never called write_result (crashed or lost context). Re-execute fresh.",
     }
 
     posture_msg = posture_context.get(reentry_posture, "Continue from previous attempt.")
