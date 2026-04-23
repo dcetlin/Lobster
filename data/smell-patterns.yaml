@@ -1,0 +1,75 @@
+# Smell Pattern Registry
+# Populated by system retrospective. Each entry is a recurring anti-pattern
+# detected in Lobster's operation. Used by the system-retrospective job for
+# automated detection and issue filing.
+version: 1
+patterns:
+  - id: write_result_not_back_propagated
+    name: "write_result not back-propagated to executor output"
+    description: "Subagents call write_result but the executor output file receives only a dispatch receipt, not the result payload. The executor cannot confirm completion at next sweep. Every steward spiral re-runs 'is this done?' against records with zero evidence content. Root cause: executor-heartbeat.py does not intercept write_result responses to back-propagate result text and status to the UoW output file."
+    detection_heuristic: "count UoWs in registry with outcome_unverifiable > threshold"
+    threshold: 5
+    severity: high
+    issue_template: "write_result back-propagation missing — N UoWs unverifiable"
+    github_label: "wos-observability"
+    recurrence_count: 1
+    first_detected: "2026-04-23"
+    last_detected: "2026-04-23"
+    issue_ref: "dcetlin/Lobster#867"
+    status: open
+
+  - id: bare_python3_in_migrations
+    name: "bare python3 in upgrade.sh migrations"
+    description: "upgrade.sh migrations use bare python3 or python instead of uv run. The CLAUDE.md rule requiring uv run instead of python3 exists, but enforcement does not. Oracle review caught it in PR #866 learnings. This is a hygiene enforcement gap, not a knowledge gap — it has recurred 4 times."
+    detection_heuristic: "grep 'python3\\|python ' scripts/upgrade.sh | grep -v uv"
+    threshold: 1
+    severity: medium
+    issue_template: "bare python3 in upgrade.sh — recurring anti-pattern (Nth recurrence)"
+    github_label: "hygiene"
+    recurrence_count: 4
+    first_detected: "2026-04-22"
+    last_detected: "2026-04-23"
+    issue_ref: null
+    status: open
+
+  - id: oracle_dual_write_no_enforcement
+    name: "oracle dual-write (decisions.md + oracle/verdicts/) with no enforcement"
+    description: "Oracle agents write to both decisions.md and oracle/verdicts/ simultaneously. PR #865 declared oracle/verdicts/pr-{N}.md as canonical. PR #875 deprecated decisions.md and archived it, but agent prompt templates were not audited to confirm decisions.md write paths were fully removed. The deprecation was structural but behavioral enforcement was not verified complete."
+    detection_heuristic: "grep 'decisions.md' .claude/agents/lobster-oracle.md"
+    threshold: 1
+    severity: medium
+    issue_template: "oracle dual-write path still active — decisions.md write not fully removed from agent templates"
+    github_label: "oracle"
+    recurrence_count: 2
+    first_detected: "2026-04-22"
+    last_detected: "2026-04-23"
+    issue_ref: null
+    status: open
+
+  - id: rolling_summary_bloat
+    name: "rolling-summary.md bloat fix agreed but not automated"
+    description: "rolling-summary.md exceeds 50 lines and is not overwritten on each session-consolidation run. Design decision (overwrite to 50-line snapshot) was agreed and recorded but no agent has been assigned to implement it. The bloat amplifies each compaction — each one costs more reconstruction overhead than necessary. This fix has been carried as a thread item for 3+ sessions."
+    detection_heuristic: "wc -l ~/lobster-user-config/memory/canonical/rolling-summary.md | awk '$1 > 50'"
+    threshold: 50
+    severity: medium
+    issue_template: "rolling-summary.md exceeds 50 lines — overwrite logic not yet wired"
+    github_label: "hygiene"
+    recurrence_count: 3
+    first_detected: "2026-04-21"
+    last_detected: "2026-04-23"
+    issue_ref: null
+    status: open
+
+  - id: health_probe_memory_saturation
+    name: "health probes saturating vector memory"
+    description: "Cron heartbeats and health pings are written to the vector memory DB alongside meaningful semantic events, degrading memory retrieval signal-to-noise over time. The type discriminator (type: health_probe, type: cron_heartbeat) is already present in message metadata but not used as an ingestion filter gate."
+    detection_heuristic: "count memory entries with event_type=health_probe or sender=system"
+    threshold: 100
+    severity: low
+    issue_template: "health probe filter gate missing — N probe entries polluting vector memory"
+    github_label: "memory"
+    recurrence_count: 2
+    first_detected: "2026-04-22"
+    last_detected: "2026-04-23"
+    issue_ref: null
+    status: open
