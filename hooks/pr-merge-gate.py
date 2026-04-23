@@ -4,8 +4,11 @@ the PR.
 
 The PR Merge Gate in CLAUDE.md requires that every code PR pass oracle review before
 merge. This hook enforces that requirement mechanically: any 'gh pr merge <N>' command
-is blocked unless oracle/decisions.md contains a 'VERDICT: APPROVED' entry for PR #N
-as its most recent verdict.
+is blocked unless the oracle has written an APPROVED verdict for PR #N.
+
+Verdict lookup order:
+1. oracle/verdicts/pr-{N}.md — first line must be 'VERDICT: APPROVED'
+2. oracle/decisions.md (legacy fallback) — **VERDICT: APPROVED** prose marker
 
 If no oracle entry exists for the PR, a warning is printed but the merge is not
 blocked — the PR may be infrastructure-level or pre-oracle.
@@ -21,6 +24,7 @@ from pathlib import Path
 
 
 DECISIONS_FILE = Path(__file__).parent.parent / "oracle" / "decisions.md"
+VERDICTS_DIR = Path(__file__).parent.parent / "oracle" / "verdicts"
 
 
 def extract_pr_number(command: str) -> "int | None":
@@ -52,8 +56,25 @@ def find_oracle_verdict(pr_number: int) -> "str | None":
     """Find the most recent oracle verdict for a PR number.
 
     Returns 'APPROVED', 'NEEDS_CHANGES', or None if no entry exists.
-    The most recent entry is the topmost section in the file.
+
+    Lookup order:
+    1. oracle/verdicts/pr-{number}.md — first line must be exactly
+       'VERDICT: APPROVED' or 'VERDICT: NEEDS_CHANGES'
+    2. oracle/decisions.md (legacy) — searches for **VERDICT: ...** prose
+       markers; used for PRs reviewed before the per-file format was adopted
     """
+    # New format: per-PR verdict file
+    verdict_file = VERDICTS_DIR / f"pr-{pr_number}.md"
+    if verdict_file.exists():
+        first_line = verdict_file.read_text().splitlines()[0].strip()
+        if first_line == "VERDICT: APPROVED":
+            return "APPROVED"
+        if first_line == "VERDICT: NEEDS_CHANGES":
+            return "NEEDS_CHANGES"
+        # File exists but first line is neither expected value — treat as unknown
+        return "UNKNOWN"
+
+    # Legacy fallback: oracle/decisions.md prose format
     if not DECISIONS_FILE.exists():
         return None
 
@@ -62,7 +83,6 @@ def find_oracle_verdict(pr_number: int) -> "str | None":
     # Split into sections by ### [
     sections = re.split(r'(?=### \[)', content)
 
-    pr_token = f"PR #{pr_number}"
     pr_boundary_re = re.compile(rf'PR #{re.escape(str(pr_number))}(?!\d)')
 
     for section in sections:
@@ -113,7 +133,8 @@ if verdict is None:
     # No oracle entry — warn but do not block (may be pre-oracle or infrastructure)
     print(
         f"WARNING: gh pr merge attempted for PR #{pr_number} but no oracle entry found in "
-        f"oracle/decisions.md. Allowing merge — add an oracle review if this is a code PR.",
+        f"oracle/verdicts/pr-{pr_number}.md or oracle/decisions.md. "
+        f"Allowing merge — add an oracle review if this is a code PR.",
         file=sys.stderr,
     )
     sys.exit(0)
@@ -123,7 +144,8 @@ if verdict == 'APPROVED':
 
 print(
     f"BLOCKED: gh pr merge attempted for PR #{pr_number} but oracle verdict is {verdict} (not APPROVED).\n"
-    "Run the oracle agent first and confirm APPROVED appears in oracle/decisions.md before merging.\n"
+    f"Run the oracle agent first and confirm oracle/verdicts/pr-{pr_number}.md first line is "
+    f"'VERDICT: APPROVED' before merging.\n"
     "PR Merge Gate — see Tier-1 Gate Register in CLAUDE.md.",
     file=sys.stderr,
 )
