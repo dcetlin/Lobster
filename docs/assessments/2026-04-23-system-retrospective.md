@@ -169,7 +169,7 @@ Ranked by estimated token/cycle cost (highest to lowest):
 
 ### Tier 3 — Feedback Loop Infrastructure (design and document; do not implement without Dan approval)
 
-9. **Smell pattern registry** (`~/lobster/data/smell-patterns.yaml`) — Machine-readable registry of named smell patterns with detection heuristics, severity, threshold, and issue templates. Enables automated smell detection in future retrospectives.
+9. **Smell pattern registry** (`~/lobster/oracle/smell-patterns.yaml`) — Machine-readable registry of named smell patterns with detection heuristics, severity, threshold, and issue templates. Enables automated smell detection in future retrospectives.
 
 10. **Automated system-retrospective scheduled job** — Weekly + on-demand retrospective that scans git log, PRs, UoW registry, and session notes; computes metabolic ratios; checks against smell registry; outputs to `~/lobster-workspace/assessments/YYYY-MM-DD-auto-retrospective.md`; injects newly-detected smells into WOS queue as GitHub issues.
 
@@ -200,7 +200,7 @@ Close the observation-to-behavioral-change loop: retrospective detects smell →
 - Shit = UoW that failed or left only a dispatch receipt
 
 **Smell detection phase:**
-- Compare detected patterns against `~/lobster/data/smell-patterns.yaml` registry
+- Compare detected patterns against `~/lobster/oracle/smell-patterns.yaml` registry
 - Match by detection heuristic (e.g., "grep `python3` in upgrade.sh migrations", "count UoWs with `outcome_unverifiable`", "check rolling-summary.md line count")
 - Flag any smell above its defined threshold
 
@@ -220,7 +220,7 @@ Close the observation-to-behavioral-change loop: retrospective detects smell →
 
 ### Smell Registry Format
 
-`~/lobster/data/smell-patterns.yaml` — each entry:
+`~/lobster/oracle/smell-patterns.yaml` — each entry:
 
 ```yaml
 - name: "write_result-not-back-propagated"
