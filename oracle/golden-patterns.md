@@ -228,3 +228,15 @@ StartupSweepResult = _sweep_mod.StartupSweepResult
 **Where it appears:** `hooks/dispatch-template-check.py` and `hooks/pr-merge-gate.py` (PR #825). The learnings.md addition in the same PR names the non-promotable gates and their reason. `scripts/upgrade.sh` Migrations 80 and 81 install the hooks on existing instances with idempotency guards.
 
 **Reuse guidance:** Before promoting any advisory gate to a hook: (1) State the gate's enforcement condition as a string pattern in one sentence. (2) Ask: does any legitimate use of the tool produce a false positive? If no → promote. If yes → refine the pattern or keep advisory. (3) Write the non-promotable reasoning at the same time — what the hook does not check is as important as what it does. (4) Add idempotency guards to the migration using the command string as the uniqueness key, consistent with the existing upgrade.sh hook registration pattern.
+
+---
+
+### [2026-04-23] Pattern: slow-section carry-forward in overwrite-snapshot files
+
+**Pattern:** When a shared memory file is written by multiple agents using a full-overwrite pattern (to prevent unbounded accumulation), designate one section as "Stable Context" — content that changes rarely (infrastructure, contacts, long-term goals) — and carry it forward verbatim from the prior file. All other sections are synthesized fresh from current signals. This prevents the overwrite pattern from silently discarding slow-moving context that no single run's signals would reconstruct.
+
+**Why it works:** A pure overwrite loses any context not visible in the current run's signal window. A pure carry-forward accumulates stale content indefinitely. The slow-section designation is the correct partition: sections that reflect current state (open PRs, recent decisions, active threads) are re-synthesized each run; sections that reflect stable facts (who the contacts are, what infra is running, what the long-term goals are) are carried verbatim unless the current run's signals explicitly change them. The partition is explicit and named — agents know exactly which section survives rewrites and why.
+
+**Where it appears:** `compact-catchup.md` Phase 3 (step 14) and `nightly-consolidation.md` step 3, both updated in PR #892. The "Stable Context" section is the designated slow section in both agents.
+
+**Reuse guidance:** Apply whenever a memory file is shared between multiple agents using an overwrite pattern. Identify the sections by update rate: (1) fast-moving sections (current work, recent decisions, active threads) — re-synthesize each run; (2) slow-moving sections (contacts, infra, long-term goals) — carry forward verbatim. Name the slow section explicitly in the file's structure and in the agent instructions. Require that both agents use the same section names and the same carry-forward rule — asymmetric rules between agents produce structural variation in the file that downstream readers must handle.
