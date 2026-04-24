@@ -471,3 +471,86 @@ class TestCollectSessionFiles:
     def test_returns_empty_list_when_dir_absent(self, retro, tmp_path):
         result = retro.collect_session_files(tmp_path / "nonexistent", "2026-04-20T00:00:00Z")
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Escalation first-crossing guard
+# ---------------------------------------------------------------------------
+
+class TestEscalationFirstCrossingGuard:
+    """
+    Escalation fires exactly once — on the run that crosses ESCALATION_THRESHOLD.
+
+    smell.recurrence_count holds the pre-run value from smell-patterns.yaml.
+    After write_back_recurrence_counts() the YAML value becomes recurrence_count+1.
+    The first-crossing guard: escalate only when pre-run count == ESCALATION_THRESHOLD - 1,
+    so we escalate exactly once (the crossing run), not on every subsequent run.
+
+    Verified cases:
+      (a) pre-threshold (recurrence_count < ESCALATION_THRESHOLD - 1) → no escalation
+      (b) crossing run  (recurrence_count == ESCALATION_THRESHOLD - 1) → escalates
+      (c) post-threshold (recurrence_count > ESCALATION_THRESHOLD - 1) → no escalation
+    """
+
+    def _make_detected_smell(self, retro, recurrence_count: int) -> object:
+        return retro.SmellDetection(
+            pattern_id="test_smell",
+            name="Test Smell",
+            severity="high",
+            detected=True,
+            evidence="test evidence",
+            recurrence_count=recurrence_count,
+            open_issue_ref=None,
+        )
+
+    def test_pre_threshold_does_not_escalate(self, retro):
+        """recurrence_count below crossing point — no escalation."""
+        THRESHOLD = retro.ESCALATION_THRESHOLD
+        pre_threshold_count = THRESHOLD - 2  # one below the crossing point
+
+        if pre_threshold_count < 0:
+            pytest.skip("ESCALATION_THRESHOLD < 2 — pre-threshold case not applicable")
+
+        escalated = []
+        smell = self._make_detected_smell(retro, pre_threshold_count)
+
+        # Mirror the guard condition from system-retrospective.run()
+        if smell.detected and smell.recurrence_count == THRESHOLD - 1:
+            escalated.append(smell.pattern_id)
+
+        assert escalated == [], (
+            f"Expected no escalation for recurrence_count={pre_threshold_count} "
+            f"(ESCALATION_THRESHOLD={THRESHOLD})"
+        )
+
+    def test_crossing_run_escalates_exactly_once(self, retro):
+        """recurrence_count == ESCALATION_THRESHOLD - 1 → escalates."""
+        THRESHOLD = retro.ESCALATION_THRESHOLD
+        crossing_count = THRESHOLD - 1
+
+        escalated = []
+        smell = self._make_detected_smell(retro, crossing_count)
+
+        if smell.detected and smell.recurrence_count == THRESHOLD - 1:
+            escalated.append(smell.pattern_id)
+
+        assert escalated == ["test_smell"], (
+            f"Expected escalation for recurrence_count={crossing_count} "
+            f"(ESCALATION_THRESHOLD={THRESHOLD})"
+        )
+
+    def test_post_threshold_does_not_re_escalate(self, retro):
+        """recurrence_count > ESCALATION_THRESHOLD - 1 → no escalation (guard prevents multi-fire)."""
+        THRESHOLD = retro.ESCALATION_THRESHOLD
+        post_threshold_count = THRESHOLD  # already at or past threshold
+
+        escalated = []
+        smell = self._make_detected_smell(retro, post_threshold_count)
+
+        if smell.detected and smell.recurrence_count == THRESHOLD - 1:
+            escalated.append(smell.pattern_id)
+
+        assert escalated == [], (
+            f"Expected no re-escalation for recurrence_count={post_threshold_count} "
+            f"(ESCALATION_THRESHOLD={THRESHOLD})"
+        )

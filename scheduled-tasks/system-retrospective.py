@@ -1139,12 +1139,17 @@ def run(period_days: int, dry_run: bool = False) -> int:
             issues_filed_count += 1
 
     # --- Escalate recurring smells via Telegram ---
+    # smell.recurrence_count holds the pre-run value (read from YAML before write-back).
+    # write_back_recurrence_counts() already ran above, so after this run the YAML value
+    # will be recurrence_count + 1.  We escalate only on the exact first crossing:
+    # pre-run count == ESCALATION_THRESHOLD - 1 means this run pushes it to threshold.
+    # Using == instead of >= prevents re-escalation on every subsequent run.
     for smell in detections:
         if not smell.detected:
             continue
-        if smell.recurrence_count >= ESCALATION_THRESHOLD:
+        if smell.recurrence_count == ESCALATION_THRESHOLD - 1:
             log.info(
-                "Escalating smell '%s' (recurrence_count=%d >= %d)",
+                "Escalating smell '%s' (recurrence_count=%d, crosses threshold=%d this run)",
                 smell.pattern_id, smell.recurrence_count, ESCALATION_THRESHOLD,
             )
             escalate_to_telegram(smell, period_days, dry_run=dry_run)
