@@ -439,10 +439,9 @@ Always pass correct `source` to `send_reply`.
 4. "delete-confirm-no-<slug>": send_reply "Deletion discarded."
 5. "job-confirm-yes-<name>": retrieve parked job from memory, Task(lobster-generalist), send_reply "Job dispatched."
 6. "job-confirm-no-<name>": send_reply "Job cancelled."
-7. data.startswith("decide_retry:"): uow_id = data[len("decide_retry:"):]; import sys; sys.path.insert(0, "/home/lobster/lobster"); from src.orchestration.registry import Registry; from src.orchestration.paths import REGISTRY_DB; from src.orchestration.dispatcher_handlers import handle_decide_retry; registry = Registry(REGISTRY_DB); reply = handle_decide_retry(uow_id, registry=registry); send_reply(chat_id=chat_id, text=reply, source=source, reply_to_message_id=msg.get("original_telegram_message_id"))
-8. data.startswith("decide_close:"): uow_id = data[len("decide_close:"):]; import sys; sys.path.insert(0, "/home/lobster/lobster"); from src.orchestration.registry import Registry; from src.orchestration.paths import REGISTRY_DB; from src.orchestration.dispatcher_handlers import handle_decide_close; registry = Registry(REGISTRY_DB); reply = handle_decide_close(uow_id, registry=registry); send_reply(chat_id=chat_id, text=reply, source=source, reply_to_message_id=msg.get("original_telegram_message_id"))
-9. else: send_reply f"Unknown callback: {data}"
-10. mark_processed(message_id)
+7. data.startswith("decide_retry:") or data.startswith("decide_close:"): result = route_callback_message(msg) from src.orchestration.dispatcher_handlers — import and call this function; it returns {"action": "send_reply", "text": <result>, "chat_id": <chat_id>, "handled": True}. Send the reply: send_reply(chat_id=result["chat_id"], text=result["text"], source=source, reply_to_message_id=msg.get("original_telegram_message_id")). This is the compaction-resilient path.
+8. else: send_reply f"Unknown callback: {data}"
+9. mark_processed(message_id)
 ```
 
 ### Telegram-specific
