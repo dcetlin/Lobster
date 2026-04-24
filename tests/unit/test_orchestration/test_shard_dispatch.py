@@ -9,17 +9,19 @@ Design:
 Named constants used (from shard_dispatch.py):
   DEFAULT_MAX_PARALLEL = 2
 
-Behaviors verified:
+Behaviors verified (issue #912 semantics — null file_scope = independent):
 - No in-flight UoWs: any candidate is allowed (regardless of scope)
 - max_parallel cap: blocked when in-flight count >= max_parallel
-- Exclusive candidate (null file_scope): blocked when anything is executing
-- Exclusive in-flight (null file_scope): blocks all candidates
+- Null file_scope candidate: ALLOWED when in-flight UoWs have annotated scopes
+  (null = independent, not exclusive — issue #912 changed this)
+- Null file_scope candidate: ALLOWED alongside null-scope in-flight UoWs
+  (two unannotated UoWs do not block each other)
 - Shard serialization: same shard_id blocks candidate
 - Different shards: allowed when shard_ids differ
-- File scope overlap (exact): blocked
+- File scope overlap (exact): blocked when BOTH sides have explicit scopes
 - File scope overlap (prefix): blocked (directory covers file)
 - No overlap: allowed
-- Scope overlap check skipped when candidate has null scope (already blocked by gate 2a)
+- Null in-flight scope does NOT block annotated-scope candidates (gate skips null in-flight)
 - max_parallel=1 enforces strict serialization
 - Prescribed UoWs accumulated within a cycle block subsequent candidates correctly
 
@@ -205,12 +207,23 @@ class TestMaxParallelCap:
 
 
 # ---------------------------------------------------------------------------
-# Tests: gate 2 — null file_scope (exclusive mode)
+# Tests: null file_scope = independent (issue #912 semantics)
 # ---------------------------------------------------------------------------
 
-class TestExclusiveMode:
-    def test_null_scope_candidate_blocked_when_anything_executing(self):
-        """Unknown scope candidate is exclusive — blocked if any UoW is executing."""
+class TestNullScopeIndependent:
+    """
+    Issue #912 changed null file_scope from "exclusive" to "independent".
+
+    Old behavior: a null-scope candidate was blocked by any in-flight UoW;
+    a null-scope in-flight UoW blocked all candidates.
+
+    New behavior: null file_scope means "no explicit annotation" — the UoW
+    proceeds unless the max_parallel cap or a shard constraint fires. Null-
+    scope UoWs do not conflict with each other or with annotated UoWs.
+    """
+
+    def test_null_scope_candidate_allowed_alongside_annotated_in_flight(self):
+        """Null-scope candidate is allowed when in-flight UoW has an annotated scope."""
         executing = [_stub("uow_a", file_scope=["src/foo.py"])]
         decision = check_shard_dispatch_eligibility(
             candidate_file_scope=None,
@@ -218,11 +231,10 @@ class TestExclusiveMode:
             executing_uows=executing,
             max_parallel=DEFAULT_MAX_PARALLEL,
         )
-        assert isinstance(decision, DispatchBlocked)
-        assert "exclusive" in decision.reason
+        assert isinstance(decision, DispatchAllowed)
 
     def test_null_scope_candidate_allowed_when_nothing_executing(self):
-        """Unknown scope candidate is allowed only when executing list is empty."""
+        """Null-scope candidate is allowed when executing list is empty."""
         decision = check_shard_dispatch_eligibility(
             candidate_file_scope=None,
             candidate_shard_id=None,
@@ -231,20 +243,19 @@ class TestExclusiveMode:
         )
         assert isinstance(decision, DispatchAllowed)
 
-    def test_null_scope_in_flight_blocks_any_candidate(self):
-        """An in-flight UoW with null scope is exclusive — blocks all candidates."""
-        executing = [_stub("uow_a", file_scope=None)]  # exclusive in-flight
+    def test_null_scope_in_flight_does_not_block_annotated_candidate(self):
+        """Null-scope in-flight UoW is independent — does not block annotated candidates."""
+        executing = [_stub("uow_a", file_scope=None)]
         decision = check_shard_dispatch_eligibility(
             candidate_file_scope=["src/bar.py"],
             candidate_shard_id=None,
             executing_uows=executing,
             max_parallel=DEFAULT_MAX_PARALLEL,
         )
-        assert isinstance(decision, DispatchBlocked)
-        assert "exclusive" in decision.reason
+        assert isinstance(decision, DispatchAllowed)
 
-    def test_both_null_scope_blocked_when_in_flight(self):
-        """Null candidate + null in-flight — candidate is blocked by gate 2a."""
+    def test_two_null_scope_uows_do_not_block_each_other(self):
+        """Null-scope candidate + null-scope in-flight — both independent, candidate allowed."""
         executing = [_stub("uow_a", file_scope=None)]
         decision = check_shard_dispatch_eligibility(
             candidate_file_scope=None,
@@ -252,7 +263,34 @@ class TestExclusiveMode:
             executing_uows=executing,
             max_parallel=DEFAULT_MAX_PARALLEL,
         )
+        assert isinstance(decision, DispatchAllowed)
+
+    def test_null_scope_still_blocked_by_max_parallel(self):
+        """Null-scope candidate is still blocked when max_parallel cap is reached."""
+        executing = [
+            _stub("uow_a", file_scope=None),
+            _stub("uow_b", file_scope=None),
+        ]
+        decision = check_shard_dispatch_eligibility(
+            candidate_file_scope=None,
+            candidate_shard_id=None,
+            executing_uows=executing,
+            max_parallel=DEFAULT_MAX_PARALLEL,  # == 2, both slots filled
+        )
         assert isinstance(decision, DispatchBlocked)
+        assert "max_parallel" in decision.reason
+
+    def test_null_scope_still_blocked_by_shard_constraint(self):
+        """Null-scope candidate is blocked when its shard matches an in-flight UoW's shard."""
+        executing = [_stub("uow_a", file_scope=None, shard_id="wos-core")]
+        decision = check_shard_dispatch_eligibility(
+            candidate_file_scope=None,
+            candidate_shard_id="wos-core",
+            executing_uows=executing,
+            max_parallel=DEFAULT_MAX_PARALLEL,
+        )
+        assert isinstance(decision, DispatchBlocked)
+        assert "wos-core" in decision.reason
 
 
 # ---------------------------------------------------------------------------
@@ -392,20 +430,20 @@ class TestGatePriority:
         assert isinstance(decision, DispatchBlocked)
         assert "max_parallel" in decision.reason
 
-    def test_exclusive_candidate_fires_before_shard_check(self):
-        """Null scope candidate gate fires before shard gate."""
+    def test_shard_check_fires_before_scope_overlap(self):
+        """Shard gate fires before file_scope overlap gate."""
         executing = [_stub("uow_a", file_scope=["src/foo.py"], shard_id="wos-core")]
         decision = check_shard_dispatch_eligibility(
-            candidate_file_scope=None,
-            candidate_shard_id="other-shard",  # would pass shard gate
+            candidate_file_scope=["src/different.py"],  # no overlap — scope gate would pass
+            candidate_shard_id="wos-core",              # shard gate fires first
             executing_uows=executing,
             max_parallel=DEFAULT_MAX_PARALLEL,
         )
         assert isinstance(decision, DispatchBlocked)
-        assert "exclusive" in decision.reason
+        assert "wos-core" in decision.reason
 
-    def test_exclusive_in_flight_fires_before_scope_check(self):
-        """Null in-flight scope fires before gate 4 (file scope overlap)."""
+    def test_null_in_flight_scope_skipped_in_overlap_check(self):
+        """Null in-flight scope is skipped in gate 3 — annotated candidate is allowed."""
         executing = [_stub("uow_a", file_scope=None)]
         decision = check_shard_dispatch_eligibility(
             candidate_file_scope=["src/totally_different.py"],
@@ -413,8 +451,8 @@ class TestGatePriority:
             executing_uows=executing,
             max_parallel=DEFAULT_MAX_PARALLEL,
         )
-        assert isinstance(decision, DispatchBlocked)
-        assert "exclusive" in decision.reason
+        # Old behavior: blocked (exclusive). New behavior: allowed (independent).
+        assert isinstance(decision, DispatchAllowed)
 
 
 # ---------------------------------------------------------------------------

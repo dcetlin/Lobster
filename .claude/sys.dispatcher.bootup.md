@@ -415,6 +415,34 @@ from src.orchestration.dispatcher_handlers import route_wos_message
 
 ---
 
+---
+
+### steward_trigger (`type: "steward_trigger"`)
+
+Written by `wos_completion.py` after an executing → ready-for-steward transition (issue #912). Triggers an immediate steward prescription cycle without waiting for the 0–3 minute cron tick.
+
+**Route through `route_wos_message` — same as `wos_execute`.**
+
+```python
+from src.orchestration.dispatcher_handlers import route_wos_message
+
+1. mark_processing(message_id)
+2. routing = route_wos_message(msg)
+   # routing["action"]       == "spawn_subagent"
+   # routing["task_id"]      == f"steward-trigger-{uow_id[:8]}"
+   # routing["prompt"]       == subagent prompt to run steward-heartbeat.py
+   # routing["agent_type"]   == "lobster-generalist"
+   # routing["message_type"] == "steward_trigger"
+
+3. Task(
+       prompt=routing["prompt"],
+       subagent_type=routing["agent_type"],
+       run_in_background=True,
+       task_id=routing["task_id"],
+   )
+4. mark_processed(message_id)
+```
+
 ### wfm_watchdog (`type: "wfm_watchdog"`)
 
 `mark_processed(message_id)` then `wait_for_messages()`. Never `send_reply`. No-op.

@@ -534,7 +534,58 @@ def handle_wos_stop() -> str:
 WOS_MESSAGE_TYPE_DISPATCH: dict[str, str] = {
     # message type → handler name (used as a stable, compaction-safe key)
     "wos_execute": "handle_wos_execute",
+    # Post-completion steward trigger (issue #912): written by wos_completion.py
+    # after executing → ready-for-steward transition. Dispatcher calls
+    # handle_steward_trigger() which returns a spawn_subagent action, running
+    # the steward heartbeat as a background subagent (7-second rule compliant),
+    # bypassing the 0–3 minute cron wait.
+    "steward_trigger": "handle_steward_trigger",
 }
+
+
+def handle_steward_trigger(uow_id: str) -> dict[str, Any]:
+    """
+    Handle a steward_trigger inbox message by spawning a background subagent.
+
+    Called by route_wos_message when the dispatcher receives a message with
+    type="steward_trigger". This is the post-completion event-driven path
+    (issue #912): rather than waiting up to 3 minutes for the next cron tick,
+    the dispatcher spawns a background subagent to run the steward heartbeat
+    immediately after a UoW completes.
+
+    Returns a spawn_subagent action so the dispatcher runs the steward heartbeat
+    as a background subagent, consistent with how wos_execute messages are handled
+    and compliant with the 7-second rule (no synchronous subprocess blocking).
+    The 3-minute cron remains the recovery fallback if the subagent fails.
+
+    Returns:
+        A dict with action="spawn_subagent" containing the task_id, agent_type,
+        and prompt for the dispatcher to pass to the background Task call.
+
+    Args:
+        uow_id: The UoW whose completion triggered this message.
+    """
+    steward_script = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), '..', '..', 'scheduled-tasks', 'steward-heartbeat.py')
+    )
+    task_id = f"steward-trigger-{uow_id[:8]}"
+    return {
+        "action": "spawn_subagent",
+        "task_id": task_id,
+        "agent_type": "lobster-generalist",
+        "prompt": (
+            f"---\n"
+            f"task_id: {task_id}\n"
+            f"---\n\n"
+            f"Run the steward heartbeat to process newly completed UoW {uow_id}:\n\n"
+            f"```bash\n"
+            f"cd ~/lobster-workspace && uv run python {steward_script}\n"
+            f"```\n\n"
+            f"Then call write_result with the steward output.\n\n"
+            f"Minimum viable output: steward heartbeat completed.\n"
+            f"Boundary: do not modify any UoW status directly."
+        ),
+    }
 
 
 def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
@@ -558,8 +609,8 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
         A dict with the following keys:
 
         ``action`` (str):
-            What the dispatcher must do.  Currently always ``"spawn_subagent"``
-            for ``wos_execute`` messages.
+            What the dispatcher must do.  ``"spawn_subagent"`` for both
+            ``wos_execute`` and ``steward_trigger`` messages.
 
         ``task_id`` (str):
             The ``task_id`` to pass to the Task tool (e.g. ``"wos-<uow_id>"``).
@@ -630,6 +681,12 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
             "agent_type": agent_type,
             "message_type": msg_type,
         }
+
+    if msg_type == "steward_trigger":
+        trigger_uow_id: str = msg.get("uow_id", "unknown")
+        result = handle_steward_trigger(trigger_uow_id)
+        result["message_type"] = msg_type
+        return result
 
     # Unreachable given the guard above, but satisfies exhaustiveness checkers
     raise ValueError(f"route_wos_message: no branch for type {msg_type!r}")

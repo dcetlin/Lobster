@@ -21,14 +21,22 @@ Close-out protocol: when a UoW with a GitHub issue source transitions to
 ready-for-steward, a comment is posted to the source issue summarising the
 completion. Source format: "github:issue/N" (set at germination time). Non-GitHub
 sources (telegram, system, etc.) are silently skipped — no side effect.
+
+Post-completion steward trigger (issue #912): after a successful
+executing → ready-for-steward transition, _write_steward_trigger() writes a
+steward_trigger inbox message so the dispatcher immediately invokes a steward
+prescription cycle. This eliminates the 0–3 minute idle window between UoW
+completion and the next steward heartbeat cron tick.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -69,6 +77,85 @@ WRITE_RESULT_SUCCESS_STATUS = "success"
 #: Pattern that identifies a GitHub issue source reference.
 #: Format: "github:issue/<number>" (integer issue number, no leading zeros required).
 _GITHUB_ISSUE_SOURCE_RE = re.compile(r"^github:issue/(\d+)$")
+
+# ---------------------------------------------------------------------------
+# Post-completion steward trigger (issue #912)
+# ---------------------------------------------------------------------------
+
+#: Default inbox directory for steward trigger messages.
+#: The function reads from the environment at call time so tests can override via
+#: patch.dict(os.environ, {"LOBSTER_INBOX_DIR": ...}) without re-importing the module.
+_STEWARD_TRIGGER_INBOX_DIR_DEFAULT: str = "~/messages/inbox"
+
+#: Default admin chat_id for steward_trigger messages (same pattern as executor).
+_STEWARD_TRIGGER_CHAT_ID_DEFAULT: str = "8075091586"
+
+
+def _write_steward_trigger(uow_id: str) -> None:
+    """
+    Write a steward_trigger inbox message after a UoW completes.
+
+    Called by maybe_complete_wos_uow after a successful executing →
+    ready-for-steward transition. The dispatcher picks up this message on its
+    next cycle and calls handle_steward_trigger(), which invokes
+    run_steward_cycle() directly — bypassing the 0–3 minute cron wait.
+
+    Message schema (mirrors wos_execute format from executor._dispatch_via_inbox):
+        {
+            "id":        "<uuid>",
+            "source":    "system",
+            "type":      "steward_trigger",
+            "chat_id":   "<admin_chat_id>",
+            "uow_id":    "<completed_uow_id>",
+            "timestamp": "<ISO-8601 UTC>"
+        }
+
+    Non-fatal: failures are logged and swallowed so that write_result delivery
+    is never blocked by inbox write errors. The 3-minute cron remains the
+    recovery fallback when this trigger is dropped.
+
+    Args:
+        uow_id: The UoW that just completed — included for observability.
+    """
+    try:
+        msg_id = str(uuid.uuid4())
+        # Read env at call time (not module load time) so tests can override via
+        # patch.dict(os.environ) without re-importing the module.
+        inbox_dir_str = os.environ.get("LOBSTER_INBOX_DIR", _STEWARD_TRIGGER_INBOX_DIR_DEFAULT)
+        chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", _STEWARD_TRIGGER_CHAT_ID_DEFAULT)
+        inbox_dir = Path(os.path.expanduser(inbox_dir_str))
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+
+        msg: dict = {
+            "id": msg_id,
+            "source": "system",
+            "type": "steward_trigger",
+            "chat_id": chat_id,
+            "uow_id": uow_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        tmp_path = inbox_dir / f"{msg_id}.json.tmp"
+        dest_path = inbox_dir / f"{msg_id}.json"
+        try:
+            tmp_path.write_text(json.dumps(msg, indent=2), encoding="utf-8")
+            tmp_path.rename(dest_path)
+            log.info(
+                "_write_steward_trigger: wrote steward_trigger for UoW %r → %s",
+                uow_id,
+                dest_path,
+            )
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+    except Exception as exc:
+        log.warning(
+            "_write_steward_trigger: failed for UoW %r — %s: %s",
+            uow_id, type(exc).__name__, exc,
+        )
 
 # ---------------------------------------------------------------------------
 # Result file enrichment — summary + artifact extraction
@@ -758,6 +845,11 @@ def maybe_complete_wos_uow(
             "(execution_complete written on write_result confirmation)",
             uow_id,
         )
+
+        # Post-completion steward trigger (issue #912): wake the steward immediately
+        # so it prescribes the next UoW in seconds rather than waiting up to 3 minutes
+        # for the next cron tick. Non-fatal — cron remains the recovery fallback.
+        _write_steward_trigger(uow_id)
 
         # Back-propagation (issue #867): write result_text to the executor output
         # file when the subagent did not write one itself. Must run BEFORE

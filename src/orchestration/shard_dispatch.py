@@ -19,9 +19,16 @@ The dispatch gate checks three conditions before allowing parallel dispatch:
    shard_id (non-null), the candidate is blocked until that shard is free.
 
 3. **file_scope overlap** — if the candidate's file_scope overlaps with any
-   in-flight UoW's file_scope, the candidate is blocked. If either side has
-   null file_scope (unknown scope), it is treated as exclusive: the candidate
-   is only dispatched when zero UoWs are executing.
+   in-flight UoW's file_scope, the candidate is blocked. UoWs with null
+   file_scope are treated as **independent**: they do not conflict with each
+   other or with annotated UoWs. A null file_scope means "no explicit scope
+   annotation" — the UoW is allowed to proceed unless a shard_id constraint
+   or explicit scope overlap fires.
+
+   Prior behavior (removed in issue #912): null file_scope UoWs were treated
+   as exclusive — a single in-flight null-scope UoW blocked ALL other
+   null-scope candidates. This was over-conservative: UoWs without scope
+   annotations are logically independent code changes on distinct files.
 
 All functions are pure: they take explicit inputs and return typed results.
 No DB connections, no side effects. Registry queries happen at the call site
@@ -114,22 +121,17 @@ def check_shard_dispatch_eligibility(
        If len(executing_uows) >= max_parallel, block unconditionally.
        This prevents runaway parallelism regardless of scope.
 
-    2. null file_scope (exclusive mode)
-       If candidate_file_scope is None (unknown scope), the candidate may
-       only be dispatched when zero UoWs are executing — it is treated as
-       potentially touching everything. This preserves the prior serial
-       behavior for UoWs that have not been annotated with a file_scope.
-       Also blocks if any in-flight UoW has null file_scope (that in-flight
-       UoW is exclusive and must complete before anything else is dispatched).
-
-    3. shard serialization
+    2. shard serialization
        If candidate_shard_id is non-null, block if any in-flight UoW has the
        same shard_id. UoWs in the same shard run serially.
 
-    4. file_scope overlap
-       If candidate_file_scope is non-null and all in-flight UoWs also have
-       non-null file_scopes, block if any in-flight file_scope overlaps with
-       the candidate's file_scope (via prefix matching).
+    3. file_scope overlap
+       Block only when BOTH the candidate and an in-flight UoW have explicit
+       (non-null) file_scope lists that overlap via prefix matching. UoWs with
+       null file_scope are treated as independent — they are allowed to proceed
+       as long as the max_parallel cap is not reached and no shard constraint
+       fires. Null file_scope means "no explicit scope annotation", not
+       "touches everything" (issue #912 changed this semantics).
 
     If all conditions pass, return DispatchAllowed.
 
@@ -157,30 +159,8 @@ def check_shard_dispatch_eligibility(
             )
         )
 
-    # Gate 2a: candidate has null file_scope → exclusive mode
-    if candidate_file_scope is None:
-        if executing_count > 0:
-            return DispatchBlocked(
-                reason=(
-                    "shard-stream: candidate has null file_scope (exclusive) — "
-                    f"blocked until {executing_count} in-flight UoW(s) complete"
-                )
-            )
-        # No in-flight UoWs — exclusive candidate can proceed.
-        return DispatchAllowed(reason="shard-stream: exclusive candidate, no in-flight UoWs")
-
-    # Gate 2b: any in-flight UoW has null file_scope → that UoW is exclusive
-    for uow in executing_uows:
-        in_flight_scope = getattr(uow, "file_scope", None)
-        if in_flight_scope is None:
-            return DispatchBlocked(
-                reason=(
-                    f"shard-stream: in-flight UoW {uow.id!r} has null file_scope "
-                    "(exclusive) — candidate must wait"
-                )
-            )
-
-    # Gate 3: shard serialization
+    # Gate 2: shard serialization
+    # Null candidate shard_id means "no shard constraint" — gate skipped entirely.
     if candidate_shard_id is not None:
         for uow in executing_uows:
             if getattr(uow, "shard_id", None) == candidate_shard_id:
@@ -191,18 +171,24 @@ def check_shard_dispatch_eligibility(
                     )
                 )
 
-    # Gate 4: file_scope overlap
-    for uow in executing_uows:
-        in_flight_scope = getattr(uow, "file_scope", None)
-        # in_flight_scope is guaranteed non-None here (Gate 2b already handled that)
-        if _scopes_overlap(candidate_file_scope, in_flight_scope):  # type: ignore[arg-type]
-            return DispatchBlocked(
-                reason=(
-                    f"shard-stream: file_scope overlap with in-flight UoW {uow.id!r} "
-                    f"(candidate={candidate_file_scope!r}, "
-                    f"in-flight={in_flight_scope!r})"
+    # Gate 3: file_scope overlap — only when BOTH sides have explicit annotations.
+    # Null file_scope (unannotated) UoWs are independent and do not conflict with
+    # each other or with annotated UoWs. This replaces the prior exclusive-lock
+    # semantics that blocked all null-scope UoWs when any one was in-flight.
+    if candidate_file_scope is not None:
+        for uow in executing_uows:
+            in_flight_scope = getattr(uow, "file_scope", None)
+            # Skip unannotated in-flight UoWs — they are independent.
+            if in_flight_scope is None:
+                continue
+            if _scopes_overlap(candidate_file_scope, in_flight_scope):
+                return DispatchBlocked(
+                    reason=(
+                        f"shard-stream: file_scope overlap with in-flight UoW {uow.id!r} "
+                        f"(candidate={candidate_file_scope!r}, "
+                        f"in-flight={in_flight_scope!r})"
+                    )
                 )
-            )
 
     return DispatchAllowed()
 
