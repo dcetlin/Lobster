@@ -226,6 +226,11 @@ class UoW:
     #   Incremented each time the steward re-dispatches after a failed execution.
     #   When retry_count >= MAX_RETRIES, escalates to needs-human-review.
     retry_count: int = 0
+    # artifacts: typed outcome refs extracted from write_result payload (migration 0011).
+    #   JSON array of {type, ref, category, description?} objects. NULL until populated.
+    #   Populated by wos_completion.py after successful UoW completion.
+    #   Types: "pr", "issue", "file", "commit".
+    artifacts: list | None = None
 
 
 def _now_iso() -> str:
@@ -400,6 +405,7 @@ class Registry:
             heartbeat_at=d.get("heartbeat_at"),
             heartbeat_ttl=d.get("heartbeat_ttl") or 300,
             retry_count=d.get("retry_count") or 0,
+            artifacts=_deserialize_json(d.get("artifacts")) if d.get("artifacts") else None,
         )
 
     def _write_audit(
@@ -1459,6 +1465,43 @@ class Registry:
             conn.execute(
                 "UPDATE uow_registry SET status = 'ready-for-steward', updated_at = ? WHERE id = ?",
                 (now, uow_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def update_artifacts(self, uow_id: str, artifacts: list) -> None:
+        """
+        Store extracted outcome refs in the registry artifacts field for a UoW.
+
+        Called by wos_completion.py after extracting artifact refs from the
+        write_result payload. Overwrites any existing value — the list is derived
+        fresh from result_text each time and replacement is idempotent.
+
+        No-op when:
+        - artifacts is empty (no refs were extracted — avoids noisy NULL→'[]' writes)
+        - uow_id does not exist in the registry (graceful skip)
+
+        Non-transactional: this is an advisory enrichment. If it fails, the UoW
+        transition already succeeded. Callers must not rely on this field for
+        correctness — only for observability and steward queries.
+
+        Args:
+            uow_id: The WOS unit-of-work ID.
+            artifacts: List of typed ref dicts. Each item has at minimum:
+                       {type: str, ref: str, category: str}.
+        """
+        if not artifacts:
+            return
+
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE uow_registry SET artifacts = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(artifacts), _now_iso(), uow_id),
             )
             conn.commit()
         except Exception:

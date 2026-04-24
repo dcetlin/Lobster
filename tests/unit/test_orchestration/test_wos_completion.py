@@ -38,7 +38,10 @@ from orchestration.wos_completion import (
     WRITE_RESULT_SUCCESS_STATUS,
     _backpropagate_result_to_output_file,
     _build_closeout_comment,
+    _extract_artifact_refs,
     _extract_github_issue,
+    _extract_outcome_refs,
+    _is_plausible_sha,
     classify_uow_output,
     maybe_complete_wos_uow,
 )
@@ -911,3 +914,329 @@ class TestBackpropagateResultToOutputFile:
         assert payload["uow_id"] == uow_id
         assert payload["outcome"] == "complete"
         assert payload["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# _is_plausible_sha — pure function
+# ---------------------------------------------------------------------------
+
+class TestIsPlausibleSha:
+    """Behavioral tests for the SHA plausibility filter."""
+
+    def test_valid_short_sha_is_plausible(self) -> None:
+        assert _is_plausible_sha("a1b2c3d") is True
+
+    def test_valid_full_sha_is_plausible(self) -> None:
+        assert _is_plausible_sha("abc123def456789012345678901234567890abcd") is True
+
+    def test_all_digits_is_not_plausible(self) -> None:
+        # Pure digits would be mistaken for a PR/issue number
+        assert _is_plausible_sha("1234567") is False
+
+    def test_deny_listed_word_dead_is_not_plausible(self) -> None:
+        assert _is_plausible_sha("dead") is False
+
+    def test_deny_listed_word_beef_is_not_plausible(self) -> None:
+        assert _is_plausible_sha("beef") is False
+
+    def test_deny_listed_word_cafe_is_not_plausible(self) -> None:
+        assert _is_plausible_sha("cafe") is False
+
+    def test_mixed_hex_not_in_denylist_is_plausible(self) -> None:
+        assert _is_plausible_sha("d34db33f") is True
+
+
+# ---------------------------------------------------------------------------
+# _extract_outcome_refs — pure function, typed ref extraction (issue #880)
+# ---------------------------------------------------------------------------
+
+#: Named constant anchoring the minimum ref set expected from a PR-mention text.
+_RESULT_TEXT_WITH_PR = "PR #42 opened on dcetlin/Lobster. Closes #880."
+_RESULT_TEXT_WITH_URL_PR = "https://github.com/dcetlin/Lobster/pull/99 was merged."
+_RESULT_TEXT_WITH_COMMIT = "commit abc1234 was merged to main."
+_RESULT_TEXT_WITH_FILE = "wrote ~/lobster-workspace/foo.py as output."
+_RESULT_TEXT_EMPTY = ""
+
+
+class TestExtractOutcomeRefs:
+    """
+    Behavioral tests for _extract_outcome_refs — typed provenance ref extraction.
+
+    All tests operate on the public behavior (returned list contents) and treat
+    the regex internals as implementation details.
+    """
+
+    def test_pr_mention_produces_pr_ref_with_pearl_category(self) -> None:
+        refs = _extract_outcome_refs(_RESULT_TEXT_WITH_PR, repo="dcetlin/Lobster")
+        pr_refs = [r for r in refs if r["type"] == "pr"]
+        assert len(pr_refs) >= 1, "PR mention must produce at least one pr ref"
+        assert pr_refs[0]["category"] == "pearl", "PR refs must be categorized as pearl"
+        assert "dcetlin/Lobster#42" in [r["ref"] for r in pr_refs]
+
+    def test_pr_url_produces_pr_ref(self) -> None:
+        refs = _extract_outcome_refs(_RESULT_TEXT_WITH_URL_PR, repo="dcetlin/Lobster")
+        pr_refs = [r for r in refs if r["type"] == "pr"]
+        assert any("99" in r["ref"] for r in pr_refs), (
+            "GitHub pull URL must produce a pr ref containing the PR number"
+        )
+
+    def test_closes_keyword_produces_issue_ref_with_seed_category(self) -> None:
+        refs = _extract_outcome_refs(_RESULT_TEXT_WITH_PR, repo="dcetlin/Lobster")
+        issue_refs = [r for r in refs if r["type"] == "issue"]
+        assert len(issue_refs) >= 1, "'Closes #N' must produce an issue ref"
+        assert issue_refs[0]["category"] == "seed", "Issue refs must be categorized as seed"
+        assert "dcetlin/Lobster#880" in [r["ref"] for r in issue_refs]
+
+    def test_file_path_produces_file_ref_with_pearl_category(self) -> None:
+        refs = _extract_outcome_refs(_RESULT_TEXT_WITH_FILE, repo="dcetlin/Lobster")
+        file_refs = [r for r in refs if r["type"] == "file"]
+        assert len(file_refs) >= 1, "File path mention must produce a file ref"
+        assert file_refs[0]["category"] == "pearl", "File refs must be categorized as pearl"
+        assert any("foo.py" in r["ref"] for r in file_refs)
+
+    def test_commit_sha_with_commit_keyword_produces_commit_ref(self) -> None:
+        refs = _extract_outcome_refs(_RESULT_TEXT_WITH_COMMIT, repo="dcetlin/Lobster")
+        commit_refs = [r for r in refs if r["type"] == "commit"]
+        assert len(commit_refs) >= 1, "commit SHA + 'commit' keyword must produce a commit ref"
+        assert commit_refs[0]["category"] == "pearl", "Commit refs must be categorized as pearl"
+
+    def test_commit_sha_without_commit_keyword_is_not_extracted(self) -> None:
+        # SHA-looking strings without "commit" nearby must not be extracted
+        # to avoid false positives in arbitrary hex content.
+        text = "Hash value: abc1234ef5 in the output."
+        refs = _extract_outcome_refs(text, repo="dcetlin/Lobster")
+        commit_refs = [r for r in refs if r["type"] == "commit"]
+        assert len(commit_refs) == 0, (
+            "SHA-looking strings without 'commit' keyword must not produce commit refs"
+        )
+
+    def test_empty_text_produces_no_refs(self) -> None:
+        refs = _extract_outcome_refs(_RESULT_TEXT_EMPTY, repo="dcetlin/Lobster")
+        assert refs == [], "Empty result text must produce an empty ref list"
+
+    def test_deduplication_prevents_duplicate_refs(self) -> None:
+        # Mentioning the same PR twice must produce exactly one ref
+        text = "PR #42 opened. See also PR #42 for details."
+        refs = _extract_outcome_refs(text, repo="dcetlin/Lobster")
+        pr_refs = [r for r in refs if r["type"] == "pr" and "42" in r["ref"]]
+        assert len(pr_refs) == 1, (
+            f"Duplicate PR mention must produce exactly one ref, got {len(pr_refs)}"
+        )
+
+    def test_repo_slug_is_used_in_ref_string(self) -> None:
+        text = "PR #7 opened."
+        refs = _extract_outcome_refs(text, repo="myorg/myrepo")
+        pr_refs = [r for r in refs if r["type"] == "pr"]
+        assert any("myorg/myrepo#7" in r["ref"] for r in pr_refs), (
+            "repo slug must be embedded in pr ref string"
+        )
+
+    def test_fixes_keyword_produces_issue_ref(self) -> None:
+        text = "Fixes #123 — bug corrected."
+        refs = _extract_outcome_refs(text, repo="dcetlin/Lobster")
+        issue_refs = [r for r in refs if r["type"] == "issue"]
+        assert any("123" in r["ref"] for r in issue_refs), (
+            "'Fixes #N' must produce an issue ref"
+        )
+
+    def test_all_ref_dicts_have_required_keys(self) -> None:
+        """Every ref dict must carry type, ref, and category — no partial objects."""
+        text = "PR #1 opened. Closes #2. Wrote ~/foo.py."
+        refs = _extract_outcome_refs(text, repo="dcetlin/Lobster")
+        for ref in refs:
+            assert "type" in ref, f"ref missing 'type': {ref}"
+            assert "ref" in ref, f"ref missing 'ref': {ref}"
+            assert "category" in ref, f"ref missing 'category': {ref}"
+
+
+# ---------------------------------------------------------------------------
+# Registry.update_artifacts — DB write (integration with in-memory DB)
+# ---------------------------------------------------------------------------
+
+class TestRegistryUpdateArtifacts:
+    """
+    Behavioral tests for Registry.update_artifacts.
+
+    Tests write to a real SQLite DB in tmp_path to verify the column is
+    written and readable via Registry.get().
+    """
+
+    def _create_uow(self, registry: Registry) -> str:
+        """Insert a UoW and return its ID."""
+        result = registry.upsert(
+            issue_number=9900,
+            title="Artifacts test UoW",
+            success_criteria="artifacts populated",
+        )
+        assert isinstance(result, UpsertInserted)
+        return result.id
+
+    def test_artifacts_stored_in_registry_after_update(self, tmp_path: Path) -> None:
+        """
+        After update_artifacts, registry.get() must return a UoW with the artifacts
+        field populated matching what was written.
+        """
+        db_path = tmp_path / "registry.db"
+        registry = Registry(db_path)
+        uow_id = self._create_uow(registry)
+
+        artifacts = [
+            {"type": "pr", "ref": "dcetlin/Lobster#42", "category": "pearl"},
+            {"type": "issue", "ref": "dcetlin/Lobster#880", "category": "seed"},
+        ]
+        registry.update_artifacts(uow_id, artifacts)
+
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.artifacts is not None, "artifacts must be populated after update_artifacts"
+        assert len(uow.artifacts) == 2
+        assert uow.artifacts[0]["type"] == "pr"
+        assert uow.artifacts[1]["type"] == "issue"
+
+    def test_empty_artifacts_list_does_not_write(self, tmp_path: Path) -> None:
+        """
+        Calling update_artifacts with an empty list must be a no-op — the artifacts
+        column must remain NULL (no noisy NULL→'[]' writes).
+        """
+        db_path = tmp_path / "registry.db"
+        registry = Registry(db_path)
+        uow_id = self._create_uow(registry)
+
+        registry.update_artifacts(uow_id, [])
+
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.artifacts is None, (
+            "Empty artifacts list must leave the column NULL — no write must occur"
+        )
+
+    def test_artifacts_overwritten_on_second_call(self, tmp_path: Path) -> None:
+        """
+        Calling update_artifacts twice must overwrite the first value with the second.
+        The field is derived fresh from result_text each time; replacement is idempotent.
+        """
+        db_path = tmp_path / "registry.db"
+        registry = Registry(db_path)
+        uow_id = self._create_uow(registry)
+
+        first = [{"type": "pr", "ref": "dcetlin/Lobster#1", "category": "pearl"}]
+        second = [{"type": "issue", "ref": "dcetlin/Lobster#2", "category": "seed"}]
+        registry.update_artifacts(uow_id, first)
+        registry.update_artifacts(uow_id, second)
+
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.artifacts is not None
+        assert uow.artifacts[0]["type"] == "issue", (
+            "Second call to update_artifacts must overwrite the first value"
+        )
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: artifacts populated from write_result via maybe_complete_wos_uow
+# ---------------------------------------------------------------------------
+
+#: Expected artifact count for a result_text mentioning both a PR and an issue.
+EXPECTED_ARTIFACT_COUNT_PR_AND_ISSUE = 2
+
+
+class TestArtifactPopulationEndToEnd:
+    """
+    End-to-end tests verifying that maybe_complete_wos_uow extracts artifacts
+    from result_text and populates the registry artifacts field.
+    """
+
+    def test_artifacts_populated_when_result_mentions_pr_and_issue(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        When result_text mentions a PR and an issue, both refs must appear in
+        the registry artifacts field after maybe_complete_wos_uow completes.
+        """
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = _seed_uow_at_status(registry, "executing", output_dir)
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+        result_text = "PR #42 opened. Closes #880."
+
+        with patch("orchestration.wos_completion.subprocess.run"), \
+             patch.dict(os.environ, {
+                 "REGISTRY_DB_PATH": str(db_path),
+                 "LOBSTER_WOS_REPO": "dcetlin/Lobster",
+             }):
+            maybe_complete_wos_uow(task_id, WRITE_RESULT_SUCCESS_STATUS, result_text=result_text)
+
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.artifacts is not None, (
+            "artifacts must be populated after write_result with PR/issue mentions"
+        )
+        assert len(uow.artifacts) >= EXPECTED_ARTIFACT_COUNT_PR_AND_ISSUE, (
+            f"Expected at least {EXPECTED_ARTIFACT_COUNT_PR_AND_ISSUE} artifact refs "
+            f"(PR #42 + issue #880), got {len(uow.artifacts)}: {uow.artifacts}"
+        )
+        types_found = {r["type"] for r in uow.artifacts}
+        assert "pr" in types_found, "PR ref must be present in artifacts"
+        assert "issue" in types_found, "Issue ref must be present in artifacts"
+
+    def test_artifacts_not_set_when_result_text_is_empty(self, tmp_path: Path) -> None:
+        """
+        When result_text is empty (subagent sent no meaningful output), the registry
+        artifacts field must remain NULL — no noisy empty-list write.
+        """
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = _seed_uow_at_status(registry, "executing", output_dir)
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        with patch("orchestration.wos_completion.subprocess.run"), \
+             patch.dict(os.environ, {
+                 "REGISTRY_DB_PATH": str(db_path),
+                 "LOBSTER_WOS_REPO": "dcetlin/Lobster",
+             }):
+            maybe_complete_wos_uow(task_id, WRITE_RESULT_SUCCESS_STATUS, result_text=None)
+
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.artifacts is None, (
+            "artifacts must remain NULL when result_text is empty — no noisy write"
+        )
+
+    def test_uow_still_transitions_when_artifact_extraction_fails(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        If artifact extraction raises an exception (e.g. corrupt text, import error),
+        the UoW must still transition to ready-for-steward — artifact enrichment is
+        non-fatal by design.
+        """
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = _seed_uow_at_status(registry, "executing", output_dir)
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        with patch("orchestration.wos_completion._extract_outcome_refs",
+                   side_effect=RuntimeError("simulated extraction failure")), \
+             patch("orchestration.wos_completion.subprocess.run"), \
+             patch.dict(os.environ, {
+                 "REGISTRY_DB_PATH": str(db_path),
+                 "LOBSTER_WOS_REPO": "dcetlin/Lobster",
+             }):
+            maybe_complete_wos_uow(
+                task_id, WRITE_RESULT_SUCCESS_STATUS, result_text="PR #1 opened."
+            )
+
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.status == UoWStatus.READY_FOR_STEWARD, (
+            "UoW must reach ready-for-steward even when artifact extraction fails"
+        )
