@@ -93,6 +93,8 @@ oracle_date: <YYYY-MM-DD>
 ---
 ```
 
+**After every git commit in ~/lobster/, immediately run `git push origin main`.** Do not commit without pushing in the same step — leaving the local repo ahead of origin causes divergence.
+
 **Write (overwrite each review round)** `~/lobster/oracle/verdicts/pr-{number}.md` for PR-gated reviews:
 
 ```markdown
