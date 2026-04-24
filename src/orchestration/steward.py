@@ -4550,6 +4550,70 @@ def run_steward_cycle(
             skipped += 1
             continue
 
+        # Step 3 — Juice sensing at dispatch time.
+        # Called after all gates pass (shard, eligibility, backpressure) so juice
+        # is only computed for UoWs that will actually be dispatched. Juice is
+        # computed from the already-fetched audit_entries to avoid a redundant
+        # DB round-trip. The result is written back to the registry when the
+        # score differs materially from the stored value (>JUICE_UPDATE_DELTA=0.05).
+        # An audit log entry with dispatch_signal=juice is written when a
+        # juice-priority UoW is dispatched.
+        _juice_write_back_needed = False
+        try:
+            from src.orchestration.juice import JuiceSensor, JUICE_UPDATE_DELTA
+            _juice_sensor = JuiceSensor()
+            _juice_assessment = _juice_sensor.assess(uow, audit_entries, registry)
+            _new_juice_score = _juice_assessment.score
+            _current_juice_quality = getattr(uow, "juice_quality", None)
+
+            # Determine if write-back is needed (score differs materially).
+            if _juice_assessment.has_juice:
+                _new_juice_quality = "juice"
+                _new_juice_rationale = _juice_assessment.rationale
+                _juice_write_back_needed = _current_juice_quality != "juice"
+            else:
+                _new_juice_quality = None
+                _new_juice_rationale = None
+                _juice_write_back_needed = _current_juice_quality == "juice"
+
+            if _juice_write_back_needed and not dry_run:
+                try:
+                    registry.write_juice(uow_id, _new_juice_quality, _new_juice_rationale)
+                    log.debug(
+                        "juice: wrote juice_quality=%r for %s (score=%s)",
+                        _new_juice_quality, uow_id, _new_juice_score,
+                    )
+                except Exception as _juice_write_exc:
+                    # Non-fatal: juice write failure does not block dispatch.
+                    log.warning(
+                        "juice: write_juice failed for %s — %s: %s (continuing dispatch)",
+                        uow_id, type(_juice_write_exc).__name__, _juice_write_exc,
+                    )
+
+            # Log audit entry when dispatching a juice-priority UoW.
+            if _juice_assessment.has_juice and not dry_run:
+                registry.append_audit_log(uow_id, {
+                    "event": "dispatch_signal",
+                    "actor": _ACTOR_STEWARD,
+                    "uow_id": uow_id,
+                    "dispatch_signal": "juice",
+                    "juice_score": _new_juice_score,
+                    "juice_rationale": _juice_assessment.rationale,
+                    "steward_cycles": uow.steward_cycles,
+                    "timestamp": _now_iso(),
+                })
+                log.info(
+                    "juice: dispatching juice-priority UoW %s (score=%.3f, rationale=%r)",
+                    uow_id, _new_juice_score or 0.0, _juice_assessment.rationale,
+                )
+
+        except Exception as _juice_exc:
+            # Non-fatal: juice sensing failure does not block dispatch.
+            log.warning(
+                "juice: sensing failed for %s — %s: %s (continuing dispatch without juice signal)",
+                uow_id, type(_juice_exc).__name__, _juice_exc,
+            )
+
         evaluated += 1
         try:
             result = _process_uow(
