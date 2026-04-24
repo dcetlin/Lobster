@@ -639,17 +639,16 @@ class TestRequalifyProposed:
         assert len(ready) == 1
         assert ready[0].id == upsert_result.id
 
-    def test_proposed_uow_aged_without_label_is_not_auto_advanced(
+    def test_proposed_uow_aged_without_label_is_auto_advanced(
         self, registry: Registry
     ) -> None:
-        """Age-only qualification is blocked by require_label=True in requalify_proposed().
+        """Age-based promotion: a UoW open ≥3 days with no blocking labels advances without a qualifying label.
 
-        A proposed UoW that is old enough (≥3 days) but carries no qualifying label
-        must NOT be auto-advanced. The od-3 constraint in vision.yaml requires explicit
-        label signal — age alone is not sufficient for requalify_proposed().
-        This is a regression guard: if require_label is accidentally removed, this test fails.
+        This is the fallback path that unblocks UoWs accumulating without label intervention
+        (issue #907). Matches scan-time qualification behavior where age alone is sufficient.
+        Blocking labels still suppress promotion at any age.
         """
-        registry.upsert(
+        upsert_result = registry.upsert(
             issue_number=301, title="Old issue", success_criteria="Do something."
         )
         snap = _snapshot(
@@ -657,17 +656,19 @@ class TestRequalifyProposed:
             labels=(),
             body="Some body text",
             state="open",
-            created_at=_iso(5),  # 5 days old — past the 3-day threshold, but no qualifying label
+            created_at=_iso(5),  # 5 days old — past the 3-day threshold, no blocking label
         )
         source = _make_source(issue_map={"github:issue/301": snap})
         caretaker = GardenCaretaker(source=source, registry=registry)
 
         result = caretaker.requalify_proposed()
 
-        # Age-only UoWs must stay in proposed — label signal is required
-        assert result["requalified"] == 0
-        assert len(registry.query(status="proposed")) == 1
-        assert registry.query(status="ready-for-steward") == []
+        # Age-based promotion: UoW advanced without any qualifying label
+        assert result["requalified"] == 1
+        assert registry.query(status="proposed") == []
+        ready = registry.query(status="ready-for-steward")
+        assert len(ready) == 1
+        assert ready[0].id == upsert_result.id
 
     def test_proposed_uow_with_blocking_label_is_not_advanced(
         self, registry: Registry
