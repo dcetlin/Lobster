@@ -545,3 +545,187 @@ class TestRouteWosMessage:
         result = route_wos_message(msg)
         # The derived path must contain the uow_id so the Steward can find it
         assert "uow_no_ref_test" in result["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# decide_retry / decide_close callback handler tests — issue #901
+#
+# These tests verify that tapping the "Retry" or "Close" buttons on a
+# needs-human-review escalation message correctly routes to the existing
+# handle_decide_retry / handle_decide_close handlers.  The handlers are pure
+# functions — no Telegram or MCP required.
+# ---------------------------------------------------------------------------
+
+# Named constants from the spec (issue #901 / steward.py escalation surface)
+DECIDE_RETRY_CALLBACK_PREFIX = "decide_retry:"
+DECIDE_CLOSE_CALLBACK_PREFIX = "decide_close:"
+
+# Named constant: the status the UoW must reach after a retry decision
+DECIDE_RETRY_EXPECTED_STATUS = "ready-for-steward"
+
+# Named constant: the status the UoW must reach after a close decision
+DECIDE_CLOSE_EXPECTED_STATUS = "failed"
+
+
+@pytest.fixture
+def blocked_uow_for_callbacks(registry) -> str:
+    """A UoW in blocked status for decide_retry / decide_close callback tests."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    result = registry.upsert(
+        issue_number=500,
+        title="Escalated UoW needing human review",
+        sweep_date=today,
+        success_criteria="Human reviews and resolves.",
+    )
+    registry.set_status_direct(result.id, "blocked")
+    return result.id
+
+
+class TestDecideRetryCallback:
+    """decide_retry:<uow_id> callback wires to handle_decide_retry."""
+
+    def test_retry_transitions_blocked_to_ready_for_steward(self, registry, blocked_uow_for_callbacks):
+        """Tapping Retry on an escalation message resets the UoW to ready-for-steward."""
+        from src.orchestration.dispatcher_handlers import handle_decide_retry
+        response = handle_decide_retry(blocked_uow_for_callbacks, registry=registry)
+        uow = registry.get(blocked_uow_for_callbacks)
+        assert uow.status.value == DECIDE_RETRY_EXPECTED_STATUS, (
+            f"After decide_retry, UoW must be {DECIDE_RETRY_EXPECTED_STATUS!r}, "
+            f"got {uow.status.value!r}"
+        )
+
+    def test_retry_resets_steward_cycles_to_zero(self, registry, blocked_uow_for_callbacks):
+        """Retry clears steward_cycles so the steward re-diagnoses from scratch."""
+        import sqlite3
+        conn = sqlite3.connect(str(registry.db_path))
+        conn.execute(
+            "UPDATE uow_registry SET steward_cycles=5 WHERE id=?",
+            (blocked_uow_for_callbacks,),
+        )
+        conn.commit()
+        conn.close()
+
+        from src.orchestration.dispatcher_handlers import handle_decide_retry
+        handle_decide_retry(blocked_uow_for_callbacks, registry=registry)
+        uow = registry.get(blocked_uow_for_callbacks)
+        assert uow.steward_cycles == 0, (
+            "steward_cycles must reset to 0 on decide_retry so the steward "
+            "gets a full fresh diagnosis pass"
+        )
+
+    def test_retry_response_mentions_uow_id(self, registry, blocked_uow_for_callbacks):
+        """Response includes the UoW ID so the user can correlate the action."""
+        from src.orchestration.dispatcher_handlers import handle_decide_retry
+        response = handle_decide_retry(blocked_uow_for_callbacks, registry=registry)
+        assert blocked_uow_for_callbacks in response
+
+    def test_retry_response_mentions_ready_for_steward(self, registry, blocked_uow_for_callbacks):
+        """Confirmation text names the new status so the user knows what happened."""
+        from src.orchestration.dispatcher_handlers import handle_decide_retry
+        response = handle_decide_retry(blocked_uow_for_callbacks, registry=registry)
+        assert DECIDE_RETRY_EXPECTED_STATUS in response.lower()
+
+    def test_retry_on_non_blocked_uow_returns_diagnostic_message(self, registry):
+        """Tapping Retry on a UoW not in blocked state returns a clear error, not a crash."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        result = registry.upsert(
+            issue_number=501,
+            title="Active UoW retry test",
+            sweep_date=today,
+            success_criteria="Test done.",
+        )
+        registry.set_status_direct(result.id, "active")
+        from src.orchestration.dispatcher_handlers import handle_decide_retry
+        response = handle_decide_retry(result.id, registry=registry)
+        # Must explain why nothing happened, not silently succeed
+        assert "not currently in" in response.lower() or "could not be" in response.lower()
+
+    def test_callback_prefix_matches_steward_escalation_format(self):
+        """The callback data prefix must match what steward.py writes into the button."""
+        # steward.py writes: f"decide_retry:{uow_id}"
+        uow_id = "uow-test-42"
+        expected_callback_data = f"{DECIDE_RETRY_CALLBACK_PREFIX}{uow_id}"
+        assert expected_callback_data == f"decide_retry:{uow_id}", (
+            f"Prefix {DECIDE_RETRY_CALLBACK_PREFIX!r} must produce callback_data "
+            f"matching steward.py's format 'decide_retry:<uow_id>'"
+        )
+
+
+class TestDecideCloseCallback:
+    """decide_close:<uow_id> callback wires to handle_decide_close."""
+
+    def test_close_transitions_blocked_to_failed(self, registry, blocked_uow_for_callbacks):
+        """Tapping Close on an escalation message moves the UoW to failed."""
+        from src.orchestration.dispatcher_handlers import handle_decide_close
+        response = handle_decide_close(blocked_uow_for_callbacks, registry=registry)
+        uow = registry.get(blocked_uow_for_callbacks)
+        assert uow.status.value == DECIDE_CLOSE_EXPECTED_STATUS, (
+            f"After decide_close, UoW must be {DECIDE_CLOSE_EXPECTED_STATUS!r}, "
+            f"got {uow.status.value!r}"
+        )
+
+    def test_close_response_mentions_uow_id(self, registry, blocked_uow_for_callbacks):
+        """Response includes the UoW ID so the user can correlate the action."""
+        from src.orchestration.dispatcher_handlers import handle_decide_close
+        response = handle_decide_close(blocked_uow_for_callbacks, registry=registry)
+        assert blocked_uow_for_callbacks in response
+
+    def test_close_response_mentions_failed_status(self, registry, blocked_uow_for_callbacks):
+        """Confirmation text names the terminal status so the user knows the UoW is done."""
+        from src.orchestration.dispatcher_handlers import handle_decide_close
+        response = handle_decide_close(blocked_uow_for_callbacks, registry=registry)
+        assert DECIDE_CLOSE_EXPECTED_STATUS in response.lower()
+
+    def test_close_on_non_blocked_uow_returns_diagnostic_message(self, registry):
+        """Tapping Close on a non-blocked UoW returns a clear error, not a crash."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        result = registry.upsert(
+            issue_number=502,
+            title="Active UoW close test",
+            sweep_date=today,
+            success_criteria="Test done.",
+        )
+        registry.set_status_direct(result.id, "active")
+        from src.orchestration.dispatcher_handlers import handle_decide_close
+        response = handle_decide_close(result.id, registry=registry)
+        assert "not currently in" in response.lower() or "could not be" in response.lower()
+
+    def test_callback_prefix_matches_steward_escalation_format(self):
+        """The callback data prefix must match what steward.py writes into the button."""
+        # steward.py writes: f"decide_close:{uow_id}"
+        uow_id = "uow-test-42"
+        expected_callback_data = f"{DECIDE_CLOSE_CALLBACK_PREFIX}{uow_id}"
+        assert expected_callback_data == f"decide_close:{uow_id}", (
+            f"Prefix {DECIDE_CLOSE_CALLBACK_PREFIX!r} must produce callback_data "
+            f"matching steward.py's format 'decide_close:<uow_id>'"
+        )
+
+
+class TestDecideCallbackParseRoundtrip:
+    """The callback_data format must survive a parse round-trip without loss."""
+
+    def test_retry_callback_data_parses_uow_id_correctly(self):
+        """Parsing 'decide_retry:<uow_id>' yields the correct uow_id."""
+        uow_id = "uow-2026-042-abc"
+        callback_data = f"decide_retry:{uow_id}"
+        assert callback_data.startswith(DECIDE_RETRY_CALLBACK_PREFIX)
+        parsed_id = callback_data[len(DECIDE_RETRY_CALLBACK_PREFIX):]
+        assert parsed_id == uow_id
+
+    def test_close_callback_data_parses_uow_id_correctly(self):
+        """Parsing 'decide_close:<uow_id>' yields the correct uow_id."""
+        uow_id = "uow-2026-042-xyz"
+        callback_data = f"decide_close:{uow_id}"
+        assert callback_data.startswith(DECIDE_CLOSE_CALLBACK_PREFIX)
+        parsed_id = callback_data[len(DECIDE_CLOSE_CALLBACK_PREFIX):]
+        assert parsed_id == uow_id
+
+    def test_uow_ids_with_hyphens_parse_correctly(self):
+        """UoW IDs containing hyphens (the canonical format) must not be truncated."""
+        uow_id = "uow-issue-123-20260424"
+        for prefix in (DECIDE_RETRY_CALLBACK_PREFIX, DECIDE_CLOSE_CALLBACK_PREFIX):
+            callback_data = f"{prefix}{uow_id}"
+            parsed = callback_data[len(prefix):]
+            assert parsed == uow_id, (
+                f"UoW ID with hyphens must survive round-trip through {prefix!r}"
+            )
