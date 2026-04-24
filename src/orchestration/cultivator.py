@@ -234,9 +234,22 @@ def promote_to_wos(
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
     from src.orchestration.registry import Registry, UpsertInserted, UpsertSkipped
     from src.orchestration.germinator import classify_register
+    from src.orchestration.wos_throttle import ConsumptionRateMonitor, PrescriptionThrottleGate
 
     from src.orchestration.paths import REGISTRY_DB as _REGISTRY_DB
     registry = Registry(_REGISTRY_DB)
+
+    # Throttle gate: suppress UoW writes when the backlog is critical.
+    # Fail-open: if the monitor cannot read the registry, suppression does not fire.
+    _monitor = ConsumptionRateMonitor()
+    _gate = PrescriptionThrottleGate(_monitor)
+    if _gate.should_suppress_prescription():
+        _status = _gate.gate_status()
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "[THROTTLED] Prescription suppressed — backlog critical: %s", _status["reason"]
+        )
+        return [], 0
 
     results: list[PromotionResult] = []
     already_registered = 0
