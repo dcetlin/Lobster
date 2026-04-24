@@ -2244,10 +2244,10 @@ def _count_oracle_passes(audit_entries: list[dict]) -> int:
     Each oracle_approved entry represents one complete oracle pass that
     returned APPROVED for this UoW. Used by the Spiral pattern detector.
 
-    NOTE: oracle_pass_count will always be 0 until the oracle agent integration
-    writes event="oracle_approved" to the UoW audit log. The spiral gate is
-    structurally correct but non-functional until that write is wired.
-    See: https://github.com/dcetlin/Lobster/issues/810
+    oracle_approved events are written by oracle_audit.emit_oracle_approved()
+    after the oracle agent issues an APPROVED verdict for a WOS-linked PR.
+    The oracle agent calls oracle_audit.py (CLI) fire-and-forget after writing
+    to oracle/verdicts/pr-{number}.md. See src/orchestration/oracle_audit.py.
 
     Pure function — reads only audit_entries; no side effects.
     """
@@ -2288,10 +2288,8 @@ def _check_dispatch_eligibility(
     Pure function — no side effects, no DB writes.
     """
     # Spiral check (highest precedence)
-    # NOTE: oracle_pass_count will always be 0 until the oracle agent integration
-    # writes event="oracle_approved" to the UoW audit log. The spiral gate is
-    # structurally correct but non-functional until that write is wired.
-    # See: https://github.com/dcetlin/Lobster/issues/810
+    # oracle_approved events are written by the oracle agent via oracle_audit.py
+    # after each APPROVED verdict for a WOS-linked PR. See oracle_audit.py.
     oracle_passes = _count_oracle_passes(audit_entries)
     if oracle_passes >= SPIRAL_ORACLE_PASS_THRESHOLD:
         log.debug(
