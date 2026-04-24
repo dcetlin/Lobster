@@ -21,9 +21,21 @@ Do NOT add per-test mocks for:
     FAILED_DIR, CONFIG_DIR, AUDIO_DIR, SENT_DIR, SENT_REPLIES_DIR,
     TASK_REPLIED_DIR, TASKS_FILE, TASK_OUTPUTS_DIR, BISQUE_OUTBOX_DIR,
     SCHEDULED_JOBS_DIR, SCHEDULED_JOBS_FILE, SCHEDULED_TASKS_TASKS_DIR,
-    SCHEDULED_TASKS_LOGS_DIR, LOG_DIR
+    SCHEDULED_TASKS_LOGS_DIR, LOG_DIR, LOBSTER_INBOX_DIR (env var)
 
 These are all redirected automatically.
+
+LOBSTER_INBOX_DIR isolation
+----------------------------
+The ``isolate_lobster_inbox_dir`` fixture (autouse=True, session-scoped) sets the
+``LOBSTER_INBOX_DIR`` environment variable to a temporary directory for the entire
+test session.  This prevents any code that reads ``LOBSTER_INBOX_DIR`` at call time
+(e.g. ``_write_steward_trigger()`` in wos_completion.py) from writing to the live
+``~/messages/inbox/`` directory.
+
+Issue #915: without this fixture, tests that trigger the executing → ready-for-steward
+transition write ghost ``steward_trigger`` messages to the live inbox.  82 such messages
+were written across 5 pytest runs on 2026-04-24 before this guard was added.
 """
 
 import asyncio
@@ -243,6 +255,44 @@ def isolate_executor_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     outputs_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("WOS_OUTPUTS_DIR", str(outputs_dir))
     return outputs_dir
+
+
+@pytest.fixture(autouse=True, scope="session")
+def isolate_lobster_inbox_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Redirect LOBSTER_INBOX_DIR to a temporary directory for the entire test session.
+
+    Any code that writes to the inbox by reading LOBSTER_INBOX_DIR from the
+    environment at call time (e.g. ``_write_steward_trigger()`` in wos_completion.py)
+    will write to this temp directory instead of the live ~/messages/inbox/.
+
+    The fixture creates the standard inbox subdirectory layout that production code
+    may expect:
+        <tmp>/inbox/
+        <tmp>/processing/
+        <tmp>/processed/
+        <tmp>/failed/
+
+    Restores (or unsets) the original env var value after the session ends.
+
+    See: Issue #915 — 82 ghost steward_trigger messages written to live inbox during
+    5 pytest runs because tests only patched REGISTRY_DB_PATH, not LOBSTER_INBOX_DIR.
+    """
+    # Create a session-level temp directory so it persists across all tests.
+    session_tmp = tmp_path_factory.mktemp("lobster_inbox_session", numbered=True)
+
+    for subdir in ("inbox", "processing", "processed", "failed"):
+        (session_tmp / subdir).mkdir(parents=True, exist_ok=True)
+
+    original_value = os.environ.get("LOBSTER_INBOX_DIR")
+    os.environ["LOBSTER_INBOX_DIR"] = str(session_tmp)
+
+    yield session_tmp
+
+    # Restore: unset if it wasn't set before, otherwise put the original back.
+    if original_value is None:
+        os.environ.pop("LOBSTER_INBOX_DIR", None)
+    else:
+        os.environ["LOBSTER_INBOX_DIR"] = original_value
 
 
 # =============================================================================
