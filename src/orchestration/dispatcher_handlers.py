@@ -576,6 +576,8 @@ def handle_steward_trigger(uow_id: str) -> dict[str, Any]:
         "prompt": (
             f"---\n"
             f"task_id: {task_id}\n"
+            f"chat_id: 0\n"
+            f"source: system\n"
             f"---\n\n"
             f"Run the steward heartbeat to process newly completed UoW {uow_id}:\n\n"
             f"```bash\n"
@@ -654,42 +656,88 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
             f"Known types: {sorted(WOS_MESSAGE_TYPE_DISPATCH)}"
         )
 
-    if msg_type == "wos_execute":
-        uow_id: str = msg["uow_id"]
-        instructions: str = msg["instructions"]
-        # output_ref may be supplied by the Executor, or derived from uow_id
-        output_ref: str = msg.get(
-            "output_ref",
-            str(
-                Path.home()
-                / "lobster-workspace"
-                / "orchestration"
-                / "outputs"
-                / f"{uow_id}.result.json"
-            ),
+    # ---------------------------------------------------------------------------
+    # Spawn-gate (issue #920): all WOS message types MUST produce action="spawn_subagent".
+    # If a handler returns any other action or raises, return action="send_reply" to
+    # alert the user rather than silently calling mark_processed without spawning a Task.
+    # Returning action="mark_processed" here is the root cause of executor orphan incidents.
+    # ---------------------------------------------------------------------------
+    try:
+        if msg_type == "wos_execute":
+            uow_id: str = msg["uow_id"]
+            instructions: str = msg["instructions"]
+            # output_ref may be supplied by the Executor, or derived from uow_id
+            output_ref: str = msg.get(
+                "output_ref",
+                str(
+                    Path.home()
+                    / "lobster-workspace"
+                    / "orchestration"
+                    / "outputs"
+                    / f"{uow_id}.result.json"
+                ),
+            )
+            # agent_type identifies which subagent_type to spawn (issue #842).
+            # Executor embeds this in the message based on the UoW register.
+            # Default: functional-engineer for backward compatibility with messages
+            # written before this field was added.
+            agent_type: str = msg.get("agent_type", "functional-engineer")
+            prompt = handle_wos_execute(uow_id, instructions, output_ref)
+            result: dict[str, Any] = {
+                "action": "spawn_subagent",
+                "task_id": f"wos-{uow_id}",
+                "prompt": prompt,
+                "agent_type": agent_type,
+                "message_type": msg_type,
+            }
+
+        elif msg_type == "steward_trigger":
+            trigger_uow_id: str = msg.get("uow_id", "unknown")
+            result = handle_steward_trigger(trigger_uow_id)
+            result["message_type"] = msg_type
+
+        else:
+            # Unreachable given the guard above, but satisfies exhaustiveness checkers
+            raise ValueError(f"route_wos_message: no branch for type {msg_type!r}")
+
+    except Exception as exc:
+        import logging as _logging
+        _logging.getLogger(__name__).error(
+            "route_wos_message: handler for type %r raised %s: %s — "
+            "returning send_reply alert to prevent mark_processed without spawn",
+            msg_type, type(exc).__name__, exc,
         )
-        # agent_type identifies which subagent_type to spawn (issue #842).
-        # Executor embeds this in the message based on the UoW register.
-        # Default: functional-engineer for backward compatibility with messages
-        # written before this field was added.
-        agent_type: str = msg.get("agent_type", "functional-engineer")
-        prompt = handle_wos_execute(uow_id, instructions, output_ref)
         return {
-            "action": "spawn_subagent",
-            "task_id": f"wos-{uow_id}",
-            "prompt": prompt,
-            "agent_type": agent_type,
+            "action": "send_reply",
+            "text": (
+                f"WOS spawn-gate alert: handler for message type {msg_type!r} raised an error "
+                f"({type(exc).__name__}: {exc}). The UoW was NOT dispatched. "
+                "Check the executor logs and re-queue manually if needed."
+            ),
             "message_type": msg_type,
         }
 
-    if msg_type == "steward_trigger":
-        trigger_uow_id: str = msg.get("uow_id", "unknown")
-        result = handle_steward_trigger(trigger_uow_id)
-        result["message_type"] = msg_type
-        return result
+    # Spawn-gate enforcement: the result must carry action="spawn_subagent".
+    # Any other value (e.g. "noop", "mark_processed") is a gate violation —
+    # return a send_reply alert instead so Dan can investigate.
+    if result.get("action") != "spawn_subagent":
+        import logging as _logging
+        _logging.getLogger(__name__).error(
+            "route_wos_message: handler for type %r returned unexpected action %r — "
+            "expected 'spawn_subagent'. Returning send_reply alert.",
+            msg_type, result.get("action"),
+        )
+        return {
+            "action": "send_reply",
+            "text": (
+                f"WOS spawn-gate alert: handler for message type {msg_type!r} returned "
+                f"action={result.get('action')!r} instead of 'spawn_subagent'. "
+                "The UoW was NOT dispatched. Check the handler and re-queue if needed."
+            ),
+            "message_type": msg_type,
+        }
 
-    # Unreachable given the guard above, but satisfies exhaustiveness checkers
-    raise ValueError(f"route_wos_message: no branch for type {msg_type!r}")
+    return result
 
 
 # ---------------------------------------------------------------------------
