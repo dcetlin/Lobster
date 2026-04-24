@@ -42,6 +42,7 @@ from orchestration.wos_completion import (
     _extract_github_issue,
     _extract_outcome_refs,
     _is_plausible_sha,
+    _write_steward_trigger,
     classify_uow_output,
     maybe_complete_wos_uow,
 )
@@ -1239,4 +1240,207 @@ class TestArtifactPopulationEndToEnd:
         assert uow is not None
         assert uow.status == UoWStatus.READY_FOR_STEWARD, (
             "UoW must reach ready-for-steward even when artifact extraction fails"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: _write_steward_trigger (issue #912)
+# ---------------------------------------------------------------------------
+
+class TestWriteStewardTrigger:
+    """
+    Unit tests for _write_steward_trigger — the post-completion inbox message
+    that wakes the steward immediately after a UoW completes.
+
+    Behaviors verified:
+    - On success: writes a JSON file to the inbox directory with the correct schema
+    - The message type is "steward_trigger"
+    - The uow_id is included in the message
+    - On inbox dir failure: logs warning but does not raise
+    - maybe_complete_wos_uow calls _write_steward_trigger after a successful transition
+    - maybe_complete_wos_uow does NOT call _write_steward_trigger for error status
+    """
+
+    def test_writes_inbox_message_with_correct_type(self, tmp_path: Path) -> None:
+        """A steward_trigger inbox message is written with type='steward_trigger'."""
+        inbox_dir = tmp_path / "inbox"
+        inbox_dir.mkdir()
+
+        with patch.dict(os.environ, {"LOBSTER_INBOX_DIR": str(inbox_dir)}):
+            _write_steward_trigger("uow_test_abc123")
+
+        files = list(inbox_dir.glob("*.json"))
+        assert len(files) == 1, f"Expected 1 inbox message, found {len(files)}"
+
+        msg = json.loads(files[0].read_text())
+        assert msg["type"] == "steward_trigger", (
+            f"Expected type='steward_trigger', got {msg['type']!r}"
+        )
+
+    def test_message_includes_uow_id(self, tmp_path: Path) -> None:
+        """The steward_trigger message includes the completing UoW's id."""
+        inbox_dir = tmp_path / "inbox"
+        inbox_dir.mkdir()
+
+        with patch.dict(os.environ, {"LOBSTER_INBOX_DIR": str(inbox_dir)}):
+            _write_steward_trigger("uow_test_abc999")
+
+        files = list(inbox_dir.glob("*.json"))
+        assert len(files) == 1
+        msg = json.loads(files[0].read_text())
+        assert msg["uow_id"] == "uow_test_abc999"
+
+    def test_message_schema_fields(self, tmp_path: Path) -> None:
+        """Steward trigger message contains all required schema fields."""
+        inbox_dir = tmp_path / "inbox"
+        inbox_dir.mkdir()
+
+        with patch.dict(os.environ, {"LOBSTER_INBOX_DIR": str(inbox_dir)}):
+            _write_steward_trigger("uow_test_schema")
+
+        files = list(inbox_dir.glob("*.json"))
+        assert len(files) == 1
+        msg = json.loads(files[0].read_text())
+
+        required_fields = {"id", "source", "type", "chat_id", "uow_id", "timestamp"}
+        missing = required_fields - set(msg.keys())
+        assert not missing, f"steward_trigger message missing required fields: {missing}"
+        assert msg["source"] == "system"
+
+    def test_inbox_dir_created_if_absent(self, tmp_path: Path) -> None:
+        """_write_steward_trigger creates the inbox directory if it does not exist."""
+        inbox_dir = tmp_path / "inbox" / "nested"
+        # do not pre-create inbox_dir
+
+        with patch.dict(os.environ, {"LOBSTER_INBOX_DIR": str(inbox_dir)}):
+            _write_steward_trigger("uow_no_inbox_dir")
+
+        assert inbox_dir.exists()
+        files = list(inbox_dir.glob("*.json"))
+        assert len(files) == 1
+
+    def test_write_failure_does_not_raise(self, tmp_path: Path) -> None:
+        """_write_steward_trigger is non-fatal — inbox write errors are swallowed."""
+        # Point to an invalid inbox dir that cannot be created
+        with patch.dict(os.environ, {"LOBSTER_INBOX_DIR": "/dev/null/not-a-dir"}):
+            # Must not raise — even on OSError
+            _write_steward_trigger("uow_write_fail")
+
+
+# ---------------------------------------------------------------------------
+# Tests: maybe_complete_wos_uow calls steward trigger (issue #912)
+# ---------------------------------------------------------------------------
+
+class TestStewardTriggerIntegration:
+    """
+    Verify that maybe_complete_wos_uow calls _write_steward_trigger after a
+    successful executing → ready-for-steward transition.
+
+    Behaviors verified:
+    - Success path: _write_steward_trigger is called once with the UoW id
+    - Error status: _write_steward_trigger is NOT called
+    - Non-WOS task_id: _write_steward_trigger is NOT called
+    """
+
+    #: Named constant for how many times the trigger should fire on success.
+    EXPECTED_TRIGGER_COUNT_ON_SUCCESS: int = 1
+
+    def test_steward_trigger_called_after_successful_completion(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        After a successful executing → ready-for-steward transition,
+        _write_steward_trigger must be called exactly once with the UoW id.
+        """
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = _seed_uow_at_status(registry, "executing", output_dir)
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        with patch("orchestration.wos_completion._write_steward_trigger") as mock_trigger, \
+             patch("orchestration.wos_completion.subprocess.run"), \
+             patch.dict(os.environ, {"REGISTRY_DB_PATH": str(db_path)}):
+            maybe_complete_wos_uow(task_id, WRITE_RESULT_SUCCESS_STATUS)
+
+        assert mock_trigger.call_count == self.EXPECTED_TRIGGER_COUNT_ON_SUCCESS, (
+            f"Expected _write_steward_trigger to be called "
+            f"{self.EXPECTED_TRIGGER_COUNT_ON_SUCCESS} time(s) on success, "
+            f"got {mock_trigger.call_count}"
+        )
+        mock_trigger.assert_called_once_with(uow_id)
+
+    def test_steward_trigger_not_called_for_error_status(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        _write_steward_trigger must NOT be called when write_result status is 'error'.
+        Only successful completions advance the UoW and wake the steward.
+        """
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = _seed_uow_at_status(registry, "executing", output_dir)
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        with patch("orchestration.wos_completion._write_steward_trigger") as mock_trigger, \
+             patch.dict(os.environ, {"REGISTRY_DB_PATH": str(db_path)}):
+            maybe_complete_wos_uow(task_id, "error")
+
+        assert mock_trigger.call_count == 0, (
+            "Error write_result must not call _write_steward_trigger"
+        )
+
+    def test_steward_trigger_not_called_for_non_wos_task(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        _write_steward_trigger must NOT be called for non-WOS task_ids.
+        """
+        db_path = tmp_path / "registry.db"
+        Registry(db_path)
+
+        with patch("orchestration.wos_completion._write_steward_trigger") as mock_trigger, \
+             patch.dict(os.environ, {"REGISTRY_DB_PATH": str(db_path)}):
+            maybe_complete_wos_uow(_NON_WOS_TASK_ID, WRITE_RESULT_SUCCESS_STATUS)
+
+        assert mock_trigger.call_count == 0, (
+            "Non-WOS task_id must not call _write_steward_trigger"
+        )
+
+    def test_steward_trigger_failure_does_not_block_uow_transition(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        If _write_steward_trigger raises (simulated failure), the UoW must still
+        reach ready-for-steward. The trigger is non-fatal.
+        """
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = _seed_uow_at_status(registry, "executing", output_dir)
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        # _write_steward_trigger itself swallows exceptions, so we need to patch the
+        # internal inbox write to raise to simulate a write failure.
+        with patch("orchestration.wos_completion.subprocess.run"), \
+             patch(
+                 "orchestration.wos_completion._write_steward_trigger",
+                 side_effect=OSError("simulated inbox failure"),
+             ), \
+             patch.dict(os.environ, {"REGISTRY_DB_PATH": str(db_path)}):
+            # Must not raise even if trigger fails
+            maybe_complete_wos_uow(task_id, WRITE_RESULT_SUCCESS_STATUS)
+
+        # UoW transition happens before the trigger — status must still advance
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.status == UoWStatus.READY_FOR_STEWARD, (
+            "UoW must reach ready-for-steward even when steward trigger fails"
         )

@@ -534,7 +534,104 @@ def handle_wos_stop() -> str:
 WOS_MESSAGE_TYPE_DISPATCH: dict[str, str] = {
     # message type → handler name (used as a stable, compaction-safe key)
     "wos_execute": "handle_wos_execute",
+    # Post-completion steward trigger (issue #912): written by wos_completion.py
+    # after executing → ready-for-steward transition. Dispatcher calls
+    # handle_steward_trigger() which invokes run_steward_cycle() directly,
+    # bypassing the 0–3 minute cron wait.
+    "steward_trigger": "handle_steward_trigger",
 }
+
+
+def handle_steward_trigger(uow_id: str) -> dict[str, Any]:
+    """
+    Handle a steward_trigger inbox message by running an immediate steward cycle.
+
+    Called by route_wos_message when the dispatcher receives a message with
+    type="steward_trigger". This is the post-completion event-driven path
+    (issue #912): rather than waiting up to 3 minutes for the next cron tick,
+    the dispatcher runs a steward prescription cycle immediately after a UoW
+    completes.
+
+    The steward cycle is invoked via subprocess (steward-heartbeat.py) so that
+    it runs in a fresh Python process with the same environment as a regular
+    cron-triggered heartbeat. This avoids importing the full steward module into
+    the dispatcher process (which carries heavy LLM dependencies) and preserves
+    the existing heartbeat logging/observability infrastructure.
+
+    Non-blocking: the subprocess runs with a 60-second timeout. If it times out
+    or fails, a warning is logged and the dispatcher continues normally. The
+    3-minute cron remains the recovery fallback.
+
+    Returns:
+        {"action": "noop"} — no subagent spawn required; the steward runs
+        synchronously in the subprocess. The dispatcher marks the message as
+        processed after receiving this result.
+
+    Args:
+        uow_id: The UoW whose completion triggered this message (for logging).
+    """
+    import subprocess as _subprocess
+
+    # Steward heartbeat script location — same as cron invokes.
+    steward_script = Path(__file__).parent.parent.parent / "scheduled-tasks" / "steward-heartbeat.py"
+    if not steward_script.exists():
+        # Fallback: try repo-relative path from LOBSTER_REPO env
+        lobster_repo = Path(os.environ.get("LOBSTER_REPO", str(Path.home() / "lobster")))
+        steward_script = lobster_repo / "scheduled-tasks" / "steward-heartbeat.py"
+
+    if not steward_script.exists():
+        # No steward script found — log and return noop so dispatcher doesn't crash.
+        # The 3-minute cron will pick up the ready-for-steward UoW on its next tick.
+        import logging as _logging
+        _logging.getLogger("dispatcher_handlers").warning(
+            "handle_steward_trigger: steward-heartbeat.py not found at %s — "
+            "skipping immediate cycle (cron fallback will fire within 3 min) for UoW %r",
+            steward_script,
+            uow_id,
+        )
+        return {"action": "noop"}
+
+    try:
+        import logging as _logging
+        _log = _logging.getLogger("dispatcher_handlers")
+        _log.info(
+            "handle_steward_trigger: running immediate steward cycle for UoW %r",
+            uow_id,
+        )
+        result = _subprocess.run(
+            ["uv", "run", str(steward_script)],
+            timeout=60,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            _log.warning(
+                "handle_steward_trigger: steward-heartbeat.py exited %d for UoW %r — "
+                "stderr: %s",
+                result.returncode,
+                uow_id,
+                (result.stderr or "")[:300],
+            )
+        else:
+            _log.info(
+                "handle_steward_trigger: steward cycle complete for UoW %r",
+                uow_id,
+            )
+    except _subprocess.TimeoutExpired:
+        import logging as _logging
+        _logging.getLogger("dispatcher_handlers").warning(
+            "handle_steward_trigger: steward-heartbeat.py timed out (60s) for UoW %r — "
+            "cron fallback will fire within 3 min",
+            uow_id,
+        )
+    except Exception as exc:
+        import logging as _logging
+        _logging.getLogger("dispatcher_handlers").warning(
+            "handle_steward_trigger: failed to run steward cycle for UoW %r — %s: %s",
+            uow_id, type(exc).__name__, exc,
+        )
+
+    return {"action": "noop"}
 
 
 def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
@@ -630,6 +727,12 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
             "agent_type": agent_type,
             "message_type": msg_type,
         }
+
+    if msg_type == "steward_trigger":
+        trigger_uow_id: str = msg.get("uow_id", "unknown")
+        result = handle_steward_trigger(trigger_uow_id)
+        result["message_type"] = msg_type
+        return result
 
     # Unreachable given the guard above, but satisfies exhaustiveness checkers
     raise ValueError(f"route_wos_message: no branch for type {msg_type!r}")
