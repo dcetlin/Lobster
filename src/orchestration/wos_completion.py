@@ -82,6 +82,103 @@ _PR_REF_RE = re.compile(r"PR\s*#(\d+)", re.IGNORECASE)
 _ISSUE_REF_RE = re.compile(r"issue\s*#(\d+)", re.IGNORECASE)
 _FILE_PATH_RE = re.compile(r"(~/[^\s,;\"']+\.(?:md|json|py|sh|txt|yaml|yml))")
 
+#: Patterns for typed outcome_refs extraction (issue #880).
+#: PR: explicit "PR #N", "pull request #N", or GitHub pull URL.
+_OUTCOME_PR_RE = re.compile(
+    r"(?:pull\s+request|PR)\s*#(\d+)|/pull/(\d+)",
+    re.IGNORECASE,
+)
+#: Issue: "issue #N", "closes #N", "fixes #N".
+_OUTCOME_ISSUE_RE = re.compile(
+    r"(?:issue|closes|fixes)\s*#(\d+)",
+    re.IGNORECASE,
+)
+#: Commit SHA: 7–40 hex chars, word-bounded, not inside a URL path segment.
+#: Conservative: must be preceded/followed by whitespace or punctuation to
+#: avoid false positives in file content and hex color codes.
+_OUTCOME_COMMIT_RE = re.compile(r"(?<![/\w])([0-9a-f]{7,40})(?![/\w])")
+#: File path: absolute-looking or home-relative paths with recognized extensions.
+_OUTCOME_FILE_RE = re.compile(
+    r"(?:^|[\s(,])([~/][^\s,;\"']+\.(?:py|md|yaml|yml|json|sh|txt))",
+    re.MULTILINE,
+)
+
+#: Words that are very unlikely to be commit SHAs (common English hex-looking words).
+_SHA_DENYLIST = frozenset({"dead", "beef", "cafe", "babe", "face", "fade"})
+
+
+def _is_plausible_sha(candidate: str) -> bool:
+    """
+    Return True when candidate looks like a git commit SHA.
+
+    A plausible SHA:
+    - Is 7–40 lowercase hex characters.
+    - Is not in the SHA denylist (common false-positive hex words).
+    - Is not all-digit (would be mistaken for a number).
+
+    Pure function — no I/O.
+    """
+    if candidate.lower() in _SHA_DENYLIST:
+        return False
+    if candidate.isdigit():
+        return False
+    return True
+
+
+def _extract_outcome_refs(text: str, repo: str = "dcetlin/Lobster") -> list[dict]:
+    """
+    Extract typed outcome refs from agent result text for storage in the registry.
+
+    Pure function — no side effects.
+
+    Returns a list of typed ref dicts matching the issue #880 schema:
+      [{type: "pr"|"issue"|"file"|"commit", ref: str, category: str}]
+
+    Classification heuristics:
+    - PR refs   → category "pearl" (a merged PR is a concrete deliverable)
+    - Issue refs → category "seed"  (a filed issue is a future-value pointer)
+    - File refs  → category "pearl" (a committed file is a concrete artifact)
+    - Commit SHAs → category "pearl" (a merged commit is a concrete deliverable)
+
+    Deduplication: each (type, ref) pair appears at most once.
+
+    Args:
+        text: The result_text string from the write_result call.
+        repo: The GitHub repo slug used to qualify PR and issue refs.
+    """
+    seen: set[tuple[str, str]] = set()
+    refs: list[dict] = []
+
+    def _add(ref_type: str, ref: str, category: str) -> None:
+        key = (ref_type, ref)
+        if key not in seen:
+            seen.add(key)
+            refs.append({"type": ref_type, "ref": ref, "category": category})
+
+    # PR refs
+    for m in _OUTCOME_PR_RE.finditer(text):
+        number = m.group(1) or m.group(2)
+        _add("pr", f"{repo}#{number}", "pearl")
+
+    # Issue refs
+    for m in _OUTCOME_ISSUE_RE.finditer(text):
+        number = m.group(1)
+        _add("issue", f"{repo}#{number}", "seed")
+
+    # File paths
+    for m in _OUTCOME_FILE_RE.finditer(text):
+        path = m.group(1).strip()
+        _add("file", path, "pearl")
+
+    # Commit SHAs — only when text explicitly contains "commit" nearby to reduce noise
+    if re.search(r"\bcommit\b", text, re.IGNORECASE):
+        for m in _OUTCOME_COMMIT_RE.finditer(text):
+            sha = m.group(1).lower()
+            if _is_plausible_sha(sha):
+                _add("commit", sha, "pearl")
+
+    return refs
+
 
 def _extract_artifact_refs(text: str) -> dict:
     """
@@ -93,6 +190,9 @@ def _extract_artifact_refs(text: str) -> dict:
     - "pr_numbers": list of int PR numbers found (e.g. [42, 99])
     - "issue_numbers": list of int issue numbers found (e.g. [123])
     - "file_paths": list of str file paths found (e.g. ["~/lobster-workspace/foo.md"])
+
+    Note: _extract_outcome_refs provides the typed list form used for the registry
+    artifacts field (issue #880). This function is retained for result.json enrichment.
     """
     pr_numbers = [int(m) for m in _PR_REF_RE.findall(text)]
     issue_numbers = [int(m) for m in _ISSUE_REF_RE.findall(text)]
@@ -674,6 +774,32 @@ def maybe_complete_wos_uow(
                 log.warning(
                     "maybe_complete_wos_uow: result file enrichment failed for UoW %r — %s: %s",
                     uow_id, type(enrich_exc).__name__, enrich_exc,
+                )
+
+        # Registry artifact population (issue #880): extract typed outcome refs from
+        # result_text and store them in the registry artifacts field so the steward
+        # and retrospective job can traverse the causal chain without reading result files.
+        # Non-fatal — artifact extraction must never block the UoW transition.
+        if result_text:
+            try:
+                repo = os.environ.get("LOBSTER_WOS_REPO", "dcetlin/Lobster")
+                outcome_refs = _extract_outcome_refs(result_text, repo=repo)
+                if outcome_refs:
+                    registry.update_artifacts(uow_id, outcome_refs)
+                    log.info(
+                        "maybe_complete_wos_uow: artifacts extracted for UoW %r: %s",
+                        uow_id,
+                        outcome_refs,
+                    )
+                else:
+                    log.debug(
+                        "maybe_complete_wos_uow: no artifact refs found in result_text for UoW %r",
+                        uow_id,
+                    )
+            except Exception as artifacts_exc:
+                log.warning(
+                    "maybe_complete_wos_uow: artifact extraction failed for UoW %r — %s: %s",
+                    uow_id, type(artifacts_exc).__name__, artifacts_exc,
                 )
 
         # Close-out protocol: post a structured comment to the source GitHub issue.
