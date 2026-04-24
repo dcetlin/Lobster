@@ -231,6 +231,19 @@ class UoW:
     #   Populated by wos_completion.py after successful UoW completion.
     #   Types: "pr", "issue", "file", "commit".
     artifacts: list | None = None
+    # Shard-stream fields (populated after migration 0012).
+    #
+    # file_scope: JSON array of file/directory paths the UoW is expected to touch.
+    #   NULL = unknown scope. Unknown scope is treated as "exclusive": the UoW is only
+    #   dispatched when zero other UoWs are executing (preserves prior serial behavior).
+    #   Example: '["src/orchestration/steward.py", "tests/unit/test_orchestration/"]'
+    #   Populated at UoW creation time by the cultivator or manually.
+    file_scope: list | None = None
+    # shard_id: named dispatch stream. UoWs in the same shard run serially (only one
+    #   active per shard at a time). UoWs in different shards can run in parallel
+    #   subject to file_scope overlap checks. NULL = no shard constraint.
+    #   Example: 'wos-core', 'docs', 'tests'
+    shard_id: str | None = None
 
 
 def _now_iso() -> str:
@@ -406,6 +419,8 @@ class Registry:
             heartbeat_ttl=d.get("heartbeat_ttl") or 300,
             retry_count=d.get("retry_count") or 0,
             artifacts=_deserialize_json(d.get("artifacts")) if d.get("artifacts") else None,
+            file_scope=_deserialize_json(d.get("file_scope")) if d.get("file_scope") else None,
+            shard_id=d.get("shard_id"),
         )
 
     def _write_audit(
@@ -1044,6 +1059,32 @@ class Registry:
         and avoids a bare list(status='active') call at the call site.
         """
         return self.list(status=UoWStatus.ACTIVE)
+
+    def list_executing(self) -> list[UoW]:
+        """
+        Return all UoWs currently in-flight for the shard-stream dispatch gate.
+
+        "In-flight" means status IN ('active', 'executing', 'ready-for-executor')
+        — any state where the UoW has been dispatched to an executor and is
+        consuming file-scope resources. Used by the steward parallel dispatch
+        logic to determine whether a candidate UoW can safely be dispatched
+        without conflicting with in-flight work.
+
+        Named explicitly so the shard-stream gate's intent is readable at
+        the call site without reconstructing the status set from first principles.
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT * FROM uow_registry
+                WHERE status IN ('active', 'executing', 'ready-for-executor')
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+            return [self._row_to_uow(r) for r in rows]
+        finally:
+            conn.close()
 
     def get_started_at(self, uow_id: str) -> str | None:
         """

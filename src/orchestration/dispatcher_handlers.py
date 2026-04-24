@@ -47,6 +47,11 @@ _WOS_CONFIG_PATH: Path = _WOS_CONFIG_PATH_FROM_PATHS
 _DEFAULT_WOS_CONFIG: dict = {
     "execution_enabled": False,
     "prescription_model": "opus",  # Default to opus; can be overridden by env var or user config
+    # max_parallel: maximum number of UoWs that may execute concurrently.
+    # The steward shard-stream gate enforces this cap before dispatching
+    # a new UoW to ready-for-executor. Requires non-overlapping file_scope
+    # annotations on concurrent candidates. Default 2 (conservative).
+    "max_parallel": 2,
 }
 
 
