@@ -594,6 +594,10 @@ class CycleResult:
     race_skipped: int
     wait_for_trace: int
     considered_ids: tuple[str, ...]  # Use tuple for hashability with frozen=True
+    # shard_blocked: UoWs skipped this cycle because the shard-stream parallel
+    # dispatch gate blocked them (file_scope conflict, shard serialization, or
+    # max_parallel cap). They will be retried on the next heartbeat.
+    shard_blocked: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         """Convert to dict for backward compatibility with callers expecting dict."""
@@ -605,6 +609,7 @@ class CycleResult:
             "skipped": self.skipped,
             "race_skipped": self.race_skipped,
             "wait_for_trace": self.wait_for_trace,
+            "shard_blocked": self.shard_blocked,
             "considered_ids": list(self.considered_ids),
         }
 
@@ -4355,7 +4360,29 @@ def run_steward_cycle(
     race_skipped = 0
     wait_for_trace = 0
     throttle_count = 0
+    shard_blocked = 0
     considered_ids = []
+
+    # Shard-stream parallel dispatch gate — fetch once before the loop.
+    # _executing_uows is updated within the loop as UoWs are prescribed
+    # so that subsequent candidates in the same cycle see the updated
+    # in-flight count (prevents over-dispatch within a single heartbeat).
+    from src.orchestration.shard_dispatch import (
+        check_shard_dispatch_eligibility,
+        read_max_parallel,
+        DispatchAllowed,
+        DispatchBlocked,
+    )
+    try:
+        _executing_uows = registry.list_executing()
+    except Exception:
+        log.warning("Steward: could not fetch executing UoWs for shard gate — defaulting to empty list")
+        _executing_uows = []
+    _max_parallel = read_max_parallel()
+    log.debug(
+        "Steward cycle: shard-stream gate: executing=%d max_parallel=%d",
+        len(_executing_uows), _max_parallel,
+    )
 
     for uow in uows:
         uow_id = uow.id
@@ -4492,6 +4519,37 @@ def run_steward_cycle(
             skipped += 1
             continue
 
+        # Shard-stream parallel dispatch gate.
+        # Applied before prescription to prevent over-dispatch when multiple
+        # UoWs are ready-for-steward in the same heartbeat cycle.
+        # Done/Surfaced paths are also blocked when the gate fires — this is
+        # acceptable: at most one extra heartbeat delay for completion
+        # acknowledgment, which is far cheaper than a scope conflict.
+        _shard_decision = check_shard_dispatch_eligibility(
+            candidate_file_scope=getattr(uow, "file_scope", None),
+            candidate_shard_id=getattr(uow, "shard_id", None),
+            executing_uows=_executing_uows,
+            max_parallel=_max_parallel,
+        )
+        if isinstance(_shard_decision, DispatchBlocked):
+            log.info(
+                "shard-stream: uow_id=%s blocked — %s",
+                uow_id, _shard_decision.reason,
+            )
+            if not dry_run:
+                registry.append_audit_log(uow_id, {
+                    "event": "shard_dispatch_blocked",
+                    "actor": _ACTOR_STEWARD,
+                    "uow_id": uow_id,
+                    "reason": _shard_decision.reason,
+                    "executing_count": len(_executing_uows),
+                    "max_parallel": _max_parallel,
+                    "timestamp": _now_iso(),
+                })
+            shard_blocked += 1
+            skipped += 1
+            continue
+
         evaluated += 1
         try:
             result = _process_uow(
@@ -4514,6 +4572,13 @@ def run_steward_cycle(
         match result:
             case Prescribed():
                 prescribed += 1
+                # Update in-flight list so subsequent UoWs in this cycle see
+                # the updated count. Append the just-prescribed UoW to
+                # _executing_uows so that the shard gate correctly blocks
+                # conflicting candidates dispatched in the same heartbeat.
+                # We append the UoW object directly — it carries file_scope
+                # and shard_id from the registry row, which is what the gate needs.
+                _executing_uows = list(_executing_uows) + [uow]
             case Done():
                 done += 1
             case Surfaced():
@@ -4535,5 +4600,6 @@ def run_steward_cycle(
         skipped=skipped,
         race_skipped=race_skipped,
         wait_for_trace=wait_for_trace,
+        shard_blocked=shard_blocked,
         considered_ids=tuple(considered_ids),
     )
