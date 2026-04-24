@@ -2510,3 +2510,45 @@ Pattern citations with behavioral effect: learnings.md PR #826 ("external API on
 **Opportunity cost note:** Fix 3 (result file enrichment) is not anchored to any current_focus item in vision.yaml — it is quality-of-life work on the completion path. Vision principle-4 ("integration rate before new feature rate") suggests this could have waited. The feature is non-fatal by design and bounded in scope, so the cost is limited. The opportunity cost of the time spent on Fix 3 vs. directly investigating the 44% failure rate root cause is the more meaningful question.
 
 **VERDICT: APPROVED**
+
+---
+
+### [2026-04-23] Doc review: philosophy/frontier/metabolic-juice.md (PR #885)
+
+**Vision alignment:** The adversarial prior: is this solving the wrong problem? Vision.yaml current_constraint names "WOS queue idle, 44% pipeline failure rate" as the primary constraint. This document is philosophy work in a priority context that is explicitly operational. The attack surface: philosophy documentation is a classic juice-trap — generative potential that doesn't crystallize when the system is starved of execution capacity.
+
+Counter-reading: the document itself diagnoses the compaction risk at the steward prescription level, which is directly relevant to the live WOS execution problem. The `quality: juice` field proposal gives the steward prescription register a way to name alive threads that are not yet UoW-ready — a structural insight with operational weight in the current pipeline health context. The opportunity cost is bounded: this is a single frontier doc, not a philosophy sprint. The doc serves the theory of change (better structural vocabulary improves routing and persistence of live work across compaction events).
+
+**Alignment verdict:** Confirmed
+
+**Interpretation finding:** The document is well-composed and internally consistent. The cadence analogy is clear and precise. The compaction risk section is the strongest section and correctly identified as load-bearing. The system representation proposals are appropriately tentative. No section over-promises.
+
+**Named gaps:**
+- **Gap 1: Juice vs. indeterminate work** — The document distinguishes juice from the four closure states, but does not clearly distinguish juice from work that is simply not-yet-started or hasn't been thought about at all. The "generative aliveness" criterion is implied but not operationalized. A steward prescription marking `quality: juice` should have a minimum signal that distinguishes it from a prescription that hasn't fired yet. This is a mild gap — the doc is philosophy rather than specification — but the system representation proposal would benefit from at least naming the minimum signal.
+- **Gap 2: Recovery from rancid juice** — The compaction risk section names the failure mode (live juice → heat/shit) but does not address what happens next. If compaction converts juice to waste, is there a recovery path? The compact-catchup agent is named as unable to reconstruct juice, but the doc stops there. A sentence on the irreversibility — or the exception case where partial articulation allows partial recovery — would close this gap.
+
+**Patterns introduced:** The juice / closure state distinction as a first-class vocabulary in the metabolic taxonomy. The calibration question framing ("Is there still juice here?") as a pre-compaction discipline. The semantic boundary between outcome_category (closure states) and quality fields on prescriptions (pre-metabolic markers).
+
+**What this forecloses:** Treating all steward prescriptions as binary (ready-to-dispatch / not) — the juice vocabulary makes the intermediate state nameable and potentially protectable.
+
+**VERDICT: APPROVED**
+
+### [2026-04-23] PR #894 — feat(wos): cap steward retries at 3 and escalate to needs-human-review
+
+**Vision alignment:** vision.yaml `current_focus.this_week.primary` names "drain 3 blocked UoWs" as the current priority. The current_constraint names those exact three UoWs. This work directly serves the stated priority. The adversarial prior entering Stage 1 — that a retry cap addresses labels rather than pipeline health — partially collapses: the manual transition of the 3 stuck UoWs is the immediate drain; the retry cap is structural prevention of recurrence. The surviving Stage 1 tension is the Encoded Orientation classification: `needs-human-review` as a status with automated Telegram escalation is a new behavioral class that requires a prior logged decision under constraint-3. No such prior exists in the oracle system.
+
+**Alignment verdict:** Questioned
+
+**Quality finding:**
+- Retry cap logic is correct. `new_retry_count > MAX_RETRIES` (strict greater-than) allows exactly 3 re-dispatch attempts before escalating. Spec and code are consistent. No off-by-one.
+- Encoded Orientation without logged prior (constraint-3 violation). `needs-human-review` plus `_send_escalation_notification` is a new autonomous action class. Issue #887 is a proposal, not an oracle/vision authorization. Blocking.
+- Incomplete callback handling. Retry/Close buttons write `decide_retry:{uow_id}` and `decide_close:{uow_id}` callback data with no dispatcher handler. User-facing dead buttons shipped in production surface.
+- Dry-run notification behavior is consistent with existing steward pattern (notifications fire outside `if not dry_run:`). Not a new defect introduced by this PR.
+
+**Patterns introduced:** retry_count field as a per-UoW re-dispatch counter; `needs-human-review` as a parking status for retry-exceeded UoWs; inbox-write pattern applied to escalation notifications (consistent with `_default_notify_dan`).
+
+**What this forecloses:** Once `needs-human-review` is live, future escalation changes (per-register thresholds, different channels, auto-close) must navigate this status. The non-terminal classification (`is_terminal()` returns False) preserves the correction path.
+
+**Opportunity cost note:** The 3 stuck UoWs are the current blocking priority. Manual transition + structural cap is the right two-part response. The constraint-3 logging gap is a process issue that can be resolved via a follow-on logged decision without changing the code.
+
+**VERDICT: NEEDS_CHANGES**
