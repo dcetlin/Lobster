@@ -930,6 +930,9 @@ def _determine_reentry_posture(
     if return_reason == "executor_orphan":
         return "executor_orphan"
 
+    if return_reason == "executing_orphan":
+        return "executing_orphan"
+
     classification = _RETURN_REASON_CLASSIFICATIONS.get(return_reason or "", None)
 
     if classification == _CLASSIFICATION_NORMAL:
@@ -941,12 +944,6 @@ def _determine_reentry_posture(
             return "crashed_no_output"
         return "execution_failed"
     elif classification == _CLASSIFICATION_ORPHAN:
-        # executing_orphan is a distinct orphan sub-type: the executor claimed the
-        # UoW and dispatched the subagent, but write_result was never called.
-        # Preserve this classification so the 4b-orphan guard in _process_uow can
-        # short-circuit to fail_uow rather than re-dispatching.
-        if return_reason == "executing_orphan":
-            return "executing_orphan"
         return "executor_orphan"
     else:
         # Fall back to audit event inspection
