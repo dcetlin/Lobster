@@ -1,6 +1,6 @@
 # WOS Pipeline Architecture
 
-**Date:** 2026-04-22
+**Date:** 2026-04-22 (updated 2026-04-24 — PR #908: age-based promotion in requalify_proposed)
 **Status:** Canonical (v3 — heartbeat locking, recurrence, lifecycle, loops)
 **Scope:** Full cultivator-to-executor pipeline, including germinator register classification, routing classifier posture assignment, executor dispatch, lifecycle stages, and feedback loops.
 **Workstream:** `~/lobster-workspace/workstreams/wos/README.md`
@@ -29,12 +29,28 @@ flowchart TD
     GH["GitHub Issues\n(dcetlin/Lobster)"]
 
     subgraph INGEST ["Ingest Layer"]
-        GC["GardenCaretaker\ngarden_caretaker.py\nscan → tend\nevery 15 min via cron"]
-        CULT["github-issue-cultivator\n(LLM scheduled job)\nfetch → classify-priority → promote\nDaily at 06:00 UTC"]
+        GC["GardenCaretaker\ngarden_caretaker.py\nscan → tend → requalify_proposed\nevery 15 min via cron\nbatch 20/cycle"]
+        CULT["github-issue-cultivator\n(LLM scheduled job)\nfetch → classify-priority → promote\nnightly (22:00–05:00 UTC window)"]
     end
 
     SKIP{Skip condition?\nmeta/tracking label\nor already active UoW}
     SKIP_OUT["Skip\n(idempotent upsert)"]
+
+    subgraph QUALIFY ["proposed → ready-for-steward Qualification\n(requalify_proposed, batch 20/cycle, every 15 min)"]
+        QUAL_BLOCK{"Blocking label?\n(blocked, wontfix)"}
+        QUAL_BLOCK_OUT["Suppressed\n(never promoted)"]
+        QUAL_LABEL{"Label gate:\nready-to-execute,\nhigh-priority, or bug?"}
+        QUAL_AGE{"Age gate (PR #908):\nUoW in proposed\n≥ qualify_after_days_open\n(default: 3 days)?"}
+        QUAL_PROMOTE["Promote\nproposed → ready-for-steward"]
+        QUAL_WAIT["Wait\n(re-checked next 15-min cycle)"]
+
+        QUAL_BLOCK -->|Yes| QUAL_BLOCK_OUT
+        QUAL_BLOCK -->|No| QUAL_LABEL
+        QUAL_LABEL -->|Yes — fast path| QUAL_PROMOTE
+        QUAL_LABEL -->|No| QUAL_AGE
+        QUAL_AGE -->|Yes| QUAL_PROMOTE
+        QUAL_AGE -->|No| QUAL_WAIT
+    end
 
     subgraph REGISTRATION ["Registration — synchronous on insert"]
         GERM["Germinator\ngerminator.py\nRegister classification at germination time"]
@@ -63,7 +79,7 @@ flowchart TD
             RC4["default → solo"]
         end
 
-        UPSERT["Registry._upsert_typed\nINSERT with register + posture + route_reason\n(idempotent — existing active UoWs not re-inserted)\nstate: proposed → pending → ready-for-steward"]
+        UPSERT["Registry._upsert_typed\nINSERT with register + posture + route_reason\n(idempotent — existing active UoWs not re-inserted)\nstate: proposed (new) — qualification runs separately"]
     end
 
     subgraph STEWARD_LOOP ["Steward/Executor Loop (every 3 min)"]
@@ -105,7 +121,8 @@ flowchart TD
     RC --> RC_RULES
     RC_RULES --> UPSERT
 
-    UPSERT --> SHB
+    UPSERT -->|state: proposed| QUAL_BLOCK
+    QUAL_PROMOTE --> SHB
     SHB --> STARTUP
     STARTUP --> OBS
     OBS --> STEWARD
@@ -228,14 +245,27 @@ The heartbeat's `_filter_stale_uows` adds a second layer for recovery dispatch: 
 
 | Component | Trigger / Frequency |
 |-----------|---------------------|
-| **GardenCaretaker** | Every 15 min via cron (`*/15 * * * *`) — Type C, cron-direct |
-| **github-issue-cultivator** | Daily at 06:00 UTC (`0 6 * * *`) — LLM scheduled job |
+| **GardenCaretaker** | Every 15 min via cron (`*/15 * * * *`) — Type C, cron-direct — runs scan + tend + requalify_proposed (batch 20/cycle) |
+| **github-issue-cultivator** | Nightly 22:00–05:00 UTC window — LLM scheduled job |
 | **Steward Heartbeat** | Every 3 min via cron (`*/3 * * * *`), offset 0s |
 | **Executor Heartbeat** | Every 3 min via cron (`*/3 * * * *`), offset +90s from steward |
 | **Germinator** | Synchronous on every new UoW insert — not polled |
 | **Routing Classifier** | Synchronous on every new UoW insert — not polled |
 | **Negentropic Sweep** | Daily at 02:00 UTC (`0 2 * * *`) — LLM scheduled job |
 | **Lobster Dispatcher** | Event-driven — picks up `wos_execute` messages within seconds |
+
+### proposed → ready-for-steward Qualification Gates (PR #908)
+
+The `requalify_proposed()` function in GardenCaretaker runs every 15 minutes and evaluates each proposed UoW against two gates (blocking labels checked first, then promotion gates):
+
+**Suppression (checked before promotion gates):**
+- Source issue has `blocked` or `wontfix` label → UoW is suppressed regardless of age or other labels
+
+**Promotion gates (either is sufficient to promote):**
+1. **Label gate** (fast path): source issue has `ready-to-execute`, `high-priority`, or `bug` label → promote immediately to `ready-for-steward`
+2. **Age gate** (added by PR #908): UoW has been in `proposed` state for ≥ `qualify_after_days_open` days (default: 3) → promote without requiring a label
+
+**Background:** Before PR #908, `requalify_proposed()` called `_qualifies(require_label=True)`, which disabled the age path. A label was the only way to advance from proposed. This caused 236 UoWs to accumulate with no forward motion. PR #908 changed `require_label` to `False`, making `requalify_proposed()` consistent with `scan()` behavior. The batch size cap (20 per cycle) prevents queue floods during recovery.
 
 ### 3. Where is the Cultivator?
 
@@ -299,7 +329,7 @@ The parallel to the pipeline diagram: WOS has the cycles (the heartbeats, the sw
 
 | Component | File | Role |
 |-----------|------|------|
-| **GardenCaretaker** | `src/orchestration/garden_caretaker.py` | Unified scan-and-tend loop. Every 15 min: discovers new issues (scan) and reconciles active UoW bindings against source state (tend). Replaces the original split between cultivator.py and issue-sweeper.py. |
+| **GardenCaretaker** | `src/orchestration/garden_caretaker.py` | Unified scan-and-tend loop. Every 15 min: discovers new issues (scan), reconciles active UoW bindings against source state (tend), and promotes qualifying proposed UoWs (requalify_proposed — batch 20/cycle). Replaces the original split between cultivator.py and issue-sweeper.py. |
 | **github-issue-cultivator** | `scheduled-tasks/tasks/github-issue-cultivator.md` | Daily LLM job (06:00 UTC). Fetches all open GitHub issues, applies skip conditions (meta-tracking labels, existing active UoWs), assigns priority, and promotes to WOS registry. |
 | **Germinator** | `src/orchestration/germinator.py` | Classifies the attentional *register* of each UoW at germination time using a 4-gate ordered algorithm. Register is immutable after germination. Runs synchronously on insert. |
 | **Routing Classifier** | `src/orchestration/routing_classifier.py` | Loads `~/lobster-user-config/orchestration/classifier.yaml` and applies first-match-wins rules to assign a *posture* (solo, sequential, review-loop, fan-out) and a `route_reason`. Falls back to `solo` if classifier YAML is absent. Runs synchronously on insert. |
