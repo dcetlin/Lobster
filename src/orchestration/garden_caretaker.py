@@ -208,14 +208,14 @@ class GardenCaretaker:
         return {**seed_results, **requalify_results, **tend_results, **trigger_results}
 
     def requalify_proposed(self) -> dict[str, int]:
-        """Re-evaluate proposed UoWs and auto-advance those with a qualifying label.
+        """Re-evaluate proposed UoWs and auto-advance those that meet qualification criteria.
 
         This closes the gap where UoWs that were reset to 'proposed' (e.g. by tend() reactivation
         after source reopens) would stay stuck there indefinitely unless manually approved.
 
         For each UoW in 'proposed' state with a source_ref (up to REQUALIFY_BATCH_SIZE per cycle):
           - Fetch the current IssueSnapshot from source
-          - If the snapshot passes _qualifies(require_label=True) → transition to 'ready-for-steward'
+          - If the snapshot passes _qualifies() → transition to 'ready-for-steward'
           - If source returns None (deleted/not found) → skip (tend() handles cleanup)
           - If source fetch errors → skip with a warning (don't block the cycle)
 
@@ -227,11 +227,11 @@ class GardenCaretaker:
         GitHub API calls. UoWs are sorted oldest-updated_at-first so the longest-unchecked
         records are prioritized on each 15-minute cycle.
 
-        **Label-only qualification (vision.yaml od-3):** Age-only qualification is suppressed
-        here. A proposed UoW must carry a qualifying label (ready-to-execute, high-priority,
-        or bug) to be auto-advanced. Issues that are only "old enough" require explicit Steward
-        or Dan input — auto-advancement on age alone would promote issues the Steward has not
-        yet reviewed via label signal.
+        **Age-based promotion:** A proposed UoW qualifies if it has a qualifying label
+        (ready-to-execute, high-priority, or bug) OR if it has been open for at least
+        qualify_after_days_open (default: 3 days) with no blocking labels. This matches
+        the scan-time qualification behavior and unblocks UoWs that accumulate without
+        label intervention.
 
         Returns:
             {"requalified": int}
@@ -268,10 +268,11 @@ class GardenCaretaker:
                 logger.debug("requalify_proposed: UoW %s source not found — skipping (tend will archive)", uow.id)
                 continue
 
-            # require_label=True: age-only qualification is suppressed per vision.yaml od-3.
-            # Only issues with a qualifying label (ready-to-execute, high-priority, bug)
-            # are auto-advanced. Age-only qualification requires explicit Steward input.
-            if not _qualifies(snapshot, self.config, require_label=True):
+            # Age-based fallback: UoWs open for qualify_after_days_open (default 3 days)
+            # without blocking labels are eligible, matching scan-time behavior.
+            # Label-based promotion remains the fast path; age is the fallback for
+            # UoWs that accumulate without label intervention (issue #907).
+            if not _qualifies(snapshot, self.config, require_label=False):
                 logger.debug("requalify_proposed: UoW %s does not qualify yet — skipping", uow.id)
                 continue
 
