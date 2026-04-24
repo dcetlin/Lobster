@@ -15,6 +15,7 @@ The dispatcher calls these handlers when it recognizes:
   decide retry <uow-id>                → handle_decide_retry(uow_id, registry)
   decide close <uow-id>                → handle_decide_close(uow_id, registry)
   type: "wos_execute"                  → handle_wos_execute(uow_id, instructions, output_ref)
+  type: "callback" (decide_retry/close)→ route_callback_message(msg)
 
 ## Compaction-resilient dispatch
 
@@ -632,3 +633,101 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
 
     # Unreachable given the guard above, but satisfies exhaustiveness checkers
     raise ValueError(f"route_wos_message: no branch for type {msg_type!r}")
+
+
+# ---------------------------------------------------------------------------
+# Compaction-resilient callback dispatch
+#
+# The dispatcher calls route_callback_message(msg) for type="callback" messages
+# instead of relying on prose instructions that may not survive context compaction.
+#
+# Dispatcher integration (add to main loop):
+#
+#     from src.orchestration.dispatcher_handlers import route_callback_message
+#
+#     if msg.get("type") == "callback":
+#         result = route_callback_message(msg)
+#         # result["action"] tells the dispatcher what to do:
+#         #   "send_reply" → send result["text"] to result["chat_id"]
+#         # mark_processed(message_id) after sending the reply
+# ---------------------------------------------------------------------------
+
+#: Callback data prefixes that this router handles.
+CALLBACK_DATA_HANDLERS: frozenset[str] = frozenset({
+    "decide_retry:",
+    "decide_close:",
+})
+
+
+def route_callback_message(msg: dict[str, Any], *, registry: "Registry | None" = None) -> dict[str, Any]:
+    """
+    Route a ``type: "callback"`` inbox message from an inline keyboard button press.
+
+    This is the compaction-resilient entry point for callback routing.  The
+    dispatcher should import and call this function rather than relying on prose
+    boot instructions that can be lost under context compaction.
+
+    Currently handles:
+    - ``decide_retry:<uow_id>`` — retry a blocked UoW (calls ``handle_decide_retry``)
+    - ``decide_close:<uow_id>`` — close a blocked UoW (calls ``handle_decide_close``)
+
+    All other callback_data values fall through to an "unknown callback" reply,
+    which lets the dispatcher handle other callback types (job-confirm, delete-confirm,
+    etc.) via its existing prose routing logic.
+
+    Args:
+        msg: The raw inbox message dict.  Must contain ``callback_data`` and
+             ``chat_id``.
+        registry: Optional Registry instance.  If omitted, a default Registry()
+             is constructed (uses the production DB path).  Pass an explicit
+             instance in tests to use a temp DB.
+
+    Returns:
+        A dict with:
+
+        ``action`` (str):
+            Always ``"send_reply"`` — the dispatcher must call send_reply.
+
+        ``text`` (str):
+            The reply text to send to the user.
+
+        ``chat_id`` (int | str):
+            The chat to reply to (echoed from ``msg["chat_id"]``).
+
+        ``handled`` (bool):
+            ``True`` if callback_data matched a known WOS pattern;
+            ``False`` if the dispatcher should fall through to its own
+            handling (e.g. job-confirm-yes, delete-confirm-yes).
+
+    Example dispatcher integration::
+
+        from src.orchestration.dispatcher_handlers import route_callback_message
+
+        if msg.get("type") == "callback":
+            result = route_callback_message(msg)
+            if result["handled"]:
+                send_reply(chat_id=result["chat_id"], text=result["text"],
+                           message_id=message_id)
+            else:
+                # fall through to prose-based job-confirm / delete-confirm logic
+                ...
+    """
+    from .registry import Registry  # local import to keep module importable without DB
+
+    data: str = msg.get("callback_data", "")
+    chat_id = msg.get("chat_id")
+
+    if data.startswith("decide_retry:"):
+        uow_id = data[len("decide_retry:"):]
+        reg = registry if registry is not None else Registry()
+        text = handle_decide_retry(uow_id, registry=reg)
+        return {"action": "send_reply", "text": text, "chat_id": chat_id, "handled": True}
+
+    if data.startswith("decide_close:"):
+        uow_id = data[len("decide_close:"):]
+        reg = registry if registry is not None else Registry()
+        text = handle_decide_close(uow_id, registry=reg)
+        return {"action": "send_reply", "text": text, "chat_id": chat_id, "handled": True}
+
+    # Not a WOS callback — signal the dispatcher to use its own handling
+    return {"action": "send_reply", "text": f"Unknown callback: {data}", "chat_id": chat_id, "handled": False}

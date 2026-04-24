@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import pytest
 
-from src.orchestration.dispatcher_handlers import handle_approve, handle_confirm, handle_decide, handle_decide_defer, handle_wos_execute, handle_wos_status, handle_wos_unblock, route_wos_message, WOS_MESSAGE_TYPE_DISPATCH
+from src.orchestration.dispatcher_handlers import handle_approve, handle_confirm, handle_decide, handle_decide_defer, handle_wos_execute, handle_wos_status, handle_wos_unblock, route_wos_message, route_callback_message, CALLBACK_DATA_HANDLERS, WOS_MESSAGE_TYPE_DISPATCH
 
 
 @pytest.fixture
@@ -729,3 +729,103 @@ class TestDecideCallbackParseRoundtrip:
             assert parsed == uow_id, (
                 f"UoW ID with hyphens must survive round-trip through {prefix!r}"
             )
+
+
+class TestRouteCallbackMessage:
+    """Tests for route_callback_message — compaction-resilient callback dispatch."""
+
+    def test_decide_retry_returns_send_reply_action(self, registry):
+        """decide_retry callback returns action='send_reply'."""
+        uow_id = registry.upsert(
+            issue_number=901, title="Retry callback test", sweep_date="2026-04-24",
+            success_criteria="Test."
+        ).id
+        registry.set_status_direct(uow_id, "blocked")
+        msg = {"callback_data": f"decide_retry:{uow_id}", "chat_id": 12345}
+        result = route_callback_message(msg, registry=registry)
+        assert result["action"] == "send_reply"
+
+    def test_decide_retry_returns_handled_true(self, registry):
+        """decide_retry callback sets handled=True."""
+        uow_id = registry.upsert(
+            issue_number=901, title="Retry handled test", sweep_date="2026-04-24",
+            success_criteria="Test."
+        ).id
+        registry.set_status_direct(uow_id, "blocked")
+        msg = {"callback_data": f"decide_retry:{uow_id}", "chat_id": 12345}
+        result = route_callback_message(msg, registry=registry)
+        assert result["handled"] is True
+
+    def test_decide_retry_echoes_chat_id(self, registry):
+        """route_callback_message echoes chat_id from the message."""
+        uow_id = registry.upsert(
+            issue_number=901, title="ChatId echo test", sweep_date="2026-04-24",
+            success_criteria="Test."
+        ).id
+        registry.set_status_direct(uow_id, "blocked")
+        msg = {"callback_data": f"decide_retry:{uow_id}", "chat_id": 99999}
+        result = route_callback_message(msg, registry=registry)
+        assert result["chat_id"] == 99999
+
+    def test_decide_retry_transitions_blocked_uow(self, registry):
+        """decide_retry callback transitions a blocked UoW to ready-for-steward."""
+        uow_id = registry.upsert(
+            issue_number=901, title="Retry transition test", sweep_date="2026-04-24",
+            success_criteria="Test."
+        ).id
+        registry.set_status_direct(uow_id, "blocked")
+        msg = {"callback_data": f"decide_retry:{uow_id}", "chat_id": 12345}
+        route_callback_message(msg, registry=registry)
+        uow = registry.get(uow_id)
+        assert uow.status == "ready-for-steward"
+
+    def test_decide_close_returns_send_reply_action(self, registry):
+        """decide_close callback returns action='send_reply'."""
+        uow_id = registry.upsert(
+            issue_number=901, title="Close callback test", sweep_date="2026-04-24",
+            success_criteria="Test."
+        ).id
+        registry.set_status_direct(uow_id, "blocked")
+        msg = {"callback_data": f"decide_close:{uow_id}", "chat_id": 12345}
+        result = route_callback_message(msg, registry=registry)
+        assert result["action"] == "send_reply"
+
+    def test_decide_close_returns_handled_true(self, registry):
+        """decide_close callback sets handled=True."""
+        uow_id = registry.upsert(
+            issue_number=901, title="Close handled test", sweep_date="2026-04-24",
+            success_criteria="Test."
+        ).id
+        registry.set_status_direct(uow_id, "blocked")
+        msg = {"callback_data": f"decide_close:{uow_id}", "chat_id": 12345}
+        result = route_callback_message(msg, registry=registry)
+        assert result["handled"] is True
+
+    def test_decide_close_transitions_blocked_to_failed(self, registry):
+        """decide_close callback transitions a blocked UoW to failed."""
+        uow_id = registry.upsert(
+            issue_number=901, title="Close transition test", sweep_date="2026-04-24",
+            success_criteria="Test."
+        ).id
+        registry.set_status_direct(uow_id, "blocked")
+        msg = {"callback_data": f"decide_close:{uow_id}", "chat_id": 12345}
+        route_callback_message(msg, registry=registry)
+        uow = registry.get(uow_id)
+        assert uow.status == "failed"
+
+    def test_unknown_callback_returns_handled_false(self):
+        """Non-WOS callbacks return handled=False so dispatcher can handle them."""
+        msg = {"callback_data": "job-confirm-yes-some-job", "chat_id": 12345}
+        result = route_callback_message(msg)
+        assert result["handled"] is False
+
+    def test_unknown_callback_returns_send_reply_action(self):
+        """Unknown callbacks still return action='send_reply'."""
+        msg = {"callback_data": "delete-confirm-no-some-slug", "chat_id": 12345}
+        result = route_callback_message(msg)
+        assert result["action"] == "send_reply"
+
+    def test_callback_data_handlers_contains_expected_prefixes(self):
+        """CALLBACK_DATA_HANDLERS contains the two WOS prefixes."""
+        assert "decide_retry:" in CALLBACK_DATA_HANDLERS
+        assert "decide_close:" in CALLBACK_DATA_HANDLERS
