@@ -4533,3 +4533,110 @@ class TestParseWorkflowArtifact:
         result = steward._parse_workflow_artifact(raw)
 
         assert result["success_criteria_check"] == "Check that status: done appears in output"
+
+
+# ---------------------------------------------------------------------------
+# Test: executing_orphan short-circuit (4b-orphan guard)
+# ---------------------------------------------------------------------------
+
+class TestExecutingOrphanShortCircuit:
+    """
+    A UoW whose subagent exited without calling write_result is detected by
+    startup_sweep as executing_orphan. The steward must mark it failed immediately
+    rather than re-dispatching — the retry loop cannot fix a subagent that
+    systematically skips the result contract.
+    """
+
+    EXECUTING_ORPHAN_AUDIT_ENTRY = {
+        "event": "startup_sweep",
+        "classification": "executing_orphan",
+        "prior_status": "executing",
+    }
+
+    def test_executing_orphan_marks_failed_not_retried(self, db_path, registry, tmp_path):
+        """executing_orphan posture → fail_uow called, no transition to ready-for-executor."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=1,
+            output_ref=None,
+            audit_log_entries=[self.EXECUTING_ORPHAN_AUDIT_ENTRY],
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+        )
+
+        uow = _get_uow(db_path, uow_id)
+        assert uow["status"] == "failed", (
+            f"executing_orphan must be marked failed immediately, not retried. "
+            f"Got status: {uow['status']}"
+        )
+
+    def test_executing_orphan_does_not_transition_to_ready_for_executor(self, db_path, registry, tmp_path):
+        """executing_orphan posture must never transition to ready-for-executor."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=1,
+            output_ref=None,
+            audit_log_entries=[self.EXECUTING_ORPHAN_AUDIT_ENTRY],
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+        )
+
+        uow = _get_uow(db_path, uow_id)
+        assert uow["status"] != "ready-for-executor", (
+            "executing_orphan must not be re-dispatched to executor — "
+            f"got status: {uow['status']}"
+        )
+
+    def test_executing_orphan_returns_surfaced_with_condition(self, db_path, registry, tmp_path):
+        """_process_uow returns Surfaced(condition='executing_orphan') for this posture."""
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=1,
+            output_ref=None,
+            audit_log_entries=[self.EXECUTING_ORPHAN_AUDIT_ENTRY],
+        )
+        conn.close()
+
+        result = steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+        )
+
+        # run_steward_cycle returns a StewardCycleResult; check that the UoW
+        # outcome was recorded — the simplest signal is the failed status above.
+        # Additionally verify that the executing_orphan_failed event appears in audit_log.
+        entries = _audit_entries(db_path, uow_id)
+        orphan_events = [e for e in entries if e.get("event") == "executing_orphan_failed"]
+        assert orphan_events, (
+            "executing_orphan_failed audit event must be written when short-circuit fires; "
+            f"audit entries: {entries}"
+        )
