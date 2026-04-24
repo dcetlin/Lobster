@@ -24,6 +24,14 @@
 
 set -euo pipefail
 
+# Enforce uv usage — reject bare python3/python/pip calls in this file.
+# Hook registration strings (inside jq arguments) are not line-leading invocations
+# and are intentionally exempt: they register Claude Code hooks, not shell calls.
+if grep -qE '^\s*(python3|python|pip)\s' "$0" 2>/dev/null; then
+    echo "ERROR: bare python3/python/pip found in upgrade.sh. Use 'uv run' or 'uv pip install' instead." >&2
+    exit 1
+fi
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -578,7 +586,7 @@ update_python_deps() {
     # Create venv if missing
     if [ ! -d "$VENV_DIR" ]; then
         info "Creating Python virtual environment..."
-        python3 -m venv "$VENV_DIR"
+        uv venv "$VENV_DIR"
         success "venv created"
     fi
 
@@ -587,24 +595,24 @@ update_python_deps() {
     source "$VENV_DIR/bin/activate"
 
     substep "Upgrading pip..."
-    pip install --quiet --upgrade pip 2>/dev/null || true
+    uv pip install --quiet --upgrade pip 2>/dev/null || true
 
     # Install from requirements.txt if it exists, otherwise install known deps
     if [ -f "$LOBSTER_DIR/requirements.txt" ]; then
         substep "Installing from requirements.txt..."
-        pip install --quiet --upgrade -r "$LOBSTER_DIR/requirements.txt" 2>/dev/null || {
+        uv pip install --quiet --upgrade -r "$LOBSTER_DIR/requirements.txt" 2>/dev/null || {
             warn "requirements.txt install had errors, installing core deps individually..."
-            pip install --quiet --upgrade mcp python-telegram-bot watchdog python-dotenv 2>/dev/null || true
+            uv pip install --quiet --upgrade mcp python-telegram-bot watchdog python-dotenv 2>/dev/null || true
         }
     else
         substep "No requirements.txt found, installing core dependencies..."
-        pip install --quiet --upgrade mcp python-telegram-bot watchdog python-dotenv 2>/dev/null || true
+        uv pip install --quiet --upgrade mcp python-telegram-bot watchdog python-dotenv 2>/dev/null || true
     fi
 
     # Always ensure playwright is importable (needed for fetch_page)
     if ! $SKIP_PLAYWRIGHT; then
         substep "Ensuring playwright is installed in venv..."
-        pip install --quiet --upgrade playwright 2>/dev/null || warn "Failed to pip install playwright"
+        uv pip install --quiet --upgrade playwright 2>/dev/null || warn "Failed to uv pip install playwright"
     fi
 
     deactivate
@@ -817,9 +825,9 @@ install_playwright() {
     # shellcheck source=/dev/null
     source "$VENV_DIR/bin/activate"
 
-    if ! python -c "import playwright" 2>/dev/null; then
+    if ! "$VENV_DIR/bin/python" -c "import playwright" 2>/dev/null; then
         substep "Installing playwright Python package..."
-        pip install --quiet playwright 2>/dev/null || {
+        uv pip install --quiet playwright 2>/dev/null || {
             warn "Failed to install playwright pip package"
             deactivate
             return 0
@@ -839,7 +847,7 @@ install_playwright() {
 
     # Install Chromium via Playwright
     substep "Installing Chromium browser (this may take a minute)..."
-    python -m playwright install chromium 2>/dev/null || {
+    "$VENV_DIR/bin/python" -m playwright install chromium 2>/dev/null || {
         warn "Playwright chromium install failed. fetch_page tool will not work."
         warn "Try manually: source $VENV_DIR/bin/activate && python -m playwright install chromium"
         deactivate
@@ -1233,7 +1241,7 @@ run_migrations() {
     local state_json="$MESSAGES_DIR/config/lobster-state.json"
     if [ -f "$state_json" ]; then
         local has_booted_at
-        has_booted_at=$(python3 -c "
+        has_booted_at=$(uv run python3 -c "
 import json, sys
 try:
     d = json.load(open('$state_json'))
@@ -1242,7 +1250,7 @@ except Exception:
     print('no')
 " 2>/dev/null)
         if [ "$has_booted_at" = "no" ]; then
-            python3 -c "
+            uv run python3 -c "
 import json, sys
 from datetime import datetime, timezone
 path = '$state_json'
@@ -2126,7 +2134,7 @@ else:
         source "$CONFIG_FILE" 2>/dev/null || true
         if [ -z "${LOBSTER_INTERNAL_SECRET:-}" ]; then
             local generated_secret
-            generated_secret=$(python3 -c "import secrets; print(secrets.token_hex(32))" 2>/dev/null || \
+            generated_secret=$(uv run python3 -c "import secrets; print(secrets.token_hex(32))" 2>/dev/null || \
                                openssl rand -hex 32 2>/dev/null || \
                                echo "")
             if [ -n "$generated_secret" ]; then
@@ -2268,8 +2276,8 @@ else:
     fi
     # Upsert the ralph-loop entry into jobs.json if not present.
     local _jobs_file="$WORKSPACE_DIR/scheduled-jobs/jobs.json"
-    if [ -f "$_jobs_file" ] && ! python3 -c "import json,sys; d=json.load(open('$_jobs_file')); sys.exit(0 if 'ralph-loop' in d.get('jobs',{}) else 1)" 2>/dev/null; then
-        python3 - <<'PYEOF'
+    if [ -f "$_jobs_file" ] && ! uv run python3 -c "import json,sys; d=json.load(open('$_jobs_file')); sys.exit(0 if 'ralph-loop' in d.get('jobs',{}) else 1)" 2>/dev/null; then
+        uv run python3 - <<'PYEOF'
 import json, os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2481,7 +2489,7 @@ CREATE TABLE IF NOT EXISTS dispatcher_lock (
         if [ -n "$_piper_arch" ]; then
             local _piper_url
             _piper_url="$(curl -fsSL https://api.github.com/repos/rhasspy/piper/releases/latest 2>/dev/null | \
-                python3 -c "import sys,json; \
+                uv run python3 -c "import sys,json; \
                 data=json.load(sys.stdin); \
                 urls=[a['browser_download_url'] for a in data.get('assets',[]) \
                       if 'linux_${_piper_arch}' in a['name'] and a['name'].endswith('.tar.gz')]; \
@@ -2915,7 +2923,7 @@ CREATE TABLE IF NOT EXISTS dispatcher_lock (
     local legacy_db="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/data/wos-registry.db"
     if [ -f "$legacy_db" ]; then
         local uow_count
-        uow_count=$(python3 -c "
+        uow_count=$(uv run python3 -c "
 import sqlite3, sys
 try:
     conn = sqlite3.connect('$legacy_db')
@@ -3066,7 +3074,7 @@ health_check() {
         source "$VENV_DIR/bin/activate"
         local missing_pkgs=()
         for pkg in mcp telegram watchdog; do
-            if ! python -c "import $pkg" 2>/dev/null; then
+            if ! "$VENV_DIR/bin/python" -c "import $pkg" 2>/dev/null; then
                 missing_pkgs+=("$pkg")
             fi
         done

@@ -153,7 +153,7 @@ else:
 PYEOF
 
 TMPOUT=$(mktemp /tmp/token-ledger-out.XXXXXX.json)
-python3 "${TMPPY}" "${JSONL_FILE}" "${LAST_OFFSET}" "${TMPOUT}" 2>/dev/null
+uv run python3 "${TMPPY}" "${JSONL_FILE}" "${LAST_OFFSET}" "${TMPOUT}" 2>/dev/null
 PY_EXIT=$?
 rm -f "${TMPPY}"
 
