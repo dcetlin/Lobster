@@ -3006,6 +3006,85 @@ except Exception as e:
         substep "Migration 87: all LLM job timers already installed — skipping"
     fi
 
+    # Migration 88: Remove stale dispatch-job.sh LOBSTER-SCHEDULED cron entries.
+    # (Upstream migration 78 — renumbered to avoid collision with fork migrations 78-87.)
+    # These three entries were already superseded by systemd timers but Migration 71
+    # left them in place on installs where the timer check was inconclusive.
+    # Two entries use invalid systemd-style cron syntax (*-*-* ...) that standard
+    # cron ignores entirely; the third (lobstertalk-ssh-watcher) fires every 6h
+    # and causes duplicate invocations alongside the timer. Remove all three
+    # unconditionally — the systemd timers are the canonical trigger.
+    _m88_jobs="lobstertalk-unified lobstertalk-ssh-watcher lobstertalk-kanban-watcher"
+    _m88_removed=""
+    for _m88_job in $_m88_jobs; do
+        if crontab -l 2>/dev/null | grep -q "dispatch-job\.sh ${_m88_job}"; then
+            { crontab -l 2>/dev/null | grep -v "dispatch-job\.sh ${_m88_job}" || true; } | crontab -
+            _m88_removed="${_m88_removed}${_m88_job} "
+            substep "Removed stale LOBSTER-SCHEDULED cron entry for ${_m88_job}"
+        fi
+    done
+    if [ -n "$_m88_removed" ]; then
+        success "Migration 88: removed cron entries for: ${_m88_removed% }"
+        migrated=$((migrated + 1))
+    fi
+
+    # Migration 89: Config consolidation (issue #1785, Option A).
+    # (Upstream migration 79 — renumbered to avoid collision with fork migrations 78-87.)
+    # Two steps:
+    #   a) Merge non-comment, non-duplicate keys from global.env into config.env,
+    #      then archive global.env as global.env.bak (safe rollback).
+    #   b) Remove stale duplicate lobster/config/consolidation.conf and
+    #      lobster/config/sync-repos.json left by the original migration 0.
+    local _m89_config_env="$LOBSTER_CONFIG_DIR/config.env"
+    local _m89_global_env="$LOBSTER_CONFIG_DIR/global.env"
+
+    # Step a: merge global.env → config.env
+    if [ -f "$_m89_global_env" ] && [ ! -f "${_m89_global_env}.bak" ]; then
+        local _m89_merged=0
+        while IFS= read -r _m89_line; do
+            # Skip comments and blank lines
+            [[ "$_m89_line" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "${_m89_line// }" ]] && continue
+
+            # Extract key (everything before first '=')
+            local _m89_key
+            _m89_key="${_m89_line%%=*}"
+            [ -z "$_m89_key" ] && continue
+
+            # Skip if key already exists in config.env
+            if grep -qE "^${_m89_key}=" "$_m89_config_env" 2>/dev/null; then
+                substep "  global.env: ${_m89_key} already in config.env — skipping"
+                continue
+            fi
+
+            # Append to config.env
+            echo "$_m89_line" >> "$_m89_config_env"
+            substep "  global.env: merged ${_m89_key} into config.env"
+            _m89_merged=$((_m89_merged + 1))
+        done < "$_m89_global_env"
+
+        # Archive global.env (keep as .bak for safety — delete after next stable release)
+        mv "$_m89_global_env" "${_m89_global_env}.bak"
+        substep "Archived global.env to global.env.bak ($_m89_merged keys merged into config.env)"
+        migrated=$((migrated + 1))
+    else
+        substep "global.env already migrated or absent — skipping step a"
+    fi
+
+    # Step b: remove stale duplicate files in the repo's config/ directory
+    local _m89_repo_conf="$LOBSTER_DIR/config/consolidation.conf"
+    local _m89_repo_repos="$LOBSTER_DIR/config/sync-repos.json"
+    if [ -f "$_m89_repo_conf" ]; then
+        rm -f "$_m89_repo_conf"
+        substep "Removed stale $LOBSTER_DIR/config/consolidation.conf"
+        migrated=$((migrated + 1))
+    fi
+    if [ -f "$_m89_repo_repos" ]; then
+        rm -f "$_m89_repo_repos"
+        substep "Removed stale $LOBSTER_DIR/config/sync-repos.json"
+        migrated=$((migrated + 1))
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
