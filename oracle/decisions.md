@@ -1,6 +1,84 @@
+# DEPRECATED — DO NOT ADD NEW ENTRIES
+
+This file is no longer the correct location for oracle decisions or ADRs.
+
+**Correct pattern:** Each PR review produces an audit file at `oracle/verdicts/pr-{number}.md`.
+Decisions, ADRs, and behavioral change authorizations belong in the relevant PR's verdict file — not here.
+
+Existing entries below are preserved for historical reference only.
+
+---
+
 # Architecture Decisions
 
 Logged durable design choices that affect observable system behavior.
+
+---
+
+## ADR-003: Prescription Throttle Gate — Encoded Orientation Behavioral Default
+
+**Date:** 2026-04-24
+**Status:** Accepted
+**WOS Reference:** uow_20260421_f91285
+
+### Context
+
+By 2026-04-24, the WOS cultivator sweeps promoted every eligible GitHub issue into the UoW registry on each cycle. The registry had accumulated 184 open UoWs over a 7-day window with a consumption_rate of 0.43 (43% of UoWs opened in the window were closed). This rate was computed as `closed / (closed + open)` over a 7-day rolling window.
+
+The oracle PR #913 review (Stage 1) raised a structural question before this ADR was written: the rate=0.43 could reflect either (a) overproduction — cultivator adds UoWs faster than executors close them — or (b) executor-side dysfunction — callback handlers (decide_retry, decide_close) are unimplemented, causing UoWs to stall in needs-human-review or blocked states regardless of cultivator behavior.
+
+**Stage 1 UoW status breakdown (attempted 2026-04-24):** The wos.db registry was queried at the time of this ADR but contained 0 rows — the WOS registry had not yet been populated in this environment. The 184-UoW figure and the rate=0.43 observation originate from the motivating context documented in uow_20260421_f91285. The status breakdown (bucketing by status to distinguish overproduction from executor dysfunction) could not be performed from live data.
+
+**The oracle PR #913 verdict names this explicitly as Stage 1 open question:** if the majority of the 184 UoWs were in `needs-human-review` or `blocked`, the low rate would indicate executor-side dysfunction rather than overproduction, and backpressure would not be the correct intervention. This question remains open and is recorded here as a named constraint on the behavioral change.
+
+### What Changed
+
+`promote_to_wos()` in `cultivator.py` previously promoted all eligible GitHub issues on every sweep. After this PR, that behavior is suppressed silently — returning `([], 0)` — when ALL of the following are true:
+
+- `consumption_rate < 0.6` (fewer than 60% of UoWs in the 7-day window are closed)
+- `backlog_depth >= 5` (at least 5 open UoWs in the 7-day window)
+
+This is a durable behavioral default change, not a one-time operational action.
+
+### Why This Is an Encoded Orientation Decision
+
+The system now acts without Dan's real-time input when the throttle conditions are met. Per constraint-3 (vision.yaml `core.inviolable_constraints`), Encoded Orientation decisions require: (a) a prior logged decision of the same class, and (b) a traceable vision.yaml anchor.
+
+This ADR satisfies both requirements for PR #913.
+
+### Vision Anchor
+
+**Primary:** `core.operating_principles.principle-1` — "Proactive resilience over reactive recovery. Structural prevention is preferred over better correction mechanisms."
+
+Suppressing new prescriptions when the queue is demonstrably not draining is a structural prevention measure: it prevents the queue from growing in a way that would require reactive cleanup. This anchors the throttle gate to a durable principle rather than to the specific measurements that triggered its implementation.
+
+**Secondary:** `active_project.phase_intent` — Phase 1 is complete when the Registry is live and populated with UoWs carrying vision_ref fields. A registry with unbounded growth and a 0.43 consumption rate does not satisfy "live and populated in a useful sense" — it satisfies a metric while defeating the intent. Queue stability is a prerequisite to Phase 1 completion in the sense that phase_intent intends.
+
+### Threshold Values as Durable Defaults
+
+- `threshold = 0.6`: If fewer than 60% of UoWs created in the last 7 days are closed, the queue is structurally undersized relative to production rate.
+- `min_depth = 5`: A rate below threshold on a queue of 4 or fewer UoWs is statistical noise, not a systemic signal. The dual condition prevents false positives on low-volume periods.
+
+These values are configuration parameters in `PrescriptionThrottleGate`, not hardcoded magic numbers. They may be tuned via `PrescriptionThrottleGate(monitor, threshold=X, min_depth=Y)` at the call site.
+
+### Constraint: Stage 1 Open Question
+
+This decision is made with the Stage 1 question unresolved. If a status breakdown of the 184 UoWs shows the majority were in `needs-human-review` or `blocked`, then the low rate was caused by executor dysfunction, not overproduction — and this throttle gate addresses a visible symptom while the root cause persists.
+
+The correct follow-on action if the throttle remains active beyond one cultivator cycle:
+1. Query the registry: `SELECT status, COUNT(*) FROM uow_registry GROUP BY status`
+2. If the majority are in `needs-human-review` or `blocked`, prioritize implementing decide_retry and decide_close handlers over tuning the throttle
+
+The state-change notification added in this PR (Telegram inbox message on first activation) is specifically designed to surface this case: if the throttle notification fires and persists, it is a signal to run the status query before assuming overproduction.
+
+### Interaction with od-3 Override (ADR-002)
+
+The od-3 override (ADR-002, 2026-04-24) authorizes age-based promotion of stuck proposed UoWs via `requalify_proposed()`. The GardenCaretaker's promotion path is not gated by this throttle. The effective behavior during sustained throttling:
+
+- Cultivator: cannot promote new GitHub issues to the registry (throttled)
+- GardenCaretaker: can still advance existing proposed UoWs to ready-for-steward (not throttled)
+
+This is coherent — the goal is to drain the existing backlog before adding new work. But it means new GitHub issues are silently blocked from entering the pipeline, which is why the state-change notification is non-optional.
 
 ---
 
