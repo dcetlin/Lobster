@@ -425,6 +425,68 @@ def load_smell_patterns(patterns_path: Path) -> list[dict]:
         return []
 
 
+def write_back_recurrence_counts(
+    patterns_path: Path,
+    detections: list["SmellDetection"],
+    dry_run: bool = False,
+) -> None:
+    """
+    Write updated recurrence_count back to smell-patterns.yaml after each run.
+
+    For each pattern:
+    - If detected: increment recurrence_count by 1 and update last_detected to today
+    - If not detected: reset recurrence_count to 0
+
+    Uses atomic write (write to temp file, then rename) to prevent partial writes.
+    Skips patterns not present in the YAML (e.g. no heuristic implemented).
+    """
+    if not patterns_path.exists():
+        log.warning("Cannot write back recurrence counts — %s not found", patterns_path)
+        return
+
+    try:
+        raw = patterns_path.read_text(encoding="utf-8")
+        data = yaml.safe_load(raw)
+    except Exception as exc:
+        log.warning("Cannot write back recurrence counts — failed to load YAML: %s", exc)
+        return
+
+    patterns = data.get("patterns", [])
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Build lookup by pattern_id for O(1) access
+    detection_by_id: dict[str, bool] = {d.pattern_id: d.detected for d in detections}
+
+    updated = False
+    for pattern in patterns:
+        pid = pattern.get("id", "")
+        if pid not in detection_by_id:
+            continue  # pattern has no heuristic — leave counts untouched
+
+        if detection_by_id[pid]:
+            pattern["recurrence_count"] = int(pattern.get("recurrence_count", 0)) + 1
+            pattern["last_detected"] = today
+        else:
+            pattern["recurrence_count"] = 0
+        updated = True
+
+    if not updated:
+        log.debug("No patterns matched detections — smell-patterns.yaml unchanged")
+        return
+
+    if dry_run:
+        log.info("DRY RUN: would write updated recurrence counts to %s", patterns_path)
+        return
+
+    try:
+        tmp = Path(str(patterns_path) + ".tmp")
+        tmp.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True), encoding="utf-8")
+        tmp.replace(patterns_path)
+        log.info("Recurrence counts written back to %s", patterns_path)
+    except Exception as exc:
+        log.warning("Failed to write back recurrence counts to %s: %s", patterns_path, exc)
+
+
 def _detect_write_result_not_back_propagated(
     uow_counts: dict[str, int],
     threshold: int,
@@ -494,9 +556,11 @@ def _detect_oracle_dual_write(repo_path: Path, threshold: int) -> tuple[bool, st
         return False, "lobster-oracle.md not found — cannot check for dual-write"
 
     content = oracle_md.read_text()
-    # Look for instructions to write to decisions.md
+    # Look specifically for write/open instructions targeting decisions.md —
+    # not bare filename presence, which fires on historical/instructional references
+    # in the agent's own instruction file.
     decisions_write_pattern = re.compile(
-        r"decisions\.md",
+        r"(?:write|open|create|append|update)\s+[^\n]*decisions\.md",
         re.IGNORECASE,
     )
     matches = decisions_write_pattern.findall(content)
@@ -504,9 +568,12 @@ def _detect_oracle_dual_write(repo_path: Path, threshold: int) -> tuple[bool, st
     detected = count >= threshold
 
     if detected:
-        evidence = f"Found {count} reference(s) to 'decisions.md' in lobster-oracle.md — dual-write may still be active"
+        evidence = (
+            f"Found {count} write/open instruction(s) targeting 'decisions.md' in "
+            f"lobster-oracle.md — dual-write path may still be active"
+        )
     else:
-        evidence = f"No references to 'decisions.md' in lobster-oracle.md (threshold={threshold})"
+        evidence = f"No write/open instructions targeting 'decisions.md' in lobster-oracle.md (threshold={threshold})"
     return detected, evidence
 
 
@@ -1035,6 +1102,13 @@ def run(period_days: int, dry_run: bool = False) -> int:
     detections = detect_smells(patterns, counts, repo_path, workspace)
     detected_count = sum(1 for d in detections if d.detected)
     log.info("  Smells detected: %d / %d", detected_count, len(detections))
+
+    # --- Write back recurrence counts ---
+    # Must happen before any escalation or issue-filing reads recurrence_count from
+    # SmellDetection, so the counts used for gating reflect the pre-run state from
+    # smell-patterns.yaml. The write-back records what happened this run for next run.
+    log.info("Writing recurrence counts back to smell-patterns.yaml...")
+    write_back_recurrence_counts(_smell_patterns_path(), detections, dry_run=dry_run)
 
     # --- Golden pattern drift ---
     log.info("Checking golden pattern drift...")
