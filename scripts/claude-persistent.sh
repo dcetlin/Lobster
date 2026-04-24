@@ -142,7 +142,7 @@ write_boot_stamp() {
     # If state file already exists, merge booted_at in without losing other fields.
     # Fall back to writing a minimal JSON if the file is absent or unreadable.
     if [[ -f "$STATE_FILE" ]]; then
-        python3 -c "
+        uv run python3 -c "
 import json, sys
 path = '$STATE_FILE'
 now = '$now'
@@ -172,7 +172,7 @@ EOF
 
 read_state_mode() {
     if [[ -f "$STATE_FILE" ]]; then
-        python3 -c "
+        uv run python3 -c "
 import json, sys
 try:
     d = json.load(open('$STATE_FILE'))
@@ -598,7 +598,7 @@ handle_exit() {
             now=$(date -Iseconds)
             local tmp_state
             tmp_state=$(mktemp "${STATE_FILE}.tmp.XXXXXX")
-            python3 -c "
+            uv run python3 -c "
 import json
 path = '$STATE_FILE'
 now = '$now'

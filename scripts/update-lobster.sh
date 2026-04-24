@@ -377,8 +377,8 @@ update_dependencies() {
         else
             if [ -d ".venv" ]; then
                 source .venv/bin/activate
-                pip install --quiet --upgrade pip
-                pip install --quiet -r requirements.txt 2>/dev/null || pip install --quiet mcp python-telegram-bot watchdog python-dotenv
+                uv pip install --quiet --upgrade pip
+                uv pip install --quiet -r requirements.txt 2>/dev/null || uv pip install --quiet mcp python-telegram-bot watchdog python-dotenv
                 deactivate
                 log OK "Python packages updated"
             else

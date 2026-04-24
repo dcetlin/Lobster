@@ -58,7 +58,7 @@ esac
 # ---------------------------------------------------------------------------
 if [[ ! -f "${LEDGER_FILE}" || ! -s "${LEDGER_FILE}" ]]; then
   NOW_S=$(date +%s)
-  NOW_ET=$(python3 -c "
+  NOW_ET=$(uv run python3 -c "
 from datetime import datetime, timezone, timedelta
 import sys
 ts = int(sys.argv[1])
@@ -87,7 +87,7 @@ SINCE_S=$(( NOW_S - WINDOW_SECS ))
 # Aggregate by source using Python (shell + jq aggregation is too error-prone
 # for multi-key groupby with formatting)
 # ---------------------------------------------------------------------------
-python3 - "${LEDGER_FILE}" "${SINCE_S}" "${NOW_S}" "${WINDOW}" <<'PYEOF'
+uv run python3 - "${LEDGER_FILE}" "${SINCE_S}" "${NOW_S}" "${WINDOW}" <<'PYEOF'
 import sys
 import json
 from collections import defaultdict
@@ -203,7 +203,7 @@ PYEOF
 # Model breakdown — group by model family, show cost-weighted share.
 # Skipped silently when no records have a model field yet.
 # ---------------------------------------------------------------------------
-python3 - "${LEDGER_FILE}" "${SINCE_S}" "${NOW_S}" "${WINDOW}" <<'PYEOF_MODEL'
+uv run python3 - "${LEDGER_FILE}" "${SINCE_S}" "${NOW_S}" "${WINDOW}" <<'PYEOF_MODEL'
 import sys
 import json
 from collections import defaultdict
@@ -283,7 +283,7 @@ PYEOF_MODEL
 OUTCOME_LEDGER_FILE="${WORKSPACE}/data/outcome-ledger.jsonl"
 
 if [[ -f "${OUTCOME_LEDGER_FILE}" && -s "${OUTCOME_LEDGER_FILE}" ]]; then
-python3 - "${OUTCOME_LEDGER_FILE}" "${SINCE_S}" "${NOW_S}" "${WINDOW}" <<'PYEOF_OUTCOME'
+uv run python3 - "${OUTCOME_LEDGER_FILE}" "${SINCE_S}" "${NOW_S}" "${WINDOW}" <<'PYEOF_OUTCOME'
 import sys
 import json
 from collections import defaultdict
