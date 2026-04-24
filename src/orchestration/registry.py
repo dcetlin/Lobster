@@ -812,6 +812,24 @@ class Registry:
         finally:
             conn.close()
 
+    def get_status_counts(self) -> dict[str, int]:
+        """Return a count of UoWs grouped by status.
+
+        Returns a dict mapping each status present in the DB to its count,
+        e.g. {"proposed": 3, "active": 1, "done": 12}.
+
+        Prefer this over a raw GROUP BY query — connection setup and WAL mode
+        are handled consistently via _connect(), and the result is typed.
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) as cnt FROM uow_registry GROUP BY status ORDER BY status"
+            ).fetchall()
+            return {row["status"]: row["cnt"] for row in rows}
+        finally:
+            conn.close()
+
     def expire_proposals(self) -> dict[str, Any]:
         """
         Transition proposed records older than 14 days to 'expired'.

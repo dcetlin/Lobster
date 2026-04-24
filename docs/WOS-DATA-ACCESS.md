@@ -75,11 +75,13 @@ Use the `Registry` class from `src/orchestration/registry.py`. This is the sole 
 ### Standard import pattern
 
 ```python
+import os
 import sys
 from pathlib import Path
 
-# Add src/ to the path — use the absolute path, not relative
-_SRC_DIR = Path("/home/lobster/lobster/src")
+# Add src/ to the path using LOBSTER_ROOT env var — avoids hardcoding the
+# host user path (e.g. /home/lobster) which is machine-specific and brittle.
+_SRC_DIR = Path(os.environ.get("LOBSTER_ROOT", "/home/lobster/lobster")) / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
@@ -104,10 +106,9 @@ if uow is None:
 
 # Count by status (returns {status: count} dict)
 # Prefer registry_cli.py status-breakdown for this — it's simpler from shell
-# From Python, build the breakdown yourself via list():
-from collections import Counter
-all_uows = registry.list()
-breakdown = Counter(u.status for u in all_uows)
+# From Python, use get_status_counts() — this runs a DB-level GROUP BY,
+# which is more efficient than loading all UoWs into memory:
+breakdown = registry.get_status_counts()
 
 # Find escalation candidates
 escalated = registry.list(status="needs-human-review")
@@ -147,13 +148,17 @@ conn = sqlite3.connect("/home/lobster/lobster-workspace/orchestration/registry.d
 rows = conn.execute("SELECT * FROM uow_registry WHERE status = 'active'").fetchall()
 ```
 
-### Never use sys.path tricks to import from an unknown location
+### Never hardcode the host user path when manipulating sys.path
 
 ```python
-# BAD — fragile, depends on repo layout staying fixed at a specific path
-sys.path.insert(0, '/home/lobster/lobster')  # absolute but brittle
+# BAD — hardcodes /home/lobster, which breaks on any other machine or user account
+sys.path.insert(0, '/home/lobster/lobster')  # host-user path, not portable
 from src.orchestration.uow_registry import UoWRegistry  # wrong class name too
 ```
+
+The approved Path 2 import pattern above uses `sys.path.insert` — that part is fine.
+What is prohibited is hardcoding `/home/lobster` as a literal string. Use the
+`LOBSTER_ROOT` env var with a sensible default instead (see Path 2 above).
 
 ### Never hardcode the DB path in queries
 

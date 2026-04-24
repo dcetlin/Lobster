@@ -202,17 +202,7 @@ def cmd_status_breakdown(registry: Registry, args: argparse.Namespace) -> None:
     This is the canonical query that subagents should use instead of raw SQL
     GROUP BY queries — those have repeatedly caused syntax errors in practice.
     """
-    import sqlite3 as _sqlite3
-    conn = _sqlite3.connect(str(registry.db_path), timeout=10.0)
-    conn.row_factory = _sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    try:
-        rows = conn.execute(
-            "SELECT status, COUNT(*) as cnt FROM uow_registry GROUP BY status ORDER BY status"
-        ).fetchall()
-        _output({row["status"]: row["cnt"] for row in rows})
-    finally:
-        conn.close()
+    _output(registry.get_status_counts())
 
 
 def cmd_escalation_candidates(registry: Registry, args: argparse.Namespace) -> None:
