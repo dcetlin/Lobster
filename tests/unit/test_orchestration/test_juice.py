@@ -467,11 +467,8 @@ class TestComputeJuice:
 
         registry = MagicMock()
         registry.get.return_value = uow
-
-        # Simulate an open connection that returns no audit rows
-        conn_mock = MagicMock()
-        conn_mock.execute.return_value.fetchall.return_value = []
-        registry._connect.return_value = conn_mock
+        # Use public fetch_audit_entries — no private _connect access
+        registry.fetch_audit_entries.return_value = []
 
         result = compute_juice("uow_test_007", registry)
         assert result is None
@@ -494,7 +491,7 @@ class TestComputeJuice:
         registry.get.return_value = uow
         registry.get.side_effect = lambda uow_id: uow if uow_id == "uow_test_008" else None
 
-        # Simulate audit log with oracle approvals
+        # Simulate audit log with oracle approvals via public fetch_audit_entries
         audit_rows = [
             {"event": "execution_complete", "to_status": "ready-for-steward"},
             {"event": "oracle_approved", "to_status": None},
@@ -502,11 +499,7 @@ class TestComputeJuice:
             {"event": "oracle_approved", "to_status": None},
             {"event": "status_change", "to_status": "done"},
         ]
-        conn_mock = MagicMock()
-        conn_mock.execute.return_value.fetchall.return_value = [
-            dict_to_sqlite_row(r) for r in audit_rows
-        ]
-        registry._connect.return_value = conn_mock
+        registry.fetch_audit_entries.return_value = audit_rows
 
         result = compute_juice("uow_test_008", registry)
         assert result is not None
@@ -593,6 +586,39 @@ class TestNamedThresholdConstants:
 
     def test_minimum_completion_rate_is_30_percent(self):
         assert JUICE_MIN_COMPLETION_RATE == 0.3
+
+    def test_completion_rate_below_minimum_returns_zero(self):
+        """Spec: completion rate below JUICE_MIN_COMPLETION_RATE gate → score 0.0."""
+        # 1 done out of 4 executions = 25%, below 30% minimum
+        signals = _make_signals(
+            done_outcome_count=1,
+            total_execution_cycles=4,
+        )
+        assert _score_completion_rate(signals) == 0.0, (
+            "Completion rate below JUICE_MIN_COMPLETION_RATE must return 0.0"
+        )
+
+    def test_completion_rate_at_minimum_returns_nonzero(self):
+        """Completion rate at JUICE_MIN_COMPLETION_RATE boundary → non-zero score."""
+        # 3 done out of 10 executions = 30%, exactly at minimum
+        signals = _make_signals(
+            done_outcome_count=3,
+            total_execution_cycles=10,
+        )
+        assert _score_completion_rate(signals) > 0.0, (
+            "Completion rate at JUICE_MIN_COMPLETION_RATE must return a positive score"
+        )
+
+    def test_completion_rate_above_minimum_returns_nonzero(self):
+        """Completion rate above minimum → positive score proportional to rate."""
+        # 2 done out of 4 executions = 50%, above 30% minimum
+        signals = _make_signals(
+            done_outcome_count=2,
+            total_execution_cycles=4,
+        )
+        score = _score_completion_rate(signals)
+        assert score > 0.0
+        assert score == 0.5
 
     def test_prerequisite_positive_threshold_is_1(self):
         assert JUICE_PREREQUISITE_POSITIVE_THRESHOLD == 1

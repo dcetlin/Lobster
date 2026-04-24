@@ -231,11 +231,17 @@ def _score_completion_rate(signals: JuiceSignals) -> float:
     Higher done outcome rate within the UoW's execution history = more
     productive thread. Returns 0.0 when there are no execution cycles.
 
+    Returns 0.0 when the raw completion rate is below JUICE_MIN_COMPLETION_RATE
+    — below-minimum UoWs score zero on this dimension.
+
     Pure function — no side effects.
     """
     if signals.total_execution_cycles == 0:
         return 0.0
-    return min(1.0, signals.done_outcome_count / signals.total_execution_cycles)
+    rate = signals.done_outcome_count / signals.total_execution_cycles
+    if rate < JUICE_MIN_COMPLETION_RATE:
+        return 0.0
+    return min(1.0, rate)
 
 
 def _score_prerequisites(signals: JuiceSignals) -> float:
@@ -490,17 +496,7 @@ def compute_juice(uow_id: str, registry: "Registry") -> float | None:
         log.warning("compute_juice: UoW %s not found", uow_id)
         return None
 
-    # Fetch audit entries via the registry's internal connection — same pattern
-    # as _fetch_audit_entries in steward.py.
-    conn = registry._connect()
-    try:
-        rows = conn.execute(
-            "SELECT * FROM audit_log WHERE uow_id = ? ORDER BY id ASC",
-            (uow_id,),
-        ).fetchall()
-        audit_entries = [dict(r) for r in rows]
-    finally:
-        conn.close()
+    audit_entries = registry.fetch_audit_entries(uow_id)
 
     sensor = JuiceSensor()
     assessment = sensor.assess(uow, audit_entries, registry)

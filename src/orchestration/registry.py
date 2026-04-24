@@ -320,6 +320,27 @@ class Registry:
         run_migrations(self.db_path)
 
     # -----------------------------------------------------------------------
+    # Public audit interface
+    # -----------------------------------------------------------------------
+
+    def fetch_audit_entries(self, uow_id: str) -> list[dict]:
+        """
+        Return all audit log entries for the given UoW, ordered by id ASC.
+
+        Returns an empty list if the UoW has no audit history or is not found.
+        Each entry is a plain dict with at minimum 'event' and 'to_status' keys.
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM audit_log WHERE uow_id = ? ORDER BY id ASC",
+                (uow_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    # -----------------------------------------------------------------------
     # Internal helpers
     # -----------------------------------------------------------------------
 
