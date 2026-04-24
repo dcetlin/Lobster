@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import pytest
 
-from src.orchestration.dispatcher_handlers import handle_approve, handle_confirm, handle_decide, handle_decide_defer, handle_wos_execute, handle_wos_status, handle_wos_unblock, route_wos_message, route_callback_message, CALLBACK_DATA_HANDLERS, WOS_MESSAGE_TYPE_DISPATCH
+from src.orchestration.dispatcher_handlers import handle_approve, handle_confirm, handle_decide, handle_decide_defer, handle_wos_execute, handle_wos_status, handle_wos_unblock, handle_steward_trigger, route_wos_message, route_callback_message, CALLBACK_DATA_HANDLERS, WOS_MESSAGE_TYPE_DISPATCH
 
 
 @pytest.fixture
@@ -545,6 +545,210 @@ class TestRouteWosMessage:
         result = route_wos_message(msg)
         # The derived path must contain the uow_id so the Steward can find it
         assert "uow_no_ref_test" in result["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# steward_trigger dispatch tests — issue #920
+#
+# These tests verify that steward_trigger messages are routed through
+# route_wos_message() and return action="spawn_subagent".  steward_trigger is
+# the post-completion event path added in PR #914 — the dispatcher must handle
+# it structurally so it survives context compaction just like wos_execute.
+#
+# Advisory fixes verified here (oracle r2 on PR #914):
+#   1. handle_steward_trigger prompt must include chat_id: 0 sentinel
+#   2. route_wos_message must return action="spawn_subagent" for steward_trigger
+# ---------------------------------------------------------------------------
+
+# Named constant: the steward_trigger message type registered in PR #914.
+STEWARD_TRIGGER_MESSAGE_TYPE = "steward_trigger"
+
+
+class TestRouteWosStewardTrigger:
+    """route_wos_message must dispatch steward_trigger as spawn_subagent."""
+
+    _SAMPLE_MSG = {
+        "type": "steward_trigger",
+        "uow_id": "uow_steward_test_001",
+    }
+
+    def test_steward_trigger_registered_in_dispatch_table(self):
+        """steward_trigger must appear in WOS_MESSAGE_TYPE_DISPATCH.
+
+        Absence means the dispatcher's type-based routing cannot fire for
+        steward_trigger messages — same compaction vulnerability as wos_execute.
+        """
+        assert STEWARD_TRIGGER_MESSAGE_TYPE in WOS_MESSAGE_TYPE_DISPATCH, (
+            f"{STEWARD_TRIGGER_MESSAGE_TYPE!r} must be registered in WOS_MESSAGE_TYPE_DISPATCH "
+            "so the dispatcher routes it structurally, not via prose"
+        )
+
+    def test_route_wos_message_steward_trigger_returns_spawn_subagent(self):
+        """route_wos_message for steward_trigger must return action='spawn_subagent'."""
+        result = route_wos_message(self._SAMPLE_MSG)
+        assert result["action"] == WOS_SPAWN_ACTION, (
+            f"Expected action={WOS_SPAWN_ACTION!r}, got {result['action']!r}. "
+            "The dispatcher must spawn a Task — not mark_processed without spawning."
+        )
+
+    def test_route_wos_message_steward_trigger_returns_task_id(self):
+        """task_id must be a non-empty string identifying the steward heartbeat task."""
+        result = route_wos_message(self._SAMPLE_MSG)
+        assert isinstance(result["task_id"], str)
+        assert len(result["task_id"]) > 0
+
+    def test_route_wos_message_steward_trigger_returns_non_empty_prompt(self):
+        """prompt must be a non-empty string for the background subagent."""
+        result = route_wos_message(self._SAMPLE_MSG)
+        assert isinstance(result["prompt"], str)
+        assert len(result["prompt"]) > 0
+
+    def test_route_wos_message_steward_trigger_echoes_message_type(self):
+        """result['message_type'] must echo 'steward_trigger' so callers can confirm routing."""
+        result = route_wos_message(self._SAMPLE_MSG)
+        assert result["message_type"] == STEWARD_TRIGGER_MESSAGE_TYPE
+
+    def test_route_wos_message_steward_trigger_uses_lobster_generalist_agent(self):
+        """steward_trigger subagent must use lobster-generalist — not functional-engineer."""
+        result = route_wos_message(self._SAMPLE_MSG)
+        assert result["agent_type"] == "lobster-generalist"
+
+    def test_handle_steward_trigger_prompt_contains_chat_id_zero(self):
+        """chat_id: 0 is the silent-drop sentinel — steward results must not be relayed to the user.
+
+        Advisory fix from oracle r2 on PR #914: the steward_trigger prompt was missing
+        'chat_id: 0', meaning write_result from the steward subagent could attempt to
+        relay a reply to the triggering chat rather than silently dropping it.
+        """
+        result = handle_steward_trigger("uow_test_abc")
+        assert "chat_id: 0" in result["prompt"], (
+            "steward_trigger prompt must include 'chat_id: 0' so write_result "
+            "silently drops the result rather than forwarding to a user chat"
+        )
+
+    def test_handle_steward_trigger_prompt_contains_task_id_header(self):
+        """task_id frontmatter must be present for write_result correlation."""
+        result = handle_steward_trigger("uow_sentinel_xyz")
+        assert "task_id:" in result["prompt"]
+
+    def test_handle_steward_trigger_is_pure_same_inputs_same_output(self):
+        """handle_steward_trigger is a pure function — identical inputs produce identical outputs."""
+        r1 = handle_steward_trigger("uow_pure_test")
+        r2 = handle_steward_trigger("uow_pure_test")
+        assert r1 == r2
+
+
+# ---------------------------------------------------------------------------
+# route_wos_message spawn-gate tests — issue #920
+#
+# These tests verify the in-code guard added to route_wos_message: if any
+# registered handler returns action != "spawn_subagent" (or raises), the
+# function returns action="send_reply" to alert Dan rather than silently
+# calling mark_processed without spawning a Task.
+#
+# The invariant: route_wos_message NEVER returns action="mark_processed".
+# ---------------------------------------------------------------------------
+
+# Named constant: the action that must never be returned by route_wos_message.
+WOS_FORBIDDEN_ACTION = "mark_processed"
+
+
+class TestRouteWosMessageSpawnGate:
+    """route_wos_message must never return action='mark_processed' for WOS message types."""
+
+    def test_wos_execute_never_returns_mark_processed(self):
+        """route_wos_message for wos_execute must not return action='mark_processed'."""
+        msg = {
+            "type": "wos_execute",
+            "uow_id": "uow_gate_test",
+            "instructions": "Do the thing.",
+        }
+        result = route_wos_message(msg)
+        assert result["action"] != WOS_FORBIDDEN_ACTION, (
+            "route_wos_message must never return action='mark_processed' for wos_execute. "
+            "Returning mark_processed without spawning a Task silently orphans the UoW."
+        )
+
+    def test_steward_trigger_never_returns_mark_processed(self):
+        """route_wos_message for steward_trigger must not return action='mark_processed'."""
+        msg = {
+            "type": "steward_trigger",
+            "uow_id": "uow_gate_test_st",
+        }
+        result = route_wos_message(msg)
+        assert result["action"] != WOS_FORBIDDEN_ACTION, (
+            "route_wos_message must never return action='mark_processed' for steward_trigger. "
+            "Returning mark_processed without spawning a Task silently drops the trigger."
+        )
+
+    def test_spawn_gate_sends_alert_when_handler_returns_non_spawn_action(self, monkeypatch):
+        """If a handler returns a non-spawn_subagent action dict, route_wos_message returns send_reply.
+
+        This verifies the in-code guard: a misbehaving handler cannot cause
+        route_wos_message to return action='mark_processed'.  steward_trigger is the
+        right vector to test here — handle_steward_trigger returns a full action dict,
+        unlike handle_wos_execute which is a pure prompt-builder (returns str).
+        """
+        import src.orchestration.dispatcher_handlers as dh
+
+        # Patch handle_steward_trigger to return a 'noop' action (simulates compaction regression
+        # where the handler reverts to its old synchronous implementation returning {"action": "noop"})
+        monkeypatch.setattr(
+            dh, "handle_steward_trigger",
+            lambda *a, **kw: {"action": "noop", "task_id": "x", "agent_type": "x", "prompt": "x"},
+        )
+
+        msg = {
+            "type": "steward_trigger",
+            "uow_id": "uow_guard_test",
+        }
+        result = route_wos_message(msg)
+        assert result["action"] == "send_reply", (
+            "When handle_steward_trigger returns action='noop' instead of 'spawn_subagent', "
+            "route_wos_message must return action='send_reply' to alert Dan."
+        )
+        assert "alert" in result.get("text", "").lower() or "error" in result.get("text", "").lower(), (
+            "The send_reply alert text must describe the error so Dan can investigate."
+        )
+
+    def test_spawn_gate_sends_alert_when_wos_execute_handler_raises(self, monkeypatch):
+        """If handle_wos_execute raises, route_wos_message returns send_reply rather than propagating."""
+        import src.orchestration.dispatcher_handlers as dh
+
+        monkeypatch.setattr(
+            dh, "handle_wos_execute",
+            lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated handler crash"))
+        )
+
+        msg = {
+            "type": "wos_execute",
+            "uow_id": "uow_raise_test",
+            "instructions": "Do the thing.",
+        }
+        result = route_wos_message(msg)
+        assert result["action"] == "send_reply", (
+            "When handle_wos_execute raises, route_wos_message must return send_reply, "
+            "not propagate the exception or return mark_processed."
+        )
+
+    def test_spawn_gate_sends_alert_when_steward_trigger_handler_raises(self, monkeypatch):
+        """If handle_steward_trigger raises, route_wos_message returns send_reply rather than propagating."""
+        import src.orchestration.dispatcher_handlers as dh
+
+        monkeypatch.setattr(
+            dh, "handle_steward_trigger",
+            lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated steward crash"))
+        )
+
+        msg = {
+            "type": "steward_trigger",
+            "uow_id": "uow_steward_raise_test",
+        }
+        result = route_wos_message(msg)
+        assert result["action"] == "send_reply", (
+            "When handle_steward_trigger raises, route_wos_message must return send_reply, "
+            "not propagate the exception."
+        )
 
 
 # ---------------------------------------------------------------------------
