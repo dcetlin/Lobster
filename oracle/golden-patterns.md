@@ -142,6 +142,24 @@ Applied in WOS Phase 2 design (2026-03-30):
 
 ---
 
+### [2026-04-24] Pattern: StrEnum constants in all enum-backed SQL and routing logic
+
+**Three rules, all required:**
+
+**Rule 1 — Always use StrEnum constants in SQL.** Raw string literals for enum-backed DB columns are forbidden. Import and use the enum; never write the string value directly in a query. `WHERE status = 'active'` is a latent bug; `WHERE status = UoWStatus.ACTIVE` is correct. A grep for the enum class surfaces all usages; a grep for the raw string catches some of them and misses others.
+
+**Rule 2 — New modules must import enums at definition time.** When writing a new module that uses status/type values from a shared enum, import the enum before writing any code that uses those values. "Not in scope mentally" is not an excuse — the enum exists for type safety and maintainability. The correct pattern: import statement at the top of the file, then use the imported constant. The incorrect pattern: discover the value by looking at an existing string in another file and copy it as a literal.
+
+**Rule 3 — PathSelection/type discriminators get StrEnum.** Any function that returns one of N fixed string choices (path selection, strategy names, mode strings) should define a StrEnum. Naked string returns have no place in internal routing logic. `StrEnum` values compare equal to their string counterparts, so the migration is backward-compatible: callers doing `if path == 'fast'` continue to work without changes.
+
+**Why these rules together.** The three failure modes are related: raw SQL strings, raw literals in new modules, and naked routing returns are all the same underlying pattern — a value with a finite domain is being managed as an unbounded string. The fix is always the same: find the enum (or define one), import it, use it.
+
+**Where these apply in this codebase:** PR #904 introduced `list_executing()` with raw SQL literals despite the surrounding `registry.py` using `UoWStatus` consistently (issue #925). `shard_dispatch.py`'s `select_path()` returns `'fast'`/`'thorough'` with no StrEnum backing (issue #926). Both are filed for fix.
+
+**Reuse guidance:** Before committing any SQL query that filters on a status/type column, run: does the value being compared have an enum in this codebase? If yes, use it. Before merging any module that returns one of N fixed string choices, ask: should this be a StrEnum? The answer is almost always yes.
+
+---
+
 *Entries should be added when: (1) an oracle decision receives an "Alignment verdict: Confirmed" with notable quality findings; (2) a negentropic sweep identifies an "undernamed gem" in the golden patterns section; (3) a reflection-systems review names a structural win specific to this codebase.*
 
 ---
