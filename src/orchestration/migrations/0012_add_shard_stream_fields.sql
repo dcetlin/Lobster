@@ -1,0 +1,34 @@
+-- Migration 0011: add shard-stream fields for parallel UoW dispatch.
+--
+-- Problem:
+--   WOS executes UoWs serially — one at a time. The serialization is global:
+--   the executor dispatches one UoW and waits for write_result before dispatching
+--   the next. This is a throughput ceiling when multiple UoWs touch different
+--   parts of the codebase and could safely run in parallel.
+--
+-- Design:
+--   The serial constraint is actually a *file-scope conflict* constraint.
+--   Two UoWs that touch different files can safely run in parallel.
+--   Two UoWs in the same shard (named stream) run serially.
+--
+-- New fields:
+--
+--   file_scope TEXT NULL
+--     JSON array of file/directory paths the UoW is expected to touch.
+--     NULL = unknown scope. Unknown scope is treated as "exclusive":
+--     only dispatched when zero other UoWs are executing.
+--     Example: '["src/orchestration/steward.py", "tests/unit/test_orchestration/"]'
+--
+--   shard_id TEXT NULL
+--     Named stream for grouping UoWs. UoWs in the same shard run serially.
+--     UoWs in different shards (or with NULL shard_id) follow only the
+--     file_scope constraint.
+--     Example: 'wos-core', 'docs', 'tests'
+--
+-- Backward compatibility:
+--   Existing UoWs get file_scope=NULL and shard_id=NULL by default.
+--   NULL file_scope is treated as exclusive (blocks all parallel dispatch)
+--   which preserves the prior serial behavior for legacy UoWs.
+
+ALTER TABLE uow_registry ADD COLUMN file_scope TEXT;
+ALTER TABLE uow_registry ADD COLUMN shard_id TEXT;

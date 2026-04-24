@@ -226,6 +226,36 @@ class UoW:
     #   Incremented each time the steward re-dispatches after a failed execution.
     #   When retry_count >= MAX_RETRIES, escalates to needs-human-review.
     retry_count: int = 0
+    # artifacts: typed outcome refs extracted from write_result payload (migration 0011).
+    #   JSON array of {type, ref, category, description?} objects. NULL until populated.
+    #   Populated by wos_completion.py after successful UoW completion.
+    #   Types: "pr", "issue", "file", "commit".
+    artifacts: list | None = None
+    # Shard-stream fields (populated after migration 0012).
+    #
+    # file_scope: JSON array of file/directory paths the UoW is expected to touch.
+    #   NULL = unknown scope. Unknown scope is treated as "exclusive": the UoW is only
+    #   dispatched when zero other UoWs are executing (preserves prior serial behavior).
+    #   Example: '["src/orchestration/steward.py", "tests/unit/test_orchestration/"]'
+    #   Populated at UoW creation time by the cultivator or manually.
+    file_scope: list | None = None
+    # shard_id: named dispatch stream. UoWs in the same shard run serially (only one
+    #   active per shard at a time). UoWs in different shards can run in parallel
+    #   subject to file_scope overlap checks. NULL = no shard constraint.
+    #   Example: 'wos-core', 'docs', 'tests'
+    shard_id: str | None = None
+    # Juice dispatch priority fields (populated after migration 0013).
+    #
+    # juice_quality: 'juice' when the steward asserts live generative momentum;
+    #   NULL when not asserted. Re-evaluated on every prescription cycle (Option C
+    #   from the spec: juice must be re-earned each cycle, not persisted automatically).
+    #   The dispatch query sorts juice='juice' UoWs first among ready-for-steward
+    #   candidates (juice wins LIFO tiebreaker).
+    # juice_rationale: mandatory prose when juice_quality='juice'. Records *what*
+    #   is alive and why (the "What is the juice?" calibration from the frontier doc).
+    #   NULL when juice_quality is NULL.
+    juice_quality: str | None = None
+    juice_rationale: str | None = None
 
 
 def _now_iso() -> str:
@@ -288,6 +318,27 @@ class Registry:
         """
         from src.orchestration.migrate import run_migrations  # local import avoids circular
         run_migrations(self.db_path)
+
+    # -----------------------------------------------------------------------
+    # Public audit interface
+    # -----------------------------------------------------------------------
+
+    def fetch_audit_entries(self, uow_id: str) -> list[dict]:
+        """
+        Return all audit log entries for the given UoW, ordered by id ASC.
+
+        Returns an empty list if the UoW has no audit history or is not found.
+        Each entry is a plain dict with at minimum 'event' and 'to_status' keys.
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM audit_log WHERE uow_id = ? ORDER BY id ASC",
+                (uow_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
 
     # -----------------------------------------------------------------------
     # Internal helpers
@@ -400,6 +451,11 @@ class Registry:
             heartbeat_at=d.get("heartbeat_at"),
             heartbeat_ttl=d.get("heartbeat_ttl") or 300,
             retry_count=d.get("retry_count") or 0,
+            artifacts=_deserialize_json(d.get("artifacts")) if d.get("artifacts") else None,
+            file_scope=_deserialize_json(d.get("file_scope")) if d.get("file_scope") else None,
+            shard_id=d.get("shard_id"),
+            juice_quality=d.get("juice_quality"),
+            juice_rationale=d.get("juice_rationale"),
         )
 
     def _write_audit(
@@ -715,10 +771,35 @@ class Registry:
             conn.close()
 
     def list(self, status: str | None = None) -> list[UoW]:
-        """Return all UoW records, optionally filtered by status."""
+        """Return all UoW records, optionally filtered by status.
+
+        When filtering by status='ready-for-steward', results are ordered so
+        that juice-quality UoWs ('juice') sort first among candidates:
+
+            ORDER BY
+              CASE WHEN juice_quality = 'juice' THEN 0 ELSE 1 END ASC,
+              created_at DESC
+
+        This implements the dispatch priority signal from the juice integration
+        spec: high-juice UoWs bubble to the front of the steward's selection
+        queue while preserving LIFO ordering among same-juice-status candidates.
+
+        For all other status filters, ordering remains created_at DESC (LIFO).
+        """
         conn = self._connect()
         try:
-            if status:
+            if status == "ready-for-steward":
+                # Juice-priority ordering: juice UoWs first, then LIFO.
+                rows = conn.execute(
+                    """
+                    SELECT * FROM uow_registry
+                    WHERE status = 'ready-for-steward'
+                    ORDER BY
+                      CASE WHEN juice_quality = 'juice' THEN 0 ELSE 1 END ASC,
+                      created_at DESC
+                    """,
+                ).fetchall()
+            elif status:
                 rows = conn.execute(
                     "SELECT * FROM uow_registry WHERE status = ? ORDER BY created_at DESC",
                     (status,),
@@ -1038,6 +1119,32 @@ class Registry:
         and avoids a bare list(status='active') call at the call site.
         """
         return self.list(status=UoWStatus.ACTIVE)
+
+    def list_executing(self) -> list[UoW]:
+        """
+        Return all UoWs currently in-flight for the shard-stream dispatch gate.
+
+        "In-flight" means status IN ('active', 'executing', 'ready-for-executor')
+        — any state where the UoW has been dispatched to an executor and is
+        consuming file-scope resources. Used by the steward parallel dispatch
+        logic to determine whether a candidate UoW can safely be dispatched
+        without conflicting with in-flight work.
+
+        Named explicitly so the shard-stream gate's intent is readable at
+        the call site without reconstructing the status set from first principles.
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT * FROM uow_registry
+                WHERE status IN ('active', 'executing', 'ready-for-executor')
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+            return [self._row_to_uow(r) for r in rows]
+        finally:
+            conn.close()
 
     def get_started_at(self, uow_id: str) -> str | None:
         """
@@ -1459,6 +1566,43 @@ class Registry:
             conn.execute(
                 "UPDATE uow_registry SET status = 'ready-for-steward', updated_at = ? WHERE id = ?",
                 (now, uow_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def update_artifacts(self, uow_id: str, artifacts: list) -> None:
+        """
+        Store extracted outcome refs in the registry artifacts field for a UoW.
+
+        Called by wos_completion.py after extracting artifact refs from the
+        write_result payload. Overwrites any existing value — the list is derived
+        fresh from result_text each time and replacement is idempotent.
+
+        No-op when:
+        - artifacts is empty (no refs were extracted — avoids noisy NULL→'[]' writes)
+        - uow_id does not exist in the registry (graceful skip)
+
+        Non-transactional: this is an advisory enrichment. If it fails, the UoW
+        transition already succeeded. Callers must not rely on this field for
+        correctness — only for observability and steward queries.
+
+        Args:
+            uow_id: The WOS unit-of-work ID.
+            artifacts: List of typed ref dicts. Each item has at minimum:
+                       {type: str, ref: str, category: str}.
+        """
+        if not artifacts:
+            return
+
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE uow_registry SET artifacts = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(artifacts), _now_iso(), uow_id),
             )
             conn.commit()
         except Exception:
@@ -2071,6 +2215,65 @@ class Registry:
             conn.commit()
             return rows_affected
 
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    # -----------------------------------------------------------------------
+    # Juice dispatch priority methods (migration 0013)
+    # -----------------------------------------------------------------------
+
+    def write_juice(
+        self,
+        uow_id: str,
+        juice_quality: str | None,
+        juice_rationale: str | None,
+    ) -> None:
+        """
+        Write juice_quality and juice_rationale to a UoW row.
+
+        Called by the steward at dispatch time after compute_juice() evaluates
+        the UoW's generative momentum. The steward is the sole writer of these
+        fields — the same convention that applies to steward_notes, steward_log,
+        and steward_agenda.
+
+        juice_quality='juice' asserts live generative momentum. None clears it.
+        juice_rationale must be non-None when juice_quality='juice' (spec requirement:
+        a prescription without a named rationale should not assert juice).
+
+        Enforces the delta-update contract at the call site (JUICE_UPDATE_DELTA=0.05):
+        callers are expected to only call write_juice when the score has changed
+        materially. This method does not check the delta — it writes unconditionally.
+
+        Args:
+            uow_id: The UoW identifier.
+            juice_quality: 'juice' to assert, or None to clear.
+            juice_rationale: Mandatory prose when juice_quality='juice'. Pass None
+                when clearing juice_quality.
+
+        Raises:
+            ValueError: If juice_quality='juice' but juice_rationale is falsy.
+        """
+        if juice_quality == "juice" and not juice_rationale:
+            raise ValueError(
+                f"write_juice: juice_rationale is required when juice_quality='juice' "
+                f"(uow_id={uow_id}). The spec requires naming what is alive and why."
+            )
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE uow_registry
+                SET juice_quality = ?, juice_rationale = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (juice_quality, juice_rationale, now, uow_id),
+            )
+            conn.commit()
         except Exception:
             conn.rollback()
             raise

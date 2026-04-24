@@ -439,8 +439,9 @@ Always pass correct `source` to `send_reply`.
 4. "delete-confirm-no-<slug>": send_reply "Deletion discarded."
 5. "job-confirm-yes-<name>": retrieve parked job from memory, Task(lobster-generalist), send_reply "Job dispatched."
 6. "job-confirm-no-<name>": send_reply "Job cancelled."
-7. else: send_reply f"Unknown callback: {data}"
-8. mark_processed(message_id)
+7. call route_callback_message(msg) — from src.orchestration.dispatcher_handlers import route_callback_message; result = route_callback_message(msg). If result["handled"] is True: send_reply(chat_id=result["chat_id"], text=result["text"], source=source, reply_to_message_id=msg.get("original_telegram_message_id")); mark_processed(message_id); done. If result["handled"] is False: fall through to step 8.
+8. else: send_reply f"Unknown callback: {data}"
+9. mark_processed(message_id)
 ```
 
 ### Telegram-specific
