@@ -57,6 +57,12 @@ as proposed UoWs.
 
 ---
 
+### Data Access Layer (canonical subagent guide)
+
+**See:** [WOS-DATA-ACCESS.md](WOS-DATA-ACCESS.md) — canonical patterns for reading WOS state from subagents and scripts. Covers when to use the CLI vs. the Registry class, the import pattern, and what not to do.
+
+---
+
 ### Registry (`src/orchestration/registry.py`)
 
 **Role:** SQLite-backed store for Units of Work. All writes use BEGIN IMMEDIATE

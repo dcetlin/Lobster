@@ -337,3 +337,162 @@ class TestDecideRetryCommand:
         assert row["from_status"] == "ready-for-steward", (
             "audit log from_status must reflect actual source status, not hardcoded 'blocked'"
         )
+
+
+# ---------------------------------------------------------------------------
+# status-breakdown command
+# ---------------------------------------------------------------------------
+
+class TestStatusBreakdownCommand:
+    def test_status_breakdown_returns_dict_of_counts(self, db_path):
+        """status-breakdown outputs a dict with status names as keys and integer counts as values."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        run_cli(db_path, "upsert", "--issue", "100", "--title", "Issue 100", "--sweep-date", today)
+        run_cli(db_path, "upsert", "--issue", "101", "--title", "Issue 101", "--sweep-date", today)
+        result = run_cli(db_path, "status-breakdown")
+        assert isinstance(result, dict), "status-breakdown must return a JSON object"
+        assert "proposed" in result, "proposed status must be present after upsert"
+        assert result["proposed"] == 2, "count must equal number of inserted records"
+
+    def test_status_breakdown_counts_are_integers(self, db_path):
+        """All values in the status-breakdown output are non-negative integers."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        run_cli(db_path, "upsert", "--issue", "110", "--title", "Issue 110", "--sweep-date", today)
+        result = run_cli(db_path, "status-breakdown")
+        for status, count in result.items():
+            assert isinstance(count, int), f"count for {status!r} must be an int, got {type(count)}"
+            assert count >= 0, f"count for {status!r} must be non-negative"
+
+    def test_status_breakdown_empty_db_returns_empty_dict(self, db_path):
+        """status-breakdown on an empty but initialized DB returns an empty dict."""
+        # Initialize DB without inserting any UoWs
+        run_cli(db_path, "upsert", "--issue", "999", "--title", "Init", "--sweep-date", "2026-01-01")
+        # Force the single record to done so there are no proposed
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("DELETE FROM uow_registry")
+        conn.commit()
+        conn.close()
+        # Must not error; must return {} or a dict without error key
+        result = run_cli(db_path, "status-breakdown")
+        assert isinstance(result, dict)
+        assert "error" not in result
+
+    def test_status_breakdown_reflects_multiple_statuses(self, db_path):
+        """status-breakdown counts separately for each status that exists in the DB."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "120", "--title", "Issue 120", "--sweep-date", today)
+        uow_id_1 = inserted["id"]
+        inserted2 = run_cli(db_path, "upsert", "--issue", "121", "--title", "Issue 121", "--sweep-date", today)
+        uow_id_2 = inserted2["id"]
+        # Force one to blocked so we get two different statuses
+        _force_status(db_path, uow_id_1, "blocked")
+        result = run_cli(db_path, "status-breakdown")
+        assert result.get("blocked", 0) >= 1
+        assert result.get("proposed", 0) >= 1
+
+
+# ---------------------------------------------------------------------------
+# escalation-candidates command
+# ---------------------------------------------------------------------------
+
+class TestEscalationCandidatesCommand:
+    def test_escalation_candidates_returns_list(self, db_path):
+        """escalation-candidates returns a JSON array."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        run_cli(db_path, "upsert", "--issue", "200", "--title", "Issue 200", "--sweep-date", today)
+        result = run_cli(db_path, "escalation-candidates")
+        assert isinstance(result, list), "escalation-candidates must return a JSON array"
+
+    def test_escalation_candidates_includes_needs_human_review(self, db_path):
+        """UoWs in needs-human-review status appear as escalation candidates."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "201", "--title", "Issue 201", "--sweep-date", today)
+        uow_id = inserted["id"]
+        _force_status(db_path, uow_id, "needs-human-review")
+        result = run_cli(db_path, "escalation-candidates")
+        ids = [r["id"] for r in result]
+        assert uow_id in ids, "UoW in needs-human-review must appear in escalation-candidates"
+
+    def test_escalation_candidates_excludes_done_uows(self, db_path):
+        """UoWs in done status do not appear as escalation candidates."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "202", "--title", "Issue 202", "--sweep-date", today)
+        uow_id = inserted["id"]
+        _force_status(db_path, uow_id, "done")
+        result = run_cli(db_path, "escalation-candidates")
+        ids = [r["id"] for r in result]
+        assert uow_id not in ids, "UoW in done status must not appear in escalation-candidates"
+
+    def test_escalation_candidates_output_has_required_fields(self, db_path):
+        """Each escalation candidate record has id, status, and summary fields."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "203", "--title", "Issue 203", "--sweep-date", today)
+        uow_id = inserted["id"]
+        _force_status(db_path, uow_id, "needs-human-review")
+        result = run_cli(db_path, "escalation-candidates")
+        assert len(result) >= 1
+        record = result[0]
+        assert "id" in record
+        assert "status" in record
+        assert "summary" in record
+
+
+# ---------------------------------------------------------------------------
+# stale command
+# ---------------------------------------------------------------------------
+
+class TestStaleCommand:
+    def test_stale_returns_list(self, db_path):
+        """stale returns a JSON array."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        run_cli(db_path, "upsert", "--issue", "300", "--title", "Issue 300", "--sweep-date", today)
+        result = run_cli(db_path, "stale")
+        assert isinstance(result, list), "stale must return a JSON array"
+
+    def test_stale_excludes_uows_without_heartbeat(self, db_path):
+        """A UoW with no heartbeat_at recorded is not included in stale output."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "301", "--title", "Issue 301", "--sweep-date", today)
+        uow_id = inserted["id"]
+        _force_status(db_path, uow_id, "active")
+        # No heartbeat written — should not appear as stale
+        result = run_cli(db_path, "stale")
+        ids = [r["id"] for r in result]
+        assert uow_id not in ids, "UoW with no heartbeat_at must not appear in stale output"
+
+    def test_stale_includes_uows_with_expired_heartbeat(self, db_path):
+        """A UoW with an old heartbeat_at beyond its TTL appears in stale output."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "302", "--title", "Issue 302", "--sweep-date", today)
+        uow_id = inserted["id"]
+        _force_status(db_path, uow_id, "active")
+        # Write an old heartbeat (well beyond any TTL)
+        old_heartbeat = "2020-01-01T00:00:00+00:00"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "UPDATE uow_registry SET heartbeat_at = ?, heartbeat_ttl = 300 WHERE id = ?",
+            (old_heartbeat, uow_id),
+        )
+        conn.commit()
+        conn.close()
+        result = run_cli(db_path, "stale")
+        ids = [r["id"] for r in result]
+        assert uow_id in ids, "UoW with expired heartbeat must appear in stale output"
+
+    def test_stale_excludes_done_uows(self, db_path):
+        """Done UoWs are never reported as stale even if heartbeat_at is old."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "303", "--title", "Issue 303", "--sweep-date", today)
+        uow_id = inserted["id"]
+        _force_status(db_path, uow_id, "done")
+        old_heartbeat = "2020-01-01T00:00:00+00:00"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "UPDATE uow_registry SET heartbeat_at = ?, heartbeat_ttl = 300 WHERE id = ?",
+            (old_heartbeat, uow_id),
+        )
+        conn.commit()
+        conn.close()
+        result = run_cli(db_path, "stale")
+        ids = [r["id"] for r in result]
+        assert uow_id not in ids, "done UoW must not appear in stale output"

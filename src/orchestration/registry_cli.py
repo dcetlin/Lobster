@@ -192,6 +192,62 @@ def cmd_decide_close(registry: Registry, args: argparse.Namespace) -> None:
         })
 
 
+def cmd_status_breakdown(registry: Registry, args: argparse.Namespace) -> None:
+    """
+    Return a count of UoWs grouped by status.
+
+    Output: JSON object mapping each status present in the DB to its count.
+    Example: {"proposed": 3, "active": 1, "done": 12}
+
+    This is the canonical query that subagents should use instead of raw SQL
+    GROUP BY queries — those have repeatedly caused syntax errors in practice.
+    """
+    import sqlite3 as _sqlite3
+    conn = _sqlite3.connect(str(registry.db_path), timeout=10.0)
+    conn.row_factory = _sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) as cnt FROM uow_registry GROUP BY status ORDER BY status"
+        ).fetchall()
+        _output({row["status"]: row["cnt"] for row in rows})
+    finally:
+        conn.close()
+
+
+def cmd_escalation_candidates(registry: Registry, args: argparse.Namespace) -> None:
+    """
+    Return UoWs that require human decision-making.
+
+    Escalation candidates are UoWs in 'needs-human-review' status — the Steward
+    has already exhausted its retry budget and escalated. These UoWs are waiting
+    for Dan to either retry, close, or defer them.
+
+    Output: JSON array of UoW objects (same structure as 'list' output).
+    """
+    records = registry.list(status="needs-human-review")
+    _output([_uow_to_dict(r) for r in records])
+
+
+def cmd_stale(registry: Registry, args: argparse.Namespace) -> None:
+    """
+    Return UoWs whose heartbeat has gone silent beyond their TTL.
+
+    A UoW is stale when:
+    - status is 'active' or 'executing' (in-flight)
+    - heartbeat_at is not NULL (agent has written at least one heartbeat)
+    - (now - heartbeat_at) > heartbeat_ttl + buffer_seconds
+
+    UoWs with no heartbeat_at are NOT returned — those use the legacy
+    started_at-based TTL path.
+
+    Output: JSON array of UoW objects with stale heartbeats.
+    """
+    buffer_seconds = getattr(args, "buffer_seconds", 30)
+    records = registry.get_stale_heartbeat_uows(buffer_seconds=buffer_seconds)
+    _output([_uow_to_dict(r) for r in records])
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -249,6 +305,31 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_decide_close.add_argument("--id", required=True, help="UoW id")
 
+    # status-breakdown
+    subparsers.add_parser(
+        "status-breakdown",
+        help="Count UoWs grouped by status (returns JSON object: {status: count})",
+    )
+
+    # escalation-candidates
+    subparsers.add_parser(
+        "escalation-candidates",
+        help="List UoWs in needs-human-review status awaiting operator decision",
+    )
+
+    # stale
+    p_stale = subparsers.add_parser(
+        "stale",
+        help="List in-flight UoWs whose heartbeat has gone silent beyond their TTL",
+    )
+    p_stale.add_argument(
+        "--buffer-seconds",
+        dest="buffer_seconds",
+        type=int,
+        default=30,
+        help="Grace period added to heartbeat_ttl before declaring a stall (default: 30)",
+    )
+
     return parser
 
 
@@ -262,6 +343,9 @@ _COMMAND_MAP = {
     "gate-readiness": cmd_gate_readiness,
     "decide-retry": cmd_decide_retry,
     "decide-close": cmd_decide_close,
+    "status-breakdown": cmd_status_breakdown,
+    "escalation-candidates": cmd_escalation_candidates,
+    "stale": cmd_stale,
 }
 
 
