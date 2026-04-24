@@ -990,6 +990,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         "text": f"[Button pressed: {query.data}]",
         "callback_data": query.data,
         "original_message_text": query.message.text or query.message.caption or "",
+        # Include the Telegram message_id of the message that contained the buttons
+        # so the dispatcher can correlate the callback to the original escalation.
+        "original_telegram_message_id": query.message.message_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
