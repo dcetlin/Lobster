@@ -1,0 +1,31 @@
+[Unit]
+Description=Lobster WOS Execute Router — mechanical wos_execute inbox routing daemon
+Documentation=https://github.com/dcetlin/Lobster/issues/940
+After=network.target lobster-mcp.service
+
+[Service]
+Type=simple
+User=lobster
+Group=lobster
+WorkingDirectory=/home/lobster/lobster
+Environment=LOBSTER_CONFIG_DIR=/home/lobster/lobster-config
+Environment=LOBSTER_INSTALL_DIR=/home/lobster/lobster
+Environment=LOBSTER_MESSAGES=/home/lobster/messages
+Environment=LOBSTER_WORKSPACE=/home/lobster/lobster-workspace
+Environment=LOBSTER_USER_CONFIG=/home/lobster/lobster-user-config
+EnvironmentFile=-/home/lobster/lobster/config/config.env
+EnvironmentFile=/home/lobster/lobster-config/config.env
+EnvironmentFile=-/home/lobster/lobster-config/global.env
+ExecStart=/home/lobster/lobster/.venv/bin/python /home/lobster/lobster/src/daemons/wos_execute_router.py
+Restart=on-failure
+RestartSec=15
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lobster-wos-router
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
