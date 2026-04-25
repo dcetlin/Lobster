@@ -752,6 +752,86 @@ class TestRouteWosMessageSpawnGate:
 
 
 # ---------------------------------------------------------------------------
+# route_wos_message artifact-fallback tests — issue #922
+#
+# These tests verify that route_wos_message handles wos_execute messages that
+# do NOT carry an 'instructions' field (test/manual invocations). The fix
+# adds _load_instructions_from_artifact as a fallback path so a minimal
+# {"type":"wos_execute","uow_id":"x","chat_id":"1"} dict no longer raises
+# KeyError but instead loads instructions from the WorkflowArtifact on disk.
+# ---------------------------------------------------------------------------
+
+class TestRouteWosMessageArtifactFallback:
+    """route_wos_message must handle wos_execute messages without 'instructions'."""
+
+    _ARTIFACT_CONTENT = (
+        '---json\n'
+        '{"uow_id":"test-uow","executor_type":"functional-engineer","constraints":[],"prescribed_skills":[]}\n'
+        '---\n'
+        'Do the thing.\n'
+    )
+
+    def test_inline_instructions_used_when_present(self):
+        """When 'instructions' is in the message, it is used directly without artifact lookup."""
+        msg = {
+            "type": "wos_execute",
+            "uow_id": "test-uow",
+            "chat_id": 8075091586,
+            "instructions": "Inline instructions here.",
+        }
+        result = route_wos_message(msg)
+        assert result["action"] == "spawn_subagent", (
+            "route_wos_message with inline instructions must return spawn_subagent"
+        )
+        assert "Inline instructions here." in result["prompt"]
+
+    def test_artifact_fallback_when_instructions_absent(self, tmp_path, monkeypatch):
+        """When 'instructions' is absent, instructions are loaded from the artifact file."""
+        artifact_file = tmp_path / "test-uow-fallback.md"
+        artifact_file.write_text(self._ARTIFACT_CONTENT, encoding="utf-8")
+
+        import src.orchestration.workflow_artifact as wa
+        monkeypatch.setattr(wa, "artifact_path", lambda uow_id: artifact_file)
+
+        msg = {
+            "type": "wos_execute",
+            "uow_id": "test-uow-fallback",
+            "chat_id": 8075091586,
+        }
+        result = route_wos_message(msg)
+        assert result["action"] == "spawn_subagent", (
+            "route_wos_message without instructions field must fall back to artifact "
+            "and return spawn_subagent when artifact exists"
+        )
+        assert "Do the thing." in result["prompt"]
+
+    def test_missing_artifact_returns_send_reply_with_alert(self, tmp_path, monkeypatch):
+        """When 'instructions' is absent and artifact is missing, spawn-gate returns send_reply."""
+        nonexistent = tmp_path / "no-such-artifact.md"
+        # Do not create the file — it should not exist
+
+        import src.orchestration.workflow_artifact as wa
+        monkeypatch.setattr(wa, "artifact_path", lambda uow_id: nonexistent)
+
+        msg = {
+            "type": "wos_execute",
+            "uow_id": "uow-missing-artifact",
+            "chat_id": 8075091586,
+        }
+        result = route_wos_message(msg)
+        assert result["action"] == "send_reply", (
+            "route_wos_message must return send_reply (spawn-gate) when instructions "
+            "field is absent and artifact file does not exist"
+        )
+        assert "spawn-gate alert" in result["text"], (
+            "send_reply result must contain 'spawn-gate alert'"
+        )
+        assert "instructions" in result["text"], (
+            "send_reply result must mention 'instructions' so the alert is actionable"
+        )
+
+
+# ---------------------------------------------------------------------------
 # decide_retry / decide_close callback handler tests — issue #901
 #
 # These tests verify that tapping the "Retry" or "Close" buttons on a
