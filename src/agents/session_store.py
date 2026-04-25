@@ -868,12 +868,20 @@ def _elapsed_minutes_str(elapsed_seconds: int | None) -> str:
     return f"{minutes}m ago"
 
 
+_ACTIVE_SESSIONS_DISPLAY_CAP = 5
+
+
 def format_active_sessions_block(sessions: list[dict]) -> str:
     """Format a list of active sessions as a compact context block.
 
     Distinguishes user-facing agents from system agents (chat_id=0 or None).
     System agents are background tasks (scheduled jobs, startup-catchup, etc.)
     that do not correspond to a user conversation in the IDE panel.
+
+    Renders at most _ACTIVE_SESSIONS_DISPLAY_CAP entries (user sessions first,
+    then system). When the total exceeds the cap, a trailing "...and N more"
+    line is appended so the dispatcher knows the full count without paying the
+    per-token cost of every entry.
 
     Produces output like:
         [1 agent running, 1 system]
@@ -899,8 +907,13 @@ def format_active_sessions_block(sessions: list[dict]) -> str:
         header += f", {system_count} {sys_label}"
     header += "]"
 
+    all_sessions = user_sessions + system_sessions
+    total = len(all_sessions)
+    displayed = all_sessions[:_ACTIVE_SESSIONS_DISPLAY_CAP]
+    hidden = total - len(displayed)
+
     lines = [header]
-    for s in user_sessions + system_sessions:
+    for s in displayed:
         agent_type = s.get("agent_type") or "agent"
         desc = s.get("description", "")
         # Truncate long descriptions
@@ -912,6 +925,10 @@ def format_active_sessions_block(sessions: list[dict]) -> str:
             lines.append(f'- {agent_type}: "{desc}" (system, {elapsed})')
         else:
             lines.append(f'- {agent_type}: "{desc}" (chat: {chat_id}, {elapsed})')
+
+    if hidden > 0:
+        lines.append(f"...and {hidden} more")
+
     return "\n".join(lines)
 
 
