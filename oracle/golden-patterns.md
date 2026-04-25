@@ -160,6 +160,24 @@ Applied in WOS Phase 2 design (2026-03-30):
 
 ---
 
+### [2026-04-25] Pattern: full-repo grep as precondition for dead-code removal
+
+**Three rules, all required:**
+
+**Rule 1 — Dead-code removal requires a full-repo grep across ALL Python files.** Searching only `src/` is insufficient. The required scope is: `src/`, `.claude/`, `scripts/`, `tests/`, `scheduled-tasks/`, `hooks/`. A grep limited to `src/` can miss imports in heartbeat scripts, scheduled tasks, hooks, and agent definitions that live outside the main package tree.
+
+**Rule 2 — Run `grep -r 'module_name' ~/lobster/ --include='*.py'` and verify zero matches before filing any dead-code removal issue.** The grep must return zero results across the entire repo. Do not grep a subdirectory and extrapolate — the full repo command is the gate.
+
+**Rule 3 — A single grep hit anywhere in the repo is sufficient to block removal.** One import in `scheduled-tasks/steward-heartbeat.py` or `hooks/` is as binding as ten imports in `src/`. Location outside `src/` does not make the usage less real.
+
+**Why these rules together.** Issue #197 filed `dispatcher_handlers.py` for removal based on a grep scoped to `src/` and `.claude/`. The file was actively imported in `steward.py`, `shard_dispatch.py`, and `inbox_server.py` — files that were never searched. The failure mode is: an incomplete search produces a false "no usages" result, the issue is filed and acted on, and a live import breaks. All three rules exist to make that failure structurally impossible: the scope rule covers the search perimeter, the command rule makes the gate explicit, and the single-hit rule prevents rationalization ("it's only in a script, probably safe to remove").
+
+**Where it applies in this codebase:** `src/orchestration/dispatcher_handlers.py` — issue #197 closed as "not planned" after the routing agent discovered the three live imports during WOS executor implementation (2026-04-25).
+
+**Reuse guidance:** Before filing any issue to remove or rename a Python module, run: `grep -r '<module_filename_without_extension>' ~/lobster/ --include='*.py'`. If any results appear, the module is not dead code — stop. If no results appear, the module is safe to remove. This command is the gate, not a judgment call about whether the usages are "important."
+
+---
+
 *Entries should be added when: (1) an oracle decision receives an "Alignment verdict: Confirmed" with notable quality findings; (2) a negentropic sweep identifies an "undernamed gem" in the golden patterns section; (3) a reflection-systems review names a structural win specific to this codebase.*
 
 ---
