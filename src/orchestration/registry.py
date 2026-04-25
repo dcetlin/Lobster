@@ -1156,9 +1156,14 @@ class Registry:
             rows = conn.execute(
                 """
                 SELECT * FROM uow_registry
-                WHERE status IN ('active', 'executing', 'ready-for-executor')
+                WHERE status IN (?, ?, ?)
                 ORDER BY updated_at DESC
-                """
+                """,
+                (
+                    UoWStatus.ACTIVE.value,
+                    UoWStatus.EXECUTING.value,
+                    UoWStatus.READY_FOR_EXECUTOR.value,
+                ),
             ).fetchall()
             return [self._row_to_uow(r) for r in rows]
         finally:
