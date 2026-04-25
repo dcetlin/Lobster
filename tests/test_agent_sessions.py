@@ -379,6 +379,41 @@ def test_format_only_system_agents():
     assert "(system," in result
 
 
+def test_format_active_sessions_block_cap():
+    """When more than _ACTIVE_SESSIONS_DISPLAY_CAP sessions exist, only cap entries are shown with a trailing '...and N more' line."""
+    cap = session_store._ACTIVE_SESSIONS_DISPLAY_CAP
+    # Build cap+2 sessions (all user-facing)
+    sessions = [
+        {"agent_type": "subagent", "description": f"Task {i}",
+         "chat_id": "8075091586", "elapsed_seconds": i * 60, "id": str(i)}
+        for i in range(cap + 2)
+    ]
+    result = session_store.format_active_sessions_block(sessions)
+    lines = result.splitlines()
+    # Header + cap detail lines + 1 overflow line
+    assert len(lines) == cap + 2, f"Expected {cap + 2} lines, got {len(lines)}: {result!r}"
+    assert lines[-1] == "...and 2 more"
+    # Entries beyond cap must not appear
+    for i in range(cap):
+        assert f"Task {i}" in result
+    for i in range(cap, cap + 2):
+        assert f"Task {i}" not in result
+
+
+def test_format_active_sessions_block_at_cap():
+    """When exactly _ACTIVE_SESSIONS_DISPLAY_CAP sessions exist, no overflow line is added."""
+    cap = session_store._ACTIVE_SESSIONS_DISPLAY_CAP
+    sessions = [
+        {"agent_type": "subagent", "description": f"Task {i}",
+         "chat_id": "8075091586", "elapsed_seconds": i * 60, "id": str(i)}
+        for i in range(cap)
+    ]
+    result = session_store.format_active_sessions_block(sessions)
+    assert "...and" not in result
+    lines = result.splitlines()
+    assert len(lines) == cap + 1  # header + cap entries
+
+
 # ---------------------------------------------------------------------------
 # Test: tracker.py adapter compatibility
 # ---------------------------------------------------------------------------
