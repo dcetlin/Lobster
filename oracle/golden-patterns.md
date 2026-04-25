@@ -298,3 +298,15 @@ StartupSweepResult = _sweep_mod.StartupSweepResult
 **No split canonical homes:** If something could plausibly live in two places, that ambiguity is the structural problem. Pick one, encode the convention. The existence of a reasonable second option means the first isn't obvious enough.
 
 **Grounded in:** Single Source of Truth (one authoritative home; duplication is structural debt); Principle of Least Surprise (contributors find things where they expect, not where they were convenient to place); self-documenting structure (the repo layout answers "where does X live?" without external documentation).
+
+---
+
+### [2026-04-25] Pattern: named display cap with aggregate-preserving header for high-frequency context payloads
+
+**Pattern:** When a list is prepended to a high-frequency context payload (e.g., every `wait_for_messages` call), cap the per-entry detail at a named module-level constant while preserving the true aggregate count in the header. Append an "...and N more" overflow hint so the consumer retains structural awareness (total count) without paying per-entry token cost. The cap constant is module-scope and directly importable by tests.
+
+**Why it works:** The two failure modes this pattern avoids are: (a) hiding the aggregate fact (how many total) which would degrade routing decisions; (b) letting per-entry cost grow O(n) with agent count, which compounds context pressure at exactly the time the system is most loaded. Preserving the aggregate in the header is the load-bearing design decision — without it, the dispatcher cannot distinguish "5 agents (all shown)" from "12 agents (7 hidden)." The named constant makes the cap observable in tests without re-declaring a local mirror (which would create a divergence risk per learnings.md PR #800).
+
+**Where it appears:** `src/agents/session_store.py` — `_ACTIVE_SESSIONS_DISPLAY_CAP = 5` and `format_active_sessions_block()` introduced in PR #938. The header computation runs before the slice, preserving true total count. Tests import the constant directly.
+
+**Reuse guidance:** Apply whenever a list is formatted into a payload that fires at high frequency (per-poll, per-heartbeat, per-WFM). The structure is: (1) compute aggregate header from the full list; (2) slice to cap; (3) render sliced entries; (4) append overflow hint iff hidden > 0. User-facing entries go first so the highest-signal entries survive truncation. The cap constant belongs at module scope so it is importable by tests — never re-declare it locally in a test file.
