@@ -276,3 +276,19 @@ StartupSweepResult = _sweep_mod.StartupSweepResult
 **Where it appears:** `compact-catchup.md` Phase 3 (step 14) and `nightly-consolidation.md` step 3, both updated in PR #892. The "Stable Context" section is the designated slow section in both agents.
 
 **Reuse guidance:** Apply whenever a memory file is shared between multiple agents using an overwrite pattern. Identify the sections by update rate: (1) fast-moving sections (current work, recent decisions, active threads) — re-synthesize each run; (2) slow-moving sections (contacts, infra, long-term goals) — carry forward verbatim. Name the slow section explicitly in the file's structure and in the agent instructions. Require that both agents use the same section names and the same carry-forward rule — asymmetric rules between agents produce structural variation in the file that downstream readers must handle.
+
+---
+
+### [2026-04-25] Principle: canonical placement must be obvious from first encounter
+
+**Principle:** The right home for any file, module, or definition must be unambiguous without interpretation. If you add something and the correct location is not immediately obvious to someone reading the repo for the first time, the organizational structure has failed — not the reader. When you're about to add something, ask: "Is the right home for this unambiguous?" If the answer requires judgment, context, or familiarity with history, restructure first. Never add to a structure that would require explanation.
+
+**The anti-pattern:** Placing a file "close enough" to where it belongs and relying on contributors to figure out the intent. This compounds. One ambiguous placement generates a second ambiguous reference to the first, then a third that mirrors the second. The confusion isn't localized — it propagates forward and creates friction in every future decision made in its vicinity.
+
+**The staleness problem is the same problem:** A file that used to be canonical and no longer is — because its function moved, its name no longer matches its contents, or its location was never updated when the surrounding structure changed — is not just dead weight. It is active misdirection. A stale canonical home is worse than no canonical home because it answers the question "where does X live?" with the wrong answer confidently.
+
+**The test:** Could a new contributor, given only the repo structure and file names, land on this file without help? If not, the structure owes them a correction — not documentation explaining the deviation.
+
+**Where it applies:** Every file addition, every module split, every directory reorganization. The question "is the right home unambiguous?" is a pre-commit check, not a post-hoc audit.
+
+**Reuse guidance:** Before adding any file: (1) state the home in one sentence using only the directory and file name; (2) ask if someone new would agree without being told; (3) if no — restructure. Before renaming or moving anything: check whether existing references to the old location would mislead rather than break (breaks are loud; misdirection is silent). The goal is a repo where organizational structure never generates a question that requires a human to answer.
