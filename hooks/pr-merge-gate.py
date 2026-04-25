@@ -10,12 +10,12 @@ Verdict lookup order:
 1. oracle/verdicts/pr-{N}.md — first line must be 'VERDICT: APPROVED'
 2. oracle/decisions.md (legacy fallback) — **VERDICT: APPROVED** prose marker
 
-If no oracle entry exists for the PR, a warning is printed but the merge is not
-blocked — the PR may be infrastructure-level or pre-oracle.
+If no oracle entry exists for the PR, the merge is hard-blocked. Run the oracle agent
+first and confirm oracle/verdicts/pr-{N}.md first line is 'VERDICT: APPROVED'.
 
 Exit codes:
-  0 — not a merge command, no PR number found, oracle APPROVED, or no oracle entry
-  2 — hard block: oracle verdict is not APPROVED
+  0 — not a merge command, no PR number found, or oracle APPROVED
+  2 — hard block: oracle verdict is not APPROVED, or no oracle entry found
 """
 import json
 import re
@@ -129,18 +129,20 @@ if pr_number is None:
 
 verdict = find_oracle_verdict(pr_number)
 
-if verdict is None:
-    # No oracle entry — warn but do not block (may be pre-oracle or infrastructure)
-    print(
-        f"WARNING: gh pr merge attempted for PR #{pr_number} but no oracle entry found in "
-        f"oracle/verdicts/pr-{pr_number}.md or oracle/decisions.md. "
-        f"Allowing merge — add an oracle review if this is a code PR.",
-        file=sys.stderr,
-    )
-    sys.exit(0)
-
 if verdict == 'APPROVED':
     sys.exit(0)
+
+if verdict is None:
+    # No oracle entry — hard block. The gate requires a verdict file to exist.
+    print(
+        f"BLOCKED: gh pr merge attempted for PR #{pr_number} but no oracle entry found in "
+        f"oracle/verdicts/pr-{pr_number}.md or oracle/decisions.md.\n"
+        f"Run the oracle agent first and confirm oracle/verdicts/pr-{pr_number}.md first line is "
+        f"'VERDICT: APPROVED' before merging.\n"
+        "PR Merge Gate — see Tier-1 Gate Register in CLAUDE.md.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
 
 print(
     f"BLOCKED: gh pr merge attempted for PR #{pr_number} but oracle verdict is {verdict} (not APPROVED).\n"
