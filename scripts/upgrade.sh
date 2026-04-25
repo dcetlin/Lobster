@@ -3085,6 +3085,40 @@ except Exception as e:
         migrated=$((migrated + 1))
     fi
 
+    # Migration 90: Install lobster-wos-router systemd service (issue #940).
+    # The WOS execute router daemon routes wos_execute inbox messages without
+    # going through the dispatcher's LLM context. It polls every 30s as a
+    # persistent systemd service (Type B — always-on, not cron-direct).
+    local _m90_svc_src="$LOBSTER_DIR/services/lobster-wos-router.service"
+    local _m90_svc_dest="/etc/systemd/system/lobster-wos-router.service"
+    if [ -f "$_m90_svc_src" ] && [ ! -f "$_m90_svc_dest" ]; then
+        substep "Installing lobster-wos-router systemd service (Migration 90)..."
+        if sudo cp "$_m90_svc_src" "$_m90_svc_dest" 2>/dev/null; then
+            sudo systemctl daemon-reload 2>/dev/null || warn "Migration 90: daemon-reload failed"
+            sudo systemctl enable lobster-wos-router 2>/dev/null || warn "Migration 90: systemctl enable failed"
+            sudo systemctl start lobster-wos-router 2>/dev/null || warn "Migration 90: systemctl start failed"
+            substep "Installed and started lobster-wos-router (Migration 90)"
+            migrated=$((migrated + 1))
+        else
+            warn "Migration 90: could not copy $(_m90_svc_src) — manual install needed"
+        fi
+    elif [ -f "$_m90_svc_src" ] && [ -f "$_m90_svc_dest" ]; then
+        # Service file already installed — check if the installed copy is stale
+        if ! diff -q "$_m90_svc_src" "$_m90_svc_dest" >/dev/null 2>&1; then
+            substep "Updating lobster-wos-router service file (Migration 90)..."
+            if sudo cp "$_m90_svc_src" "$_m90_svc_dest" 2>/dev/null; then
+                sudo systemctl daemon-reload 2>/dev/null || warn "Migration 90: daemon-reload failed"
+                sudo systemctl restart lobster-wos-router 2>/dev/null || warn "Migration 90: restart failed"
+                substep "Updated lobster-wos-router service file (Migration 90)"
+                migrated=$((migrated + 1))
+            fi
+        else
+            substep "lobster-wos-router service already up to date — skipping Migration 90"
+        fi
+    else
+        substep "lobster-wos-router service source not found — skipping Migration 90"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
