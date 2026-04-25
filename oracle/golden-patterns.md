@@ -292,3 +292,9 @@ StartupSweepResult = _sweep_mod.StartupSweepResult
 **Where it applies:** Every file addition, every module split, every directory reorganization. The question "is the right home unambiguous?" is a pre-commit check, not a post-hoc audit.
 
 **Reuse guidance:** Before adding any file: (1) state the home in one sentence using only the directory and file name; (2) ask if someone new would agree without being told; (3) if no — restructure. Before renaming or moving anything: check whether existing references to the old location would mislead rather than break (breaks are loud; misdirection is silent). The goal is a repo where organizational structure never generates a question that requires a human to answer.
+
+**Documentation is not a fix:** The urge to write a comment or README saying "X lives in Y" is a signal the structure failed, not a solution. Document the why; never the where. If you need to explain where something lives, the location is wrong.
+
+**No split canonical homes:** If something could plausibly live in two places, that ambiguity is the structural problem. Pick one, encode the convention. The existence of a reasonable second option means the first isn't obvious enough.
+
+**Grounded in:** Single Source of Truth (one authoritative home; duplication is structural debt); Principle of Least Surprise (contributors find things where they expect, not where they were convenient to place); self-documenting structure (the repo layout answers "where does X live?" without external documentation).
