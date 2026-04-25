@@ -195,7 +195,7 @@ A document is substantial if it is:
 
 **If the document has no frontmatter at all:** treat it as pending. Do not assume unreviewed documents are safe to deliver.
 
-For PR merges specifically, also verify oracle approval in `~/lobster/oracle/decisions.md` per the PR Merge Gate in CLAUDE.md.
+For PR merges specifically, the `pr-merge-gate.py` PreToolUse hook enforces this mechanically — any `gh pr merge <N>` command is hard-blocked unless `oracle/verdicts/pr-{N}.md` exists and its first line is exactly `VERDICT: APPROVED`. Do not attempt to merge by other means to bypass this check.
 
 This check applies to documents being delivered, not to internal reports or log summaries. Short replies, task acknowledgments, and inline answers do not require frontmatter.
 
