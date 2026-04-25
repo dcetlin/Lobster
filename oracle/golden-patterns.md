@@ -142,6 +142,42 @@ Applied in WOS Phase 2 design (2026-03-30):
 
 ---
 
+### [2026-04-24] Pattern: StrEnum constants in all enum-backed SQL and routing logic
+
+**Three rules, all required:**
+
+**Rule 1 — Always use StrEnum constants in SQL.** Raw string literals for enum-backed DB columns are forbidden. Import and use the enum; never write the string value directly in a query. `WHERE status = 'active'` is a latent bug; `WHERE status = UoWStatus.ACTIVE` is correct. A grep for the enum class surfaces all usages; a grep for the raw string catches some of them and misses others.
+
+**Rule 2 — New modules must import enums at definition time.** When writing a new module that uses status/type values from a shared enum, import the enum before writing any code that uses those values. "Not in scope mentally" is not an excuse — the enum exists for type safety and maintainability. The correct pattern: import statement at the top of the file, then use the imported constant. The incorrect pattern: discover the value by looking at an existing string in another file and copy it as a literal.
+
+**Rule 3 — PathSelection/type discriminators get StrEnum.** Any function that returns one of N fixed string choices (path selection, strategy names, mode strings) should define a StrEnum. Naked string returns have no place in internal routing logic. `StrEnum` values compare equal to their string counterparts, so the migration is backward-compatible: callers doing `if path == 'fast'` continue to work without changes.
+
+**Why these rules together.** The three failure modes are related: raw SQL strings, raw literals in new modules, and naked routing returns are all the same underlying pattern — a value with a finite domain is being managed as an unbounded string. The fix is always the same: find the enum (or define one), import it, use it.
+
+**Where these apply in this codebase:** PR #904 introduced `list_executing()` with raw SQL literals despite the surrounding `registry.py` using `UoWStatus` consistently (issue #925). `shard_dispatch.py`'s `select_path()` returns `'fast'`/`'thorough'` with no StrEnum backing (issue #926). Both are filed for fix.
+
+**Reuse guidance:** Before committing any SQL query that filters on a status/type column, run: does the value being compared have an enum in this codebase? If yes, use it. Before merging any module that returns one of N fixed string choices, ask: should this be a StrEnum? The answer is almost always yes.
+
+---
+
+### [2026-04-25] Pattern: full-repo grep as precondition for dead-code removal
+
+**Three rules, all required:**
+
+**Rule 1 — Dead-code removal requires a full-repo grep across ALL Python files.** Searching only `src/` is insufficient. The required scope is: `src/`, `.claude/`, `scripts/`, `tests/`, `scheduled-tasks/`, `hooks/`. A grep limited to `src/` can miss imports in heartbeat scripts, scheduled tasks, hooks, and agent definitions that live outside the main package tree.
+
+**Rule 2 — Run `grep -r 'module_name' ~/lobster/ --include='*.py'` and verify zero matches before filing any dead-code removal issue.** The grep must return zero results across the entire repo. Do not grep a subdirectory and extrapolate — the full repo command is the gate.
+
+**Rule 3 — A single grep hit anywhere in the repo is sufficient to block removal.** One import in `scheduled-tasks/steward-heartbeat.py` or `hooks/` is as binding as ten imports in `src/`. Location outside `src/` does not make the usage less real.
+
+**Why these rules together.** Issue #197 filed `dispatcher_handlers.py` for removal based on a grep scoped to `src/` and `.claude/`. The file was actively imported in `steward.py`, `shard_dispatch.py`, and `inbox_server.py` — files that were never searched. The failure mode is: an incomplete search produces a false "no usages" result, the issue is filed and acted on, and a live import breaks. All three rules exist to make that failure structurally impossible: the scope rule covers the search perimeter, the command rule makes the gate explicit, and the single-hit rule prevents rationalization ("it's only in a script, probably safe to remove").
+
+**Where it applies in this codebase:** `src/orchestration/dispatcher_handlers.py` — issue #197 closed as "not planned" after the routing agent discovered the three live imports during WOS executor implementation (2026-04-25).
+
+**Reuse guidance:** Before filing any issue to remove or rename a Python module, run: `grep -r '<module_filename_without_extension>' ~/lobster/ --include='*.py'`. If any results appear, the module is not dead code — stop. If no results appear, the module is safe to remove. This command is the gate, not a judgment call about whether the usages are "important."
+
+---
+
 *Entries should be added when: (1) an oracle decision receives an "Alignment verdict: Confirmed" with notable quality findings; (2) a negentropic sweep identifies an "undernamed gem" in the golden patterns section; (3) a reflection-systems review names a structural win specific to this codebase.*
 
 ---
@@ -240,3 +276,25 @@ StartupSweepResult = _sweep_mod.StartupSweepResult
 **Where it appears:** `compact-catchup.md` Phase 3 (step 14) and `nightly-consolidation.md` step 3, both updated in PR #892. The "Stable Context" section is the designated slow section in both agents.
 
 **Reuse guidance:** Apply whenever a memory file is shared between multiple agents using an overwrite pattern. Identify the sections by update rate: (1) fast-moving sections (current work, recent decisions, active threads) — re-synthesize each run; (2) slow-moving sections (contacts, infra, long-term goals) — carry forward verbatim. Name the slow section explicitly in the file's structure and in the agent instructions. Require that both agents use the same section names and the same carry-forward rule — asymmetric rules between agents produce structural variation in the file that downstream readers must handle.
+
+---
+
+### [2026-04-25] Principle: canonical placement must be obvious from first encounter
+
+**Principle:** The right home for any file, module, or definition must be unambiguous without interpretation. If you add something and the correct location is not immediately obvious to someone reading the repo for the first time, the organizational structure has failed — not the reader. When you're about to add something, ask: "Is the right home for this unambiguous?" If the answer requires judgment, context, or familiarity with history, restructure first. Never add to a structure that would require explanation.
+
+**The anti-pattern:** Placing a file "close enough" to where it belongs and relying on contributors to figure out the intent. This compounds. One ambiguous placement generates a second ambiguous reference to the first, then a third that mirrors the second. The confusion isn't localized — it propagates forward and creates friction in every future decision made in its vicinity.
+
+**The staleness problem is the same problem:** A file that used to be canonical and no longer is — because its function moved, its name no longer matches its contents, or its location was never updated when the surrounding structure changed — is not just dead weight. It is active misdirection. A stale canonical home is worse than no canonical home because it answers the question "where does X live?" with the wrong answer confidently.
+
+**The test:** Could a new contributor, given only the repo structure and file names, land on this file without help? If not, the structure owes them a correction — not documentation explaining the deviation.
+
+**Where it applies:** Every file addition, every module split, every directory reorganization. The question "is the right home unambiguous?" is a pre-commit check, not a post-hoc audit.
+
+**Reuse guidance:** Before adding any file: (1) state the home in one sentence using only the directory and file name; (2) ask if someone new would agree without being told; (3) if no — restructure. Before renaming or moving anything: check whether existing references to the old location would mislead rather than break (breaks are loud; misdirection is silent). The goal is a repo where organizational structure never generates a question that requires a human to answer.
+
+**Documentation is not a fix:** The urge to write a comment or README saying "X lives in Y" is a signal the structure failed, not a solution. Document the why; never the where. If you need to explain where something lives, the location is wrong.
+
+**No split canonical homes:** If something could plausibly live in two places, that ambiguity is the structural problem. Pick one, encode the convention. The existence of a reasonable second option means the first isn't obvious enough.
+
+**Grounded in:** Single Source of Truth (one authoritative home; duplication is structural debt); Principle of Least Surprise (contributors find things where they expect, not where they were convenient to place); self-documenting structure (the repo layout answers "where does X live?" without external documentation).
