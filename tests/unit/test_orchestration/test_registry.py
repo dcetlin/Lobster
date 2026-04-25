@@ -1087,3 +1087,70 @@ class TestLifetimeCycles:
         with pytest.raises(RuntimeError, match="lifetime_cycles"):
             validate_steward_executor_schema(conn)
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# file_scope tests
+# ---------------------------------------------------------------------------
+
+class TestFileScopeUpsert:
+    """file_scope passed to upsert() must be persisted in the DB."""
+
+    def test_file_scope_stored_as_json(self, registry, db_path):
+        """upsert() with file_scope stores value as JSON in the DB."""
+        from src.orchestration.registry import UpsertInserted
+        import json as _json
+        today = datetime.now(timezone.utc).date().isoformat()
+        result = registry.upsert(
+            issue_number=800,
+            title="File scope issue",
+            sweep_date=today,
+            success_criteria="File scope is persisted.",
+            file_scope=["src/orchestration/steward.py"],
+        )
+        assert isinstance(result, UpsertInserted)
+        conn = _open_db(db_path)
+        row = conn.execute(
+            "SELECT file_scope FROM uow_registry WHERE id = ?", (result.id,)
+        ).fetchone()
+        conn.close()
+        assert row["file_scope"] == _json.dumps(["src/orchestration/steward.py"])
+
+    def test_file_scope_none_inserts_null(self, registry, db_path):
+        """upsert() with file_scope=None (default) inserts NULL."""
+        from src.orchestration.registry import UpsertInserted
+        today = datetime.now(timezone.utc).date().isoformat()
+        result = registry.upsert(
+            issue_number=801,
+            title="No file scope issue",
+            sweep_date=today,
+            success_criteria="Null file scope is safe.",
+        )
+        assert isinstance(result, UpsertInserted)
+        conn = _open_db(db_path)
+        row = conn.execute(
+            "SELECT file_scope FROM uow_registry WHERE id = ?", (result.id,)
+        ).fetchone()
+        conn.close()
+        assert row["file_scope"] is None
+
+    def test_file_scope_multiple_paths_sorted(self, registry, db_path):
+        """upsert() with multiple file_scope paths stores them as-provided JSON."""
+        from src.orchestration.registry import UpsertInserted
+        import json as _json
+        today = datetime.now(timezone.utc).date().isoformat()
+        paths = ["src/orchestration/steward.py", "tests/unit/test_orchestration/test_steward.py"]
+        result = registry.upsert(
+            issue_number=802,
+            title="Multi file scope issue",
+            sweep_date=today,
+            success_criteria="Multiple paths stored.",
+            file_scope=paths,
+        )
+        assert isinstance(result, UpsertInserted)
+        conn = _open_db(db_path)
+        row = conn.execute(
+            "SELECT file_scope FROM uow_registry WHERE id = ?", (result.id,)
+        ).fetchone()
+        conn.close()
+        assert _json.loads(row["file_scope"]) == paths
