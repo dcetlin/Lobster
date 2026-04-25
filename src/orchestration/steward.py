@@ -930,6 +930,9 @@ def _determine_reentry_posture(
     if return_reason == "executor_orphan":
         return "executor_orphan"
 
+    if return_reason == "executing_orphan":
+        return "executing_orphan"
+
     classification = _RETURN_REASON_CLASSIFICATIONS.get(return_reason or "", None)
 
     if classification == _CLASSIFICATION_NORMAL:
@@ -3729,6 +3732,42 @@ def _process_uow(
             artifact_dir=artifact_dir,
         )
         return Done(uow_id=uow_id)
+
+    # 4b-orphan: executing_orphan short-circuit.
+    # A UoW whose subagent exited without calling write_result should not be
+    # retried — the retry loop cannot fix a subagent that systematically skips
+    # the result contract. Mark failed immediately so the Steward does not
+    # re-dispatch into an infinite loop.
+    if reentry_posture == "executing_orphan":
+        orphan_reason = "executing_orphan: subagent exited without calling write_result"
+        orphan_log_entry = {
+            "event": "executing_orphan_failed",
+            "uow_id": uow_id,
+            "steward_cycles": cycles,
+            "reason": orphan_reason,
+            "timestamp": _now_iso(),
+        }
+        current_log_str = _append_steward_log_entry(registry, uow_id, current_log_str, orphan_log_entry)
+        if not dry_run:
+            _write_steward_fields(registry, uow_id, steward_log=current_log_str)
+            registry.append_audit_log(uow_id, {
+                "event": "executing_orphan_failed",
+                "actor": _ACTOR_STEWARD,
+                "uow_id": uow_id,
+                "steward_cycles": cycles,
+                "reason": orphan_reason,
+                "timestamp": _now_iso(),
+            })
+            registry.fail_uow(uow_id, orphan_reason)
+        _append_cycle_trace(
+            uow_id=uow_id,
+            cycle_num=cycles,
+            subagent_excerpt=_read_output_ref(uow.output_ref),
+            return_reason=return_reason or "",
+            next_action="failed",
+            artifact_dir=artifact_dir,
+        )
+        return Surfaced(uow_id=uow_id, condition="executing_orphan")
 
     # 4c: Prescribe another Executor pass
     # executor-contract.md Steward Interpretation Table: `partial` and `failed`
