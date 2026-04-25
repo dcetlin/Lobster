@@ -209,3 +209,17 @@ class TestCiteBasis:
         basis = cite_basis(ctx)
         # Vision anchor should take precedence
         assert basis == "vision.active_project.phase_intent"
+
+
+# ---------------------------------------------------------------------------
+# PathSelection backward-compatibility
+# ---------------------------------------------------------------------------
+
+class TestPathSelectionBackwardCompat:
+    def test_fast_equals_raw_string(self):
+        """PathSelection.FAST == 'fast' — StrEnum backward-compat guarantee."""
+        assert PathSelection.FAST == "fast"
+
+    def test_thorough_equals_raw_string(self):
+        """PathSelection.THOROUGH == 'thorough' — StrEnum backward-compat guarantee."""
+        assert PathSelection.THOROUGH == "thorough"
