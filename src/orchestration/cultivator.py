@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -188,6 +189,40 @@ def _extract_success_criteria(body: str) -> str:
     return ""
 
 
+def _extract_file_scope(body: str) -> list[str] | None:
+    """
+    Extract file/directory scope from a GitHub issue body.
+
+    Looks for backtick-wrapped tokens that look like filesystem paths
+    (contain '/' and a recognizable path prefix or extension).
+    Returns a deduplicated sorted list, or None if nothing is found.
+
+    Callers pass None to registry.upsert() when extraction yields nothing,
+    preserving null-scope exclusivity (serial behavior) as the safe default.
+    """
+    if not body:
+        return None
+
+    # Match backtick-wrapped tokens: `src/foo/bar.py` or `src/orchestration/`
+    candidates = re.findall(r"`([^`]+)`", body)
+    paths: list[str] = []
+    for token in candidates:
+        token = token.strip()
+        # Accept tokens that look like relative file or directory paths:
+        # must contain '/' and start with a recognizable segment (src/, tests/, scripts/, etc.)
+        # or end with a known extension (.py, .sh, .sql, .yaml, .json, .md)
+        if "/" not in token:
+            continue
+        if token.startswith(("src/", "tests/", "scripts/", "scheduled-tasks/", "oracle/", ".claude/")):
+            paths.append(token)
+        elif re.search(r"\.(py|sh|sql|yaml|yml|json|md|toml)$", token):
+            paths.append(token)
+
+    if not paths:
+        return None
+    return sorted(set(paths))
+
+
 def classify_issues(issues: list[GitHubIssue]) -> tuple[list[ClassifiedIssue], int]:
     """
     Classify all issues. Returns (classified_issues, skipped_count).
@@ -276,11 +311,13 @@ def promote_to_wos(
             )
             continue
 
+        file_scope = _extract_file_scope(issue.body)
         result = registry.upsert(
             issue_number=issue.number,
             title=issue.title,
             success_criteria=success_criteria,
             register=register,
+            file_scope=file_scope,
         )
 
         if isinstance(result, UpsertInserted):

@@ -492,6 +492,7 @@ class Registry:
         issue_url: str | None = None,
         register: str = "operational",
         source_ref: str | None = None,
+        file_scope: list[str] | None = None,
     ) -> UpsertResult:
         """
         Propose a UoW for a GitHub issue.
@@ -528,6 +529,9 @@ class Registry:
                 the Germinator).
             source_ref: Canonical source reference (e.g. "github:issue/42"). If provided,
                 used directly; otherwise derived from issue_number for backwards compatibility.
+            file_scope: List of file/directory paths touched by this issue (extracted from
+                issue body). Used by shard_dispatch to detect overlap between concurrent UoWs.
+                None means the UoW is treated as independent (serial execution is safe default).
         """
         if not success_criteria or not success_criteria.strip():
             raise ValueError(
@@ -538,6 +542,7 @@ class Registry:
             issue_number, title, sweep_date, uow_type, success_criteria,
             source_repo=source_repo, issue_url=issue_url,
             register=register, source_ref=source_ref,
+            file_scope=file_scope,
         )
 
     def _upsert_typed(
@@ -551,6 +556,7 @@ class Registry:
         issue_url: str | None = None,
         register: str = "operational",
         source_ref: str | None = None,
+        file_scope: list[str] | None = None,
     ) -> UpsertResult:
         """Core upsert logic returning typed UpsertResult."""
         if sweep_date is None:
@@ -645,6 +651,8 @@ class Registry:
             # If the INSERT fails, both roll back together.
             self._write_audit(conn, uow_id=uow_id, event="created", to_status="proposed")
 
+            file_scope_json = json.dumps(file_scope) if file_scope is not None else None
+
             # register is classified by the Germinator before this call.
             # uow_mode mirrors register at INSERT time — kept separate to allow
             # future divergence between routing register and execution mode.
@@ -654,8 +662,8 @@ class Registry:
                     id, type, source, source_issue_number, sweep_date,
                     status, posture, created_at, updated_at, summary,
                     success_criteria, route_reason, route_evidence, trigger,
-                    issue_url, register, uow_mode, source_ref
-                ) VALUES (?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}', ?, ?, ?, ?)
+                    issue_url, register, uow_mode, source_ref, file_scope
+                ) VALUES (?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}', ?, ?, ?, ?, ?)
                 """,
                 (
                     uow_id,
@@ -673,6 +681,7 @@ class Registry:
                     register,
                     register,  # uow_mode mirrors register at germination time
                     source_ref,
+                    file_scope_json,
                 ),
             )
             conn.commit()
