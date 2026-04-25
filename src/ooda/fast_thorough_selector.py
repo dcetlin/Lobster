@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import logging
 
+from src.orchestration.shard_dispatch import PathSelection
+
 log = logging.getLogger(__name__)
 
 
@@ -71,7 +73,7 @@ def cite_basis(context: dict) -> str | None:
     return None
 
 
-def select_path(context: dict) -> str:
+def select_path(context: dict) -> PathSelection:
     """
     Select the routing path for an OODA loop decision: "fast" or "thorough".
 
@@ -107,7 +109,7 @@ def select_path(context: dict) -> str:
             context.get("stakes", "<unknown>"),
             basis,
         )
-        return "fast"
+        return PathSelection.FAST
 
     log.info(
         "[fast-thorough-selector] Thorough Path selected | "
@@ -117,4 +119,4 @@ def select_path(context: dict) -> str:
         context.get("vision_anchor"),
         len(context.get("prior_decisions", [])),
     )
-    return "thorough"
+    return PathSelection.THOROUGH

@@ -42,7 +42,13 @@ Named constants
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Sequence
+
+
+class PathSelection(StrEnum):
+    FAST = "fast"
+    THOROUGH = "thorough"
 
 # Default cap: two non-overlapping UoWs may run in parallel before any
 # Attunement evidence exists at higher concurrency.

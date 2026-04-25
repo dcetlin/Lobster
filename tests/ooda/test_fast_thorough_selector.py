@@ -15,6 +15,7 @@ Coverage:
 import pytest
 
 from src.ooda.fast_thorough_selector import cite_basis, select_path
+from src.orchestration.shard_dispatch import PathSelection
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +31,7 @@ class TestSelectPath:
             "prior_decisions": [],
             "vision_anchor": "vision.core.fundamental_intent",
         }
-        assert select_path(ctx) == "fast"
+        assert select_path(ctx) == PathSelection.FAST
 
     def test_fast_path_prior_decision_same_class_low_stakes(self):
         """Fast Path when prior decision of same class exists and stakes low."""
@@ -42,7 +43,7 @@ class TestSelectPath:
             ],
             "vision_anchor": None,
         }
-        assert select_path(ctx) == "fast"
+        assert select_path(ctx) == PathSelection.FAST
 
     def test_thorough_path_no_anchor_no_prior(self):
         """Thorough Path when no anchor and no prior decision."""
@@ -52,7 +53,7 @@ class TestSelectPath:
             "prior_decisions": [],
             "vision_anchor": None,
         }
-        assert select_path(ctx) == "thorough"
+        assert select_path(ctx) == PathSelection.THOROUGH
 
     def test_thorough_path_high_stakes_even_with_anchor(self):
         """Thorough Path when stakes are high even if vision anchor exists."""
@@ -62,7 +63,7 @@ class TestSelectPath:
             "prior_decisions": [],
             "vision_anchor": "vision.core.inviolable_constraints",
         }
-        assert select_path(ctx) == "thorough"
+        assert select_path(ctx) == PathSelection.THOROUGH
 
     def test_thorough_path_high_stakes_with_prior(self):
         """Thorough Path when stakes high even with matching prior decision."""
@@ -74,7 +75,7 @@ class TestSelectPath:
             ],
             "vision_anchor": None,
         }
-        assert select_path(ctx) == "thorough"
+        assert select_path(ctx) == PathSelection.THOROUGH
 
     def test_fast_path_prior_decision_no_explicit_id(self):
         """Fast Path with prior decision that has no explicit ID uses synthetic ref."""
@@ -86,7 +87,7 @@ class TestSelectPath:
             ],
             "vision_anchor": None,
         }
-        assert select_path(ctx) == "fast"
+        assert select_path(ctx) == PathSelection.FAST
 
     def test_thorough_path_prior_different_class(self):
         """Thorough Path when prior decision exists but is a different class."""
@@ -98,7 +99,7 @@ class TestSelectPath:
             ],
             "vision_anchor": None,
         }
-        assert select_path(ctx) == "thorough"
+        assert select_path(ctx) == PathSelection.THOROUGH
 
     def test_fast_path_prefers_vision_anchor_over_prior(self):
         """When both anchor and prior exist (low stakes), Fast Path is selected."""
@@ -110,7 +111,7 @@ class TestSelectPath:
             ],
             "vision_anchor": "vision.active_project.phase_intent",
         }
-        assert select_path(ctx) == "fast"
+        assert select_path(ctx) == PathSelection.FAST
 
     def test_empty_string_anchor_treated_as_absent(self):
         """An empty string vision_anchor is treated as absent (Thorough Path)."""
@@ -120,7 +121,7 @@ class TestSelectPath:
             "prior_decisions": [],
             "vision_anchor": "",
         }
-        assert select_path(ctx) == "thorough"
+        assert select_path(ctx) == PathSelection.THOROUGH
 
     def test_whitespace_only_anchor_treated_as_absent(self):
         """A whitespace-only vision_anchor is treated as absent (Thorough Path)."""
@@ -130,7 +131,7 @@ class TestSelectPath:
             "prior_decisions": [],
             "vision_anchor": "   ",
         }
-        assert select_path(ctx) == "thorough"
+        assert select_path(ctx) == PathSelection.THOROUGH
 
 
 # ---------------------------------------------------------------------------
