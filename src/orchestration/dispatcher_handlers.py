@@ -590,6 +590,28 @@ def handle_steward_trigger(uow_id: str) -> dict[str, Any]:
     }
 
 
+def _load_instructions_from_artifact(uow_id: str) -> str:
+    """
+    Load prescribed instructions from the WorkflowArtifact file for uow_id.
+
+    Called by route_wos_message when the wos_execute inbox message does not
+    embed an 'instructions' field (test/manual invocations).
+    Raises ValueError with a descriptive message if the artifact is missing
+    or malformed — this is caught by the spawn-gate and surfaced as a send_reply
+    alert rather than a raw KeyError.
+    """
+    from .workflow_artifact import artifact_path, from_frontmatter
+    path = artifact_path(uow_id)
+    if not path.exists():
+        raise ValueError(
+            f"wos_execute message has no 'instructions' field and artifact file "
+            f"not found at {path} for uow_id={uow_id!r}"
+        )
+    text = path.read_text(encoding="utf-8")
+    artifact = from_frontmatter(text)
+    return artifact["instructions"]
+
+
 def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
     """
     Route an inbox message whose `type` is listed in WOS_MESSAGE_TYPE_DISPATCH.
@@ -665,7 +687,7 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
     try:
         if msg_type == "wos_execute":
             uow_id: str = msg["uow_id"]
-            instructions: str = msg["instructions"]
+            instructions: str = msg.get("instructions") or _load_instructions_from_artifact(uow_id)
             # output_ref may be supplied by the Executor, or derived from uow_id
             output_ref: str = msg.get(
                 "output_ref",
