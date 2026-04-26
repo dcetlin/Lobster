@@ -2165,6 +2165,142 @@ def _read_trace_json(output_ref: str | None, expected_uow_id: str) -> dict | Non
     return data
 
 
+# ---------------------------------------------------------------------------
+# Orphan kill classification — reads trace.json to distinguish kill types
+# ---------------------------------------------------------------------------
+
+# Named constants for orphan kill classifications (spec: architectural-proposal-20260426.md)
+ORPHAN_KILL_BEFORE_START = "kill_before_start"
+ORPHAN_KILL_DURING_EXECUTION = "kill_during_execution"
+ORPHAN_COMPLETED_WITHOUT_OUTPUT = "completed_without_output"
+
+# The three ReentryPosture values that trigger orphan trace enrichment in _diagnose_uow.
+# Defined at module scope — not inside _diagnose_uow — to avoid re-allocating the
+# frozenset on every call. Uses ReentryPosture enum values per the StrEnum golden
+# pattern (2026-04-24): enum-backed values must not appear as raw string literals.
+_ORPHAN_POSTURES: frozenset[str] = frozenset({
+    ReentryPosture.EXECUTOR_ORPHAN,
+    ReentryPosture.EXECUTING_ORPHAN,
+    ReentryPosture.DIAGNOSING_ORPHAN,
+})
+
+
+def _classify_orphan_from_trace(trace_data: dict | None, output_ref: str | None) -> str:
+    """
+    Classify the orphan kill type from available trace and result evidence.
+
+    Returns one of three string constants:
+    - ORPHAN_COMPLETED_WITHOUT_OUTPUT ("completed_without_output"):
+        result.json exists alongside output_ref — the executor subagent completed
+        its work and wrote a result, but write_result was never called so the
+        Steward never received the completion signal.
+    - ORPHAN_KILL_DURING_EXECUTION ("kill_during_execution"):
+        trace.json has non-empty surprises or prescription_delta — the agent
+        established some working state before being killed (partial work done).
+    - ORPHAN_KILL_BEFORE_START ("kill_before_start"):
+        Default. trace.json absent, or dispatch-only execution_summary with
+        no surprises/prescription_delta — the session ended before any real
+        execution was established.
+
+    Priority order: completed_without_output > kill_during_execution > kill_before_start.
+    The completed_without_output check runs first because result.json presence is
+    the strongest signal — it overrides even non-empty surprises.
+
+    Pure function: only reads files (result.json presence check). No DB writes.
+    Note: "pure" here means no DB writes or mutation — not side-effect-free.
+    The function reads from the filesystem, so its output depends on file state.
+
+    result.json naming conventions: two forms are checked to handle legacy producers.
+    - Canonical form (new executors): `Path(output_ref).with_suffix(".result.json")`
+      replaces the existing `.json` suffix, producing `uow_id.result.json`.
+    - Legacy form (older executor scripts that appended rather than replaced):
+      `str(output_ref) + ".result.json"`, producing `uow_id.json.result.json`.
+    The alt-path check ensures that UoWs completed by legacy producers are not
+    misclassified as kill_before_start (which would cause unnecessary retries).
+    If no legacy producers remain active, the alt-path check never fires but is
+    kept to avoid breaking audit continuity for historical UoW replay.
+
+    Args:
+        trace_data: Parsed trace.json dict (already validated by _read_trace_json),
+            or None when trace.json is absent or invalid.
+        output_ref: The UoW's output_ref path (used to derive result.json path).
+            May be None when the UoW has no output_ref.
+    """
+    # Priority 1: result.json exists → agent ran and completed, but write_result skipped.
+    if output_ref:
+        result_path = Path(output_ref).with_suffix(".result.json")
+        if not result_path.exists():
+            result_path_alt = Path(str(output_ref) + ".result.json")
+            if result_path_alt.exists():
+                result_path = result_path_alt
+        if result_path.exists():
+            return ORPHAN_COMPLETED_WITHOUT_OUTPUT
+
+    # Priority 2: no trace data → cannot distinguish, default to kill_before_start.
+    if trace_data is None:
+        return ORPHAN_KILL_BEFORE_START
+
+    # Priority 3: trace has execution evidence (surprises or prescription_delta).
+    surprises = trace_data.get("surprises") or []
+    prescription_delta = trace_data.get("prescription_delta") or ""
+    if surprises or prescription_delta:
+        return ORPHAN_KILL_DURING_EXECUTION
+
+    # Default: dispatch-only trace with no distinguishing signals.
+    return ORPHAN_KILL_BEFORE_START
+
+
+def _enrich_orphan_completion_rationale(
+    base_rationale: str,
+    output_ref: str | None,
+    uow_id: str,
+) -> str:
+    """
+    Enrich a bare orphan completion_rationale with trace.json evidence.
+
+    Reads trace.json from output_ref (via _read_trace_json), classifies the
+    orphan kill type, and returns a rationale string that includes:
+    - The orphan_classification label (kill_before_start / kill_during_execution /
+      completed_without_output)
+    - The execution_summary from the trace (if present)
+    - Up to 3 surprises from the trace (if present)
+
+    Returns base_rationale unchanged when:
+    - output_ref is None
+    - trace.json is absent or invalid
+    - trace.json has a mismatched uow_id (handled by _read_trace_json)
+
+    Pure function with respect to state — reads files only.
+
+    Args:
+        base_rationale: The original rationale string (from _assess_completion).
+        output_ref: The UoW's output_ref path. May be None.
+        uow_id: The UoW ID — used to validate the trace's uow_id field.
+    """
+    trace_data = _read_trace_json(output_ref, expected_uow_id=uow_id)
+
+    kill_class = _classify_orphan_from_trace(trace_data, output_ref)
+
+    if trace_data is None and kill_class == ORPHAN_KILL_BEFORE_START:
+        # No trace and default classification — nothing to enrich with
+        return base_rationale
+
+    parts: list[str] = [base_rationale, f"orphan_classification={kill_class}"]
+
+    if trace_data is not None:
+        exec_summary = trace_data.get("execution_summary", "").strip()
+        if exec_summary:
+            parts.append(f"execution_summary={exec_summary!r}")
+
+        surprises = [str(s) for s in (trace_data.get("surprises") or []) if s]
+        if surprises:
+            # Cap at 3 surprises to keep rationale bounded
+            surprises_excerpt = surprises[:3]
+            parts.append(f"surprises={surprises_excerpt}")
+
+    return " | ".join(parts)
+
+
 def _bound_prescription_delta(delta: str, history: list[str]) -> str:
     """
     Bound a prescription_delta string to prevent loop gain instability.
@@ -3093,6 +3229,18 @@ def _diagnose_uow(
     is_complete, completion_rationale, executor_outcome = _assess_completion(
         uow, output_content, reentry_posture
     )
+
+    # Orphan trace enrichment: when re-entry is an orphan posture, read trace.json
+    # and classify the kill type (kill_before_start / kill_during_execution /
+    # completed_without_output). This enriches completion_rationale so the prescriber
+    # has evidence rather than diagnosing blind on every orphan re-entry.
+    # Only fires for the three orphan postures — normal completion paths are unaffected.
+    if reentry_posture in _ORPHAN_POSTURES:
+        completion_rationale = _enrich_orphan_completion_rationale(
+            base_rationale=completion_rationale,
+            output_ref=output_ref,
+            uow_id=uow.id,
+        )
 
     stuck_condition = _detect_stuck_condition(uow, reentry_posture, return_reason)
 
