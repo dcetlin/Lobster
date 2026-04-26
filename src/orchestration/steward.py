@@ -793,6 +793,8 @@ _RETURN_REASON_CLASSIFICATIONS: dict[str, str] = {
     "executor_orphan": _CLASSIFICATION_ORPHAN,
     "diagnosing_orphan": _CLASSIFICATION_ORPHAN,
     "executing_orphan": _CLASSIFICATION_ORPHAN,  # subagent dispatched but write_result never received (#858)
+    "orphan_kill_before_start": _CLASSIFICATION_ORPHAN,    # heartbeat-classified: killed before work began (#963)
+    "orphan_kill_during_execution": _CLASSIFICATION_ORPHAN,  # heartbeat-classified: killed mid-execution (#963)
 }
 
 
@@ -975,14 +977,20 @@ def _determine_reentry_posture(
     - 'executor_orphan': executor never ran
     - 'first_execution': no prior execution cycle (steward_cycles == 0)
     """
-    if not audit_entries:
-        return "first_execution"
-
+    # Explicit return_reason values that map 1:1 to a posture always win,
+    # even when there are no audit entries (e.g. fresh state after migration).
     if return_reason == "executor_orphan":
         return "executor_orphan"
 
     if return_reason == "executing_orphan":
         return "executing_orphan"
+
+    # Heartbeat-classified kill types (issue #963): pass through directly.
+    if return_reason in ("orphan_kill_before_start", "orphan_kill_during_execution"):
+        return return_reason
+
+    if not audit_entries:
+        return "first_execution"
 
     classification = _RETURN_REASON_CLASSIFICATIONS.get(return_reason or "", None)
 
@@ -995,34 +1003,41 @@ def _determine_reentry_posture(
             return "crashed_no_output"
         return "execution_failed"
     elif classification == _CLASSIFICATION_ORPHAN:
-        return "executor_orphan"
+        # For orphan classifications without a specific return_reason match above,
+        # fall through to audit inspection to get the most precise posture.
+        pass
     else:
-        # Fall back to audit event inspection
-        for entry in reversed(audit_entries):
-            event = entry.get("event", "")
-            if event == "execution_complete":
-                return "execution_complete"
-            elif event == "stall_detected":
-                return "stall_detected"
-            elif event == "startup_sweep":
-                note = entry.get("note", "")
-                try:
-                    data = json.loads(note) if note else {}
-                except (json.JSONDecodeError, TypeError):
-                    data = {}
-                clf = data.get("classification", "")
-                if clf == "possibly_complete":
-                    return "startup_sweep_possibly_complete"
-                elif clf in ("crashed_no_output", "crashed_zero_bytes", "crashed_output_ref_missing"):
-                    return clf
-                elif clf == "executor_orphan":
-                    return "executor_orphan"
-                elif clf == "diagnosing_orphan":
-                    return "diagnosing_orphan"
-                elif clf == "executing_orphan":
-                    return "executing_orphan"
-            elif event == "execution_failed":
-                return "execution_failed"
+        pass
+
+    # Fall back to audit event inspection
+    for entry in reversed(audit_entries):
+        event = entry.get("event", "")
+        if event == "execution_complete":
+            return "execution_complete"
+        elif event == "stall_detected":
+            return "stall_detected"
+        elif event == "startup_sweep":
+            note = entry.get("note", "")
+            try:
+                data = json.loads(note) if note else {}
+            except (json.JSONDecodeError, TypeError):
+                data = {}
+            clf = data.get("classification", "")
+            if clf == "possibly_complete":
+                return "startup_sweep_possibly_complete"
+            elif clf in ("crashed_no_output", "crashed_zero_bytes", "crashed_output_ref_missing"):
+                return clf
+            elif clf == "executor_orphan":
+                return "executor_orphan"
+            elif clf == "diagnosing_orphan":
+                return "diagnosing_orphan"
+            elif clf == "executing_orphan":
+                return "executing_orphan"
+            elif clf in ("orphan_kill_before_start", "orphan_kill_during_execution"):
+                # Heartbeat-classified kill types (#963): preserve the precise value.
+                return clf
+        elif event == "execution_failed":
+            return "execution_failed"
 
     return "first_execution"
 
@@ -1207,6 +1222,10 @@ def _posture_rationale(diagnosis: Diagnosis, cycles: int, trace_posture: str | N
                 return "Executor never claimed UoW — re-prescribing."
             if posture == "executing_orphan":
                 return "Subagent dispatched but write_result never received — re-prescribing."
+            if posture == "orphan_kill_before_start":
+                return "Subagent killed before starting work — re-prescribing."
+            if posture == "orphan_kill_during_execution":
+                return "Subagent killed mid-execution (heartbeat evidence) — re-prescribing."
             return "Unexpected state encountered — investigating."
         elif trace_posture == "closing_with_discovery":
             return "Completion criteria satisfied — closing with findings documented."
@@ -1227,6 +1246,10 @@ def _posture_rationale(diagnosis: Diagnosis, cycles: int, trace_posture: str | N
             return "Steward crashed mid-diagnosis — re-diagnosing from current state."
         case "executing_orphan":
             return "UoW stuck in executing — subagent dispatched but write_result never received (#858)."
+        case "orphan_kill_before_start":
+            return "UoW stuck in executing — subagent killed before writing any heartbeat (no work started) (#963)."
+        case "orphan_kill_during_execution":
+            return "UoW stuck in executing — subagent was actively working (heartbeats present) when killed (#963)."
         case "steward_cycle_cap":
             return f"Steward cycle cap reached ({cycles} cycles) — surfacing to Dan."
         case _:
@@ -1276,6 +1299,10 @@ def _posture_prediction(diagnosis: Diagnosis) -> str | None:
             return "Re-prescription will be issued — executor never claimed UoW."
         case "executing_orphan":
             return "Re-prescription will be issued — subagent dispatched but write_result never received."
+        case "orphan_kill_before_start":
+            return "Re-prescription will be issued — subagent killed before starting work."
+        case "orphan_kill_during_execution":
+            return "Re-prescription will be issued — subagent killed mid-execution (heartbeat evidence present)."
         case _:
             return "Next prescription will be determined from diagnosis output."
 
@@ -2498,6 +2525,8 @@ def _build_deterministic_prescription_instructions(
         "executor_orphan": "Executor never ran on this UoW. Execute fresh.",
         "diagnosing_orphan": "Steward crashed mid-diagnosis. Re-diagnosing from current state.",
         "executing_orphan": "Subagent was dispatched but never called write_result (crashed or lost context). Re-execute fresh.",
+        "orphan_kill_before_start": "Subagent was dispatched but killed before writing any heartbeat — no work was started. Re-execute fresh.",
+        "orphan_kill_during_execution": "Subagent was dispatched, wrote heartbeats (was actively working), then was killed before write_result. Re-execute fresh.",
     }
 
     posture_msg = posture_context.get(reentry_posture, "Continue from previous attempt.")
@@ -3901,13 +3930,25 @@ def _process_uow(
     # retried — the retry loop cannot fix a subagent that systematically skips
     # the result contract. Mark failed immediately so the Steward does not
     # re-dispatch into an infinite loop.
-    if reentry_posture == "executing_orphan":
-        orphan_reason = "executing_orphan: subagent exited without calling write_result"
+    #
+    # Heartbeat-classified kill types (#963) surface with distinct condition
+    # values so that the notification and audit trail distinguish:
+    # - orphan_kill_before_start: agent killed before any work (infrastructure event)
+    # - orphan_kill_during_execution: agent killed mid-execution (partial work)
+    # Retry accounting is not changed here (separate PR per task boundary).
+    if reentry_posture in (
+        "executing_orphan",
+        "orphan_kill_before_start",
+        "orphan_kill_during_execution",
+    ):
+        surface_condition = reentry_posture  # preserve precise kill classification
+        orphan_reason = f"{reentry_posture}: subagent exited without calling write_result"
         orphan_log_entry = {
             "event": "executing_orphan_failed",
             "uow_id": uow_id,
             "steward_cycles": cycles,
             "reason": orphan_reason,
+            "kill_classification": reentry_posture,
             "timestamp": _now_iso(),
         }
         current_log_str = _append_steward_log_entry(registry, uow_id, current_log_str, orphan_log_entry)
@@ -3919,6 +3960,7 @@ def _process_uow(
                 "uow_id": uow_id,
                 "steward_cycles": cycles,
                 "reason": orphan_reason,
+                "kill_classification": reentry_posture,
                 "timestamp": _now_iso(),
             })
             registry.fail_uow(uow_id, orphan_reason)
@@ -3930,7 +3972,7 @@ def _process_uow(
             next_action="failed",
             artifact_dir=artifact_dir,
         )
-        return Surfaced(uow_id=uow_id, condition="executing_orphan")
+        return Surfaced(uow_id=uow_id, condition=surface_condition)
 
     # 4c: Prescribe another Executor pass
     # executor-contract.md Steward Interpretation Table: `partial` and `failed`
