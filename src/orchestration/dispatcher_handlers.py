@@ -540,6 +540,13 @@ WOS_MESSAGE_TYPE_DISPATCH: dict[str, str] = {
     # the steward heartbeat as a background subagent (7-second rule compliant),
     # bypassing the 0–3 minute cron wait.
     "steward_trigger": "handle_steward_trigger",
+    # Dispatcher escalation handler (issue #969): written by the Steward when a UoW
+    # exhausts its retry cap. The dispatcher routes wos_escalate through a 4-branch
+    # decision tree before deciding whether to auto-retry or surface to Dan.
+    # Unlike wos_execute/steward_trigger, this handler legitimately returns either
+    # action="spawn_subagent" (auto-retry branches) or action="send_reply" (surface-to-Dan
+    # branches) — it is exempt from the spawn-gate that applies to execution message types.
+    "wos_escalate": "handle_wos_escalate",
 }
 
 
@@ -587,6 +594,250 @@ def handle_steward_trigger(uow_id: str) -> dict[str, Any]:
             f"Minimum viable output: steward heartbeat completed.\n"
             f"Boundary: do not modify any UoW status directly."
         ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# wos_escalate handler — dispatcher escalation decision tree (issue #969)
+#
+# Called when a UoW exhausts its retry cap and the Steward writes a wos_escalate
+# inbox message instead of notifying Dan directly.  The handler classifies the
+# failure and routes it: auto-retry for infrastructure kills, surface to Dan for
+# genuine execution failures or human-judgment UoWs.
+#
+# This handler is exempt from the spawn-gate that governs wos_execute and
+# steward_trigger — it legitimately returns action="send_reply" for the
+# surface-to-Dan branches and action="spawn_subagent" for the auto-retry branches.
+# route_wos_message handles this by dispatching wos_escalate outside the spawn-gate.
+# ---------------------------------------------------------------------------
+
+# Execution attempts threshold at which the handler surfaces to Dan regardless
+# of return_reason_classification.  3 confirmed execution attempts means the
+# prescription itself may be broken — auto-retrying without diagnosis loops forever.
+_ESCALATE_SURFACE_EXECUTION_THRESHOLD: int = 3
+
+# Registers that bypass auto-retry and surface to Dan immediately.
+# The structured executor was never the right tool for these UoW types.
+_ESCALATE_HUMAN_JUDGMENT_REGISTERS: frozenset[str] = frozenset({
+    "human-judgment",
+    "philosophical",
+})
+
+# return_reason_classification values that indicate an infrastructure kill
+# (session killed before or during execution — no execution outcome produced).
+_ESCALATE_ORPHAN_CLASSIFICATIONS: frozenset[str] = frozenset({
+    "orphan",
+})
+
+
+def handle_wos_escalate(msg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Handle a ``wos_escalate`` inbox message via the 4-branch dispatcher decision tree.
+
+    Called by route_wos_message when the dispatcher receives a message with
+    type="wos_escalate".  The Steward writes this message when a UoW exhausts
+    its execution retry cap (MAX_RETRIES on execution_attempts, not retry_count),
+    inserting a programmatic triage layer before the human-judgment escalation path.
+
+    Pure function — no side effects, no I/O.  All branches return a dict describing
+    what the dispatcher must do next.
+
+    Decision tree (checked in order; first matching branch wins):
+
+    **Branch 4 — Human-judgment register** (checked first — register overrides all):
+        If ``register`` is "human-judgment" or "philosophical", surface to Dan
+        immediately.  The structured executor was never the right tool; retrying
+        would waste cycles.
+        → Returns ``action="send_reply"`` with structured context for Dan.
+
+    **Branch 3 — Execution cap exhausted** (3+ confirmed execution_attempts):
+        If ``execution_attempts >= _ESCALATE_SURFACE_EXECUTION_THRESHOLD``, the
+        prescription has been attempted multiple times and failed.  Auto-retrying
+        would loop without diagnosis.
+        → Returns ``action="send_reply"`` with structured context for Dan.
+
+    **Branch 1 — Pure infrastructure failure** (execution_attempts == 0, orphan):
+        If ``execution_attempts == 0`` and ``return_reason_classification`` is
+        "orphan", the UoW was never executed — the session was killed before the
+        subagent established working state.  The original prescription is intact.
+        → Returns ``action="spawn_subagent"`` to run steward heartbeat (auto-retry).
+
+    **Branch 2 — Mid-execution kill** (execution_attempts > 0, orphan):
+        If ``execution_attempts > 0`` and ``return_reason_classification`` is
+        "orphan", the subagent was killed mid-execution.  Partial work may exist.
+        → Returns ``action="spawn_subagent"`` to run steward heartbeat (retry).
+
+    **Default — surface to Dan** (unclassified failures):
+        Any failure not matched by the above branches is surfaced to Dan.
+        → Returns ``action="send_reply"`` with structured context.
+
+    Args:
+        msg: The raw wos_escalate inbox message dict.  Expected fields:
+            - ``uow_id`` (str): The Unit of Work identifier.
+            - ``uow_title`` (str, optional): Human-readable UoW title.
+            - ``register`` (str, optional): UoW register ("operational", "human-judgment",
+              "philosophical", "iterative-convergent"). Default "operational".
+            - ``failure_history`` (dict): Failure context from the Steward.
+              Key sub-fields:
+                - ``execution_attempts`` (int): Confirmed execution attempts.
+                - ``return_reason_classification`` (str): Classification of the last
+                  return reason ("orphan", "error", "abnormal", etc.).
+                - ``kill_type`` (str, optional): Heartbeat-derived kill classification
+                  ("orphan_kill_before_start", "orphan_kill_during_execution").
+                - ``heartbeats_before_kill`` (int, optional): Heartbeats written before
+                  the subagent was killed.  0 means killed before execution began.
+            - ``posture`` (str, optional): Trace-diagnosed reentry posture.
+
+    Returns:
+        A dict with ``action`` and branch-specific fields:
+
+        For ``action="spawn_subagent"`` (auto-retry branches 1 and 2):
+            - ``task_id`` (str): Task identifier for the steward heartbeat subagent.
+            - ``agent_type`` (str): Always "lobster-generalist".
+            - ``prompt`` (str): Subagent prompt to run the steward heartbeat.
+            - ``message_type`` (str): Echo of "wos_escalate".
+
+        For ``action="send_reply"`` (surface-to-Dan branches 3 and 4):
+            - ``text`` (str): Telegram notification text with structured context.
+            - ``chat_id`` (str | int): Admin chat ID (from LOBSTER_ADMIN_CHAT_ID env var).
+            - ``message_type`` (str): Echo of "wos_escalate".
+    """
+    uow_id: str = msg.get("uow_id", "unknown")
+    uow_title: str = msg.get("uow_title", "")
+    register: str = msg.get("register", "operational")
+    failure_history: dict[str, Any] = msg.get("failure_history", {})
+    posture: str = msg.get("posture", "")
+
+    execution_attempts: int = int(failure_history.get("execution_attempts", 0))
+    return_reason_classification: str = failure_history.get("return_reason_classification", "")
+    kill_type: str = failure_history.get("kill_type", "")
+    heartbeats_before_kill: int = int(failure_history.get("heartbeats_before_kill", 0))
+
+    _msg_type = "wos_escalate"
+
+    # Branch 4 — Human-judgment register: surface immediately, no retry.
+    # Checked first — register classification overrides all other branches.
+    if register in _ESCALATE_HUMAN_JUDGMENT_REGISTERS:
+        text = (
+            f"WOS escalation: UoW `{uow_id}` is in `{register}` register — "
+            f"surfaces for human judgment rather than executor retry.\n\n"
+            f"Title: {uow_title}\n"
+            f"Register: {register}\n"
+            f"Execution attempts: {execution_attempts}\n"
+            f"Posture: {posture}\n\n"
+            f"The structured executor cannot resolve this UoW. "
+            f"Please review and either `/decide {uow_id} proceed` or `/decide {uow_id} abandon`."
+        )
+        return {
+            "action": "send_reply",
+            "text": text,
+            "chat_id": os.environ.get("LOBSTER_ADMIN_CHAT_ID", "0"),
+            "message_type": _msg_type,
+        }
+
+    # Branch 3 — Execution cap exhausted: surface to Dan.
+    # execution_attempts >= threshold means the prescription was tried multiple times.
+    if execution_attempts >= _ESCALATE_SURFACE_EXECUTION_THRESHOLD:
+        text = (
+            f"WOS escalation: UoW `{uow_id}` exhausted execution attempts.\n\n"
+            f"Title: {uow_title}\n"
+            f"Execution attempts: {execution_attempts} (threshold: {_ESCALATE_SURFACE_EXECUTION_THRESHOLD})\n"
+            f"Return reason classification: {return_reason_classification}\n"
+            f"Kill type: {kill_type or 'n/a'}\n"
+            f"Posture: {posture}\n\n"
+            f"The executor ran {execution_attempts} times without completing. "
+            f"Please review the prescription and either:\n"
+            f"  `/decide {uow_id} retry` — reset and re-queue with fresh prescription\n"
+            f"  `/decide {uow_id} abandon` — close as failed"
+        )
+        return {
+            "action": "send_reply",
+            "text": text,
+            "chat_id": os.environ.get("LOBSTER_ADMIN_CHAT_ID", "0"),
+            "message_type": _msg_type,
+        }
+
+    # Branch 1 — Pure infrastructure failure: auto-retry via steward heartbeat.
+    # execution_attempts == 0 AND orphan classification means the UoW was never executed.
+    if execution_attempts == 0 and return_reason_classification in _ESCALATE_ORPHAN_CLASSIFICATIONS:
+        task_id = f"escalate-retry-{uow_id[:12]}"
+        steward_script = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), '..', '..', 'scheduled-tasks', 'steward-heartbeat.py')
+        )
+        prompt = (
+            f"---\n"
+            f"task_id: {task_id}\n"
+            f"chat_id: 0\n"
+            f"source: system\n"
+            f"---\n\n"
+            f"WOS escalation auto-retry: UoW `{uow_id}` was killed before execution began "
+            f"(kill_type={kill_type!r}, execution_attempts=0). "
+            f"The prescription is intact — running steward heartbeat to re-queue.\n\n"
+            f"```bash\n"
+            f"cd ~/lobster-workspace && uv run python {steward_script}\n"
+            f"```\n\n"
+            f"Then call write_result with the steward output.\n\n"
+            f"Minimum viable output: steward heartbeat completed for UoW {uow_id}.\n"
+            f"Boundary: do not modify any UoW status directly."
+        )
+        return {
+            "action": "spawn_subagent",
+            "task_id": task_id,
+            "agent_type": "lobster-generalist",
+            "prompt": prompt,
+            "message_type": _msg_type,
+        }
+
+    # Branch 2 — Mid-execution kill: retry via steward heartbeat.
+    # execution_attempts > 0 AND orphan classification means the subagent was killed
+    # while working. Partial output may exist; retry is still warranted.
+    if return_reason_classification in _ESCALATE_ORPHAN_CLASSIFICATIONS:
+        task_id = f"escalate-midexec-{uow_id[:12]}"
+        steward_script = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), '..', '..', 'scheduled-tasks', 'steward-heartbeat.py')
+        )
+        prompt = (
+            f"---\n"
+            f"task_id: {task_id}\n"
+            f"chat_id: 0\n"
+            f"source: system\n"
+            f"---\n\n"
+            f"WOS escalation mid-execution retry: UoW `{uow_id}` was killed during execution "
+            f"(kill_type={kill_type!r}, heartbeats_before_kill={heartbeats_before_kill}, "
+            f"execution_attempts={execution_attempts}). "
+            f"Partial output may exist — running steward heartbeat to re-queue with resume context.\n\n"
+            f"```bash\n"
+            f"cd ~/lobster-workspace && uv run python {steward_script}\n"
+            f"```\n\n"
+            f"Then call write_result with the steward output.\n\n"
+            f"Minimum viable output: steward heartbeat completed for UoW {uow_id}.\n"
+            f"Boundary: do not modify any UoW status directly."
+        )
+        return {
+            "action": "spawn_subagent",
+            "task_id": task_id,
+            "agent_type": "lobster-generalist",
+            "prompt": prompt,
+            "message_type": _msg_type,
+        }
+
+    # Default — unclassified failure: surface to Dan.
+    text = (
+        f"WOS escalation: UoW `{uow_id}` requires review (unclassified failure).\n\n"
+        f"Title: {uow_title}\n"
+        f"Execution attempts: {execution_attempts}\n"
+        f"Return reason classification: {return_reason_classification or 'unknown'}\n"
+        f"Kill type: {kill_type or 'n/a'}\n"
+        f"Posture: {posture or 'unknown'}\n\n"
+        f"Please review and either:\n"
+        f"  `/decide {uow_id} retry` — reset and re-queue\n"
+        f"  `/decide {uow_id} abandon` — close as failed"
+    )
+    return {
+        "action": "send_reply",
+        "text": text,
+        "chat_id": os.environ.get("LOBSTER_ADMIN_CHAT_ID", "0"),
+        "message_type": _msg_type,
     }
 
 
@@ -677,6 +928,35 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
             f"route_wos_message: unrecognised message type {msg_type!r}. "
             f"Known types: {sorted(WOS_MESSAGE_TYPE_DISPATCH)}"
         )
+
+    # ---------------------------------------------------------------------------
+    # wos_escalate fast-path: dispatched before the spawn-gate because this handler
+    # legitimately returns either action="spawn_subagent" (auto-retry branches) or
+    # action="send_reply" (surface-to-Dan branches).  The spawn-gate applies only to
+    # execution message types (wos_execute, steward_trigger) that must always spawn.
+    # ---------------------------------------------------------------------------
+    if msg_type == "wos_escalate":
+        try:
+            escalate_result = handle_wos_escalate(msg)
+            escalate_result["message_type"] = msg_type
+            return escalate_result
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).error(
+                "route_wos_message: handle_wos_escalate raised %s: %s — "
+                "returning send_reply alert",
+                type(exc).__name__, exc,
+            )
+            return {
+                "action": "send_reply",
+                "text": (
+                    f"WOS escalation handler raised an error "
+                    f"({type(exc).__name__}: {exc}). "
+                    f"UoW escalation was NOT processed. "
+                    "Check logs and re-queue manually if needed."
+                ),
+                "message_type": msg_type,
+            }
 
     # ---------------------------------------------------------------------------
     # Spawn-gate (issue #920): all WOS message types MUST produce action="spawn_subagent".
