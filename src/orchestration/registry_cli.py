@@ -247,15 +247,25 @@ def _read_trace_json(output_ref: str | None) -> dict | None:
         return None
 
 
+# Orphan return_reason constants — used for kill-wave detection in _suggest_diagnosis.
+# Exposed as module-level names so tests can import them rather than mirror raw literals.
+_RETURN_REASON_EXECUTOR_ORPHAN = "executor_orphan"
+_RETURN_REASON_EXECUTING_ORPHAN = "executing_orphan"
+_RETURN_REASON_DIAGNOSING_ORPHAN = "diagnosing_orphan"
+_RETURN_REASON_ORPHAN_KILL_BEFORE_START = "orphan_kill_before_start"
+_RETURN_REASON_ORPHAN_KILL_DURING_EXECUTION = "orphan_kill_during_execution"
+
 # Orphan return_reason values — infrastructure kills, not execution outcomes.
-# Must match ORPHAN_REASONS in steward.py; kept here as a read-only constant
-# so registry_cli.py can classify without importing steward.
+# Canonical source: _RETURN_REASON_CLASSIFICATIONS in steward.py (keys whose value is
+# _CLASSIFICATION_ORPHAN). ORPHAN_REASONS in steward.py covers only the pre-heartbeat-
+# classification subset; use _RETURN_REASON_CLASSIFICATIONS for the authoritative list.
+# Kept here so registry_cli.py can classify without importing steward.
 _ORPHAN_RETURN_REASONS = frozenset({
-    "executor_orphan",
-    "executing_orphan",
-    "diagnosing_orphan",
-    "orphan_kill_before_start",
-    "orphan_kill_during_execution",
+    _RETURN_REASON_EXECUTOR_ORPHAN,
+    _RETURN_REASON_EXECUTING_ORPHAN,
+    _RETURN_REASON_DIAGNOSING_ORPHAN,
+    _RETURN_REASON_ORPHAN_KILL_BEFORE_START,    # heartbeat-classified (#963)
+    _RETURN_REASON_ORPHAN_KILL_DURING_EXECUTION,  # heartbeat-classified (#963)
 })
 
 

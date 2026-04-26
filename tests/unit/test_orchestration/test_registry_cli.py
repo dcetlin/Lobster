@@ -17,6 +17,15 @@ from pathlib import Path
 import pytest
 import os
 
+# Import production constants so tests do not mirror raw string literals.
+# These are defined in registry_cli.py and must be kept in sync with
+# _RETURN_REASON_CLASSIFICATIONS in steward.py.
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "src"))
+from orchestration.registry_cli import (
+    _RETURN_REASON_EXECUTOR_ORPHAN,
+    _RETURN_REASON_DIAGNOSING_ORPHAN,
+)
+
 REPO_ROOT = Path(__file__).parent.parent.parent.parent
 CLI_PATH = REPO_ROOT / "src" / "orchestration" / "registry_cli.py"
 
@@ -614,10 +623,10 @@ class TestTraceCommand:
         uow_id = inserted["id"]
 
         _write_audit_entry(db_path, uow_id, "steward_re_entry",
-                           note='{"return_reason": "executor_orphan"}',
+                           note=json.dumps({"return_reason": _RETURN_REASON_EXECUTOR_ORPHAN}),
                            ts="2026-04-26T08:00:00+00:00")
         _write_audit_entry(db_path, uow_id, "steward_re_entry",
-                           note='{"return_reason": "diagnosing_orphan"}',
+                           note=json.dumps({"return_reason": _RETURN_REASON_DIAGNOSING_ORPHAN}),
                            ts="2026-04-26T09:00:00+00:00")
 
         result = run_cli(db_path, "trace", "--id", uow_id)
@@ -626,8 +635,8 @@ class TestTraceCommand:
         reasons = result["return_reasons"]
         assert isinstance(reasons, list)
         assert len(reasons) >= 2
-        assert reasons[0]["return_reason"] == "executor_orphan"
-        assert reasons[1]["return_reason"] == "diagnosing_orphan"
+        assert reasons[0]["return_reason"] == _RETURN_REASON_EXECUTOR_ORPHAN
+        assert reasons[1]["return_reason"] == _RETURN_REASON_DIAGNOSING_ORPHAN
 
     def test_trace_includes_kill_classification_when_present(self, db_path):
         """trace.kill_classification surfaces kill_type and heartbeats_before_kill from audit notes."""
@@ -727,7 +736,7 @@ class TestTraceCommand:
         uow_id = inserted["id"]
         _force_status(db_path, uow_id, "needs-human-review")
 
-        for ts_offset, reason in enumerate(["executor_orphan", "executor_orphan", "executor_orphan"]):
+        for ts_offset, reason in enumerate([_RETURN_REASON_EXECUTOR_ORPHAN] * 3):
             _write_audit_entry(
                 db_path, uow_id, "steward_re_entry",
                 note=json.dumps({"return_reason": reason}),
@@ -740,6 +749,43 @@ class TestTraceCommand:
                "orphan" in result["diagnosis_hint"].lower(), (
             f"diagnosis_hint should name the orphan/kill-wave pattern; got: {result['diagnosis_hint']!r}"
         )
+
+    def test_trace_reads_trace_json_via_alt_path(self, db_path, tmp_path):
+        """
+        _read_trace_json fallback: when output_ref has a suffix and the primary path
+        (p.with_suffix('.trace.json')) does not exist, but the string-append path
+        (str(output_ref) + '.trace.json') does, the alt path is used.
+
+        Concretely: output_ref = 'dir/file.json'
+          primary:  dir/file.trace.json    — does NOT exist
+          alt:      dir/file.json.trace.json — DOES exist
+        """
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "413", "--title", "Issue 413", "--sweep-date", today)
+        uow_id = inserted["id"]
+
+        trace_content = {
+            "uow_id": uow_id,
+            "register": "operational",
+            "execution_summary": "Alt-path trace loaded.",
+        }
+        # Write ONLY the string-append alt path; leave the with_suffix path absent.
+        output_ref = str(tmp_path / f"{uow_id}.json")
+        alt_trace_path = tmp_path / f"{uow_id}.json.trace.json"
+        alt_trace_path.write_text(json.dumps(trace_content))
+
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("UPDATE uow_registry SET output_ref = ? WHERE id = ?", (output_ref, uow_id))
+        conn.commit()
+        conn.close()
+
+        result = run_cli(db_path, "trace", "--id", uow_id)
+
+        assert "trace_json" in result
+        assert result["trace_json"] is not None, (
+            "trace_json must be populated via the alt path when primary path is absent"
+        )
+        assert result["trace_json"]["execution_summary"] == "Alt-path trace loaded."
 
     def test_trace_output_has_stable_top_level_keys(self, db_path):
         """trace output always has the documented top-level keys regardless of UoW state."""
