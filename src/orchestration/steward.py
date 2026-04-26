@@ -376,11 +376,24 @@ def _build_claude_env() -> dict[str, str]:
     `CLAUDE_CODE_OAUTH_TOKEN` and the subprocess will attempt its own refresh
     (which may fail in headless environments).
 
-    Returns a copy of `os.environ` augmented with the resolved token, ensuring
-    the subprocess inherits all PATH and library paths from the parent while
-    having a valid auth token.
+    PATH augmentation: always prepends ~/.local/bin to PATH so the `claude`
+    binary (installed there by the Claude Code installer) is found even when
+    invoked from cron, which strips the user's PATH to /usr/bin:/bin.
+
+    Returns a copy of `os.environ` augmented with the resolved token and PATH,
+    ensuring the subprocess inherits all library paths from the parent while
+    having a valid auth token and access to ~/.local/bin binaries.
     """
     env = dict(os.environ)
+
+    # Always ensure ~/.local/bin is in PATH so `claude` is found from cron.
+    # Cron environments typically only have /usr/bin:/bin; the Claude Code
+    # installer puts the binary at ~/.local/bin/claude.
+    _local_bin = str(Path.home() / ".local" / "bin")
+    current_path = env.get("PATH", "")
+    path_entries = current_path.split(":") if current_path else []
+    if _local_bin not in path_entries:
+        env["PATH"] = _local_bin + (":" + current_path if current_path else "")
 
     # Fast path: token already present in environment (interactive CC session).
     if env.get("CLAUDE_CODE_OAUTH_TOKEN"):
