@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 from .registry import ApproveConfirmed, ApproveExpired, ApproveNotFound, ApproveSkipped
 from .paths import LOBSTER_WORKSPACE as _LOBSTER_WORKSPACE, WOS_CONFIG as _WOS_CONFIG_PATH_FROM_PATHS, WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG
-from .steward import ReturnReasonClassification
+from .steward import ReturnReasonClassification, MAX_RETRIES as _STEWARD_MAX_RETRIES, _HARD_CAP_CYCLES
 
 
 # ---------------------------------------------------------------------------
@@ -556,8 +556,8 @@ WOS_MESSAGE_TYPE_DISPATCH: dict[str, str] = {
     "wos_surface": "handle_wos_surface",
     # Manual-trigger forensics handler: written by the dispatcher when Dan types
     # "diagnose <uow_id>". Spawns a diagnostic subagent that runs registry_cli trace
-    # and returns a structured forensic report. Like wos_escalate, this handler is
-    # exempt from the spawn-gate — it legitimately returns action="spawn_subagent".
+    # and returns a structured forensic report. Always returns action="spawn_subagent";
+    # runs inside the spawn-gate block where the enforcement check is always satisfied.
     "wos_diagnose": "handle_wos_diagnose",
 }
 
@@ -1076,10 +1076,10 @@ def handle_wos_surface(msg: dict[str, Any]) -> dict[str, Any]:
 # Spawns a diagnostic subagent that runs registry_cli trace and returns a
 # structured forensic report.
 #
-# Unlike wos_execute/steward_trigger, this handler is exempt from the
-# spawn-gate because it legitimately returns action="spawn_subagent" only
-# (no send_reply branches). route_wos_message handles this analogously to
-# the wos_escalate fast-path.
+# Unlike wos_escalate (which has send_reply branches and runs before the
+# spawn-gate), wos_diagnose always returns action="spawn_subagent" and runs
+# inside the spawn-gate block. The gate enforcement check is always satisfied
+# for this handler, making the gate redundant but not harmful.
 #
 # UoW ID resolution is intentionally isolated through _resolve_uow_id().
 # Today that function is a direct pass-through; a future PR (short-ID
@@ -1183,8 +1183,8 @@ def handle_wos_diagnose(msg: dict[str, Any]) -> dict[str, Any]:
         f"2. Apply the diagnosis algorithm:\n\n"
         f"   ORPHAN_REASONS = {{'executor_orphan', 'executing_orphan', 'diagnosing_orphan', "
         f"'orphan_kill_before_start', 'orphan_kill_during_execution'}}\n"
-        f"   MAX_RETRIES = 3\n"
-        f"   HARD_CAP = 9\n\n"
+        f"   MAX_RETRIES = {_STEWARD_MAX_RETRIES}\n"
+        f"   HARD_CAP = {_HARD_CAP_CYCLES}\n\n"
         f"   - If ALL return_reasons are in ORPHAN_REASONS and execution_attempts == 0:\n"
         f"     posture = reset, pattern = 'infrastructure-kill-wave'\n"
         f"   - If ALL return_reasons are in ORPHAN_REASONS and "
@@ -1291,9 +1291,10 @@ def parse_diagnose_command(text: str) -> str | None:
     stripped = text.strip()
     lower = stripped.lower()
     if lower.startswith("diagnose "):
-        uow_id_token = stripped[len("diagnose "):].strip()
-        if uow_id_token:
-            return uow_id_token
+        remainder = stripped[len("diagnose "):].strip()
+        tokens = remainder.split()
+        if tokens:
+            return tokens[0]
     return None
 
 

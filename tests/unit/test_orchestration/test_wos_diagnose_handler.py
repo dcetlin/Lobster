@@ -26,6 +26,7 @@ from src.orchestration.dispatcher_handlers import (
     parse_diagnose_command,
     route_wos_message,
 )
+from src.orchestration.steward import MAX_RETRIES as _STEWARD_MAX_RETRIES, _HARD_CAP_CYCLES
 
 # ---------------------------------------------------------------------------
 # Named constants from the spec — imported from production module where
@@ -45,9 +46,10 @@ PATTERN_HARD_CAP = "hard-cap"
 PATTERN_DEAD_PRESCRIPTION_LOOP = "dead-prescription-loop"
 PATTERN_UNRECOGNISED = "unrecognised"
 
-# Algorithm constants embedded in the subagent prompt (from design spec §3)
-MAX_RETRIES = 3
-HARD_CAP = 9
+# Algorithm constants — imported from production modules so tests stay in sync
+# when the production values change.
+MAX_RETRIES = _STEWARD_MAX_RETRIES
+HARD_CAP = _HARD_CAP_CYCLES
 
 
 # ---------------------------------------------------------------------------
@@ -420,11 +422,7 @@ class TestParseDiagnoseCommand:
     def test_uow_id_token_is_first_word_after_diagnose(self):
         """Only the first token after 'diagnose ' is returned (no multi-word parsing)."""
         result = parse_diagnose_command("diagnose uow_001 extra ignored")
-        # The function returns the full remainder after 'diagnose ' with leading/trailing
-        # whitespace stripped — so "uow_001 extra ignored" is the raw uow_id token.
-        # This matches the design: _resolve_uow_id does full resolution later.
-        assert result is not None
-        assert "uow_001" in result
+        assert result == "uow_001"
 
 
 # ---------------------------------------------------------------------------
