@@ -40,6 +40,8 @@ Evidence of an orphan:
 
 **Question 2 — Load-bearing vs. decorative:** For each artifact class (lessons, proposals, premise-review), is the load-bearing content distinguishable from accumulated-but-inert content? Name specific files or sections where the distinction has collapsed — where everything looks equally important.
 
+The form-function lens sharpens this question. An element is load-bearing when removing it would change the system's behavior or require something else to compensate for its absence. An element is compensatory when it exists not because the structure requires it, but because clarity was not achieved upstream — it is translating between what the system is and how it appears. The difference matters diagnostically: a symptom-catch (inconsistent naming, orphaned file) points to a local repair; a structural issue (a concept being carried in the wrong place, a boundary that does not match the actual boundary of a responsibility) requires the upstream decision to be revisited. When reviewing artifact classes, ask not just whether content is inert but whether active content is in its natural place — whether the form faithfully expresses the structure it claims to represent, or whether the instruction layer has developed a translation layer that compounds under use.
+
 **Question 3 — Accumulation without signal:** Is total instruction volume increasing without corresponding increase in precision or behavioral distinctiveness of outputs? Name specific files that have grown without commensurate behavioral signal.
 
 **Step 3: Write output**

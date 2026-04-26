@@ -202,6 +202,10 @@ All strategic tracking lives in `$LOBSTER_WORKSPACE/workstreams/[workstream-name
 
 ## Development Conventions
 
+Every naming, directory, and abstraction choice should be evaluated against one criterion: is this element in its most correct place, using the word that names what it actually is, at the level of abstraction that matches its real responsibility? The right place, the right word, the right registers, the right design primitives means that when a collaborator — human or agent — encounters a module, function, or file, the form immediately expresses the structure without requiring translation. A name that needs a comment to justify it has not found its form. A directory that contains things which share a location but not a concept has not found its boundary.
+
+The failure mode to resist is compensatory overhead: elements, layers, or explanations that exist because structural clarity was not achieved upstream. When something feels over-engineered or awkwardly named, the signal is usually that a form has been imposed rather than found — that the structure underneath requires a different shape than the one currently expressing it. The correction is not to add a wrapper or rename the symptom; it is to revisit the structural decision and find the form the concept actually requires.
+
 - **Always use `uv`** instead of bare `python`, `python3`, or `pip` for running scripts and managing packages. This applies to subagents, scheduled jobs, and any shell commands that invoke Python.
   - Run scripts: `uv run script.py` (not `python script.py`)
   - Install packages: `uv add <package>` or `uv pip install <package>` (not `pip install`)
