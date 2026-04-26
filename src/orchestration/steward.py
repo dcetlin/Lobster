@@ -668,10 +668,48 @@ _ACTOR_STEWARD = "steward"
 # per-UoW-lifetime circuit breaker. steward_cycles (per-attempt) is NOT used here.
 _HARD_CAP_CYCLES = 9
 
-# Retry cap: maximum number of re-dispatch attempts before escalating a UoW to
-# needs-human-review. Applied at re-dispatch time (when the steward would otherwise
-# prescribe again after a failed/partial/blocked execution).
+# Retry cap: maximum number of confirmed execution attempts before escalating a UoW to
+# needs-human-review. Applied at re-dispatch time and gates on execution_attempts
+# (confirmed dispatches), NOT retry_count (total steward cycles) or steward_cycles.
+#
+# Rationale: infrastructure kill events (session TTL, orphan recovery) must not consume
+# the retry budget. Only cycles where an agent confirmed execution (return_reason is not
+# an orphan classification) count toward this cap. See issue #962.
 MAX_RETRIES: int = 3
+
+# Return reasons that represent infrastructure kill events, not confirmed executions.
+# When return_reason is in this set, execution_attempts must NOT be incremented and
+# the retry cap must NOT apply. The agent session was killed before or during dispatch —
+# no execution outcome was produced.
+#
+# Mapping to _RETURN_REASON_CLASSIFICATIONS:
+#   executor_orphan   → _CLASSIFICATION_ORPHAN (session killed before dispatch)
+#   executing_orphan  → _CLASSIFICATION_ORPHAN (subagent dispatched, write_result never received)
+#   diagnosing_orphan → _CLASSIFICATION_ORPHAN (startup sweep classified during diagnosis)
+ORPHAN_REASONS: frozenset[str] = frozenset({
+    "executor_orphan",
+    "executing_orphan",
+    "diagnosing_orphan",
+})
+
+
+def _is_infrastructure_event(return_reason: str | None) -> bool:
+    """
+    Return True when return_reason represents an infrastructure kill event that
+    must NOT consume execution_attempts budget.
+
+    Pure function — no side effects, no I/O.
+
+    Infrastructure events (ORPHAN_REASONS) are session kills or dispatch failures
+    where no agent confirmed execution. None (first execution) is not infrastructure.
+
+    Used in the retry-cap check in _process_uow to gate MAX_RETRIES on
+    execution_attempts rather than retry_count.
+    """
+    if return_reason is None:
+        return False
+    return return_reason in ORPHAN_REASONS
+
 
 # close_reason written by the cleanup arc when a UoW hits the hard cap.
 # Used to gate decide-retry: bare retry is rejected; explicit override required.
@@ -2603,6 +2641,7 @@ def _write_steward_fields(
     closed_at: str | None = None,
     close_reason: str | None = None,
     retry_count: int | None = None,
+    execution_attempts: int | None = None,
 ) -> None:
     """
     Write Steward-private and Steward-managed fields to the UoW row.
@@ -2632,6 +2671,8 @@ def _write_steward_fields(
         updates["close_reason"] = close_reason
     if retry_count is not None:
         updates["retry_count"] = retry_count
+    if execution_attempts is not None:
+        updates["execution_attempts"] = execution_attempts
 
     if not updates:
         return
@@ -3789,19 +3830,33 @@ def _process_uow(
     # reflects how far the previous execution got. For `failed`, re-diagnose
     # with `reason` as the primary input (already in completion_rationale).
 
-    # 4c-retry-cap: check retry_count before prescribing again.
+    # 4c-retry-cap: gate MAX_RETRIES on execution_attempts (confirmed dispatches).
+    #
     # On the first execution (cycles == 0, reentry_posture == "first_execution"),
-    # skip the cap — it only applies to re-dispatches after a failed attempt.
-    # On re-entry (cycles > 0), increment retry_count and check against MAX_RETRIES.
+    # skip the cap entirely — it only applies to re-dispatches after a prior cycle.
+    #
+    # On re-entry (cycles > 0), always increment retry_count (diagnostic counter).
+    # Only increment execution_attempts when return_reason is NOT an infrastructure
+    # event (ORPHAN_REASONS). Infrastructure events are session kills — no execution
+    # outcome was produced, so they must not consume the execution retry budget.
+    #
+    # MAX_RETRIES gates on execution_attempts, NOT retry_count. This prevents the
+    # 2026-04-26 failure mode where 3 orphan kill events exhausted the retry budget
+    # and produced needs-human-review escalations for UoWs with lifetime_cycles=0.
     if cycles > 0 and reentry_posture != "first_execution":
         new_retry_count = uow.retry_count + 1
-        if new_retry_count > MAX_RETRIES:
-            # Cap exceeded — escalate to needs-human-review.
+        # Only count confirmed executions toward the retry budget.
+        is_infra_event = _is_infrastructure_event(return_reason)
+        new_execution_attempts = uow.execution_attempts + (0 if is_infra_event else 1)
+
+        if new_execution_attempts > MAX_RETRIES:
+            # Execution retry cap exceeded — escalate to needs-human-review.
             escalation_entry = {
                 "event": "retry_cap_exceeded",
                 "uow_id": uow_id,
                 "steward_cycles": cycles,
-                "retry_count": uow.retry_count,
+                "retry_count": new_retry_count,
+                "execution_attempts": new_execution_attempts,
                 "max_retries": MAX_RETRIES,
                 "return_reason": return_reason,
             }
@@ -3812,15 +3867,18 @@ def _process_uow(
                 _write_steward_fields(
                     registry, uow_id,
                     steward_log=current_log_str,
-                    retry_count=uow.retry_count,  # do not increment at cap
+                    retry_count=new_retry_count,
+                    execution_attempts=uow.execution_attempts,  # do not increment at cap
                 )
                 registry.append_audit_log(uow_id, {
                     "event": "retry_cap_exceeded",
                     "actor": _ACTOR_STEWARD,
                     "uow_id": uow_id,
                     "steward_cycles": cycles,
-                    "retry_count": uow.retry_count,
+                    "retry_count": new_retry_count,
+                    "execution_attempts": uow.execution_attempts,
                     "max_retries": MAX_RETRIES,
+                    "return_reason": return_reason,
                     "timestamp": _now_iso(),
                 })
                 registry.transition(uow_id, _STATUS_NEEDS_HUMAN_REVIEW, _STATUS_DIAGNOSING)
@@ -3835,13 +3893,25 @@ def _process_uow(
             )
             return Surfaced(uow_id=uow_id, condition="retry_cap")
         else:
-            # Increment retry_count before proceeding with prescription.
+            # Below cap — increment both counters and proceed with prescription.
             if not dry_run:
-                _write_steward_fields(registry, uow_id, retry_count=new_retry_count)
-            log.info(
-                "_process_uow: UoW %s re-dispatch attempt %d/%d",
-                uow_id, new_retry_count, MAX_RETRIES,
-            )
+                _write_steward_fields(
+                    registry, uow_id,
+                    retry_count=new_retry_count,
+                    execution_attempts=new_execution_attempts,
+                )
+            if is_infra_event:
+                log.info(
+                    "_process_uow: UoW %s infrastructure event (return_reason=%r) — "
+                    "retry_count=%d, execution_attempts=%d/%d (budget unchanged)",
+                    uow_id, return_reason, new_retry_count,
+                    uow.execution_attempts, MAX_RETRIES,
+                )
+            else:
+                log.info(
+                    "_process_uow: UoW %s execution attempt %d/%d (retry_count=%d)",
+                    uow_id, new_execution_attempts, MAX_RETRIES, new_retry_count,
+                )
 
     # 4c-gate: Corrective trace one-cycle temporal gate (cristae-junction delay).
     # Before prescribing again after an executor return, the executor must have
