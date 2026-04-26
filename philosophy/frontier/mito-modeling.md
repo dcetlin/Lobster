@@ -1,5 +1,7 @@
 # Mitochondrial Patterns as Architectural Primitives
 
+*Status: live*
+
 *Can we model mitochondrial function with crons, code, prompts, and organizational structures?*
 
 Date: 2026-04-04

@@ -1,5 +1,7 @@
 # Frontier: Poiesis / Poiema
 
+*Status: live*
+
 *Domain: The relationship between making and the thing made; creative expression as continuous with technical work*
 
 *Last updated: 2026-03-29*

@@ -1,5 +1,7 @@
 # Frontier: Governor Timing Structure
 
+*Status: live*
+
 *Domain: The WOS system as governor — timing, permission, and the structural conditions that make closure possible*
 
 *Last updated: 2026-04-04*
@@ -122,7 +124,7 @@ In the WOS system as it currently exists, these cycles grew organically and are 
 
 - **Nightly (~24h):** nightly consolidation — memory repair, digest archiving, rolling summary update. Repair is permitted; new UoW dispatch is paused. This is the most obvious rest window, but it is one cycle among several.
 - **Weekly:** weekly retro and negentropic hygiene sweep — pruning, signal extraction, pattern recognition across accumulated output. This is the slower repair cycle, operating at a timescale where daily noise has averaged out.
-- **RALPH cycle cadence:** structured iterative digestion — run → evaluate → gap-identify → next cycle. Each RALPH cycle is a mitochondrial breath: action, then the mandatory pause in which the trace is read before the next prescription fires. The corrective trace is the dwell time.
+- **Steward cycle cadence (formerly RALPH):** structured iterative digestion — run → evaluate → gap-identify → next cycle. Each steward cycle is a mitochondrial breath: action, then the mandatory pause in which the trace is read before the next prescription fires. The corrective trace is the dwell time.
 - **WOS execution cycle:** UoW → steward → executor → corrective trace → next pass. The corrective trace is the rest window before re-prescription. Without it, re-dispatch happens immediately on completion — the exactly-wrong thing, at the timescale where ghost agents are born.
 - **Dispatcher hibernation:** the obvious one — `wait_for_messages(hibernate_on_timeout=True)` silencing the intake channel. This is a real cycle. But it is only one timescale of a larger rhythm, not the rhythm itself.
 

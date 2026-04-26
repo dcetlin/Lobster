@@ -76,11 +76,11 @@ The field has converged on a set of structural patterns for long-running agentic
 
 ---
 
-### RALPH Loop / OODA-Style Agents
+### OODA-Style Agents (formerly referred to as "RALPH Loop")
 
-**What it is:** Agent execution pattern: Reflect, Act, Learn, Plan, Halt. Variants appear in BabyAGI reflection step, OpenDevin's MINT countdown, and WOS V3's OODA formalization. Not a single framework — a convergent pattern.
+**What it is:** Agent execution pattern: Reflect, Act, Learn, Plan, Halt (RALPH was an early internal label, retired 2026-04-20). Variants appear in BabyAGI reflection step, OpenDevin's MINT countdown, and WOS V3's OODA formalization. Not a single framework — a convergent pattern.
 
-**How it handles done:** The RALPH/OODA pattern produces a natural halt condition when the Orient phase determines that success criteria are met. But "halt" requires an explicit trigger — OODA without a done-condition is an infinite loop.
+**How it handles done:** The OODA pattern produces a natural halt condition when the Orient phase determines that success criteria are met. But "halt" requires an explicit trigger — OODA without a done-condition is an infinite loop.
 
 **Relevance to WOS:** WOS V3's dispatch loop is OODA instantiated. The relevant insight: the Orient step (Steward's diagnosis) is the schwerpunkt. All downstream decisions — prescribe, surface to Dan, declare done — depend on the quality of orientation. This is why the Steward reads corrective traces and garden context before diagnosing: more evidence at Orient time improves all subsequent decisions.
 

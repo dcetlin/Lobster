@@ -1,5 +1,7 @@
 # Frontier: ToL Arc
 
+*Status: live*
+
 *Domain: The philosophical arc Dan is working through re: Tree of Life / Pattern of Life*
 
 *Last updated: 2026-03-29*

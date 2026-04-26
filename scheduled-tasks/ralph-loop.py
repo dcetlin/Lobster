@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-WOS pipeline health loop (ralph-loop).
+WOS pipeline health loop (wos-health-loop; legacy job name: ralph-loop).
 
 Runs every 3 hours as a Type A (LLM subagent) scheduled job.
 On each invocation:
@@ -11,6 +11,11 @@ On each invocation:
 The actual multi-step loop logic (inject → execute → observe → report → fix → track)
 lives in the task definition at scheduled-jobs/tasks/ralph-loop.md.
 The subagent that runs that task has access to all MCP tools and the shell.
+
+Note: The "RALPH" naming (Reflect, Act, Learn, Plan, Halt) was retired 2026-04-20
+(PR #806). The job name, file paths, and state file (ralph-state.json) remain
+unchanged for operational continuity. A coordinated migration is needed to rename
+these artifacts; see the KILL-RALPH open thread in handoff.md.
 
 Cron schedule (every 3 hours):
     0 */3 * * * cd ~/lobster && uv run scheduled-tasks/ralph-loop.py >> \

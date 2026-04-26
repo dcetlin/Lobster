@@ -1,5 +1,7 @@
 # WOS V3 Convergence
 
+*Status: superseded — WOS V3 is fully implemented as of 2026-04-26 (PRs #839, #848, #859, #860, #965–#968). Seeds S1–S5 remain as V4 design directions. Pearls remain valid as orienting context.*
+
 *Synthesized from: wos-v3-proposal.md, wos-v3-steward-executor-spec.md, philosopher session documents (cybernetics, Theory of Learning, mito-governor), 2026-04-04.*
 
 ---
