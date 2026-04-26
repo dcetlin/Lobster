@@ -53,6 +53,17 @@ Read-only for oracle, steward, and sweep. Updated only via oracle decisions or h
 
 ---
 
+## form-function isomorphism (meta-pattern)
+
+**Signal:** a component's code structure — naming, organization, module boundaries, hierarchy — does not mirror the conceptual structure of what the component does
+**Oracle response:** when reviewing any architectural component (pipeline stage, handler, schema, configuration block), ask: does the form of this code mirror the conceptual structure of what it does? Apply the zero-excess test: every element should be load-bearing; nothing should be present that doesn't carry meaning, and nothing should be absent that the component needs. Two failure modes to check: (1) over-structuring — the structure is more elaborate than the concept requires, adding translation cost at every reading; (2) under-structuring — the structure is simpler than the concept requires, hiding information that is genuinely load-bearing. If a component has a name, an organization, or a boundary that requires explanation before it makes sense, it has not achieved form-function isomorphism.
+**Steward response:** when prescribing new UoWs for architectural components, include a form-function check: does the proposed implementation structure match the conceptual model in the spec?
+**Sweep response:** accumulated form-function drift is visible as documentation debt — when the prose explaining a component must carry information the code itself does not express, the structure is under-explaining its own logic
+
+**Reference:** `~/lobster/philosophy/form-function-isomorphism-20260426.md`
+
+---
+
 ## Notes on evolution
 - New patterns emerge from oracle/learnings.md observations
 - Threshold values (≥3 passes, ≥5 UoWs, etc.) are initial estimates; adjust via oracle decisions
