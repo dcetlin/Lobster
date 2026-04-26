@@ -71,7 +71,7 @@ stateDiagram-v2
 
 ```mermaid
 flowchart TD
-    A([steward cycle begins\n_pending_escalations = []]) --> B
+    A([steward cycle begins\n_pending_escalations = empty list]) --> B
 
     B[for each UoW in ready-for-steward\nBOOTUP_CANDIDATE_GATE: skip if label set] --> C
 
