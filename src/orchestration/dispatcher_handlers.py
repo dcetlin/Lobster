@@ -1030,15 +1030,21 @@ def handle_wos_surface(msg: dict[str, Any]) -> dict[str, Any]:
             "message_type": _msg_type,
         }
 
-    # Branch: Mixed causes — auto-retry orphans (silent), surface non-orphans to Dan.
+    # Branch: Mixed causes — surface non-orphans to Dan; list orphans for Dan to retry.
     # Branch: All non-orphan causes — surface all to Dan (non_orphan_uow_ids == uow_ids).
+    #
+    # Note: this handler cannot spawn a subagent AND send a reply in the same result —
+    # the dispatch architecture returns one action per message.  Orphan UoWs in the mixed
+    # case are identified and listed for Dan to retry, but no steward heartbeat is spawned
+    # here.  Dan can use `/decide <uow_id> retry` for each orphan UoW listed.
     uow_list = "\n".join(f"  - `{uid}`" for uid in non_orphan_uow_ids)
     orphan_note = ""
     if orphan_uow_ids:
-        orphan_ids_str = ", ".join(f"`{uid}`" for uid in orphan_uow_ids)
+        orphan_ids_str = "\n".join(f"  - `{uid}` → `/decide {uid} retry`" for uid in orphan_uow_ids)
         orphan_note = (
-            f"\nNote: {len(orphan_uow_ids)} orphan UoW(s) were auto-retried "
-            f"(infrastructure kills — no execution budget consumed): {orphan_ids_str}\n"
+            f"\nOrphan UoW(s) eligible for auto-retry (infrastructure kills, "
+            f"no execution budget consumed) — use `/decide retry` for each:\n"
+            f"{orphan_ids_str}\n"
         )
 
     text = (
