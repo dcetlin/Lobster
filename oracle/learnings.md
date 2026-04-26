@@ -1130,4 +1130,12 @@ Applied: 295 "failed" UoWs decomposed into test contamination (154, env bug), cr
 
 ## write_result handshake gap (2026-04-24)
 Pattern: UoWs that orphan 3x with return_reason=executing_orphan and outcome=complete are likely hitting the write_result handshake defect, not a task-content failure. Recommendation: close + re-queue after the executor/write_result handshake is fixed, rather than retrying indefinitely.
+
+## 2026-04-26: Long-running task scaffolding (upstream merge incident)
+
+Long-running subagent tasks (expected > 15 min) that stall leave no recoverable breadcrumbs when they only write to /tmp/ output files. Two agents (v1: 34 min, v2: 86 min) produced zero useful state on failure.
+
+Fix applied: v3 created workstream at ~/lobster-workspace/workstreams/upstream-precision-merge/ before doing any work, logged progress incrementally, succeeded in ~1 min.
+
+Pattern: Any task with expected duration > 15 min must create a workstream directory FIRST and write progress there. The workstream is the primary artifact; /tmp/ output is secondary.
 | 2026-04-24 | PR #918 | Session-scoped autouse fixture for env-var-at-call-time isolation is the correct scope when (a) the env var is read at call time rather than import time and (b) tests do not need per-test inbox state isolation. A per-test scope adds fixture overhead (hundreds of temp dirs per run) without adding correctness benefit when the only goal is preventing production writes. The distinction: per-test scope is required when tests need to observe that their specific writes went to their specific directory; session scope is sufficient when the goal is purely "not the live inbox." Detection: when adding an env-var isolation fixture, ask whether tests need to inspect their own writes — if yes, per-test; if no, session. |
