@@ -82,12 +82,20 @@ CREATE TABLE IF NOT EXISTS uow_registry (
     --   Executor-accessible (included in executor_uow_view).
     issue_url           TEXT    DEFAULT NULL,
 
-    -- retry_count: number of steward re-dispatch attempts for the current attempt.
-    --   Incremented each time the steward re-dispatches (prescribes again after
-    --   a failed/partial/blocked execution). When retry_count >= MAX_RETRIES (3),
-    --   the steward transitions the UoW to needs-human-review instead of re-dispatching.
+    -- retry_count: diagnostic counter — total Steward re-entry cycles (cycles > 0).
+    --   Incremented on every re-entry regardless of return_reason (infrastructure events
+    --   or genuine execution outcomes). Used in escalation notifications for visibility.
+    --   NOT used as the retry budget gate (see execution_attempts).
     --   Steward-private (excluded from executor_uow_view).
     retry_count         INTEGER NOT NULL DEFAULT 0,
+
+    -- execution_attempts: confirmed execution attempts (retry budget counter).
+    --   Incremented only when return_reason is NOT an orphan classification
+    --   (executor_orphan, executing_orphan, diagnosing_orphan). These orphan events
+    --   are infrastructure kills — the agent session ended before or during dispatch —
+    --   not execution outcomes. MAX_RETRIES gates on this field, not retry_count.
+    --   Steward-private (excluded from executor_uow_view).
+    execution_attempts  INTEGER NOT NULL DEFAULT 0,
 
     UNIQUE(source_issue_number, sweep_date)
 );

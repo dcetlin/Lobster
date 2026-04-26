@@ -222,10 +222,14 @@ class UoW:
     #   stalled. Set at claim time from estimated_runtime; default 300 (5 minutes).
     heartbeat_at: str | None = None
     heartbeat_ttl: int = 300
-    # retry_count: number of steward re-dispatch attempts (populated after migration 0010).
-    #   Incremented each time the steward re-dispatches after a failed execution.
-    #   When retry_count >= MAX_RETRIES, escalates to needs-human-review.
+    # retry_count: diagnostic counter — total Steward re-entry cycles (populated after migration 0010).
+    #   Incremented on every re-entry regardless of return_reason.
+    #   Used in escalation notifications for visibility. NOT the retry budget gate.
     retry_count: int = 0
+    # execution_attempts: confirmed execution attempts — retry budget counter (migration 0014).
+    #   Incremented only when return_reason is NOT an orphan classification
+    #   (executor_orphan, executing_orphan, diagnosing_orphan). MAX_RETRIES gates on this.
+    execution_attempts: int = 0
     # artifacts: typed outcome refs extracted from write_result payload (migration 0011).
     #   JSON array of {type, ref, category, description?} objects. NULL until populated.
     #   Populated by wos_completion.py after successful UoW completion.
@@ -451,6 +455,7 @@ class Registry:
             heartbeat_at=d.get("heartbeat_at"),
             heartbeat_ttl=d.get("heartbeat_ttl") or 300,
             retry_count=d.get("retry_count") or 0,
+            execution_attempts=d.get("execution_attempts") or 0,
             artifacts=_deserialize_json(d.get("artifacts")) if d.get("artifacts") else None,
             file_scope=_deserialize_json(d.get("file_scope")) if d.get("file_scope") else None,
             shard_id=d.get("shard_id"),

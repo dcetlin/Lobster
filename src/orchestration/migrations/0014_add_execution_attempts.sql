@@ -1,0 +1,27 @@
+-- Migration 0014: add execution_attempts field to distinguish confirmed executions
+-- from infrastructure-kill events in retry accounting.
+--
+-- Problem (issue #962):
+--   The retry counter (MAX_RETRIES = 3) treats "agent killed before starting"
+--   identically to "agent ran and failed." Evidence: 19 UoWs from the 2026-04-26
+--   failure cohort had lifetime_cycles = 0 — none completed a full execution arc.
+--   Three session-layer kill events (orphan recovery) exhausted retry_count and
+--   escalated all 19 UoWs to needs-human-review. No work was ever attempted.
+--
+--   Root cause: retry_count increments on every Steward re-entry when cycles > 0,
+--   regardless of return_reason. Orphan classifications (executor_orphan,
+--   executing_orphan, diagnosing_orphan) are infrastructure events — the agent
+--   session was killed before or during dispatch — not execution outcomes.
+--
+-- Fix:
+--   Add execution_attempts INTEGER NOT NULL DEFAULT 0.
+--   Incremented only when return_reason is NOT an orphan classification.
+--   MAX_RETRIES gates on execution_attempts instead of retry_count.
+--   retry_count continues to increment on every re-entry for diagnostic visibility.
+--
+-- Backward compatibility:
+--   Existing UoWs get execution_attempts=0. The next Steward re-entry will start
+--   classifying correctly. A UoW with retry_count=3 but execution_attempts=0 will
+--   not be immediately escalated — it will get up to MAX_RETRIES genuine attempts.
+
+ALTER TABLE uow_registry ADD COLUMN execution_attempts INTEGER NOT NULL DEFAULT 0;

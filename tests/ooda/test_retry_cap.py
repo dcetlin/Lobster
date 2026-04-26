@@ -58,6 +58,7 @@ def _make_uow_row(
     steward_cycles: int = 1,
     lifetime_cycles: int = 1,
     retry_count: int = 0,
+    execution_attempts: int = 0,
     output_ref: str | None = None,
     audit_log_entries: list[dict] | None = None,
     summary: str = "Test UoW",
@@ -73,14 +74,14 @@ def _make_uow_row(
         INSERT INTO uow_registry
             (id, type, source, source_issue_number, sweep_date, status, posture,
              created_at, updated_at, summary, output_ref, steward_cycles, lifetime_cycles,
-             retry_count, success_criteria, register, route_evidence, trigger,
-             steward_agenda, steward_log)
+             retry_count, execution_attempts, success_criteria, register, route_evidence,
+             trigger, steward_agenda, steward_log)
         VALUES (?, 'executable', 'github:issue/99', 99, '2026-01-01', ?, 'solo',
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}',
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}',
                 NULL, NULL)
         """,
         (uow_id, status, now, now, summary, output_ref, steward_cycles,
-         lifetime_cycles, retry_count, success_criteria, register),
+         lifetime_cycles, retry_count, execution_attempts, success_criteria, register),
     )
     if audit_log_entries:
         for entry in audit_log_entries:
@@ -270,12 +271,16 @@ class TestRetryCountIncrement:
 # ---------------------------------------------------------------------------
 
 class TestRetryCapEscalation:
-    def test_steward_escalates_when_retry_count_at_cap(self, db_path, registry, tmp_path):
+    def test_steward_escalates_when_execution_attempts_at_cap(self, db_path, registry, tmp_path):
         """
-        When retry_count == MAX_RETRIES, the steward must:
+        When execution_attempts == MAX_RETRIES and the next re-entry is a genuine
+        execution outcome (not an orphan), the steward must:
         1. Transition the UoW to needs-human-review.
         2. Call _send_escalation_notification (not re-dispatch).
-        3. NOT increment retry_count further.
+        3. NOT increment execution_attempts further.
+
+        Note: escalation is gated on execution_attempts (confirmed dispatches),
+        not retry_count (total steward cycles). See issue #962.
         """
         conn = _open_db(db_path)
         audit_entries = [
@@ -287,14 +292,15 @@ class TestRetryCapEscalation:
             status="ready-for-steward",
             steward_cycles=MAX_RETRIES + 1,
             lifetime_cycles=MAX_RETRIES + 1,
-            retry_count=MAX_RETRIES,  # at cap
+            retry_count=MAX_RETRIES,
+            execution_attempts=MAX_RETRIES,  # at execution cap
             audit_log_entries=audit_entries,
         )
         conn.close()
 
         uow = registry.get(uow_id)
         assert uow is not None
-        assert uow.retry_count == MAX_RETRIES
+        assert uow.execution_attempts == MAX_RETRIES
 
         escalation_calls = []
         prescribe_calls = []
@@ -332,12 +338,12 @@ class TestRetryCapEscalation:
 
             # _send_escalation_notification must have been called
             assert mock_escalate.called, (
-                "_send_escalation_notification must be called when retry cap is exceeded"
+                "_send_escalation_notification must be called when execution_attempts >= MAX_RETRIES"
             )
 
         # LLM prescriber must NOT have been called (we escalated, not re-dispatched)
         assert not prescribe_calls, (
-            "LLM prescriber must not be called when retry cap is exceeded"
+            "LLM prescriber must not be called when execution retry cap is exceeded"
         )
 
         # UoW status must be needs-human-review
@@ -347,9 +353,10 @@ class TestRetryCapEscalation:
         assert row["status"] == "needs-human-review", (
             f"Expected status=needs-human-review, got {row['status']}"
         )
-        # retry_count must NOT have been incremented
-        assert row["retry_count"] == MAX_RETRIES, (
-            f"Expected retry_count={MAX_RETRIES} (not incremented), got {row['retry_count']}"
+        # execution_attempts must NOT have been incremented at cap
+        assert row["execution_attempts"] == MAX_RETRIES, (
+            f"Expected execution_attempts={MAX_RETRIES} (not incremented at cap), "
+            f"got {row['execution_attempts']}"
         )
 
     def test_steward_does_not_escalate_on_first_execution(self, db_path, registry, tmp_path):
