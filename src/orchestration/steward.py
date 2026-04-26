@@ -2147,6 +2147,16 @@ ORPHAN_KILL_BEFORE_START = "kill_before_start"
 ORPHAN_KILL_DURING_EXECUTION = "kill_during_execution"
 ORPHAN_COMPLETED_WITHOUT_OUTPUT = "completed_without_output"
 
+# The three ReentryPosture values that trigger orphan trace enrichment in _diagnose_uow.
+# Defined at module scope — not inside _diagnose_uow — to avoid re-allocating the
+# frozenset on every call. Uses ReentryPosture enum values per the StrEnum golden
+# pattern (2026-04-24): enum-backed values must not appear as raw string literals.
+_ORPHAN_POSTURES: frozenset[str] = frozenset({
+    ReentryPosture.EXECUTOR_ORPHAN,
+    ReentryPosture.EXECUTING_ORPHAN,
+    ReentryPosture.DIAGNOSING_ORPHAN,
+})
+
 
 def _classify_orphan_from_trace(trace_data: dict | None, output_ref: str | None) -> str:
     """
@@ -2170,6 +2180,18 @@ def _classify_orphan_from_trace(trace_data: dict | None, output_ref: str | None)
     the strongest signal — it overrides even non-empty surprises.
 
     Pure function: only reads files (result.json presence check). No DB writes.
+    Note: "pure" here means no DB writes or mutation — not side-effect-free.
+    The function reads from the filesystem, so its output depends on file state.
+
+    result.json naming conventions: two forms are checked to handle legacy producers.
+    - Canonical form (new executors): `Path(output_ref).with_suffix(".result.json")`
+      replaces the existing `.json` suffix, producing `uow_id.result.json`.
+    - Legacy form (older executor scripts that appended rather than replaced):
+      `str(output_ref) + ".result.json"`, producing `uow_id.json.result.json`.
+    The alt-path check ensures that UoWs completed by legacy producers are not
+    misclassified as kill_before_start (which would cause unnecessary retries).
+    If no legacy producers remain active, the alt-path check never fires but is
+    kept to avoid breaking audit continuity for historical UoW replay.
 
     Args:
         trace_data: Parsed trace.json dict (already validated by _read_trace_json),
@@ -3184,7 +3206,6 @@ def _diagnose_uow(
     # completed_without_output). This enriches completion_rationale so the prescriber
     # has evidence rather than diagnosing blind on every orphan re-entry.
     # Only fires for the three orphan postures — normal completion paths are unaffected.
-    _ORPHAN_POSTURES = frozenset({"executor_orphan", "executing_orphan", "diagnosing_orphan"})
     if reentry_posture in _ORPHAN_POSTURES:
         completion_rationale = _enrich_orphan_completion_rationale(
             base_rationale=completion_rationale,

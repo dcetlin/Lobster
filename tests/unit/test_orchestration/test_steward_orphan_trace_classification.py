@@ -32,19 +32,13 @@ from pathlib import Path
 import pytest
 
 from orchestration.steward import (
+    ORPHAN_COMPLETED_WITHOUT_OUTPUT,
+    ORPHAN_KILL_BEFORE_START,
+    ORPHAN_KILL_DURING_EXECUTION,
     _classify_orphan_from_trace,
     _enrich_orphan_completion_rationale,
     _read_trace_json,
 )
-
-
-# ---------------------------------------------------------------------------
-# Named constants (spec-derived)
-# ---------------------------------------------------------------------------
-
-KILL_BEFORE_START = "kill_before_start"
-KILL_DURING_EXECUTION = "kill_during_execution"
-COMPLETED_WITHOUT_OUTPUT = "completed_without_output"
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +53,7 @@ class TestClassifyOrphanFromTrace:
         """When trace.json is absent, default to kill_before_start."""
         output_ref = str(tmp_path / "uow_absent.json")
         result = _classify_orphan_from_trace(trace_data=None, output_ref=output_ref)
-        assert result == KILL_BEFORE_START
+        assert result == ORPHAN_KILL_BEFORE_START
 
     def test_dispatch_only_summary_empty_surprises_is_kill_before_start(self, tmp_path: Path) -> None:
         """Dispatch-only execution_summary + empty surprises → kill_before_start."""
@@ -74,7 +68,7 @@ class TestClassifyOrphanFromTrace:
             "timestamp": "2026-04-26T10:00:00+00:00",
         }
         result = _classify_orphan_from_trace(trace_data=trace, output_ref=output_ref)
-        assert result == KILL_BEFORE_START
+        assert result == ORPHAN_KILL_BEFORE_START
 
     def test_nonempty_surprises_is_kill_during_execution(self, tmp_path: Path) -> None:
         """Non-empty surprises list → kill_during_execution."""
@@ -89,7 +83,7 @@ class TestClassifyOrphanFromTrace:
             "timestamp": "2026-04-26T10:00:00+00:00",
         }
         result = _classify_orphan_from_trace(trace_data=trace, output_ref=output_ref)
-        assert result == KILL_DURING_EXECUTION
+        assert result == ORPHAN_KILL_DURING_EXECUTION
 
     def test_nonempty_prescription_delta_is_kill_during_execution(self, tmp_path: Path) -> None:
         """Non-empty prescription_delta → kill_during_execution even if surprises empty."""
@@ -104,7 +98,7 @@ class TestClassifyOrphanFromTrace:
             "timestamp": "2026-04-26T10:00:00+00:00",
         }
         result = _classify_orphan_from_trace(trace_data=trace, output_ref=output_ref)
-        assert result == KILL_DURING_EXECUTION
+        assert result == ORPHAN_KILL_DURING_EXECUTION
 
     def test_result_json_present_is_completed_without_output(self, tmp_path: Path) -> None:
         """result.json exists → completed_without_output (agent ran, write_result never called)."""
@@ -127,7 +121,7 @@ class TestClassifyOrphanFromTrace:
             "timestamp": "2026-04-26T10:00:00+00:00",
         }
         result = _classify_orphan_from_trace(trace_data=trace, output_ref=output_ref)
-        assert result == COMPLETED_WITHOUT_OUTPUT
+        assert result == ORPHAN_COMPLETED_WITHOUT_OUTPUT
 
     def test_result_json_present_overrides_surprises(self, tmp_path: Path) -> None:
         """result.json existence takes priority over surprises (agent completed its work)."""
@@ -145,7 +139,39 @@ class TestClassifyOrphanFromTrace:
             "timestamp": "2026-04-26T10:00:00+00:00",
         }
         result = _classify_orphan_from_trace(trace_data=trace, output_ref=output_ref)
-        assert result == COMPLETED_WITHOUT_OUTPUT
+        assert result == ORPHAN_COMPLETED_WITHOUT_OUTPUT
+
+    def test_result_json_alt_path_form_is_completed_without_output(self, tmp_path: Path) -> None:
+        """result.json written by legacy producers uses append form (foo.json.result.json).
+
+        Legacy executor scripts appended '.result.json' to the full filename rather than
+        replacing the suffix: Path(str(output_ref) + '.result.json') → uow_id.json.result.json.
+        New executors use with_suffix('.result.json') → uow_id.result.json (canonical form).
+        Both forms must be recognized as completed_without_output to avoid misclassifying
+        legacy-produced UoWs as kill_before_start and retrying them unnecessarily.
+        """
+        output_ref = str(tmp_path / "uow_alt_path.json")
+        # Write the alt-path (legacy append form): uow_alt_path.json.result.json
+        result_path_alt = Path(str(output_ref) + ".result.json")
+        result_path_alt.write_text(json.dumps({
+            "uow_id": "uow_alt_path",
+            "outcome": "complete",
+            "success": True,
+        }), encoding="utf-8")
+        # Ensure canonical form does NOT exist (so only the alt-path fires)
+        assert not Path(output_ref).with_suffix(".result.json").exists()
+
+        trace = {
+            "uow_id": "uow_alt_path",
+            "register": "operational",
+            "execution_summary": "Executor dispatched subagent abc123.",
+            "surprises": [],
+            "prescription_delta": "",
+            "gate_score": None,
+            "timestamp": "2026-04-26T10:00:00+00:00",
+        }
+        result = _classify_orphan_from_trace(trace_data=trace, output_ref=output_ref)
+        assert result == ORPHAN_COMPLETED_WITHOUT_OUTPUT
 
     def test_empty_execution_summary_no_surprises_is_kill_before_start(self, tmp_path: Path) -> None:
         """Empty execution_summary with no other signals → kill_before_start."""
@@ -160,7 +186,7 @@ class TestClassifyOrphanFromTrace:
             "timestamp": "2026-04-26T10:00:00+00:00",
         }
         result = _classify_orphan_from_trace(trace_data=trace, output_ref=output_ref)
-        assert result == KILL_BEFORE_START
+        assert result == ORPHAN_KILL_BEFORE_START
 
     def test_output_ref_none_falls_back_to_kill_before_start(self) -> None:
         """output_ref=None means no result.json check possible → kill_before_start."""
@@ -171,7 +197,7 @@ class TestClassifyOrphanFromTrace:
             "prescription_delta": "",
         }
         result = _classify_orphan_from_trace(trace_data=trace, output_ref=None)
-        assert result == KILL_BEFORE_START
+        assert result == ORPHAN_KILL_BEFORE_START
 
 
 # ---------------------------------------------------------------------------
