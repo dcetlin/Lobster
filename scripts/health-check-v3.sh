@@ -1528,6 +1528,27 @@ do_restart() {
     local suppress_alert="${2:-false}"
     log_warn "Restarting $SERVICE_CLAUDE (reason: $reason, suppress_alert=$suppress_alert)"
 
+    # Storm cap: do not restart when inbox has > INBOX_STORM_CAP pending messages.
+    # A large inbox indicates the system is overwhelmed or recovering from a flood
+    # (e.g. 54 stale messages after a quota-exhaustion midnight restart). Restarting
+    # into a flood triggers a feedback loop: health check sees stale inbox → restart
+    # → inbox recovered from processing/ → repeat → 433 restarts in 3 hours.
+    # Instead, skip the restart and let the inbox drain naturally on the next check.
+    local INBOX_STORM_CAP=20
+    local inbox_count
+    inbox_count=$(ls "$INBOX_DIR" 2>/dev/null | wc -l)
+    if [[ "$inbox_count" -gt "$INBOX_STORM_CAP" ]]; then
+        log_warn "STORM CAP: Skipping restart — inbox has $inbox_count messages (cap: $INBOX_STORM_CAP). Reason: $reason"
+        if [[ "$suppress_alert" != "true" ]]; then
+            send_telegram_alert_deduped "storm-cap" "Health check skipped restart: inbox has $inbox_count pending messages (cap: $INBOX_STORM_CAP).
+
+Reason: $reason
+
+Restart suppressed to prevent a restart storm. System will re-evaluate on the next health check cycle."
+        fi
+        return 0
+    fi
+
     # Subagent guard: do not restart while subagents are active.
     # A systemd restart kills the entire Claude process tree including all
     # sidechain agents. If the DB shows running sessions, log a warning and

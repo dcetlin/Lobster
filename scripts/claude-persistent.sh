@@ -649,6 +649,36 @@ Usage quota hit. Sleeping until midnight UTC ($wake_time_et).
 Will auto-restart at quota reset. No action needed."
             sleep "$sleep_secs"
             log "QUOTA WAIT COMPLETE: Midnight UTC reached, resuming restart."
+
+            # Pre-flight drain check: after a quota-exhaustion midnight restart,
+            # the inbox may contain many stale messages that piled up overnight.
+            # The health checker fires every 4 minutes — if it sees a large inbox
+            # immediately after restart it will attempt another restart, creating
+            # the same feedback loop that caused the 2026-04 restart storm (433
+            # restarts in 3 hours). Wait until the inbox drops below
+            # INBOX_DRAIN_THRESHOLD before writing "restarting" so Claude can
+            # start processing the backlog rather than being killed again.
+            local INBOX_DRAIN_THRESHOLD=5
+            local INBOX_DRAIN_POLL_INTERVAL=30
+            local INBOX_DRAIN_TIMEOUT=600  # 10 minutes
+            local drain_elapsed=0
+            log "QUOTA PREFLIGHT: Waiting for inbox to drain to < $INBOX_DRAIN_THRESHOLD messages before restart..."
+            while true; do
+                local inbox_count
+                inbox_count=$(ls "$MESSAGES_DIR/inbox/" 2>/dev/null | wc -l)
+                log "QUOTA PREFLIGHT: inbox count = $inbox_count (threshold: $INBOX_DRAIN_THRESHOLD, elapsed: ${drain_elapsed}s)"
+                if [[ "$inbox_count" -lt "$INBOX_DRAIN_THRESHOLD" ]]; then
+                    log "QUOTA PREFLIGHT: Inbox drained (count=$inbox_count) — proceeding with restart."
+                    break
+                fi
+                if [[ "$drain_elapsed" -ge "$INBOX_DRAIN_TIMEOUT" ]]; then
+                    log "QUOTA PREFLIGHT: Drain timeout (${INBOX_DRAIN_TIMEOUT}s) reached with inbox_count=$inbox_count — proceeding anyway."
+                    break
+                fi
+                sleep "$INBOX_DRAIN_POLL_INTERVAL"
+                drain_elapsed=$(( drain_elapsed + INBOX_DRAIN_POLL_INTERVAL ))
+            done
+
             write_state "restarting" "quota_wait_complete"
             AUTH_FAIL_COUNT=0
             AUTH_FAIL_ALERTED=false

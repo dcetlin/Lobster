@@ -523,6 +523,31 @@ def main() -> int:
         log.info("Executor heartbeat complete")
         return 0
 
+    # Context pressure throttle: skip new dispatches when too many subagents are
+    # already running. Each active subagent consumes context in the dispatcher
+    # session, accelerating compaction cycles. High active-session counts are a
+    # reliable proxy for context pressure and a contributing cause of the
+    # 2026-04 restart storm (WOS running at full speed → faster compaction cycles).
+    #
+    # TTL recovery (Phase 1) and heartbeat sidecar (Phase 1b) always run above —
+    # only new dispatch is throttled here.
+    CONTEXT_PRESSURE_AGENT_THRESHOLD: int = 5
+    try:
+        from src.agents.session_store import get_active_sessions
+        active_session_count = len(get_active_sessions())
+    except Exception as e:
+        log.debug("Context pressure check: could not read active sessions — %s (skipping throttle)", e)
+        active_session_count = 0
+
+    if active_session_count >= CONTEXT_PRESSURE_AGENT_THRESHOLD:
+        log.info(
+            "Context pressure throttle: %d active subagent session(s) >= threshold %d "
+            "— skipping new UoW dispatch this cycle to reduce context load",
+            active_session_count, CONTEXT_PRESSURE_AGENT_THRESHOLD,
+        )
+        log.info("Executor heartbeat complete")
+        return 0
+
     try:
         result = run_executor_cycle(registry, dry_run=dry_run)
         log.info(
