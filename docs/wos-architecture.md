@@ -4,12 +4,12 @@
 
 ## Related Documents
 
-**Supersedes:** [escalation-architecture-20260426.md](../workstreams/wos/reports/escalation-architecture-20260426.md) *(ASCII diagrams, pre-PRs #980–#981)*
+**Supersedes:** `~/lobster-workspace/workstreams/wos/reports/escalation-architecture-20260426.md` *(ASCII diagrams, pre-PRs #980–#981)*
 
 **Referenced by:**
-- [WOS Failure Runbook](../workstreams/wos/runbooks/failure-diagnosis.md) — failure signatures and triage procedure
-- [Self-Diagnosing Subagent Design](../workstreams/wos/design/self-diagnosing-subagent-design.md) — T1-B implementation context
-- [Vision Inlet Design](../workstreams/wos/design/vision-inlet-design.md) — T2-C observation loop
+- `~/lobster-workspace/workstreams/wos/runbooks/failure-diagnosis.md` — failure signatures and triage procedure
+- `~/lobster-workspace/workstreams/wos/design/self-diagnosing-subagent-design.md` — T1-B implementation context
+- `~/lobster-workspace/workstreams/wos/design/vision-inlet-design.md` — T2-C observation loop
 
 **Key PRs:** #965 (execution_attempts), #966 (escalation consolidation), #967 (trace.json orphan diagnosis), #968 (heartbeat kill classification), #970 (wos_escalate handler), #973 (exhaustiveness test), #974 (steward write path), #976 (registry_cli trace), #980 (wos_diagnose handler), #981 (wos_surface handler)
 
@@ -22,7 +22,7 @@ Source files read:
 
 ## Section 1: UoW Lifecycle State Machine
 
-> See also: [WOS Failure Runbook](../workstreams/wos/runbooks/failure-diagnosis.md) — for failure signatures (kill-before-start, kill-during-execution, dead-prescription-loop) that correspond to the transitions shown here.
+> See also: `~/lobster-workspace/workstreams/wos/runbooks/failure-diagnosis.md` — for failure signatures (kill-before-start, kill-during-execution, dead-prescription-loop) that correspond to the transitions shown here.
 
 ```mermaid
 stateDiagram-v2
@@ -67,7 +67,7 @@ stateDiagram-v2
 
 ## Section 2: Steward Cycle Flow
 
-> See also: [Self-Diagnosing Subagent Design](../workstreams/wos/design/self-diagnosing-subagent-design.md) — T1-B covers the planned replacement of inline triage with a tool-backed diagnosis subagent spawned from this cycle.
+> See also: `~/lobster-workspace/workstreams/wos/design/self-diagnosing-subagent-design.md` — T1-B covers the planned replacement of inline triage with a tool-backed diagnosis subagent spawned from this cycle.
 
 ```mermaid
 flowchart TD
@@ -131,7 +131,7 @@ flowchart TD
 
 ### Track A — wos_escalate (per-UoW)
 
-> See also: [Self-Diagnosing Subagent Design](../workstreams/wos/design/self-diagnosing-subagent-design.md) — the 4-branch dispatcher tree below is the T1-B inline triage that the self-diagnosing subagent is designed to replace.
+> See also: `~/lobster-workspace/workstreams/wos/design/self-diagnosing-subagent-design.md` — the 4-branch dispatcher tree below is the T1-B inline triage that the self-diagnosing subagent is designed to replace.
 
 **Message fields written by `_write_wos_escalate_message()`:**
 
@@ -206,7 +206,7 @@ flowchart TD
 
 ## Section 4: Diagnosis Path
 
-> See also: [Self-Diagnosing Subagent Design](../workstreams/wos/design/self-diagnosing-subagent-design.md) — full implementation spec for the subagent spawned by this path, including the diagnosis algorithm, safety constraints, and PR sequence.
+> See also: `~/lobster-workspace/workstreams/wos/design/self-diagnosing-subagent-design.md` — full implementation spec for the subagent spawned by this path, including the diagnosis algorithm, safety constraints, and PR sequence.
 
 ```mermaid
 flowchart TD
@@ -273,7 +273,7 @@ timestamp
 
 ## Section 5: Forensics — registry_cli trace
 
-> See also: [WOS Failure Runbook](../workstreams/wos/runbooks/failure-diagnosis.md) — operational procedures for reading trace output and triaging each failure signature.
+> See also: `~/lobster-workspace/workstreams/wos/runbooks/failure-diagnosis.md` — operational procedures for reading trace output and triaging each failure signature.
 
 **Invocation:** `uv run registry_cli.py trace --id <uow_id>`
 
