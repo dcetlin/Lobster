@@ -3637,13 +3637,23 @@ ESCALATION_CONSOLIDATION_THRESHOLD: int = 3
 @dataclass(frozen=True)
 class EscalationRecord:
     """
-    Carries the UoW and its return_reason at the point of retry-cap escalation.
+    Carries the UoW and failure context at the point of retry-cap escalation.
 
     Accumulated per heartbeat cycle in run_steward_cycle. When the cycle ends,
     the count determines whether individual or consolidated notification fires.
+
+    Fields added in issue #971 (wos_escalate write path):
+        execution_attempts: Confirmed execution count at cap time.
+        reentry_posture: Posture string from _determine_reentry_posture.
+        audit_entries: Audit trail for this UoW at the time of escalation.
     """
     uow: UoW
     return_reason: str | None
+    # Fields required for _write_wos_escalate_message (default=None/[] for
+    # backwards compatibility with tests that construct EscalationRecord directly).
+    execution_attempts: int = 0
+    reentry_posture: str = ""
+    audit_entries: tuple[dict[str, Any], ...] = ()
 
 
 def _build_consolidated_escalation_text(records: list[EscalationRecord]) -> str:
@@ -3725,6 +3735,224 @@ def _send_consolidated_escalation_notification(records: list[EscalationRecord]) 
         log.error("Failed to write WOS consolidated escalation message to inbox: %s", e)
 
 
+# ---------------------------------------------------------------------------
+# Inbox path constant — module-level so tests can patch it cleanly
+# ---------------------------------------------------------------------------
+
+_INBOX_DIR_PATH: Path = Path(os.path.expanduser("~/messages/inbox"))
+
+# Audit event types that represent infrastructure kill events.
+# Used to extract infrastructure_events from the audit trail.
+_INFRASTRUCTURE_AUDIT_EVENT_TYPES: frozenset[str] = frozenset({
+    "executing_orphan_failed",
+    "executor_orphan",
+    "diagnosing_orphan",
+    "heartbeat_stall",
+})
+
+# Reentry postures that carry a kill_type token (heartbeat-classified orphans).
+# Maps posture → kill_type string in the wos_escalate message.
+_ORPHAN_POSTURE_TO_KILL_TYPE: dict[str, str] = {
+    "orphan_kill_before_start": "orphan_kill_before_start",
+    "orphan_kill_during_execution": "orphan_kill_during_execution",
+    "executor_orphan": "orphan_kill_before_start",  # classic orphan — no heartbeat evidence
+    "executing_orphan": "orphan_kill_during_execution",  # subagent exited without write_result
+    "diagnosing_orphan": "orphan_kill_before_start",  # killed during diagnosis, before dispatch
+}
+
+# Postures where the subagent wrote at least one heartbeat before being killed.
+# Used to derive heartbeats_before_kill: postures not in this set → 0.
+_EXECUTION_ACTIVE_POSTURES: frozenset[str] = frozenset({
+    "orphan_kill_during_execution",
+    "executing_orphan",
+})
+
+# Named string constants for orphan-kill reentry postures.
+# Used in _build_wos_escalate_failure_history and its tests.
+_POSTURE_ORPHAN_KILL_BEFORE_START: str = "orphan_kill_before_start"
+_POSTURE_ORPHAN_KILL_DURING_EXECUTION: str = "orphan_kill_during_execution"
+_POSTURE_EXECUTOR_ORPHAN: str = "executor_orphan"
+
+
+def _build_wos_escalate_failure_history(
+    uow: UoW,
+    execution_attempts: int,
+    return_reason: str | None,
+    reentry_posture: str,
+    audit_entries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Build the failure_history dict for a wos_escalate inbox message.
+
+    Pure function — no side effects, no I/O.
+
+    Fields produced:
+        execution_attempts (int): Confirmed execution attempts at the time of escalation.
+        return_reason_classification (str): Classification of the last return reason
+            ("orphan", "error", "abnormal", etc.) via _classify_return_reason.
+        kill_type (str): Heartbeat-derived kill classification, or empty string when
+            the return_reason is not an orphan posture.
+        heartbeats_before_kill (int): 0 if killed before any heartbeat was written;
+            1 (conservative lower bound) if the agent was actively executing.
+        infrastructure_events (list[dict]): Audit entries whose event type matches
+            _INFRASTRUCTURE_AUDIT_EVENT_TYPES — infrastructure kills or stalls.
+
+    Args:
+        uow: The Unit of Work being escalated.
+        execution_attempts: Confirmed execution count (post-increment, at cap).
+        return_reason: Most recent return_reason from the audit trail (may be None).
+        reentry_posture: Posture determined by _determine_reentry_posture.
+        audit_entries: All audit_log entries for this UoW.
+
+    Returns:
+        A dict matching the failure_history schema expected by handle_wos_escalate.
+    """
+    return_reason_classification = _classify_return_reason(return_reason)
+    kill_type = _ORPHAN_POSTURE_TO_KILL_TYPE.get(reentry_posture, "")
+    heartbeats_before_kill = 1 if reentry_posture in _EXECUTION_ACTIVE_POSTURES else 0
+    infrastructure_events = [
+        entry for entry in audit_entries
+        if entry.get("event") in _INFRASTRUCTURE_AUDIT_EVENT_TYPES
+    ]
+
+    return {
+        "execution_attempts": execution_attempts,
+        "return_reason_classification": return_reason_classification,
+        "kill_type": kill_type,
+        "heartbeats_before_kill": heartbeats_before_kill,
+        "infrastructure_events": infrastructure_events,
+    }
+
+
+def _compute_suggested_action(
+    register: str,
+    execution_attempts: int,
+    return_reason_classification: str,
+) -> str:
+    """
+    Derive the suggested_action for a wos_escalate message.
+
+    Mirrors the 4-branch decision tree in handle_wos_escalate (dispatcher_handlers.py)
+    so the message carries a hint that the dispatcher can use without re-computing it.
+
+    Pure function — no side effects, no I/O.
+
+    Decision order (first match wins):
+      Branch 4 — human-judgment register → "surface_to_human"
+      Branch 3 — execution_attempts >= MAX_RETRIES → "surface_to_human"
+      Branch 1 — execution_attempts == 0, orphan → "auto_retry"
+      Branch 2 — execution_attempts > 0, orphan → "retry_mid_execution"
+      Default  → "surface_to_human"
+    """
+    # Branch 4 — checked first: register overrides all other branches.
+    from .dispatcher_handlers import _ESCALATE_HUMAN_JUDGMENT_REGISTERS, _ESCALATE_SURFACE_EXECUTION_THRESHOLD
+    if register in _ESCALATE_HUMAN_JUDGMENT_REGISTERS:
+        return "surface_to_human"
+
+    # Branch 3 — execution cap exhausted.
+    if execution_attempts >= _ESCALATE_SURFACE_EXECUTION_THRESHOLD:
+        return "surface_to_human"
+
+    # Branches 1 and 2 — orphan classification.
+    if return_reason_classification == ReturnReasonClassification.ORPHAN:
+        if execution_attempts == 0:
+            return "auto_retry"   # Branch 1: pure infrastructure failure
+        return "retry_mid_execution"   # Branch 2: killed mid-execution
+
+    # Default — unclassified failure.
+    return "surface_to_human"
+
+
+def _write_wos_escalate_message(
+    uow: UoW,
+    execution_attempts: int,
+    return_reason: str | None,
+    reentry_posture: str,
+    audit_entries: list[dict[str, Any]],
+    posture: str = "",
+    fallback_fn: Callable[["UoW"], None] | None = None,
+) -> None:
+    """
+    Write a wos_escalate inbox message when a UoW exhausts its execution retry cap.
+
+    Replaces _send_escalation_notification at the retry-cap exceeded call site.
+    The wos_escalate message type activates the 4-branch dispatcher decision tree
+    added in PR #970, inserting a programmatic triage layer before human notification.
+
+    On any write failure, falls back to fallback_fn (default: _send_escalation_notification)
+    so escalations are never silently lost.
+
+    Args:
+        uow: The Unit of Work being escalated.
+        execution_attempts: Confirmed execution count at the time of escalation.
+        return_reason: Most recent return_reason from the audit trail.
+        reentry_posture: Posture from _determine_reentry_posture.
+        audit_entries: All audit_log entries for this UoW.
+        posture: Optional trace posture string (v2 vocabulary) from cycle trace.
+        fallback_fn: Callable invoked when the wos_escalate write fails.
+            Defaults to _send_escalation_notification.
+    """
+    uow_id = uow.id
+    chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", _DAN_CHAT_ID)
+
+    log.warning(
+        "WOS ESCALATION: UoW %s exhausted %d execution_attempts — "
+        "writing wos_escalate message (posture=%r, return_reason=%r)",
+        uow_id, execution_attempts, reentry_posture, return_reason,
+    )
+
+    failure_history = _build_wos_escalate_failure_history(
+        uow=uow,
+        execution_attempts=execution_attempts,
+        return_reason=return_reason,
+        reentry_posture=reentry_posture,
+        audit_entries=audit_entries,
+    )
+    # suggested_action is a hint field only — the dispatcher recomputes routing
+    # from first principles in handle_wos_escalate and does not read this field
+    # for routing decisions.  It is carried for observability and debugging.
+    suggested_action = _compute_suggested_action(
+        register=uow.register or "operational",
+        execution_attempts=execution_attempts,
+        return_reason_classification=failure_history["return_reason_classification"],
+    )
+
+    msg_id = str(uuid.uuid4())
+    msg: dict[str, Any] = {
+        "id": msg_id,
+        "type": "wos_escalate",
+        "source": "system",
+        "chat_id": chat_id,
+        "timestamp": time.time(),
+        "uow_id": uow_id,
+        "uow_title": (uow.summary or "")[:200],
+        "register": uow.register or "operational",
+        "failure_history": failure_history,
+        "posture": posture,
+        "suggested_action": suggested_action,
+    }
+
+    _fallback = fallback_fn if fallback_fn is not None else _send_escalation_notification
+
+    try:
+        _INBOX_DIR_PATH.mkdir(parents=True, exist_ok=True)
+        (_INBOX_DIR_PATH / f"{msg_id}.json").write_text(
+            json.dumps(msg, indent=2), encoding="utf-8"
+        )
+        log.info(
+            "WOS wos_escalate message written to inbox: %s "
+            "(uow_id=%s, execution_attempts=%d, suggested_action=%s)",
+            msg_id, uow_id, execution_attempts, suggested_action,
+        )
+    except Exception as e:
+        log.error(
+            "Failed to write wos_escalate message for UoW %s: %s — "
+            "falling back to _send_escalation_notification",
+            uow_id, e,
+        )
+        _fallback(uow)
+
+
 def _send_escalation_notification(uow: UoW) -> None:
     """
     Send a Telegram notification to Dan when a UoW has exhausted MAX_RETRIES
@@ -3732,6 +3960,9 @@ def _send_escalation_notification(uow: UoW) -> None:
 
     Uses the same inbox-write pattern as _default_notify_dan so the dispatcher
     surfaces the message to Dan via Telegram.
+
+    Kept as fallback for _write_wos_escalate_message. Direct callers in
+    run_steward_cycle use _write_wos_escalate_message instead.
     """
     uow_id = uow.id
     chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", _DAN_CHAT_ID)
@@ -4182,12 +4413,23 @@ def _process_uow(
                 })
                 registry.transition(uow_id, _STATUS_NEEDS_HUMAN_REVIEW, _STATUS_DIAGNOSING)
             # Route through injected notifier when provided (consolidation path),
-            # or fall back to individual notification (default / test path).
+            # or write a wos_escalate message directly (default path).
             # Gated on not dry_run: notifications are side effects; dry_run must
             # not write to inbox or accumulate the collector.
             if not dry_run:
-                _effective_notifier = escalation_notifier or _send_escalation_notification
-                _effective_notifier(uow)
+                if escalation_notifier is not None:
+                    # Collector path: accumulate for end-of-cycle consolidation.
+                    escalation_notifier(uow)
+                else:
+                    # Direct path: write wos_escalate message immediately.
+                    # Falls back to _send_escalation_notification on write failure.
+                    _write_wos_escalate_message(
+                        uow=uow,
+                        execution_attempts=new_execution_attempts,
+                        return_reason=return_reason,
+                        reentry_posture=reentry_posture,
+                        audit_entries=audit_entries,
+                    )
             _append_cycle_trace(
                 uow_id=uow_id,
                 cycle_num=cycles,
@@ -4799,8 +5041,23 @@ def run_steward_cycle(
 
     def _collect_escalation(uow: UoW) -> None:
         """Collector injected as escalation_notifier — defers notification to end of cycle."""
-        _return_reason = _most_recent_return_reason(_fetch_audit_entries(registry, uow.id))
-        _pending_escalations.append(EscalationRecord(uow=uow, return_reason=_return_reason))
+        _audit = _fetch_audit_entries(registry, uow.id)
+        _return_reason = _most_recent_return_reason(_audit)
+        # Recover execution_attempts and reentry_posture from the retry_cap_exceeded
+        # audit entry that was written just before the collector was invoked.
+        _execution_attempts = uow.execution_attempts
+        _reentry_posture = _determine_reentry_posture(_audit, _return_reason)
+        for _entry in reversed(_audit):
+            if _entry.get("event") == "retry_cap_exceeded":
+                _execution_attempts = _entry.get("execution_attempts", uow.execution_attempts)
+                break
+        _pending_escalations.append(EscalationRecord(
+            uow=uow,
+            return_reason=_return_reason,
+            execution_attempts=_execution_attempts,
+            reentry_posture=_reentry_posture,
+            audit_entries=tuple(_audit),
+        ))
 
     # Shard-stream parallel dispatch gate — fetch once before the loop.
     # _executing_uows is updated within the loop as UoWs are prescribed
@@ -5114,7 +5371,15 @@ def run_steward_cycle(
                 len(_pending_escalations), ESCALATION_CONSOLIDATION_THRESHOLD,
             )
             for _rec in _pending_escalations:
-                _send_escalation_notification(_rec.uow)
+                # Write wos_escalate message (4-branch dispatcher path).
+                # Falls back to _send_escalation_notification on write failure.
+                _write_wos_escalate_message(
+                    uow=_rec.uow,
+                    execution_attempts=_rec.execution_attempts,
+                    return_reason=_rec.return_reason,
+                    reentry_posture=_rec.reentry_posture,
+                    audit_entries=list(_rec.audit_entries),
+                )
 
     return CycleResult(
         evaluated=evaluated,
