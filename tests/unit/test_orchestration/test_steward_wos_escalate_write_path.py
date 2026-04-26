@@ -30,6 +30,9 @@ from orchestration.steward import (
     MAX_RETRIES,
     ORPHAN_KILL_BEFORE_START,
     ORPHAN_KILL_DURING_EXECUTION,
+    _POSTURE_EXECUTOR_ORPHAN,
+    _POSTURE_ORPHAN_KILL_BEFORE_START,
+    _POSTURE_ORPHAN_KILL_DURING_EXECUTION,
     _build_wos_escalate_failure_history,
     _write_wos_escalate_message,
 )
@@ -43,10 +46,11 @@ from src.orchestration.registry import UoW
 # Message type that wos_escalate messages must carry (matches dispatcher handler)
 WOS_ESCALATE_TYPE = "wos_escalate"
 
-# Reentry postures that map to specific kill_type values
-ORPHAN_KILL_BEFORE_START_POSTURE = "orphan_kill_before_start"
-ORPHAN_KILL_DURING_EXECUTION_POSTURE = "orphan_kill_during_execution"
-EXECUTOR_ORPHAN_POSTURE = "executor_orphan"
+# Reentry postures that map to specific kill_type values — imported from steward.py
+# to avoid re-declaring strings that would silently diverge if the source changes.
+ORPHAN_KILL_BEFORE_START_POSTURE = _POSTURE_ORPHAN_KILL_BEFORE_START
+ORPHAN_KILL_DURING_EXECUTION_POSTURE = _POSTURE_ORPHAN_KILL_DURING_EXECUTION
+EXECUTOR_ORPHAN_POSTURE = _POSTURE_EXECUTOR_ORPHAN
 
 
 # ---------------------------------------------------------------------------

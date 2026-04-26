@@ -3767,13 +3767,11 @@ _EXECUTION_ACTIVE_POSTURES: frozenset[str] = frozenset({
     "executing_orphan",
 })
 
-# Registers that should not be auto-retried — mirrors _ESCALATE_HUMAN_JUDGMENT_REGISTERS
-# in dispatcher_handlers.py. Duplicated here to keep suggested_action a pure local
-# computation without a cross-module import that would create a circular dependency.
-_HUMAN_JUDGMENT_REGISTERS: frozenset[str] = frozenset({
-    "human-judgment",
-    "philosophical",
-})
+# Named string constants for orphan-kill reentry postures.
+# Used in _build_wos_escalate_failure_history and its tests.
+_POSTURE_ORPHAN_KILL_BEFORE_START: str = "orphan_kill_before_start"
+_POSTURE_ORPHAN_KILL_DURING_EXECUTION: str = "orphan_kill_during_execution"
+_POSTURE_EXECUTOR_ORPHAN: str = "executor_orphan"
 
 
 def _build_wos_escalate_failure_history(
@@ -3847,11 +3845,11 @@ def _compute_suggested_action(
       Default  → "surface_to_human"
     """
     # Branch 4 — checked first: register overrides all other branches.
-    if register in _HUMAN_JUDGMENT_REGISTERS:
+    from .dispatcher_handlers import _ESCALATE_HUMAN_JUDGMENT_REGISTERS, _ESCALATE_SURFACE_EXECUTION_THRESHOLD
+    if register in _ESCALATE_HUMAN_JUDGMENT_REGISTERS:
         return "surface_to_human"
 
     # Branch 3 — execution cap exhausted.
-    from .dispatcher_handlers import _ESCALATE_SURFACE_EXECUTION_THRESHOLD
     if execution_attempts >= _ESCALATE_SURFACE_EXECUTION_THRESHOLD:
         return "surface_to_human"
 
@@ -3910,6 +3908,9 @@ def _write_wos_escalate_message(
         reentry_posture=reentry_posture,
         audit_entries=audit_entries,
     )
+    # suggested_action is a hint field only — the dispatcher recomputes routing
+    # from first principles in handle_wos_escalate and does not read this field
+    # for routing decisions.  It is carried for observability and debugging.
     suggested_action = _compute_suggested_action(
         register=uow.register or "operational",
         execution_attempts=execution_attempts,
