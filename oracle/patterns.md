@@ -45,6 +45,14 @@ Read-only for oracle, steward, and sweep. Updated only via oracle decisions or h
 
 ---
 
+## infrastructure-vs-execution discriminator
+**Signal:** a retry gate increments its counter on orphan recovery events (session TTL, executor kill, no result.json written) the same way it increments on genuine execution failures (agent ran, produced output, output indicated failure)
+**Steward response:** do not apply MAX_RETRIES pressure against infrastructure events; maintain a separate `execution_attempts` counter incremented only when `return_reason` is NOT an orphan classification
+**Oracle response:** when reviewing any PR that adds or modifies a retry gate, verify that the gate counter excludes orphan recovery events. A counter that increments on both is architecturally wrong regardless of increment size — infrastructure turbulence silently depletes execution budget and causes the system to surface to human review for problems that resolved themselves
+**Sweep response:** if `needs-human-review` backlog is dominated by UoWs with `execution_attempts == 0` and all-orphan `return_reasons`, the retry gate is conflating infrastructure events with execution failures — apply the discriminator fix before processing the backlog
+
+---
+
 ## Notes on evolution
 - New patterns emerge from oracle/learnings.md observations
 - Threshold values (≥3 passes, ≥5 UoWs, etc.) are initial estimates; adjust via oracle decisions
