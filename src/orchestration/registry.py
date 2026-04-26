@@ -1230,6 +1230,30 @@ class Registry:
         finally:
             conn.close()
 
+    def fetch_corrective_traces(self, uow_id: str) -> list[dict]:
+        """
+        Return all corrective_traces rows for the given UoW, ordered by created_at ASC.
+
+        Each row is a plain dict with all table columns.  Returns an empty list when no
+        rows exist or when the table is absent (pre-migration DB).
+
+        Use this for the forensics trace view; use get_corrective_trace_history() when
+        only prescription_delta values are needed.
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, uow_id, register, execution_summary, surprises, "
+                "prescription_delta, gate_score, created_at "
+                "FROM corrective_traces WHERE uow_id = ? ORDER BY created_at ASC",
+                (uow_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+        finally:
+            conn.close()
+
     def record_startup_sweep_active(
         self,
         uow_id: str,

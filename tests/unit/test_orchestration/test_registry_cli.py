@@ -17,6 +17,15 @@ from pathlib import Path
 import pytest
 import os
 
+# Import production constants so tests do not mirror raw string literals.
+# These are defined in registry_cli.py and must be kept in sync with
+# _RETURN_REASON_CLASSIFICATIONS in steward.py.
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "src"))
+from orchestration.registry_cli import (
+    _RETURN_REASON_EXECUTOR_ORPHAN,
+    _RETURN_REASON_DIAGNOSING_ORPHAN,
+)
+
 REPO_ROOT = Path(__file__).parent.parent.parent.parent
 CLI_PATH = REPO_ROOT / "src" / "orchestration" / "registry_cli.py"
 
@@ -496,3 +505,300 @@ class TestStaleCommand:
         result = run_cli(db_path, "stale")
         ids = [r["id"] for r in result]
         assert uow_id not in ids, "done UoW must not appear in stale output"
+
+
+# ---------------------------------------------------------------------------
+# trace command
+# ---------------------------------------------------------------------------
+
+def _write_audit_entry(db_path: Path, uow_id: str, event: str,
+                       from_status: str | None = None, to_status: str | None = None,
+                       agent: str | None = None, note: str | None = None,
+                       ts: str | None = None) -> None:
+    """Write a raw audit_log entry for test setup."""
+    if ts is None:
+        ts = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (ts, uow_id, event, from_status, to_status, agent, note),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _write_corrective_trace(db_path: Path, uow_id: str, execution_summary: str,
+                             prescription_delta: str = "", surprises: str = "[]",
+                             gate_score: str | None = None) -> None:
+    """Write a corrective_traces row for test setup."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO corrective_traces "
+        "(uow_id, register, execution_summary, surprises, prescription_delta, gate_score, created_at) "
+        "VALUES (?, 'operational', ?, ?, ?, ?, datetime('now'))",
+        (uow_id, execution_summary, surprises, prescription_delta, gate_score),
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestTraceCommand:
+    def test_trace_not_found_returns_error(self, db_path):
+        """trace on a non-existent UoW returns an error key."""
+        # Initialize DB
+        run_cli(db_path, "upsert", "--issue", "400", "--title", "Init", "--sweep-date", "2026-01-01")
+        result = run_cli(db_path, "trace", "--id", "uow_does_not_exist")
+        assert "error" in result, "trace on missing UoW must return error key"
+
+    def test_trace_surfaces_current_state_fields(self, db_path):
+        """trace output includes status, execution_attempts, and lifetime_cycles from the registry row."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "401", "--title", "Issue 401", "--sweep-date", today)
+        uow_id = inserted["id"]
+
+        result = run_cli(db_path, "trace", "--id", uow_id)
+
+        assert result["uow_id"] == uow_id
+        assert "current_state" in result
+        state = result["current_state"]
+        assert "status" in state
+        assert "execution_attempts" in state
+        assert "lifetime_cycles" in state
+
+    def test_trace_includes_audit_log_in_chronological_order(self, db_path):
+        """trace.audit_log entries are present and ordered by id ASC."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "402", "--title", "Issue 402", "--sweep-date", today)
+        uow_id = inserted["id"]
+
+        _write_audit_entry(db_path, uow_id, "state_transition",
+                           from_status="proposed", to_status="pending",
+                           ts="2026-04-26T10:00:00+00:00")
+        _write_audit_entry(db_path, uow_id, "state_transition",
+                           from_status="pending", to_status="active",
+                           ts="2026-04-26T10:05:00+00:00")
+
+        result = run_cli(db_path, "trace", "--id", uow_id)
+
+        assert "audit_log" in result
+        audit = result["audit_log"]
+        assert isinstance(audit, list)
+        events = [e["event"] for e in audit]
+        assert "state_transition" in events
+
+    def test_trace_includes_corrective_traces_when_present(self, db_path):
+        """trace.corrective_traces includes rows from the corrective_traces table."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "403", "--title", "Issue 403", "--sweep-date", today)
+        uow_id = inserted["id"]
+
+        _write_corrective_trace(db_path, uow_id,
+                                execution_summary="Executor ran, wrote output.",
+                                prescription_delta="Add error handling for edge case X.")
+
+        result = run_cli(db_path, "trace", "--id", uow_id)
+
+        assert "corrective_traces" in result
+        traces = result["corrective_traces"]
+        assert isinstance(traces, list)
+        assert len(traces) >= 1
+        assert traces[0]["execution_summary"] == "Executor ran, wrote output."
+
+    def test_trace_corrective_traces_empty_when_none_written(self, db_path):
+        """trace.corrective_traces is an empty list when no corrective traces exist."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "404", "--title", "Issue 404", "--sweep-date", today)
+        uow_id = inserted["id"]
+
+        result = run_cli(db_path, "trace", "--id", uow_id)
+
+        assert "corrective_traces" in result
+        assert result["corrective_traces"] == []
+
+    def test_trace_includes_return_reasons_in_chronological_order(self, db_path):
+        """trace.return_reasons lists audit events with return_reason note payloads, oldest first."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "405", "--title", "Issue 405", "--sweep-date", today)
+        uow_id = inserted["id"]
+
+        _write_audit_entry(db_path, uow_id, "steward_re_entry",
+                           note=json.dumps({"return_reason": _RETURN_REASON_EXECUTOR_ORPHAN}),
+                           ts="2026-04-26T08:00:00+00:00")
+        _write_audit_entry(db_path, uow_id, "steward_re_entry",
+                           note=json.dumps({"return_reason": _RETURN_REASON_DIAGNOSING_ORPHAN}),
+                           ts="2026-04-26T09:00:00+00:00")
+
+        result = run_cli(db_path, "trace", "--id", uow_id)
+
+        assert "return_reasons" in result
+        reasons = result["return_reasons"]
+        assert isinstance(reasons, list)
+        assert len(reasons) >= 2
+        assert reasons[0]["return_reason"] == _RETURN_REASON_EXECUTOR_ORPHAN
+        assert reasons[1]["return_reason"] == _RETURN_REASON_DIAGNOSING_ORPHAN
+
+    def test_trace_includes_kill_classification_when_present(self, db_path):
+        """trace.kill_classification surfaces kill_type and heartbeats_before_kill from audit notes."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "406", "--title", "Issue 406", "--sweep-date", today)
+        uow_id = inserted["id"]
+
+        _write_audit_entry(
+            db_path, uow_id, "orphan_kill_classified",
+            note='{"kill_type": "kill_during_execution", "heartbeats_before_kill": 3}',
+        )
+
+        result = run_cli(db_path, "trace", "--id", uow_id)
+
+        assert "kill_classification" in result
+        kc = result["kill_classification"]
+        assert kc["kill_type"] == "kill_during_execution"
+        assert kc["heartbeats_before_kill"] == 3
+
+    def test_trace_kill_classification_is_none_when_absent(self, db_path):
+        """trace.kill_classification is null when no orphan_kill_classified event exists."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "407", "--title", "Issue 407", "--sweep-date", today)
+        uow_id = inserted["id"]
+
+        result = run_cli(db_path, "trace", "--id", uow_id)
+
+        assert "kill_classification" in result
+        assert result["kill_classification"] is None
+
+    def test_trace_reads_trace_json_when_output_ref_set(self, db_path, tmp_path):
+        """trace.trace_json contains the parsed trace.json when output_ref is set and file exists."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "408", "--title", "Issue 408", "--sweep-date", today)
+        uow_id = inserted["id"]
+
+        # Write a trace.json file
+        trace_content = {
+            "uow_id": uow_id,
+            "register": "operational",
+            "execution_summary": "Subagent completed the task.",
+            "surprises": ["Unexpected dependency on module X"],
+            "prescription_delta": "Add X to prescribed_skills",
+            "gate_score": None,
+            "timestamp": "2026-04-26T10:00:00+00:00",
+        }
+        output_ref = str(tmp_path / f"{uow_id}.json")
+        trace_path = tmp_path / f"{uow_id}.trace.json"
+        trace_path.write_text(json.dumps(trace_content))
+
+        # Set output_ref on the UoW
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("UPDATE uow_registry SET output_ref = ? WHERE id = ?", (output_ref, uow_id))
+        conn.commit()
+        conn.close()
+
+        result = run_cli(db_path, "trace", "--id", uow_id)
+
+        assert "trace_json" in result
+        assert result["trace_json"] is not None
+        assert result["trace_json"]["execution_summary"] == "Subagent completed the task."
+
+    def test_trace_json_is_none_when_file_absent(self, db_path, tmp_path):
+        """trace.trace_json is null when output_ref is set but trace.json file does not exist."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "409", "--title", "Issue 409", "--sweep-date", today)
+        uow_id = inserted["id"]
+
+        # Set output_ref pointing to a file that doesn't exist
+        output_ref = str(tmp_path / f"{uow_id}.json")
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("UPDATE uow_registry SET output_ref = ? WHERE id = ?", (output_ref, uow_id))
+        conn.commit()
+        conn.close()
+
+        result = run_cli(db_path, "trace", "--id", uow_id)
+
+        assert "trace_json" in result
+        assert result["trace_json"] is None
+
+    def test_trace_includes_diagnosis_suggestion(self, db_path):
+        """trace.diagnosis_hint is always present and non-empty."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "410", "--title", "Issue 410", "--sweep-date", today)
+        uow_id = inserted["id"]
+
+        result = run_cli(db_path, "trace", "--id", uow_id)
+
+        assert "diagnosis_hint" in result
+        assert isinstance(result["diagnosis_hint"], str)
+        assert len(result["diagnosis_hint"]) > 0
+
+    def test_trace_diagnosis_hints_infrastructure_kill_wave(self, db_path):
+        """When all return reasons are orphan types, diagnosis_hint names infrastructure-kill-wave."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "411", "--title", "Issue 411", "--sweep-date", today)
+        uow_id = inserted["id"]
+        _force_status(db_path, uow_id, "needs-human-review")
+
+        for ts_offset, reason in enumerate([_RETURN_REASON_EXECUTOR_ORPHAN] * 3):
+            _write_audit_entry(
+                db_path, uow_id, "steward_re_entry",
+                note=json.dumps({"return_reason": reason}),
+                ts=f"2026-04-26T0{ts_offset}:00:00+00:00",
+            )
+
+        result = run_cli(db_path, "trace", "--id", uow_id)
+
+        assert "infrastructure-kill-wave" in result["diagnosis_hint"].lower() or \
+               "orphan" in result["diagnosis_hint"].lower(), (
+            f"diagnosis_hint should name the orphan/kill-wave pattern; got: {result['diagnosis_hint']!r}"
+        )
+
+    def test_trace_reads_trace_json_via_alt_path(self, db_path, tmp_path):
+        """
+        _read_trace_json fallback: when output_ref has a suffix and the primary path
+        (p.with_suffix('.trace.json')) does not exist, but the string-append path
+        (str(output_ref) + '.trace.json') does, the alt path is used.
+
+        Concretely: output_ref = 'dir/file.json'
+          primary:  dir/file.trace.json    — does NOT exist
+          alt:      dir/file.json.trace.json — DOES exist
+        """
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "413", "--title", "Issue 413", "--sweep-date", today)
+        uow_id = inserted["id"]
+
+        trace_content = {
+            "uow_id": uow_id,
+            "register": "operational",
+            "execution_summary": "Alt-path trace loaded.",
+        }
+        # Write ONLY the string-append alt path; leave the with_suffix path absent.
+        output_ref = str(tmp_path / f"{uow_id}.json")
+        alt_trace_path = tmp_path / f"{uow_id}.json.trace.json"
+        alt_trace_path.write_text(json.dumps(trace_content))
+
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("UPDATE uow_registry SET output_ref = ? WHERE id = ?", (output_ref, uow_id))
+        conn.commit()
+        conn.close()
+
+        result = run_cli(db_path, "trace", "--id", uow_id)
+
+        assert "trace_json" in result
+        assert result["trace_json"] is not None, (
+            "trace_json must be populated via the alt path when primary path is absent"
+        )
+        assert result["trace_json"]["execution_summary"] == "Alt-path trace loaded."
+
+    def test_trace_output_has_stable_top_level_keys(self, db_path):
+        """trace output always has the documented top-level keys regardless of UoW state."""
+        EXPECTED_KEYS = {
+            "uow_id", "current_state", "audit_log", "corrective_traces",
+            "return_reasons", "kill_classification", "trace_json", "diagnosis_hint",
+        }
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "412", "--title", "Issue 412", "--sweep-date", today)
+        uow_id = inserted["id"]
+
+        result = run_cli(db_path, "trace", "--id", uow_id)
+
+        assert EXPECTED_KEYS.issubset(result.keys()), (
+            f"trace output missing keys: {EXPECTED_KEYS - result.keys()}"
+        )
