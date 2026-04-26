@@ -477,6 +477,48 @@ from src.orchestration.dispatcher_handlers import route_wos_message
 4. mark_processed(message_id)
 ```
 
+### wos_diagnose (`type: "wos_diagnose"`)
+
+Written by the dispatcher when Dan types `diagnose <uow_id>` in Telegram. Spawns a
+diagnostic subagent that runs `registry_cli trace` and returns a structured forensic
+report. The subagent auto-resets if confidence is high and the pattern is a pure
+infrastructure kill; otherwise it surfaces to Dan via the write_result dispatcher flow.
+
+**Telegram command parsing:** When a user message text matches `diagnose <uow_id>`
+(case-insensitive), call `parse_diagnose_command(text)` to extract the `uow_id`,
+then build and route a `wos_diagnose` message using the standard flow:
+
+```python
+from src.orchestration.dispatcher_handlers import parse_diagnose_command, route_wos_message
+
+uow_id = parse_diagnose_command(msg_text)
+if uow_id:
+    mark_processing(message_id)
+    diagnose_msg = {
+        "type": "wos_diagnose",
+        "uow_id": uow_id,
+        "escalation_id": "",
+        "escalation_trigger": "manual",
+        "failure_history": {},
+    }
+    routing = route_wos_message(diagnose_msg)
+    # routing["action"]       == "spawn_subagent"
+    # routing["task_id"]      == f"wos-diagnose-{uow_id[:12]}"
+    # routing["prompt"]       == diagnostic subagent prompt
+    # routing["agent_type"]   == "lobster-generalist"
+    # routing["message_type"] == "wos_diagnose"
+    Task(
+        prompt=routing["prompt"],
+        subagent_type=routing["agent_type"],
+        run_in_background=True,
+        task_id=routing["task_id"],
+    )
+    send_reply(chat_id, f"Diagnosing UoW `{uow_id}` — report incoming.", ...)
+    mark_processed(message_id)
+```
+
+---
+
 ### wfm_watchdog (`type: "wfm_watchdog"`)
 
 `mark_processed(message_id)` then `wait_for_messages()`. Never `send_reply`. No-op.
