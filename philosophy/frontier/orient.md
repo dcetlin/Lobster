@@ -1,5 +1,7 @@
 # Frontier: Orient
 
+*Status: live*
+
 *Domain: How patterns observed in the system actually shape decisions — the observation→decision loop*
 
 *Last updated: 2026-03-29*

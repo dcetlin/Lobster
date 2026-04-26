@@ -1,6 +1,6 @@
 # WOS Pipeline Health Loop
 
-**Job**: ralph-loop
+**Job**: ralph-loop *(legacy name — "RALPH" naming retired 2026-04-20, PR #806; job name retained for operational continuity)*
 **Schedule**: Every 3 hours (`0 */3 * * *`)
 **Purpose**: Self-diagnose, self-heal, and track robustness of the WOS steward/executor pipeline without human prompting.
 

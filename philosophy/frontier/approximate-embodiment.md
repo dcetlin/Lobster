@@ -1,5 +1,7 @@
 # Frontier: Approximate Embodiment
 
+*Status: live*
+
 *Domain: What embodiment means for a system without persistent memory; navigation flow states*
 
 *Last updated: 2026-03-29*

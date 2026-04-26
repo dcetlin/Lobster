@@ -1,5 +1,7 @@
 # Frontier: Registers
 
+*Status: live*
+
 *Domain: The attentional configurations a communication presupposes in its receiver — and what happens when they mismatch*
 
 *Last updated: 2026-03-30*

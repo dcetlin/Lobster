@@ -1,5 +1,7 @@
 # Frontier: Collapse Topology
 
+*Status: live*
+
 *Domain: The structure of how inquiry collapses from open to closed; what is preserved and lost at each collapse*
 
 *Last updated: 2026-03-29*

@@ -2261,12 +2261,14 @@ else:
         migrated=$((migrated + 1))
     fi
 
-    # Migration 67: Register WOS pipeline health loop (ralph-loop).
+    # Migration 67: Register WOS pipeline health loop (job name: ralph-loop; "RALPH" naming retired 2026-04-20).
     # ralph-loop.py runs every 3 hours as a Type A LLM subagent job. It reads
     # jobs.json for the enabled gate, writes an inbox trigger message, and the
     # dispatcher spawns a subagent with the ralph-loop.md task definition.
     # The subagent performs a full WOS test run cycle: inject → execute → observe →
     # report → fix → track. State is persisted in data/ralph-state.json.
+    # TODO: rename ralph-state.json → wos-health-state.json, ralph-reports/ → wos-health-reports/,
+    # and update cron marker in a future coordinated migration.
     local RALPH_LOOP_MARKER="# LOBSTER-RALPH-LOOP"
     if ! crontab -l 2>/dev/null | grep -q "$RALPH_LOOP_MARKER"; then
         "$LOBSTER_DIR/scripts/cron-manage.sh" add "$RALPH_LOOP_MARKER" \
