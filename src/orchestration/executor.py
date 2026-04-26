@@ -700,11 +700,30 @@ class Executor:
             # standard subagent contract format (status/outcome/success/summary)
             # even when the Executor itself failed before dispatching the subagent.
             reason = f"{type(exc).__name__}: {exc}"
+            # For CalledProcessError: include exit code, stderr, and stdout in the
+            # summary so post-hoc analysis can distinguish auth failures, logic
+            # failures, and network errors. Generic str(exc) on CalledProcessError
+            # only contains the exit code — stderr/stdout are attributes, not part
+            # of str(exc). Including them here makes result.json self-contained for
+            # failure diagnosis without requiring access to the executor log files.
+            if isinstance(exc, subprocess.CalledProcessError):
+                stderr_excerpt = (exc.stderr or "").strip()[:500]
+                stdout_excerpt = (exc.stdout or "").strip()[:500]
+                output_parts = [
+                    f"CalledProcessError(exit={exc.returncode})",
+                ]
+                if stderr_excerpt:
+                    output_parts.append(f"stderr: {stderr_excerpt}")
+                if stdout_excerpt:
+                    output_parts.append(f"stdout: {stdout_excerpt}")
+                failure_detail = " | ".join(output_parts)
+            else:
+                failure_detail = reason
             _write_output_ref_content(output_ref, f"execution failed: {reason}")
             _write_subagent_result(
                 output_ref,
                 status="failed",
-                summary=f"executor error before subagent dispatch: {reason}",
+                summary=f"executor error before subagent dispatch: {failure_detail}",
             )
             # V3: write trace.json alongside result.json at the crash exit path.
             # register defaults to "operational" — the crash handler has no access
@@ -713,8 +732,8 @@ class Executor:
                 uow_id=uow_id,
                 register=register,
                 outcome=ExecutorOutcome.FAILED,
-                execution_summary=f"Executor crashed: {type(exc).__name__}: {exc}",
-                surprises=[str(exc)],
+                execution_summary=f"Executor crashed: {failure_detail}",
+                surprises=[failure_detail],
                 prescription_delta="exception before subagent dispatch — check executor logs",
             )
             _write_trace_json(output_ref, trace)
