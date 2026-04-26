@@ -25,24 +25,22 @@ from src.orchestration.dispatcher_handlers import (
     handle_wos_escalate,
     route_wos_message,
     WOS_MESSAGE_TYPE_DISPATCH,
+    _ESCALATE_SURFACE_EXECUTION_THRESHOLD,
+    _ESCALATE_HUMAN_JUDGMENT_REGISTERS,
 )
 
 # ---------------------------------------------------------------------------
-# Named constants from the spec
+# Named constants from the spec — imported from production module
 # ---------------------------------------------------------------------------
 
 # The message type this PR adds
 WOS_ESCALATE_MESSAGE_TYPE = "wos_escalate"
 
 # Execution_attempts threshold at which the handler surfaces to Dan
-SURFACE_TO_DAN_EXECUTION_THRESHOLD = 3
+SURFACE_TO_DAN_EXECUTION_THRESHOLD = _ESCALATE_SURFACE_EXECUTION_THRESHOLD
 
 # Registers that bypass auto-retry and surface directly to Dan
-HUMAN_JUDGMENT_REGISTERS = ("human-judgment", "philosophical")
-
-# Orphan return_reason values — infrastructure kills, no execution occurred
-ORPHAN_RETURN_REASONS = ("executor_orphan", "executing_orphan", "diagnosing_orphan",
-                         "orphan_kill_before_start", "orphan_kill_during_execution")
+HUMAN_JUDGMENT_REGISTERS = tuple(_ESCALATE_HUMAN_JUDGMENT_REGISTERS)
 
 # ---------------------------------------------------------------------------
 # Fixtures

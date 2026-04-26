@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
 from .registry import ApproveConfirmed, ApproveExpired, ApproveNotFound, ApproveSkipped
 from .paths import LOBSTER_WORKSPACE as _LOBSTER_WORKSPACE, WOS_CONFIG as _WOS_CONFIG_PATH_FROM_PATHS, WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG
+from .steward import ReturnReasonClassification
 
 
 # ---------------------------------------------------------------------------
@@ -626,7 +627,7 @@ _ESCALATE_HUMAN_JUDGMENT_REGISTERS: frozenset[str] = frozenset({
 # return_reason_classification values that indicate an infrastructure kill
 # (session killed before or during execution — no execution outcome produced).
 _ESCALATE_ORPHAN_CLASSIFICATIONS: frozenset[str] = frozenset({
-    "orphan",
+    ReturnReasonClassification.ORPHAN,
 })
 
 
