@@ -218,6 +218,12 @@ _TOKEN_FILE_MODE: int = stat.S_IRUSR | stat.S_IWUSR
 
 _INTERNAL_SECRET: str = os.environ.get("LOBSTER_INTERNAL_SECRET", "").strip()
 
+# AWP_IMPORT_TOKEN is used by the AWP webhook endpoint.
+# In the Google Apps Script that sends intake data, this is stored as LOBSTER_SECRET.
+_AWP_IMPORT_TOKEN: str = os.environ.get("AWP_IMPORT_TOKEN", "").strip()
+
+_INBOX_DIR: Path = _MESSAGES_DIR / "inbox"
+
 
 def _is_authorized_internal(request: Request) -> bool:
     """Return True if the request carries a valid LOBSTER_INTERNAL_SECRET."""
@@ -228,6 +234,21 @@ def _is_authorized_internal(request: Request) -> bool:
     if not auth_header.startswith("Bearer "):
         return False
     return auth_header[7:].strip() == _INTERNAL_SECRET
+
+
+def _is_authorized_awp(request: Request) -> bool:
+    """Return True if the request carries a valid AWP_IMPORT_TOKEN.
+
+    The Apps Script on the AWP side stores this token as LOBSTER_SECRET and
+    sends it as ``Authorization: Bearer <AWP_IMPORT_TOKEN>``.
+    """
+    if not _AWP_IMPORT_TOKEN:
+        logger.error("AWP_IMPORT_TOKEN not configured — awp-intake endpoint disabled")
+        return False
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return False
+    return auth_header[7:].strip() == _AWP_IMPORT_TOKEN
 
 
 async def push_calendar_token_endpoint(scope, receive, send):
