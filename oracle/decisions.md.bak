@@ -1,0 +1,101 @@
+
+### [2026-04-24] PR #905 R3 — feat(wos): add route_callback_message for compaction-resilient callback dispatch
+**Vision alignment:** The adversarial prior entering review was that PR #903 had already solved this problem adequately via bootup prose encoding, making PR #905 redundant complexity. That prior was disconfirmed. The learnings.md PR #894 entry documents the exact failure class — "notification surface wired before callback handling creates user-facing dead buttons" — and PR #903 recreated that failure in a slower form by using prose that loses reliability under context compaction. Principle-3 ("determinism over judgment for conditionals — if-then logic is code, not LLM instructions") and the route_wos_message golden pattern both anchor this PR structurally. Stage 1 finding unchanged from R2.
+**Alignment verdict:** Confirmed
+**Prior gap tracking (R3):**
+- Gap 1 (Merge conflict): Addressed. PR rebased; mergeStateStatus CLEAN, mergeable MERGEABLE. PR #903 verbose inline chains replaced by single route_callback_message step.
+- Gap 2 (Bootup doc contract incoherence): Addressed. Step 7 now calls route_callback_message(msg) unconditionally for all type="callback" messages and branches on result["handled"]. The False path falls through to step 8. No claim that handled is always True.
+**Quality finding:**
+- Both blocking gaps from R2 fully addressed; no new gaps introduced
+- Code implementation confirmed correct and unchanged from R2: two prefix branches, lazy Registry instantiation, CALLBACK_DATA_HANDLERS frozenset, local import preserves module importability
+- Encoded Orientation check satisfied: re-encoding of existing PR #903 decision; principle-3 is vision anchor; constraint-3 satisfied
+- Feature bundling clean: 3 files (bootup doc, dispatcher_handlers.py, test file), all described in PR body
+- 82 tests pass; 10 new tests cover status transitions, handled flag, chat_id echo, and fallthrough
+**Patterns introduced:** route_callback_message as a compaction-resilient entry point for callback dispatch — same structural form as route_wos_message. CALLBACK_DATA_HANDLERS frozenset as enumeration of handled prefixes. Both extend existing patterns.
+**What this forecloses:** Nothing material. The handled=False fallthrough preserves extensibility for future callback types.
+**Opportunity cost note:** None — correct closure of the PR #903 reliability gap.
+
+**VERDICT: APPROVED**
+
+### [2026-04-24] PR #906 R2 — feat: juice sensing and dispatch priority (re-oracle after gap fixes, commit 28eb4c1b)
+**Vision alignment:** Carried from Round 1 without modification. The adversarial prior was that this PR ships sensing + schema + dispatch in a single pass when the design spec explicitly named the sensing protocol as Phase 0 — a prerequisite requiring separate design specification before any schema or dispatch changes. The prior was partially confirmed (dead constant implied a gate that didn't exist, suggesting the sensing implementation was not fully reviewed against its own spec) and partially disconfirmed (clean pure-function design, mandatory rationale enforcement, correct non-fatal wrapping). The questioning is on record in learnings.md (PR #906 entry). The implementation is sound; the gap fixes close the blocking issues.
+**Alignment verdict:** Questioned (carried)
+**Quality finding:**
+- Gap 1 (dead constant): Addressed. `_score_completion_rate` now applies `if rate < JUICE_MIN_COMPLETION_RATE: return 0.0`. Behavioral test `test_completion_rate_below_minimum_returns_zero` asserts the gate consequence — satisfies the revision contract's "test must assert the behavioral consequence" requirement.
+- Gap 2 (private API): Addressed. `Registry.fetch_audit_entries(uow_id)` added as a public method wrapping `_connect()` internally (correct — Registry owns its connection management). `compute_juice()` now calls the public method; tests updated to mock at the public boundary.
+- Gap 3 (Encoded Orientation): Addressed per revision contract terms. `oracle/decisions.md` (created in this PR as a new file) contains ADR-001 with Dan's explicit approval, authorizing design thread (#886, #888, #889), and the starvation sequencing follow-on. Vision.yaml anchor not cited by field path within ADR-001 — advisory imprecision only; anchor is inferable from `active_project.phase_intent`. Future ADRs should cite the field path explicitly.
+- Feature bundling: clean — 7 files, all covered by PR description.
+- No new failure modes introduced by the gap fixes.
+**Patterns introduced:** (Carried from Round 1) Non-fatal sensing wrapper as advisory enrichment step; delta-gated write-back for per-cycle re-evaluation fields; pure-function sensing module with typed frozen dataclass inputs/outputs. New: `Registry.fetch_audit_entries()` as named public intent-bearing method at the registry boundary.
+**What this forecloses:** (Carried) `juice_quality` as unconstrained TEXT means future quality values extend the string convention rather than a typed enum; named and manageable.
+**Opportunity cost note:** Not applicable.
+
+**VERDICT: APPROVED**
+
+### [2026-04-24] PR #906 — feat: juice sensing and dispatch priority for WOS steward cycle
+**Vision alignment:** The adversarial prior was that this PR ships sensing + schema + dispatch in a single pass when the design spec (`assessments/juice-uow-integration-spec.md`) explicitly named the sensing protocol as Phase 0 — a prerequisite requiring separate design specification before any schema or dispatch changes. Issues #888 and #889 remain OPEN; the PR closes them by implementation rather than by prior design resolution. The concern is whether `JuiceSensor`'s signals (oracle approval rate, completion rate, completed prerequisites) constitute the validated sensing protocol the spec called for, or a heuristic assembled without the design pass that the spec said must come first. The oracle approval rate and completion rate are signals of past productivity — not of present generative aliveness, which is what the spec identified as the distinction that matters. This prior was partially confirmed by finding a dead constant (`JUICE_MIN_COMPLETION_RATE`) that implies a threshold gate exists in `_score_completion_rate` when none does — suggesting the sensing implementation was not fully reviewed against its own spec. The prior was partially disconfirmed by the clean pure-function design, mandatory rationale enforcement, and correct non-fatal wrapping — the implementation quality is sound. The sensing question is about whether the signals chosen are the right ones, not whether they are implemented correctly.
+**Alignment verdict:** Questioned
+**Quality finding:**
+- `JUICE_MIN_COMPLETION_RATE = 0.3` is declared, exported, and tested but never applied inside `_score_completion_rate` — dead constant implying a behavioral gate that does not exist; this is the PR #839 anti-pattern (test asserts constant value, not that constant is used)
+- `compute_juice()` calls `registry._connect()` directly — private API access from an external module; creates silent coupling risk if Registry changes connection management
+- Encoded Orientation check fires: juice-first dispatch ordering is a durable behavioral default change; no prior logged decision exists in oracle/decisions.md, oracle/verdicts/, or vision.yaml open_decisions — the assessments/ spec is a design document, not a logged authorization per constraint-3 (precedent: learnings.md PR #894)
+- Starvation mitigation named in the spec (K consecutive juice dispatches before a non-juice candidate) is absent; advisory, not blocking, because spec treats it as sequenceable
+**Patterns introduced:** Non-fatal sensing wrapper as advisory enrichment step in dispatch loop (correct pattern — sensing failure never blocks dispatch). Delta-gated write-back for per-cycle re-evaluation fields. Pure-function sensing module with typed frozen dataclass inputs/outputs.
+**What this forecloses:** `juice_quality` as unconstrained TEXT (no CHECK constraint, no enum) means future quality values beyond 'juice' extend the string convention rather than a typed enum; manageable but named.
+**Opportunity cost note:** Not applicable — this is the named spec implementation. The gap is the sensing protocol design process, which the spec said should precede implementation.
+
+**VERDICT: NEEDS_CHANGES**
+**Revision contract:**
+- Gap 1 (dead constant): Apply `JUICE_MIN_COMPLETION_RATE` as a gate inside `_score_completion_rate`, or remove the constant and update the test. The test must assert the behavioral consequence, not the constant's value.
+- Gap 2 (private API): Expose a public `fetch_audit_entries(uow_id)` on Registry, or document with explicit rationale why `_connect()` access is acceptable from juice.py.
+- Gap 3 (Encoded Orientation): Add a `vision.yaml open_decisions` entry (or oracle/decisions.md entry) recording Dan's authorization of juice-first dispatch ordering. The assessments/ spec serves as the reference; the logged decision is the authorization record.
+
+### [2026-04-24] PR #904 — feat(wos): shard-stream parallel dispatch
+**Vision alignment:** The adversarial prior was that WOS parallelism is premature — the active constraint in vision.yaml names oracle/verdict completeness and callback handler wiring, not throughput. That prior was partially confirmed: no current producer populates `file_scope`, so parallelism produces no immediate production benefit. It was disconfirmed on the design question: null-scope exclusivity preserves serial behavior as the default, making this a zero-footprint change for all existing UoWs. The learnings.md PR #714 "library with no wiring" pattern was the active prior — I checked specifically whether the gate runs in any production code path (it does: steward cycle main loop), distinguishing this from the #714 failure class. The Encoded Orientation check (constraint-3) was triggered by `max_parallel: 2` in `_DEFAULT_WOS_CONFIG` and was resolved by direct owner authorization and vision.yaml `active_project.current_phase` anchor.
+**Alignment verdict:** Confirmed
+**Quality finding:**
+- Four-gate pure function design is correct; typed DispatchAllowed/DispatchBlocked result extends the classification-result-as-typed-dataclass golden pattern to dispatch decisions
+- Within-cycle `_executing_uows` accumulation correctly prevents over-dispatch in a single heartbeat; `list_executing()` including `ready-for-executor` is conservative and correct (prevents overlap window between prescription and executor claim)
+- Migration file is correctly named 0012 but internal comment says "Migration 0011" — documentation error only, not schema error; advisory
+- `src/ooda/fast_thorough_selector.py` bundled as a cherry-pick to make build importable; acknowledged in PR description; module is standalone with no side effects; acceptable scoping
+**Patterns introduced:** Pure-function gate module with typed dispatch result; within-cycle in-flight accumulation pattern for over-dispatch prevention; `list_executing()` as named intent-bearing registry method.
+**What this forecloses:** Nothing. null-scope exclusivity preserves backward compatibility fully; `max_parallel` is runtime-configurable without code changes.
+**Opportunity cost note:** file_scope annotation infrastructure not yet wired in any producer; parallelism benefit is deferred until a follow-on PR populates the field at UoW creation time.
+
+**VERDICT: APPROVED**
+
+### [2026-04-24] PR #903 — wire decide_retry/decide_close callback handlers for needs-human-review escalation
+**Vision alignment:** The adversarial prior was that the inline buttons from PR #894 might be the wrong design — making this PR's wiring moot. That prior was disconfirmed by two structural facts: vision.yaml `current_focus.current_constraint` names "callback handlers (decide_retry, decide_close) are not yet dispatched" as the active constraint verbatim; and the handlers already exist as pure functions, making the gap a clean wiring gap under principle-4 ("wire what exists before building more"). The learnings.md PR #894 entry ("notification surface wired before callback handling creates user-facing dead buttons") identifies this exact failure class and names this PR as its correct resolution. The learnings.md oracle vocabulary caused me to check the PR specifically against the constraint-3 Encoded Orientation gate — confirmed satisfied because the handlers are pre-existing pure functions, not new automated behaviors.
+**Alignment verdict:** Confirmed
+**Quality finding:**
+- Steps 7 and 8 in the bootup doc callback table encode a full import + call chain in one bullet per step; encoding is dense but correct — all paths (hardcoded repo path, REGISTRY_DB constant, msg.get fallback for original_telegram_message_id) are verified against the production code
+- `original_telegram_message_id` field addition in lobster_bot.py is correctly placed at the producer; consumer uses `msg.get()` making it backward-compatible (None produces standalone reply rather than threaded, which is acceptable degradation)
+- Test assertions for non-blocked UoW error paths (`"not currently in"` or `"could not be"`) verified against actual production return strings — not softened assertions
+- Feature bundling check clean: 3 files changed, all three described in PR body
+**Patterns introduced:** Callback prefix-dispatch template in bootup doc — `data.startswith("<prefix>:")` followed by slice, import, instantiate, call, threaded reply. Template is now encoded for future callback types.
+**What this forecloses:** Nothing material. Advisory-to-hook promotion path (golden-patterns.md 2026-04-22) remains available if the callback table grows.
+**Opportunity cost note:** None — this is the named active constraint closure from vision.yaml current_focus.
+
+### [2026-04-23] PR #900 — populate UoW artifacts field from write_result payload
+**Vision alignment:** The adversarial prior was "stored-but-unread data" — the library-with-no-wiring pattern (learnings.md PR #714). The oracle vocabulary caused me to specifically check for downstream consumers reading `uow_registry.artifacts`. None are introduced. The distinction from PR #714 is structural: the `artifacts` column is directly queryable without new import wiring, unlike a routing module that requires a caller. The write path now exists; a read path adds no schema changes. Serves the WOS substrate goal (richer completion records) and principle-4 (wire what exists before building more — the write path is now complete, enabling the read path without DB schema changes). Issue #880 closes correctly.
+**Alignment verdict:** Confirmed
+**Quality finding:**
+- Migration safe: `ALTER TABLE uow_registry ADD COLUMN artifacts TEXT NULL` is backward-compatible, forward-only, existing rows get NULL default
+- Non-fatal failure path correctly placed: artifact extraction wrapped in try/except after the UoW transition succeeds; failure logged and swallowed; does not block ready-for-steward
+- Naming ambiguity between `_extract_outcome_refs` and `_extract_artifact_refs` documented in a docstring note; structural difference (typed list vs. dict) is observable; not a correctness defect
+- SHA keyword-gate is document-level (not proximity-level) — a documented heuristic gap acceptable for an advisory field; 24 new tests cover pure function, DB write, and end-to-end including non-fatal failure case
+**Patterns introduced:** Registry enrichment at completion time as a non-fatal advisory field — correct pattern for observability data that must not block the main transition arc.
+**What this forecloses:** A more structured approach where subagents explicitly declare typed artifacts at write_result time; extractable without schema changes if that path is pursued.
+**Opportunity cost note:** No downstream consumer reads `artifacts` at merge time. Field is queryable; first reader completes the wire.
+
+### [2026-04-23] PR #899 — remove stale spiral gate NOTEs in steward.py
+**Vision alignment:** The stale NOTEs claiming the spiral gate was "structurally correct but non-functional" were accurate before PR #865 (merged 2026-04-23T16:13:31Z) and false after it. The adversarial prior was that oracle_approved events might not be genuinely wired — disconfirmed by verifying oracle_audit.py and PR #865 merge state. The learnings.md PR #607 pattern (comment/code mismatch causes silent state divergence) was the active prior: a reader of _count_oracle_passes() oriented by stale NOTEs would investigate a non-problem or attempt duplicate implementation. Removing the stale NOTEs and pointing to oracle_audit.py is the minimum correct action; it completes the documentation of what PR #865 wired. Consistent with principle-4 (wire what exists before building more) — completing the documentation loop is part of "wiring."
+**Alignment verdict:** Confirmed
+**Quality finding:**
+- Replacement text in both locations (docstring and inline comment) verified accurate against oracle_audit.py implementation and PR #865 lobster-oracle.md changes
+- No behavior change; 48 tests pass; diff is comment-only
+- Encoded Orientation check: not applicable (no agent definitions, bootup docs, or CLAUDE.md modified)
+- Feature bundling check: 1 file, PR description matches scope exactly
+**Patterns introduced:** None — this PR removes content.
+**What this forecloses:** Nothing.
+**Opportunity cost note:** None material.
