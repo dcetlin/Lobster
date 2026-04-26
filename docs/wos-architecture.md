@@ -2,6 +2,17 @@
 *Produced: 2026-04-26*
 *Covers PRs #965–#981*
 
+## Related Documents
+
+**Supersedes:** [escalation-architecture-20260426.md](../workstreams/wos/reports/escalation-architecture-20260426.md) *(ASCII diagrams, pre-PRs #980–#981)*
+
+**Referenced by:**
+- [WOS Failure Runbook](../workstreams/wos/runbooks/failure-diagnosis.md) — failure signatures and triage procedure
+- [Self-Diagnosing Subagent Design](../workstreams/wos/design/self-diagnosing-subagent-design.md) — T1-B implementation context
+- [Vision Inlet Design](../workstreams/wos/design/vision-inlet-design.md) — T2-C observation loop
+
+**Key PRs:** #965 (execution_attempts), #966 (escalation consolidation), #967 (trace.json orphan diagnosis), #968 (heartbeat kill classification), #970 (wos_escalate handler), #973 (exhaustiveness test), #974 (steward write path), #976 (registry_cli trace), #980 (wos_diagnose handler), #981 (wos_surface handler)
+
 Source files read:
 - `~/lobster/src/orchestration/steward.py` — lifecycle, execution_attempts, orphan classification, escalation write paths
 - `~/lobster/src/orchestration/dispatcher_handlers.py` — handle_wos_escalate, handle_wos_surface, handle_wos_diagnose, route_wos_message
@@ -11,201 +22,107 @@ Source files read:
 
 ## Section 1: UoW Lifecycle State Machine
 
+> See also: [WOS Failure Runbook](../workstreams/wos/runbooks/failure-diagnosis.md) — for failure signatures (kill-before-start, kill-during-execution, dead-prescription-loop) that correspond to the transitions shown here.
+
+```mermaid
+stateDiagram-v2
+    [*] --> proposed
+    proposed --> pending : operator approves
+    proposed --> expired : 14-day window exceeded
+    pending --> ready_for_steward : auto-advance on write
+    ready_for_steward --> cancelled : germination gate (issue closed/stale)
+
+    ready_for_steward --> ready_for_executor : steward _process_uow() prescribes
+    ready_for_steward --> ready_for_steward : diagnosis loop (prescribe again)
+
+    ready_for_executor --> active : executor-heartbeat dispatches wos_execute\n(checks execution_enabled + file_scope shard gate)
+
+    active --> executing : subagent writes result.json and calls write_result()
+    active --> orphan_recovery : timeout without heartbeat\n(steward detects stall)
+    orphan_recovery --> ready_for_steward : orphan classified and re-queued
+
+    executing --> done : next steward cycle reads result\noutcome=complete
+    executing --> diagnosing : outcome=failed/partial/blocked
+
+    diagnosing --> ready_for_executor : execution_attempts ≤ MAX_RETRIES\nis_infra_event=True → attempts NOT incremented\nis_infra_event=False → attempts incremented+1
+    diagnosing --> needs_human_review : execution_attempts > MAX_RETRIES\nappend_audit_log(retry_cap_exceeded)\nthen escalation path
+
+    needs_human_review --> ready_for_steward : operator /decide retry
+    needs_human_review --> failed : operator /decide abandon
+
+    done --> [*]
+    failed --> [*]
+    cancelled --> [*]
+    expired --> [*]
 ```
-UNIT OF WORK STATUS TRANSITIONS
-=================================
 
-                    [operator approves]
-  proposed ─────────────────────────────> pending
-                                              |
-                                    [auto-advance on write]
-                                              |
-                                              v
-                                    ready-for-steward
-                                              |
-                              steward-heartbeat.py runs
-                              _process_uow()
-                                              |
-                              +───────────────+───────────────+
-                              |                               |
-                       [diagnosis loop]               [germination gate]
-                       prescribe again                 issue closed/stale
-                              |                               |
-                              v                               v
-                      ready-for-executor                  cancelled
-                              |
-                   executor-heartbeat.py
-                   checks execution_enabled
-                   + file_scope shard gate
-                   dispatches wos_execute message
-                              |
-                              v
-                           active
-                              |
-                   subagent runs, writes heartbeats
-                   every 60–90 seconds
-                              |
-                   [on timeout without heartbeat]
-                   Steward detects stall ──────────> orphan recovery
-                              |
-                   subagent writes result.json
-                   and calls write_result()
-                              |
-                              v
-                           executing
-                              |
-                   [next steward cycle reads result]
-                              |
-            +─────────────────+──────────────────+
-            |                                    |
-     outcome=complete                   outcome=failed/partial/blocked
-            |                                    |
-            v                                    v
-          done                         return_reason classification
-                                                 |
-                     +───────────────────────────+───────────────────────────+
-                     |                           |                           |
-               is_infra_event=True       is_infra_event=False           error/abnormal
-               (orphan return reason)    (confirmed execution)          (non-infra)
-                     |                           |                           |
-               execution_attempts         execution_attempts              execution_attempts
-               NOT incremented             incremented +1                 incremented +1
-                     |                           |                           |
-                     +─────────────┬─────────────+                           |
-                                   |                                         |
-                     execution_attempts > MAX_RETRIES (3)?                   |
-                     (PR #965: gates on confirmed dispatches only)           |
-                                   |                                         |
-                        +──────────+──────────+                              |
-                        |                     |                              |
-                      YES                    NO                              |
-                        |                     |                              |
-                        v                     v                              v
-           registry transition:         prescribe again                 steward_cycles
-           diagnosing →                 ready-for-executor               incremented,
-           needs-human-review                                             prescribe again
-           append_audit_log(retry_cap_exceeded)
-                        |
-           [escalation_notifier injected?]
-                        |
-              +─────────+─────────+
-              |                   |
-          collector path       direct path
-          (consolidated)       (no collector)
-              |                   |
-              v                   v
-       _collect_escalation()  _write_wos_escalate_message()
-       append to              writes inbox JSON type="wos_escalate"
-       _pending_escalations
-
-
-TERMINAL STATES
-================
-  done                — all prescribed steps confirmed complete
-  failed              — user_closed (decide-close) OR hard_cap_cleanup
-  cancelled           — germination gate: issue closed
-  needs-human-review  — retry cap exceeded; awaiting human decision
-  expired             — proposal exceeded 14-day window without approval
-```
+**Terminal states:**
+- `done` — all prescribed steps confirmed complete
+- `failed` — user_closed (decide-close) OR hard_cap_cleanup
+- `cancelled` — germination gate: issue closed
+- `needs-human-review` — retry cap exceeded; awaiting human decision
+- `expired` — proposal exceeded 14-day window without approval
 
 ---
 
 ## Section 2: Steward Cycle Flow
 
-```
-STEWARD CYCLE (steward-heartbeat.py → run_steward_cycle)
-==========================================================
+> See also: [Self-Diagnosing Subagent Design](../workstreams/wos/design/self-diagnosing-subagent-design.md) — T1-B covers the planned replacement of inline triage with a tool-backed diagnosis subagent spawned from this cycle.
 
-steward cycle begins
-  _pending_escalations = []
-        |
-        v
-  for each UoW in ready-for-steward:
-  [BOOTUP_CANDIDATE_GATE: skip if issue has bootup-candidate label AND gate not cleared]
-        |
-        v
-  ORPHAN RECOVERY ARC (PR #967, PR #968)
-  ----------------------------------------
-  Is UoW reentry posture in _ORPHAN_POSTURES?
-  (executor_orphan, executing_orphan, diagnosing_orphan)
-        |
-       YES
-        |
-        v
-  _classify_orphan_from_trace(trace_data, output_ref):
-    Priority 1: result.json present alongside output_ref?
-      → "completed_without_output"
-    Priority 2: trace.json absent?
-      → "kill_before_start" (default)
-    Priority 3: trace.json has surprises or prescription_delta?
-      → "kill_during_execution"
-    Default:
-      → "kill_before_start"
+```mermaid
+flowchart TD
+    A([steward cycle begins\n_pending_escalations = []]) --> B
 
-  Write orphan_kill_classified audit entry:
-    {kill_type, heartbeats_before_kill, ts}
+    B[for each UoW in ready-for-steward\nBOOTUP_CANDIDATE_GATE: skip if label set] --> C
 
-  (heartbeat-based classification added by PR #968 — distinguishes
-   orphan_kill_before_start vs orphan_kill_during_execution)
+    C{Is UoW reentry posture\nin _ORPHAN_POSTURES?\nexecutor_orphan / executing_orphan\n/ diagnosing_orphan} -->|YES| D
+    C -->|NO| I
 
-  EXECUTION ATTEMPTS ACCOUNTING (PR #965)
-  -----------------------------------------
-  return_reason in ORPHAN_REASONS (executor_orphan / executing_orphan /
-  diagnosing_orphan)?
-        |
-       YES → is_infra_event = True  → execution_attempts NOT incremented
-        NO → is_infra_event = False → execution_attempts incremented +1
+    D[_classify_orphan_from_trace\ntrace_data + output_ref] --> E
 
-  new_execution_attempts > MAX_RETRIES (3)?
-        |
-  +─────+─────+
-  |           |
- YES          NO
-  |           |
-  v           v
-  RETRY CAP EXCEEDED        prescribe again
-  ──────────────────        ready-for-executor
-  transition: diagnosing → needs-human-review
-  append_audit_log(retry_cap_exceeded)
+    E{result.json present\nalongside output_ref?} -->|YES → completed_without_output| F
+    E -->|NO| E2
 
-  escalation_notifier injected? (only when NOT dry_run)
-        |
-  +─────+─────+
-  |           |
-  YES          NO
-  |           |
-  v           v
-  _collect_escalation(uow):  _write_wos_escalate_message() immediately
-    - read audit_log           type="wos_escalate"
-    - extract execution_attempts from retry_cap_exceeded entry
-    - determine reentry_posture
-    - append EscalationRecord to _pending_escalations
+    E2{trace.json absent?} -->|YES → kill_before_start default| F
+    E2 -->|NO| E3
 
-  [end of UoW loop]
+    E3{trace.json has surprises\nor prescription_delta?} -->|YES → kill_during_execution| F
+    E3 -->|DEFAULT → kill_before_start| F
 
-  EARLY WARNING CHECK
-  --------------------
-  lifetime_cycles + new_steward_cycles >= _EARLY_WARNING_CYCLES (4)?
-    → write wos_early_warning message to inbox (informational, no routing)
+    F[Write orphan_kill_classified audit entry\nkill_type + heartbeats_before_kill + ts] --> G
 
-  ESCALATION CONSOLIDATION (PR #966)
-  ------------------------------------
-  len(_pending_escalations) >= ESCALATION_CONSOLIDATION_THRESHOLD (3)?
-        |
-  +─────+─────+
-  |           |
-  YES          NO
-  |           |
-  v           v
-  _send_consolidated_    for each EscalationRecord:
-  escalation_            _write_wos_escalate_message()
-  notification()         (individual wos_escalate per UoW)
-    writes ONE message:
-    type: "wos_surface"
-    condition: "retry_cap_consolidated"
-    escalation_count: N
-    causes: [raw return_reasons]
-    uow_ids: [all affected UoWs]
+    G{return_reason in\nORPHAN_REASONS?} -->|YES → is_infra_event=True\nexecution_attempts NOT incremented| H
+    G -->|NO → is_infra_event=False\nexecution_attempts incremented +1| H
+
+    I[Normal processing path] --> H
+
+    H{execution_attempts\n> MAX_RETRIES?} -->|YES| J
+    H -->|NO| K
+
+    J[RETRY CAP EXCEEDED\ntransition: diagnosing → needs-human-review\nappend_audit_log retry_cap_exceeded] --> L
+
+    K[prescribe again\nready-for-executor] --> N
+
+    L{escalation_notifier\ninjected?\nnot dry_run} -->|YES - collector path| M
+    L -->|NO - direct path| M2
+
+    M[_collect_escalation:\nread audit_log\nextract execution_attempts\ndetermine reentry_posture\nappend EscalationRecord to _pending_escalations] --> N
+
+    M2[_write_wos_escalate_message\ntype=wos_escalate] --> N
+
+    N([end of UoW loop]) --> O
+
+    O{lifetime_cycles + steward_cycles\n>= _EARLY_WARNING_CYCLES 4?} -->|YES| P
+    O -->|NO| Q
+
+    P[write wos_early_warning\nto inbox - informational] --> Q
+
+    Q{len _pending_escalations\n>= THRESHOLD 3?} -->|YES| R
+    Q -->|NO| S
+
+    R[_send_consolidated_escalation_notification\nONE message:\ntype=wos_surface\ncondition=retry_cap_consolidated\nescalation_count=N\ncauses + uow_ids] --> T([cycle complete])
+
+    S[for each EscalationRecord:\n_write_wos_escalate_message\nindividual wos_escalate per UoW] --> T
 ```
 
 ---
@@ -214,368 +131,216 @@ steward cycle begins
 
 ### Track A — wos_escalate (per-UoW)
 
+> See also: [Self-Diagnosing Subagent Design](../workstreams/wos/design/self-diagnosing-subagent-design.md) — the 4-branch dispatcher tree below is the T1-B inline triage that the self-diagnosing subagent is designed to replace.
+
+**Message fields written by `_write_wos_escalate_message()`:**
+
 ```
-STEWARD WRITES wos_escalate
-=============================
+type: "wos_escalate"
+uow_id: <str>
+uow_title: <str>
+register: <operational|human-judgment|philosophical|iterative-convergent>
+failure_history:
+  execution_attempts: <int>          (confirmed dispatches, not total retries)
+  return_reason_classification: <str> (orphan|error|abnormal)
+  kill_type: <str>                   (orphan_kill_before_start|orphan_kill_during_execution)
+  heartbeats_before_kill: <int>      (0 = killed before execution)
+posture: <str>                       (trace-diagnosed reentry posture)
+suggested_action: <str>             (mirrors 4-branch tree; informational)
+```
 
-  Condition: UoW exhausts retry cap
-  Writer: _write_wos_escalate_message()
-  Trigger: direct path (no collector) OR collector below threshold
+```mermaid
+flowchart TD
+    A([Dispatcher receives wos_escalate\nroute_wos_message → handle_wos_escalate\nruns before spawn-gate]) --> B4
 
-  Message fields:
-    type: "wos_escalate"
-    uow_id: <str>
-    uow_title: <str>
-    register: <operational|human-judgment|philosophical|iterative-convergent>
-    failure_history:
-      execution_attempts: <int>          (confirmed dispatches, not total retries)
-      return_reason_classification: <str> (orphan|error|abnormal)
-      kill_type: <str>                   (orphan_kill_before_start|orphan_kill_during_execution)
-      heartbeats_before_kill: <int>      (0 = killed before execution)
-    posture: <str>                       (trace-diagnosed reentry posture)
-    suggested_action: <str>             (mirrors 4-branch tree; informational)
+    B4{register in\nhuman-judgment\nor philosophical?} -->|YES| C4[action=send_reply\nsurface to Dan\n/decide proceed or abandon]
+    B4 -->|NO| B3
 
+    B3{execution_attempts\n>= 3?} -->|YES| C3[action=send_reply\nsurface to Dan\n/decide retry or abandon]
+    B3 -->|NO| B1
 
-DISPATCHER RECEIVES wos_escalate
-===================================
+    B1{execution_attempts == 0\nAND classification == orphan?} -->|YES| C1[action=spawn_subagent\ntask_id: escalate-retry-<uow_id12>\nprompt: run steward-heartbeat.py\nauto-retry: no budget consumed]
+    B1 -->|NO| B2
 
-  route_wos_message(msg) → handle_wos_escalate(msg)
-  [wos_escalate runs before spawn-gate: legitimately returns send_reply OR spawn_subagent]
+    B2{execution_attempts > 0\nAND classification == orphan?} -->|YES| C2[action=spawn_subagent\ntask_id: escalate-midexec-<uow_id12>\nprompt: run steward-heartbeat.py\nretry with resume context]
+    B2 -->|NO| CD[DEFAULT: action=send_reply\nsurface to Dan for review\nunclassified failure]
 
-  Decision tree — checked in order (first match wins):
+    C1 --> ACT_SPAWN
+    C2 --> ACT_SPAWN
+    C3 --> ACT_REPLY
+    C4 --> ACT_REPLY
+    CD --> ACT_REPLY
 
-  ┌─ BRANCH 4: Human-judgment register ──────────────────────────────┐
-  │  register in {"human-judgment", "philosophical"}?                 │
-  │  → action=send_reply                                              │
-  │    surface to Dan: [/decide proceed] or [/decide abandon]        │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ BRANCH 3: Execution cap exhausted ──────────────────────────────┐
-  │  execution_attempts >= 3?                                         │
-  │  (prescription attempted 3+ times — retrying loops without       │
-  │   diagnosis)                                                      │
-  │  → action=send_reply                                              │
-  │    surface to Dan: [/decide retry] or [/decide abandon]          │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ BRANCH 1: Pure infrastructure failure ──────────────────────────┐
-  │  execution_attempts == 0 AND classification == "orphan"?          │
-  │  (UoW never executed — session killed before agent started)       │
-  │  → action=spawn_subagent                                          │
-  │    task_id: escalate-retry-<uow_id[:12]>                         │
-  │    prompt: run steward-heartbeat.py                               │
-  │    (auto-retry; no execution budget consumed)                     │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ BRANCH 2: Mid-execution kill ────────────────────────────────────┐
-  │  execution_attempts > 0 AND classification == "orphan"?           │
-  │  (agent was executing when session was killed; partial work may   │
-  │   exist)                                                           │
-  │  → action=spawn_subagent                                          │
-  │    task_id: escalate-midexec-<uow_id[:12]>                       │
-  │    prompt: run steward-heartbeat.py                               │
-  │    (retry with resume context)                                    │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ DEFAULT: Unclassified failure ────────────────────────────────────┐
-  │  → action=send_reply                                              │
-  │    surface to Dan for review                                      │
-  └───────────────────────────────────────────────────────────────────┘
-
-
-DISPATCHER ACTS
-================
-
-  action=spawn_subagent                    action=send_reply
-          |                                        |
-          v                                        v
-  spawn background subagent           send_reply(chat_id=ADMIN_CHAT_ID)
-  runs steward-heartbeat.py                        |
-          |                            Dan sees Telegram notification
-          v                            /decide <uow_id> retry|abandon|defer
-  steward re-queues UoW
-  → ready-for-executor
-  executor dispatches again
+    ACT_SPAWN([spawn background subagent\nruns steward-heartbeat.py\nsteward re-queues UoW → ready-for-executor\nexecutor dispatches again])
+    ACT_REPLY([send_reply to ADMIN_CHAT_ID\nDan sees Telegram notification\n/decide retry|abandon|defer])
 ```
 
 ### Track B — wos_surface (batch kill-wave)
 
+**Condition A (PR #966):** >= 3 UoWs escalate in one steward cycle — replaces N individual `wos_escalate` messages.
+
+**Condition B (fallback):** `_write_wos_escalate_message()` raises OSError — falls through to surface-all-to-Dan branch.
+
+```mermaid
+flowchart TD
+    A([Dispatcher receives wos_surface\nroute_wos_message → handle_wos_surface\nruns before spawn-gate]) --> BP
+
+    BP{is_execution_enabled\n== False?} -->|YES| CP[action=send_reply\nnotify Dan: pipeline paused\nlist all UoW IDs\nsuggest /wos start then /decide retry each]
+    BP -->|NO| BA
+
+    BA{every causes_i in\n_SURFACE_ORPHAN_RETURN_REASONS?} -->|YES - single infra kill wave\nno budget consumed| CA[action=spawn_subagent\ntask_id: surface-batch-retry-NuoW\nprompt: run steward-heartbeat.py once\nre-queues all\nalso sends Dan brief summary notification]
+    BA -->|NO| BM
+
+    BM{some causes orphan\nsome not?} -->|YES - mixed causes| CM[action=send_reply\nsurface non-orphan UoWs to Dan\nlist orphan UoWs separately\nwith /decide retry suggestion\nnote: one action only - no concurrent spawn+reply]
+    BM -->|NO - all non-orphan or no causes list| CD[DEFAULT: action=send_reply\nsurface all UoW IDs to Dan]
 ```
-STEWARD WRITES wos_surface
-============================
 
-  Condition A (PR #966): >= 3 UoWs escalate in one steward cycle
-  Writer: _send_consolidated_escalation_notification()
-    condition: "retry_cap_consolidated"
-    escalation_count: N
-    causes: [return_reason per UoW, positionally aligned with uow_ids]
-    uow_ids: [all affected UoW IDs]
-
-  Condition B (fallback): _write_wos_escalate_message() raises OSError
-  Writer: _send_escalation_notification()
-    condition: "retry_cap"
-    uow_id: <singular>
-    (no causes list — falls through to surface-all-to-Dan branch)
-
-
-DISPATCHER RECEIVES wos_surface (PR #981)
-==========================================
-
-  route_wos_message(msg) → handle_wos_surface(msg)
-  [wos_surface runs before spawn-gate: same exemption as wos_escalate]
-
-  Decision tree — checked in order (first match wins):
-
-  ┌─ BRANCH: Pipeline paused ─────────────────────────────────────────┐
-  │  is_execution_enabled() == False?                                  │
-  │  (do not auto-retry into a stopped pipeline)                       │
-  │  → action=send_reply                                               │
-  │    notify Dan: pipeline is paused, list all UoW IDs               │
-  │    suggest: /wos start, then /decide retry for each               │
-  └────────────────────────────────────────────────────────────────────┘
-
-  ┌─ BRANCH: All causes are orphan return_reasons ─────────────────────┐
-  │  every causes[i] in _SURFACE_ORPHAN_RETURN_REASONS?                │
-  │  (single infrastructure kill wave; no execution budget consumed)   │
-  │  → action=spawn_subagent                                           │
-  │    task_id: surface-batch-retry-<N>uow                            │
-  │    prompt: run steward-heartbeat.py once (re-queues all)          │
-  │    also sends Dan a brief summary notification (no action needed)  │
-  └────────────────────────────────────────────────────────────────────┘
-
-  ┌─ BRANCH: Mixed causes ─────────────────────────────────────────────┐
-  │  some causes are orphan, some are not?                             │
-  │  → action=send_reply                                               │
-  │    surface non-orphan UoWs to Dan                                  │
-  │    list orphan UoWs separately with /decide retry suggestion       │
-  │    (note: handler returns one action; no concurrent spawn+reply)   │
-  └────────────────────────────────────────────────────────────────────┘
-
-  ┌─ DEFAULT: All non-orphan or no causes list ───────────────────────┐
-  │  → action=send_reply                                               │
-  │    surface all UoW IDs to Dan                                      │
-  └────────────────────────────────────────────────────────────────────┘
-
-
-_SURFACE_ORPHAN_RETURN_REASONS (raw return_reason strings):
-  executor_orphan
-  executing_orphan
-  diagnosing_orphan
-  orphan_kill_before_start
-  orphan_kill_during_execution
-```
+**`_SURFACE_ORPHAN_RETURN_REASONS` (raw return_reason strings):**
+- `executor_orphan`
+- `executing_orphan`
+- `diagnosing_orphan`
+- `orphan_kill_before_start`
+- `orphan_kill_during_execution`
 
 ---
 
 ## Section 4: Diagnosis Path
 
+> See also: [Self-Diagnosing Subagent Design](../workstreams/wos/design/self-diagnosing-subagent-design.md) — full implementation spec for the subagent spawned by this path, including the diagnosis algorithm, safety constraints, and PR sequence.
+
+```mermaid
+flowchart TD
+    A([Dan types: diagnose uow_id in Telegram]) --> B
+
+    B[Dispatcher: parse_diagnose_command\npattern: 'diagnose ' prefix case-insensitive\nextracts uow_id token] --> C
+
+    C{uow_id\nresolved?} -->|None| Z([no-op])
+    C -->|non-None| D
+
+    D[Dispatcher writes wos_diagnose to inbox\ntype=wos_diagnose\nuow_id\nescalation_id=empty - manual trigger\nescalation_trigger=manual\nfailure_history=empty] --> E
+
+    E[route_wos_message → handle_wos_diagnose\nruns inside spawn-gate\nalways returns action=spawn_subagent] --> F
+
+    F[_resolve_uow_id raw_uow_id\ntoday: direct pass-through\nfuture PR: short-ID lookup via registry] --> G
+
+    G([Spawns diagnostic subagent\ntask_id: wos-diagnose-uow_id12\nagent_type: lobster-generalist]) --> H
+
+    H[Step 1: registry_cli trace --id uow_id\nread: diagnosis_hint, return_reasons,\nexecution_attempts, kill_classification] --> I
+
+    I{Apply diagnosis algorithm\nORPHAN_REASONS check} --> IA & IB & IC & ID & IE & IF
+
+    IA{ALL return_reasons in ORPHAN_REASONS\nAND execution_attempts == 0?} -->|YES| PA[posture=reset\npattern=infrastructure-kill-wave]
+    IB{ALL in ORPHAN_REASONS\nAND kill_type == orphan_kill_before_start?} -->|YES| PB[posture=reset\npattern=kill-before-start]
+    IC{ALL in ORPHAN_REASONS\nAND kill_type == orphan_kill_during_execution?} -->|YES| PC[posture=reset\npattern=kill-during-execution]
+    ID{execution_attempts\n>= MAX_RETRIES 3?} -->|YES| PD[posture=surface-to-human\npattern=genuine-retry-cap\nrun registry_cli get for steward_log context]
+    IE{lifetime_cycles\n>= HARD_CAP?} -->|YES| PE[posture=surface-to-human\npattern=hard-cap]
+    IF{steward_cycles >= 3\nAND execution_attempts == 0\nAND no orphan reasons?} -->|YES| PF[posture=surface-to-human\npattern=dead-prescription-loop]
+
+    PA & PB & PC --> CHECK_CONFIG
+    PD & PE & PF --> SURFACE
+
+    CHECK_CONFIG[Step 3: check wos-config.json\nexecution_enabled?] --> CG
+
+    CG{execution_enabled\n== false?} -->|YES - override| SURFACE
+    CG -->|NO| RESET_ACT
+
+    RESET_ACT[Step 5: registry_cli decide-retry --id uow_id] --> WR
+
+    SURFACE --> WR
+
+    WR[Step 6: write_result\ntask_id\nchat_id=0\nsent_reply_to_user=False\nstructured JSON diagnosis output] --> DISP
+
+    DISP([Dispatcher receives subagent_notification\ndecides whether to relay surface_message to Dan])
 ```
-DIAGNOSIS PATH (PR #980)
-==========================
 
-  Dan types: "diagnose <uow_id>" in Telegram
-          |
-          v
-  Dispatcher: parse_diagnose_command(text)
-    - pattern: "diagnose " prefix (case-insensitive)
-    - extracts uow_id token
-    - returns uow_id or None
-          |
-          v  (non-None)
-  Dispatcher writes wos_diagnose message to inbox:
-    type: "wos_diagnose"
-    uow_id: <str>
-    escalation_id: "" (manual trigger)
-    escalation_trigger: "manual"
-    failure_history: {} (no pre-computed context)
-          |
-          v
-  route_wos_message(msg) → handle_wos_diagnose(msg)
-  [runs inside spawn-gate: always returns action="spawn_subagent"]
-          |
-          v
-  _resolve_uow_id(raw_uow_id):
-    Today: direct pass-through (full IDs unchanged)
-    Future PR: short-ID lookup via registry
-          |
-          v
-  Spawns diagnostic subagent:
-    task_id: wos-diagnose-<uow_id[:12]>
-    agent_type: "lobster-generalist"
-          |
-          v
-  SUBAGENT RUNS DIAGNOSIS ALGORITHM
-  -----------------------------------
-  Step 1: uv run registry_cli.py trace --id <uow_id>
-          Read: diagnosis_hint, return_reasons, execution_attempts,
-                kill_classification
-          |
-  Step 2: Apply diagnosis algorithm (mirrors _suggest_diagnosis logic):
-          ORPHAN_REASONS = {executor_orphan, executing_orphan,
-                            diagnosing_orphan, orphan_kill_before_start,
-                            orphan_kill_during_execution}
-
-    - ALL return_reasons in ORPHAN_REASONS AND execution_attempts == 0?
-        posture=reset, pattern="infrastructure-kill-wave"
-    - ALL return_reasons in ORPHAN_REASONS AND
-      kill_type == "orphan_kill_before_start"?
-        posture=reset, pattern="kill-before-start"
-    - ALL return_reasons in ORPHAN_REASONS AND
-      kill_type == "orphan_kill_during_execution"?
-        posture=reset, pattern="kill-during-execution"
-    - execution_attempts >= MAX_RETRIES (3)?
-        posture=surface-to-human, pattern="genuine-retry-cap"
-        (also runs: registry_cli get --id <uow_id> for steward_log context)
-    - lifetime_cycles >= HARD_CAP?
-        posture=surface-to-human, pattern="hard-cap"
-    - steward_cycles >= 3 AND execution_attempts == 0 AND no orphan reasons?
-        posture=surface-to-human, pattern="dead-prescription-loop"
-    - Otherwise:
-        posture=surface-to-human, pattern="unrecognised"
-          |
-  Step 3: Check wos-config.json:
-          execution_enabled == False?
-          → override posture to surface-to-human (never reset into stopped pipeline)
-          |
-  Step 4: Status check before decide-retry:
-          status == "needs-human-review"?
-          → surface-to-human with note: "status must be blocked first"
-          (registry_cli decide-retry accepts blocked or ready-for-steward only)
-          |
-  Step 5 (if posture=reset AND status is blocked/ready-for-steward):
-          uv run registry_cli.py decide-retry --id <uow_id>
-          |
-  Step 6: write_result(task_id, chat_id=0, sent_reply_to_user=False)
-          Outputs structured JSON diagnosis:
-          {
-            event, uow_id, escalation_id, escalation_trigger,
-            pattern_matched, confidence, posture,
-            action_taken, rationale,
-            execution_attempts_at_diagnosis, lifetime_cycles_at_diagnosis,
-            surface_message (if posture=surface-to-human),
-            timestamp
-          }
-          |
-  [Dispatcher receives write_result notification and decides
-   whether to relay surface_message to Dan]
-
-
-CONSTRAINTS
-============
-  - Max 3 shell commands total: trace + optionally get + optionally decide-retry
-  - Never call decide-close (requires human confirmation)
-  - Never send Telegram messages directly (write_result only)
-  - One UoW per invocation — no batch loops
+**Diagnosis output JSON fields:**
 ```
+event, uow_id, escalation_id, escalation_trigger,
+pattern_matched, confidence, posture,
+action_taken, rationale,
+execution_attempts_at_diagnosis, lifetime_cycles_at_diagnosis,
+surface_message (if posture=surface-to-human),
+timestamp
+```
+
+**Constraints:**
+- Max 3 shell commands total: trace + optionally get + optionally decide-retry
+- Never call decide-close (requires human confirmation)
+- Never send Telegram messages directly (write_result only)
+- One UoW per invocation — no batch loops
 
 ---
 
 ## Section 5: Forensics — registry_cli trace
 
+> See also: [WOS Failure Runbook](../workstreams/wos/runbooks/failure-diagnosis.md) — operational procedures for reading trace output and triaging each failure signature.
+
+**Invocation:** `uv run registry_cli.py trace --id <uow_id>`
+
+`cmd_trace()` joins five data sources:
+
+1. `registry.get(uow_id)` → `current_state`: {status, execution_attempts, lifetime_cycles, steward_cycles, retry_count, heartbeat_at, output_ref, close_reason, started_at}
+2. `registry.fetch_audit_entries(uow_id)` → `audit_log`: chronological list of all status transitions, retry_cap events, orphan_kill_classified entries
+3. `registry.fetch_corrective_traces(uow_id)` → `corrective_traces`: executor observations per attempt (partial work, context from prior runs)
+4. `_extract_return_reasons(audit_entries)` → `return_reasons`: [{ts, event, return_reason}] from audit note JSON
+5. `_extract_kill_classification(audit_entries)` → `kill_classification`: most recent orphan_kill_classified entry {kill_type, heartbeats_before_kill, ts} or null
+6. `_read_trace_json(output_ref)` → `trace_json`: parsed trace.json from output_ref path, or null
+   - Primary: `Path(output_ref).with_suffix(".trace.json")`
+   - Fallback: `Path(str(output_ref) + ".trace.json")`
+7. `_suggest_diagnosis(uow, return_reasons, kill_classification, trace_json)` → `diagnosis_hint`: one-paragraph actionable summary
+
+```mermaid
+flowchart TD
+    A([_suggest_diagnosis — pattern matching\nfirst match wins]) --> P1
+
+    P1{all return_reasons in _ORPHAN_RETURN_REASONS\nAND len >= 2?} -->|YES| H1[Pattern: infrastructure-kill-wave\nHint: reset with decide-retry\ninvestigate session TTL]
+    P1 -->|NO| P2
+
+    P2{kill_classification present AND\nkill_type == orphan_kill_before_start\nOR trace_json absent AND kill_type present?} -->|YES| H2[Pattern: kill-before-start\nHint: reset with decide-retry\nexecution_attempts not charged]
+    P2 -->|NO| P3
+
+    P3{kill_classification present AND\nkill_type == orphan_kill_during_execution?} -->|YES| H3[Pattern: kill-during-execution\nHint: reset with decide-retry\nreview trace_json.prescription_delta]
+    P3 -->|NO| P4
+
+    P4{status == needs-human-review\nAND execution_attempts == 0?} -->|YES| H4[Pattern: retry-cap-from-orphans\nHint: reset with decide-retry after\nconfirming executor dispatch healthy]
+    P4 -->|NO| P5
+
+    P5{status == needs-human-review\nAND execution_attempts > 0?} -->|YES| H5[Pattern: retry-cap\nHint: review corrective_traces\ndecide-retry or decide-close]
+    P5 -->|NO| P6
+
+    P6{steward_cycles >= 3\nAND execution_attempts == 0?} -->|YES| H6[Pattern: dead-prescription-loop\nHint: check executor dispatch enabled\nthrottle clear]
+    P6 -->|NO| P7
+
+    P7{status in proposed\nor pending?} -->|YES| H7[Pattern: early-stage]
+    P7 -->|NO| P8
+
+    P8{status == done?} -->|YES| H8[Pattern: completed]
+    P8 -->|NO| HD[Default: No known failure pattern matched\nReview audit_log]
 ```
-REGISTRY_CLI TRACE COMMAND (PR #976)
-=======================================
 
-  Invocation: uv run registry_cli.py trace --id <uow_id>
+**`_ORPHAN_RETURN_REASONS` (module-level, importable by tests):**
+- `executor_orphan`
+- `executing_orphan`
+- `diagnosing_orphan`
+- `orphan_kill_before_start` (PR #968 — heartbeat-classified)
+- `orphan_kill_during_execution` (PR #968 — heartbeat-classified)
 
-  cmd_trace() joins five data sources:
-
-  1. registry.get(uow_id)
-     → current_state: {status, execution_attempts, lifetime_cycles,
-                        steward_cycles, retry_count, heartbeat_at,
-                        output_ref, close_reason, started_at}
-
-  2. registry.fetch_audit_entries(uow_id)
-     → audit_log: chronological list of all status transitions,
-                   retry_cap events, orphan_kill_classified entries
-
-  3. registry.fetch_corrective_traces(uow_id)
-     → corrective_traces: executor observations per attempt
-                           (partial work, context from prior runs)
-
-  4. _extract_return_reasons(audit_entries)
-     → return_reasons: [{ts, event, return_reason}] from audit note JSON
-
-  5. _extract_kill_classification(audit_entries)
-     → kill_classification: most recent orphan_kill_classified entry
-       {kill_type, heartbeats_before_kill, ts} or null
-
-  6. _read_trace_json(output_ref)
-     → trace_json: parsed trace.json from output_ref path, or null
-     Path derivation:
-       Primary:  Path(output_ref).with_suffix(".trace.json")
-       Fallback: Path(str(output_ref) + ".trace.json")
-
-  7. _suggest_diagnosis(uow, return_reasons, kill_classification, trace_json)
-     → diagnosis_hint: one-paragraph actionable summary
-
-  Output: JSON to stdout (all fields above)
-
-
-_suggest_diagnosis() PATTERN MATCHING (first match wins):
-============================================================
-
-  Pattern 1: infrastructure-kill-wave
-    Condition: all return_reasons in _ORPHAN_RETURN_REASONS AND len >= 2
-    Hint: "reset with decide-retry; investigate session TTL"
-
-  Pattern 2: kill-before-start
-    Condition: kill_classification present AND
-               kill_type == "orphan_kill_before_start"
-               OR (trace_json absent AND kill_type present)
-    Hint: "reset with decide-retry; execution_attempts not charged"
-
-  Pattern 3: kill-during-execution
-    Condition: kill_classification present AND
-               kill_type == "orphan_kill_during_execution"
-    Hint: "reset with decide-retry; review trace_json.prescription_delta"
-
-  Pattern 4: retry-cap-from-orphans
-    Condition: status == needs-human-review AND execution_attempts == 0
-    Hint: "reset with decide-retry after confirming executor dispatch healthy"
-
-  Pattern 5: retry-cap
-    Condition: status == needs-human-review AND execution_attempts > 0
-    Hint: "review corrective_traces; decide-retry or decide-close"
-
-  Pattern 6: dead-prescription-loop
-    Condition: steward_cycles >= 3 AND execution_attempts == 0
-    Hint: "check executor dispatch enabled; throttle clear"
-
-  Pattern 7: early-stage
-    Condition: status in (proposed, pending)
-
-  Pattern 8: completed
-    Condition: status == done
-
-  Default: "No known failure pattern matched. Review audit_log."
-
-
-_ORPHAN_RETURN_REASONS (module-level, importable by tests):
-=============================================================
-  executor_orphan
-  executing_orphan
-  diagnosing_orphan
-  orphan_kill_before_start         (PR #968 — heartbeat-classified)
-  orphan_kill_during_execution     (PR #968 — heartbeat-classified)
-
-
-REGISTRY_CLI COMMAND REFERENCE
-================================
-  trace --id <uow_id>                full forensics view (start here)
-  get --id <uow_id>                  raw UoW row with all fields
-  list [--status <status>]           list UoWs, optional status filter
-  approve --id <uow_id>              proposed → pending
-  decide-retry --id <uow_id>         blocked/ready-for-steward → ready-for-steward
-                                     (steward_cycles reset to 0)
-  decide-close --id <uow_id>         blocked → failed (user_closed)
-  status-breakdown                   count UoWs by status (JSON object)
-  escalation-candidates              list needs-human-review UoWs
-  stale [--buffer-seconds N]         list in-flight UoWs with silent heartbeats
-  check-stale                        active UoWs whose source issue is closed
-  expire-proposals                   expire proposed records older than 14 days
-  gate-readiness                     WOS autonomy gate metric
-  upsert --issue N --title T         propose a UoW for a GitHub issue
+**Registry CLI command reference:**
+```
+trace --id <uow_id>                full forensics view (start here)
+get --id <uow_id>                  raw UoW row with all fields
+list [--status <status>]           list UoWs, optional status filter
+approve --id <uow_id>              proposed → pending
+decide-retry --id <uow_id>         blocked/ready-for-steward → ready-for-steward
+                                   (steward_cycles reset to 0)
+decide-close --id <uow_id>         blocked → failed (user_closed)
+status-breakdown                   count UoWs by status (JSON object)
+escalation-candidates              list needs-human-review UoWs
+stale [--buffer-seconds N]         list in-flight UoWs with silent heartbeats
+check-stale                        active UoWs whose source issue is closed
+expire-proposals                   expire proposed records older than 14 days
+gate-readiness                     WOS autonomy gate metric
+upsert --issue N --title T         propose a UoW for a GitHub issue
 ```
 
 ---
@@ -705,32 +470,33 @@ defaulting. The mechanism is in place; discipline is required to maintain it.
 
 ## Operator Decision Reference
 
+**Telegram commands:**
 ```
-OPERATOR COMMAND SURFACE
-==========================
+/approve <uow_id>                proposed → pending
+/decide <uow_id> proceed         blocked → ready-for-steward (cycles preserved)
+/decide <uow_id> retry           blocked → ready-for-steward (cycles reset)
+/decide <uow_id> retry force     blocked → ready-for-steward (override hard-cap)
+/decide <uow_id> abandon         blocked → failed (user_closed)
+/decide <uow_id> defer [note]    blocked (unchanged) + audit entry
+/wos status [status]             list UoWs by status
+/wos start                       set execution_enabled=true in wos-config.json
+/wos stop                        set execution_enabled=false in wos-config.json
+/wos unblock                     clear BOOTUP_CANDIDATE_GATE flag
+diagnose <uow_id>                spawn diagnostic subagent via wos_diagnose
+```
 
-  Telegram commands:
-    /approve <uow_id>                proposed → pending
-    /decide <uow_id> proceed         blocked → ready-for-steward (cycles preserved)
-    /decide <uow_id> retry           blocked → ready-for-steward (cycles reset)
-    /decide <uow_id> retry force     blocked → ready-for-steward (override hard-cap)
-    /decide <uow_id> abandon         blocked → failed (user_closed)
-    /decide <uow_id> defer [note]    blocked (unchanged) + audit entry
-    /wos status [status]             list UoWs by status
-    /wos start                       set execution_enabled=true in wos-config.json
-    /wos stop                        set execution_enabled=false in wos-config.json
-    /wos unblock                     clear BOOTUP_CANDIDATE_GATE flag
-    diagnose <uow_id>                spawn diagnostic subagent via wos_diagnose
+**CLI (`uv run registry_cli.py`):**
+```
+trace --id <uow_id>              full forensics view
+decide-retry --id <uow_id>       same as /decide retry
+decide-close --id <uow_id>       same as /decide abandon
+escalation-candidates            list all needs-human-review UoWs
+stale                            list in-flight UoWs with silent heartbeats
+status-breakdown                 count by status
+```
 
-  CLI (uv run registry_cli.py):
-    trace --id <uow_id>              full forensics view
-    decide-retry --id <uow_id>       same as /decide retry
-    decide-close --id <uow_id>       same as /decide abandon
-    escalation-candidates            list all needs-human-review UoWs
-    stale                            list in-flight UoWs with silent heartbeats
-    status-breakdown                 count by status
-
-  Inline keyboard buttons (Telegram):
-    [Retry] → callback: decide_retry:<uow_id>    → route_callback_message
-    [Close] → callback: decide_close:<uow_id>    → route_callback_message
+**Inline keyboard buttons (Telegram):**
+```
+[Retry] → callback: decide_retry:<uow_id>    → route_callback_message
+[Close] → callback: decide_close:<uow_id>    → route_callback_message
 ```
