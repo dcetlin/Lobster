@@ -68,6 +68,21 @@ _EXECUTOR_ORPHAN_THRESHOLD_SECONDS = 3600  # 1 hour: ready-for-executor age thre
 # of the 24h TTL recovery ceiling.
 _EXECUTING_ORPHAN_THRESHOLD_SECONDS = 600  # 10 minutes
 
+# Grace window (seconds) after executor_dispatch before we expect the subagent
+# to have written its first heartbeat.  Absorbs agent startup jitter (model
+# load, context injection, first tool call).
+#
+# If heartbeat_at is more than DISPATCH_WINDOW_SECONDS after the
+# executor_dispatch timestamp, the agent demonstrably started working before
+# being killed → orphan_kill_during_execution.  Otherwise the kill happened
+# before the agent established any foothold → orphan_kill_before_start.
+#
+# 120 s is generous: model load + session startup typically takes <30 s.
+# A 2-minute window ensures we do not false-positive classify a freshly-started
+# agent as kill_during_execution if it happened to run a tool before writing its
+# first heartbeat within the window.
+DISPATCH_WINDOW_SECONDS: int = 120
+
 # Fallback minimum age (seconds) for an `active` UoW before the startup sweep
 # will classify it as a crash candidate.  This constant is used when the UoW
 # does not have an `estimated_runtime` value (S3P2-C).
@@ -100,6 +115,73 @@ class StartupSweepResult:
 # ---------------------------------------------------------------------------
 # Phase 1: Startup sweep — crash recovery (#307)
 # ---------------------------------------------------------------------------
+
+def _classify_executing_orphan_kill_type(
+    dispatch_ts: str | None,
+    heartbeat_at: str | None,
+) -> str:
+    """
+    Classify the kill type of an `executing` orphan UoW using the heartbeat signal.
+
+    Pure function: no side effects, no registry access.
+
+    Args:
+        dispatch_ts: ISO timestamp of the most recent executor_dispatch audit entry.
+            None if no executor_dispatch entry exists (e.g. older records before
+            the inbox-dispatch path was added).
+        heartbeat_at: ISO timestamp of the most recent heartbeat_at value on the
+            UoW, or None if heartbeat_at was never written.
+
+    Returns:
+        'orphan_kill_before_start': No evidence of agent working after dispatch.
+            Either heartbeat_at is None, or it does not exceed
+            dispatch_ts + DISPATCH_WINDOW_SECONDS.
+            Re-entry strategy: treat as clean first execution (no partial state).
+
+        'orphan_kill_during_execution': Agent wrote a heartbeat after the
+            dispatch window, confirming it had started processing before being
+            killed.
+            Re-entry strategy: note partial execution evidence for diagnosis.
+
+    Safe default: returns 'orphan_kill_before_start' whenever the classification
+    cannot be determined (None inputs, unparseable timestamps, missing dispatch
+    audit). This is conservative — treating an ambiguous kill as kill-before-start
+    avoids over-claiming partial execution evidence that may not exist.
+    """
+    # No dispatch timestamp → cannot determine if heartbeat was post-dispatch.
+    # Safe default: kill_before_start.
+    if dispatch_ts is None:
+        return "orphan_kill_before_start"
+
+    # No heartbeat → agent never wrote one → kill-before-start.
+    if heartbeat_at is None:
+        return "orphan_kill_before_start"
+
+    # Parse both timestamps for comparison.
+    try:
+        dispatch_dt = datetime.fromisoformat(dispatch_ts.replace("Z", "+00:00"))
+        if dispatch_dt.tzinfo is None:
+            dispatch_dt = dispatch_dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError, AttributeError):
+        return "orphan_kill_before_start"
+
+    try:
+        heartbeat_dt = datetime.fromisoformat(heartbeat_at.replace("Z", "+00:00"))
+        if heartbeat_dt.tzinfo is None:
+            heartbeat_dt = heartbeat_dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError, AttributeError):
+        return "orphan_kill_before_start"
+
+    # heartbeat_at must be strictly after dispatch_ts + DISPATCH_WINDOW_SECONDS.
+    # This absorbs startup jitter: even if the agent wrote a heartbeat quickly,
+    # we require it to be beyond the window to count as "working" evidence.
+    from datetime import timedelta
+    threshold_dt = dispatch_dt + timedelta(seconds=DISPATCH_WINDOW_SECONDS)
+    if heartbeat_dt > threshold_dt:
+        return "orphan_kill_during_execution"
+
+    return "orphan_kill_before_start"
+
 
 def _classify_active_uow(output_ref: str | None) -> tuple[str, dict]:
     """
@@ -479,6 +561,13 @@ def run_startup_sweep(
     # path (get_stale_heartbeat_uows) catches most of these when heartbeat_at is
     # non-NULL. This population covers the gap: agents that crashed before their
     # first heartbeat write (heartbeat_at = NULL) and never called write_result.
+    #
+    # Kill classification (issue #963): each executing orphan is classified by
+    # comparing the executor_dispatch audit timestamp against heartbeat_at.
+    # - orphan_kill_before_start: no heartbeat evidence after dispatch window
+    # - orphan_kill_during_execution: heartbeat written after dispatch window
+    # The classification is stored in the startup_sweep audit note for downstream
+    # use by the Steward's re-entry classifier.
     for uow in executing_uows:
         uow_id = uow.id
 
@@ -517,11 +606,28 @@ def run_startup_sweep(
             # Not old enough — may still be executing normally.
             continue
 
+        # Classify kill type using heartbeat evidence (issue #963).
+        # Safe default: kill_before_start when registry method is unavailable.
+        dispatch_ts: str | None = None
+        heartbeat_at: str | None = getattr(uow, "heartbeat_at", None)
+        try:
+            dispatch_ts = registry.get_executor_dispatch_timestamp(uow_id)
+        except (AttributeError, Exception) as _exc:
+            log.debug(
+                "Startup sweep: could not get dispatch timestamp for UoW %s — %s "
+                "(defaulting to orphan_kill_before_start)",
+                uow_id, _exc,
+            )
+        kill_classification = _classify_executing_orphan_kill_type(
+            dispatch_ts=dispatch_ts,
+            heartbeat_at=heartbeat_at,
+        )
+
         if dry_run:
             log.info(
                 "Startup sweep (DRY RUN): executing UoW %s (age=%.0fs) "
-                "would be classified as executing_orphan and transitioned to ready-for-steward",
-                uow_id, age_seconds,
+                "would be classified as %s and transitioned to ready-for-steward",
+                uow_id, age_seconds, kill_classification,
             )
             skipped_dry_run += 1
             continue
@@ -531,14 +637,15 @@ def run_startup_sweep(
             started_at=started_at,
             age_seconds=age_seconds,
             threshold_seconds=executing_orphan_threshold_seconds,
+            kill_classification=kill_classification,
         )
 
         if rows == 1:
             executing_swept += 1
             log.info(
-                "Startup sweep: executing_orphan UoW %s → ready-for-steward "
+                "Startup sweep: %s UoW %s → ready-for-steward "
                 "(age=%.0fs, threshold=%ds — subagent never called write_result)",
-                uow_id, age_seconds, executing_orphan_threshold_seconds,
+                kill_classification, uow_id, age_seconds, executing_orphan_threshold_seconds,
             )
         else:
             log.debug(

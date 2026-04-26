@@ -1391,6 +1391,59 @@ class Registry:
         finally:
             conn.close()
 
+    def get_executor_dispatch_timestamp(self, uow_id: str) -> str | None:
+        """
+        Return the timestamp of the most recent executor_dispatch audit entry
+        for this UoW, or None if no such entry exists.
+
+        Called by startup_sweep at classification time to determine whether
+        any heartbeat writes occurred AFTER the subagent was dispatched. This
+        enables distinguishing kill-before-start from kill-during-execution:
+
+        - If heartbeat_at is None or <= dispatch_ts + DISPATCH_WINDOW_SECONDS:
+          the agent was killed before establishing any working state.
+        - If heartbeat_at > dispatch_ts + DISPATCH_WINDOW_SECONDS:
+          the agent was actively working when killed.
+
+        The timestamp is extracted from the `note` JSON field of the
+        executor_dispatch audit entry (key: "timestamp"). Falls back to the
+        `ts` column if the note is absent or unparseable.
+
+        Returns None on any query error (safe default: treat as no dispatch,
+        classify as orphan_kill_before_start).
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT ts, note FROM audit_log
+                WHERE uow_id = ?
+                  AND event = 'executor_dispatch'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (uow_id,),
+            ).fetchall()
+            if not rows:
+                return None
+            row = rows[0]
+            # Prefer the timestamp from the note JSON (written at dispatch time).
+            note_str = row["note"] if hasattr(row, "__getitem__") else None
+            if note_str:
+                try:
+                    data = json.loads(note_str)
+                    ts = data.get("timestamp")
+                    if ts:
+                        return str(ts)
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    pass
+            # Fallback: use the audit_log ts column
+            return str(row["ts"]) if row["ts"] else None
+        except Exception:
+            return None
+        finally:
+            conn.close()
+
     def record_startup_sweep_diagnosing(
         self,
         uow_id: str,
@@ -1454,6 +1507,7 @@ class Registry:
         started_at: str | None,
         age_seconds: float,
         threshold_seconds: int,
+        kill_classification: str = "orphan_kill_before_start",
     ) -> int:
         """
         Atomically write a startup_sweep audit entry and transition an
@@ -1475,12 +1529,21 @@ class Registry:
             started_at: ISO timestamp when the UoW was claimed (for audit note).
             age_seconds: How long the UoW has been in executing status.
             threshold_seconds: The threshold that was exceeded (for audit note).
+            kill_classification: Heartbeat-derived kill type. One of:
+                'orphan_kill_before_start': no heartbeat evidence after dispatch
+                    — agent killed before establishing working state.
+                'orphan_kill_during_execution': heartbeat written after dispatch
+                    — agent was actively working when killed.
+                Defaults to 'orphan_kill_before_start' (safe default when
+                heartbeat evidence is absent or the registry method is not
+                available).
         """
         now = _now_iso()
         note_json = json.dumps({
             "event": "startup_sweep",
             "actor": "steward",
-            "classification": "executing_orphan",
+            "classification": kill_classification,
+            "kill_classification": kill_classification,
             "output_ref": None,
             "uow_id": uow_id,
             "timestamp": now,
