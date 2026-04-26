@@ -13,6 +13,7 @@ Usage:
     uv run registry_cli.py check-stale
     uv run registry_cli.py expire-proposals
     uv run registry_cli.py gate-readiness
+    uv run registry_cli.py trace --id <uow-id>
 
 Environment:
     REGISTRY_DB_PATH — override the default db path (~/.../orchestration/registry.db)
@@ -219,6 +220,231 @@ def cmd_escalation_candidates(registry: Registry, args: argparse.Namespace) -> N
     _output([_uow_to_dict(r) for r in records])
 
 
+def _read_trace_json(output_ref: str | None) -> dict | None:
+    """
+    Read and parse the trace.json file associated with output_ref.
+
+    Uses the same path-derivation logic as executor/_read_trace_json:
+    - Primary:  Path(output_ref).with_suffix(".trace.json")
+    - Fallback: Path(str(output_ref) + ".trace.json")
+
+    Returns None if output_ref is None, the file is absent, or the file
+    cannot be parsed as JSON.
+    """
+    if not output_ref:
+        return None
+    p = Path(output_ref)
+    trace_file = p.with_suffix(".trace.json") if p.suffix else Path(str(output_ref) + ".trace.json")
+    if not trace_file.exists():
+        alt = Path(str(output_ref) + ".trace.json")
+        if alt != trace_file and alt.exists():
+            trace_file = alt
+        else:
+            return None
+    try:
+        return json.loads(trace_file.read_text())
+    except Exception:
+        return None
+
+
+# Orphan return_reason values — infrastructure kills, not execution outcomes.
+# Must match ORPHAN_REASONS in steward.py; kept here as a read-only constant
+# so registry_cli.py can classify without importing steward.
+_ORPHAN_RETURN_REASONS = frozenset({
+    "executor_orphan",
+    "executing_orphan",
+    "diagnosing_orphan",
+    "orphan_kill_before_start",
+    "orphan_kill_during_execution",
+})
+
+
+def _extract_return_reasons(audit_entries: list[dict]) -> list[dict]:
+    """
+    Extract return_reason payloads from audit_log entries, in chronological order.
+
+    Each entry in the returned list has:
+      ts, return_reason, event (the originating audit event)
+
+    Only entries whose note field contains a JSON object with a "return_reason" key
+    are included.
+    """
+    reasons = []
+    for entry in audit_entries:  # already ASC order from fetch_audit_entries
+        note = entry.get("note")
+        if not note:
+            continue
+        try:
+            note_data = json.loads(note)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(note_data, dict) and "return_reason" in note_data:
+            reasons.append({
+                "ts": entry.get("ts"),
+                "event": entry.get("event"),
+                "return_reason": note_data["return_reason"],
+            })
+    return reasons
+
+
+def _extract_kill_classification(audit_entries: list[dict]) -> dict | None:
+    """
+    Find the most recent audit entry with event='orphan_kill_classified' and
+    return its kill_type / heartbeats_before_kill payload.
+
+    Returns None if no such entry exists.
+    """
+    for entry in reversed(audit_entries):
+        if entry.get("event") != "orphan_kill_classified":
+            continue
+        note = entry.get("note")
+        if not note:
+            continue
+        try:
+            note_data = json.loads(note)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(note_data, dict) and "kill_type" in note_data:
+            return {
+                "kill_type": note_data.get("kill_type"),
+                "heartbeats_before_kill": note_data.get("heartbeats_before_kill"),
+                "ts": entry.get("ts"),
+            }
+    return None
+
+
+def _suggest_diagnosis(uow: UoW, return_reasons: list[dict],
+                       kill_classification: dict | None,
+                       trace_json: dict | None) -> str:
+    """
+    Produce a short, actionable diagnosis hint based on the forensics data.
+
+    Pattern recognition order (first match wins):
+    1. infrastructure-kill-wave — all return reasons are orphan types
+    2. kill-before-start — kill_type is orphan_kill_before_start or trace absent
+    3. kill-during-execution — kill_type is orphan_kill_during_execution
+    4. dead-prescription-loop — steward_cycles ≥ 3 with no execution_attempts
+    5. retry-cap — needs-human-review with execution_attempts > 0
+    6. steady / unknown — default
+    """
+    all_orphan = (
+        bool(return_reasons)
+        and all(r["return_reason"] in _ORPHAN_RETURN_REASONS for r in return_reasons)
+    )
+
+    if all_orphan and len(return_reasons) >= 2:
+        return (
+            "infrastructure-kill-wave: all return reasons are orphan classifications. "
+            "No execution budget was consumed. "
+            "Posture: reset with decide-retry; do not retire. "
+            "Investigate session TTL or executor dispatch scheduling."
+        )
+
+    if kill_classification:
+        kt = kill_classification.get("kill_type", "")
+        hb = kill_classification.get("heartbeats_before_kill", 0) or 0
+        if kt == "orphan_kill_before_start" or (not trace_json and kt):
+            return (
+                f"kill-before-start: agent was killed before writing any output "
+                f"(heartbeats_before_kill={hb}). "
+                "execution_attempts was not charged. "
+                "Posture: reset with decide-retry."
+            )
+        if kt == "orphan_kill_during_execution":
+            return (
+                f"kill-during-execution: agent was killed after starting "
+                f"(heartbeats_before_kill={hb}). "
+                "execution_attempts was charged. "
+                "Posture: reset with decide-retry; review trace_json for progress made."
+            )
+
+    if uow.status == "needs-human-review" and uow.execution_attempts == 0:
+        return (
+            "retry-cap-from-orphans: reached needs-human-review with zero confirmed "
+            "execution attempts — all retries were infrastructure kills. "
+            "Posture: reset with decide-retry after confirming executor dispatch is healthy."
+        )
+
+    if uow.status == "needs-human-review" and uow.execution_attempts > 0:
+        return (
+            f"retry-cap: reached needs-human-review with {uow.execution_attempts} confirmed "
+            "execution attempt(s). "
+            "Posture: review corrective_traces and steward_log for root cause, "
+            "then decide-retry or decide-close."
+        )
+
+    if uow.steward_cycles >= 3 and uow.execution_attempts == 0:
+        return (
+            "dead-prescription-loop: steward has cycled ≥3 times without a confirmed "
+            "execution attempt. "
+            "Posture: check whether executor dispatch is enabled and throttle is clear."
+        )
+
+    if str(uow.status) in ("proposed", "pending"):
+        return "early-stage: UoW has not yet entered the executor pipeline. No diagnosis needed."
+
+    if str(uow.status) in ("done",):
+        return "completed: UoW reached done status. No failure to diagnose."
+
+    return (
+        f"status={uow.status!s} steward_cycles={uow.steward_cycles} "
+        f"execution_attempts={uow.execution_attempts} lifetime_cycles={uow.lifetime_cycles}. "
+        "No known failure pattern matched. Review audit_log and corrective_traces for context."
+    )
+
+
+def cmd_trace(registry: Registry, args: argparse.Namespace) -> None:
+    """
+    Produce a unified forensics view for a single UoW.
+
+    Output fields:
+      uow_id             — the ID requested
+      current_state      — status, execution_attempts, lifetime_cycles, steward_cycles,
+                           retry_count, heartbeat_at, output_ref, close_reason, started_at
+      audit_log          — all audit_log rows, oldest first
+      corrective_traces  — all corrective_traces rows, oldest first
+      return_reasons     — chronological list of {ts, event, return_reason} extracted
+                           from audit_log note payloads
+      kill_classification — {kill_type, heartbeats_before_kill, ts} from the most recent
+                            orphan_kill_classified audit entry, or null
+      trace_json         — parsed trace.json from output_ref path, or null
+      diagnosis_hint     — one-paragraph triage summary with suggested posture
+    """
+    uow_id = args.id
+    uow = registry.get(uow_id)
+    if uow is None:
+        _output({"error": "not found", "id": uow_id})
+        return
+
+    audit_entries = registry.fetch_audit_entries(uow_id)
+    corrective_traces = registry.fetch_corrective_traces(uow_id)
+    return_reasons = _extract_return_reasons(audit_entries)
+    kill_classification = _extract_kill_classification(audit_entries)
+    trace_json = _read_trace_json(uow.output_ref)
+    diagnosis = _suggest_diagnosis(uow, return_reasons, kill_classification, trace_json)
+
+    _output({
+        "uow_id": uow_id,
+        "current_state": {
+            "status": str(uow.status),
+            "execution_attempts": uow.execution_attempts,
+            "lifetime_cycles": uow.lifetime_cycles,
+            "steward_cycles": uow.steward_cycles,
+            "retry_count": uow.retry_count,
+            "heartbeat_at": uow.heartbeat_at,
+            "output_ref": uow.output_ref,
+            "close_reason": uow.close_reason,
+            "started_at": uow.started_at,
+        },
+        "audit_log": audit_entries,
+        "corrective_traces": corrective_traces,
+        "return_reasons": return_reasons,
+        "kill_classification": kill_classification,
+        "trace_json": trace_json,
+        "diagnosis_hint": diagnosis,
+    })
+
+
 def cmd_stale(registry: Registry, args: argparse.Namespace) -> None:
     """
     Return UoWs whose heartbeat has gone silent beyond their TTL.
@@ -320,6 +546,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Grace period added to heartbeat_ttl before declaring a stall (default: 30)",
     )
 
+    # trace
+    p_trace = subparsers.add_parser(
+        "trace",
+        help=(
+            "Unified forensics view for a single UoW: registry row, audit_log, "
+            "corrective_traces, trace.json, return reasons, kill classification, "
+            "and a diagnosis hint. Start here for any WOS failure."
+        ),
+    )
+    p_trace.add_argument("--id", required=True, help="UoW id")
+
     return parser
 
 
@@ -336,6 +573,7 @@ _COMMAND_MAP = {
     "status-breakdown": cmd_status_breakdown,
     "escalation-candidates": cmd_escalation_candidates,
     "stale": cmd_stale,
+    "trace": cmd_trace,
 }
 
 
