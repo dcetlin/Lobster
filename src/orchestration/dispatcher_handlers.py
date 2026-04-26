@@ -554,6 +554,11 @@ WOS_MESSAGE_TYPE_DISPATCH: dict[str, str] = {
     # exempt from the spawn-gate — it legitimately returns action="spawn_subagent" for
     # all-orphan auto-retry and action="send_reply" for surface-to-Dan branches.
     "wos_surface": "handle_wos_surface",
+    # Manual-trigger forensics handler: written by the dispatcher when Dan types
+    # "diagnose <uow_id>". Spawns a diagnostic subagent that runs registry_cli trace
+    # and returns a structured forensic report. Like wos_escalate, this handler is
+    # exempt from the spawn-gate — it legitimately returns action="spawn_subagent".
+    "wos_diagnose": "handle_wos_diagnose",
 }
 
 
@@ -1063,6 +1068,235 @@ def handle_wos_surface(msg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# wos_diagnose handler — manual-trigger forensics subagent
+#
+# Called when the dispatcher receives a message with type="wos_diagnose".
+# Written by the dispatcher when Dan types "diagnose <uow_id>" in Telegram.
+# Spawns a diagnostic subagent that runs registry_cli trace and returns a
+# structured forensic report.
+#
+# Unlike wos_execute/steward_trigger, this handler is exempt from the
+# spawn-gate because it legitimately returns action="spawn_subagent" only
+# (no send_reply branches). route_wos_message handles this analogously to
+# the wos_escalate fast-path.
+#
+# UoW ID resolution is intentionally isolated through _resolve_uow_id().
+# Today that function is a direct pass-through; a future PR (short-ID
+# support) will add lookup logic there without changing this handler.
+# ---------------------------------------------------------------------------
+
+def _resolve_uow_id(uow_id: str) -> str:
+    """
+    Resolve a UoW ID from a raw identifier supplied by the user.
+
+    Today this is a direct pass-through: full IDs like ``uow_20260426_abc123``
+    are returned unchanged.
+
+    A future PR will add short-ID support here — resolving a serial number or
+    semantic slug alias to the canonical UoW ID via a registry lookup — without
+    requiring any changes to ``handle_wos_diagnose``.
+
+    Args:
+        uow_id: The raw UoW identifier as parsed from the user's command.
+
+    Returns:
+        The canonical UoW ID to pass to registry_cli.
+    """
+    return uow_id
+
+
+def handle_wos_diagnose(msg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Handle a ``wos_diagnose`` inbox message by spawning a diagnostic subagent.
+
+    Called by ``route_wos_message`` when the dispatcher receives a message with
+    ``type="wos_diagnose"``.  Written by the dispatcher when Dan types
+    ``diagnose <uow_id>`` in Telegram.
+
+    The spawned subagent runs ``registry_cli trace`` against the UoW, applies
+    the five-pattern diagnosis algorithm, and returns a structured forensic
+    report. If the diagnosis confidence is high and the pattern is a pure
+    infrastructure kill, the subagent calls ``registry_cli decide-retry``
+    autonomously before reporting; otherwise it surfaces the report to Dan.
+
+    UoW ID resolution goes through ``_resolve_uow_id()``.  Today that is a
+    direct pass-through for full IDs; a future PR adds short-ID lookup there.
+
+    Args:
+        msg: The raw ``wos_diagnose`` inbox message dict.  Expected fields:
+
+            - ``uow_id`` (str): The Unit of Work identifier.
+            - ``escalation_id`` (str, optional): Correlation ID from the
+              originating ``wos_escalate`` message; ``""`` for manual triggers.
+            - ``escalation_trigger`` (str, optional): ``"manual"`` for
+              Telegram-triggered diagnoses; escalation trigger string otherwise.
+            - ``failure_history`` (dict, optional): Pre-computed failure context
+              from the Steward; ``{}`` for manual triggers.
+
+    Returns:
+        A dict with ``action="spawn_subagent"`` and the following fields:
+
+        ``task_id`` (str):
+            Task identifier for the diagnostic subagent.
+
+        ``agent_type`` (str):
+            Always ``"lobster-generalist"``.
+
+        ``prompt`` (str):
+            Subagent prompt implementing the diagnosis algorithm.
+
+        ``message_type`` (str):
+            Always ``"wos_diagnose"``.
+    """
+    raw_uow_id: str = msg.get("uow_id", "unknown")
+    uow_id: str = _resolve_uow_id(raw_uow_id)
+    escalation_id: str = msg.get("escalation_id", "")
+    escalation_trigger: str = msg.get("escalation_trigger", "manual")
+    failure_history: dict[str, Any] = msg.get("failure_history", {})
+
+    task_id = f"wos-diagnose-{uow_id[:12]}"
+    registry_cli_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "registry_cli.py")
+    )
+    failure_history_json = json.dumps(failure_history, indent=2)
+
+    prompt = (
+        f"---\n"
+        f"task_id: {task_id}\n"
+        f"chat_id: 0\n"
+        f"source: system\n"
+        f"---\n\n"
+        f"Your task_id is: {task_id}\n\n"
+        f"You are a WOS self-diagnosing subagent. Your only job is to diagnose one UoW "
+        f"and decide whether to reset it, retire it, or surface it to Dan.\n\n"
+        f"## Task\n\n"
+        f"UoW ID: {uow_id}\n"
+        f"Escalation trigger: {escalation_trigger}\n"
+        f"Escalation ID: {escalation_id or '(manual trigger)'}\n\n"
+        f"Pre-computed failure history from escalation message:\n"
+        f"```json\n{failure_history_json}\n```\n\n"
+        f"## Steps\n\n"
+        f"1. Run: uv run {registry_cli_path} trace --id {uow_id}\n"
+        f"   Read the output. Focus on: diagnosis_hint, return_reasons, "
+        f"execution_attempts, kill_classification.\n\n"
+        f"2. Apply the diagnosis algorithm:\n\n"
+        f"   ORPHAN_REASONS = {{'executor_orphan', 'executing_orphan', 'diagnosing_orphan', "
+        f"'orphan_kill_before_start', 'orphan_kill_during_execution'}}\n"
+        f"   MAX_RETRIES = 3\n"
+        f"   HARD_CAP = 9\n\n"
+        f"   - If ALL return_reasons are in ORPHAN_REASONS and execution_attempts == 0:\n"
+        f"     posture = reset, pattern = 'infrastructure-kill-wave'\n"
+        f"   - If ALL return_reasons are in ORPHAN_REASONS and "
+        f"kill_type == 'orphan_kill_before_start':\n"
+        f"     posture = reset, pattern = 'kill-before-start'\n"
+        f"   - If ALL return_reasons are in ORPHAN_REASONS and "
+        f"kill_type == 'orphan_kill_during_execution':\n"
+        f"     posture = reset, pattern = 'kill-during-execution'\n"
+        f"   - If execution_attempts >= MAX_RETRIES:\n"
+        f"     posture = surface-to-human, pattern = 'genuine-retry-cap'\n"
+        f"     Run: uv run {registry_cli_path} get --id {uow_id}\n"
+        f"     (to get steward_log for Dan's context)\n"
+        f"   - If lifetime_cycles >= HARD_CAP:\n"
+        f"     posture = surface-to-human, pattern = 'hard-cap'\n"
+        f"   - If steward_cycles >= 3 and execution_attempts == 0 and "
+        f"no orphan return_reasons:\n"
+        f"     posture = surface-to-human, pattern = 'dead-prescription-loop'\n"
+        f"   - Otherwise:\n"
+        f"     posture = surface-to-human, pattern = 'unrecognised'\n\n"
+        f"3. Before any reset: check ~/lobster-workspace/data/wos-config.json.\n"
+        f"   If execution_enabled is false, change posture to surface-to-human "
+        f"regardless of pattern.\n"
+        f"   Rationale: 'execution disabled system-wide, auto-reset deferred.'\n\n"
+        f"4. IMPORTANT: `registry_cli decide-retry` only accepts UoWs in 'blocked' or\n"
+        f"   'ready-for-steward' status. If the UoW is in 'needs-human-review' status,\n"
+        f"   you cannot call decide-retry — surface to Dan with that note included.\n\n"
+        f"5. If posture == reset AND status is 'blocked' or 'ready-for-steward':\n"
+        f"   Run: uv run {registry_cli_path} decide-retry --id {uow_id}\n"
+        f"   Confirm success.\n\n"
+        f"6. Call write_result with:\n"
+        f"   task_id: {task_id}\n"
+        f"   chat_id: 0\n"
+        f"   text: structured diagnosis (see format below)\n"
+        f"   sent_reply_to_user: False\n\n"
+        f"## Output format for write_result text\n\n"
+        f"Always write a JSON object:\n"
+        f"{{\n"
+        f'  "event": "diagnosis_complete",\n'
+        f'  "uow_id": "{uow_id}",\n'
+        f'  "escalation_id": "{escalation_id}",\n'
+        f'  "escalation_trigger": "{escalation_trigger}",\n'
+        f'  "pattern_matched": "<pattern>",\n'
+        f'  "confidence": "<high|medium|low>",\n'
+        f'  "posture": "<reset|surface-to-human>",\n'
+        f'  "action_taken": "<registry_cli decide-retry | null>",\n'
+        f'  "rationale": "<one sentence>",\n'
+        f'  "execution_attempts_at_diagnosis": <int>,\n'
+        f'  "lifetime_cycles_at_diagnosis": <int>,\n'
+        f'  "surface_message": "<only if posture=surface-to-human: one paragraph for Dan>",\n'
+        f'  "timestamp": "<iso8601>"\n'
+        f"}}\n\n"
+        f"## Constraints\n\n"
+        f"- Maximum 3 shell commands total "
+        f"(trace + optionally get + optionally decide-retry).\n"
+        f"- Do not call decide-retry if execution_enabled is false in wos-config.json.\n"
+        f"- Do not call decide-retry if UoW status is 'needs-human-review' — "
+        f"surface to Dan instead with a note that status must be 'blocked' first.\n"
+        f"- Do not call decide-close. Retirement requires human confirmation always.\n"
+        f"- Do not send a Telegram message directly. write_result only.\n"
+        f"- Do not loop over multiple UoWs. You handle exactly one: {uow_id}.\n\n"
+        f"Minimum viable output: write_result called with the diagnosis JSON.\n"
+        f"Boundary: do not open PRs, do not modify code, do not send Telegram messages, "
+        f"do not touch steward.py.\n"
+    )
+
+    return {
+        "action": "spawn_subagent",
+        "task_id": task_id,
+        "agent_type": "lobster-generalist",
+        "prompt": prompt,
+        "message_type": "wos_diagnose",
+    }
+
+
+def parse_diagnose_command(text: str) -> str | None:
+    """
+    Parse a ``diagnose <uow_id>`` Telegram command and return the UoW ID.
+
+    The dispatcher calls this when processing direct user messages.  If the
+    message matches ``diagnose <uow_id>`` (case-insensitive, leading/trailing
+    whitespace ignored), the UoW ID token is returned.  Otherwise, ``None``
+    is returned and the dispatcher continues its normal routing.
+
+    The parsed ``uow_id`` is a raw token — full resolution (including
+    short-ID lookup) happens inside ``_resolve_uow_id()`` at dispatch time.
+
+    Args:
+        text: The raw Telegram message text.
+
+    Returns:
+        The ``uow_id`` token if the command matches; ``None`` otherwise.
+
+    Examples::
+
+        parse_diagnose_command("diagnose uow_20260426_abc123")
+        # → "uow_20260426_abc123"
+
+        parse_diagnose_command("DIAGNOSE uow_20260426_abc123")
+        # → "uow_20260426_abc123"
+
+        parse_diagnose_command("wos status")
+        # → None
+    """
+    stripped = text.strip()
+    lower = stripped.lower()
+    if lower.startswith("diagnose "):
+        uow_id_token = stripped[len("diagnose "):].strip()
+        if uow_id_token:
+            return uow_id_token
+    return None
+
+
 def _load_instructions_from_artifact(uow_id: str) -> str:
     """
     Load prescribed instructions from the WorkflowArtifact file for uow_id.
@@ -1155,7 +1389,8 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
     # wos_escalate fast-path: dispatched before the spawn-gate because this handler
     # legitimately returns either action="spawn_subagent" (auto-retry branches) or
     # action="send_reply" (surface-to-Dan branches).  The spawn-gate applies only to
-    # execution message types (wos_execute, steward_trigger) that must always spawn.
+    # execution message types (wos_execute, steward_trigger, wos_diagnose) that must
+    # always spawn.
     # ---------------------------------------------------------------------------
     if msg_type == "wos_escalate":
         try:
@@ -1246,6 +1481,10 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
         elif msg_type == "steward_trigger":
             trigger_uow_id: str = msg.get("uow_id", "unknown")
             result = handle_steward_trigger(trigger_uow_id)
+            result["message_type"] = msg_type
+
+        elif msg_type == "wos_diagnose":
+            result = handle_wos_diagnose(msg)
             result["message_type"] = msg_type
 
         else:
