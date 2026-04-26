@@ -1072,8 +1072,8 @@ def _dispatch_via_claude_p(instructions: str, uow_id: str) -> str:
         raise subprocess.CalledProcessError(
             error.exit_code or 1,
             error.command,
+            output=error.stdout,
             stderr=error.stderr,
-            stdout=error.stdout,
         )
 
     return run_id
@@ -1200,8 +1200,8 @@ def _dispatch_via_stub(register_name: str, instructions: str, uow_id: str) -> st
         raise subprocess.CalledProcessError(
             error.exit_code or 1,
             error.command,
+            output=error.stdout,
             stderr=error.stderr,
-            stdout=error.stdout,
         )
 
     return run_id
