@@ -3444,6 +3444,110 @@ def _default_notify_dan_early_warning(
 # Escalation notification (retry cap reached)
 # ---------------------------------------------------------------------------
 
+# Consolidation threshold: when this many or more UoWs escalate within a single
+# heartbeat cycle (same return_reason), suppress individual notifications and
+# emit one consolidated signal instead.
+#
+# Rationale: a session-end event can kill N executing agents simultaneously,
+# producing N independent "retry cap exceeded" escalations that share a single
+# root cause. Below this threshold, individual messages are more informative.
+# At or above: a consolidated message is less noisy and more actionable.
+#
+# Spec: architectural-proposal-20260426.md §Category 4 / §3
+ESCALATION_CONSOLIDATION_THRESHOLD: int = 3
+
+
+@dataclass(frozen=True)
+class EscalationRecord:
+    """
+    Carries the UoW and its return_reason at the point of retry-cap escalation.
+
+    Accumulated per heartbeat cycle in run_steward_cycle. When the cycle ends,
+    the count determines whether individual or consolidated notification fires.
+    """
+    uow: UoW
+    return_reason: str | None
+
+
+def _build_consolidated_escalation_text(records: list[EscalationRecord]) -> str:
+    """
+    Build a human-readable summary for a batch of same-cycle escalations.
+
+    Pure function — no side effects, no I/O.
+
+    Returns a multi-line string naming the count, the cause(s), and each UoW ID.
+    When all records share one return_reason, the cause is stated as the shared
+    cause. When multiple causes are present, each is listed.
+    """
+    count = len(records)
+    causes = sorted({r.return_reason or "unknown" for r in records})
+    cause_str = causes[0] if len(causes) == 1 else ", ".join(causes)
+
+    uow_lines = "\n".join(
+        f"  - {r.uow.id} ({(r.uow.summary or '')[:80].strip()})"
+        for r in records
+    )
+    return (
+        f"WOS: {count} UoWs escalated to needs-human-review in the same heartbeat cycle.\n\n"
+        f"Shared cause: {cause_str}\n\n"
+        f"Affected UoWs ({count}):\n{uow_lines}\n\n"
+        f"This is likely a single infrastructure event (e.g. session-end killing multiple "
+        f"executing agents), not {count} independent work failures.\n\n"
+        f"To act on all: 'retry <uow_id>' or 'close <uow_id>' for each.\n"
+        f"(Button handlers are a follow-on — text commands are the current interface.)"
+    )
+
+
+def _send_consolidated_escalation_notification(records: list[EscalationRecord]) -> None:
+    """
+    Send a single consolidated Telegram notification covering all UoWs that
+    escalated within the same heartbeat cycle.
+
+    Writes one JSON file to ~/messages/inbox/ instead of N individual files.
+    Called by run_steward_cycle when len(pending_escalations) >= ESCALATION_CONSOLIDATION_THRESHOLD.
+    """
+    chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", _DAN_CHAT_ID)
+    count = len(records)
+    causes = sorted({r.return_reason or "unknown" for r in records})
+    uow_ids = [r.uow.id for r in records]
+
+    log.warning(
+        "WOS ESCALATION (consolidated): %d UoWs escalated in same cycle "
+        "— cause(s): %s — sending one consolidated notification",
+        count, ", ".join(causes),
+    )
+
+    msg_id = str(uuid.uuid4())
+    text = _build_consolidated_escalation_text(records)
+    msg = {
+        "id": msg_id,
+        "source": "system",
+        "chat_id": chat_id,
+        "text": text,
+        "timestamp": time.time(),
+        "metadata": {
+            "type": "wos_surface",
+            "condition": "retry_cap_consolidated",
+            "escalation_count": count,
+            "causes": causes,
+            "uow_ids": uow_ids,
+        },
+    }
+    inbox_dir = Path(os.path.expanduser("~/messages/inbox"))
+    try:
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        (inbox_dir / f"{msg_id}.json").write_text(
+            json.dumps(msg, indent=2), encoding="utf-8"
+        )
+        log.info(
+            "WOS consolidated escalation message written to inbox: %s "
+            "(%d UoWs, cause=%s)",
+            msg_id, count, ", ".join(causes),
+        )
+    except OSError as e:
+        log.error("Failed to write WOS consolidated escalation message to inbox: %s", e)
+
+
 def _send_escalation_notification(uow: UoW) -> None:
     """
     Send a Telegram notification to Dan when a UoW has exhausted MAX_RETRIES
@@ -3526,6 +3630,7 @@ def _process_uow(
     notify_dan_early_warning: Callable | None = None,
     llm_prescriber: Callable[..., LLMPrescription | None] | None = _llm_prescribe,
     inline_executor: Callable[[str], Any] | None = None,
+    escalation_notifier: Callable[[UoW], None] | None = None,
 ) -> StewardOutcome:
     """
     Process a single UoW through the full diagnosis + prescribe/close/surface cycle.
@@ -3542,6 +3647,10 @@ def _process_uow(
             The Executor's optimistic lock protects against double-execution if a
             concurrent heartbeat fires between the transition and the inline call.
             Defaults to None (no inline dispatch — heartbeat remains the dispatch path).
+        escalation_notifier: Callable(uow) invoked when the retry cap is exceeded.
+            Defaults to _send_escalation_notification (immediate individual notification).
+            run_steward_cycle injects a collector that accumulates escalations for
+            end-of-cycle consolidation. Tests may inject a no-op or a recorder.
     """
     uow_id = uow.id
     cycles = uow.steward_cycles
@@ -3882,7 +3991,13 @@ def _process_uow(
                     "timestamp": _now_iso(),
                 })
                 registry.transition(uow_id, _STATUS_NEEDS_HUMAN_REVIEW, _STATUS_DIAGNOSING)
-            _send_escalation_notification(uow)
+            # Route through injected notifier when provided (consolidation path),
+            # or fall back to individual notification (default / test path).
+            # Gated on not dry_run: notifications are side effects; dry_run must
+            # not write to inbox or accumulate the collector.
+            if not dry_run:
+                _effective_notifier = escalation_notifier or _send_escalation_notification
+                _effective_notifier(uow)
             _append_cycle_trace(
                 uow_id=uow_id,
                 cycle_num=cycles,
@@ -4485,6 +4600,18 @@ def run_steward_cycle(
     shard_blocked = 0
     considered_ids = []
 
+    # Per-cycle escalation collector for shared-cause consolidation.
+    # Accumulates (uow, return_reason) tuples during the loop. After the loop,
+    # if count >= ESCALATION_CONSOLIDATION_THRESHOLD: one consolidated notification.
+    # Otherwise: individual notification per UoW.
+    # In dry_run mode: no notifications are sent regardless.
+    _pending_escalations: list[EscalationRecord] = []
+
+    def _collect_escalation(uow: UoW) -> None:
+        """Collector injected as escalation_notifier — defers notification to end of cycle."""
+        _return_reason = _most_recent_return_reason(_fetch_audit_entries(registry, uow.id))
+        _pending_escalations.append(EscalationRecord(uow=uow, return_reason=_return_reason))
+
     # Shard-stream parallel dispatch gate — fetch once before the loop.
     # _executing_uows is updated within the loop as UoWs are prescribed
     # so that subsequent candidates in the same cycle see the updated
@@ -4749,6 +4876,7 @@ def run_steward_cycle(
                 notify_dan_early_warning=notify_dan_early_warning,
                 llm_prescriber=llm_prescriber,
                 inline_executor=inline_executor,
+                escalation_notifier=None if dry_run else _collect_escalation,
             )
         except Exception:
             log.exception("Steward: unhandled error processing UoW %s — skipping", uow_id)
@@ -4777,6 +4905,26 @@ def run_steward_cycle(
                 wait_for_trace += 1
             case _:
                 skipped += 1
+
+    # Post-loop: dispatch escalation notifications.
+    # Individual UoW transitions to needs-human-review have already been written
+    # inside _process_uow. Only the notification layer is consolidated here.
+    if _pending_escalations and not dry_run:
+        if len(_pending_escalations) >= ESCALATION_CONSOLIDATION_THRESHOLD:
+            log.info(
+                "Steward cycle: consolidating %d escalations (threshold=%d) "
+                "— sending one consolidated notification",
+                len(_pending_escalations), ESCALATION_CONSOLIDATION_THRESHOLD,
+            )
+            _send_consolidated_escalation_notification(_pending_escalations)
+        else:
+            log.info(
+                "Steward cycle: %d escalations below threshold=%d "
+                "— sending individual notifications",
+                len(_pending_escalations), ESCALATION_CONSOLIDATION_THRESHOLD,
+            )
+            for _rec in _pending_escalations:
+                _send_escalation_notification(_rec.uow)
 
     return CycleResult(
         evaluated=evaluated,
