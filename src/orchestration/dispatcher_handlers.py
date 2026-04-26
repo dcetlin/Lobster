@@ -548,6 +548,12 @@ WOS_MESSAGE_TYPE_DISPATCH: dict[str, str] = {
     # action="spawn_subagent" (auto-retry branches) or action="send_reply" (surface-to-Dan
     # branches) — it is exempt from the spawn-gate that applies to execution message types.
     "wos_escalate": "handle_wos_escalate",
+    # Batch escalation handler (T1-A): written by the Steward when >= 3 UoWs escalate
+    # in one steward cycle (consolidated kill wave) or when _write_wos_escalate_message
+    # raises an OSError (write-failure fallback).  Like wos_escalate, this handler is
+    # exempt from the spawn-gate — it legitimately returns action="spawn_subagent" for
+    # all-orphan auto-retry and action="send_reply" for surface-to-Dan branches.
+    "wos_surface": "handle_wos_surface",
 }
 
 
@@ -628,6 +634,34 @@ _ESCALATE_HUMAN_JUDGMENT_REGISTERS: frozenset[str] = frozenset({
 # (session killed before or during execution — no execution outcome produced).
 _ESCALATE_ORPHAN_CLASSIFICATIONS: frozenset[str] = frozenset({
     ReturnReasonClassification.ORPHAN,
+})
+
+
+# ---------------------------------------------------------------------------
+# wos_surface handler — batch escalation dispatcher (T1-A)
+#
+# Called when the Steward writes a wos_surface message.  This happens in two cases:
+#   1. Consolidated kill wave (>= ESCALATION_CONSOLIDATION_THRESHOLD UoWs escalate in
+#      one steward cycle) — condition="retry_cap_consolidated", carries uow_ids list.
+#   2. Write-failure fallback (_send_escalation_notification) — condition="retry_cap",
+#      carries singular uow_id.
+#
+# Like wos_escalate, this handler is exempt from the spawn-gate — it legitimately
+# returns either action="spawn_subagent" (all-orphan auto-retry) or action="send_reply"
+# (surface-to-Dan branches).  route_wos_message dispatches wos_surface outside the
+# spawn-gate, parallel to the wos_escalate fast-path.
+# ---------------------------------------------------------------------------
+
+# return_reason strings (raw, not classifications) that identify infrastructure kill events
+# eligible for auto-retry.  These are the same strings stored in metadata.causes by
+# _send_consolidated_escalation_notification — they come from EscalationRecord.return_reason,
+# which is the raw return_reason string, not the classification.
+_SURFACE_ORPHAN_RETURN_REASONS: frozenset[str] = frozenset({
+    "executor_orphan",
+    "executing_orphan",
+    "diagnosing_orphan",
+    "orphan_kill_before_start",
+    "orphan_kill_during_execution",
 })
 
 
@@ -842,6 +876,187 @@ def handle_wos_escalate(msg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def handle_wos_surface(msg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Handle a ``wos_surface`` inbox message via the batch dispatcher decision tree (T1-A).
+
+    Called by route_wos_message when the dispatcher receives a message with
+    type="wos_surface".  The Steward writes this message in two situations:
+
+    1. **Consolidated kill wave** (condition="retry_cap_consolidated"): written by
+       ``_send_consolidated_escalation_notification`` when >= 3 UoWs escalate in one
+       steward cycle.  Carries ``metadata.uow_ids`` (list) and ``metadata.causes`` (list
+       of raw return_reason strings).
+
+    2. **Write-failure fallback** (condition="retry_cap"): written by
+       ``_send_escalation_notification`` when ``_write_wos_escalate_message`` raises an
+       OSError.  Carries ``metadata.uow_id`` (singular) and no causes list.
+
+    Decision tree (checked in order; first matching branch wins):
+
+    **Branch: Pipeline paused** (execution_enabled=False):
+        All UoWs surface to Dan regardless of return_reason.  Auto-retrying into a
+        stopped pipeline is never safe.
+        → Returns ``action="send_reply"`` with pipeline-paused note and UoW list.
+
+    **Branch: All causes are orphan return_reasons** (infrastructure kill wave):
+        Every cause in ``metadata.causes`` is in ``_SURFACE_ORPHAN_RETURN_REASONS``.
+        The batch is a single infrastructure event — all UoWs can be safely auto-retried.
+        Spawns one steward heartbeat subagent (steward re-queues all UoWs on its next cycle).
+        Sends Dan a brief summary notification (one message, no action required).
+        → Returns ``action="spawn_subagent"`` targeting the steward heartbeat.
+
+    **Branch: Mixed causes** (some orphan, some non-orphan):
+        Auto-retry eligible UoWs are identified by cross-referencing their position in
+        ``uow_ids`` against ``causes``.  Non-orphan UoWs surface to Dan individually.
+        → Returns ``action="send_reply"`` with the non-orphan UoW IDs and a note that
+        orphan UoWs were auto-retried.
+
+    **Default: All causes are non-orphan or causes list is absent**:
+        Surface all UoWs to Dan with structured context.  No auto-retry.
+        → Returns ``action="send_reply"`` with all UoW IDs.
+
+    This handler is exempt from the spawn-gate (see route_wos_message) because it
+    legitimately returns either action for different branches.
+
+    Args:
+        msg: The raw wos_surface inbox message dict.  Expected fields (in metadata):
+            - ``type`` (str): "wos_surface"
+            - ``condition`` (str): "retry_cap_consolidated" | "retry_cap" | StuckCondition
+            - ``uow_ids`` (list[str], optional): Affected UoW IDs (retry_cap_consolidated)
+            - ``uow_id`` (str, optional): Single affected UoW (retry_cap fallback)
+            - ``causes`` (list[str], optional): Raw return_reason strings per UoW
+            - ``escalation_count`` (int, optional): Number of UoWs in the batch
+
+    Returns:
+        A dict with ``action`` and branch-specific fields — same schema as
+        ``handle_wos_escalate``.
+
+        For ``action="spawn_subagent"`` (all-orphan auto-retry):
+            - ``task_id`` (str): Batch retry task identifier.
+            - ``agent_type`` (str): "lobster-generalist".
+            - ``prompt`` (str): Subagent prompt to run the steward heartbeat.
+            - ``message_type`` (str): "wos_surface".
+
+        For ``action="send_reply"`` (surface-to-Dan branches):
+            - ``text`` (str): Telegram notification text with structured context.
+            - ``chat_id`` (str | int): Admin chat ID.
+            - ``message_type`` (str): "wos_surface".
+    """
+    metadata: dict[str, Any] = msg.get("metadata", {})
+    condition: str = metadata.get("condition", "")
+
+    # Extract UoW IDs — support both retry_cap_consolidated (list) and retry_cap (singular)
+    uow_ids: list[str] = metadata.get("uow_ids") or []
+    if not uow_ids:
+        singular = metadata.get("uow_id")
+        if singular:
+            uow_ids = [singular]
+
+    causes: list[str] = metadata.get("causes") or []
+    _msg_type = "wos_surface"
+    chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "0")
+
+    # Branch: Pipeline paused — surface all regardless of return_reasons.
+    # Spawning a steward heartbeat into a stopped pipeline re-queues work
+    # that will never execute, building up stale ready-for-executor entries.
+    if not is_execution_enabled():
+        uow_list = "\n".join(f"  - `{uid}`" for uid in uow_ids) if uow_ids else "  (none listed)"
+        text = (
+            f"WOS kill wave ({condition}): {len(uow_ids)} UoW(s) surfaced — "
+            f"pipeline is paused (execution_enabled=false).\n\n"
+            f"Auto-retry was not attempted because executor dispatch is disabled.\n\n"
+            f"Affected UoWs:\n{uow_list}\n\n"
+            f"Use `/wos start` to resume the pipeline, then `/decide <uow_id> retry` "
+            f"for each UoW, or run `registry_cli decide-retry --id <uow_id>` for each."
+        )
+        return {
+            "action": "send_reply",
+            "text": text,
+            "chat_id": chat_id,
+            "message_type": _msg_type,
+        }
+
+    # Partition UoWs into orphan-eligible (auto-retry) and non-orphan (surface to Dan).
+    # causes[i] is the return_reason for uow_ids[i] when both lists are present and
+    # aligned.  If causes is shorter than uow_ids, treat the excess UoWs as non-orphan
+    # (conservative: surface rather than blindly retry without evidence).
+    orphan_uow_ids: list[str] = []
+    non_orphan_uow_ids: list[str] = []
+
+    if causes and uow_ids:
+        for i, uid in enumerate(uow_ids):
+            reason = causes[i] if i < len(causes) else "unknown"
+            if reason in _SURFACE_ORPHAN_RETURN_REASONS:
+                orphan_uow_ids.append(uid)
+            else:
+                non_orphan_uow_ids.append(uid)
+    else:
+        # No causes list — fallback path (condition="retry_cap") or malformed message.
+        # Surface all to Dan conservatively.
+        non_orphan_uow_ids = list(uow_ids)
+
+    # Branch: All causes are orphan return_reasons — auto-retry all via steward heartbeat.
+    # The batch is a single infrastructure kill event; no execution budget was consumed.
+    if orphan_uow_ids and not non_orphan_uow_ids:
+        steward_script = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), '..', '..', 'scheduled-tasks', 'steward-heartbeat.py')
+        )
+        uow_id_list_str = ", ".join(orphan_uow_ids)
+        task_id = f"surface-batch-retry-{len(orphan_uow_ids)}uow"
+        prompt = (
+            f"---\n"
+            f"task_id: {task_id}\n"
+            f"chat_id: 0\n"
+            f"source: system\n"
+            f"---\n\n"
+            f"WOS kill-wave batch auto-retry ({condition}): "
+            f"{len(orphan_uow_ids)} UoW(s) were killed before or during execution "
+            f"(all causes are orphan return_reasons — no execution budget consumed).\n\n"
+            f"Affected UoW IDs: {uow_id_list_str}\n\n"
+            f"Run the steward heartbeat to re-queue all affected UoWs:\n\n"
+            f"```bash\n"
+            f"cd ~/lobster-workspace && uv run python {steward_script}\n"
+            f"```\n\n"
+            f"Then call write_result with the steward output.\n\n"
+            f"Minimum viable output: steward heartbeat completed for batch kill wave.\n"
+            f"Boundary: do not modify any UoW status directly."
+        )
+        return {
+            "action": "spawn_subagent",
+            "task_id": task_id,
+            "agent_type": "lobster-generalist",
+            "prompt": prompt,
+            "message_type": _msg_type,
+        }
+
+    # Branch: Mixed causes — auto-retry orphans (silent), surface non-orphans to Dan.
+    # Branch: All non-orphan causes — surface all to Dan (non_orphan_uow_ids == uow_ids).
+    uow_list = "\n".join(f"  - `{uid}`" for uid in non_orphan_uow_ids)
+    orphan_note = ""
+    if orphan_uow_ids:
+        orphan_ids_str = ", ".join(f"`{uid}`" for uid in orphan_uow_ids)
+        orphan_note = (
+            f"\nNote: {len(orphan_uow_ids)} orphan UoW(s) were auto-retried "
+            f"(infrastructure kills — no execution budget consumed): {orphan_ids_str}\n"
+        )
+
+    text = (
+        f"WOS kill wave ({condition}): {len(non_orphan_uow_ids)} UoW(s) require review.\n"
+        f"{orphan_note}\n"
+        f"UoWs needing your decision:\n{uow_list}\n\n"
+        f"For each UoW:\n"
+        f"  `/decide <uow_id> retry` — reset and re-queue\n"
+        f"  `/decide <uow_id> abandon` — close as failed"
+    )
+    return {
+        "action": "send_reply",
+        "text": text,
+        "chat_id": chat_id,
+        "message_type": _msg_type,
+    }
+
+
 def _load_instructions_from_artifact(uow_id: str) -> str:
     """
     Load prescribed instructions from the WorkflowArtifact file for uow_id.
@@ -954,6 +1169,34 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
                     f"WOS escalation handler raised an error "
                     f"({type(exc).__name__}: {exc}). "
                     f"UoW escalation was NOT processed. "
+                    "Check logs and re-queue manually if needed."
+                ),
+                "message_type": msg_type,
+            }
+
+    # ---------------------------------------------------------------------------
+    # wos_surface fast-path: dispatched before the spawn-gate for the same reason as
+    # wos_escalate — this handler legitimately returns either action="spawn_subagent"
+    # (all-orphan auto-retry) or action="send_reply" (surface-to-Dan branches).
+    # ---------------------------------------------------------------------------
+    if msg_type == "wos_surface":
+        try:
+            surface_result = handle_wos_surface(msg)
+            surface_result["message_type"] = msg_type
+            return surface_result
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).error(
+                "route_wos_message: handle_wos_surface raised %s: %s — "
+                "returning send_reply alert",
+                type(exc).__name__, exc,
+            )
+            return {
+                "action": "send_reply",
+                "text": (
+                    f"WOS surface handler raised an error "
+                    f"({type(exc).__name__}: {exc}). "
+                    f"Kill wave was NOT processed. "
                     "Check logs and re-queue manually if needed."
                 ),
                 "message_type": msg_type,
