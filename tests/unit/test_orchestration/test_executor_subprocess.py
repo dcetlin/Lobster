@@ -440,3 +440,81 @@ class TestAuthTokenPassthrough:
 
         assert len(captured_envs) == 1
         assert captured_envs[0].get("CLAUDE_CODE_OAUTH_TOKEN") == "sk-ant-oat01-from-credentials-json"
+
+
+class TestEndOfOptionsSeparator:
+    """
+    _dispatch_via_claude_p and _dispatch_via_stub must place '--' before the prompt
+    in the subprocess command list so that prompts starting with '---' (e.g. YAML
+    front matter blocks) are not parsed as unknown CLI flags by the claude binary.
+
+    Background: '-p' / '--print' is a boolean flag — not a value-taking option.
+    The prompt is a positional argument. When a prompt starts with '---', the
+    claude CLI's argument parser sees an unknown option unless '--' precedes it.
+    """
+
+    def test_dispatch_via_claude_p_places_double_dash_before_yaml_front_matter_prompt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A prompt starting with '---' must not be passed as a CLI flag.
+        '--' must appear in the command list immediately before the prompt.
+        """
+        import orchestration.executor as executor_mod
+
+        captured_commands: list[list] = []
+
+        def mock_run_capture(*args, **kwargs):
+            captured_commands.append(kwargs.get("command") or list(args[0] if args else []))
+            proc = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            return proc, None
+
+        monkeypatch.setattr(executor_mod, "run_subprocess_with_error_capture", mock_run_capture)
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test-separator")
+
+        yaml_prompt = "---\ntask_id: wos-uow_test\nchat_id: 0\nsource: system\n---\nDo the thing."
+        _dispatch_via_claude_p(yaml_prompt, "uow-test-sep-001")
+
+        assert len(captured_commands) == 1
+        cmd = captured_commands[0]
+        assert "--" in cmd, "'--' sentinel must be present in the command list"
+        sep_idx = cmd.index("--")
+        assert cmd[sep_idx + 1] == yaml_prompt, (
+            "Prompt must immediately follow '--' in the command list"
+        )
+        # The prompt must not appear before '--' where it could be parsed as a flag
+        assert yaml_prompt not in cmd[:sep_idx], (
+            "Prompt must not appear before the '--' sentinel"
+        )
+
+    def test_dispatch_via_stub_places_double_dash_before_yaml_front_matter_prompt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Same guarantee for _dispatch_via_stub (used by non-general register dispatchers).
+        """
+        import orchestration.executor as executor_mod
+
+        captured_commands: list[list] = []
+
+        def mock_run_capture(*args, **kwargs):
+            captured_commands.append(kwargs.get("command") or list(args[0] if args else []))
+            proc = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            return proc, None
+
+        monkeypatch.setattr(executor_mod, "run_subprocess_with_error_capture", mock_run_capture)
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test-separator-stub")
+
+        yaml_prompt = "---\ntask_id: wos-uow_test\nchat_id: 0\nsource: system\n---\nDo the thing."
+        _dispatch_via_stub("frontier-writer", yaml_prompt, "uow-test-sep-002")
+
+        assert len(captured_commands) == 1
+        cmd = captured_commands[0]
+        assert "--" in cmd, "'--' sentinel must be present in the command list"
+        sep_idx = cmd.index("--")
+        assert cmd[sep_idx + 1] == yaml_prompt, (
+            "Prompt must immediately follow '--' in the command list"
+        )
+        assert yaml_prompt not in cmd[:sep_idx], (
+            "Prompt must not appear before the '--' sentinel"
+        )

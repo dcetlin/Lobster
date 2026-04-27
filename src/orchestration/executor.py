@@ -1036,9 +1036,12 @@ def _dispatch_via_claude_p(instructions: str, uow_id: str) -> str:
 
     command = [
         _CLAUDE_BIN,
-        "-p", prompt,
+        "-p",
         "--dangerously-skip-permissions",
         "--max-turns", "40",
+        "--",  # end-of-options sentinel: prevents prompts starting with '---' from being
+               # parsed as CLI flags by the claude argument parser
+        prompt,
     ]
 
     # Use error capture to detect and log subprocess failures with context.
@@ -1170,9 +1173,12 @@ def _dispatch_via_stub(register_name: str, instructions: str, uow_id: str) -> st
 
     command = [
         _CLAUDE_BIN,
-        "-p", instructions,
+        "-p",
         "--dangerously-skip-permissions",
         "--max-turns", "40",
+        "--",  # end-of-options sentinel: prevents prompts starting with '---' from being
+               # parsed as CLI flags by the claude argument parser
+        instructions,
     ]
 
     # Pass an explicit env so CLAUDE_CODE_OAUTH_TOKEN is present even when
