@@ -104,6 +104,13 @@ CREATE TABLE IF NOT EXISTS uow_registry (
     --   wall_clock_seconds is a derived field: computed from completed_at - started_at at query time.
     token_usage         INTEGER NULL,
 
+    -- prescription_confidence: steward's confidence in the prescription, written at dispatch time.
+    --   Float 0.0–1.0. NULL for UoWs prescribed before this migration or if computation is skipped.
+    --   Computed deterministically from steward_cycles and execution_attempts at prescription time.
+    --   Named constants in steward.py (CONFIDENCE_*) govern the thresholds.
+    --   Steward-private (excluded from executor_uow_view). Data collection only — no gating logic.
+    prescription_confidence REAL NULL,
+
     UNIQUE(source_issue_number, sweep_date)
 );
 -- vision_ref: JSON {layer, field, statement, anchored_at}

@@ -739,6 +739,69 @@ _EARLY_WARNING_CYCLES = 4
 # Uses per-attempt steward_cycles (not lifetime_cycles) — crash detection is per-attempt.
 _CRASH_SURFACE_CYCLES = 2
 
+# ---------------------------------------------------------------------------
+# Prescription confidence thresholds
+# ---------------------------------------------------------------------------
+# confidence values written at steward dispatch time (issue #995).
+# Computed deterministically from steward_cycles and execution_attempts — no LLM.
+# These are data-collection constants; no routing or gating logic reads them.
+
+# First prescription, success_criteria present → high confidence baseline.
+CONFIDENCE_FIRST_EXECUTION: float = 0.8
+
+# Re-entry with few confirmed execution attempts (1–2) → moderate confidence.
+CONFIDENCE_LOW_ATTEMPTS: float = 0.6
+
+# Re-entry with several confirmed execution attempts (3+) → lower confidence.
+CONFIDENCE_HIGH_ATTEMPTS: float = 0.4
+
+# High steward cycle count signals a struggling UoW → minimal confidence.
+CONFIDENCE_HIGH_CYCLES: float = 0.2
+
+# Threshold: steward_cycles >= this value → use CONFIDENCE_HIGH_CYCLES.
+CONFIDENCE_HIGH_CYCLES_THRESHOLD: int = 4
+
+# Threshold: execution_attempts >= this value → use CONFIDENCE_HIGH_ATTEMPTS.
+CONFIDENCE_HIGH_ATTEMPTS_THRESHOLD: int = 3
+
+
+def _compute_prescription_confidence(
+    steward_cycles: int,
+    execution_attempts: int,
+    success_criteria_present: bool,
+) -> float:
+    """
+    Compute a deterministic confidence signal for a prescription.
+
+    Pure function: no side effects, no I/O, no randomness.
+
+    Decision table (evaluated top-to-bottom, first match wins):
+    1. steward_cycles >= CONFIDENCE_HIGH_CYCLES_THRESHOLD → CONFIDENCE_HIGH_CYCLES
+    2. execution_attempts >= CONFIDENCE_HIGH_ATTEMPTS_THRESHOLD → CONFIDENCE_HIGH_ATTEMPTS
+    3. execution_attempts >= 1 → CONFIDENCE_LOW_ATTEMPTS  (re-entry, few attempts)
+    4. success_criteria_present → CONFIDENCE_FIRST_EXECUTION  (first execution, criteria set)
+    5. fallback → CONFIDENCE_LOW_ATTEMPTS  (first execution but no criteria)
+
+    Args:
+        steward_cycles: current per-attempt cycle count (0 on first pass).
+        execution_attempts: confirmed execution attempts (incremented only for
+            non-orphan returns).
+        success_criteria_present: True when the UoW has a non-empty success_criteria.
+
+    Returns:
+        Float in [0.0, 1.0] representing the steward's confidence in this prescription.
+    """
+    if steward_cycles >= CONFIDENCE_HIGH_CYCLES_THRESHOLD:
+        return CONFIDENCE_HIGH_CYCLES
+    if execution_attempts >= CONFIDENCE_HIGH_ATTEMPTS_THRESHOLD:
+        return CONFIDENCE_HIGH_ATTEMPTS
+    if execution_attempts >= 1:
+        return CONFIDENCE_LOW_ATTEMPTS
+    if success_criteria_present:
+        return CONFIDENCE_FIRST_EXECUTION
+    return CONFIDENCE_LOW_ATTEMPTS
+
+
 # Fields required by the Steward for operation
 _STEWARD_REQUIRED_FIELDS = frozenset({
     "workflow_artifact",
@@ -2807,6 +2870,7 @@ def _write_steward_fields(
     close_reason: str | None = None,
     retry_count: int | None = None,
     execution_attempts: int | None = None,
+    prescription_confidence: float | None = None,
 ) -> None:
     """
     Write Steward-private and Steward-managed fields to the UoW row.
@@ -2838,6 +2902,8 @@ def _write_steward_fields(
         updates["retry_count"] = retry_count
     if execution_attempts is not None:
         updates["execution_attempts"] = execution_attempts
+    if prescription_confidence is not None:
+        updates["prescription_confidence"] = prescription_confidence
 
     if not updates:
         return
@@ -4832,6 +4898,14 @@ def _process_uow(
                 "timestamp": _now_iso(),
             })
 
+        # Compute prescription confidence from available signals (data-collection only —
+        # no routing logic reads this value in this PR). Pure function, no side effects.
+        confidence = _compute_prescription_confidence(
+            steward_cycles=cycles,
+            execution_attempts=uow.execution_attempts,
+            success_criteria_present=bool(uow.success_criteria and uow.success_criteria.strip()),
+        )
+
         # Write all steward fields BEFORE status transition
         _write_steward_fields(
             registry, uow_id,
@@ -4841,6 +4915,7 @@ def _process_uow(
             prescribed_skills=json.dumps(prescribed_skills),
             route_reason=route_reason,
             steward_cycles=new_cycles,
+            prescription_confidence=confidence,
         )
 
         # Write prescription audit entry (before status transition)
@@ -4854,6 +4929,7 @@ def _process_uow(
             "prescription_source": "llm" if _llm_path_taken[0] else "deterministic",
             "instructions_preview": instructions[:80],
             "prescription_path": prescription_path,
+            "prescription_confidence": confidence,
             "timestamp": _now_iso(),
         })
 
