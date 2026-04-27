@@ -625,6 +625,146 @@ def recover_stale_heartbeat_uows(
 
 
 # ---------------------------------------------------------------------------
+# Stuck-agent detection (Phase 2c, migration 0016) — progress governor
+# ---------------------------------------------------------------------------
+
+# Number of consecutive zero-delta heartbeat intervals required to flag a UoW
+# as stuck_heartbeat. With a ~60–90s heartbeat frequency and a 3-minute steward
+# cycle, N=2 means ~2–3 minutes of no-progress signal before the flag fires.
+STUCK_HEARTBEAT_CONSECUTIVE_INTERVALS: int = 2
+
+# Minimum token delta per heartbeat interval to be considered "making progress".
+# Set to 0: any nonzero delta (even 1 token) clears the stuck condition.
+STUCK_HEARTBEAT_MIN_DELTA: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class StuckHeartbeatResult:
+    """Pure result value returned by detect_stuck_heartbeat_uows."""
+    checked: int
+    flagged: int
+
+
+def _consecutive_zero_delta_tail(token_snapshots: list[int]) -> int:
+    """
+    Return the number of consecutive zero-delta intervals at the end of a
+    sequence of token counts (oldest to newest).
+
+    Each interval is the difference between snapshot[i] and snapshot[i-1].
+    An interval with delta == 0 (or negative, which is treated as 0) means
+    no tokens were consumed between those two heartbeats.
+
+    >>> _consecutive_zero_delta_tail([100, 200, 300])
+    0
+    >>> _consecutive_zero_delta_tail([100, 200, 200])
+    1
+    >>> _consecutive_zero_delta_tail([100, 200, 200, 200])
+    2
+    >>> _consecutive_zero_delta_tail([100, 100, 100])
+    2
+    >>> _consecutive_zero_delta_tail([100])
+    0
+    """
+    if len(token_snapshots) < 2:
+        return 0
+    count = 0
+    for i in range(len(token_snapshots) - 1, 0, -1):
+        delta = token_snapshots[i] - token_snapshots[i - 1]
+        if delta <= STUCK_HEARTBEAT_MIN_DELTA:
+            count += 1
+        else:
+            break
+    return count
+
+
+def detect_stuck_heartbeat_uows(
+    registry,
+    dry_run: bool = False,
+    consecutive_threshold: int = STUCK_HEARTBEAT_CONSECUTIVE_INTERVALS,
+) -> StuckHeartbeatResult:
+    """
+    Detect executing UoWs whose heartbeat token delta has been zero (or below
+    threshold) for consecutive_threshold consecutive intervals.
+
+    A stuck agent is one that writes heartbeats (proving liveness) but consumes
+    no tokens between consecutive heartbeats — indicating it is looping, sleeping,
+    or spinning without making forward LLM progress.
+
+    Detection condition:
+    - status IN ('active', 'executing')
+    - uow_heartbeat_log has >= consecutive_threshold + 1 rows with non-NULL
+      token_usage for this UoW (need N+1 snapshots for N intervals)
+    - The last consecutive_threshold deltas between consecutive snapshots are
+      all <= STUCK_HEARTBEAT_MIN_DELTA
+
+    Action: log the detection as stuck_heartbeat. Do NOT kill or re-queue.
+    Kill logic is a future gate (out of scope for this PR).
+
+    In dry_run mode: same detection logic, same logging — no state changes are
+    made anyway (detection is read-only).
+
+    Returns StuckHeartbeatResult(checked, flagged).
+    """
+    try:
+        candidates = registry.get_executing_uows_with_heartbeats()
+    except Exception as exc:
+        log.warning("Stuck-agent detection: failed to query candidates — %s", exc)
+        return StuckHeartbeatResult(checked=0, flagged=0)
+
+    checked = 0
+    flagged = 0
+
+    for uow in candidates:
+        uow_id = uow["id"] if isinstance(uow, dict) else uow.id
+        checked += 1
+
+        try:
+            log_rows = registry.get_heartbeat_log(uow_id)
+        except Exception as exc:
+            log.warning(
+                "Stuck-agent detection: failed to read heartbeat log for UoW %s — %s",
+                uow_id, exc,
+            )
+            continue
+
+        token_snapshots = [row["token_usage"] for row in log_rows]
+        if len(token_snapshots) < consecutive_threshold + 1:
+            # Not enough snapshots to evaluate N consecutive intervals.
+            continue
+
+        zero_tail = _consecutive_zero_delta_tail(token_snapshots)
+        if zero_tail >= consecutive_threshold:
+            flagged += 1
+            latest_token = token_snapshots[-1]
+            prev_token = token_snapshots[-2]
+            if dry_run:
+                log.info(
+                    "stuck_heartbeat (DRY RUN): UoW %s — %d consecutive zero-delta intervals "
+                    "(latest_token=%d, prev_token=%d, snapshots=%d). "
+                    "Detection only — no kill (future gate).",
+                    uow_id, zero_tail, latest_token, prev_token, len(token_snapshots),
+                )
+            else:
+                log.warning(
+                    "stuck_heartbeat: UoW %s — %d consecutive zero-delta heartbeat intervals "
+                    "(latest_token=%d, prev_token=%d, snapshots=%d). "
+                    "Agent is alive but making no LLM progress. Detection only — no kill (future gate).",
+                    uow_id, zero_tail, latest_token, prev_token, len(token_snapshots),
+                )
+                _append_observation(
+                    f"stuck_heartbeat: UoW {uow_id} — {zero_tail} consecutive zero-delta intervals "
+                    f"(latest_token={latest_token}, prev_token={prev_token})"
+                )
+        else:
+            log.debug(
+                "Stuck-agent check: UoW %s — %d zero-delta tail (threshold=%d, not flagged)",
+                uow_id, zero_tail, consecutive_threshold,
+            )
+
+    return StuckHeartbeatResult(checked=checked, flagged=flagged)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -725,6 +865,19 @@ def main() -> int:
         )
     except Exception:
         log.exception("Heartbeat stall recovery failed — continuing to Steward main loop")
+
+    # Phase 2c: Stuck-agent detection — progress governor (migration 0016, issue #994).
+    # Agents that write heartbeats while consuming no tokens are alive but not progressing.
+    # Detection only — no kill logic in this PR (future gate).
+    log.info("--- Phase 2c: Stuck-agent detection ---")
+    try:
+        stuck_result = detect_stuck_heartbeat_uows(registry, dry_run=dry_run)
+        log.info(
+            "Stuck-agent detection complete: %d checked, %d flagged as stuck_heartbeat",
+            stuck_result.checked, stuck_result.flagged,
+        )
+    except Exception:
+        log.exception("Stuck-agent detection failed — continuing to Steward main loop")
 
     # execution_enabled gate — mirrors the executor-heartbeat pattern.
     # Phases 0–2 (stale agent cleanup, startup sweep, observation loop) always

@@ -2589,6 +2589,8 @@ async def list_tools() -> list[Tool]:
                 "Call this every 60–90 seconds during WOS task execution to prove the agent is alive. "
                 "Without periodic heartbeats, the Observation Loop will detect a stall and re-queue "
                 "the UoW for re-execution. "
+                "Pass token_usage (cumulative input+output tokens from Claude API responses so far) "
+                "so the steward can detect stuck agents that heartbeat without making progress. "
                 "Returns: {\"rowcount\": 1} on success, {\"rowcount\": 0} if the UoW status has "
                 "already changed (e.g. recovered by the Observation Loop — stop execution immediately "
                 "and call write_result with outcome=failed)."
@@ -2599,6 +2601,16 @@ async def list_tools() -> list[Tool]:
                     "uow_id": {
                         "type": "string",
                         "description": "The WOS unit-of-work ID to write a heartbeat for (e.g. 'uow_abc123').",
+                    },
+                    "token_usage": {
+                        "type": "integer",
+                        "description": (
+                            "Optional cumulative token count at the time of this heartbeat "
+                            "(sum of input_tokens + output_tokens from all Claude API responses "
+                            "received so far in this execution). Pass your running total each time. "
+                            "The steward uses consecutive token deltas to detect stuck agents. "
+                            "Omit if you are not tracking token usage."
+                        ),
                     },
                 },
                 "required": ["uow_id"],
@@ -7796,6 +7808,15 @@ async def handle_write_wos_heartbeat(args: dict) -> list[TextContent]:
     if not uow_id:
         return [TextContent(type="text", text='{"error": "uow_id is required"}')]
 
+    # token_usage: optional cumulative token count for stuck-agent detection.
+    # Accept integers and floats (MCP may transmit numbers as float); reject strings
+    # and negative values. None is the backwards-compatible default.
+    _token_usage_raw = args.get("token_usage")
+    token_usage: int | None = None
+    if _token_usage_raw is not None:
+        if isinstance(_token_usage_raw, (int, float)) and int(_token_usage_raw) >= 0:
+            token_usage = int(_token_usage_raw)
+
     try:
         import sys as _sys
         import os
@@ -7804,8 +7825,11 @@ async def handle_write_wos_heartbeat(args: dict) -> list[TextContent]:
         if _src not in _sys.path:
             _sys.path.insert(0, _src)
         from orchestration.registry import WOSRegistry
-        rowcount = WOSRegistry().write_heartbeat(uow_id)
-        log.debug("write_wos_heartbeat: uow_id=%s rowcount=%d", uow_id, rowcount)
+        rowcount = WOSRegistry().write_heartbeat(uow_id, token_usage=token_usage)
+        log.debug(
+            "write_wos_heartbeat: uow_id=%s rowcount=%d token_usage=%s",
+            uow_id, rowcount, token_usage,
+        )
         return [TextContent(type="text", text=f'{{"rowcount": {rowcount}}}')]
     except Exception as exc:
         log.warning(

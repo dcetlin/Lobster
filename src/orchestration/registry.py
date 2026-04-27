@@ -2191,7 +2191,7 @@ class Registry:
     # Heartbeat locking methods (migration 0009)
     # -----------------------------------------------------------------------
 
-    def write_heartbeat(self, uow_id: str) -> int:
+    def write_heartbeat(self, uow_id: str, token_usage: int | None = None) -> int:
         """
         Update heartbeat_at for an executing UoW to prove agent liveness.
 
@@ -2205,6 +2205,15 @@ class Registry:
         The write is fire-and-forget from the agent's perspective — agents
         call this unconditionally on a regular interval (every 60–90s) and
         do not need to act on the return value.
+
+        Args:
+            uow_id: The UoW identifier.
+            token_usage: Optional cumulative token count at the time of this
+                heartbeat (input + output tokens combined). When provided,
+                a snapshot row is written to uow_heartbeat_log so the steward
+                can compute per-interval token deltas and detect stuck agents.
+                Pass None (the default) to remain backwards compatible with
+                agents that do not track token usage.
         """
         conn = self._connect()
         try:
@@ -2217,11 +2226,100 @@ class Registry:
                 """,
                 (now, now, uow_id),
             )
+            rowcount = cursor.rowcount
+            # Write per-heartbeat token snapshot when token_usage is provided.
+            # The uow_heartbeat_log table is created by migration 0016. If the
+            # table does not yet exist (pre-migration install), we skip silently
+            # so existing deploys are not broken.
+            if token_usage is not None:
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO uow_heartbeat_log (uow_id, recorded_at, token_usage)
+                        VALUES (?, ?, ?)
+                        """,
+                        (uow_id, now, token_usage),
+                    )
+                except Exception as log_exc:
+                    # Non-fatal: table may not exist on pre-0016 deploys.
+                    # Log and continue — the heartbeat_at update already succeeded.
+                    log.debug(
+                        "write_heartbeat: could not write heartbeat log for uow_id=%s — %s: %s",
+                        uow_id, type(log_exc).__name__, log_exc,
+                    )
             conn.commit()
-            return cursor.rowcount
+            return rowcount
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.close()
+
+    def get_heartbeat_log(self, uow_id: str) -> list[dict]:
+        """
+        Return heartbeat log rows for a UoW, ordered oldest-first.
+
+        Each row is a dict with keys: id, uow_id, recorded_at, token_usage.
+        Only rows with non-NULL token_usage are included — NULL rows carry no
+        progress signal and are irrelevant to stuck-agent detection.
+
+        Returns an empty list when no token-bearing heartbeats have been recorded
+        or when the uow_heartbeat_log table does not yet exist (pre-0016 deploys).
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, uow_id, recorded_at, token_usage
+                FROM uow_heartbeat_log
+                WHERE uow_id = ? AND token_usage IS NOT NULL
+                ORDER BY recorded_at ASC
+                """,
+                (uow_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        except Exception as exc:
+            log.debug(
+                "get_heartbeat_log: failed for uow_id=%s — %s: %s",
+                uow_id, type(exc).__name__, exc,
+            )
+            return []
+        finally:
+            conn.close()
+
+    def get_executing_uows_with_heartbeats(self) -> list[dict]:
+        """
+        Return all executing UoWs that have at least 2 token-bearing heartbeat
+        log rows — the minimum needed to compute a progress delta.
+
+        Used by the steward's stuck-agent detector (Phase 2c). Returns a list
+        of dicts with keys: id, status, heartbeat_at, heartbeat_ttl.
+        Only UoWs in 'active' or 'executing' status are included.
+
+        Returns an empty list when the uow_heartbeat_log table does not yet
+        exist (pre-0016 deploys).
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT u.id, u.status, u.heartbeat_at, u.heartbeat_ttl
+                FROM uow_registry u
+                WHERE u.status IN ('active', 'executing')
+                  AND (
+                    SELECT COUNT(*)
+                    FROM uow_heartbeat_log h
+                    WHERE h.uow_id = u.id AND h.token_usage IS NOT NULL
+                  ) >= 2
+                """,
+            ).fetchall()
+            return [dict(row) for row in rows]
+        except Exception as exc:
+            log.debug(
+                "get_executing_uows_with_heartbeats: failed — %s: %s",
+                type(exc).__name__, exc,
+            )
+            return []
         finally:
             conn.close()
 
