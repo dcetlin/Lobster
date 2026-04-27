@@ -859,7 +859,6 @@ class TestWindowStartIso:
 
     def test_from_iso_invalid_raises_value_error(self):
         """A non-ISO --from value raises ValueError."""
-        import pytest
         with pytest.raises(ValueError, match="not a valid ISO 8601"):
             _window_start_iso(None, "not-a-date")
 
@@ -908,8 +907,14 @@ class TestClassifyStatus:
 
 class TestComputeSummary:
     def _make_row(self, status: str, wall_clock: int | None = None,
-                  token_usage: int | None = None) -> dict:
-        return {"status": status, "wall_clock_seconds": wall_clock, "token_usage": token_usage}
+                  token_usage: int | None = None,
+                  outcome_category: str | None = None) -> dict:
+        return {
+            "status": status,
+            "wall_clock_seconds": wall_clock,
+            "token_usage": token_usage,
+            "outcome_category": outcome_category,
+        }
 
     def test_counts_correct_for_mixed_statuses(self):
         """Bucket counts match the spec for a known set of rows."""
@@ -988,6 +993,40 @@ class TestComputeSummary:
         assert summary["median_wall_clock_seconds"] is None
 
 
+    def test_outcome_category_counts_valid_labels_only(self):
+        """outcome_category breakdown counts only valid label values; NULL is excluded."""
+        WINDOW_START = "2026-01-01T00:00:00+00:00"
+        now = datetime(2026, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
+        rows = [
+            self._make_row("done", outcome_category="pearl"),
+            self._make_row("done", outcome_category="pearl"),
+            self._make_row("done", outcome_category="seed"),
+            self._make_row("done", outcome_category="heat"),
+            self._make_row("done", outcome_category=None),         # excluded — NULL
+            self._make_row("done", outcome_category="mystery"),    # excluded — invalid label
+        ]
+        summary = _compute_summary(rows, WINDOW_START, now)
+
+        counts = summary["outcome_category_counts"]
+        assert counts.get("pearl") == 2
+        assert counts.get("seed") == 1
+        assert counts.get("heat") == 1
+        assert "shit" not in counts          # not present in this dataset
+        assert "mystery" not in counts       # invalid label filtered out
+
+    def test_outcome_category_counts_empty_when_all_null(self):
+        """outcome_category_counts is empty when no UoW has a category set."""
+        WINDOW_START = "2026-01-01T00:00:00+00:00"
+        now = datetime(2026, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
+        rows = [
+            self._make_row("done", outcome_category=None),
+            self._make_row("done", outcome_category=None),
+        ]
+        summary = _compute_summary(rows, WINDOW_START, now)
+
+        assert summary["outcome_category_counts"] == {}
+
+
 # ---------------------------------------------------------------------------
 # report command integration tests (subprocess, real DB)
 # ---------------------------------------------------------------------------
@@ -1052,3 +1091,71 @@ class TestReportCommand:
         run_cli(db_path, "upsert", "--issue", "40", "--title", "Init", "--sweep-date", "2024-01-01")
         output = run_cli_text(db_path, "report")
         assert "WOS Pipeline Report" in output
+
+    def test_report_outcome_category_line_present_when_categories_exist(self, db_path):
+        """The 'Outcomes' header line appears when at least one UoW has outcome_category set."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        run_cli(db_path, "upsert", "--issue", "50", "--title", "Pearl UoW", "--sweep-date", today)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "UPDATE uow_registry SET started_at = ?, outcome_category = 'pearl' "
+            "WHERE source_issue_number = 50",
+            (now_iso,),
+        )
+        conn.commit()
+        conn.close()
+
+        output = run_cli_text(db_path, "report", "--since", "1")
+        assert "Outcomes" in output
+        assert "pearl: 1" in output
+
+    def test_report_outcome_category_line_absent_when_all_null(self, db_path):
+        """The 'Outcomes' header line is omitted when no UoW has outcome_category."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        run_cli(db_path, "upsert", "--issue", "60", "--title", "No category", "--sweep-date", today)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "UPDATE uow_registry SET started_at = ? WHERE source_issue_number = 60",
+            (now_iso,),
+        )
+        conn.commit()
+        conn.close()
+
+        output = run_cli_text(db_path, "report", "--since", "1")
+        assert "Outcomes" not in output
+
+    def test_report_per_uow_line_shows_category_label(self, db_path):
+        """The per-UoW line includes the [category] label when outcome_category is set."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        run_cli(db_path, "upsert", "--issue", "70", "--title", "Seed UoW", "--sweep-date", today)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "UPDATE uow_registry SET started_at = ?, outcome_category = 'seed' "
+            "WHERE source_issue_number = 70",
+            (now_iso,),
+        )
+        conn.commit()
+        conn.close()
+
+        output = run_cli_text(db_path, "report", "--since", "1")
+        # The per-UoW line for issue 70 should contain [seed]
+        per_uow_lines = [l for l in output.splitlines() if "uow_" in l]
+        assert any("[seed]" in l for l in per_uow_lines), (
+            f"Expected [seed] in a per-UoW line, got:\n" + "\n".join(per_uow_lines)
+        )
+
+    def test_report_from_flag_future_returns_zero(self, db_path):
+        """--from with a future timestamp returns zero UoWs."""
+        run_cli(db_path, "upsert", "--issue", "20", "--title", "Old UoW", "--sweep-date", "2024-01-01")
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("UPDATE uow_registry SET started_at = '2024-01-01T00:00:00+00:00'")
+        conn.commit()
+        conn.close()
+
+        output = run_cli_text(db_path, "report", "--from", "2099-01-01T00:00:00+00:00")
+        total_line = next(l for l in output.splitlines() if l.startswith("Total UoWs"))
+        total_str = total_line.split(":")[1].strip().split()[0]
+        assert int(total_str) == 0

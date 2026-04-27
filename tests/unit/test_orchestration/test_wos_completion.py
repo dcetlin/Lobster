@@ -1444,3 +1444,124 @@ class TestStewardTriggerIntegration:
         assert uow.status == UoWStatus.READY_FOR_STEWARD, (
             "UoW must reach ready-for-steward even when steward trigger fails"
         )
+
+
+# ---------------------------------------------------------------------------
+# outcome_category forwarding through maybe_complete_wos_uow (issue #998)
+# ---------------------------------------------------------------------------
+
+class TestOutcomeCategoryForwarding:
+    """
+    Verify that outcome_category is forwarded from maybe_complete_wos_uow
+    to registry.complete_uow and persisted in the DB column.
+    """
+
+    def test_outcome_category_pearl_stored_in_db(self, tmp_path: Path) -> None:
+        """
+        When maybe_complete_wos_uow is called with outcome_category='pearl',
+        the value is written to the outcome_category column in uow_registry.
+        """
+        import sqlite3
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = _seed_uow_at_status(registry, "executing", output_dir)
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        with patch("orchestration.wos_completion.subprocess.run"), \
+             patch.dict(os.environ, {"REGISTRY_DB_PATH": str(db_path)}):
+            maybe_complete_wos_uow(
+                task_id,
+                WRITE_RESULT_SUCCESS_STATUS,
+                outcome_category="pearl",
+            )
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        stored = conn.execute(
+            "SELECT outcome_category FROM uow_registry WHERE id = ?", (uow_id,)
+        ).fetchone()["outcome_category"]
+        conn.close()
+        assert stored == "pearl", f"Expected 'pearl' in DB, got {stored!r}"
+
+    def test_outcome_category_null_when_not_provided(self, tmp_path: Path) -> None:
+        """
+        When maybe_complete_wos_uow is called without outcome_category,
+        the DB column remains NULL — not the string 'None'.
+        """
+        import sqlite3
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = _seed_uow_at_status(registry, "executing", output_dir)
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        with patch("orchestration.wos_completion.subprocess.run"), \
+             patch.dict(os.environ, {"REGISTRY_DB_PATH": str(db_path)}):
+            maybe_complete_wos_uow(task_id, WRITE_RESULT_SUCCESS_STATUS)
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        stored = conn.execute(
+            "SELECT outcome_category FROM uow_registry WHERE id = ?", (uow_id,)
+        ).fetchone()["outcome_category"]
+        conn.close()
+        assert stored is None, (
+            f"outcome_category must be NULL when not provided, got {stored!r}"
+        )
+
+    def test_all_four_valid_outcome_categories_are_persisted(self, tmp_path: Path) -> None:
+        """
+        Each of the four valid metabolic labels (heat/shit/seed/pearl) can be
+        passed through maybe_complete_wos_uow and persisted without truncation.
+        """
+        import sqlite3
+        from orchestration.registry import UpsertInserted
+
+        VALID_LABELS = ("heat", "shit", "seed", "pearl")
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        for i, label in enumerate(VALID_LABELS):
+            result = registry.upsert(
+                issue_number=8800 + i,
+                title=f"Outcome category test UoW: {label}",
+                success_criteria="label storage test",
+            )
+            assert isinstance(result, UpsertInserted)
+            uow_id = result.id
+            registry.approve(uow_id)
+            # Advance to 'executing' via the proper path
+            registry.set_status_direct(uow_id, "active")
+            output_ref = str(output_dir / f"{uow_id}.json")
+            conn = sqlite3.connect(str(db_path))
+            conn.execute(
+                "UPDATE uow_registry SET output_ref = ? WHERE id = ?",
+                (output_ref, uow_id),
+            )
+            conn.commit()
+            conn.close()
+            registry.transition_to_executing(uow_id, f"mock-executor-{i}")
+
+            task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+            with patch("orchestration.wos_completion.subprocess.run"), \
+                 patch.dict(os.environ, {"REGISTRY_DB_PATH": str(db_path)}):
+                maybe_complete_wos_uow(
+                    task_id,
+                    WRITE_RESULT_SUCCESS_STATUS,
+                    outcome_category=label,
+                )
+
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            stored = conn.execute(
+                "SELECT outcome_category FROM uow_registry WHERE id = ?", (uow_id,)
+            ).fetchone()["outcome_category"]
+            conn.close()
+            assert stored == label, f"Expected {label!r} stored, got {stored!r}"

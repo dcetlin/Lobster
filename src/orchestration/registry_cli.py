@@ -489,6 +489,10 @@ _ESCALATED_STATUSES = frozenset({"needs-human-review"})
 _EXECUTING_STATUSES = frozenset({"active", "executing", "ready-for-steward",
                                   "ready-for-executor", "diagnosing"})
 
+# Valid metabolic taxonomy labels — mirrors VALID_OUTCOME_CATEGORIES in inbox_server.
+# Defined here so registry_cli can classify without importing the MCP server.
+_VALID_OUTCOME_CATEGORIES = frozenset({"heat", "shit", "seed", "pearl"})
+
 # Default look-back window when neither --since nor --from is specified.
 DEFAULT_REPORT_HOURS = 24
 
@@ -544,7 +548,8 @@ def _compute_summary(rows: list[dict], window_start_iso: str, now: datetime) -> 
 
     Returns a plain dict with:
       total, complete, failed, escalated, executing, in_pipeline,
-      throughput_per_hour, median_wall_clock_seconds, total_token_usage
+      throughput_per_hour, median_wall_clock_seconds, total_token_usage,
+      outcome_category_counts
     """
     total = len(rows)
     buckets: dict[str, int] = {
@@ -579,6 +584,14 @@ def _compute_summary(rows: list[dict], window_start_iso: str, now: datetime) -> 
         if row.get("token_usage") is not None
     )
 
+    # outcome_category breakdown: count UoWs per label (heat/shit/seed/pearl).
+    # Only non-NULL values are counted; NULL means the subagent did not report one.
+    outcome_counts: dict[str, int] = {}
+    for row in rows:
+        cat = row.get("outcome_category")
+        if cat in _VALID_OUTCOME_CATEGORIES:
+            outcome_counts[cat] = outcome_counts.get(cat, 0) + 1
+
     return {
         "total": total,
         "complete": buckets["complete"],
@@ -589,6 +602,7 @@ def _compute_summary(rows: list[dict], window_start_iso: str, now: datetime) -> 
         "throughput_per_hour": throughput,
         "median_wall_clock_seconds": median_wc,
         "total_token_usage": total_tokens,
+        "outcome_category_counts": outcome_counts,
     }
 
 
@@ -607,14 +621,15 @@ def _format_report(rows: list[dict], summary: dict, window_start_iso: str,
     Render the report as plain aligned text — no markdown tables.
 
     Layout:
-      Header block  (window, counts, throughput, median wall-clock, tokens)
+      Header block  (window, counts, throughput, median wall-clock, tokens,
+                     outcome_category breakdown)
       Blank line
       Per-UoW lines (one per row, most recent first — already ordered by query)
     """
     lines: list[str] = []
 
     # --- Header ---
-    lines.append(f"WOS Pipeline Report")
+    lines.append("WOS Pipeline Report")
     lines.append(f"Window start : {window_start_iso}")
     lines.append(
         f"Total UoWs   : {summary['total']}"
@@ -630,6 +645,17 @@ def _format_report(rows: list[dict], summary: dict, window_start_iso: str,
     lines.append(f"Median wall  : {int(mwc)}s" if mwc is not None else "Median wall  : n/a")
     lines.append(f"Total tokens : {summary['total_token_usage']}")
 
+    # Outcome category breakdown — only emit the line when at least one UoW has one.
+    oc_counts = summary.get("outcome_category_counts") or {}
+    if oc_counts:
+        # Emit in canonical order: pearl seed heat shit (positive → negative)
+        parts = [
+            f"{label}: {oc_counts[label]}"
+            for label in ("pearl", "seed", "heat", "shit")
+            if label in oc_counts
+        ]
+        lines.append(f"Outcomes     : {'  '.join(parts)}")
+
     if not rows:
         lines.append("")
         lines.append("(no UoWs in window)")
@@ -641,13 +667,15 @@ def _format_report(rows: list[dict], summary: dict, window_start_iso: str,
 
     # Column header
     lines.append(
-        f"{'UoW ID':<26}  {'Status':<22}  {'Wall(s)':>7}  {'Tokens':>8}  {'Issue':>6}  Kill"
+        f"{'UoW ID':<26}  {'Status':<22}  {'Category':<8}  {'Wall(s)':>7}  {'Tokens':>8}  {'Issue':>6}  Kill"
     )
-    lines.append("-" * 90)
+    lines.append("-" * 100)
 
     for row in rows:
         uow_id = row.get("id") or ""
         status = row.get("status") or ""
+        cat = row.get("outcome_category")
+        cat_str = f"[{cat}]" if cat in _VALID_OUTCOME_CATEGORIES else ""
         wc = row.get("wall_clock_seconds")
         wc_str = str(int(wc)) if wc is not None else "-"
         tok = row.get("token_usage")
@@ -664,7 +692,7 @@ def _format_report(rows: list[dict], summary: dict, window_start_iso: str,
                 kill_str = lbl
 
         lines.append(
-            f"{uow_id:<26}  {status:<22}  {wc_str:>7}  {tok_str:>8}  {issue_str:>6}  {kill_str}"
+            f"{uow_id:<26}  {status:<22}  {cat_str:<8}  {wc_str:>7}  {tok_str:>8}  {issue_str:>6}  {kill_str}"
         )
 
     return "\n".join(lines)
@@ -676,6 +704,8 @@ def cmd_report(registry: "Registry", args: argparse.Namespace) -> None:
 
     Output is plain aligned text (no markdown tables). The report covers all
     UoWs whose started_at or completed_at falls within the requested window.
+    Includes outcome_category (heat/shit/seed/pearl) in the summary breakdown
+    and per-UoW listing when present.
 
     Options:
       --since HOURS   Look back N hours from now (default: 24)
@@ -795,9 +825,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "report",
         help=(
             "Time-windowed pipeline visibility report. "
-            "Shows aggregate stats and a per-UoW listing for all UoWs "
-            "whose started_at or completed_at falls within the window. "
-            "Output is plain aligned text (not JSON)."
+            "Plain text output (not JSON). Shows aggregate stats, throughput, "
+            "median wall-clock, token usage, outcome_category breakdown, "
+            "and a per-UoW listing."
         ),
     )
     p_report.add_argument(

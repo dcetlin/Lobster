@@ -7752,6 +7752,7 @@ def _maybe_complete_wos_uow(
     status: str,
     result_text: str | None = None,
     token_usage: int | None = None,
+    outcome_category: str | None = None,
 ) -> None:
     """
     Transition a WOS UoW from 'executing' to 'ready-for-steward' when its subagent
@@ -7768,6 +7769,11 @@ def _maybe_complete_wos_uow(
     token_usage is forwarded to record per-UoW cost telemetry in the registry
     (issue #990). NULL when the subagent did not report usage.
 
+    outcome_category is forwarded to record the metabolic taxonomy label in the
+    registry (issue #998). Already validated as a member of VALID_OUTCOME_CATEGORIES
+    by the write_result handler before this function is called. NULL when the
+    subagent did not report an outcome_category.
+
     Errors are logged but never raised — write_result delivery must not be blocked
     by registry update failures.
     """
@@ -7779,7 +7785,8 @@ def _maybe_complete_wos_uow(
         if _src not in _sys.path:
             _sys.path.insert(0, _src)
         from orchestration.wos_completion import maybe_complete_wos_uow
-        maybe_complete_wos_uow(task_id, status, result_text=result_text, token_usage=token_usage)
+        maybe_complete_wos_uow(task_id, status, result_text=result_text, token_usage=token_usage,
+                               outcome_category=outcome_category)
     except Exception as exc:
         log.warning("_maybe_complete_wos_uow: unexpected error — %s: %s", type(exc).__name__, exc)
 
@@ -8010,7 +8017,9 @@ async def handle_write_result(args: dict) -> list[TextContent]:
     # result_text is forwarded so the output classifier can build an accurate close-out
     # comment (pearl for PR opened, heat for nothing to do, seed as default).
     # token_usage is forwarded for per-UoW cost telemetry (issue #990).
-    _maybe_complete_wos_uow(task_id, status, result_text=text or None, token_usage=token_usage)
+    # outcome_category is forwarded to persist metabolic taxonomy in the registry (issue #998).
+    _maybe_complete_wos_uow(task_id, status, result_text=text or None, token_usage=token_usage,
+                            outcome_category=outcome_category)
 
     # Notify wire server so SSE clients update within 40ms
     asyncio.create_task(_notify_wire_server())
