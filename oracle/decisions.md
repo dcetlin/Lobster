@@ -158,3 +158,60 @@ guarantee a dispatch slot for null-juice UoWs within a bounded time window
 when juiced UoWs are continuously present. A follow-on task should evaluate
 whether a fairness slot (e.g., every N cycles, promote the oldest null-juice
 ready-for-steward UoW to the front) is warranted as load increases.
+
+---
+
+## ADR-004: 'closed' Treated as Terminal in SQL Exclusion Contexts — Encoded Orientation
+
+**Date:** 2026-04-27
+**Status:** Accepted
+**PR:** #1003 (fix/issue-dedup-reactivate)
+
+### Context
+
+The UoWStatus enum covers all current status values. However, the production
+registry contains rows with `status='closed'` — a legacy value set externally
+before enum enforcement was introduced. As of the time this ADR was written,
+768 rows carried `status='closed'`.
+
+`UoWStatus.is_terminal()` intentionally excludes 'closed' because it is not
+a valid enum value — `UoWStatus('closed')` raises `ValueError`. Rows in
+`'closed'` state cannot be represented as `UoWStatus` instances.
+
+### Problem
+
+In `_upsert_typed` and `has_active_uow_for_issue`, the SQL exclusion list
+(the set of statuses that count as "already done, re-proposal is allowed")
+did not include 'closed'. This caused legacy rows with `status='closed'` to
+be treated as non-terminal — i.e., as if an active UoW already existed for
+that issue — permanently blocking re-proposal for any issue whose only
+registry row was in the 'closed' state.
+
+### Decision
+
+'closed' is treated as terminal in all SQL exclusion contexts. Specifically:
+
+- `_upsert_typed` adds 'closed' to its NOT IN exclusion list alongside the
+  enum terminal statuses (done, failed, expired, cancelled).
+- `has_active_uow_for_issue` uses `_TERMINAL_STATUSES_FOR_ISSUE_CHECK` — a
+  frozenset containing the same five values — as the authoritative source for
+  its SQL NOT IN clause.
+
+`UoWStatus.is_terminal()` is NOT updated. It covers only enum-representable
+statuses. The docstring for `is_terminal()` explicitly names this boundary.
+
+### Rationale
+
+Semantically, 'closed' means the same thing as 'done': the work is finished
+and re-proposal should be allowed. The only reason it was not enumerated is
+that the enum did not exist when those rows were written. Treating 'closed'
+as non-terminal was unintentional — an artifact of the enum boundary, not a
+deliberate design choice.
+
+### Constraint
+
+New code must not write `status='closed'` directly. All new terminal writes
+must use `UoWStatus.DONE` (or another enum value as appropriate). The 'closed'
+treatment as terminal is for legacy-row compatibility only. The production
+migration to reclassify existing 'closed' rows as 'done' is out of scope for
+this PR and tracked as a follow-on.

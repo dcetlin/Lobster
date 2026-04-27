@@ -70,7 +70,16 @@ class UoWStatus(StrEnum):
     NEEDS_HUMAN_REVIEW = "needs-human-review"
 
     def is_terminal(self) -> bool:
-        """True for statuses that allow re-proposal (done, failed, expired, cancelled)."""
+        """True for statuses that allow re-proposal (done, failed, expired, cancelled).
+
+        Note: 'closed' is NOT included here. 'closed' is a legacy DB status that
+        predates the UoWStatus enum — it was set externally on rows that existed
+        before enum enforcement was introduced. Semantically it means "done", but
+        it cannot be expressed as a UoWStatus value (UoWStatus('closed') raises
+        ValueError). SQL queries that need to exclude terminal rows therefore handle
+        'closed' separately via _TERMINAL_STATUSES_FOR_ISSUE_CHECK; this method
+        covers only the enum-representable statuses.
+        """
         return self in {UoWStatus.DONE, UoWStatus.FAILED, UoWStatus.EXPIRED, UoWStatus.CANCELLED}
 
     def is_in_flight(self) -> bool:
@@ -1003,14 +1012,15 @@ class Registry:
         """
         conn = self._connect()
         try:
+            placeholders = ", ".join("?" * len(self._TERMINAL_STATUSES_FOR_ISSUE_CHECK))
             row = conn.execute(
-                """
+                f"""
                 SELECT id FROM uow_registry
                 WHERE source_issue_number = ?
-                  AND status NOT IN ('done', 'failed', 'expired', 'cancelled', 'closed')
+                  AND status NOT IN ({placeholders})
                 LIMIT 1
                 """,
-                (issue_number,),
+                (issue_number, *self._TERMINAL_STATUSES_FOR_ISSUE_CHECK),
             ).fetchone()
             return row is not None
         finally:
