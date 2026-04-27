@@ -61,6 +61,12 @@ class MemoryObservation:
 
 
 @dataclass(frozen=True)
+class FrictionTrace:
+    text: str
+    orientation_quality: str | None = None
+
+
+@dataclass(frozen=True)
 class ActionSeeds:
     issues: tuple[IssueSpec, ...]
     bootup_candidates: tuple[BootupCandidate, ...]
@@ -74,6 +80,7 @@ class HarvestResult:
     stored_observations: int
     errors: tuple[str, ...]
     frontier_domains_routed: tuple[str, ...]   # domain names updated in frontier docs
+    friction_traces_stored: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +112,22 @@ def extract_yaml_block(markdown_text: str) -> str | None:
     if match:
         return match.group(1)
 
+    return None
+
+
+_FRICTION_TRACE_PATTERN = re.compile(r'\*friction-trace:\s*(.*?)\*', re.DOTALL)
+
+
+def extract_friction_trace(markdown_text: str) -> str | None:
+    """
+    Extract the friction-trace section from a philosophy-explore markdown file.
+
+    Friction-traces appear as italic blocks: *friction-trace: ... *
+    Returns the captured text stripped, or None if not found.
+    """
+    match = _FRICTION_TRACE_PATTERN.search(markdown_text)
+    if match:
+        return match.group(1).strip()
     return None
 
 
@@ -282,9 +305,10 @@ def send_telegram_summary(
     stored_obs: int,
     frontier_domains: list[str],
     dry_run: bool,
+    friction_traces_stored: int = 0,
 ) -> None:
     """Send a Telegram summary via the lobster-inbox send_reply tool."""
-    if not filed and queued_bootup == 0 and stored_obs == 0 and not frontier_domains:
+    if not filed and queued_bootup == 0 and stored_obs == 0 and not frontier_domains and friction_traces_stored == 0:
         print("  No items to report — skipping Telegram notification.")
         return
 
@@ -305,6 +329,10 @@ def send_telegram_summary(
     if stored_obs:
         parts.append(
             f"\n{stored_obs} memory observation{'s' if stored_obs != 1 else ''} stored."
+        )
+    if friction_traces_stored:
+        parts.append(
+            f"\n{friction_traces_stored} friction-trace{'s' if friction_traces_stored != 1 else ''} stored as navigation_record."
         )
     if frontier_domains:
         domain_list = ", ".join(frontier_domains)
@@ -414,6 +442,25 @@ def harvest(
             print(f"  ERROR: {msg}")
             errors.append(msg)
 
+    # --- Extract and store friction-trace as navigation_record ---
+    friction_traces_stored = 0
+    file_text = md_path.read_text(encoding="utf-8")
+    friction_trace_text = extract_friction_trace(file_text)
+    if friction_trace_text:
+        trace_obs = MemoryObservation(
+            text=f"Navigation record ({md_path.name}): {friction_trace_text}",
+            type="navigation_record",
+            valence="neutral",
+        )
+        try:
+            if store_memory_observation(trace_obs, dry_run):
+                friction_traces_stored = 1
+                print(f"  Stored friction-trace as navigation_record.")
+        except Exception as exc:
+            msg = f"Failed to store friction-trace: {exc}"
+            print(f"  ERROR: {msg}")
+            errors.append(msg)
+
     # --- Frontier document routing ---
     frontier_domains: list[str] = []
     if not skip_frontier:
@@ -424,7 +471,7 @@ def harvest(
             effective_frontier_dir = frontier_dir or (
                 Path.home() / "lobster-user-config" / "memory" / "canonical" / "frontiers"
             )
-            text = md_path.read_text(encoding="utf-8")
+            text = file_text
 
             # Re-parse the raw action_seeds dict for explicit frontier_advances
             raw_seeds_dict: dict | None = None
@@ -474,6 +521,7 @@ def harvest(
             stored_obs=stored,
             frontier_domains=frontier_domains,
             dry_run=dry_run,
+            friction_traces_stored=friction_traces_stored,
         )
     except Exception as exc:
         errors.append(f"Telegram summary failed: {exc}")
@@ -484,6 +532,7 @@ def harvest(
         stored_observations=stored,
         errors=tuple(errors),
         frontier_domains_routed=tuple(frontier_domains),
+        friction_traces_stored=friction_traces_stored,
     )
 
 
@@ -588,6 +637,7 @@ def main() -> int:
     print(f"  Issues filed:          {len(result.filed_issues)}")
     print(f"  Bootup candidates:     {len(result.queued_bootup)}")
     print(f"  Memory observations:   {result.stored_observations}")
+    print(f"  Friction traces:       {result.friction_traces_stored}")
     print(f"  Frontier docs updated: {len(result.frontier_domains_routed)}"
           + (f" ({', '.join(result.frontier_domains_routed)})" if result.frontier_domains_routed else ""))
     if result.errors:

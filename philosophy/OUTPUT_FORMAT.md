@@ -91,6 +91,14 @@ This routes `action_seeds` items to:
 - `~/lobster-workspace/philosophy-explore/pending-bootup-candidates/` (for Dan's review — never auto-applied)
 - `memory.db` observations (stored via MCP `memory_store`)
 
+### Friction-Trace Harvesting
+
+In addition to the YAML action seeds, the harvester also extracts the `*friction-trace: ...*` section (if present) from the session output. This italic-delimited block records the navigational act — the pull that was resisted, the attractor that was not followed, the reorientation that was required.
+
+When found, the friction-trace text is stored as a `navigation_record` memory observation in `memory.db`. This allows future sessions to surface directional sensitivity records via memory search, not just findings.
+
+The friction-trace is not part of the YAML `action_seeds` format — it is harvested directly from the markdown body.
+
 A Telegram summary is sent after harvest with counts and issue links.
 
 ---
