@@ -260,6 +260,12 @@ class UoW:
     #   NULL when juice_quality is NULL.
     juice_quality: str | None = None
     juice_rationale: str | None = None
+    # prescription_confidence: steward's confidence in the prescription at dispatch time.
+    #   Float 0.0–1.0. NULL when not yet written (UoWs prescribed before migration 0016,
+    #   or first-cycle prescriptions before the field is populated).
+    #   Computed deterministically by _compute_prescription_confidence() in steward.py.
+    #   Steward-private (excluded from executor_uow_view). Data collection only.
+    prescription_confidence: float | None = None
 
 
 def _now_iso() -> str:
@@ -461,6 +467,7 @@ class Registry:
             shard_id=d.get("shard_id"),
             juice_quality=d.get("juice_quality"),
             juice_rationale=d.get("juice_rationale"),
+            prescription_confidence=d.get("prescription_confidence"),
         )
 
     def _write_audit(

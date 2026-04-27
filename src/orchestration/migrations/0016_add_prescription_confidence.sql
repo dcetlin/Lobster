@@ -1,0 +1,25 @@
+-- Migration 0016: add prescription_confidence field for steward dispatch telemetry (issue #995).
+--
+-- Problem:
+--   Steward prescriptions carry no confidence signal. The steward's judgment about
+--   how likely a prescription is to succeed is implicit and unrecorded. Without a
+--   persisted confidence value there is no data corpus for studying prescription
+--   quality, identifying patterns that predict failure, or eventually building
+--   gating logic based on historical signal quality.
+--
+-- Fix:
+--   Add prescription_confidence REAL NULL to uow_registry.
+--   Written at dispatch time by _write_steward_fields() in steward.py alongside
+--   workflow_artifact, prescribed_skills, and route_reason.
+--   Also included in the steward_prescription audit log entry.
+--
+-- Computation (deterministic, no LLM involvement):
+--   Derived from steward_cycles and execution_attempts at prescription time.
+--   Named constants in steward.py govern the thresholds.
+--
+-- Backward compatibility:
+--   Existing UoWs get prescription_confidence=NULL (not available before migration).
+--   Field is optional at all write sites; omitting it leaves the column NULL.
+--   No routing or gating logic reads this field in this migration — data only.
+
+ALTER TABLE uow_registry ADD COLUMN prescription_confidence REAL NULL;
