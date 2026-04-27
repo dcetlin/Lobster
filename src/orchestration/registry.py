@@ -70,7 +70,16 @@ class UoWStatus(StrEnum):
     NEEDS_HUMAN_REVIEW = "needs-human-review"
 
     def is_terminal(self) -> bool:
-        """True for statuses that allow re-proposal (done, failed, expired, cancelled)."""
+        """True for statuses that allow re-proposal (done, failed, expired, cancelled).
+
+        Note: 'closed' is NOT included here. 'closed' is a legacy DB status that
+        predates the UoWStatus enum — it was set externally on rows that existed
+        before enum enforcement was introduced. Semantically it means "done", but
+        it cannot be expressed as a UoWStatus value (UoWStatus('closed') raises
+        ValueError). SQL queries that need to exclude terminal rows therefore handle
+        'closed' separately via _TERMINAL_STATUSES_FOR_ISSUE_CHECK; this method
+        covers only the enum-representable statuses.
+        """
         return self in {UoWStatus.DONE, UoWStatus.FAILED, UoWStatus.EXPIRED, UoWStatus.CANCELLED}
 
     def is_in_flight(self) -> bool:
@@ -587,11 +596,13 @@ class Registry:
             # Cross-sweep-date pre-check: any non-terminal record for this issue?
             # 'cancelled' is a terminal status (UoWStatus.CANCELLED) that allows
             # re-proposal after a cancellation.
+            # 'closed' is a legacy DB status predating the UoWStatus enum; treat it
+            # as terminal so that legacy rows do not permanently block re-proposal.
             existing = conn.execute(
                 """
                 SELECT id, status FROM uow_registry
                 WHERE source_issue_number = ?
-                  AND status NOT IN ('done', 'failed', 'expired', 'cancelled')
+                  AND status NOT IN ('done', 'failed', 'expired', 'cancelled', 'closed')
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
@@ -981,6 +992,39 @@ class Registry:
         parameter — used by the Registrar sweep to fetch only `pending` UoWs.
         """
         return self.list(status=status)
+
+    # Terminal statuses for has_active_uow_for_issue — mirrors the exclusion list
+    # in _upsert_typed. 'closed' is a legacy DB status treated as terminal here.
+    _TERMINAL_STATUSES_FOR_ISSUE_CHECK = frozenset({
+        "done", "failed", "expired", "cancelled", "closed",
+    })
+
+    def has_active_uow_for_issue(self, issue_number: int) -> bool:
+        """Return True if a non-terminal UoW already exists for the given issue number.
+
+        Used by GardenCaretaker._reactivate_uow to guard against creating a
+        duplicate when scan() has already created a new proposed UoW for the
+        same issue on a different sweep_date while the old UoW was temporarily
+        in a terminal state.
+
+        Mirrors the exclusion logic in _upsert_typed exactly so the two
+        idempotency checks stay in sync.
+        """
+        conn = self._connect()
+        try:
+            placeholders = ", ".join("?" * len(self._TERMINAL_STATUSES_FOR_ISSUE_CHECK))
+            row = conn.execute(
+                f"""
+                SELECT id FROM uow_registry
+                WHERE source_issue_number = ?
+                  AND status NOT IN ({placeholders})
+                LIMIT 1
+                """,
+                (issue_number, *self._TERMINAL_STATUSES_FOR_ISSUE_CHECK),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
 
     def transition(
         self,

@@ -605,3 +605,99 @@ class TestRun:
         assert result["seeded"] == 1
         assert result["no_change"] == 1
         assert result["archived"] == 0
+
+
+# ===========================================================================
+# Dedup guard: reactivation must not create a duplicate when scan() already
+# proposed a new UoW for the same issue on a different sweep_date.
+# ===========================================================================
+
+class TestReactivationDedup:
+    def test_reactivation_skipped_when_new_proposed_uow_exists(
+        self, registry: Registry
+    ) -> None:
+        """tend() must not reactivate an expired UoW when a newer proposed UoW already
+        exists for the same issue number.
+
+        Regression scenario (issue #833 reopen path):
+        1. Old UoW (sweep_date D) is archived to expired.
+        2. scan() creates a new proposed UoW (sweep_date D+1) because the old one is terminal.
+        3. tend() finds the old expired UoW and sees source is open → would reactivate.
+        4. Without the guard this produces two proposed UoWs for the same issue.
+        With the guard, step 4 must be a no-op — reactivation count stays at 0.
+        """
+        # Step 1: Create old UoW and archive it to expired.
+        old = registry.upsert(issue_number=77, title="Old UoW", success_criteria="Old done.")
+        registry.set_status_direct(old.id, "expired")
+
+        # Step 2: Simulate scan() creating a new proposed UoW for the same issue
+        # on a different sweep_date (future date forces a new row past the UNIQUE constraint).
+        new = registry.upsert(
+            issue_number=77,
+            title="New UoW same issue",
+            success_criteria="New done.",
+            sweep_date="2099-01-01",
+        )
+        assert isinstance(new, UpsertInserted), "New UoW must be inserted"
+        assert len(registry.query(status="proposed")) == 1
+
+        # Step 3 + 4: tend() processes old expired UoW, source is open.
+        snap = _snap(issue_number=77, state="open")
+        source = StubIssueSource(issue_map={"github:issue/77": snap})
+        caretaker = GardenCaretaker(source=source, registry=registry)
+
+        result = caretaker.tend()
+
+        # Reactivation must be skipped — dedup guard fires.
+        assert result["reactivated"] == 0, (
+            "tend() must not reactivate when a non-terminal UoW already exists for the issue"
+        )
+        # The new proposed UoW must be the only proposed UoW.
+        proposed = registry.query(status="proposed")
+        assert len(proposed) == 1
+        assert proposed[0].id == new.id, "Only the new proposed UoW must remain"
+        # Old UoW must remain expired (not promoted).
+        expired = registry.query(status="expired")
+        assert len(expired) == 1
+        assert expired[0].id == old.id
+
+    def test_reactivation_proceeds_when_no_other_active_uow_exists(
+        self, registry: Registry
+    ) -> None:
+        """tend() must still reactivate an expired UoW when no other non-terminal UoW
+        exists for the same issue — normal reactivation path must not be broken.
+        """
+        upsert = registry.upsert(issue_number=78, title="Was expired", success_criteria="Done.")
+        registry.set_status_direct(upsert.id, "expired")
+
+        snap = _snap(issue_number=78, state="open")
+        source = StubIssueSource(issue_map={"github:issue/78": snap})
+        caretaker = GardenCaretaker(source=source, registry=registry)
+
+        result = caretaker.tend()
+
+        assert result["reactivated"] == 1
+        proposed = registry.query(status="proposed")
+        assert len(proposed) == 1
+        assert proposed[0].id == upsert.id
+
+    def test_has_active_uow_for_issue_returns_true_when_proposed_exists(
+        self, registry: Registry
+    ) -> None:
+        """Registry.has_active_uow_for_issue must return True when a proposed UoW exists."""
+        registry.upsert(issue_number=79, title="Proposed", success_criteria="Done.")
+        assert registry.has_active_uow_for_issue(79) is True
+
+    def test_has_active_uow_for_issue_returns_false_when_only_terminal_exists(
+        self, registry: Registry
+    ) -> None:
+        """Registry.has_active_uow_for_issue must return False when only terminal UoWs exist."""
+        upsert = registry.upsert(issue_number=80, title="Terminal", success_criteria="Done.")
+        registry.set_status_direct(upsert.id, "expired")
+        assert registry.has_active_uow_for_issue(80) is False
+
+    def test_has_active_uow_for_issue_returns_false_for_unknown_issue(
+        self, registry: Registry
+    ) -> None:
+        """Registry.has_active_uow_for_issue must return False for an issue with no UoWs."""
+        assert registry.has_active_uow_for_issue(99999) is False
