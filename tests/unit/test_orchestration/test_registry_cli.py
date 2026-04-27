@@ -6,6 +6,9 @@ Tests verify the JSON output contract for every command:
 
 All tests invoke the CLI as a subprocess (matching how scheduled subagents use it)
 and parse stdout as JSON.
+
+The report command outputs plain text (not JSON). Its tests use run_cli_text()
+which returns raw stdout instead of parsing it.
 """
 
 import json
@@ -24,6 +27,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "src"))
 from orchestration.registry_cli import (
     _RETURN_REASON_EXECUTOR_ORPHAN,
     _RETURN_REASON_DIAGNOSING_ORPHAN,
+    DEFAULT_REPORT_HOURS,
+    _classify_status,
+    _compute_summary,
+    _window_start_iso,
 )
 
 REPO_ROOT = Path(__file__).parent.parent.parent.parent
@@ -46,6 +53,24 @@ def run_cli(db_path: Path, *args, extra_env: dict | None = None) -> dict | list:
         f"CLI exited with {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
     return json.loads(result.stdout)
+
+
+def run_cli_text(db_path: Path, *args, extra_env: dict | None = None) -> str:
+    """Run registry_cli.py and return raw stdout text (for commands that output plain text)."""
+    env = os.environ.copy()
+    env["REGISTRY_DB_PATH"] = str(db_path)
+    if extra_env:
+        env.update(extra_env)
+    result = subprocess.run(
+        [sys.executable, str(CLI_PATH)] + list(args),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, (
+        f"CLI exited with {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    return result.stdout
 
 
 @pytest.fixture
@@ -802,3 +827,228 @@ class TestTraceCommand:
         assert EXPECTED_KEYS.issubset(result.keys()), (
             f"trace output missing keys: {EXPECTED_KEYS - result.keys()}"
         )
+
+
+# ---------------------------------------------------------------------------
+# _window_start_iso unit tests
+# ---------------------------------------------------------------------------
+
+class TestWindowStartIso:
+    def test_defaults_to_DEFAULT_REPORT_HOURS_when_no_args(self):
+        """With no arguments the window start is DEFAULT_REPORT_HOURS ago."""
+        before = datetime.now(timezone.utc) - timedelta(hours=DEFAULT_REPORT_HOURS, seconds=2)
+        result = _window_start_iso(None, None)
+        after = datetime.now(timezone.utc) - timedelta(hours=DEFAULT_REPORT_HOURS) + timedelta(seconds=2)
+        dt = datetime.fromisoformat(result)
+        assert before <= dt <= after
+
+    def test_since_hours_overrides_default(self):
+        """--since 6 produces a window start approximately 6 hours ago."""
+        SINCE_HOURS = 6
+        before = datetime.now(timezone.utc) - timedelta(hours=SINCE_HOURS, seconds=2)
+        result = _window_start_iso(SINCE_HOURS, None)
+        after = datetime.now(timezone.utc) - timedelta(hours=SINCE_HOURS) + timedelta(seconds=2)
+        dt = datetime.fromisoformat(result)
+        assert before <= dt <= after
+
+    def test_from_iso_takes_priority_over_since(self):
+        """--from ISO_DATE overrides --since."""
+        from_ts = "2026-01-15T12:00:00+00:00"
+        result = _window_start_iso(since_hours=48.0, from_iso=from_ts)
+        assert result == from_ts
+
+    def test_from_iso_invalid_raises_value_error(self):
+        """A non-ISO --from value raises ValueError."""
+        import pytest
+        with pytest.raises(ValueError, match="not a valid ISO 8601"):
+            _window_start_iso(None, "not-a-date")
+
+
+# ---------------------------------------------------------------------------
+# _classify_status unit tests
+# ---------------------------------------------------------------------------
+
+class TestClassifyStatus:
+    def test_done_maps_to_complete(self):
+        assert _classify_status("done") == "complete"
+
+    def test_failed_maps_to_failed(self):
+        assert _classify_status("failed") == "failed"
+
+    def test_cancelled_maps_to_failed(self):
+        assert _classify_status("cancelled") == "failed"
+
+    def test_needs_human_review_maps_to_escalated(self):
+        assert _classify_status("needs-human-review") == "escalated"
+
+    def test_active_maps_to_executing(self):
+        assert _classify_status("active") == "executing"
+
+    def test_executing_status_maps_to_executing(self):
+        """Statuses in _EXECUTING_STATUSES are reported as 'executing'."""
+        assert _classify_status("executing") == "executing"
+        assert _classify_status("ready-for-steward") == "executing"
+        assert _classify_status("ready-for-executor") == "executing"
+        assert _classify_status("diagnosing") == "executing"
+
+    def test_proposed_maps_to_in_pipeline(self):
+        """Proposed UoWs are not executing — they map to 'in-pipeline'."""
+        assert _classify_status("proposed") == "in-pipeline"
+
+    def test_pipeline_statuses_map_to_in_pipeline(self):
+        """pending, blocked, and expired are queued but not yet running."""
+        assert _classify_status("pending") == "in-pipeline"
+        assert _classify_status("blocked") == "in-pipeline"
+        assert _classify_status("expired") == "in-pipeline"
+
+
+# ---------------------------------------------------------------------------
+# _compute_summary unit tests
+# ---------------------------------------------------------------------------
+
+class TestComputeSummary:
+    def _make_row(self, status: str, wall_clock: int | None = None,
+                  token_usage: int | None = None) -> dict:
+        return {"status": status, "wall_clock_seconds": wall_clock, "token_usage": token_usage}
+
+    def test_counts_correct_for_mixed_statuses(self):
+        """Bucket counts match the spec for a known set of rows."""
+        WINDOW_START = "2026-01-01T00:00:00+00:00"
+        now = datetime(2026, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
+        rows = [
+            self._make_row("done", wall_clock=120),
+            self._make_row("done", wall_clock=180),
+            self._make_row("failed"),
+            self._make_row("needs-human-review"),
+            self._make_row("active"),
+        ]
+        summary = _compute_summary(rows, WINDOW_START, now)
+
+        assert summary["total"] == 5
+        assert summary["complete"] == 2
+        assert summary["failed"] == 1
+        assert summary["escalated"] == 1
+        assert summary["executing"] == 1
+        assert summary["in_pipeline"] == 0
+
+    def test_counts_proposed_in_pipeline_not_executing(self):
+        """proposed/pending/blocked UoWs appear in in_pipeline, not executing."""
+        WINDOW_START = "2026-01-01T00:00:00+00:00"
+        now = datetime(2026, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
+        rows = [
+            self._make_row("proposed"),
+            self._make_row("proposed"),
+            self._make_row("pending"),
+            self._make_row("blocked"),
+            self._make_row("active"),
+            self._make_row("done", wall_clock=100),
+        ]
+        summary = _compute_summary(rows, WINDOW_START, now)
+
+        assert summary["total"] == 6
+        assert summary["in_pipeline"] == 4
+        assert summary["executing"] == 1
+        assert summary["complete"] == 1
+
+    def test_median_wall_clock_uses_complete_uows_only(self):
+        """Median wall-clock is computed only from UoWs with status 'done'."""
+        WINDOW_START = "2026-01-01T00:00:00+00:00"
+        now = datetime(2026, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
+        rows = [
+            self._make_row("done", wall_clock=100),
+            self._make_row("done", wall_clock=200),
+            self._make_row("done", wall_clock=300),
+            self._make_row("failed", wall_clock=50),   # excluded from median
+        ]
+        summary = _compute_summary(rows, WINDOW_START, now)
+
+        assert summary["median_wall_clock_seconds"] == 200  # median of [100, 200, 300]
+
+    def test_total_token_usage_sums_all_non_null(self):
+        """Total token_usage sums all rows regardless of status."""
+        WINDOW_START = "2026-01-01T00:00:00+00:00"
+        now = datetime(2026, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
+        rows = [
+            self._make_row("done", token_usage=1000),
+            self._make_row("failed", token_usage=500),
+            self._make_row("active", token_usage=None),  # excluded
+        ]
+        summary = _compute_summary(rows, WINDOW_START, now)
+
+        assert summary["total_token_usage"] == 1500
+
+    def test_empty_window_returns_zero_counts(self):
+        """An empty row list produces all-zero counts and None for stats."""
+        WINDOW_START = "2026-01-01T00:00:00+00:00"
+        now = datetime(2026, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
+        summary = _compute_summary([], WINDOW_START, now)
+
+        assert summary["total"] == 0
+        assert summary["complete"] == 0
+        assert summary["median_wall_clock_seconds"] is None
+
+
+# ---------------------------------------------------------------------------
+# report command integration tests (subprocess, real DB)
+# ---------------------------------------------------------------------------
+
+class TestReportCommand:
+    def test_report_runs_against_empty_db(self, db_path):
+        """report command exits 0 and emits header even when DB has no UoWs."""
+        # Touch the DB first so migrations run.
+        run_cli(db_path, "upsert", "--issue", "1", "--title", "Init", "--sweep-date", "2024-01-01")
+        output = run_cli_text(db_path, "report", "--since", "24")
+        assert "WOS Pipeline Report" in output
+        assert "Window start" in output
+        assert "Total UoWs" in output
+
+    def test_report_counts_proposed_uow_in_window(self, db_path):
+        """A UoW created within the window appears in the total count."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        # Insert two UoWs.
+        run_cli(db_path, "upsert", "--issue", "10", "--title", "In-window A", "--sweep-date", today)
+        run_cli(db_path, "upsert", "--issue", "11", "--title", "In-window B", "--sweep-date", today)
+        # Neither UoW has started_at yet (they're proposed), so we need to seed
+        # started_at directly to make them visible to the window query.
+        conn = sqlite3.connect(str(db_path))
+        now_iso = datetime.now(timezone.utc).isoformat()
+        conn.execute("UPDATE uow_registry SET started_at = ? WHERE source_issue_number IN (10, 11)", (now_iso,))
+        conn.commit()
+        conn.close()
+
+        output = run_cli_text(db_path, "report", "--since", "1")
+        # The total count line should mention at least 2.
+        # Extract the "Total UoWs : N" portion.
+        total_line = next(l for l in output.splitlines() if l.startswith("Total UoWs"))
+        # Parse the leading integer after the colon.
+        total_str = total_line.split(":")[1].strip().split()[0]
+        assert int(total_str) >= 2
+
+    def test_report_from_flag_filters_correctly(self, db_path):
+        """--from timestamp in the future returns zero UoWs."""
+        run_cli(db_path, "upsert", "--issue", "20", "--title", "Old UoW", "--sweep-date", "2024-01-01")
+        # Seed started_at to a past time.
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "UPDATE uow_registry SET started_at = '2024-01-01T00:00:00+00:00'"
+        )
+        conn.commit()
+        conn.close()
+
+        future_ts = "2099-01-01T00:00:00+00:00"
+        output = run_cli_text(db_path, "report", "--from", future_ts)
+        total_line = next(l for l in output.splitlines() if l.startswith("Total UoWs"))
+        total_str = total_line.split(":")[1].strip().split()[0]
+        assert int(total_str) == 0
+
+    def test_report_since_and_from_both_accepted(self, db_path):
+        """Both --since and --from flags are accepted by the CLI without error."""
+        run_cli(db_path, "upsert", "--issue", "30", "--title", "Init", "--sweep-date", "2024-01-01")
+        run_cli_text(db_path, "report", "--since", "6")
+        run_cli_text(db_path, "report", "--from", "2026-01-01T00:00:00+00:00")
+
+    def test_report_default_window_is_DEFAULT_REPORT_HOURS(self, db_path):
+        """report with no flags uses DEFAULT_REPORT_HOURS as the look-back."""
+        run_cli(db_path, "upsert", "--issue", "40", "--title", "Init", "--sweep-date", "2024-01-01")
+        output = run_cli_text(db_path, "report")
+        assert "WOS Pipeline Report" in output
