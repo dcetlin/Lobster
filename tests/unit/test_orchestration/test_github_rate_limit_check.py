@@ -3,7 +3,7 @@ Tests for the GitHub API rate limit pre-dispatch check in executor-heartbeat.py.
 
 The rate limit check fires once per dispatch cycle (in main(), after the context
 pressure throttle and before run_executor_cycle). It is a pure-ish function
-(check_github_rate_limit) that shells out to `gh api rate_limit --jq .rate.remaining`
+(check_github_rate_limit) that shells out to `gh api rate_limit --jq '.rate | {remaining, reset}'`
 and returns a named result so the caller can log and skip without knowing the details.
 
 Coverage:
@@ -155,21 +155,6 @@ def _make_mock_registry(tmp_path):
     db_path = tmp_path / "test_registry.db"
     return Registry(db_path)
 
-
-def _run_main_with_clean_argv(hb_module, patches: dict):
-    """Run hb_module.main() with sys.argv cleared so argparse doesn't see pytest args."""
-    context_managers = [patch.object(hb_module, name, **kwargs) if isinstance(kwargs, dict) else patch.object(hb_module, name, kwargs) for name, kwargs in patches.items()]
-    # Build the patches as a flat list of context managers
-    with patch("sys.argv", ["executor-heartbeat.py"]):
-        all_patches = [
-            patch.object(hb_module, name, new=val)
-            for name, val in patches.items()
-        ]
-        # stack them all
-        from contextlib import ExitStack
-        with ExitStack() as stack:
-            mocks = {name: stack.enter_context(p) for name, p in zip(patches.keys(), all_patches)}
-            return hb_module.main(), mocks
 
 
 def test_dispatch_skipped_when_rate_limit_low(tmp_path):
