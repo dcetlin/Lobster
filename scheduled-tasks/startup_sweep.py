@@ -97,6 +97,16 @@ DISPATCH_WINDOW_SECONDS: int = 120
 # executor.py) if they slip past this window.
 _ACTIVE_SWEEP_THRESHOLD_SECONDS = 300
 
+# Maximum age (seconds) of `last_heartbeat_at` before the startup sweep
+# considers an `executing` UoW's heartbeat stale and proceeds with kill.
+# If `last_heartbeat_at` is non-NULL and more recent than this threshold, the
+# agent is alive and actively working — skip the kill entirely.
+#
+# 2× the heartbeat interval (agents emit every ~60 s) gives a generous margin
+# for jitter and slow tool calls without letting truly dead agents linger.
+# Issue #992: this closes the loop opened by PR #989 (write_wos_heartbeat).
+HEARTBEAT_SKIP_THRESHOLD_SECONDS: int = 120
+
 
 # ---------------------------------------------------------------------------
 # Startup sweep result type
@@ -110,6 +120,7 @@ class StartupSweepResult:
     diagnosing_swept: int
     executing_swept: int
     skipped_dry_run: int
+    skipped_heartbeat_alive: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +194,49 @@ def _classify_executing_orphan_kill_type(
     return "orphan_kill_before_start"
 
 
+def _is_heartbeat_recent(
+    heartbeat_at: str | None,
+    now: datetime,
+    threshold_seconds: int,
+) -> bool:
+    """
+    Return True if `heartbeat_at` is non-NULL and within `threshold_seconds` of `now`.
+
+    Pure function: no side effects, no registry access.
+
+    Used by Population 4 of run_startup_sweep to decide whether to skip killing
+    an `executing` UoW that has exceeded the TTL — a recent heartbeat means the
+    agent is alive and actively working (#992).
+
+    Args:
+        heartbeat_at: ISO timestamp of the most recent heartbeat written by the
+            agent, or None if no heartbeat has ever been written.
+        now: The current UTC datetime (caller-supplied for testability).
+        threshold_seconds: Maximum age (seconds) of `heartbeat_at` to be
+            considered recent. Typically HEARTBEAT_SKIP_THRESHOLD_SECONDS (120 s).
+
+    Returns:
+        True  — heartbeat_at is non-NULL and age < threshold_seconds → skip kill.
+        False — heartbeat_at is NULL, unparseable, or stale → proceed with kill.
+
+    Safe default: False whenever the recency cannot be determined (None input,
+    unparseable timestamp). This is conservative — an ambiguous heartbeat never
+    prevents a kill.
+    """
+    if heartbeat_at is None:
+        return False
+
+    try:
+        hb_dt = datetime.fromisoformat(heartbeat_at.replace("Z", "+00:00"))
+        if hb_dt.tzinfo is None:
+            hb_dt = hb_dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+    age_seconds = (now - hb_dt).total_seconds()
+    return age_seconds < threshold_seconds
+
+
 def _classify_active_uow(output_ref: str | None) -> tuple[str, dict]:
     """
     Classify an active UoW by examining output_ref.
@@ -245,6 +299,7 @@ def run_startup_sweep(
     orphan_threshold_seconds: int = _EXECUTOR_ORPHAN_THRESHOLD_SECONDS,
     active_sweep_threshold_seconds: int = _ACTIVE_SWEEP_THRESHOLD_SECONDS,
     executing_orphan_threshold_seconds: int = _EXECUTING_ORPHAN_THRESHOLD_SECONDS,
+    heartbeat_skip_threshold_seconds: int = HEARTBEAT_SKIP_THRESHOLD_SECONDS,
     bootup_candidate_gate: bool | None = None,
     github_client: Callable[[int], dict[str, Any]] | None = None,
 ) -> StartupSweepResult:
@@ -279,6 +334,12 @@ def run_startup_sweep(
        written (agent crashed before its first heartbeat write).
        Classified as executing_orphan and transitioned to ready-for-steward.
 
+       Heartbeat recency gate (#992): before killing an executing UoW that has
+       exceeded the TTL, check last_heartbeat_at recency. If heartbeat_at is
+       non-NULL and within heartbeat_skip_threshold_seconds (default: 120 s),
+       the agent is alive — skip the kill and log. Only UoWs with a NULL or
+       stale heartbeat are killed.
+
     Each transition uses the optimistic-lock + audit pattern (Principle 1):
     - Audit entry written in same transaction as status UPDATE.
     - If rows_affected == 0: another process won the race — skip silently.
@@ -295,6 +356,10 @@ def run_startup_sweep(
         is classified as executor_orphan. Default: 3600 s.
     executing_orphan_threshold_seconds: minimum age before an `executing` UoW
         is classified as executing_orphan. Default: 600 s (10 minutes).
+    heartbeat_skip_threshold_seconds: maximum age (seconds) of heartbeat_at
+        before a heartbeat is considered stale. Default: 120 s. UoWs with a
+        heartbeat younger than this are skipped (agent is alive). Pass 0 to
+        disable the gate entirely (original behaviour before #992).
     bootup_candidate_gate: override for BOOTUP_CANDIDATE_GATE module constant.
     github_client: callable(issue_number) → {labels, ...}. Defaults to the
         production gh CLI client from steward.py.
@@ -350,6 +415,7 @@ def run_startup_sweep(
     diagnosing_swept = 0
     executing_swept = 0
     skipped_dry_run = 0
+    skipped_heartbeat_alive = 0
 
     # --- Population 1: active UoWs (Executor crash during execution) ---
     for uow in active_uows:
@@ -606,10 +672,27 @@ def run_startup_sweep(
             # Not old enough — may still be executing normally.
             continue
 
+        # Heartbeat recency gate (#992): if the agent is actively emitting
+        # heartbeats, it is alive — skip the kill regardless of TTL.
+        # _is_heartbeat_recent returns False for NULL or stale heartbeats so
+        # the gate is a no-op for agents that never wrote a heartbeat.
+        heartbeat_at: str | None = getattr(uow, "heartbeat_at", None)
+        if heartbeat_skip_threshold_seconds > 0 and _is_heartbeat_recent(
+            heartbeat_at=heartbeat_at,
+            now=now,
+            threshold_seconds=heartbeat_skip_threshold_seconds,
+        ):
+            log.info(
+                "Startup sweep: skipping executing UoW %s — recent heartbeat "
+                "(heartbeat_at=%s, age=%.0fs, skip_threshold=%ds); agent is alive",
+                uow_id, heartbeat_at, age_seconds, heartbeat_skip_threshold_seconds,
+            )
+            skipped_heartbeat_alive += 1
+            continue
+
         # Classify kill type using heartbeat evidence (issue #963).
         # Safe default: kill_before_start when registry method is unavailable.
         dispatch_ts: str | None = None
-        heartbeat_at: str | None = getattr(uow, "heartbeat_at", None)
         try:
             dispatch_ts = registry.get_executor_dispatch_timestamp(uow_id)
         except (AttributeError, Exception) as _exc:
@@ -654,12 +737,17 @@ def run_startup_sweep(
                 uow_id,
             )
 
-    total = active_swept + executor_orphans_swept + diagnosing_swept + executing_swept + skipped_dry_run
+    total = (
+        active_swept + executor_orphans_swept + diagnosing_swept
+        + executing_swept + skipped_dry_run + skipped_heartbeat_alive
+    )
     if total > 0:
         log.info(
             "Startup sweep complete: %d active swept, %d executor_orphans swept, "
-            "%d diagnosing swept, %d executing_orphans swept, %d skipped (dry-run)",
-            active_swept, executor_orphans_swept, diagnosing_swept, executing_swept, skipped_dry_run,
+            "%d diagnosing swept, %d executing_orphans swept, "
+            "%d skipped (dry-run), %d skipped (heartbeat alive)",
+            active_swept, executor_orphans_swept, diagnosing_swept, executing_swept,
+            skipped_dry_run, skipped_heartbeat_alive,
         )
 
     return StartupSweepResult(
@@ -668,4 +756,5 @@ def run_startup_sweep(
         diagnosing_swept=diagnosing_swept,
         executing_swept=executing_swept,
         skipped_dry_run=skipped_dry_run,
+        skipped_heartbeat_alive=skipped_heartbeat_alive,
     )
