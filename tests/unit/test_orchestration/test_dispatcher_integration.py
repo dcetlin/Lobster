@@ -98,6 +98,30 @@ class TestHandleWosExecute:
         assert f"wos-{uow_id}" in prompt   # frontmatter task_id
         assert uow_id in prompt            # body (UoW ID line or result contract)
 
+    def test_prompt_includes_mcp_heartbeat_tool(self):
+        """
+        The MCP tool name must appear in the heartbeat instructions so subagents
+        know they can call write_wos_heartbeat directly rather than importing Python.
+        """
+        prompt = self._prompt()
+        assert "write_wos_heartbeat" in prompt, (
+            "The write_wos_heartbeat MCP tool must be the preferred heartbeat method "
+            "in the dispatched prompt (issue #849)"
+        )
+
+    def test_prompt_heartbeat_section_is_labeled_required(self):
+        """The heartbeat section must be labeled REQUIRED so subagents do not skip it."""
+        prompt = self._prompt()
+        assert "REQUIRED" in prompt
+
+    def test_prompt_includes_wos_registry_fallback(self):
+        """WOSRegistry must remain as a Python fallback in the heartbeat instructions."""
+        prompt = self._prompt()
+        assert "WOSRegistry" in prompt, (
+            "WOSRegistry fallback must remain in the prompt so agents without MCP "
+            "tool access can still write heartbeats via Python"
+        )
+
 
 class TestHandleApprove:
     def test_success_message_contains_ready_for_steward(self, registry, uow_id):
