@@ -1,4 +1,4 @@
--- Migration 0016: per-heartbeat token snapshot log for stuck-agent detection (issue #994).
+-- Migration 0017: per-heartbeat token snapshot log for stuck-agent detection (issue #994).
 --
 -- Problem:
 --   PR #993 protects heartbeating agents from the startup_sweep kill gate.

@@ -625,7 +625,7 @@ def recover_stale_heartbeat_uows(
 
 
 # ---------------------------------------------------------------------------
-# Stuck-agent detection (Phase 2c, migration 0016) — progress governor
+# Stuck-agent detection (Phase 2c, migration 0017) — progress governor
 # ---------------------------------------------------------------------------
 
 # Number of consecutive zero-delta heartbeat intervals required to flag a UoW
@@ -866,7 +866,7 @@ def main() -> int:
     except Exception:
         log.exception("Heartbeat stall recovery failed — continuing to Steward main loop")
 
-    # Phase 2c: Stuck-agent detection — progress governor (migration 0016, issue #994).
+    # Phase 2c: Stuck-agent detection — progress governor (migration 0017, issue #994).
     # Agents that write heartbeats while consuming no tokens are alive but not progressing.
     # Detection only — no kill logic in this PR (future gate).
     log.info("--- Phase 2c: Stuck-agent detection ---")
