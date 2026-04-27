@@ -1652,7 +1652,12 @@ class Registry:
         finally:
             conn.close()
 
-    def complete_uow(self, uow_id: str, output_ref: str) -> None:
+    def complete_uow(
+        self,
+        uow_id: str,
+        output_ref: str,
+        token_usage: int | None = None,
+    ) -> None:
         """
         Transition a UoW to 'ready-for-steward' with an execution_complete audit entry.
 
@@ -1665,6 +1670,10 @@ class Registry:
 
         The from_status is derived from the current DB state so the audit entry
         is accurate regardless of which dispatch path was used.
+
+        token_usage: optional integer (input + output tokens) reported by the subagent
+        via write_result. Written to the registry when provided; NULL otherwise.
+        wall_clock_seconds is derived at query time from completed_at - started_at.
 
         Single transaction: audit INSERT before status UPDATE
         (audit-before-transition invariant).
@@ -1680,16 +1689,27 @@ class Registry:
                 "SELECT status FROM uow_registry WHERE id = ?", (uow_id,)
             ).fetchone()
             current_status = row["status"] if row else "active"
+            audit_note = json.dumps({
+                "actor": "executor",
+                "output_ref": output_ref,
+                "timestamp": now,
+                **({"token_usage": token_usage} if token_usage is not None else {}),
+            })
             conn.execute(
                 """
                 INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
                 VALUES (?, ?, 'execution_complete', ?, 'ready-for-steward', 'executor', ?)
                 """,
-                (now, uow_id, current_status, json.dumps({"actor": "executor", "output_ref": output_ref, "timestamp": now})),
+                (now, uow_id, current_status, audit_note),
             )
             conn.execute(
-                "UPDATE uow_registry SET status = 'ready-for-steward', updated_at = ? WHERE id = ?",
-                (now, uow_id),
+                """
+                UPDATE uow_registry
+                SET status = 'ready-for-steward', updated_at = ?, completed_at = ?,
+                    token_usage = COALESCE(?, token_usage)
+                WHERE id = ?
+                """,
+                (now, now, token_usage, uow_id),
             )
             conn.commit()
         except Exception:

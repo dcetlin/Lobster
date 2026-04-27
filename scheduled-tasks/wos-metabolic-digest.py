@@ -263,6 +263,35 @@ def compute_avg_duration(uows: list[dict]) -> str:
     return f"{avg} min"
 
 
+def aggregate_token_usage(uows: list[dict]) -> int | None:
+    """
+    Sum token_usage across UoWs that reported it.
+
+    Returns the total token count, or None if no UoW reported usage.
+    UoWs with NULL token_usage (pre-migration or unreported) are excluded from
+    the sum but do not invalidate it — partial data is better than no data.
+    """
+    values = [u["token_usage"] for u in uows if u.get("token_usage") is not None]
+    return sum(values) if values else None
+
+
+def compute_wall_clock_stats(uows: list[dict]) -> dict:
+    """
+    Compute wall_clock_seconds statistics across UoWs.
+
+    Returns a dict with keys: count (UoWs with data), total_seconds, avg_seconds.
+    All values are None when no UoWs reported wall_clock_seconds.
+    """
+    values = [u["wall_clock_seconds"] for u in uows if u.get("wall_clock_seconds") is not None]
+    if not values:
+        return {"count": 0, "total_seconds": None, "avg_seconds": None}
+    return {
+        "count": len(values),
+        "total_seconds": sum(values),
+        "avg_seconds": round(sum(values) / len(values)),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Registry query — reads completed UoWs in the lookback window
 # ---------------------------------------------------------------------------
@@ -304,11 +333,22 @@ def query_completed_uows(db_path: Path, lookback_hours: int) -> list[dict]:
             uow_ids = [r["uow_id"] for r in transition_rows]
             id_placeholders = ",".join("?" * len(uow_ids))
 
-            # Fetch full UoW records for each matched ID
+            # Fetch full UoW records for each matched ID.
+            # token_usage: per-UoW cost telemetry (issue #990); NULL for pre-migration rows.
+            # wall_clock_seconds: derived from completed_at - started_at delta at query time.
             rows = conn.execute(
                 f"""
                 SELECT id, status, summary, register, close_reason, output_ref,
-                       started_at, closed_at, updated_at, created_at, steward_cycles
+                       started_at, closed_at, updated_at, created_at, steward_cycles,
+                       token_usage,
+                       CASE
+                         WHEN completed_at IS NOT NULL AND started_at IS NOT NULL
+                         THEN CAST(
+                           (julianday(completed_at) - julianday(started_at)) * 86400.0
+                           AS INTEGER
+                         )
+                         ELSE NULL
+                       END AS wall_clock_seconds
                 FROM uow_registry
                 WHERE id IN ({id_placeholders})
                   AND status IN ({terminal_placeholders})
@@ -388,7 +428,9 @@ def format_digest(
 
     # Register breakdown — count by register across all classified UoWs
     register_counts: dict[str, int] = {}
+    all_uows: list[dict] = []
     for label, uows in groups.items():
+        all_uows.extend(uows)
         for uow in uows:
             reg = uow.get("register") or "operational"
             register_counts[reg] = register_counts.get(reg, 0) + 1
@@ -400,6 +442,10 @@ def format_digest(
     # Average durations per category
     pearl_avg = compute_avg_duration(groups[OUTCOME_PEARL])
     heat_avg = compute_avg_duration(groups[OUTCOME_HEAT])
+
+    # Telemetry: aggregate token_usage and wall_clock_seconds (issue #990)
+    total_tokens = aggregate_token_usage(all_uows)
+    wall_clock = compute_wall_clock_stats(all_uows)
 
     # Stalled display
     stalled_line = ""
@@ -417,6 +463,12 @@ def format_digest(
     if total > 0:
         lines.append(f"Register breakdown: {register_parts}")
         lines.append(f"Avg duration: {pearl_avg} (pearl), {heat_avg} (heat)")
+        # Token and wall-clock telemetry — only show when data is available
+        if total_tokens is not None:
+            lines.append(f"Tokens: {total_tokens:,} total")
+        if wall_clock["avg_seconds"] is not None:
+            avg_min = round(wall_clock["avg_seconds"] / 60, 1)
+            lines.append(f"Wall-clock avg: {avg_min} min ({wall_clock['count']} UoWs with data)")
     else:
         lines.append("No UoWs completed in this window.")
 
@@ -494,6 +546,10 @@ def run_digest(db_path: Path, lookback_hours: int, dry_run: bool = False) -> dic
 
     _write_inbox_digest(digest_text, dry_run=dry_run)
 
+    all_uows = [uow for uows in groups.values() for uow in uows]
+    total_tokens = aggregate_token_usage(all_uows)
+    wall_stats = compute_wall_clock_stats(all_uows)
+
     return {
         "timestamp": now_iso,
         "lookback_hours": lookback_hours,
@@ -505,6 +561,10 @@ def run_digest(db_path: Path, lookback_hours: int, dry_run: bool = False) -> dic
         "stalled_count": len(stalled),
         "dry_run": dry_run,
         "digest_text": digest_text,
+        # Telemetry (issue #990) — None when no UoWs reported data
+        "total_tokens": total_tokens,
+        "wall_clock_uow_count": wall_stats["count"],
+        "wall_clock_avg_seconds": wall_stats["avg_seconds"],
     }
 
 

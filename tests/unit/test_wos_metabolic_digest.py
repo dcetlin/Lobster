@@ -124,12 +124,14 @@ def db_path(tmp_path: Path) -> Path:
             close_reason TEXT,
             output_ref TEXT,
             started_at TEXT,
+            completed_at TEXT,
             closed_at TEXT,
             updated_at TEXT,
             created_at TEXT NOT NULL,
             heartbeat_at TEXT,
             heartbeat_ttl INTEGER DEFAULT 300,
-            steward_cycles INTEGER DEFAULT 0
+            steward_cycles INTEGER DEFAULT 0,
+            token_usage INTEGER NULL
         )
     """)
     conn.execute("""
