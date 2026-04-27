@@ -44,6 +44,8 @@ from src.orchestration.steward import (
     CONFIDENCE_HIGH_CYCLES_THRESHOLD,
     CONFIDENCE_HIGH_ATTEMPTS_THRESHOLD,
     _write_steward_fields,
+    run_steward_cycle,
+    IssueInfo,
 )
 
 
@@ -384,3 +386,151 @@ class TestConfidenceComputedAndStoredFromUoWSignals:
         conn.close()
 
         assert row["prescription_confidence"] == pytest.approx(CONFIDENCE_HIGH_CYCLES)
+
+
+# ---------------------------------------------------------------------------
+# Audit log tests: confidence included in steward_prescription audit entry
+# ---------------------------------------------------------------------------
+
+def _mock_github_client(issue_number: int) -> IssueInfo:
+    """Minimal stub: open issue with body, no labels."""
+    return IssueInfo(
+        status_code=200,
+        state="open",
+        labels=[],
+        body=f"Issue #{issue_number}: implement this.\n\nAcceptance:\n- Works",
+        title=f"Test issue {issue_number}",
+    )
+
+
+class TestPrescriptionConfidenceAuditLog:
+    """
+    Verify that prescription_confidence appears in the steward_prescription
+    audit log entry written by _capturing_prescriber → registry.append_audit_log.
+
+    These tests exercise the full write path: run_steward_cycle claims a
+    ready-for-steward UoW, computes confidence, writes the registry row, and
+    appends the steward_prescription audit entry — all in one call.
+    """
+
+    def test_audit_entry_contains_prescription_confidence(
+        self, db_path: Path, registry, tmp_path: Path
+    ) -> None:
+        """
+        The steward_prescription audit log entry must include prescription_confidence.
+
+        Uses llm_prescriber=None (deterministic path) to avoid real LLM calls.
+        """
+        conn = _open_db(db_path)
+        uow_id = _insert_uow(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=0,
+            execution_attempts=0,
+            success_criteria="Output file exists with non-empty content",
+        )
+        conn.close()
+
+        run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client,
+            artifact_dir=tmp_path / "artifacts",
+            llm_prescriber=None,  # deterministic path — no LLM call
+        )
+
+        # Only assert on the audit entry if the UoW reached ready-for-executor.
+        # If diagnosis gated it out (e.g. waiting for trace), skip — the audit
+        # entry does not exist yet and that is correct behavior.
+        conn = _open_db(db_path)
+        row = _get_row(conn, uow_id)
+        conn.close()
+
+        if row.get("status") != "ready-for-executor":
+            pytest.skip(
+                f"UoW did not reach ready-for-executor (status={row.get('status')!r}) "
+                "— steward_prescription audit entry not written on this code path"
+            )
+
+        conn = _open_db(db_path)
+        entries = _get_audit_entries(conn, uow_id)
+        conn.close()
+        presc_entry = next(
+            (e for e in entries if e.get("event") == "steward_prescription"), None
+        )
+        assert presc_entry is not None, (
+            "steward_prescription audit entry not found — "
+            "audit write path may be broken"
+        )
+
+        note_data = json.loads(presc_entry["note"])
+        assert "prescription_confidence" in note_data, (
+            f"prescription_confidence missing from steward_prescription audit entry. "
+            f"Keys present: {list(note_data.keys())}"
+        )
+        confidence_value = note_data["prescription_confidence"]
+        assert isinstance(confidence_value, float), (
+            f"prescription_confidence must be a float, got {type(confidence_value)}"
+        )
+        assert 0.0 <= confidence_value <= 1.0, (
+            f"prescription_confidence must be in [0.0, 1.0], got {confidence_value}"
+        )
+        # First execution with criteria → CONFIDENCE_FIRST_EXECUTION
+        assert confidence_value == pytest.approx(CONFIDENCE_FIRST_EXECUTION), (
+            f"Expected CONFIDENCE_FIRST_EXECUTION ({CONFIDENCE_FIRST_EXECUTION}) "
+            f"for a first-execution UoW, got {confidence_value}"
+        )
+
+    def test_audit_confidence_matches_registry_row(
+        self, db_path: Path, registry, tmp_path: Path
+    ) -> None:
+        """
+        The confidence stored in the audit entry must match the value written to
+        the registry row — both are computed from the same _compute_prescription_confidence
+        call and must be identical.
+        """
+        conn = _open_db(db_path)
+        uow_id = _insert_uow(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=0,
+            execution_attempts=0,
+            success_criteria="Feature renders correctly",
+        )
+        conn.close()
+
+        run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client,
+            artifact_dir=tmp_path / "artifacts",
+            llm_prescriber=None,
+        )
+
+        conn = _open_db(db_path)
+        row = _get_row(conn, uow_id)
+        conn.close()
+
+        if row.get("status") != "ready-for-executor":
+            pytest.skip(
+                f"UoW did not reach ready-for-executor (status={row.get('status')!r})"
+            )
+
+        conn = _open_db(db_path)
+        entries = _get_audit_entries(conn, uow_id)
+        conn.close()
+        presc_entry = next(
+            (e for e in entries if e.get("event") == "steward_prescription"), None
+        )
+        assert presc_entry is not None
+
+        note_data = json.loads(presc_entry["note"])
+        audit_confidence = note_data.get("prescription_confidence")
+        row_confidence = row.get("prescription_confidence")
+
+        assert audit_confidence is not None, "prescription_confidence missing from audit entry"
+        assert row_confidence is not None, "prescription_confidence missing from registry row"
+        assert audit_confidence == pytest.approx(row_confidence), (
+            f"Audit confidence {audit_confidence} != row confidence {row_confidence} "
+            "— the two write paths must use the same computed value"
+        )

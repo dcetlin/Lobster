@@ -783,7 +783,19 @@ def _compute_prescription_confidence(
     5. fallback → CONFIDENCE_LOW_ATTEMPTS  (first execution but no criteria)
 
     Args:
-        steward_cycles: current per-attempt cycle count (0 on first pass).
+        steward_cycles: per-attempt cycle count at the moment of prescription (0 on
+            first pass). This is the PRE-INCREMENT value — the caller passes
+            ``uow.steward_cycles`` (``cycles``), not ``new_cycles`` (``cycles + 1``).
+            The rationale: confidence reflects what the steward knew *when it made
+            the prescription decision*, not what the cycle count will be after the
+            decision is recorded. As a result, the ``prescription_confidence`` stored
+            in the audit record and the DB row appears alongside
+            ``steward_cycles = new_cycles`` (post-increment). On a UoW that has
+            completed 3 prior steward cycles and is now being prescribed for the
+            4th time: ``cycles=3`` (input here) and the audit entry shows
+            ``steward_cycles=4``. Calibration analyses must subtract 1 from
+            the stored ``steward_cycles`` to recover the value that was used as
+            input to this function.
         execution_attempts: confirmed execution attempts (incremented only for
             non-orphan returns).
         success_criteria_present: True when the UoW has a non-empty success_criteria.
@@ -4900,6 +4912,11 @@ def _process_uow(
 
         # Compute prescription confidence from available signals (data-collection only —
         # no routing logic reads this value in this PR). Pure function, no side effects.
+        #
+        # Pass `cycles` (pre-increment), not `new_cycles`. Confidence reflects what the
+        # steward knew at decision time. The stored audit record and DB row will show
+        # steward_cycles=new_cycles alongside this confidence value — see the docstring
+        # on _compute_prescription_confidence for calibration guidance.
         confidence = _compute_prescription_confidence(
             steward_cycles=cycles,
             execution_attempts=uow.execution_attempts,
