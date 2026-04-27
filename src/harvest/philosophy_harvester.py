@@ -115,19 +115,26 @@ def extract_yaml_block(markdown_text: str) -> str | None:
     return None
 
 
-_FRICTION_TRACE_PATTERN = re.compile(r'\*friction-trace:\s*(.*?)\*', re.DOTALL)
+_FRICTION_TRACE_PATTERN = re.compile(
+    r'\*friction-trace:\s*((?:[^*]|\*(?!\s*(?:\n|\Z)))*)\*',
+    re.DOTALL,
+)
 
 
-def extract_friction_trace(markdown_text: str) -> str | None:
+def extract_friction_trace(markdown_text: str) -> FrictionTrace | None:
     """
     Extract the friction-trace section from a philosophy-explore markdown file.
 
     Friction-traces appear as italic blocks: *friction-trace: ... *
-    Returns the captured text stripped, or None if not found.
+    Returns a FrictionTrace with the captured text stripped, or None if not found.
+
+    The pattern allows asterisks embedded in the body (e.g. bold markers) by
+    treating only a ``*`` immediately before optional whitespace + newline/end as
+    the closing delimiter.
     """
     match = _FRICTION_TRACE_PATTERN.search(markdown_text)
     if match:
-        return match.group(1).strip()
+        return FrictionTrace(text=match.group(1).strip())
     return None
 
 
@@ -448,7 +455,7 @@ def harvest(
     friction_trace_text = extract_friction_trace(file_text)
     if friction_trace_text:
         trace_obs = MemoryObservation(
-            text=f"Navigation record ({md_path.name}): {friction_trace_text}",
+            text=f"Navigation record ({md_path.name}): {friction_trace_text.text}",
             type="navigation_record",
             valence="neutral",
         )

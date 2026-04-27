@@ -62,6 +62,15 @@ Some preamble text.
 Some trailing text.
 """
 
+SAMPLE_WITH_EMBEDDED_ASTERISKS = """\
+Some preamble text.
+
+*friction-trace: The resistance arose around **naming the thing** precisely — \
+the pull was toward vague gesture rather than *exact form*.*
+
+Some trailing text.
+"""
+
 
 class TestExtractFrictionTrace:
     """Tests for the extract_friction_trace pure function."""
@@ -69,8 +78,9 @@ class TestExtractFrictionTrace:
     def test_extracts_multiline_friction_trace(self) -> None:
         result = extract_friction_trace(SAMPLE_WITH_FRICTION_TRACE)
         assert result is not None
-        assert result.startswith("The pull toward a capability-by-capability diagnostic was strong.")
-        assert "The reorientation was toward the harvest apparatus itself" in result
+        assert isinstance(result, FrictionTrace)
+        assert result.text.startswith("The pull toward a capability-by-capability diagnostic was strong.")
+        assert "The reorientation was toward the harvest apparatus itself" in result.text
 
     def test_returns_none_when_absent(self) -> None:
         result = extract_friction_trace(SAMPLE_WITHOUT_FRICTION_TRACE)
@@ -78,12 +88,27 @@ class TestExtractFrictionTrace:
 
     def test_extracts_single_sentence(self) -> None:
         result = extract_friction_trace(SAMPLE_SHORT_FRICTION_TRACE)
-        assert result == "Single sentence trace."
+        assert result is not None
+        assert isinstance(result, FrictionTrace)
+        assert result.text == "Single sentence trace."
 
     def test_strips_whitespace(self) -> None:
         text = "*friction-trace:   padded content with spaces   *"
         result = extract_friction_trace(text)
-        assert result == "padded content with spaces"
+        assert result is not None
+        assert isinstance(result, FrictionTrace)
+        assert result.text == "padded content with spaces"
+
+    def test_embedded_asterisks_not_truncated(self) -> None:
+        """Friction-trace body containing * markers must not be truncated at the first asterisk."""
+        result = extract_friction_trace(SAMPLE_WITH_EMBEDDED_ASTERISKS)
+        assert result is not None
+        assert isinstance(result, FrictionTrace)
+        # The full body including the **bold** and *exact form* markers must be present
+        assert "**naming the thing**" in result.text
+        assert "*exact form*" in result.text
+        # The text must not be truncated — the closing phrase must appear
+        assert "pull was toward vague gesture rather than *exact form*" in result.text
 
 
 class TestFrictionTraceDataclass:
