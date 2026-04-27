@@ -884,9 +884,22 @@ class TestClassifyStatus:
     def test_active_maps_to_executing(self):
         assert _classify_status("active") == "executing"
 
-    def test_proposed_maps_to_executing(self):
-        """Statuses not in any named bucket fall through to 'executing'."""
-        assert _classify_status("proposed") == "executing"
+    def test_executing_status_maps_to_executing(self):
+        """Statuses in _EXECUTING_STATUSES are reported as 'executing'."""
+        assert _classify_status("executing") == "executing"
+        assert _classify_status("ready-for-steward") == "executing"
+        assert _classify_status("ready-for-executor") == "executing"
+        assert _classify_status("diagnosing") == "executing"
+
+    def test_proposed_maps_to_in_pipeline(self):
+        """Proposed UoWs are not executing — they map to 'in-pipeline'."""
+        assert _classify_status("proposed") == "in-pipeline"
+
+    def test_pipeline_statuses_map_to_in_pipeline(self):
+        """pending, blocked, and expired are queued but not yet running."""
+        assert _classify_status("pending") == "in-pipeline"
+        assert _classify_status("blocked") == "in-pipeline"
+        assert _classify_status("expired") == "in-pipeline"
 
 
 # ---------------------------------------------------------------------------
@@ -916,6 +929,26 @@ class TestComputeSummary:
         assert summary["failed"] == 1
         assert summary["escalated"] == 1
         assert summary["executing"] == 1
+        assert summary["in_pipeline"] == 0
+
+    def test_counts_proposed_in_pipeline_not_executing(self):
+        """proposed/pending/blocked UoWs appear in in_pipeline, not executing."""
+        WINDOW_START = "2026-01-01T00:00:00+00:00"
+        now = datetime(2026, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
+        rows = [
+            self._make_row("proposed"),
+            self._make_row("proposed"),
+            self._make_row("pending"),
+            self._make_row("blocked"),
+            self._make_row("active"),
+            self._make_row("done", wall_clock=100),
+        ]
+        summary = _compute_summary(rows, WINDOW_START, now)
+
+        assert summary["total"] == 6
+        assert summary["in_pipeline"] == 4
+        assert summary["executing"] == 1
+        assert summary["complete"] == 1
 
     def test_median_wall_clock_uses_complete_uows_only(self):
         """Median wall-clock is computed only from UoWs with status 'done'."""

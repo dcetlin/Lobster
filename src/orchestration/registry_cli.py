@@ -513,14 +513,29 @@ def _window_start_iso(since_hours: float | None, from_iso: str | None) -> str:
 
 
 def _classify_status(status: str) -> str:
-    """Map a raw status string to a report bucket label."""
+    """Map a raw status string to a report bucket label.
+
+    Bucket hierarchy (first match wins):
+      complete    — done
+      failed      — failed, cancelled
+      escalated   — needs-human-review
+      executing   — statuses in _EXECUTING_STATUSES (active, executing,
+                    ready-for-steward, ready-for-executor, diagnosing)
+      in-pipeline — everything else (proposed, pending, blocked, expired)
+
+    The "in-pipeline" catch-all is intentionally distinct from "executing" so
+    that proposed UoWs — which have not yet been claimed by the Steward — are
+    not reported as currently running.
+    """
     if status in _COMPLETE_STATUSES:
         return "complete"
     if status in _FAILED_STATUSES:
         return "failed"
     if status in _ESCALATED_STATUSES:
         return "escalated"
-    return "executing"
+    if status in _EXECUTING_STATUSES:
+        return "executing"
+    return "in-pipeline"
 
 
 def _compute_summary(rows: list[dict], window_start_iso: str, now: datetime) -> dict:
@@ -528,11 +543,13 @@ def _compute_summary(rows: list[dict], window_start_iso: str, now: datetime) -> 
     Derive aggregate statistics from a list of window-filtered UoW dicts.
 
     Returns a plain dict with:
-      total, complete, failed, escalated, executing,
+      total, complete, failed, escalated, executing, in_pipeline,
       throughput_per_hour, median_wall_clock_seconds, total_token_usage
     """
     total = len(rows)
-    buckets: dict[str, int] = {"complete": 0, "failed": 0, "escalated": 0, "executing": 0}
+    buckets: dict[str, int] = {
+        "complete": 0, "failed": 0, "escalated": 0, "executing": 0, "in-pipeline": 0,
+    }
     for row in rows:
         bucket = _classify_status(row.get("status") or "")
         buckets[bucket] = buckets.get(bucket, 0) + 1
@@ -568,6 +585,7 @@ def _compute_summary(rows: list[dict], window_start_iso: str, now: datetime) -> 
         "failed": buckets["failed"],
         "escalated": buckets["escalated"],
         "executing": buckets["executing"],
+        "in_pipeline": buckets["in-pipeline"],
         "throughput_per_hour": throughput,
         "median_wall_clock_seconds": median_wc,
         "total_token_usage": total_tokens,
@@ -603,7 +621,8 @@ def _format_report(rows: list[dict], summary: dict, window_start_iso: str,
         f"  (complete: {summary['complete']}"
         f"  failed: {summary['failed']}"
         f"  escalated: {summary['escalated']}"
-        f"  executing: {summary['executing']})"
+        f"  executing: {summary['executing']}"
+        f"  in-pipeline: {summary['in_pipeline']})"
     )
     tph = summary["throughput_per_hour"]
     lines.append(f"Throughput   : {tph:.2f} completions/hr" if tph is not None else "Throughput   : n/a")
