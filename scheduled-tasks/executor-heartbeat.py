@@ -38,7 +38,9 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -144,6 +146,95 @@ def _warn_if_legacy_registry_exists() -> None:
 # ---------------------------------------------------------------------------
 
 RECOVERY_STALE_MINUTES: int = 5
+
+# ---------------------------------------------------------------------------
+# GitHub API rate limit pre-dispatch check
+#
+# Subagents dispatched by the executor call `gh issue view` as step 1.
+# When the GitHub API rate limit is exhausted, that call fails immediately —
+# but the subagent still burns its full 10-minute TTL before getting orphan-
+# killed. Checking the rate limit once per dispatch cycle avoids wasting slots
+# and prevents unnecessary executor_orphan audit entries.
+#
+# Fail-open: if the gh CLI is unavailable or its output is unparseable, the
+# check returns ok=True so dispatch is not blocked by a tooling failure.
+# ---------------------------------------------------------------------------
+
+#: Minimum remaining GitHub API requests required before the executor will
+#: dispatch a UoW in this cycle. Subagents use a small number of API calls
+#: (issue view, PR create, label apply), so 100 provides a comfortable buffer
+#: that prevents wasted TTL slots without blocking dispatch prematurely.
+GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD: int = 100
+
+
+@dataclass(frozen=True)
+class RateLimitStatus:
+    """Result of a GitHub API rate limit check.
+
+    ok: True when dispatch may proceed (remaining >= threshold or check failed).
+    remaining: Requests remaining as reported by GitHub, or None on error.
+    reset_at: ISO 8601 UTC timestamp of the next rate limit reset, or None.
+    """
+    ok: bool
+    remaining: int | None
+    reset_at: str | None
+
+
+def check_github_rate_limit(
+    threshold: int = GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD,
+) -> RateLimitStatus:
+    """Query the GitHub API rate limit and return a dispatch-gate result.
+
+    Calls `gh api rate_limit` and parses the remaining and reset fields.
+    Returns ok=True (dispatch allowed) when:
+    - remaining >= threshold, OR
+    - the gh CLI fails or returns unparseable output (fail-open)
+
+    Returns ok=False (dispatch should be skipped) when:
+    - remaining < threshold AND the call succeeded.
+
+    Pure in behaviour: no side effects beyond the subprocess call. The
+    caller owns all logging and the skip decision.
+
+    Args:
+        threshold: Minimum remaining requests to allow dispatch.
+                   Defaults to GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD.
+
+    Returns:
+        RateLimitStatus with ok, remaining, and reset_at fields.
+    """
+    try:
+        proc = subprocess.run(
+            ["gh", "api", "rate_limit", "--jq", ".rate | {remaining, reset}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        # gh not on PATH, subprocess error, or timeout — fail open.
+        return RateLimitStatus(ok=True, remaining=None, reset_at=None)
+
+    if proc.returncode != 0:
+        # gh CLI failed (auth error, network, etc.) — fail open.
+        return RateLimitStatus(ok=True, remaining=None, reset_at=None)
+
+    try:
+        data = json.loads(proc.stdout.strip())
+        remaining = int(data["remaining"])
+        reset_epoch = data.get("reset")
+        reset_at: str | None = None
+        if reset_epoch is not None:
+            from datetime import datetime, timezone
+            reset_at = datetime.fromtimestamp(int(reset_epoch), tz=timezone.utc).isoformat()
+    except Exception:
+        # Unparseable output — fail open.
+        return RateLimitStatus(ok=True, remaining=None, reset_at=None)
+
+    return RateLimitStatus(
+        ok=remaining >= threshold,
+        remaining=remaining,
+        reset_at=reset_at,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +638,30 @@ def main() -> int:
         )
         log.info("Executor heartbeat complete")
         return 0
+
+    # GitHub API rate limit check — called once per dispatch cycle.
+    # Subagents call `gh issue view` as step 1; if the rate limit is exhausted
+    # the subagent fails immediately but still burns its full 10-minute TTL.
+    # Skipping dispatch when the quota is low avoids wasted slots and prevents
+    # unnecessary executor_orphan audit entries.
+    if not dry_run:
+        rate_status = check_github_rate_limit()
+        if not rate_status.ok:
+            reset_msg = f", next reset at {rate_status.reset_at}" if rate_status.reset_at else ""
+            log.info(
+                "Skipping dispatch: GitHub API rate limit low "
+                "(remaining=%d%s). Dispatching will resume after reset.",
+                rate_status.remaining,
+                reset_msg,
+            )
+            log.info("Executor heartbeat complete")
+            return 0
+        if rate_status.remaining is not None:
+            log.debug(
+                "GitHub API rate limit ok: %d remaining (threshold=%d)",
+                rate_status.remaining,
+                GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD,
+            )
 
     try:
         result = run_executor_cycle(registry, dry_run=dry_run)
