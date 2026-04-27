@@ -2366,6 +2366,45 @@ class Registry:
             conn.close()
 
     # -----------------------------------------------------------------------
+    # Time-window query (used by registry_cli report command)
+    # -----------------------------------------------------------------------
+
+    def fetch_in_window(self, since_iso: str) -> list[dict]:
+        """
+        Return all UoW rows whose started_at or completed_at falls at or after
+        since_iso (an ISO 8601 UTC timestamp string).
+
+        Returns raw dicts rather than UoW value objects so that callers can
+        access columns not yet mapped into the UoW dataclass (e.g. token_usage,
+        completed_at). Each dict is keyed by column name.
+
+        Results are ordered by most-recent-first (COALESCE(completed_at,
+        started_at, created_at) DESC).
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT *,
+                       CASE
+                         WHEN started_at IS NOT NULL AND completed_at IS NOT NULL
+                         THEN CAST(
+                               (julianday(completed_at) - julianday(started_at)) * 86400
+                               AS INTEGER)
+                         ELSE NULL
+                       END AS wall_clock_seconds
+                FROM uow_registry
+                WHERE started_at >= ?
+                   OR completed_at >= ?
+                ORDER BY COALESCE(completed_at, started_at, created_at) DESC
+                """,
+                (since_iso, since_iso),
+            ).fetchall()
+            return [self._row_to_dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    # -----------------------------------------------------------------------
     # Juice dispatch priority methods (migration 0013)
     # -----------------------------------------------------------------------
 

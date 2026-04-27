@@ -2,8 +2,9 @@
 """
 registry_cli.py — UoW Registry command-line interface.
 
-All commands output JSON to stdout. All writes use BEGIN IMMEDIATE transactions
-via the Registry class. Audit log entries are written atomically with state changes.
+All commands output JSON to stdout unless noted otherwise. All writes use
+BEGIN IMMEDIATE transactions via the Registry class. Audit log entries are
+written atomically with state changes.
 
 Usage:
     uv run registry_cli.py upsert --issue <N> --title <T> [--sweep-date <YYYY-MM-DD>]
@@ -14,6 +15,7 @@ Usage:
     uv run registry_cli.py expire-proposals
     uv run registry_cli.py gate-readiness
     uv run registry_cli.py trace --id <uow-id>
+    uv run registry_cli.py report [--since HOURS] [--from ISO_DATE]
 
 Environment:
     REGISTRY_DB_PATH — override the default db path (~/.../orchestration/registry.db)
@@ -23,7 +25,9 @@ import argparse
 import dataclasses
 import json
 import os
+import statistics
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Allow importing registry module whether run as script or via uv run
@@ -475,6 +479,206 @@ def cmd_stale(registry: Registry, args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# report command — time-windowed pipeline visibility
+# ---------------------------------------------------------------------------
+
+# Status buckets used for the summary header.
+_COMPLETE_STATUSES = frozenset({"done"})
+_FAILED_STATUSES = frozenset({"failed", "cancelled"})
+_ESCALATED_STATUSES = frozenset({"needs-human-review"})
+_EXECUTING_STATUSES = frozenset({"active", "executing", "ready-for-steward",
+                                  "ready-for-executor", "diagnosing"})
+
+# Default look-back window when neither --since nor --from is specified.
+DEFAULT_REPORT_HOURS = 24
+
+
+def _window_start_iso(since_hours: float | None, from_iso: str | None) -> str:
+    """
+    Resolve the window start timestamp to an ISO 8601 UTC string.
+
+    Priority: explicit --from timestamp > --since hours > DEFAULT_REPORT_HOURS.
+    """
+    if from_iso is not None:
+        # Accept both offset-aware and naive ISO strings; treat naive as UTC.
+        try:
+            dt = datetime.fromisoformat(from_iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.isoformat()
+        except ValueError as exc:
+            raise ValueError(f"--from value is not a valid ISO 8601 timestamp: {from_iso!r}") from exc
+    hours = since_hours if since_hours is not None else DEFAULT_REPORT_HOURS
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+
+
+def _classify_status(status: str) -> str:
+    """Map a raw status string to a report bucket label."""
+    if status in _COMPLETE_STATUSES:
+        return "complete"
+    if status in _FAILED_STATUSES:
+        return "failed"
+    if status in _ESCALATED_STATUSES:
+        return "escalated"
+    return "executing"
+
+
+def _compute_summary(rows: list[dict], window_start_iso: str, now: datetime) -> dict:
+    """
+    Derive aggregate statistics from a list of window-filtered UoW dicts.
+
+    Returns a plain dict with:
+      total, complete, failed, escalated, executing,
+      throughput_per_hour, median_wall_clock_seconds, total_token_usage
+    """
+    total = len(rows)
+    buckets: dict[str, int] = {"complete": 0, "failed": 0, "escalated": 0, "executing": 0}
+    for row in rows:
+        bucket = _classify_status(row.get("status") or "")
+        buckets[bucket] = buckets.get(bucket, 0) + 1
+
+    # Wall-clock for completed UoWs only (column computed in fetch_in_window).
+    wall_clocks = [
+        row["wall_clock_seconds"]
+        for row in rows
+        if row.get("wall_clock_seconds") is not None
+        and _classify_status(row.get("status") or "") == "complete"
+    ]
+    median_wc = statistics.median(wall_clocks) if wall_clocks else None
+
+    # Throughput: complete UoWs / hours in window.
+    try:
+        window_dt = datetime.fromisoformat(window_start_iso)
+        if window_dt.tzinfo is None:
+            window_dt = window_dt.replace(tzinfo=timezone.utc)
+        elapsed_hours = (now - window_dt).total_seconds() / 3600.0
+    except (ValueError, TypeError):
+        elapsed_hours = None
+    throughput = (buckets["complete"] / elapsed_hours) if elapsed_hours else None
+
+    total_tokens = sum(
+        row["token_usage"]
+        for row in rows
+        if row.get("token_usage") is not None
+    )
+
+    return {
+        "total": total,
+        "complete": buckets["complete"],
+        "failed": buckets["failed"],
+        "escalated": buckets["escalated"],
+        "executing": buckets["executing"],
+        "throughput_per_hour": throughput,
+        "median_wall_clock_seconds": median_wc,
+        "total_token_usage": total_tokens,
+    }
+
+
+def _kill_label(audit_entries: list[dict]) -> str | None:
+    """
+    Return the kill_type from the most recent orphan_kill_classified audit
+    entry, or None if no such entry exists.
+    """
+    kc = _extract_kill_classification(audit_entries)
+    return kc["kill_type"] if kc else None
+
+
+def _format_report(rows: list[dict], summary: dict, window_start_iso: str,
+                   registry: "Registry") -> str:
+    """
+    Render the report as plain aligned text — no markdown tables.
+
+    Layout:
+      Header block  (window, counts, throughput, median wall-clock, tokens)
+      Blank line
+      Per-UoW lines (one per row, most recent first — already ordered by query)
+    """
+    lines: list[str] = []
+
+    # --- Header ---
+    lines.append(f"WOS Pipeline Report")
+    lines.append(f"Window start : {window_start_iso}")
+    lines.append(
+        f"Total UoWs   : {summary['total']}"
+        f"  (complete: {summary['complete']}"
+        f"  failed: {summary['failed']}"
+        f"  escalated: {summary['escalated']}"
+        f"  executing: {summary['executing']})"
+    )
+    tph = summary["throughput_per_hour"]
+    lines.append(f"Throughput   : {tph:.2f} completions/hr" if tph is not None else "Throughput   : n/a")
+    mwc = summary["median_wall_clock_seconds"]
+    lines.append(f"Median wall  : {int(mwc)}s" if mwc is not None else "Median wall  : n/a")
+    lines.append(f"Total tokens : {summary['total_token_usage']}")
+
+    if not rows:
+        lines.append("")
+        lines.append("(no UoWs in window)")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("Per-UoW listing (most recent first):")
+    lines.append("")
+
+    # Column header
+    lines.append(
+        f"{'UoW ID':<26}  {'Status':<22}  {'Wall(s)':>7}  {'Tokens':>8}  {'Issue':>6}  Kill"
+    )
+    lines.append("-" * 90)
+
+    for row in rows:
+        uow_id = row.get("id") or ""
+        status = row.get("status") or ""
+        wc = row.get("wall_clock_seconds")
+        wc_str = str(int(wc)) if wc is not None else "-"
+        tok = row.get("token_usage")
+        tok_str = str(tok) if tok is not None else "-"
+        issue = row.get("source_issue_number")
+        issue_str = f"#{issue}" if issue is not None else "-"
+
+        # Fetch kill label only for UoWs that look like they were killed.
+        kill_str = "-"
+        if status in ("failed", "needs-human-review", "ready-for-steward"):
+            audit = registry.fetch_audit_entries(uow_id)
+            lbl = _kill_label(audit)
+            if lbl:
+                kill_str = lbl
+
+        lines.append(
+            f"{uow_id:<26}  {status:<22}  {wc_str:>7}  {tok_str:>8}  {issue_str:>6}  {kill_str}"
+        )
+
+    return "\n".join(lines)
+
+
+def cmd_report(registry: "Registry", args: argparse.Namespace) -> None:
+    """
+    Print a time-windowed pipeline visibility report to stdout.
+
+    Output is plain aligned text (no markdown tables). The report covers all
+    UoWs whose started_at or completed_at falls within the requested window.
+
+    Options:
+      --since HOURS   Look back N hours from now (default: 24)
+      --from ISO_DATE Start window at an explicit ISO 8601 timestamp
+    """
+    since_hours: float | None = getattr(args, "since", None)
+    from_iso: str | None = getattr(args, "from_iso", None)
+
+    try:
+        window_start = _window_start_iso(since_hours, from_iso)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    now = datetime.now(timezone.utc)
+    rows = registry.fetch_in_window(window_start)
+    summary = _compute_summary(rows, window_start, now)
+    report = _format_report(rows, summary, window_start, registry)
+    print(report)
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -567,6 +771,31 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_trace.add_argument("--id", required=True, help="UoW id")
 
+    # report
+    p_report = subparsers.add_parser(
+        "report",
+        help=(
+            "Time-windowed pipeline visibility report. "
+            "Shows aggregate stats and a per-UoW listing for all UoWs "
+            "whose started_at or completed_at falls within the window. "
+            "Output is plain aligned text (not JSON)."
+        ),
+    )
+    p_report.add_argument(
+        "--since",
+        type=float,
+        default=None,
+        metavar="HOURS",
+        help=f"Look back N hours from now (default: {DEFAULT_REPORT_HOURS})",
+    )
+    p_report.add_argument(
+        "--from",
+        dest="from_iso",
+        default=None,
+        metavar="ISO_DATE",
+        help="Start window at an explicit ISO 8601 timestamp (overrides --since)",
+    )
+
     return parser
 
 
@@ -584,6 +813,7 @@ _COMMAND_MAP = {
     "escalation-candidates": cmd_escalation_candidates,
     "stale": cmd_stale,
     "trace": cmd_trace,
+    "report": cmd_report,
 }
 
 
