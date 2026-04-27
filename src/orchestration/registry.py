@@ -587,11 +587,13 @@ class Registry:
             # Cross-sweep-date pre-check: any non-terminal record for this issue?
             # 'cancelled' is a terminal status (UoWStatus.CANCELLED) that allows
             # re-proposal after a cancellation.
+            # 'closed' is a legacy DB status predating the UoWStatus enum; treat it
+            # as terminal so that legacy rows do not permanently block re-proposal.
             existing = conn.execute(
                 """
                 SELECT id, status FROM uow_registry
                 WHERE source_issue_number = ?
-                  AND status NOT IN ('done', 'failed', 'expired', 'cancelled')
+                  AND status NOT IN ('done', 'failed', 'expired', 'cancelled', 'closed')
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
@@ -981,6 +983,38 @@ class Registry:
         parameter — used by the Registrar sweep to fetch only `pending` UoWs.
         """
         return self.list(status=status)
+
+    # Terminal statuses for has_active_uow_for_issue — mirrors the exclusion list
+    # in _upsert_typed. 'closed' is a legacy DB status treated as terminal here.
+    _TERMINAL_STATUSES_FOR_ISSUE_CHECK = frozenset({
+        "done", "failed", "expired", "cancelled", "closed",
+    })
+
+    def has_active_uow_for_issue(self, issue_number: int) -> bool:
+        """Return True if a non-terminal UoW already exists for the given issue number.
+
+        Used by GardenCaretaker._reactivate_uow to guard against creating a
+        duplicate when scan() has already created a new proposed UoW for the
+        same issue on a different sweep_date while the old UoW was temporarily
+        in a terminal state.
+
+        Mirrors the exclusion logic in _upsert_typed exactly so the two
+        idempotency checks stay in sync.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT id FROM uow_registry
+                WHERE source_issue_number = ?
+                  AND status NOT IN ('done', 'failed', 'expired', 'cancelled', 'closed')
+                LIMIT 1
+                """,
+                (issue_number,),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
 
     def transition(
         self,
