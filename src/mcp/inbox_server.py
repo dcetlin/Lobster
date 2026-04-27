@@ -2694,6 +2694,16 @@ async def list_tools() -> list[Tool]:
                         ),
                         "enum": ["heat", "shit", "seed", "pearl"],
                     },
+                    "token_usage": {
+                        "type": "integer",
+                        "description": (
+                            "Optional total token count consumed by this subagent (input + output tokens combined). "
+                            "Report what the Claude API returned in response metadata across all tool calls and turns. "
+                            "Accumulate usage.input_tokens + usage.output_tokens across turns and report the total here. "
+                            "Used for per-UoW cost telemetry in the WOS registry. "
+                            "Omit if token counts were not available or not tracked."
+                        ),
+                    },
                 },
                 "required": ["task_id", "chat_id", "text"],
             },
@@ -7725,7 +7735,12 @@ async def handle_write_task_output(args: dict) -> list[TextContent]:
 # WOS registry completion helper (issue #669)
 # =============================================================================
 
-def _maybe_complete_wos_uow(task_id: str, status: str, result_text: str | None = None) -> None:
+def _maybe_complete_wos_uow(
+    task_id: str,
+    status: str,
+    result_text: str | None = None,
+    token_usage: int | None = None,
+) -> None:
     """
     Transition a WOS UoW from 'executing' to 'ready-for-steward' when its subagent
     calls write_result with status='success'.
@@ -7738,6 +7753,9 @@ def _maybe_complete_wos_uow(task_id: str, status: str, result_text: str | None =
     can distinguish pearl (PR opened), heat (nothing to do), and seed (default)
     outcomes when building the GitHub close-out comment.
 
+    token_usage is forwarded to record per-UoW cost telemetry in the registry
+    (issue #990). NULL when the subagent did not report usage.
+
     Errors are logged but never raised — write_result delivery must not be blocked
     by registry update failures.
     """
@@ -7749,7 +7767,7 @@ def _maybe_complete_wos_uow(task_id: str, status: str, result_text: str | None =
         if _src not in _sys.path:
             _sys.path.insert(0, _src)
         from orchestration.wos_completion import maybe_complete_wos_uow
-        maybe_complete_wos_uow(task_id, status, result_text=result_text)
+        maybe_complete_wos_uow(task_id, status, result_text=result_text, token_usage=token_usage)
     except Exception as exc:
         log.warning("_maybe_complete_wos_uow: unexpected error — %s: %s", type(exc).__name__, exc)
 
@@ -7821,6 +7839,14 @@ async def handle_write_result(args: dict) -> list[TextContent]:
     outcome_category = (
         outcome_category_raw
         if outcome_category_raw in VALID_OUTCOME_CATEGORIES
+        else None
+    )
+    # token_usage: optional integer reported by the subagent (input + output tokens).
+    # Validated as a positive integer; ignored if absent, None, or non-integer.
+    _token_usage_raw = args.get("token_usage")
+    token_usage: int | None = (
+        int(_token_usage_raw)
+        if _token_usage_raw is not None and isinstance(_token_usage_raw, (int, float)) and int(_token_usage_raw) > 0
         else None
     )
     # Accept new name (sent_reply_to_user) with backward-compat alias (forward).
@@ -7959,7 +7985,8 @@ async def handle_write_result(args: dict) -> list[TextContent]:
     # task_id convention: "wos-{uow_id}" (set by route_wos_message in dispatcher_handlers.py)
     # result_text is forwarded so the output classifier can build an accurate close-out
     # comment (pearl for PR opened, heat for nothing to do, seed as default).
-    _maybe_complete_wos_uow(task_id, status, result_text=text or None)
+    # token_usage is forwarded for per-UoW cost telemetry (issue #990).
+    _maybe_complete_wos_uow(task_id, status, result_text=text or None, token_usage=token_usage)
 
     # Notify wire server so SSE clients update within 40ms
     asyncio.create_task(_notify_wire_server())

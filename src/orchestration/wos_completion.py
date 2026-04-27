@@ -760,6 +760,7 @@ def maybe_complete_wos_uow(
     task_id: str,
     status: str,
     result_text: str | None = None,
+    token_usage: int | None = None,
     gh_bin: str = "gh",
 ) -> None:
     """
@@ -794,6 +795,10 @@ def maybe_complete_wos_uow(
         status:  The status from the write_result call ("success" or "error").
         result_text: Optional text from the write_result call; used in the
                      close-out comment summary and output classification.
+        token_usage: Optional total token count (input + output) reported by
+                     the subagent via write_result. Written to the registry
+                     when provided; NULL otherwise. Used for per-UoW cost
+                     telemetry (issue #990).
         gh_bin:  Path to the gh CLI binary (injectable for tests; default "gh").
     """
     if not task_id.startswith(WOS_TASK_ID_PREFIX):
@@ -839,7 +844,7 @@ def maybe_complete_wos_uow(
             return
 
         output_ref = uow.output_ref or ""
-        registry.complete_uow(uow_id, output_ref)
+        registry.complete_uow(uow_id, output_ref, token_usage=token_usage)
         log.info(
             "maybe_complete_wos_uow: UoW %r transitioned executing → ready-for-steward "
             "(execution_complete written on write_result confirmation)",

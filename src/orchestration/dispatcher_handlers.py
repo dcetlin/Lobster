@@ -397,7 +397,11 @@ def handle_wos_execute(uow_id: str, instructions: str, output_ref: str) -> str:
         f"  2. Write JSON to {output_ref}.tmp, then rename to {output_ref}\n\n"
         f"After writing the result file:\n"
         f'  write_result(task_id="wos-{uow_id}", chat_id=0, source="system",\n'
-        f'               text="WOS UoW {uow_id}: outcome=<outcome>")\n\n'
+        f'               text="WOS UoW {uow_id}: outcome=<outcome>",\n'
+        f'               token_usage=<total_input_plus_output_tokens>)\n\n'
+        f"token_usage: accumulate usage.input_tokens + usage.output_tokens from every Claude API\n"
+        f"response across all turns and report the total. This enables per-UoW cost telemetry.\n"
+        f"Omit token_usage if you did not track it.\n\n"
         f"Minimum viable output: {output_ref} with uow_id, outcome, and success fields.\n"
         f"Boundary: do not modify executor.py, registry.py, or any WOS source files.\n"
     )

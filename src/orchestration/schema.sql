@@ -97,6 +97,13 @@ CREATE TABLE IF NOT EXISTS uow_registry (
     --   Steward-private (excluded from executor_uow_view).
     execution_attempts  INTEGER NOT NULL DEFAULT 0,
 
+    -- token_usage: total tokens consumed by the executing subagent (input + output).
+    --   Reported by the subagent via write_result at completion time.
+    --   NULL for UoWs completed before this migration or when the subagent did not report usage.
+    --   Executor-accessible (included in executor_uow_view).
+    --   wall_clock_seconds is a derived field: computed from completed_at - started_at at query time.
+    token_usage         INTEGER NULL,
+
     UNIQUE(source_issue_number, sweep_date)
 );
 -- vision_ref: JSON {layer, field, statement, anchored_at}
@@ -129,7 +136,7 @@ SELECT
     source_issue_number, summary,
     workflow_artifact, success_criteria, prescribed_skills,
     steward_cycles, timeout_at, estimated_runtime,
-    issue_url
+    issue_url, token_usage
 FROM uow_registry
 WHERE status = 'ready-for-executor';
 -- steward_agenda: Steward-private, excluded from executor_uow_view.
