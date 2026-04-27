@@ -2456,6 +2456,48 @@ validate_phase2_schema = validate_steward_executor_schema
 
 
 # ---------------------------------------------------------------------------
+# WOSRegistry — convenience wrapper that uses the default REGISTRY_DB path
+# ---------------------------------------------------------------------------
+
+class WOSRegistry(Registry):
+    """
+    Convenience subclass of Registry that uses the canonical REGISTRY_DB path.
+
+    Allows WOS subagents to write heartbeats without needing to import or
+    resolve the DB path themselves:
+
+        from src.orchestration.registry import WOSRegistry
+        WOSRegistry().write_heartbeat(uow_id)
+
+    This is equivalent to:
+
+        from src.orchestration.paths import REGISTRY_DB
+        from src.orchestration.registry import Registry
+        Registry(REGISTRY_DB).write_heartbeat(uow_id)
+
+    WOSRegistry is intentionally minimal — it adds no methods beyond the
+    Registry base class. Its sole purpose is to eliminate the path-resolution
+    boilerplate that was causing agent-side heartbeat calls to fail when
+    prompts referenced this class name before it existed.
+
+    Design note (issue #849): Agent-side heartbeat emission is now backed by
+    two mechanisms:
+    1. Prompt instructions (handle_wos_execute) — agents are told to call
+       write_heartbeat at regular checkpoints.
+    2. Heartbeat sidecar (heartbeat_sidecar.py) — structural enforcement via
+       the executor-heartbeat cron, which writes heartbeats for all in-flight
+       UoWs every ~3 minutes regardless of whether the agent called them.
+
+    WOSRegistry enables mechanism 1 to work reliably by providing the class
+    name referenced in the dispatched prompt.
+    """
+
+    def __init__(self) -> None:
+        from src.orchestration.paths import REGISTRY_DB
+        super().__init__(REGISTRY_DB)
+
+
+# ---------------------------------------------------------------------------
 # NoteAccessor — thin wrapper for the notes JSONB column in uow_registry
 # ---------------------------------------------------------------------------
 

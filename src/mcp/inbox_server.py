@@ -2580,6 +2580,30 @@ async def list_tools() -> list[Tool]:
                 "required": ["job_name", "output"],
             },
         ),
+        # WOS Agent Heartbeat — allows executing subagents to prove liveness
+        # without needing to import Python modules or resolve the registry path.
+        Tool(
+            name="write_wos_heartbeat",
+            description=(
+                "Write a liveness heartbeat for a WOS unit of work. "
+                "Call this every 60–90 seconds during WOS task execution to prove the agent is alive. "
+                "Without periodic heartbeats, the Observation Loop will detect a stall and re-queue "
+                "the UoW for re-execution. "
+                "Returns: {\"rowcount\": 1} on success, {\"rowcount\": 0} if the UoW status has "
+                "already changed (e.g. recovered by the Observation Loop — stop execution immediately "
+                "and call write_result with outcome=failed)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "uow_id": {
+                        "type": "string",
+                        "description": "The WOS unit-of-work ID to write a heartbeat for (e.g. 'uow_abc123').",
+                    },
+                },
+                "required": ["uow_id"],
+            },
+        ),
         # Subagent Result Relay
         Tool(
             name="write_result",
@@ -4154,6 +4178,8 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         return await handle_check_task_outputs(arguments)
     elif name == "write_task_output":
         return await handle_write_task_output(arguments)
+    elif name == "write_wos_heartbeat":
+        return await handle_write_wos_heartbeat(arguments)
     elif name == "write_result":
         return await handle_write_result(arguments)
     elif name == "write_observation":
@@ -7726,6 +7752,49 @@ def _maybe_complete_wos_uow(task_id: str, status: str, result_text: str | None =
         maybe_complete_wos_uow(task_id, status, result_text=result_text)
     except Exception as exc:
         log.warning("_maybe_complete_wos_uow: unexpected error — %s: %s", type(exc).__name__, exc)
+
+
+# =============================================================================
+# WOS Heartbeat Handler (issue #849)
+# =============================================================================
+
+async def handle_write_wos_heartbeat(args: dict) -> list[TextContent]:
+    """
+    Write a liveness heartbeat for a WOS unit of work.
+
+    Called by executing WOS subagents every 60–90 seconds to prove they are
+    alive. Without periodic heartbeats, the Observation Loop (steward-heartbeat
+    Phase 2b) detects a stall and re-queues the UoW for re-execution.
+
+    Delegates to Registry.write_heartbeat() — a fire-and-forget SQL UPDATE that
+    sets heartbeat_at to the current UTC timestamp for UoWs in 'active' or
+    'executing' status. Returns rowcount=0 when the UoW is no longer in an
+    executing state, which signals the agent to stop.
+
+    Errors are logged and returned as an error response — never raised — so the
+    agent's execution continues and the heartbeat sidecar provides backup coverage.
+    """
+    uow_id = (args.get("uow_id") or "").strip()
+    if not uow_id:
+        return [TextContent(type="text", text='{"error": "uow_id is required"}')]
+
+    try:
+        import sys as _sys
+        import os
+        from pathlib import Path as _Path
+        _src = str(_Path(__file__).resolve().parent.parent)
+        if _src not in _sys.path:
+            _sys.path.insert(0, _src)
+        from orchestration.registry import WOSRegistry
+        rowcount = WOSRegistry().write_heartbeat(uow_id)
+        log.debug("write_wos_heartbeat: uow_id=%s rowcount=%d", uow_id, rowcount)
+        return [TextContent(type="text", text=f'{{"rowcount": {rowcount}}}')]
+    except Exception as exc:
+        log.warning(
+            "write_wos_heartbeat: failed for uow_id=%s — %s: %s",
+            uow_id, type(exc).__name__, exc,
+        )
+        return [TextContent(type="text", text=f'{{"error": "{type(exc).__name__}: {exc}"}}')]
 
 
 # =============================================================================
