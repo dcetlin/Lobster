@@ -771,6 +771,65 @@ class TestRegistryCompleteUow:
         note_data = json.loads(row["note"])
         assert note_data["reason"] == "disk full"
 
+    def test_complete_uow_stores_outcome_category_in_db(self, registry, db_path):
+        """outcome_category passed to complete_uow is written to uow_registry."""
+        uow_id = self._make_active_uow(registry, db_path)
+        registry.complete_uow(uow_id, "/tmp/output.json", outcome_category="pearl")
+        conn = _open_db(db_path)
+        row = conn.execute(
+            "SELECT outcome_category FROM uow_registry WHERE id = ?", (uow_id,)
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row["outcome_category"] == "pearl"
+
+    def test_complete_uow_outcome_category_null_when_not_provided(self, registry, db_path):
+        """outcome_category is NULL in the DB when not passed to complete_uow."""
+        uow_id = self._make_active_uow(registry, db_path)
+        registry.complete_uow(uow_id, "/tmp/output.json")
+        conn = _open_db(db_path)
+        row = conn.execute(
+            "SELECT outcome_category FROM uow_registry WHERE id = ?", (uow_id,)
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row["outcome_category"] is None
+
+    def test_complete_uow_outcome_category_recorded_in_audit_note(self, registry, db_path):
+        """outcome_category is included in the execution_complete audit note payload."""
+        uow_id = self._make_active_uow(registry, db_path)
+        registry.complete_uow(uow_id, "/tmp/output.json", outcome_category="seed")
+        conn = _open_db(db_path)
+        row = conn.execute(
+            "SELECT note FROM audit_log WHERE uow_id = ? AND event = 'execution_complete'",
+            (uow_id,),
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        note_data = json.loads(row["note"])
+        assert note_data.get("outcome_category") == "seed"
+
+    def test_complete_uow_all_four_outcome_categories_are_stored(self, registry, db_path):
+        """All four valid outcome_category labels are persisted without truncation."""
+        from src.orchestration.registry import UpsertInserted
+        # Valid labels defined in inbox_server: heat, shit, seed, pearl
+        VALID_LABELS = ("heat", "shit", "seed", "pearl")
+        for i, label in enumerate(VALID_LABELS):
+            result = registry.upsert(
+                issue_number=9100 + i, title=f"UoW for {label}", success_criteria="label test"
+            )
+            assert isinstance(result, UpsertInserted)
+            uow_id = result.id
+            registry.approve(uow_id)
+            registry.set_status_direct(uow_id, "active")
+            registry.complete_uow(uow_id, f"/tmp/{label}.json", outcome_category=label)
+            conn = _open_db(db_path)
+            stored = conn.execute(
+                "SELECT outcome_category FROM uow_registry WHERE id = ?", (uow_id,)
+            ).fetchone()["outcome_category"]
+            conn.close()
+            assert stored == label, f"Expected {label!r} stored, got {stored!r}"
+
 
 # ---------------------------------------------------------------------------
 # Item 18: NoteAccessor

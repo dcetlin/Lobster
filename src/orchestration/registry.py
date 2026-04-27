@@ -1657,6 +1657,7 @@ class Registry:
         uow_id: str,
         output_ref: str,
         token_usage: int | None = None,
+        outcome_category: str | None = None,
     ) -> None:
         """
         Transition a UoW to 'ready-for-steward' with an execution_complete audit entry.
@@ -1674,6 +1675,11 @@ class Registry:
         token_usage: optional integer (input + output tokens) reported by the subagent
         via write_result. Written to the registry when provided; NULL otherwise.
         wall_clock_seconds is derived at query time from completed_at - started_at.
+
+        outcome_category: optional metabolic taxonomy label (heat/shit/seed/pearl)
+        reported by the subagent via write_result. Written to the registry when
+        provided; NULL otherwise. Validation (membership in VALID_OUTCOME_CATEGORIES)
+        is the caller's responsibility — this method stores whatever is passed.
 
         Single transaction: audit INSERT before status UPDATE
         (audit-before-transition invariant).
@@ -1694,6 +1700,7 @@ class Registry:
                 "output_ref": output_ref,
                 "timestamp": now,
                 **({"token_usage": token_usage} if token_usage is not None else {}),
+                **({"outcome_category": outcome_category} if outcome_category is not None else {}),
             })
             conn.execute(
                 """
@@ -1706,10 +1713,11 @@ class Registry:
                 """
                 UPDATE uow_registry
                 SET status = 'ready-for-steward', updated_at = ?, completed_at = ?,
-                    token_usage = COALESCE(?, token_usage)
+                    token_usage = COALESCE(?, token_usage),
+                    outcome_category = COALESCE(?, outcome_category)
                 WHERE id = ?
                 """,
-                (now, now, token_usage, uow_id),
+                (now, now, token_usage, outcome_category, uow_id),
             )
             conn.commit()
         except Exception:
@@ -2475,7 +2483,7 @@ class Registry:
 
         Returns raw dicts rather than UoW value objects so that callers can
         access columns not yet mapped into the UoW dataclass (e.g. token_usage,
-        completed_at). Each dict is keyed by column name.
+        completed_at, outcome_category). Each dict is keyed by column name.
 
         Results are ordered by most-recent-first (COALESCE(completed_at,
         started_at, created_at) DESC).
