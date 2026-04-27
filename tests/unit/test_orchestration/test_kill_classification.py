@@ -605,13 +605,17 @@ class TestStartupSweepKillClassification:
         """
         For UoWs where no executor_dispatch audit entry exists (e.g. older records
         before this migration), the classification defaults to kill_before_start.
+
+        The heartbeat is stale (> HEARTBEAT_SKIP_THRESHOLD_SECONDS) so the
+        heartbeat recency gate (#992) does not protect this UoW — the kill
+        fires and the PR #968 classification logic is exercised.
         """
         conn = _open_conn(tmp_db)
         _make_executing_uow(
             conn,
             uow_id="uow-no-dispatch-audit-001",
             started_at=_iso_ago(1800),
-            heartbeat_at=_iso_ago(60),  # Has a heartbeat but no dispatch audit
+            heartbeat_at=_iso_ago(300),  # Stale heartbeat (> 120 s threshold) — kill fires
         )
         conn.close()
 
