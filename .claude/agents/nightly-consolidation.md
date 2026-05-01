@@ -69,6 +69,95 @@ Collect this output as `gate_miss_summary`. Include it in step 3 (rolling-summar
 
 Also include `gate_miss_summary` in step 4 (daily-digest.md): append one sentence after the prose summary if any gate misses occurred — e.g., "Proprioceptive note: N gate miss(es) detected (gate=X: M times)."
 
+**1d. Pull classified patterns from the event store.**
+Query `~/lobster-workspace/data/memory.db` for `pattern_observation` events from the past 24 hours, and check each pattern type's recurrence over the prior 7 days.
+
+Run:
+```python
+uv run python - << 'PYEOF'
+import sqlite3, json, os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+db_path = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace")) / "data" / "memory.db"
+if not db_path.exists():
+    print("PATTERN_SUMMARY: memory.db not found — skipping pattern step.")
+    raise SystemExit(0)
+
+conn = sqlite3.connect(str(db_path))
+conn.row_factory = sqlite3.Row
+
+now = datetime.now(timezone.utc)
+today_cutoff = (now - timedelta(hours=24)).isoformat()
+week_cutoff = (now - timedelta(days=7)).isoformat()
+
+# Today's pattern_observation rows
+cursor = conn.execute("""
+    SELECT id, timestamp, source, content, metadata
+    FROM events
+    WHERE type = 'pattern_observation' AND timestamp >= ?
+    ORDER BY timestamp ASC
+""", (today_cutoff,))
+today_rows = cursor.fetchall()
+
+# Prior 7-day counts by pattern_type (excluding today)
+cursor = conn.execute("""
+    SELECT json_extract(metadata, '$.pattern_type') AS ptype, COUNT(*) AS cnt
+    FROM events
+    WHERE type = 'pattern_observation' AND timestamp >= ? AND timestamp < ?
+    GROUP BY ptype
+""", (week_cutoff, today_cutoff))
+prior_counts = {r["ptype"]: r["cnt"] for r in cursor.fetchall() if r["ptype"]}
+
+# Slow-v1 significant events from past 24h (elevated by cross-event analysis)
+cursor = conn.execute("""
+    SELECT ct.entry_id, ct.signal_type, ct.posture_hint, ct.notes
+    FROM classification_tags ct
+    INNER JOIN events e ON e.id = CAST(ct.entry_id AS INTEGER)
+    WHERE ct.classifier = 'slow-v1' AND ct.significant = 1 AND e.timestamp >= ?
+      AND e.type != 'pattern_observation'
+""", (today_cutoff,))
+significant_events = cursor.fetchall()
+conn.close()
+
+# Build summary
+lines = []
+if today_rows:
+    from collections import Counter
+    by_type = Counter()
+    meta_by_type = {}
+    for row in today_rows:
+        meta = json.loads(row["metadata"] or "{}")
+        ptype = meta.get("pattern_type", "unknown")
+        by_type[ptype] += 1
+        meta_by_type.setdefault(ptype, []).append(meta)
+
+    lines.append("Patterns detected today:")
+    for ptype, count in by_type.most_common():
+        prior = prior_counts.get(ptype, 0)
+        label = "recurring" if prior >= 2 else "novel"
+        valences = [m.get("valence", "neutral") for m in meta_by_type[ptype]]
+        dominant_valence = max(set(valences), key=valences.count)
+        lines.append(f"  [{label}] {ptype}: {count}x today, {prior} times prior 7d | valence={dominant_valence}")
+else:
+    lines.append("Patterns detected today: none")
+
+if significant_events:
+    lines.append(f"Slow-v1 significant events: {len(significant_events)}")
+    for ev in significant_events[:5]:
+        lines.append(f"  event={ev['entry_id']} signal={ev['signal_type']} posture={ev['posture_hint']}")
+    if len(significant_events) > 5:
+        lines.append(f"  ... and {len(significant_events) - 5} more")
+else:
+    lines.append("Slow-v1 significant events: none")
+
+print("PATTERN_SUMMARY:")
+print("\n".join(lines))
+PYEOF
+```
+
+Capture this output as `pattern_summary`. If the script fails or memory.db is absent, set `pattern_summary = "Pattern data unavailable (memory.db absent or query failed)."` and continue.
+
 2. **Search for key mentions.**
    Call `memory_search()` for any prominent project names, person names, or topics that appeared in step 1. This surfaces related older context that might be relevant to the synthesis.
 
@@ -125,6 +214,7 @@ Include the GitHub activity summary in the synthesis for rolling-summary.md and 
    - **Issues** bullet: opened/closed issues from step 2b (if any) — add as bullets in Open Threads or Recent Decisions.
    - **Stable Context**: carry forward verbatim from the prior file unless today's events show an explicit change.
    - **Proprioceptive**: if gate_miss_summary contains gate misses, add one bullet in Open Threads: `Proprioceptive: <gate_miss_summary content>`. If zero misses, add: `Proprioceptive: no gate misses in past 24h.`
+   - **Patterns**: if `pattern_summary` contains detected patterns, add a `Patterns:` bullet in Open Threads listing recurring and novel patterns. Format: `Patterns (today): [recurring] brainstorm_mode x2, [novel] philosophy_thread x1`. Omit if no patterns detected.
 
    Size enforcement: the file must not exceed 75 lines. If the draft exceeds this, drop oldest Recent Decisions bullets first, then merge related Open Thread items.
 
@@ -133,6 +223,8 @@ Include the GitHub activity summary in the synthesis for rolling-summary.md and 
 4. **Update `daily-digest.md`.**
    Read `~/lobster-user-config/memory/canonical/daily-digest.md`.
    Prepend today's dated section with a prose summary (2-4 sentences) of what happened, followed by bullet action items if any were identified.
+
+   If `pattern_summary` is non-empty and contains detected patterns, append a `**Patterns:**` line after the prose summary (before action items). Format: one line per pattern type, e.g., `- [recurring] design_session x1 (valence: neutral)`. If no patterns, omit this section entirely — do not write "none".
 
 5. **Update project files if relevant info emerged.**
    For each project mentioned in today's memory events where new status, blockers, or decisions appeared:
@@ -300,7 +392,7 @@ Include the GitHub activity summary in the synthesis for rolling-summary.md and 
 mcp__lobster-inbox__write_result(
     task_id=task_id,   # from your prompt header
     chat_id=0,
-    text="Nightly consolidation complete. Updated: rolling-summary.md, daily-digest.md, handoff.md, priorities.md, _context.md. Projects updated: <list or 'none'>. People updated: <list or 'none'>. Events consolidated: <count>. Session files read: <count>. GitHub PRs merged: <count>. GitHub issues opened/closed: <count>. Priorities pruned: <count removed> items. Handoff PR table: <N open, M merged removed, K closed removed, or 'skipped: no table' or 'skipped: gh unavailable'>.",
+    text="Nightly consolidation complete. Updated: rolling-summary.md, daily-digest.md, handoff.md, priorities.md, _context.md. Projects updated: <list or 'none'>. People updated: <list or 'none'>. Events consolidated: <count>. Patterns surfaced: <count of pattern_observation rows today, e.g. '3 (2 recurring, 1 novel)' or 'none'>. Session files read: <count>. GitHub PRs merged: <count>. GitHub issues opened/closed: <count>. Priorities pruned: <count removed> items. Handoff PR table: <N open, M merged removed, K closed removed, or 'skipped: no table' or 'skipped: gh unavailable'>.",
     source="system",
     status="success",
     sent_reply_to_user=False,
