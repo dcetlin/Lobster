@@ -895,6 +895,180 @@ def cmd_report(registry: "Registry", args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# queue-latency command — decompose wall-clock into queue wait vs execution time
+# ---------------------------------------------------------------------------
+
+# Default look-back for queue-latency when --since is not specified.
+DEFAULT_LATENCY_HOURS = 24
+
+
+def _parse_seconds_between(ts_start: str, ts_end: str) -> float | None:
+    """
+    Return the number of seconds between two ISO 8601 timestamp strings.
+
+    Returns None if either timestamp is missing or cannot be parsed.
+    The result is always ts_end - ts_start; a negative value means ts_end
+    precedes ts_start (data anomaly — callers decide how to handle).
+    """
+    if not ts_start or not ts_end:
+        return None
+    try:
+        dt_start = datetime.fromisoformat(ts_start)
+        dt_end = datetime.fromisoformat(ts_end)
+        if dt_start.tzinfo is None:
+            dt_start = dt_start.replace(tzinfo=timezone.utc)
+        if dt_end.tzinfo is None:
+            dt_end = dt_end.replace(tzinfo=timezone.utc)
+        return (dt_end - dt_start).total_seconds()
+    except (ValueError, TypeError):
+        return None
+
+
+def _percentile(sorted_values: list[float], p: float) -> float:
+    """
+    Compute the p-th percentile of a sorted list using linear interpolation.
+
+    p must be in [0, 100]. sorted_values must be non-empty and already sorted
+    ascending. This is the same interpolation method used by numpy.percentile
+    with the default 'linear' method.
+    """
+    n = len(sorted_values)
+    if n == 1:
+        return sorted_values[0]
+    rank = (p / 100.0) * (n - 1)
+    lower = int(rank)
+    upper = lower + 1
+    if upper >= n:
+        return sorted_values[-1]
+    fraction = rank - lower
+    return sorted_values[lower] + fraction * (sorted_values[upper] - sorted_values[lower])
+
+
+def _compute_latency_stats(rows: list[dict]) -> dict:
+    """
+    Compute queue_wait and execution_time latency statistics from a list of UoW dicts.
+
+    For each row:
+      queue_wait     = started_at - created_at   (time in queue before Executor claims)
+      execution_time = completed_at - started_at  (time from claim to completion)
+
+    A row contributes to queue_wait stats only if started_at is present.
+    A row contributes to execution_time stats only if both started_at and
+    completed_at are present.
+
+    Returns:
+      {
+        "queue_wait":     {"count": N, "p50": ..., "p90": ..., "p99": ..., "mean": ...},
+        "execution_time": {"count": N, "p50": ..., "p90": ..., "p99": ..., "mean": ...},
+      }
+
+    All stat values are None when count == 0.
+    """
+    queue_waits: list[float] = []
+    exec_times: list[float] = []
+
+    for row in rows:
+        created_at = row.get("created_at")
+        started_at = row.get("started_at")
+        completed_at = row.get("completed_at")
+
+        qw = _parse_seconds_between(created_at, started_at)
+        if qw is not None and qw >= 0:
+            queue_waits.append(qw)
+
+        et = _parse_seconds_between(started_at, completed_at)
+        if et is not None and et >= 0:
+            exec_times.append(et)
+
+    def _stats(values: list[float]) -> dict:
+        if not values:
+            return {"count": 0, "p50": None, "p90": None, "p99": None, "mean": None}
+        s = sorted(values)
+        return {
+            "count": len(s),
+            "p50": round(_percentile(s, 50)),
+            "p90": round(_percentile(s, 90)),
+            "p99": round(_percentile(s, 99)),
+            "mean": round(sum(s) / len(s), 1),
+        }
+
+    return {
+        "queue_wait": _stats(queue_waits),
+        "execution_time": _stats(exec_times),
+    }
+
+
+def _format_latency_report(stats: dict, since_hours: float, status_filter: str | None) -> str:
+    """
+    Render queue-latency stats as plain aligned text — no markdown tables.
+
+    Layout:
+      Header (title, window, status filter if set)
+      Blank line
+      Queue wait section   (count, p50, p90, p99, mean)
+      Blank line
+      Execution time section (count, p50, p90, p99, mean)
+    """
+
+    def _fmt_seconds(v: float | int | None) -> str:
+        if v is None:
+            return "n/a"
+        return f"{int(v)}s"
+
+    def _fmt_mean(v: float | None) -> str:
+        if v is None:
+            return "n/a"
+        return f"{v:.1f}s"
+
+    lines: list[str] = []
+    lines.append("Queue Latency Report")
+    lines.append(f"Window       : last {since_hours:.0f}h")
+    if status_filter:
+        lines.append(f"Status filter: {status_filter}")
+    lines.append("")
+
+    for label, key in [("Queue wait (created → started)", "queue_wait"),
+                        ("Execution time (started → completed)", "execution_time")]:
+        s = stats[key]
+        count = s["count"]
+        lines.append(label)
+        lines.append(f"  Count : {count}")
+        if count == 0:
+            lines.append("  (no data)")
+        else:
+            lines.append(f"  p50   : {_fmt_seconds(s['p50'])}")
+            lines.append(f"  p90   : {_fmt_seconds(s['p90'])}")
+            lines.append(f"  p99   : {_fmt_seconds(s['p99'])}")
+            lines.append(f"  mean  : {_fmt_mean(s['mean'])}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def cmd_queue_latency(registry: "Registry", args: argparse.Namespace) -> None:
+    """
+    Print a latency decomposition report: queue wait vs. execution time.
+
+    queue_wait     = started_at - created_at   (how long UoWs sit before dispatch)
+    execution_time = completed_at - started_at  (how long execution takes)
+
+    Reports p50, p90, p99, and mean for each dimension.
+
+    Options:
+      --since HOURS   Look back N hours from now (default: 24)
+      --status STATUS Filter to a single status value (e.g. 'done')
+    """
+    since_hours: float = getattr(args, "since", None) or DEFAULT_LATENCY_HOURS
+    status_filter: str | None = getattr(args, "status", None)
+
+    window_start = (datetime.now(timezone.utc) - timedelta(hours=since_hours)).isoformat()
+    rows = registry.fetch_for_latency(window_start, status=status_filter)
+    stats = _compute_latency_stats(rows)
+    report = _format_latency_report(stats, since_hours=since_hours, status_filter=status_filter)
+    print(report)
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -1005,6 +1179,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Filter to UoWs created on or after this ISO 8601 timestamp",
     )
 
+    # queue-latency
+    p_queue_latency = subparsers.add_parser(
+        "queue-latency",
+        help=(
+            "Decompose UoW wall-clock time into queue wait (created→started) and "
+            "execution time (started→completed). Reports p50, p90, p99, and mean "
+            "for each dimension. Plain text output."
+        ),
+    )
+    p_queue_latency.add_argument(
+        "--since",
+        type=float,
+        default=None,
+        metavar="HOURS",
+        help=f"Look back N hours from now (default: {DEFAULT_LATENCY_HOURS})",
+    )
+    p_queue_latency.add_argument(
+        "--status",
+        default=None,
+        metavar="STATUS",
+        help="Filter to UoWs with a specific status (e.g. 'done')",
+    )
+
     # report
     p_report = subparsers.add_parser(
         "report",
@@ -1048,6 +1245,7 @@ _COMMAND_MAP = {
     "stale": cmd_stale,
     "trace": cmd_trace,
     "failure-breakdown": cmd_failure_breakdown,
+    "queue-latency": cmd_queue_latency,
     "report": cmd_report,
 }
 

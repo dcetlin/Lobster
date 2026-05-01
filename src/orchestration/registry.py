@@ -2563,6 +2563,49 @@ class Registry:
             conn.close()
 
     # -----------------------------------------------------------------------
+    # Latency query (used by registry_cli queue-latency command)
+    # -----------------------------------------------------------------------
+
+    def fetch_for_latency(self, since_iso: str, status: str | None = None) -> list[dict]:
+        """
+        Return UoW rows needed to compute queue-wait and execution-time latency.
+
+        Selects only the columns required for latency computation:
+          created_at, started_at, completed_at, status.
+
+        Filters to rows where started_at is not NULL and falls at or after
+        since_iso (the window start). An optional status filter narrows further.
+
+        Read-only. Never modifies registry state.
+        """
+        conn = self._connect()
+        try:
+            if status is not None:
+                rows = conn.execute(
+                    """
+                    SELECT id, created_at, started_at, completed_at, status
+                    FROM uow_registry
+                    WHERE started_at >= ?
+                      AND status = ?
+                    ORDER BY started_at ASC
+                    """,
+                    (since_iso, status),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, created_at, started_at, completed_at, status
+                    FROM uow_registry
+                    WHERE started_at >= ?
+                    ORDER BY started_at ASC
+                    """,
+                    (since_iso,),
+                ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    # -----------------------------------------------------------------------
     # Juice dispatch priority methods (migration 0013)
     # -----------------------------------------------------------------------
 
