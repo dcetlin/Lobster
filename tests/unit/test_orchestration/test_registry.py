@@ -277,6 +277,75 @@ class TestUpsert:
         conn2.close()
         assert row["status"] == "pending"
 
+    def test_repropose_active_issue_returns_upsert_skipped(self, registry, db_path):
+        """Dedup regression: re-proposing an issue with a non-terminal UoW must return UpsertSkipped.
+
+        Covers the bug where the dedup query's hardcoded NOT IN list could drift from
+        _TERMINAL_STATUSES_FOR_ISSUE_CHECK, letting a new UoW be inserted for an already-active issue.
+        """
+        from src.orchestration.registry import UpsertInserted, UpsertSkipped
+        today = datetime.now(timezone.utc).date().isoformat()
+        tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
+
+        # Seed the issue with a non-terminal UoW.
+        first = registry.upsert(issue_number=42, title="Issue 42", sweep_date=today, success_criteria="Done when fixed.")
+        assert isinstance(first, UpsertInserted)
+
+        # Transition to a non-terminal active status to simulate in-progress work.
+        conn = _open_db(db_path)
+        conn.execute("UPDATE uow_registry SET status='ready-for-steward' WHERE id=?", (first.id,))
+        conn.commit()
+        conn.close()
+
+        # Re-propose the same issue on the next sweep — must be skipped.
+        second = registry.upsert(issue_number=42, title="Issue 42", sweep_date=tomorrow, success_criteria="Done when fixed.")
+        assert isinstance(second, UpsertSkipped), (
+            f"Expected UpsertSkipped for active issue, got {type(second).__name__}: {getattr(second, 'reason', '')}"
+        )
+
+        # Exactly one row must exist in the registry.
+        conn = _open_db(db_path)
+        count = conn.execute(
+            "SELECT COUNT(*) as c FROM uow_registry WHERE source_issue_number = 42"
+        ).fetchone()["c"]
+        conn.close()
+        assert count == 1, f"Expected exactly 1 row for issue 42, got {count} (dedup failure)"
+
+    def test_repropose_terminal_issue_creates_new_uow(self, registry, db_path):
+        """Dedup regression: re-proposing a done or closed issue must create a fresh UoW.
+
+        A terminal ('done', 'closed') row must not block re-proposal on a future sweep date.
+        """
+        from src.orchestration.registry import UpsertInserted
+        today = datetime.now(timezone.utc).date().isoformat()
+        tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
+
+        # Seed and complete issue 43.
+        first = registry.upsert(issue_number=43, title="Issue 43", sweep_date=today, success_criteria="Done when fixed.")
+        assert isinstance(first, UpsertInserted)
+        conn = _open_db(db_path)
+        conn.execute("UPDATE uow_registry SET status='done' WHERE id=?", (first.id,))
+        conn.commit()
+        conn.close()
+
+        # Re-propose on next sweep — must create a new UoW.
+        second = registry.upsert(issue_number=43, title="Issue 43", sweep_date=tomorrow, success_criteria="Done when fixed.")
+        assert isinstance(second, UpsertInserted), (
+            f"Expected UpsertInserted after done status, got {type(second).__name__}: {getattr(second, 'reason', '')}"
+        )
+        assert second.id != first.id, "Re-proposed UoW must have a new ID"
+
+        # Also verify legacy 'closed' status allows re-proposal.
+        conn = _open_db(db_path)
+        conn.execute("UPDATE uow_registry SET status='closed' WHERE id=?", (second.id,))
+        conn.commit()
+        conn.close()
+        next_day = (datetime.now(timezone.utc) + timedelta(days=2)).date().isoformat()
+        third = registry.upsert(issue_number=43, title="Issue 43", sweep_date=next_day, success_criteria="Done when fixed.")
+        assert isinstance(third, UpsertInserted), (
+            f"Expected UpsertInserted after closed status, got {type(third).__name__}: {getattr(third, 'reason', '')}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Issue #488: success_criteria enforcement and issue_url population
