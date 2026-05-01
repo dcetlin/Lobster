@@ -15,7 +15,7 @@ To avoid propagating the naming ambiguity:
   established job name in jobs.json.
 - New code and docstrings use "Germinator" when referring to register classification.
 
-See docs/WOS-INDEX.md for the full component glossary.
+See docs/wos/current/INDEX.md for the full component glossary.
 
 Register classification
 -----------------------

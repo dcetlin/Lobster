@@ -339,7 +339,7 @@ def _validate_result_json_written(uow_id: str, output_ref: str) -> None:
         log.warning(
             "Executor contract violation: result.json not found after write for UoW %s "
             "(expected: %s). Steward will be unable to assess completion deterministically. "
-            "See docs/executor-contract.md.",
+            "See docs/wos/current/executor-contract.md.",
             uow_id,
             result_path,
         )
@@ -1352,7 +1352,8 @@ def _log_dispatch_boundary(
     Args:
         uow_id: The UoW being dispatched.
         dispatch_attempt: Attempt number (1 for first attempt, 2+ for retries).
-        outcome: One of "success", "retry", "failure".
+        outcome: One of "success", "failure". (`retry` is reserved for a future
+            retry loop and is not currently emitted.)
         msg_id: The inbox message ID (on success).
         failure_reason: Reason for failure or retry (on non-success).
     """
@@ -1441,7 +1442,8 @@ def _dispatch_via_inbox(instructions: str, uow_id: str, agent_type: str = "funct
 
     Observability: All dispatch attempts, retries, and failures are logged to
     ~/lobster-workspace/logs/dispatch-boundary.jsonl with structured records:
-    {uow_id, dispatch_attempt, timestamp, outcome: success|retry|failure, failure_reason?}
+    {uow_id, dispatch_attempt, timestamp, outcome: success|failure, failure_reason?}
+    (`retry` is reserved for a future retry loop; `dispatch_attempt` is always 1.)
 
     Raises OSError if the inbox directory cannot be created or the message
     file cannot be written.
