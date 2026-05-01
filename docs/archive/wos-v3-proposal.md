@@ -1,3 +1,7 @@
+> **Status: SUPERSEDED**
+> Superseded by: `docs/wos/current/wos-v3-spec.md`
+> Do not treat as authoritative. Retained for historical reference only.
+
 # Work Orchestration System v3 — Design Proposal
 
 *Status: Proposal — 2026-04-04*

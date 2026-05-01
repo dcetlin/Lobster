@@ -1,8 +1,6 @@
-> **DEPRECATED** — Superseded by WOS V3. See [wos-v3-steward-executor-spec.md](./wos-v3-steward-executor-spec.md) for the current spec. Retained for historical reference only.
-
----
-
-> **Status: SUPERSEDED** — This is the v2 WOS design document. The canonical design is now [`wos-v3-proposal.md`](./wos-v3-proposal.md). V2 remains the implementation reference until V3 is built.
+> **Status: SUPERSEDED**
+> Superseded by: `docs/wos/current/wos-v3-spec.md`
+> Do not treat as authoritative. Retained for historical reference only.
 
 # Work Orchestration System v2 — Design Document
 
