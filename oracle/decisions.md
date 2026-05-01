@@ -5,6 +5,8 @@ This file is no longer the correct location for oracle decisions or ADRs.
 **Correct pattern:** Each PR review produces an audit file at `oracle/verdicts/pr-{number}.md`.
 Decisions, ADRs, and behavioral change authorizations belong in the relevant PR's verdict file — not here.
 
+**For document-type verdicts** (retros, design docs, synthesis work): see `oracle/document-review-protocol.md` for the verdict format and storage convention (`oracle/verdicts/document-<slug>.md`).
+
 Existing entries below are preserved for historical reference only.
 
 ---
