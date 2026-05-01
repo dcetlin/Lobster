@@ -31,6 +31,12 @@ from orchestration.registry_cli import (
     _classify_status,
     _compute_summary,
     _window_start_iso,
+    KILL_TYPE_ORPHAN_BEFORE_START,
+    KILL_TYPE_ORPHAN_DURING_EXECUTION,
+    KILL_TYPE_HARD_CAP,
+    KILL_TYPE_USER_CLOSED,
+    KILL_TYPE_EXECUTION_FAILED,
+    KILL_TYPE_UNKNOWN,
 )
 
 REPO_ROOT = Path(__file__).parent.parent.parent.parent
@@ -1159,3 +1165,218 @@ class TestReportCommand:
         total_line = next(l for l in output.splitlines() if l.startswith("Total UoWs"))
         total_str = total_line.split(":")[1].strip().split()[0]
         assert int(total_str) == 0
+
+
+# ---------------------------------------------------------------------------
+# failure-breakdown command
+# ---------------------------------------------------------------------------
+
+
+def _insert_failed_uow(db_path: Path, issue_number: int, register: str = "operational") -> str:
+    """Insert a UoW directly into the DB in failed status. Returns the UoW id."""
+    import uuid
+    uow_id = f"uow_{uuid.uuid4().hex[:8]}"
+    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        INSERT INTO uow_registry
+            (id, type, source, source_issue_number, sweep_date, status, posture,
+             created_at, updated_at, summary, success_criteria, register)
+        VALUES (?, 'executable', 'github', ?, ?, 'failed', 'solo', ?, ?, ?, '', ?)
+        """,
+        (uow_id, issue_number, datetime.now(timezone.utc).date().isoformat(),
+         now, now, f"Issue #{issue_number}", register),
+    )
+    conn.commit()
+    conn.close()
+    return uow_id
+
+
+def _add_audit_entry(db_path: Path, uow_id: str, event: str, note: dict | None = None) -> None:
+    """Append an audit_log entry for the given UoW."""
+    now = datetime.now(timezone.utc).isoformat()
+    note_json = json.dumps(note) if note is not None else None
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+        VALUES (?, ?, ?, NULL, 'failed', 'test', ?)
+        """,
+        (now, uow_id, event, note_json),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _set_close_reason(db_path: Path, uow_id: str, close_reason: str) -> None:
+    """Set close_reason on a UoW row directly."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("UPDATE uow_registry SET close_reason = ? WHERE id = ?", (close_reason, uow_id))
+    conn.commit()
+    conn.close()
+
+
+class TestFailureBreakdownCommand:
+    def test_empty_db_returns_zero_failures(self, db_path):
+        """When no failed UoWs exist, output says no failures found."""
+        # Initialize the DB by inserting and removing a record
+        run_cli(db_path, "upsert", "--issue", "1", "--title", "Init", "--sweep-date", "2026-01-01")
+        output = run_cli_text(db_path, "failure-breakdown")
+        assert "0" in output or "no failed" in output.lower()
+
+    def test_execution_failed_uow_classified_correctly(self, db_path):
+        """A UoW with an execution_failed audit event is classified as execution_failed."""
+        run_cli(db_path, "upsert", "--issue", "1", "--title", "Init", "--sweep-date", "2026-01-01")
+        uow_id = _insert_failed_uow(db_path, issue_number=100)
+        _add_audit_entry(db_path, uow_id, "execution_failed",
+                         note={"actor": "executor", "reason": "agent returned nonzero"})
+
+        output = run_cli_text(db_path, "failure-breakdown")
+        assert KILL_TYPE_EXECUTION_FAILED in output
+
+    def test_hard_cap_uow_classified_correctly(self, db_path):
+        """A UoW with close_reason=hard_cap_cleanup is classified as hard_cap."""
+        run_cli(db_path, "upsert", "--issue", "1", "--title", "Init", "--sweep-date", "2026-01-01")
+        uow_id = _insert_failed_uow(db_path, issue_number=101)
+        _set_close_reason(db_path, uow_id, "hard_cap_cleanup")
+
+        output = run_cli_text(db_path, "failure-breakdown")
+        assert KILL_TYPE_HARD_CAP in output
+
+    def test_user_closed_uow_classified_correctly(self, db_path):
+        """A UoW with a decide_close audit event is classified as user_closed."""
+        run_cli(db_path, "upsert", "--issue", "1", "--title", "Init", "--sweep-date", "2026-01-01")
+        uow_id = _insert_failed_uow(db_path, issue_number=102)
+        _add_audit_entry(db_path, uow_id, "decide_close",
+                         note={"event": "decide_close", "actor": "user", "reason": "user_closed"})
+
+        output = run_cli_text(db_path, "failure-breakdown")
+        assert KILL_TYPE_USER_CLOSED in output
+
+    def test_orphan_kill_before_start_classified_correctly(self, db_path):
+        """A UoW with orphan_kill_classified event and kill_type=orphan_kill_before_start."""
+        run_cli(db_path, "upsert", "--issue", "1", "--title", "Init", "--sweep-date", "2026-01-01")
+        uow_id = _insert_failed_uow(db_path, issue_number=103)
+        _add_audit_entry(db_path, uow_id, "orphan_kill_classified",
+                         note={"kill_type": "orphan_kill_before_start", "heartbeats_before_kill": 0})
+
+        output = run_cli_text(db_path, "failure-breakdown")
+        assert KILL_TYPE_ORPHAN_BEFORE_START in output
+
+    def test_orphan_kill_during_execution_classified_correctly(self, db_path):
+        """A UoW with orphan_kill_classified event and kill_type=orphan_kill_during_execution."""
+        run_cli(db_path, "upsert", "--issue", "1", "--title", "Init", "--sweep-date", "2026-01-01")
+        uow_id = _insert_failed_uow(db_path, issue_number=104)
+        _add_audit_entry(db_path, uow_id, "orphan_kill_classified",
+                         note={"kill_type": "orphan_kill_during_execution", "heartbeats_before_kill": 3})
+
+        output = run_cli_text(db_path, "failure-breakdown")
+        assert KILL_TYPE_ORPHAN_DURING_EXECUTION in output
+
+    def test_unknown_failure_classified_as_unknown(self, db_path):
+        """A failed UoW with no classifiable audit entries is classified as unknown."""
+        run_cli(db_path, "upsert", "--issue", "1", "--title", "Init", "--sweep-date", "2026-01-01")
+        _insert_failed_uow(db_path, issue_number=105)
+        # No audit entries added — classification must fall back to unknown
+
+        output = run_cli_text(db_path, "failure-breakdown")
+        assert KILL_TYPE_UNKNOWN in output
+
+    def test_kill_type_counts_and_percentages_are_accurate(self, db_path):
+        """Two execution_failed and one hard_cap UoW produce correct counts and pct."""
+        run_cli(db_path, "upsert", "--issue", "1", "--title", "Init", "--sweep-date", "2026-01-01")
+
+        for issue_num in (200, 201):
+            uid = _insert_failed_uow(db_path, issue_number=issue_num)
+            _add_audit_entry(db_path, uid, "execution_failed",
+                             note={"actor": "executor", "reason": "nonzero"})
+
+        uid_cap = _insert_failed_uow(db_path, issue_number=202)
+        _set_close_reason(db_path, uid_cap, "hard_cap_cleanup")
+
+        output = run_cli_text(db_path, "failure-breakdown")
+        lines = output.splitlines()
+
+        # Find the execution_failed line and confirm count of 2
+        exec_failed_lines = [l for l in lines if KILL_TYPE_EXECUTION_FAILED in l]
+        assert exec_failed_lines, f"Expected {KILL_TYPE_EXECUTION_FAILED} in output:\n{output}"
+        assert "2" in exec_failed_lines[0], f"Expected count 2 in line: {exec_failed_lines[0]}"
+
+        # Find the hard_cap line and confirm count of 1
+        hard_cap_lines = [l for l in lines if KILL_TYPE_HARD_CAP in l]
+        assert hard_cap_lines, f"Expected {KILL_TYPE_HARD_CAP} in output:\n{output}"
+        assert "1" in hard_cap_lines[0], f"Expected count 1 in line: {hard_cap_lines[0]}"
+
+        # Percentages present (66% and 33%, or close)
+        assert "%" in output, "Output must include percentage values"
+
+    def test_register_breakdown_section_present(self, db_path):
+        """Output includes a breakdown by register field."""
+        run_cli(db_path, "upsert", "--issue", "1", "--title", "Init", "--sweep-date", "2026-01-01")
+
+        uid_op = _insert_failed_uow(db_path, issue_number=300, register="operational")
+        _add_audit_entry(db_path, uid_op, "execution_failed")
+
+        uid_ic = _insert_failed_uow(db_path, issue_number=301, register="iterative-convergent")
+        _add_audit_entry(db_path, uid_ic, "execution_failed")
+
+        output = run_cli_text(db_path, "failure-breakdown")
+        assert "operational" in output
+        assert "iterative-convergent" in output
+
+    def test_since_flag_filters_by_created_at(self, db_path):
+        """--since filters UoWs to only those created on or after the given timestamp."""
+        run_cli(db_path, "upsert", "--issue", "1", "--title", "Init", "--sweep-date", "2026-01-01")
+
+        # Insert an old failed UoW backdated to 2024
+        old_uid = f"uow_old_test_01"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """
+            INSERT INTO uow_registry
+                (id, type, source, source_issue_number, sweep_date, status, posture,
+                 created_at, updated_at, summary, success_criteria, register)
+            VALUES (?, 'executable', 'github', 400, '2024-01-01', 'failed', 'solo',
+                    '2024-01-01T00:00:00+00:00', '2024-01-01T00:00:00+00:00', 'Old UoW', '', 'operational')
+            """,
+            (old_uid,),
+        )
+        conn.commit()
+        conn.close()
+
+        # Insert a recent failed UoW
+        recent_uid = _insert_failed_uow(db_path, issue_number=401)
+        _add_audit_entry(db_path, recent_uid, "execution_failed")
+
+        # Filter to only 2026 — the 2024 UoW should not appear in counts
+        output_filtered = run_cli_text(db_path, "failure-breakdown", "--since", "2026-01-01T00:00:00+00:00")
+        output_all = run_cli_text(db_path, "failure-breakdown")
+
+        # The filtered output must show fewer total failures than the unfiltered one
+        def _extract_total(text: str) -> int:
+            for line in text.splitlines():
+                if "total" in line.lower():
+                    parts = line.split()
+                    for p in parts:
+                        if p.isdigit():
+                            return int(p)
+            return 0
+
+        assert _extract_total(output_filtered) < _extract_total(output_all), (
+            f"Filtered output should have fewer failures than unfiltered.\n"
+            f"Filtered:\n{output_filtered}\nAll:\n{output_all}"
+        )
+
+    def test_output_has_no_markdown_table_syntax(self, db_path):
+        """Output must use plain aligned columns, not markdown table syntax (no | delimiters)."""
+        run_cli(db_path, "upsert", "--issue", "1", "--title", "Init", "--sweep-date", "2026-01-01")
+        uow_id = _insert_failed_uow(db_path, issue_number=500)
+        _add_audit_entry(db_path, uow_id, "execution_failed")
+
+        output = run_cli_text(db_path, "failure-breakdown")
+        # No markdown table pipe delimiter at the start of a line
+        lines_with_pipes = [l for l in output.splitlines() if l.strip().startswith("|")]
+        assert not lines_with_pipes, (
+            f"Output must not use markdown table syntax. Found: {lines_with_pipes}"
+        )
