@@ -39,6 +39,12 @@ from .registry import ApproveConfirmed, ApproveExpired, ApproveNotFound, Approve
 from .paths import LOBSTER_WORKSPACE as _LOBSTER_WORKSPACE, WOS_CONFIG as _WOS_CONFIG_PATH_FROM_PATHS, WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG
 from .steward import ReturnReasonClassification, MAX_RETRIES as _STEWARD_MAX_RETRIES, _HARD_CAP_CYCLES
 
+# Epistemic principle weights — re-exported for callers that import from this module.
+from .principle_weights import (  # noqa: F401
+    assign_principle_weights,
+    format_principle_weights_block,
+)
+
 
 # ---------------------------------------------------------------------------
 # WOS execution config — runtime start/stop for executor dispatch

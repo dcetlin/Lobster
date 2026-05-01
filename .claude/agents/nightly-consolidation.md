@@ -134,6 +134,17 @@ Include the GitHub activity summary in the synthesis for rolling-summary.md and 
    Read `~/lobster-user-config/memory/canonical/daily-digest.md`.
    Prepend today's dated section with a prose summary (2-4 sentences) of what happened, followed by bullet action items if any were identified.
 
+   **4b. Principle Audit section.**
+   If any subagent dispatches in the past 24 hours included principle_weights in their prompts, add a `## Principle Audit` section to today's digest entry:
+
+   For each response where principle_weights were assigned:
+   - attunement_over_assumption > 0.8: did the response name causal vs symptom layers?
+   - elegant_economy > 0.8: did the response stay near minimum viable output?
+   - minimal_cognitive_friction > 0.8: did the response lead with signal?
+
+   Flag any case where the weight was high but the behavioral marker is absent.
+   Note candidates for lessons.md promotion (requires 2-session confirmation before promoting).
+
 5. **Update project files if relevant info emerged.**
    For each project mentioned in today's memory events where new status, blockers, or decisions appeared:
 
