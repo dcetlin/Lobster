@@ -339,7 +339,7 @@ def _validate_result_json_written(uow_id: str, output_ref: str) -> None:
         log.warning(
             "Executor contract violation: result.json not found after write for UoW %s "
             "(expected: %s). Steward will be unable to assess completion deterministically. "
-            "See docs/executor-contract.md.",
+            "See docs/wos/current/executor-contract.md.",
             uow_id,
             result_path,
         )
