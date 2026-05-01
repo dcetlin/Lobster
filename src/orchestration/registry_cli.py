@@ -16,6 +16,7 @@ Usage:
     uv run registry_cli.py gate-readiness
     uv run registry_cli.py trace --id <uow-id>
     uv run registry_cli.py report [--since HOURS] [--from ISO_DATE]
+    uv run registry_cli.py failure-breakdown [--since ISO_TIMESTAMP]
 
 Environment:
     REGISTRY_DB_PATH — override the default db path (~/.../orchestration/registry.db)
@@ -698,6 +699,172 @@ def _format_report(rows: list[dict], summary: dict, window_start_iso: str,
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# failure-breakdown command — cross-UoW failure pattern aggregation
+# ---------------------------------------------------------------------------
+
+# Canonical kill_type labels for the failure-breakdown command.
+# Infrastructure kills are UoWs where the agent was terminated by the platform
+# before it could complete — no execution budget was consumed.
+# Genuine failures are UoWs where execution began but the agent returned failure.
+KILL_TYPE_ORPHAN_BEFORE_START = "orphan_kill_before_start"
+KILL_TYPE_ORPHAN_DURING_EXECUTION = "orphan_kill_during_execution"
+KILL_TYPE_HARD_CAP = "hard_cap"
+KILL_TYPE_USER_CLOSED = "user_closed"
+KILL_TYPE_EXECUTION_FAILED = "execution_failed"
+KILL_TYPE_UNKNOWN = "unknown"
+
+
+def _classify_failure_kill_type(audit_entries: list[dict], close_reason: str | None) -> str:
+    """
+    Derive a kill_type label for a single failed UoW.
+
+    Classification priority (first match wins):
+    1. orphan_kill_classified audit event — infrastructure kill (before or during execution)
+    2. close_reason == 'hard_cap_cleanup' — genuine retry cap exhaustion
+    3. decide_close audit event — user explicitly closed
+    4. execution_failed audit event — executor returned failure
+    5. unknown — no matching signal
+
+    This function is a pure classifier: it reads signals and returns a label.
+    It does not query the DB.
+    """
+    # Priority 1: heartbeat-classified infrastructure kill
+    kill_classification = _extract_kill_classification(audit_entries)
+    if kill_classification:
+        kt = kill_classification.get("kill_type", "")
+        if kt == "orphan_kill_before_start":
+            return KILL_TYPE_ORPHAN_BEFORE_START
+        if kt == "orphan_kill_during_execution":
+            return KILL_TYPE_ORPHAN_DURING_EXECUTION
+
+    # Priority 2: hard cap retry exhaustion
+    if close_reason == "hard_cap_cleanup":
+        return KILL_TYPE_HARD_CAP
+
+    # Priority 3 & 4: scan audit event types
+    event_types = {entry.get("event") for entry in audit_entries}
+    if "decide_close" in event_types:
+        return KILL_TYPE_USER_CLOSED
+    if "execution_failed" in event_types:
+        return KILL_TYPE_EXECUTION_FAILED
+
+    return KILL_TYPE_UNKNOWN
+
+
+def _fetch_failed_uows_since(registry: "Registry", since_iso: str | None) -> list[dict]:
+    """
+    Return all failed UoWs as dicts, optionally filtered to those created on or
+    after since_iso. Each dict has: id, register, close_reason, created_at.
+    """
+    import sqlite3 as _sqlite3
+    conn = registry._connect()
+    try:
+        if since_iso:
+            cursor = conn.execute(
+                "SELECT id, register, close_reason, created_at FROM uow_registry "
+                "WHERE status = 'failed' AND created_at >= ? ORDER BY created_at",
+                (since_iso,),
+            )
+        else:
+            cursor = conn.execute(
+                "SELECT id, register, close_reason, created_at FROM uow_registry "
+                "WHERE status = 'failed' ORDER BY created_at",
+            )
+        rows = [dict(row) for row in cursor.fetchall()]
+    finally:
+        conn.close()
+    return rows
+
+
+def _format_failure_breakdown(
+    by_kill_type: dict[str, int],
+    by_register: dict[str, int],
+    total: int,
+    since_iso: str | None,
+) -> str:
+    """
+    Render failure counts as plain aligned text — no markdown tables.
+
+    Layout:
+      Header (total, optional since filter)
+      Blank line
+      By kill type (aligned columns: label, count, percentage)
+      Blank line
+      By register (aligned columns: label, count, percentage)
+    """
+    lines: list[str] = []
+
+    lines.append("WOS Failure Breakdown")
+    if since_iso:
+        lines.append(f"Since        : {since_iso}")
+    lines.append(f"Total failed : {total}")
+
+    if total == 0:
+        lines.append("")
+        lines.append("(no failed UoWs found)")
+        return "\n".join(lines)
+
+    def _pct(count: int) -> str:
+        return f"{100 * count / total:.0f}%"
+
+    col_w = 32  # label column width
+
+    lines.append("")
+    lines.append("By kill type:")
+    lines.append(f"  {'Kill type':<{col_w}}  {'Count':>5}  {'Pct':>5}")
+    lines.append(f"  {'-' * col_w}  {'-' * 5}  {'-' * 5}")
+    for label in sorted(by_kill_type):
+        count = by_kill_type[label]
+        lines.append(f"  {label:<{col_w}}  {count:>5}  {_pct(count):>5}")
+
+    lines.append("")
+    lines.append("By register:")
+    lines.append(f"  {'Register':<{col_w}}  {'Count':>5}  {'Pct':>5}")
+    lines.append(f"  {'-' * col_w}  {'-' * 5}  {'-' * 5}")
+    for label in sorted(by_register):
+        count = by_register[label]
+        lines.append(f"  {label:<{col_w}}  {count:>5}  {_pct(count):>5}")
+
+    return "\n".join(lines)
+
+
+def cmd_failure_breakdown(registry: "Registry", args: argparse.Namespace) -> None:
+    """
+    Aggregate failed UoWs by kill_type and register.
+
+    Kill type is derived from audit_log and close_reason — no schema changes required.
+
+    Classification priority per UoW:
+      1. orphan_kill_classified audit event → infrastructure kill (before/during execution)
+      2. close_reason == 'hard_cap_cleanup' → genuine retry cap exhaustion
+      3. decide_close audit event → user explicitly closed
+      4. execution_failed audit event → executor returned failure
+      5. unknown
+
+    Options:
+      --since ISO_TIMESTAMP  Filter to UoWs created on or after this timestamp
+    """
+    since_iso: str | None = getattr(args, "since", None)
+
+    failed_rows = _fetch_failed_uows_since(registry, since_iso)
+    total = len(failed_rows)
+
+    by_kill_type: dict[str, int] = {}
+    by_register: dict[str, int] = {}
+
+    for row in failed_rows:
+        audit_entries = registry.fetch_audit_entries(row["id"])
+        kill_type = _classify_failure_kill_type(audit_entries, row.get("close_reason"))
+        by_kill_type[kill_type] = by_kill_type.get(kill_type, 0) + 1
+
+        reg = row.get("register") or "operational"
+        by_register[reg] = by_register.get(reg, 0) + 1
+
+    report = _format_failure_breakdown(by_kill_type, by_register, total, since_iso)
+    print(report)
+
+
 def cmd_report(registry: "Registry", args: argparse.Namespace) -> None:
     """
     Print a time-windowed pipeline visibility report to stdout.
@@ -820,6 +987,24 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_trace.add_argument("--id", required=True, help="UoW id")
 
+    # failure-breakdown
+    p_failure_breakdown = subparsers.add_parser(
+        "failure-breakdown",
+        help=(
+            "Aggregate failed UoWs by kill_type and register. "
+            "Plain text output showing count + percentage per category. "
+            "Kill types: orphan_kill_before_start, orphan_kill_during_execution, "
+            "hard_cap, user_closed, execution_failed, unknown."
+        ),
+    )
+    p_failure_breakdown.add_argument(
+        "--since",
+        dest="since",
+        default=None,
+        metavar="ISO_TIMESTAMP",
+        help="Filter to UoWs created on or after this ISO 8601 timestamp",
+    )
+
     # report
     p_report = subparsers.add_parser(
         "report",
@@ -862,6 +1047,7 @@ _COMMAND_MAP = {
     "escalation-candidates": cmd_escalation_candidates,
     "stale": cmd_stale,
     "trace": cmd_trace,
+    "failure-breakdown": cmd_failure_breakdown,
     "report": cmd_report,
 }
 
