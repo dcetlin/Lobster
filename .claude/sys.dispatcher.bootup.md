@@ -46,7 +46,7 @@ Before consulting any gate, classify the message as ACTION or DESIGN_OPEN. These
 | **7-Second Rule** | Any tool call not in {wait_for_messages, check_inbox, mark_processing, mark_processed, mark_failed, send_reply} must go to a background subagent. | Structural |
 | **Design Gate** | Message is DESIGN_OPEN when no concrete output artifact can be stated in one sentence. | Advisory |
 | **Bias to Action** | Classifier returned ACTION. Proceed with implementation without asking for confirmation. | Advisory |
-| **Dispatch template** | Every Task call must include `Minimum viable output:` and `Boundary: do not produce` in prompt. | Advisory |
+| **Dispatch template** | Every Task call must include `Minimum viable output:` and `Boundary: do not produce` in prompt. A dispatch without both fields is a gate miss — log via `write_observation`. | Structural — empty Minimum viable output is a dispatch blocker, not a reminder. |
 | **No self-relay** | When `sent_reply_to_user == True` or type is `subagent_notification`, mark_processed without send_reply. | Structural |
 | **Relay filter** | Key signal in send_reply must be in paragraph 1, not buried. | Advisory |
 | **PR Merge Gate** | Every code PR must pass oracle review before merge. Flow: open PR → oracle agent → writes `oracle/verdicts/pr-{number}.md` → if first line is `VERDICT: APPROVED` dispatch merge agent; if `NEEDS_CHANGES` dispatch fix agent → re-oracle → repeat. Merge agent must check `oracle/verdicts/pr-{number}.md` first line is `VERDICT: APPROVED` before merging, then move the file to `oracle/verdicts/archive/pr-{number}.md`. | Advisory |
@@ -317,6 +317,16 @@ Never `send_reply`. Only act if there are real observations.
                            f"Engineer's briefing:\n{msg['text']}"))
                mark_processed(message_id)
            continue
+
+       # RESULT ELEGANCE AUDIT (before every relay)
+       # Before calling send_reply with a subagent result, apply this heuristic check:
+       # 1. Is each section of this result load-bearing? (would the response fail without it?)
+       # 2. Is there noise that could be trimmed without losing meaning?
+       # 3. Does the output volume match the complexity of the original task?
+       # This is not a hard gate — do not block relay. It is a calibration signal:
+       # - If output-to-task ratio is high, trim non-load-bearing sections before sending.
+       # - If trimming would lose meaning, relay as-is but note the ratio:
+       #   write_observation(category="elegance_signal", text="task=<slug> ratio=high sections=<count> trimmed=<count>")
 
        # RELAY
        if msg.get("artifacts"):
