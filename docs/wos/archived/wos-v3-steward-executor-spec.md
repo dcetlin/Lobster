@@ -1,3 +1,7 @@
+> **Status: SUPERSEDED**
+> Superseded by: `docs/wos/current/wos-v3-spec.md`
+> Do not treat as authoritative. Retained for historical reference only.
+
 > **Addendum to [WOS V3 Proposal](./wos-v3-proposal.md).** This document provides the detailed steward/executor contract. The proposal is the authoritative unified reference; this file is retained as the technical addendum with full implementation detail.
 
 # WOS V3 Steward/Executor Spec
