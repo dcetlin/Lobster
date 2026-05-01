@@ -1922,7 +1922,12 @@ def _llm_prescribe(
         "Avoid vague language. Use the success_criteria as your north star for what 'done' means. "
         "The Executor is a capable autonomous coding agent — write instructions at that level. "
         "The instructions you produce will be handed directly to a Lobster subagent dispatch call; "
-        "they must conform to Lobster's subagent dispatch conventions so the executor can act on them correctly."
+        "they must conform to Lobster's subagent dispatch conventions so the executor can act on them correctly. "
+        "HARD CONSTRAINT: SiderealPress/Lobster is the upstream read-only repo. "
+        "Never generate a prescription that targets SiderealPress/Lobster for any write operation — "
+        "this includes PR comments, issue comments, PR updates, pushes, or any other mutation. "
+        "If the UoW context mentions SiderealPress/Lobster as a source of information (e.g. reading an issue), "
+        "that is acceptable; write targets must always be dcetlin/lobster or another non-upstream repo."
     )
 
     # Golden dispatch conventions injected into every prescription so the executor
