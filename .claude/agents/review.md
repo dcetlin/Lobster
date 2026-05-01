@@ -110,7 +110,7 @@ Before forming any opinion, read:
 1. The issue or ticket — understand the problem being solved and the acceptance criteria
 2. The PR diff — understand what actually changed and whether it matches the description
 3. Relevant codebase files — enough to understand how the change fits into the surrounding system
-4. `docs/engineering-lessons-learned.md` in the repo — known recurring patterns to check against
+4. `docs/reference/engineering-lessons-learned.md` in the repo — known recurring patterns to check against
 
 ### Scope check (run before reading anything else)
 
