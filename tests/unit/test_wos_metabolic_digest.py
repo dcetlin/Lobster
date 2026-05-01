@@ -515,11 +515,18 @@ class TestHandleWosExecuteHeartbeatContract:
         assert "write_heartbeat" in prompt
 
     def test_uow_id_interpolated_in_heartbeat_call(self, prompt):
-        # The heartbeat call must use the actual UoW ID, not a placeholder
-        assert "write_heartbeat('test-uow-001')" in prompt
+        # The heartbeat call must use the actual UoW ID, not a placeholder.
+        # Both the MCP path (uow_id='test-uow-001') and the fallback path
+        # (WOSRegistry().write_heartbeat('test-uow-001', ...)) embed the UoW ID.
+        # Check that at least one form is present.
+        assert (
+            "uow_id='test-uow-001'" in prompt
+            or "write_heartbeat('test-uow-001'" in prompt
+        )
 
     def test_60_90_second_interval_documented(self, prompt):
-        assert "60-90 seconds" in prompt
+        # The prompt uses an en-dash (U+2013) between 60 and 90.
+        assert "60\u201390 seconds" in prompt
 
     def test_stop_on_zero_return_value_documented(self, prompt):
         # Agent must stop if write_heartbeat returns 0 (UoW re-queued)
