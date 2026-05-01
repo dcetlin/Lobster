@@ -86,10 +86,10 @@ All dispatch attempts are logged to `~/lobster-workspace/logs/dispatch-boundary.
 |-------|------|-------------|
 | `ts` | ISO 8601 | Timestamp of the dispatch attempt |
 | `uow_id` | string | The UoW being dispatched |
-| `dispatch_attempt` | int | Attempt number (1 for first, 2+ for retries) |
-| `outcome` | enum | `success`, `retry`, or `failure` |
+| `dispatch_attempt` | int | Attempt number (always 1 — values >1 are reserved for a future retry loop) |
+| `outcome` | enum | `success` or `failure` (`retry` is reserved — not implemented) |
 | `msg_id` | string? | Inbox message ID (on success) |
-| `failure_reason` | string? | Reason for failure or retry (on non-success) |
+| `failure_reason` | string? | Reason for failure (on non-success) |
 
 ### Query Examples
 
