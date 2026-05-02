@@ -565,6 +565,11 @@ WOS_MESSAGE_TYPE_DISPATCH: dict[str, str] = {
     # and returns a structured forensic report. Always returns action="spawn_subagent";
     # runs inside the spawn-gate block where the enforcement check is always satisfied.
     "wos_diagnose": "handle_wos_diagnose",
+    # PR sweep result handler: written by wos-pr-sweeper.py (Type C cron script) when
+    # stale open PRs or merged PRs with non-done UoWs are detected. Fast-path — dispatched
+    # before the spawn-gate because this handler legitimately returns action="send_reply"
+    # (surface PR attention items to Dan). No subagent spawn required.
+    "wos_pr_sweep_result": "handle_wos_pr_sweep_result",
 }
 
 
@@ -1326,6 +1331,40 @@ def _load_instructions_from_artifact(uow_id: str) -> str:
     return artifact["instructions"]
 
 
+def handle_wos_pr_sweep_result(msg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Handle a ``wos_pr_sweep_result`` inbox message from the PR sweeper cron script.
+
+    Called by route_wos_message when the dispatcher receives a message written by
+    wos-pr-sweeper.py.  The sweeper produces these messages when stale open PRs
+    (open >7 days) or merged PRs with non-done UoWs are detected.
+
+    This handler is a fast-path: it returns action="send_reply" so the dispatcher
+    surfaces the sweep results directly to Dan without spawning a subagent.  It is
+    dispatched before the spawn-gate (which only applies to execution message types
+    that must always spawn a subagent).
+
+    Pure function — no side effects, no I/O.
+
+    Args:
+        msg: The raw wos_pr_sweep_result inbox message dict.  Expected fields:
+            - ``text`` (str): Pre-formatted notification text from the sweeper.
+            - ``chat_id`` (int): Admin chat ID to deliver the message to.
+            - ``data`` (dict, optional): Structured counts (stale_open_count, etc.).
+
+    Returns:
+        A dict with action="send_reply" and the notification text.
+    """
+    text: str = msg.get("text", "WOS PR sweep results (no detail available)")
+    chat_id: int = int(msg.get("chat_id", os.environ.get("LOBSTER_ADMIN_CHAT_ID", "0")))
+    return {
+        "action": "send_reply",
+        "text": text,
+        "chat_id": chat_id,
+        "message_type": "wos_pr_sweep_result",
+    }
+
+
 def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
     """
     Route an inbox message whose `type` is listed in WOS_MESSAGE_TYPE_DISPATCH.
@@ -1446,6 +1485,34 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
                     f"({type(exc).__name__}: {exc}). "
                     f"Kill wave was NOT processed. "
                     "Check logs and re-queue manually if needed."
+                ),
+                "message_type": msg_type,
+            }
+
+    # ---------------------------------------------------------------------------
+    # wos_pr_sweep_result fast-path: dispatched before the spawn-gate.  The PR sweeper
+    # cron script writes these messages when stale open PRs or merged PRs with non-done
+    # UoWs are found.  This handler always returns action="send_reply" — no subagent
+    # spawn is needed, just surface the pre-formatted text to Dan.
+    # ---------------------------------------------------------------------------
+    if msg_type == "wos_pr_sweep_result":
+        try:
+            sweep_result = handle_wos_pr_sweep_result(msg)
+            sweep_result["message_type"] = msg_type
+            return sweep_result
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).error(
+                "route_wos_message: handle_wos_pr_sweep_result raised %s: %s — "
+                "returning send_reply alert",
+                type(exc).__name__, exc,
+            )
+            return {
+                "action": "send_reply",
+                "text": (
+                    f"WOS PR sweep handler raised an error "
+                    f"({type(exc).__name__}: {exc}). "
+                    "PR sweep results were NOT delivered. Check logs."
                 ),
                 "message_type": msg_type,
             }
