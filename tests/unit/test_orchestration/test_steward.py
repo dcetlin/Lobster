@@ -4713,6 +4713,36 @@ class TestLoadDanRegisterExcerpt:
         assert "[...truncated]" not in result
         assert "Short excerpt." in result
 
+    def test_matches_production_heading_format(self, tmp_path, monkeypatch):
+        """Anchor prefix matches the exact production heading format.
+
+        Production heading in user.base.context.md is:
+            ## Lobster Developmental Map (Theory of Learning, YYYY-MM-DD)
+
+        The anchor "## Lobster Developmental Map" is a prefix match via str.find().
+        This test verifies that the prefix correctly locates a heading in the
+        production format, so a heading with a date suffix is found — not silently
+        treated as absent.
+        """
+        steward = _import_steward()
+        agents_dir = tmp_path / "lobster-user-config" / "agents"
+        agents_dir.mkdir(parents=True)
+        # Use the exact production heading format (prefix + date suffix)
+        production_heading = "## Lobster Developmental Map (Theory of Learning, 2026-03-26)"
+        context = (
+            "# Dan's Context\n\n"
+            "## Identity\nSoftware engineer.\n\n"
+            f"{production_heading}\n\n"
+            "Capability stages: dispatcher routing near Embodiment.\n"
+        )
+        (agents_dir / "user.base.context.md").write_text(context, encoding="utf-8")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        result = steward._load_dan_register_excerpt()
+        # Anchor must find the production-format heading
+        assert result.startswith("## Lobster Developmental Map (Theory of Learning")
+        assert "dispatcher routing near Embodiment" in result
+        assert "Identity" not in result
+
 
 class TestLLMPrescribeIncludesOrientationBlock:
     """Verify that _llm_prescribe injects Dan's register into the prompt."""

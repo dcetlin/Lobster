@@ -1845,7 +1845,7 @@ def _parse_workflow_artifact(raw_text: str) -> dict:
     }
 
 
-def _load_dan_register_excerpt(max_chars: int = 1500) -> str:
+def _load_dan_register_excerpt(max_chars: int = 8000) -> str:
     """Return a focused excerpt of Dan's developmental register from user.base.context.md.
 
     Extracts the section from "Lobster Developmental Map" through the capability
@@ -1856,6 +1856,20 @@ def _load_dan_register_excerpt(max_chars: int = 1500) -> str:
 
     The excerpt is capped at ``max_chars`` to keep the injected context tight.
     A trailing "[...truncated]" marker is appended when the cap is applied.
+
+    Anchor string: "## Lobster Developmental Map"
+    This is a prefix match against the production heading, which reads:
+    "## Lobster Developmental Map (Theory of Learning, <date>)".
+    If the heading is ever renamed, find() returns -1 and the excerpt is silently
+    absent — callers treat an empty return as optional enrichment, so no error
+    is raised. Any rename of this section heading must update this anchor.
+
+    Cap rationale: the production "Lobster Developmental Map" section is ~6,888
+    chars (as of 2026-05-02). 8000 chars safely covers the full section including
+    the "Capability ceiling and Embodiment distinction" subsection and the
+    "Attentional Budget Constraint" and "Capability Coupling Structure" subsections
+    that carry the most prescription-relevant orientation signals. The previous
+    1500-char cap truncated the section at ~22% and never reached these subsections.
     """
     register_path = Path.home() / "lobster-user-config" / "agents" / "user.base.context.md"
     try:
@@ -1863,7 +1877,9 @@ def _load_dan_register_excerpt(max_chars: int = 1500) -> str:
     except OSError:
         return ""
 
-    # Find the anchor section that starts the developmental register
+    # Find the anchor section that starts the developmental register.
+    # Exact anchor string: "## Lobster Developmental Map"
+    # Production heading: "## Lobster Developmental Map (Theory of Learning, YYYY-MM-DD)"
     anchor = "## Lobster Developmental Map"
     start = text.find(anchor)
     if start == -1:

@@ -310,3 +310,56 @@ The circadian module existed before this PR. Wiring it into the shared write pat
 ### Constraint
 
 The circadian gate applies only to messages where `is_non_urgent()` returns True (type is `subagent_result`, no `reply_to_message_id`, no urgent-signal keywords). Urgent messages, user replies, and incident alerts always deliver immediately via the existing path. The gate cannot defer a message the user is waiting for a reply to.
+
+---
+
+## ADR-007: Developmental Register Injection into _llm_prescribe — Encoded Orientation Behavioral Default
+
+**Date:** 2026-05-02
+**Status:** Accepted
+**PR:** #1049 (feature/steward-dev-register)
+
+### Context
+
+The WOS Steward prescriber generates execution instructions for Units of Work but had no awareness of Dan's developmental arc — the current attunement stage, active capability clusters, and the Goldilocks window for expanding vs. consolidating work. Prescriptions could land correctly for the task surface while missing what the arc requires (e.g. prioritising observation-loop work over new capability surface, or flagging when a UoW would push the active cluster beyond the consolidation threshold).
+
+The oracle PR #1049 verdict (Round 1) identified this change as an Encoded Orientation decision under constraint-3: it modifies a durable behavioral default in `_llm_prescribe` that fires on every steward prescription cycle without Dan's real-time input. No logged prior existed before this ADR was written.
+
+### What Changed
+
+`_llm_prescribe` in `src/orchestration/steward.py` now calls `_load_dan_register_excerpt()` and — when the excerpt is non-empty — injects it as a `## Dan's current orientation` block positioned after the UoW context and before the dispatch conventions in the user prompt. The model sees both "what does this UoW need" and "what does Dan's arc require of how this work lands" before generating the prescription.
+
+When the excerpt is empty (file absent or anchor section missing) the prompt is unchanged. This makes the injection safe in upstream and CI environments without a user config.
+
+### Why This Is an Encoded Orientation Decision
+
+The injection fires on every `_llm_prescribe` call — a durable behavioral default change that operates without Dan's explicit per-prescription input. Per constraint-3 (`core.inviolable_constraints.constraint-3`): Encoded Orientation decisions require a prior logged decision of the same class and a traceable vision.yaml anchor. This ADR is the logged decision.
+
+### Vision Anchor
+
+**Primary:** `core.fundamental_intent` — "The system should be able to answer 'is this aligned with Dan's intent?' without asking me — because it has structural access to my intent, not just a prose reconstruction of it."
+
+The developmental register excerpt is a proxy toward this intent: it surfaces Dan's current arc to the prescriber so prescriptions can be evaluated against more than task-surface correctness. This is a stepping-stone toward the structural Orient seam (#733), not a substitute for it.
+
+**Secondary:** `core.inviolable_constraints.constraint-3` — "Every system decision traverses the full OODA loop at the appropriate register. Encoded Orientation decisions require a prior logged decision of the same class and a traceable vision.yaml anchor."
+
+This ADR satisfies constraint-3 for the `_llm_prescribe` behavioral default change.
+
+### Dual-Source Drift Risk
+
+`user.base.context.md` (the source of the developmental register excerpt) and `vision.yaml` (the structural intent anchor) have different update disciplines:
+
+- `user.base.context.md` is updated by agents and Dan's session work — higher frequency, lower ceremony
+- `vision.yaml` structural fields are Dan-authored — lower frequency, higher ceremony
+
+When the two sources diverge — a `current_focus` or developmental stage description in `user.base.context.md` that no longer aligns with `vision.yaml.current_focus` — the prescriber has no mechanism to detect the conflict or prefer one over the other. The injection silently uses whichever text is in `user.base.context.md` at call time.
+
+This is an accepted risk at current scale given: (a) the developmental map section of `user.base.context.md` is updated intentionally (not auto-generated), (b) the injection is advisory context rather than a routing decision — it enriches the prompt but does not gate prescription generation, and (c) graceful degradation (empty-string return) fires if the file or section is absent, leaving the prompt unchanged.
+
+The correct mitigation when Orient (#733) is implemented: replace the prose excerpt injection with a structured query against a vision.yaml-native orient seam, eliminating the dual-source problem structurally.
+
+### Deliberate Proxy Approach
+
+This implementation uses `user.base.context.md` as a proxy for the structural orient substrate that `current_focus.horizon.after_that` names as the next investment: "Orient implementation (#733) — the guardrail names the next structural investment once feedback loop is verifiably closed end-to-end."
+
+This ADR explicitly records that this is a proxy approach chosen for ergonomic benefit while the structural seam is not yet built. It does not foreclose the structural implementation — `_load_dan_register_excerpt` is a pure I/O boundary function that can be replaced with a vision.yaml query when Orient is ready. The behavioral default (inject orientation into prescriptions) is the durable change; the source (prose excerpt vs. structured field) is a replaceable implementation detail.
