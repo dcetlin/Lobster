@@ -1387,6 +1387,13 @@ with open(path, 'w') as f:
         migrated=$((migrated + 1))
     fi
 
+    # NOTE: The inline SQL blocks below for agent_sessions.db and memory.db are
+    # intentionally kept here. Those databases do not yet have a numbered .sql
+    # migration system (unlike the WOS registry.db which uses src/orchestration/migrations/).
+    # Until a formal migration runner is added for each, upgrade.sh remains the
+    # only migration path. Do not add new WOS schema changes here — use a numbered
+    # .sql file in src/orchestration/migrations/ instead.
+
     # Migration 23: Add stop_reason column to agent_sessions SQLite table
     # Existing rows will have NULL for stop_reason (nullable, backward-compatible).
     local DB_PATH="${LOBSTER_MESSAGES:-$HOME/messages}/config/agent_sessions.db"
