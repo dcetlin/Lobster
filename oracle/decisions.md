@@ -215,3 +215,54 @@ must use `UoWStatus.DONE` (or another enum value as appropriate). The 'closed'
 treatment as terminal is for legacy-row compatibility only. The production
 migration to reclassify existing 'closed' rows as 'done' is out of scope for
 this PR and tracked as a follow-on.
+
+---
+
+## ADR-005: Fast-Path Classification Bypass for Writer-Provided signal_type_hint — Encoded Orientation
+
+**Date:** 2026-05-01
+**Status:** Accepted
+**PR:** #1032 (mem-event-subject-tagging)
+**WOS Reference:** uow_20260501_8de2bc
+
+### Context
+
+PR #1032 adds `subject` and `signal_type_hint` columns to the memory events table. The `signal_type_hint` field allows a producer (harvester, scheduled job, dispatcher) to pre-classify an event at write time. The slow-reclassifier's `run_pass` function uses this hint via a fast path: events with `signal_type_hint` set bypass all content-inference pattern detection and receive a `confidence="high"` slow-v1 tag using the caller's self-declared type.
+
+This is an Encoded Orientation decision under vision.yaml `core.inviolable_constraints.constraint-3` because it changes a durable behavioral default in the classification pipeline without requiring Dan's real-time input on each invocation.
+
+### What Changed
+
+Before this PR, every event processed by the slow-reclassifier went through cluster-based pattern detection (design_session, brainstorm_mode, complex_request, meta_thread, philosophy_thread). The classification result depended on the event's content and its neighbors in time.
+
+After this PR, events with `signal_type_hint` set are classified directly by the hint value with `confidence="high"` and are excluded from cluster-based pattern detection entirely. Events without `signal_type_hint` continue through pattern detection unchanged.
+
+This creates a two-tier classification contract: structured producers (harvesters, scheduled jobs) self-classify at write time; ad-hoc writers go through content inference. The fast path is the operative change — it is not constrained, not temporary, and not reversible per-run.
+
+### Why This Is an Encoded Orientation Decision
+
+The fast-path decision is structural: every event carrying a `signal_type_hint` value will be classified with `confidence="high"` on the hint, regardless of content, without a human deciding this on a per-event basis. This satisfies all three of constraint-3's conditions: (a) the system acts without Dan's explicit input, (b) it changes a durable default in the classification pipeline, and (c) the behavioral change is encoded in code, not in a retrievable prompt or conversation.
+
+The oracle PR #1032 verdict Round 1 confirms this is a constraint-3 gap and requires this ADR as the resolution.
+
+### Vision Anchor
+
+**Primary:** `core.inviolable_constraints.constraint-3` — "Every system decision traverses the full OODA loop at the appropriate register. Encoded Orientation decisions require a prior logged decision of the same class and a traceable vision.yaml anchor."
+
+This ADR is the logged decision. It satisfies constraint-3 for the fast-path classification bypass.
+
+**Secondary:** `core.operating_principles.principle-3` — "Determinism over judgment for conditionals. If-then logic and field checks are code, not LLM instructions. Use LLMs where genuine interpretation is required."
+
+The fast path encodes the rule "if signal_type_hint is present, trust it" as code. This is correct — a producer writing a hint at event time has more context than the slow-reclassifier can recover from content alone. The deterministic path (trust hint) is preferable to re-running inference on content the producer already interpreted.
+
+**Tertiary:** `current_focus.what_not_to_touch` — "New detection or classification rules — improve Orient routing before adding more detection."
+
+The fast path does not add detection rules. It reduces detection: events with hints skip pattern detection entirely. This is complementary to the constraint's intent — it prevents over-detection on events where classification is already known.
+
+### Authorization
+
+Authorized by WOS UoW uow_20260501_8de2bc (mem-event-type-subject-tagging). The UoW is a dispatch record, not a decision record per learnings.md PR #913; this ADR is the decision record. The behavioral change is technically sound; the oracle Round 1 verdict (Alignment: Questioned, not Rejected) confirms the underlying logic is coherent while requiring this log entry as the structural anchor.
+
+### Known Correction Gap
+
+Events classified via the fast path (confidence="high") have no correction path if the producer's hint is wrong. The slow-reclassifier's `total_revised` counter conflates hinted events with pattern-revised events, making true reclassification rates harder to audit. These are accepted trade-offs at current scale given that structured producers (harvesters, scheduled jobs) have reliable self-knowledge of their signal type. If producer accuracy degrades, the correct response is to add a monitoring gap to the daily digest, not to remove the fast path.

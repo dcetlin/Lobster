@@ -159,8 +159,14 @@ except Exception as _db_import_err:
 
 # Memory system (optional — gracefully degrades to static file search)
 _memory_provider = None
+# VALID_SIGNAL_TYPES is imported here so the memory_store tool schema enum
+# is derived from the single source of truth in provider.py rather than
+# duplicated as a raw string list. See learnings.md mirror-constant pattern.
+_VALID_SIGNAL_TYPES_FOR_SCHEMA: list[str] = []
 try:
     from memory import create_memory_provider, MemoryEvent
+    from memory.provider import VALID_SIGNAL_TYPES as _VALID_SIGNAL_TYPES
+    _VALID_SIGNAL_TYPES_FOR_SCHEMA = sorted(_VALID_SIGNAL_TYPES)
     _memory_provider = create_memory_provider(use_vector=True)
 except Exception as _mem_err:
     # Memory system is optional; log and continue
@@ -3360,7 +3366,12 @@ async def list_tools() -> list[Tool]:
                     },
                     "signal_type_hint": {
                         "type": "string",
-                        "enum": ["task_request", "design_question", "voice_note", "status_check", "system_observation", "meta_reflection", "philosophy", "casual"],
+                        # Derived from VALID_SIGNAL_TYPES in memory/provider.py — do not hardcode here.
+                        # _VALID_SIGNAL_TYPES_FOR_SCHEMA is populated at server startup from the same
+                        # frozenset that runtime validation uses. If memory is unavailable, the enum
+                        # key is omitted and the schema accepts any string (runtime validation still
+                        # applies via handle_memory_store).
+                        **( {"enum": _VALID_SIGNAL_TYPES_FOR_SCHEMA} if _VALID_SIGNAL_TYPES_FOR_SCHEMA else {} ),
                         "description": "Caller's pre-classification of the event's signal type. When provided, the slow-reclassifier will use this value and skip content inference.",
                     },
                     "task_id": {
