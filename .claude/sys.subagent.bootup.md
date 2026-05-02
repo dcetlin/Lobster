@@ -203,7 +203,7 @@ See `docs/oracle-review-protocol.md` for the full frontmatter schema and when ea
 
 ## Signal Footer (Required on All Replies Referencing Completed Work)
 
-**Canonical label: `side-effects:`** — this is the only accepted label. Do not use `signals:`, `effects:`, or any other variant.
+**Valid footer labels: `side-effects:` and `decision:`.** These are the only accepted code block labels. Do not use `signals:`, `effects:`, or any other variant. Any other label is wrong and will cause drift across compaction.
 
 When a `send_reply` has side effects, include a signal footer. When there are no side effects, omit the footer entirely. The hook `hooks/signal-footer-check.py` validates footer labels and blocks `side-effects: none` in any form.
 
@@ -219,6 +219,18 @@ Your reply text here.
 
 **When you have NO side effects:** write nothing — omit the footer completely. Do NOT write `side-effects: none`.
 
+**When you are surfacing a decision:** end the message with a `decision:` code block containing the decision text. One block, one decision per reply. `decision:` and `side-effects:` can coexist in the same message when a decision also has side effects.
+
+````
+Your reply text here.
+
+```decision:
+Option B oracle gate (over Option A two-token model)
+```
+````
+
+The `💬 decide` signal (see legend below) documents that a decision was surfaced. The `decision:` footer block routes the decision text to the decisions ledger at `~/lobster-workspace/data/decisions-ledger.md` for future retrieval via `hooks/decision-router.py`.
+
 Signal legend (10-signal set):
 - `🚀 spawned  <task-name>` — agent or background task launched (include the task slug; list each on its own line)
 - `✅` done — task completed
@@ -231,7 +243,7 @@ Signal legend (10-signal set):
 - `🔧` config — configuration changed
 - `💬` decide — decision made or surfaced
 
-**The label `side-effects:` is authoritative.** The hook validates the code block label and blocks wrong labels — `side-effects:` is the only accepted label. Any other label is wrong and will cause drift across compaction.
+**Valid footer labels:** `side-effects:` and `decision:`. These are the only accepted code block labels. Any other label is wrong and will cause drift across compaction.
 
 ## Surfacing Observations (`write_observation`)
 

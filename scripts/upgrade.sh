@@ -3213,6 +3213,27 @@ print(f'prune-pr-worktrees: {result.status}')
     fi
 
 
+    # Migration 94: Register decision-router PostToolUse hook in settings.json.
+    # Routes decision: footer blocks from send_reply messages to the decisions ledger.
+    # Appends extracted decision text to ~/lobster-workspace/data/decisions-ledger.md.
+    if [ -f "$CLAUDE_SETTINGS" ]; then
+        if ! jq -e '.hooks.PostToolUse[]? | select(.hooks[]?.command | contains("decision-router"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
+            chmod +x "$LOBSTER_DIR/hooks/decision-router.py" 2>/dev/null || true
+            TMP_SETTINGS=$(mktemp)
+            jq --arg cmd "python3 $LOBSTER_DIR/hooks/decision-router.py" \
+               '.hooks.PostToolUse = (.hooks.PostToolUse // []) + [{
+                "matcher": "mcp__lobster-inbox__send_reply",
+                "hooks": [{
+                    "type": "command",
+                    "command": $cmd,
+                    "timeout": 5
+                }]
+            }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+            substep "Registered decision-router PostToolUse hook in settings.json"
+            migrated=$((migrated + 1))
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
