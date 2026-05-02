@@ -115,8 +115,14 @@ def store_memory_observation(text: str, tag: str = "") -> bool:
     writing to a local observations log so nothing is silently lost.
     """
     content = f"[weekly-retro] {tag}{text}" if tag else f"[weekly-retro] {text}"
+    subject = tag.strip() if tag else "weekly retrospective"
 
-    result = run_lobster_mcp("memory_store", {"content": content, "source": "weekly-retro"})
+    result = run_lobster_mcp("memory_store", {
+        "content": content,
+        "source": "weekly-retro",
+        "subject": subject,
+        "signal_type_hint": "meta_reflection"
+    })
     if result:
         return True
 

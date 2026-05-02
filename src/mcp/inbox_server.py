@@ -3354,6 +3354,15 @@ async def list_tools() -> list[Tool]:
                         ),
                         "default": "neutral",
                     },
+                    "subject": {
+                        "type": "string",
+                        "description": "Short noun-phrase label for what this event is about (e.g. 'OAuth implementation', 'hiking trip planning').",
+                    },
+                    "signal_type_hint": {
+                        "type": "string",
+                        "enum": ["task_request", "design_question", "voice_note", "status_check", "system_observation", "meta_reflection", "philosophy", "casual"],
+                        "description": "Caller's pre-classification of the event's signal type. When provided, the slow-reclassifier will use this value and skip content inference.",
+                    },
                     "task_id": {
                         "type": "string",
                         "description": "Optional subagent task identifier. Included in debug alerts when LOBSTER_DEBUG=true so the caller is visible in the memory write notification.",
@@ -8996,9 +9005,20 @@ async def handle_memory_store(arguments: dict[str, Any]) -> list[TextContent]:
         )
         return [TextContent(type="text", text=f"Skipped: event type '{event_type}' is excluded from memory ingestion.")]
 
-    from memory.provider import VALENCE_VALUES
+    from memory.provider import VALENCE_VALUES, VALID_SIGNAL_TYPES
     raw_valence = arguments.get("valence", "neutral")
     valence = raw_valence if raw_valence in VALENCE_VALUES else "neutral"
+
+    # Validate signal_type_hint if provided
+    signal_type_hint = arguments.get("signal_type_hint")
+    if signal_type_hint is not None and signal_type_hint not in VALID_SIGNAL_TYPES:
+        return [TextContent(
+            type="text",
+            text=f"Error: invalid signal_type_hint '{signal_type_hint}'. Must be one of: {', '.join(sorted(VALID_SIGNAL_TYPES))}"
+        )]
+
+    subject = arguments.get("subject")
+
     metadata = {"tags": arguments.get("tags", [])}
     chat_id_arg = arguments.get("chat_id")
     if chat_id_arg is not None:
@@ -9013,6 +9033,8 @@ async def handle_memory_store(arguments: dict[str, Any]) -> list[TextContent]:
         content=content,
         metadata=metadata,
         valence=valence,
+        subject=subject,
+        signal_type_hint=signal_type_hint,
     )
 
     try:

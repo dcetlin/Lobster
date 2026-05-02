@@ -3152,6 +3152,26 @@ print(f'prune-pr-worktrees: {result.status}')
         warn "prune-pr-worktrees.py not found at $_m83_script or uv unavailable — skipping Migration 83"
     fi
 
+    # Migration 91: Add subject and signal_type_hint columns to events table
+    # These columns enable structured tagging at write time so the slow-reclassifier
+    # can use provided hints instead of expensive content inference.
+    local _db_path="$WORKSPACE_DIR/data/memory.db"
+    if [ -f "$_db_path" ]; then
+        local _has_subject
+        _has_subject=$(sqlite3 "$_db_path" "PRAGMA table_info(events);" 2>/dev/null | grep -c "subject" || true)
+        if [ "$_has_subject" -eq 0 ]; then
+            substep "Adding subject and signal_type_hint columns to events table..."
+            sqlite3 "$_db_path" "ALTER TABLE events ADD COLUMN subject TEXT;"
+            sqlite3 "$_db_path" "ALTER TABLE events ADD COLUMN signal_type_hint TEXT;"
+            success "Added subject and signal_type_hint columns to events table"
+            migrated=$((migrated + 1))
+        else
+            substep "subject column already exists in events table — skipping Migration 91"
+        fi
+    else
+        warn "memory.db not found at $_db_path — skipping Migration 91"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
