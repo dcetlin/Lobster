@@ -43,9 +43,20 @@ def _queue_path() -> Path:
     return Path(workspace) / "data" / "pending-deliveries.jsonl"
 
 
-def is_morning_window() -> bool:
-    """True if current Pacific time is between 06:00 and 10:00 (inclusive of 06, exclusive of 10)."""
-    now_pt = datetime.now(_PACIFIC)
+def is_morning_window(_now_fn=None) -> bool:
+    """True if current Pacific time is between 06:00 and 10:00 (inclusive of 06, exclusive of 10).
+
+    Parameters
+    ----------
+    _now_fn:
+        Optional callable that returns the current datetime (must be timezone-aware).
+        When None (default), uses ``datetime.now(_PACIFIC)``.
+        Inject a fixed-time callable in tests to avoid time-of-day dependency.
+    """
+    if _now_fn is not None:
+        now_pt = _now_fn()
+    else:
+        now_pt = datetime.now(_PACIFIC)
     return 6 <= now_pt.hour < 10
 
 

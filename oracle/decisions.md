@@ -266,3 +266,47 @@ Authorized by WOS UoW uow_20260501_8de2bc (mem-event-type-subject-tagging). The 
 ### Known Correction Gap
 
 Events classified via the fast path (confidence="high") have no correction path if the producer's hint is wrong. The slow-reclassifier's `total_revised` counter conflates hinted events with pattern-revised events, making true reclassification rates harder to audit. These are accepted trade-offs at current scale given that structured producers (harvesters, scheduled jobs) have reliable self-knowledge of their signal type. If producer accuracy degrades, the correct response is to add a monitoring gap to the daily digest, not to remove the fast path.
+
+---
+
+## ADR-006: Circadian Gate Wired into inbox_write.py as a Shared Behavioral Default — Encoded Orientation
+
+**Date:** 2026-05-02
+**Status:** Accepted
+**PR:** #1036 (feat/circadian-delivery_uow_20260427_7ffcb3)
+
+### Context
+
+PR #1036 introduces circadian-aware message delivery: non-urgent scheduled-job outputs are held in a local queue and batched for delivery during Dan's morning window (06:00–10:00 America/Los_Angeles). The circadian gate logic lives in `src/delivery/circadian.py`.
+
+Before this PR, `src/utils/inbox_write.py` wrote every subagent_result directly to the inbox, regardless of time-of-day. The circadian module was self-contained with no call site in the shared delivery path.
+
+### Decision
+
+The circadian gate is wired into `write_inbox_message()` in `src/utils/inbox_write.py` as a durable behavioral default for all callers. When `is_non_urgent(msg)` returns True and `is_morning_window()` returns False, the message is routed to `queue_message()` instead of being written to the inbox. This applies to every caller of `write_inbox_message()` — no opt-in is required.
+
+The gate is wrapped in a `try/except` so that unavailability of the circadian module falls through to immediate delivery without disrupting existing callers.
+
+### Why This Is an Encoded Orientation Decision
+
+The system now acts without Dan's real-time input when circadian deferral conditions are met: every non-urgent job output sent outside the morning window is silently queued rather than immediately delivered. This satisfies all three conditions under constraint-3: (a) the system acts without Dan's explicit per-message input, (b) it changes a durable behavioral default in the delivery path, and (c) the change is encoded in `inbox_write.py`, not in a retrievable prompt.
+
+### Rationale
+
+Wiring the gate into `inbox_write.py` rather than into each caller individually serves the "integration rate before new feature rate" principle: the shared utility is the correct seam for a delivery-layer concern. Callers that produce non-urgent output do not need to know about circadian delivery — they call `write_inbox_message()` and the gate is applied transparently.
+
+This directly addresses constraint-4: overnight job outputs that would otherwise interrupt Dan's sleep or early-morning focus are held and batched for the morning window, reducing friction and screen-time without reducing information completeness.
+
+### Vision Anchor
+
+**Primary:** `core.inviolable_constraints.constraint-4` — "Minimize metabolic cost of cybernetic engagement. The system should reduce friction and screen time, not maximize output volume or feature density."
+
+Deferring non-urgent job outputs to the morning window is a structural implementation of constraint-4: it removes overnight interruptions at the delivery layer rather than relying on Dan to manage notification volume manually.
+
+**Secondary:** `core.operating_principles.principle-4` — "Integration rate before new feature rate. Wire what exists before building more. The missing arrows between existing systems are the velocity multiplier."
+
+The circadian module existed before this PR. Wiring it into the shared write path is the missing arrow — it makes the feature operative for all callers without requiring per-caller changes.
+
+### Constraint
+
+The circadian gate applies only to messages where `is_non_urgent()` returns True (type is `subagent_result`, no `reply_to_message_id`, no urgent-signal keywords). Urgent messages, user replies, and incident alerts always deliver immediately via the existing path. The gate cannot defer a message the user is waiting for a reply to.
