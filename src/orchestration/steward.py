@@ -1845,6 +1845,36 @@ def _parse_workflow_artifact(raw_text: str) -> dict:
     }
 
 
+def _load_dan_register_excerpt(max_chars: int = 1500) -> str:
+    """Return a focused excerpt of Dan's developmental register from user.base.context.md.
+
+    Extracts the section from "Lobster Developmental Map" through the capability
+    coupling / attentional budget sections — the part of the file that captures
+    Dan's current arc, active focus areas, and developmental posture.  Returns an
+    empty string if the file is absent or the section cannot be found, so callers
+    can treat it as optional enrichment.
+
+    The excerpt is capped at ``max_chars`` to keep the injected context tight.
+    A trailing "[...truncated]" marker is appended when the cap is applied.
+    """
+    register_path = Path.home() / "lobster-user-config" / "agents" / "user.base.context.md"
+    try:
+        text = register_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+    # Find the anchor section that starts the developmental register
+    anchor = "## Lobster Developmental Map"
+    start = text.find(anchor)
+    if start == -1:
+        return ""
+
+    excerpt = text[start:]
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[:max_chars] + "\n[...truncated]"
+    return excerpt.strip()
+
+
 def _llm_prescribe(
     uow: UoW,
     reentry_posture: str,
@@ -1963,10 +1993,21 @@ Every prompt must include:
 For internal tasks (no user reply): write_result only with sent_reply_to_user=False
 """
 
+    # Load Dan's developmental register and build an optional orientation block.
+    # Placed after the UoW context so the model sees both "what this UoW needs"
+    # and "what Dan's current arc requires of how this work lands" before generating
+    # the prescription.
+    _register_excerpt = _load_dan_register_excerpt()
+    _orientation_block = (
+        f"\n## Dan's current orientation\n\n{_register_excerpt}\n"
+        if _register_excerpt
+        else ""
+    )
+
     user_prompt = f"""Given this Unit of Work, write a precise prescription for the Executor.
 
 {uow_context}
-
+{_orientation_block}
 {_DISPATCH_CONVENTIONS}
 Respond using front-matter + prose format. Output ONLY the prescription — no preamble, no explanation outside this structure:
 
