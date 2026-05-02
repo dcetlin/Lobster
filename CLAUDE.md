@@ -255,8 +255,27 @@ Never use cron for user-space jobs. Never use systemd tools for system-level inf
 ### Job type distinction
 
 - **Type A (LLM subagent tasks):** Run a prompt, do work, return output. The cron + jobs.json `enabled` field is the correct dispatch gate. Systemd was intentionally excluded — job dispatch is not process management. Jobs are prompts, not processes. Runtime enable/disable lives in jobs.json without touching cron.
-- **Type B (long-running services):** The dispatcher, MCP servers, Telegram bot, health daemons. These are processes. Systemd is the right tool here when/if Lobster moves to fully-automated operation.
-- **Type C (cron-direct non-LLM scripts):** Pure Python scripts invoked directly by cron — no inbox message written, no LLM round-trip. The script reads jobs.json itself to check the `enabled` gate and logs to `scheduled-jobs/logs/` directly. `dispatch: "cron-direct"` in jobs.json identifies these entries. Examples: `executor-heartbeat.py`, `steward-heartbeat.py`.
+- **Type B (cron-direct scripts):** Pure Python scripts invoked directly by cron — no inbox message, no LLM round-trip. Use this type when: (a) the job is a deterministic polling/recovery loop rather than an LLM reasoning task, (b) the same result would be produced on every invocation regardless of model choice, and (c) latency or LLM cost matter (e.g. runs every 3 minutes). The script handles its own error recovery and logging.
+
+  **Cron entry pattern** (unique marker per job required):
+  ```
+  */N * * * * cd ~/lobster && uv run scheduled-tasks/my-script.py >> ~/lobster-workspace/scheduled-jobs/logs/my-script.log 2>&1 # LOBSTER-MY-SCRIPT
+  ```
+
+  **Required: jobs.json gate.** Add `_is_job_enabled(job_name)` at the top of `main()` before any DB work. This preserves runtime enable/disable via `wos start/stop` and direct jobs.json edits. See `scheduled-tasks/executor-heartbeat.py` and `scheduled-tasks/steward-heartbeat.py` for the reference implementation.
+
+  **jobs.json fields for Type B jobs:**
+  ```json
+  {
+    "type": "B",
+    "dispatch": "cron-direct",
+    "task_file": null
+  }
+  ```
+
+  **Decision rule:** If the job would run identically regardless of which LLM model responds, and it runs more frequently than every 15 minutes, prefer Type B.
+
+- **Long-running services** (dispatcher, MCP servers, Telegram bot, health daemons): These are processes, not jobs. Systemd is the right tool here when/if Lobster moves to fully-automated operation. Not part of the job type taxonomy.
 
 ## Key Directories
 
