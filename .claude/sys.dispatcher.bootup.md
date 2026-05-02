@@ -46,11 +46,25 @@ Before consulting any gate, classify the message as ACTION or DESIGN_OPEN. These
 | **7-Second Rule** | Any tool call not in {wait_for_messages, check_inbox, mark_processing, mark_processed, mark_failed, send_reply} must go to a background subagent. | Structural |
 | **Design Gate** | Message is DESIGN_OPEN when no concrete output artifact can be stated in one sentence. | Advisory |
 | **Bias to Action** | Classifier returned ACTION. Proceed with implementation without asking for confirmation. | Advisory |
-| **Dispatch template** | Every Task call must include `Minimum viable output:` and `Boundary: do not produce` in prompt. | Advisory |
+| **Dispatch template** | Every Task call must include `Minimum viable output:` and `Boundary: do not produce` in prompt. **Long-running gate:** If Minimum viable output implies >15 min, prepend the workstream scaffolding preamble (mkdir workstream, write status.md, heartbeat every ~5 min) before any other prompt content. See CLAUDE.md "Long-Running Dispatch Preamble" for the full template. | Advisory |
 | **No self-relay** | When `sent_reply_to_user == True` or type is `subagent_notification`, mark_processed without send_reply. | Structural |
 | **Relay filter** | Key signal in send_reply must be in paragraph 1, not buried. | Advisory |
 | **PR Merge Gate** | Every code PR must pass oracle review before merge. Flow: open PR → oracle agent → writes `oracle/verdicts/pr-{number}.md` → if first line is `VERDICT: APPROVED` dispatch merge agent; if `NEEDS_CHANGES` dispatch fix agent → re-oracle → repeat. Merge agent must check `oracle/verdicts/pr-{number}.md` first line is `VERDICT: APPROVED` before merging, then move the file to `oracle/verdicts/archive/pr-{number}.md`. | Advisory |
 | **WOS Execute Gate** | `type: "wos_execute"` → daemon-owned (wos-execute-router); dispatcher marks processed without routing. If daemon is down, heartbeat recovers. | Advisory |
+
+### Long-Running Dispatch Preamble (summary)
+
+For dispatches implying >15 min runtime, prepend this to the subagent prompt:
+
+```
+WORKSTREAM SETUP (do this first):
+1. mkdir -p ~/lobster-workspace/workstreams/<task-slug>/
+2. Write ~/lobster-workspace/workstreams/<task-slug>/status.md immediately (task_id, start time, goal, step 1).
+3. Rewrite status.md every ~5 min: current step, % complete, next step. Write failures explicitly.
+```
+
+Signals: cloning, migrations, merging many commits, "full"/"complete"/"all"/"migrate" in prompt, WOS UoW with estimated_cycles > 1.
+Full template: CLAUDE.md § "Long-Running Dispatch Preamble".
 
 ### Gate-Miss Logging (Proprioceptive Feedback)
 

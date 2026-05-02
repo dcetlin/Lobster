@@ -154,11 +154,38 @@ Before consulting any gate, classify the message as ACTION or DESIGN_OPEN. These
 | **7-Second Rule** | Any tool call that is not `wait_for_messages`, `check_inbox`, `mark_processing`, `mark_processed`, `mark_failed`, or `send_reply` must go to a background subagent. | Structural — if you reach for any other tool, stop and delegate. |
 | **Design Gate** | A message is DESIGN_OPEN when no concrete output artifact can be stated in one sentence from the message alone. | Advisory — classify before routing; fire the gate if DESIGN_OPEN. |
 | **Bias to Action** | Classifier returned ACTION. Proceed with implementation without asking for confirmation. | Advisory — classifier output is the entry condition; no secondary check needed. |
-| **Dispatch template** | Every subagent Task call must include `Minimum viable output: [deliverable]` and `Boundary: do not produce [X]` in its prompt. Every subagent prompt must include `Your task_id is: <slug>` as its first line. task_id must be a slug (not a UUID); the SessionStart hook rejects sessions without task_id. | Advisory — check before calling Task. |
+| **Dispatch template** | Every subagent Task call must include `Minimum viable output: [deliverable]` and `Boundary: do not produce [X]` in its prompt. Every subagent prompt must include `Your task_id is: <slug>` as its first line. task_id must be a slug (not a UUID); the SessionStart hook rejects sessions without task_id. **Long-running gate:** If the Minimum viable output implies >15 min of work, prepend the workstream scaffolding preamble (see "Long-Running Dispatch Preamble" below) to the subagent prompt before any other content. | Advisory — check before calling Task. |
 | **No self-relay** | When `sent_reply_to_user == True` or message type is `subagent_notification`, mark_processed without calling send_reply. | Structural — the message type routes it; no discretion needed. |
 | **Relay filter** | If the key signal in a send_reply to Dan is buried past paragraph 2, move it to the lead. | Advisory — apply before every send_reply. |
 | **PR Merge Gate** | Every code PR must pass oracle review before merge. Flow: open PR → oracle agent → writes `oracle/verdicts/pr-{number}.md` → if first line is `VERDICT: APPROVED` dispatch merge agent; if `VERDICT: NEEDS_CHANGES` dispatch fix agent → re-oracle → repeat. Merge agent must read `oracle/verdicts/pr-{number}.md` and confirm first line is `VERDICT: APPROVED` before merging, then move file to `oracle/verdicts/archive/pr-{number}.md`. Oracle round cap: Rounds 1–2: auto-fix. Round 3: notify Dan before dispatching another fix. Round 4+: escalate to Dan before dispatching; include a summary of what gaps keep re-opening and why. | Advisory — never dispatch a merge agent without first confirming `VERDICT: APPROVED` in `oracle/verdicts/pr-{number}.md`. |
 | **WOS Execute Gate** | A message with `type: "wos_execute"` must be routed by calling `route_wos_message(msg)` from `src/orchestration/dispatcher_handlers.py` — never by re-reading prose that may be absent after compaction. | Structural — if you receive a `wos_execute` message, call `route_wos_message` unconditionally; the import is always available. |
+
+### Long-Running Dispatch Preamble
+
+Any dispatch where the `Minimum viable output` implies >15 minutes of runtime **must** begin with the following preamble, substituting `<task-slug>` with the agent's task_id:
+
+```
+WORKSTREAM SETUP (do this first, before any other work):
+
+1. Create your workstream directory:
+   mkdir -p ~/lobster-workspace/workstreams/<task-slug>/
+
+2. Write an initial status file immediately after creating the directory:
+   ~/lobster-workspace/workstreams/<task-slug>/status.md
+   Content: task_id, start time, goal summary, current step ("started"), next planned step.
+
+3. Rewrite status.md every ~5 minutes as you work:
+   Update: current step, % complete estimate, last completed milestone, next step.
+   If you are blocked or failing, write that explicitly — stalled state is recoverable; silent state is not.
+
+Do not defer workstream creation. If you die without writing status.md, the reconciler has nothing to recover from.
+```
+
+Signals that a dispatch implies >15 min:
+- The Minimum viable output involves cloning a repo, running a migration, or merging many commits
+- The prompt includes words like "full", "complete", "all", "every", "rewrite", "port", "migrate"
+- The task requires reading many files before writing any output
+- The task_id is for a WOS UoW with estimated_cycles > 1
 
 ### Gate-Miss Logging (Proprioceptive Feedback)
 
