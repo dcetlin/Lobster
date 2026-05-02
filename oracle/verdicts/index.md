@@ -1,3 +1,5 @@
+| 2026-05-02 | PR #1047 | Round 2 | APPROVED |
+| 2026-05-02 | PR #1047 | Round 1 | NEEDS_CHANGES |
 | 2026-05-02 | PR #1044 | Round 1 | APPROVED |
 | 2026-05-02 | PR #1038 | Round 1 | APPROVED |
 | 2026-05-02 | PR #1034 | Round 3 | NEEDS_CHANGES (PR Merge Gate violation — merged without oracle approval, all 5 gaps in merged code) |
