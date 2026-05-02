@@ -56,9 +56,6 @@ def _load_decay_detector():
 decay_detector = _load_decay_detector()
 is_night4_rotation = decay_detector.is_night4_rotation
 
-# Sentinel value defined in the spec: current_night after Night 4 completes.
-NIGHT4_SENTINEL = 5
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -90,7 +87,7 @@ class TestIsNight4Rotation:
     ) -> None:
         """current_night == 5 is the only value that should return True."""
         monkeypatch.setattr(decay_detector, "HYGIENE_DIR", tmp_path)
-        _write_state(tmp_path, {"current_night": NIGHT4_SENTINEL})
+        _write_state(tmp_path, {"current_night": decay_detector.NIGHT4_ROTATION_STATE})
         assert is_night4_rotation() is True
 
     def test_returns_false_when_current_night_is_4(
@@ -138,7 +135,7 @@ class TestIsNight4Rotation:
     ) -> None:
         """Valid JSON without 'current_night' key triggers the exception path → False."""
         monkeypatch.setattr(decay_detector, "HYGIENE_DIR", tmp_path)
-        _write_state(tmp_path, {"other_key": NIGHT4_SENTINEL})
+        _write_state(tmp_path, {"other_key": decay_detector.NIGHT4_ROTATION_STATE})
         assert is_night4_rotation() is False
 
     def test_returns_false_when_value_not_castable_to_int(
