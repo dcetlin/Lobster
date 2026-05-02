@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
 """
 WOS PR Sweeper — surfaces open and recently-merged PRs associated with WOS Units of Work.
 
@@ -8,7 +8,7 @@ Runs every 6 hours. On each invocation:
 3. Identifies stale open PRs (open >7 days)
 4. Identifies newly merged PRs where the UoW is still in 'complete' (not 'done')
 5. Writes structured summary to task-outputs
-6. Emits inbox notification if action is needed
+6. Emits inbox notification if action is needed (with per-PR cooldown to prevent flooding)
 
 This is Option 2 from the WOS PR completion design: a lightweight sweeper that runs
 on a schedule, separate from the executor state machine. Does not modify UoW state;
@@ -51,6 +51,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 from src.orchestration.registry import WOSRegistry, UoWStatus
+from src.utils.inbox_write import _inbox_dir, _task_outputs_dir
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -68,6 +69,7 @@ log = logging.getLogger("wos-pr-sweeper")
 # ---------------------------------------------------------------------------
 
 STALE_OPEN_THRESHOLD_DAYS = 7
+NOTIFICATION_COOLDOWN_HOURS = 24
 UOW_ID_PATTERN = re.compile(r"_uow_(\d{8}_[a-f0-9]{6})")
 REPOS_TO_SCAN = [
     "dcetlin/Lobster",
@@ -107,6 +109,59 @@ def _is_job_enabled(job_name: str) -> bool:
     except Exception as exc:
         log.error("Failed to read jobs.json — %s: %s", type(exc).__name__, exc)
         return True  # Fail open
+
+
+# ---------------------------------------------------------------------------
+# Notification state — per-PR cooldown to prevent inbox flooding
+# ---------------------------------------------------------------------------
+
+def _state_path() -> Path:
+    """Return the path to the per-PR notification state file."""
+    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+    return workspace / "data" / "wos-pr-sweeper-state.json"
+
+
+def _load_state() -> dict:
+    """Load per-PR notification state from disk. Returns empty dict on missing/corrupt file."""
+    path = _state_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("Could not read state file %s: %s — starting fresh", path, exc)
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    """Atomically persist per-PR notification state (tmp-then-rename)."""
+    path = _state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _pr_key(repo: str, number: int) -> str:
+    """Stable key for a PR in the notification state dict."""
+    return f"{repo}#{number}"
+
+
+def _should_notify(pr_key: str, state: dict) -> bool:
+    """
+    Return True if this PR has not been notified within NOTIFICATION_COOLDOWN_HOURS.
+
+    A PR with no prior notification record always passes the cooldown gate.
+    """
+    last_notified_str = state.get(pr_key, {}).get("last_notified_at")
+    if last_notified_str is None:
+        return True
+    try:
+        last_notified = datetime.fromisoformat(last_notified_str)
+        now = datetime.now(timezone.utc)
+        return (now - last_notified) >= timedelta(hours=NOTIFICATION_COOLDOWN_HOURS)
+    except (ValueError, TypeError):
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -292,9 +347,7 @@ def sweep_prs(dry_run: bool = False) -> dict:
 
 def write_output(summary: dict, dry_run: bool = False):
     """Write sweep results to task-outputs directory."""
-    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-    output_dir = workspace / "messages" / "task-outputs"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = _task_outputs_dir()
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     output_file = output_dir / f"wos-pr-sweeper-{timestamp}.json"
@@ -309,34 +362,63 @@ def write_output(summary: dict, dry_run: bool = False):
 
 
 def emit_inbox_notification(summary: dict, dry_run: bool = False):
-    """Write inbox notification if action is needed."""
-    needs_attention = summary["stale_open"] or summary["merged_pending_close"]
-    if not needs_attention:
+    """
+    Write inbox notification for PRs requiring attention, respecting per-PR cooldown.
+
+    Each PR is tracked in wos-pr-sweeper-state.json. A PR that was notified
+    within NOTIFICATION_COOLDOWN_HOURS is suppressed to prevent inbox flooding
+    on every 6-hour sweep run.
+    """
+    needs_attention_all = summary["stale_open"] + summary["merged_pending_close"]
+    if not needs_attention_all:
         log.info("No action needed — skipping inbox notification")
         return
 
-    inbox_dir = Path.home() / "messages" / "inbox"
-    inbox_dir.mkdir(parents=True, exist_ok=True)
+    state = _load_state()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Filter to PRs not recently notified
+    stale_to_notify = [
+        item for item in summary["stale_open"]
+        if _should_notify(_pr_key(item["repo"], item["pr_number"]), state)
+    ]
+    merged_to_notify = [
+        item for item in summary["merged_pending_close"]
+        if _should_notify(_pr_key(item["repo"], item["pr_number"]), state)
+    ]
+
+    suppressed = len(needs_attention_all) - len(stale_to_notify) - len(merged_to_notify)
+    if suppressed:
+        log.info("Suppressed %d PRs within cooldown window (%dh)", suppressed, NOTIFICATION_COOLDOWN_HOURS)
+
+    if not stale_to_notify and not merged_to_notify:
+        log.info("All PRs needing attention are within cooldown — no notification sent")
+        return
+
+    inbox_dir = _inbox_dir()
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     message_id = f"wos-pr-sweep-{timestamp}"
     inbox_file = inbox_dir / f"{message_id}.json"
 
     # Build message text
-    lines = ["🔍 WOS PR Sweep Results\n"]
-    if summary["stale_open"]:
-        lines.append(f"**{len(summary['stale_open'])} stale open PRs** (>7 days):")
-        for item in summary["stale_open"][:5]:  # Limit to first 5
-            lines.append(f"  • PR #{item['pr_number']} ({item['repo']}) - {item['opened_days_ago']} days")
-        if len(summary["stale_open"]) > 5:
-            lines.append(f"  ... and {len(summary['stale_open']) - 5} more")
+    lines = ["WOS PR Sweep Results\n"]
+    if stale_to_notify:
+        lines.append(f"**{len(stale_to_notify)} stale open PRs** (>7 days):")
+        for item in stale_to_notify[:5]:  # Limit to first 5
+            lines.append(f"  * PR #{item['pr_number']} ({item['repo']}) - {item['opened_days_ago']} days")
+        if len(stale_to_notify) > 5:
+            lines.append(f"  ... and {len(stale_to_notify) - 5} more")
 
-    if summary["merged_pending_close"]:
-        lines.append(f"\n**{len(summary['merged_pending_close'])} merged PRs** with non-done UoWs:")
-        for item in summary["merged_pending_close"][:5]:
-            lines.append(f"  • PR #{item['pr_number']} ({item['repo']}) - UoW: {item['uow_status']}")
-        if len(summary["merged_pending_close"]) > 5:
-            lines.append(f"  ... and {len(summary['merged_pending_close']) - 5} more")
+    if merged_to_notify:
+        lines.append(f"\n**{len(merged_to_notify)} merged PRs** with non-done UoWs:")
+        for item in merged_to_notify[:5]:
+            lines.append(f"  * PR #{item['pr_number']} ({item['repo']}) - UoW: {item['uow_status']}")
+        if len(merged_to_notify) > 5:
+            lines.append(f"  ... and {len(merged_to_notify) - 5} more")
+
+    if suppressed:
+        lines.append(f"\n({suppressed} additional PRs suppressed — notified within {NOTIFICATION_COOLDOWN_HOURS}h)")
 
     message = {
         "message_id": message_id,
@@ -344,21 +426,34 @@ def emit_inbox_notification(summary: dict, dry_run: bool = False):
         "source": "wos_pr_sweep",
         "type": "wos_pr_sweep_result",
         "text": "\n".join(lines),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": now_iso,
         "category": "wos_pr_sweep_result",
         "data": {
-            "stale_open_count": len(summary["stale_open"]),
-            "merged_pending_close_count": len(summary["merged_pending_close"]),
+            "stale_open_count": len(stale_to_notify),
+            "merged_pending_close_count": len(merged_to_notify),
         },
     }
 
     if dry_run:
         print("DRY RUN: Would write inbox notification:")
         print(json.dumps(message, indent=2))
+        print(f"DRY RUN: Would update state for {len(stale_to_notify) + len(merged_to_notify)} PRs")
     else:
-        with inbox_file.open("w") as f:
-            json.dump(message, f, indent=2)
+        tmp_path = Path(str(inbox_file) + ".tmp")
+        tmp_path.write_text(json.dumps(message, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(inbox_file)
         log.info("Wrote inbox notification to %s", inbox_file)
+
+        # Update state: record last_notified_at for each notified PR
+        for item in stale_to_notify:
+            key = _pr_key(item["repo"], item["pr_number"])
+            state[key] = {"last_notified_at": now_iso}
+        for item in merged_to_notify:
+            key = _pr_key(item["repo"], item["pr_number"])
+            state[key] = {"last_notified_at": now_iso}
+
+        _save_state(state)
+        log.info("Updated notification state for %d PRs", len(stale_to_notify) + len(merged_to_notify))
 
 
 # ---------------------------------------------------------------------------
