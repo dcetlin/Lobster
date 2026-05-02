@@ -22,7 +22,7 @@ continues for remaining UoWs.
 Cron schedule (every 3 minutes, offset by 90s from steward-heartbeat):
     */3 * * * * sleep 90 && cd ~/lobster && uv run scheduled-tasks/executor-heartbeat.py >> ~/lobster-workspace/scheduled-jobs/logs/executor-heartbeat.log 2>&1
 
-Type B dispatch: cron calls this script directly (no inbox/ message, no dispatcher
+Type C dispatch: cron calls this script directly (no inbox/ message, no dispatcher
 involvement). The jobs.json enabled gate is checked at the top of main() so that
 runtime enable/disable (wos start/stop) is respected without touching cron.
 
@@ -70,7 +70,7 @@ log = logging.getLogger("executor-heartbeat")
 
 
 # ---------------------------------------------------------------------------
-# jobs.json enabled gate — Type B dispatch path
+# jobs.json enabled gate — Type C dispatch path
 # ---------------------------------------------------------------------------
 
 def _is_job_enabled(job_name: str) -> bool:
@@ -82,7 +82,7 @@ def _is_job_enabled(job_name: str) -> bool:
     - the job entry is missing
     - the file is unreadable or malformed
 
-    This mirrors the gate logic in dispatch-job.sh so Type B (cron → script)
+    This mirrors the gate logic in dispatch-job.sh so Type C (cron → script)
     jobs respect the same runtime enable/disable toggle as Type A jobs.
     """
     workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
