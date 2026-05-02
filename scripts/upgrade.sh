@@ -3187,6 +3187,32 @@ print(f'prune-pr-worktrees: {result.status}')
         substep "wos-pr-sweeper cron entry already present — skipping"
     fi
 
+
+    # Migration 93: Circadian delivery — pending-deliveries queue file and morning flush cron.
+    # Creates the JSONL queue file for off-peak message deferral and registers the
+    # morning-delivery-flush cron entry (14:00 UTC = 06:00 PST / 07:00 PDT).
+    local PENDING_DELIVERIES="$WORKSPACE_DIR/data/pending-deliveries.jsonl"
+    if [ ! -f "$PENDING_DELIVERIES" ]; then
+        touch "$PENDING_DELIVERIES" \
+            && substep "Created pending-deliveries.jsonl (Migration 93)" \
+            || warn "Could not create pending-deliveries.jsonl — check $WORKSPACE_DIR/data/"
+        migrated=$((migrated + 1))
+    else
+        substep "pending-deliveries.jsonl already exists — skipping"
+    fi
+
+    local MORNING_FLUSH_MARKER="# LOBSTER-MORNING-DELIVERY-FLUSH"
+    if ! crontab -l 2>/dev/null | grep -qF "$MORNING_FLUSH_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$MORNING_FLUSH_MARKER" \
+            "0 14 * * * cd $LOBSTER_DIR && uv run scheduled-tasks/morning-delivery-flush.py >> $WORKSPACE_DIR/scheduled-jobs/logs/morning-delivery-flush.log 2>&1 $MORNING_FLUSH_MARKER" \
+            && substep "Added morning-delivery-flush cron entry (Migration 93)" \
+            || warn "Could not add morning-delivery-flush cron entry — check cron-manage.sh"
+        migrated=$((migrated + 1))
+    else
+        substep "morning-delivery-flush cron entry already present — skipping"
+    fi
+
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
