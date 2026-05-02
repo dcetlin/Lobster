@@ -291,24 +291,29 @@ def _extract_artifact_refs(text: str) -> dict:
     }
 
 
-def _enrich_result_file(output_ref: str, result_text: str | None) -> None:
+def _enrich_result_file(
+    output_ref: str,
+    result_text: str | None,
+    token_usage: int | None = None,
+) -> None:
     """
-    Read the existing result.json at output_ref, add 'summary' and 'refs' fields,
-    and rewrite it atomically.
+    Read the existing result.json at output_ref, add 'summary', 'refs', and
+    'token_usage' fields, and rewrite it atomically.
 
     Called after a successful UoW completion (outcome=complete) to capture:
     - summary: first _RESULT_SUMMARY_MAX_CHARS chars of result_text
     - refs: extracted PR numbers, issue numbers, and file paths from result_text
+    - token_usage: cumulative input+output tokens from the subagent (issue #1033)
 
     No-op when:
-    - result_text is None or empty
+    - result_text is None or empty AND token_usage is None
     - result file does not exist (subagent skipped result_writer)
     - result file is unreadable or not valid JSON
 
     Side effects are isolated to this function. Failures are logged and swallowed
     — result file enrichment must never block the UoW transition.
     """
-    if not result_text:
+    if not result_text and token_usage is None:
         return
 
     # Derive result file path (mirrors result_writer._result_json_path)
@@ -340,14 +345,31 @@ def _enrich_result_file(output_ref: str, result_text: str | None) -> None:
         import json
         import tempfile
 
-        summary = result_text[:_RESULT_SUMMARY_MAX_CHARS]
-        refs = _extract_artifact_refs(result_text)
+        enriched = False
 
-        # Only add fields not already present (subagent may have set summary itself)
-        if "summary" not in payload:
-            payload["summary"] = summary
-        if "refs" not in payload and any(refs.values()):
-            payload["refs"] = refs
+        if result_text:
+            summary = result_text[:_RESULT_SUMMARY_MAX_CHARS]
+            refs = _extract_artifact_refs(result_text)
+
+            # Only add fields not already present (subagent may have set summary itself)
+            if "summary" not in payload:
+                payload["summary"] = summary
+                enriched = True
+            if "refs" not in payload and any(refs.values()):
+                payload["refs"] = refs
+                enriched = True
+        else:
+            refs = {}
+
+        # token_usage: always write when provided, never overwrite an existing value.
+        # This is the primary fix for issue #1033 — token_usage was stored in the
+        # registry DB but absent from the on-disk result.json.
+        if token_usage is not None and "token_usage" not in payload:
+            payload["token_usage"] = token_usage
+            enriched = True
+
+        if not enriched:
+            return
 
         # Atomic rewrite
         tmp_fd, tmp_name = tempfile.mkstemp(
@@ -361,8 +383,8 @@ def _enrich_result_file(output_ref: str, result_text: str | None) -> None:
                 fh.write(json.dumps(payload, indent=2))
             tmp_path.rename(result_path)
             log.debug(
-                "_enrich_result_file: enriched %s (summary_len=%d, refs=%s)",
-                result_path, len(summary), refs,
+                "_enrich_result_file: enriched %s (summary_len=%d, refs=%s, token_usage=%s)",
+                result_path, len(result_text or ""), refs, token_usage,
             )
         except Exception:
             try:
@@ -385,6 +407,7 @@ def _backpropagate_result_to_output_file(
     uow_id: str,
     output_ref: str,
     result_text: str | None,
+    token_usage: int | None = None,
 ) -> None:
     """
     Write the write_result payload to the executor output file when none exists.
@@ -405,6 +428,7 @@ def _backpropagate_result_to_output_file(
     - success: true
     - reason: the write_result text (truncated to 500 chars)
     - executor_id: "write_result_backprop" (identifies this synthetic record)
+    - token_usage: cumulative token count from the subagent (issue #1033)
 
     Also writes result_text to the primary output_ref path when that file is
     missing or empty (sentinel-only), so agent-status.sh and the steward have
@@ -417,6 +441,9 @@ def _backpropagate_result_to_output_file(
         uow_id: The WOS unit-of-work ID.
         output_ref: The output_ref path for this UoW (absolute path).
         result_text: The text field from the write_result call. May be None or empty.
+        token_usage: Optional cumulative token count (input + output) from the
+            subagent's write_result call. Written to the synthetic result.json
+            when provided (issue #1033).
     """
     if not output_ref:
         return
@@ -442,13 +469,17 @@ def _backpropagate_result_to_output_file(
 
         # Write a minimal conforming result.json
         reason = (result_text or "").strip()[:500] or "completed via write_result"
-        payload = {
+        payload: dict = {
             "uow_id": uow_id,
             "outcome": "complete",
             "success": True,
             "reason": reason,
             "executor_id": "write_result_backprop",
         }
+        # token_usage: include when provided so per-UoW cost is visible in the
+        # result file, not only in the registry DB (issue #1033).
+        if token_usage is not None:
+            payload["token_usage"] = token_usage
 
         result_path.parent.mkdir(parents=True, exist_ok=True)
         # Atomic write: tmp → rename so the Steward never reads a partial file
@@ -867,13 +898,15 @@ def maybe_complete_wos_uow(
         # file when the subagent did not write one itself. Must run BEFORE
         # _enrich_result_file so the file exists for enrichment to update.
         if output_ref:
-            _backpropagate_result_to_output_file(uow_id, output_ref, result_text)
+            _backpropagate_result_to_output_file(uow_id, output_ref, result_text,
+                                                 token_usage=token_usage)
 
         # Enrich result file with summary + extracted artifact refs from agent output.
+        # Also writes token_usage to the result.json (issue #1033).
         # Non-fatal — enrichment failure never blocks the UoW transition.
         if output_ref:
             try:
-                _enrich_result_file(output_ref, result_text)
+                _enrich_result_file(output_ref, result_text, token_usage=token_usage)
             except Exception as enrich_exc:
                 log.warning(
                     "maybe_complete_wos_uow: result file enrichment failed for UoW %r — %s: %s",
