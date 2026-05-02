@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
 """
 WOS PR Sweeper — surfaces open and recently-merged PRs associated with WOS Units of Work.
 
@@ -51,6 +51,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 from src.orchestration.registry import WOSRegistry, UoWStatus
+from src.utils.inbox_write import _inbox_dir, _task_outputs_dir
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -68,11 +69,71 @@ log = logging.getLogger("wos-pr-sweeper")
 # ---------------------------------------------------------------------------
 
 STALE_OPEN_THRESHOLD_DAYS = 7
+# Minimum hours between repeated notifications for the same stale PR.
+# Prevents inbox flood: a PR stale for 30 days produces 1 notification every
+# NOTIFICATION_COOLDOWN_HOURS rather than one per 6-hour run.
+NOTIFICATION_COOLDOWN_HOURS = 24
 UOW_ID_PATTERN = re.compile(r"_uow_(\d{8}_[a-f0-9]{6})")
 REPOS_TO_SCAN = [
     "dcetlin/Lobster",
     "SiderealPress/lobster",
 ]
+
+# State file tracks when each stale PR was last notified so we can suppress
+# repeated notifications for the same PR within NOTIFICATION_COOLDOWN_HOURS.
+def _notification_state_path() -> Path:
+    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+    return workspace / "data" / "wos-pr-sweeper-state.json"
+
+
+def _load_notification_state() -> dict[str, str]:
+    """Return {pr_key: last_notified_iso} from the state file. Returns {} if absent."""
+    path = _notification_state_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception as exc:
+        log.warning("Failed to read notification state file — %s: %s", type(exc).__name__, exc)
+        return {}
+
+
+def _save_notification_state(state: dict[str, str]) -> None:
+    """Atomically persist {pr_key: last_notified_iso} to the state file."""
+    path = _notification_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _pr_key(item: dict) -> str:
+    """Stable key for a stale/pending PR: repo + PR number."""
+    return f"{item['repo']}#{item['pr_number']}"
+
+
+def _filter_new_items(
+    items: list[dict],
+    state: dict[str, str],
+    now: datetime,
+) -> list[dict]:
+    """Return only items whose PR has not been notified within NOTIFICATION_COOLDOWN_HOURS."""
+    cooldown = timedelta(hours=NOTIFICATION_COOLDOWN_HOURS)
+    result = []
+    for item in items:
+        key = _pr_key(item)
+        last_str = state.get(key)
+        if last_str is None:
+            result.append(item)
+            continue
+        try:
+            last = datetime.fromisoformat(last_str)
+            if now - last >= cooldown:
+                result.append(item)
+        except ValueError:
+            # Unparseable timestamp — treat as never notified
+            result.append(item)
+    return result
 
 # ---------------------------------------------------------------------------
 # jobs.json enabled gate — Type C dispatch path
@@ -291,10 +352,14 @@ def sweep_prs(dry_run: bool = False) -> dict:
 
 
 def write_output(summary: dict, dry_run: bool = False):
-    """Write sweep results to task-outputs directory."""
-    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-    output_dir = workspace / "messages" / "task-outputs"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    """Write sweep results to task-outputs directory.
+
+    Uses _task_outputs_dir() from src/utils/inbox_write so the path resolves
+    via LOBSTER_MESSAGES rather than LOBSTER_WORKSPACE — consistent with the
+    canonical pattern used by steward-heartbeat.py, wos-queue-monitor.py, and
+    what check_task_outputs reads.
+    """
+    output_dir = _task_outputs_dir()
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     output_file = output_dir / f"wos-pr-sweeper-{timestamp}.json"
@@ -303,62 +368,91 @@ def write_output(summary: dict, dry_run: bool = False):
         print("DRY RUN: Would write to", output_file)
         print(json.dumps(summary, indent=2))
     else:
-        with output_file.open("w") as f:
-            json.dump(summary, f, indent=2)
+        tmp = Path(str(output_file) + ".tmp")
+        tmp.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        tmp.replace(output_file)
         log.info("Wrote output to %s", output_file)
 
 
 def emit_inbox_notification(summary: dict, dry_run: bool = False):
-    """Write inbox notification if action is needed."""
-    needs_attention = summary["stale_open"] or summary["merged_pending_close"]
-    if not needs_attention:
-        log.info("No action needed — skipping inbox notification")
+    """Write inbox notification for newly-discovered stale PRs and pending merges.
+
+    Deduplication: loads a per-PR state file and only emits notifications for
+    PRs that haven't been notified within NOTIFICATION_COOLDOWN_HOURS. After
+    emitting, updates the state file so the next run sees the recorded timestamp.
+    This prevents inbox flood when stale PRs persist across many 6-hour runs.
+
+    Uses _inbox_dir() from src/utils/inbox_write for canonical path resolution
+    (respects LOBSTER_MESSAGES env var) and atomic tmp-then-rename for write safety.
+    """
+    now = datetime.now(timezone.utc)
+    state = _load_notification_state()
+
+    new_stale = _filter_new_items(summary["stale_open"], state, now)
+    new_pending = _filter_new_items(summary["merged_pending_close"], state, now)
+
+    if not new_stale and not new_pending:
+        log.info(
+            "No new action items (all %d stale + %d pending already notified within %dh) "
+            "— skipping inbox notification",
+            len(summary["stale_open"]),
+            len(summary["merged_pending_close"]),
+            NOTIFICATION_COOLDOWN_HOURS,
+        )
         return
 
-    inbox_dir = Path.home() / "messages" / "inbox"
-    inbox_dir.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    message_id = f"wos-pr-sweep-{timestamp}"
+    inbox_dir = _inbox_dir()
+    timestamp_str = now.strftime("%Y%m%d-%H%M%S")
+    message_id = f"wos-pr-sweeper_{timestamp_str}"
     inbox_file = inbox_dir / f"{message_id}.json"
 
     # Build message text
-    lines = ["🔍 WOS PR Sweep Results\n"]
-    if summary["stale_open"]:
-        lines.append(f"**{len(summary['stale_open'])} stale open PRs** (>7 days):")
-        for item in summary["stale_open"][:5]:  # Limit to first 5
-            lines.append(f"  • PR #{item['pr_number']} ({item['repo']}) - {item['opened_days_ago']} days")
-        if len(summary["stale_open"]) > 5:
-            lines.append(f"  ... and {len(summary['stale_open']) - 5} more")
+    lines = ["WOS PR Sweep Results\n"]
+    if new_stale:
+        lines.append(f"{len(new_stale)} stale open PRs (>{STALE_OPEN_THRESHOLD_DAYS} days):")
+        for item in new_stale[:5]:
+            lines.append(f"  PR #{item['pr_number']} ({item['repo']}) - {item['opened_days_ago']} days")
+        if len(new_stale) > 5:
+            lines.append(f"  ... and {len(new_stale) - 5} more")
 
-    if summary["merged_pending_close"]:
-        lines.append(f"\n**{len(summary['merged_pending_close'])} merged PRs** with non-done UoWs:")
-        for item in summary["merged_pending_close"][:5]:
-            lines.append(f"  • PR #{item['pr_number']} ({item['repo']}) - UoW: {item['uow_status']}")
-        if len(summary["merged_pending_close"]) > 5:
-            lines.append(f"  ... and {len(summary['merged_pending_close']) - 5} more")
+    if new_pending:
+        lines.append(f"\n{len(new_pending)} merged PRs with non-done UoWs:")
+        for item in new_pending[:5]:
+            lines.append(f"  PR #{item['pr_number']} ({item['repo']}) - UoW: {item['uow_status']}")
+        if len(new_pending) > 5:
+            lines.append(f"  ... and {len(new_pending) - 5} more")
 
     message = {
+        "id": message_id,
         "message_id": message_id,
         "chat_id": int(os.environ.get("ADMIN_CHAT_ID", "0")),
-        "source": "wos_pr_sweep",
+        "source": os.environ.get("LOBSTER_DEFAULT_SOURCE", "telegram"),
         "type": "wos_pr_sweep_result",
         "text": "\n".join(lines),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": now.isoformat(),
         "category": "wos_pr_sweep_result",
         "data": {
-            "stale_open_count": len(summary["stale_open"]),
-            "merged_pending_close_count": len(summary["merged_pending_close"]),
+            "stale_open_count": len(new_stale),
+            "merged_pending_close_count": len(new_pending),
         },
     }
 
     if dry_run:
         print("DRY RUN: Would write inbox notification:")
         print(json.dumps(message, indent=2))
+        print(f"DRY RUN: Would update notification state for {len(new_stale) + len(new_pending)} PRs")
     else:
-        with inbox_file.open("w") as f:
-            json.dump(message, f, indent=2)
+        tmp = Path(str(inbox_file) + ".tmp")
+        tmp.write_text(json.dumps(message, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(inbox_file)
         log.info("Wrote inbox notification to %s", inbox_file)
+
+        # Update state so next run won't re-notify these PRs for NOTIFICATION_COOLDOWN_HOURS
+        now_iso = now.isoformat()
+        for item in new_stale + new_pending:
+            state[_pr_key(item)] = now_iso
+        _save_notification_state(state)
+        log.info("Updated notification state for %d PRs", len(new_stale) + len(new_pending))
 
 
 # ---------------------------------------------------------------------------

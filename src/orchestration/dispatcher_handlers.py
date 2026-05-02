@@ -565,6 +565,11 @@ WOS_MESSAGE_TYPE_DISPATCH: dict[str, str] = {
     # and returns a structured forensic report. Always returns action="spawn_subagent";
     # runs inside the spawn-gate block where the enforcement check is always satisfied.
     "wos_diagnose": "handle_wos_diagnose",
+    # PR sweeper result handler (PR #1034): written by wos-pr-sweeper.py (Type C cron-direct)
+    # when stale open PRs or merged PRs with non-done UoWs are detected.
+    # Returns action="send_reply" to surface the advisory report to Dan.
+    # Exempt from the spawn-gate — no UoW state is mutated, no subagent is needed.
+    "wos_pr_sweep_result": "handle_wos_pr_sweep_result",
 }
 
 
@@ -1304,6 +1309,48 @@ def parse_diagnose_command(text: str) -> str | None:
     return None
 
 
+def handle_wos_pr_sweep_result(msg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Handle a wos_pr_sweep_result inbox message by surfacing its report to the user.
+
+    Called by route_wos_message when the dispatcher receives a message with
+    type="wos_pr_sweep_result". This message type is written by the wos-pr-sweeper.py
+    Type C cron-direct script when it detects stale open PRs (>7 days) or merged
+    PRs whose associated UoW is still not in 'done' state.
+
+    The sweeper is read-only and advisory — it does not mutate UoW state. No subagent
+    is needed; the handler simply formats the sweep findings into a send_reply action
+    so the dispatcher can surface them to Dan.
+
+    This handler is exempt from the spawn-gate (see route_wos_message) because it
+    legitimately returns action="send_reply" — there is no UoW to dispatch.
+
+    Args:
+        msg: The raw inbox message dict. Expected fields:
+            - ``text`` (str): Human-readable sweep summary written by the sweeper.
+            - ``data`` (dict, optional): Structured counts:
+                - ``stale_open_count`` (int)
+                - ``merged_pending_close_count`` (int)
+            - ``chat_id`` (int): The chat to reply to.
+
+    Returns:
+        A dict with:
+            ``action`` (str): ``"send_reply"``
+            ``text`` (str): The sweep summary text.
+            ``chat_id`` (int): Taken from ``msg["chat_id"]`` if present.
+            ``message_type`` (str): ``"wos_pr_sweep_result"``.
+    """
+    _msg_type = "wos_pr_sweep_result"
+    text: str = msg.get("text", "(no sweep summary provided)")
+    chat_id: int = int(msg.get("chat_id", 0))
+    return {
+        "action": "send_reply",
+        "text": text,
+        "chat_id": chat_id,
+        "message_type": _msg_type,
+    }
+
+
 def _load_instructions_from_artifact(uow_id: str) -> str:
     """
     Load prescribed instructions from the WorkflowArtifact file for uow_id.
@@ -1446,6 +1493,33 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
                     f"({type(exc).__name__}: {exc}). "
                     f"Kill wave was NOT processed. "
                     "Check logs and re-queue manually if needed."
+                ),
+                "message_type": msg_type,
+            }
+
+    # ---------------------------------------------------------------------------
+    # wos_pr_sweep_result fast-path: dispatched before the spawn-gate because this
+    # handler is advisory-only — the sweeper is read-only and no subagent is needed.
+    # It legitimately returns action="send_reply" to surface sweep findings to Dan.
+    # ---------------------------------------------------------------------------
+    if msg_type == "wos_pr_sweep_result":
+        try:
+            sweep_result = handle_wos_pr_sweep_result(msg)
+            sweep_result["message_type"] = msg_type
+            return sweep_result
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).error(
+                "route_wos_message: handle_wos_pr_sweep_result raised %s: %s — "
+                "returning send_reply alert",
+                type(exc).__name__, exc,
+            )
+            return {
+                "action": "send_reply",
+                "text": (
+                    f"WOS PR sweep result handler raised an error "
+                    f"({type(exc).__name__}: {exc}). "
+                    "Check logs for sweep output details."
                 ),
                 "message_type": msg_type,
             }
