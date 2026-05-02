@@ -3172,6 +3172,21 @@ print(f'prune-pr-worktrees: {result.status}')
         warn "memory.db not found at $_db_path — skipping Migration 91"
     fi
 
+    # Migration 92: Add cron entry for wos-pr-sweeper
+    # Type C cron-direct script that scans WOS-associated PRs for stale open or
+    # unacknowledged merges. Runs every 6 hours. Surfaces PRs that need attention
+    # without modifying UoW state — reads and reports only.
+    local WOS_PR_SWEEPER_MARKER="# LOBSTER-WOS-PR-SWEEPER"
+    if ! crontab -l 2>/dev/null | grep -qF "$WOS_PR_SWEEPER_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$WOS_PR_SWEEPER_MARKER" \
+            "0 */6 * * * cd $LOBSTER_DIR && uv run scheduled-tasks/wos-pr-sweeper.py >> $LOBSTER_WORKSPACE/scheduled-jobs/logs/wos-pr-sweeper.log 2>&1 $WOS_PR_SWEEPER_MARKER" \
+            && substep "Added wos-pr-sweeper cron entry (Migration 92)" \
+            || warn "Could not add wos-pr-sweeper cron entry — check cron-manage.sh"
+        migrated=$((migrated + 1))
+    else
+        substep "wos-pr-sweeper cron entry already present — skipping"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
