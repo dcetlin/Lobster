@@ -25,6 +25,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from src.delivery.circadian import (
     flush_morning_queue,
+    is_morning_window,
     is_non_urgent,
     queue_message,
 )
@@ -95,6 +96,43 @@ class TestIsNonUrgent:
             text="Today's exploration: The Ship of Theseus and software identity.",
         )
         assert is_non_urgent(msg) is True
+
+
+# ---------------------------------------------------------------------------
+# is_morning_window
+# ---------------------------------------------------------------------------
+
+# Window bounds per spec: 06:00 <= hour < 10:00 (America/Los_Angeles)
+WINDOW_OPEN_HOUR = 6    # first hour inside the window
+WINDOW_LAST_HOUR = 9    # last hour inside the window
+WINDOW_CLOSE_HOUR = 10  # first hour outside (exclusive upper bound)
+BEFORE_WINDOW_HOUR = 5  # hour before the window opens
+
+
+def _make_now_fn(hour: int):
+    """Return a _now_fn callable that yields a fixed datetime at the given hour."""
+    from zoneinfo import ZoneInfo
+    _PACIFIC = ZoneInfo("America/Los_Angeles")
+    fixed = datetime(2026, 5, 2, hour, 0, 0, tzinfo=_PACIFIC)
+    return lambda: fixed
+
+
+class TestIsMorningWindow:
+    def test_window_open_hour_is_inside(self):
+        """hour=6 is the first hour of the window — must return True."""
+        assert is_morning_window(_now_fn=_make_now_fn(WINDOW_OPEN_HOUR)) is True
+
+    def test_window_last_hour_is_inside(self):
+        """hour=9 is the last valid hour — must return True."""
+        assert is_morning_window(_now_fn=_make_now_fn(WINDOW_LAST_HOUR)) is True
+
+    def test_window_close_hour_is_outside(self):
+        """hour=10 is just past the window (exclusive upper bound) — must return False."""
+        assert is_morning_window(_now_fn=_make_now_fn(WINDOW_CLOSE_HOUR)) is False
+
+    def test_before_window_is_outside(self):
+        """hour=5 is before the window opens — must return False."""
+        assert is_morning_window(_now_fn=_make_now_fn(BEFORE_WINDOW_HOUR)) is False
 
 
 # ---------------------------------------------------------------------------
