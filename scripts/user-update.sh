@@ -669,25 +669,6 @@ ISSUE_SWEEPER_TASK
         fi
     fi
 
-    # d8a: Add vision_ref column to uow_registry (Vision Object Phase 1)
-    # Adds the intent-anchor field that connects each UoW back to a specific
-    # Vision Object layer. NULL is correct for pre-existing rows.
-    local registry_db="$WORKSPACE_DIR/orchestration/registry.db"
-    if [ -f "$registry_db" ]; then
-        if ! python3 -c "
-import sqlite3, sys
-conn = sqlite3.connect('$registry_db')
-cols = [row[1] for row in conn.execute('PRAGMA table_info(uow_registry)').fetchall()]
-conn.close()
-sys.exit(0 if 'vision_ref' in cols else 1)
-" 2>/dev/null; then
-            sqlite3 "$registry_db" "ALTER TABLE uow_registry ADD COLUMN vision_ref TEXT DEFAULT NULL;" 2>/dev/null && \
-                substep "Added vision_ref column to uow_registry" || \
-                warn "Could not add vision_ref column to uow_registry (non-fatal: column added at schema init for new installs)"
-            migrated=$((migrated + 1))
-        fi
-    fi
-
     # d8b: Normalize abbreviated legacy route_reason rows in uow_registry.
     # Canonical value is "phase1-default: no classifier" — updates abbreviated rows.
     local registry_db="$WORKSPACE_DIR/orchestration/registry.db"
