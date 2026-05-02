@@ -159,8 +159,14 @@ except Exception as _db_import_err:
 
 # Memory system (optional — gracefully degrades to static file search)
 _memory_provider = None
+# VALID_SIGNAL_TYPES is imported here so the memory_store tool schema enum
+# is derived from the single source of truth in provider.py rather than
+# duplicated as a raw string list. See learnings.md mirror-constant pattern.
+_VALID_SIGNAL_TYPES_FOR_SCHEMA: list[str] = []
 try:
     from memory import create_memory_provider, MemoryEvent
+    from memory.provider import VALID_SIGNAL_TYPES as _VALID_SIGNAL_TYPES
+    _VALID_SIGNAL_TYPES_FOR_SCHEMA = sorted(_VALID_SIGNAL_TYPES)
     _memory_provider = create_memory_provider(use_vector=True)
 except Exception as _mem_err:
     # Memory system is optional; log and continue
@@ -3353,6 +3359,20 @@ async def list_tools() -> list[Tool]:
                             "'neutral' for observations with no strong directional signal (default)."
                         ),
                         "default": "neutral",
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Short noun-phrase label for what this event is about (e.g. 'OAuth implementation', 'hiking trip planning').",
+                    },
+                    "signal_type_hint": {
+                        "type": "string",
+                        # Derived from VALID_SIGNAL_TYPES in memory/provider.py — do not hardcode here.
+                        # _VALID_SIGNAL_TYPES_FOR_SCHEMA is populated at server startup from the same
+                        # frozenset that runtime validation uses. If memory is unavailable, the enum
+                        # key is omitted and the schema accepts any string (runtime validation still
+                        # applies via handle_memory_store).
+                        **( {"enum": _VALID_SIGNAL_TYPES_FOR_SCHEMA} if _VALID_SIGNAL_TYPES_FOR_SCHEMA else {} ),
+                        "description": "Caller's pre-classification of the event's signal type. When provided, the slow-reclassifier will use this value and skip content inference.",
                     },
                     "task_id": {
                         "type": "string",
@@ -8996,9 +9016,20 @@ async def handle_memory_store(arguments: dict[str, Any]) -> list[TextContent]:
         )
         return [TextContent(type="text", text=f"Skipped: event type '{event_type}' is excluded from memory ingestion.")]
 
-    from memory.provider import VALENCE_VALUES
+    from memory.provider import VALENCE_VALUES, VALID_SIGNAL_TYPES
     raw_valence = arguments.get("valence", "neutral")
     valence = raw_valence if raw_valence in VALENCE_VALUES else "neutral"
+
+    # Validate signal_type_hint if provided
+    signal_type_hint = arguments.get("signal_type_hint")
+    if signal_type_hint is not None and signal_type_hint not in VALID_SIGNAL_TYPES:
+        return [TextContent(
+            type="text",
+            text=f"Error: invalid signal_type_hint '{signal_type_hint}'. Must be one of: {', '.join(sorted(VALID_SIGNAL_TYPES))}"
+        )]
+
+    subject = arguments.get("subject")
+
     metadata = {"tags": arguments.get("tags", [])}
     chat_id_arg = arguments.get("chat_id")
     if chat_id_arg is not None:
@@ -9013,6 +9044,8 @@ async def handle_memory_store(arguments: dict[str, Any]) -> list[TextContent]:
         content=content,
         metadata=metadata,
         valence=valence,
+        subject=subject,
+        signal_type_hint=signal_type_hint,
     )
 
     try:

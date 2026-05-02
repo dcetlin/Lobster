@@ -143,7 +143,9 @@ class VectorMemory:
                 metadata TEXT DEFAULT '{}',
                 consolidated INTEGER DEFAULT 0,
                 created_at TEXT DEFAULT (datetime('now')),
-                valence TEXT DEFAULT 'neutral' CHECK(valence IN ('golden', 'smell', 'neutral'))
+                valence TEXT DEFAULT 'neutral' CHECK(valence IN ('golden', 'smell', 'neutral')),
+                subject TEXT,
+                signal_type_hint TEXT
             )
         """)
 
@@ -157,6 +159,21 @@ class VectorMemory:
             conn.commit()
         except Exception:
             # Column already exists — expected on new installs after CREATE TABLE
+            pass
+
+        # Add subject and signal_type_hint columns to existing databases.
+        # ALTER TABLE is a no-op on new databases (the columns are in CREATE TABLE above).
+        try:
+            conn.execute("ALTER TABLE events ADD COLUMN subject TEXT")
+            conn.commit()
+        except Exception:
+            # Column already exists
+            pass
+        try:
+            conn.execute("ALTER TABLE events ADD COLUMN signal_type_hint TEXT")
+            conn.commit()
+        except Exception:
+            # Column already exists
             pass
 
         # Create FTS5 virtual table for keyword search
@@ -234,8 +251,8 @@ class VectorMemory:
 
         cursor = self._conn.execute(
             """
-            INSERT INTO events (timestamp, type, source, project, content, metadata, consolidated, valence)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO events (timestamp, type, source, project, content, metadata, consolidated, valence, subject, signal_type_hint)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.timestamp.isoformat(),
@@ -246,6 +263,8 @@ class VectorMemory:
                 json.dumps(event.metadata),
                 1 if event.consolidated else 0,
                 valence,
+                event.subject,
+                event.signal_type_hint,
             ),
         )
         event_id = cursor.lastrowid
@@ -547,6 +566,17 @@ class VectorMemory:
         except (IndexError, KeyError):
             valence = "neutral"
 
+        # subject and signal_type_hint columns may be absent on DBs not yet migrated
+        try:
+            subject = row["subject"]
+        except (IndexError, KeyError):
+            subject = None
+
+        try:
+            signal_type_hint = row["signal_type_hint"]
+        except (IndexError, KeyError):
+            signal_type_hint = None
+
         return MemoryEvent(
             id=row["id"],
             timestamp=ts,
@@ -557,4 +587,6 @@ class VectorMemory:
             metadata=metadata,
             consolidated=bool(row["consolidated"]),
             valence=valence,
+            subject=subject,
+            signal_type_hint=signal_type_hint,
         )
