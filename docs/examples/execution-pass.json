@@ -1,0 +1,58 @@
+{
+  "diagnosis": {
+    "signal": "UoW uow_20260430_7c8d9e entered ready-for-steward on first execution; source is GitHub issue #1042 requesting addition of the --dry-run flag to the registry CLI.",
+    "reentry_posture": "first_execution",
+    "completion_gap": "",
+    "executor_outcome": null,
+    "prior_cycle_count": 0
+  },
+  "prescription": {
+    "summary": "Add a --dry-run flag to the registry CLI (registry_cli.py) that prints planned mutations without writing to the database.",
+    "instructions": "Implement the --dry-run flag for the registry CLI as described in GitHub issue #1042.\n\n1. Read the issue: gh issue view 1042 --repo SiderealPress/lobster\n2. Create a worktree branch: git worktree add ~/lobster-workspace/projects/lobster-1042 feat/issue-1042-dry-run\n3. Add --dry-run to the CLI argument parser in src/orchestration/registry_cli.py\n4. When --dry-run is set, print each planned DB mutation as 'DRY-RUN: <mutation>' and return without executing\n5. Add a test in tests/unit/test_orchestration/test_registry_cli.py covering the --dry-run path\n6. Open a PR: gh pr create --repo SiderealPress/lobster --title 'feat: add --dry-run flag to registry CLI (#1042)'\n\nMinimum viable output: PR opened against main with the --dry-run implementation and at least one passing test.\nBoundary: do not modify registry.py, schema.sql, or any migration files.",
+    "estimated_cycles": 1,
+    "minimum_viable_output": "PR opened against main with the --dry-run implementation and at least one passing test",
+    "boundary": "do not modify registry.py, schema.sql, or any migration files"
+  },
+  "workflow": {
+    "agent_type": "functional-engineer",
+    "steps": [
+      "Read GitHub issue #1042 for full requirements",
+      "Create feature branch via git worktree",
+      "Implement --dry-run flag in registry_cli.py",
+      "Write test covering --dry-run path",
+      "Open PR against main"
+    ],
+    "fan_out": null
+  },
+  "constraints": {
+    "boundary": "do not modify registry.py, schema.sql, or any migration files",
+    "no_modify": [
+      "src/orchestration/registry.py",
+      "src/orchestration/schema.sql"
+    ],
+    "no_deploy": false,
+    "max_cycles": 2
+  },
+  "success_criteria": {
+    "check": "A PR is open against main in SiderealPress/lobster with title containing '#1042'. The PR diff includes changes to registry_cli.py and a new or modified test file. Tests pass in CI.",
+    "artifacts": [],
+    "commands": [
+      "gh pr list --repo SiderealPress/lobster --state open --search '1042'"
+    ],
+    "gate_command": null
+  },
+  "dan_context": {
+    "orientation": "This is a standalone CLI improvement; no dependencies on other active UoWs.",
+    "priority_signal": "Requested by Dan for use in the WOS sprint runbook — needed before the next sprint planning session.",
+    "open_questions": [],
+    "load_bearing_assumption": "Issue #1042 is open and unassigned; no duplicate work is in progress."
+  },
+  "audit_metadata": {
+    "uow_id": "uow_20260430_7c8d9e",
+    "cycle": 0,
+    "executor_posture": "first_execution",
+    "schema_version": "1.0.0",
+    "prescribed_at": "2026-04-30T09:00:00Z",
+    "prescribed_skills": ["functional-engineer"]
+  }
+}
