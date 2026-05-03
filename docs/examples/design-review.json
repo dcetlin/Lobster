@@ -1,0 +1,68 @@
+{
+  "diagnosis": {
+    "signal": "UoW uow_20260428_d4e5f6 returned from first execution with outcome=partial; Executor determined that the proposed API schema change requires independent security and ergonomics review before a recommendation can be made.",
+    "reentry_posture": "execution_partial",
+    "completion_gap": "Executor completed investigation but flagged that the design decision requires two independent perspectives before a recommendation is safe to make.",
+    "executor_outcome": "partial",
+    "prior_cycle_count": 1
+  },
+  "prescription": {
+    "summary": "Conduct parallel security and ergonomics review of the proposed v2 API schema; merge findings into a single recommendation document.",
+    "instructions": "Two parallel Executor agents will review the proposed v2 API schema (see ~/lobster-workspace/workstreams/uow_20260428_d4e5f6/proposed-schema.json).\n\nAgent 1 (security focus): Evaluate the proposed schema for authentication gaps, data exposure risks, and injection surface area. Write findings to ~/lobster-workspace/workstreams/uow_20260428_d4e5f6/security-review.md.\n\nAgent 2 (ergonomics focus): Evaluate the proposed schema for API consistency, naming conventions, and consumer usability. Write findings to ~/lobster-workspace/workstreams/uow_20260428_d4e5f6/ergonomics-review.md.\n\nAfter both agents complete, the Steward will merge findings into a final recommendation.\n\nMinimum viable output: Both review documents present and non-empty.\nBoundary: do not modify the proposed schema or any production API files.",
+    "estimated_cycles": 2,
+    "minimum_viable_output": "Both security-review.md and ergonomics-review.md present and non-empty",
+    "boundary": "do not modify the proposed schema or any production API files"
+  },
+  "workflow": {
+    "agent_type": "lobster-generalist",
+    "steps": [
+      "Merge findings from security-review.md and ergonomics-review.md",
+      "Produce a single recommendation document with a clear go/no-go signal"
+    ],
+    "fan_out": [
+      {
+        "agent_type": "lobster-generalist",
+        "focus": "Security review: authentication gaps, data exposure, injection surface",
+        "task_id_suffix": "-security"
+      },
+      {
+        "agent_type": "lobster-generalist",
+        "focus": "Ergonomics review: API consistency, naming conventions, consumer usability",
+        "task_id_suffix": "-ergonomics"
+      }
+    ]
+  },
+  "constraints": {
+    "boundary": "do not modify the proposed schema or any production API files",
+    "no_modify": [
+      "~/lobster-workspace/workstreams/uow_20260428_d4e5f6/proposed-schema.json"
+    ],
+    "no_deploy": true,
+    "max_cycles": 3
+  },
+  "success_criteria": {
+    "check": "Both security-review.md and ergonomics-review.md exist and are non-empty. Each contains a section titled 'Findings' and a section titled 'Recommendation'.",
+    "artifacts": [
+      "~/lobster-workspace/workstreams/uow_20260428_d4e5f6/security-review.md",
+      "~/lobster-workspace/workstreams/uow_20260428_d4e5f6/ergonomics-review.md"
+    ],
+    "commands": [],
+    "gate_command": null
+  },
+  "dan_context": {
+    "orientation": "This is the second cycle of the v2 API schema review; the first cycle surfaced the need for independent perspectives.",
+    "priority_signal": "The v2 API is blocking two downstream features; the review needs to resolve before those can proceed.",
+    "open_questions": [
+      "Should the security reviewer also evaluate the authentication token refresh flow, or is that out of scope for this UoW?"
+    ],
+    "load_bearing_assumption": "proposed-schema.json at the workstream path reflects the latest version discussed in the design session."
+  },
+  "audit_metadata": {
+    "uow_id": "uow_20260428_d4e5f6",
+    "cycle": 1,
+    "executor_posture": "continuation",
+    "schema_version": "1.0.0",
+    "prescribed_at": "2026-04-28T19:15:00Z",
+    "prescribed_skills": []
+  }
+}
