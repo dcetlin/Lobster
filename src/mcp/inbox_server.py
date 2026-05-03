@@ -3233,6 +3233,10 @@ async def list_tools() -> list[Tool]:
                         "description": "Optional labels to apply (e.g., ['urgent', 'project:xyz']).",
                         "items": {"type": "string"},
                     },
+                    "item_owner": {
+                        "type": "string",
+                        "description": "Who owns this action item: 'dan' (Dan needs to do this) or 'lobster' (Lobster will execute this). Defaults to 'dan' if omitted.",
+                    },
                 },
                 "required": ["owner", "repo", "brain_dump_issue", "title"],
             },
@@ -8721,6 +8725,7 @@ async def handle_create_action_item(args: dict) -> list[TextContent]:
     title = args.get("title", "").strip()
     body = args.get("body", "").strip()
     labels = args.get("labels", [])
+    item_owner = args.get("item_owner", "dan").strip().lower() or "dan"
 
     if not owner or not repo:
         return [TextContent(type="text", text="Error: owner and repo are required.")]
@@ -8738,6 +8743,8 @@ async def handle_create_action_item(args: dict) -> list[TextContent]:
         issue_body_lines.append(body)
         issue_body_lines.append("")
 
+    issue_body_lines.append(f"owner: {item_owner}")
+    issue_body_lines.append("")
     issue_body_lines.append("---")
     issue_body_lines.append(f"**Source:** Brain dump #{brain_dump_issue}")
     issue_body_lines.append("")
@@ -11035,7 +11042,7 @@ async def reconcile_agent_sessions() -> None:
     that does not exist on this system — and even if fixed, Claude Code places
     output symlinks in project-specific subdirectories, not a flat tasks dir.
     """
-    from agents.session_store import check_output_file_status, get_output_file_mtime
+    from agents.session_store import check_output_file_status, get_output_file_mtime, get_workstream_status_mtime
 
     DEFAULT_DEAD_THRESHOLD_SECONDS = 30 * 60   # 30 minutes — fallback for missing output files
     DEFAULT_DEAD_THRESHOLD_RUNNING_SECONDS = 120 * 60  # 120 minutes — fallback for stuck tool_use files
@@ -11046,6 +11053,7 @@ async def reconcile_agent_sessions() -> None:
     # immediately. 15 minutes gives ample margin to avoid false positives during slow
     # tool calls, while cutting the misclassification window from 120 min → 30 min.
     MTIME_STALE_THRESHOLD_SECONDS = 15 * 60    # 15 minutes
+    WORKSTREAM_STATUS_STALE_SECONDS = 600       # 10 min stale threshold for status.md liveness
 
     # Startup sweep: re-send notifications for sessions that completed while down
     await _startup_sweep()
@@ -11152,27 +11160,36 @@ async def reconcile_agent_sessions() -> None:
                     #      stops updating immediately; detectable within 15 minutes.
                     #   2. Legitimately slow tool call — mtime keeps ticking; leave alone.
                     #
-                    # Mtime gate (issue #868): if the output file has been idle for
-                    # MTIME_STALE_THRESHOLD_SECONDS, use the short threshold (same as
-                    # the "missing file" branch) rather than the generous 120-minute cap.
-                    # This closes the gap where interrupted agents are misclassified as
-                    # "still running" for up to 120 minutes.
+                    # Two staleness signals feed the same short-threshold gate:
+                    # - Mtime gate (issue #868): output file idle >15 min.
+                    # - Workstream gate: workstream/status.md idle >10 min (earlier signal
+                    #   for long-running dispatches that update status.md every ~5 min).
+                    # Either signal is sufficient; output_file logic is fallback when
+                    # no workstream directory exists.
+                    task_id = session.get("task_id")
+                    ws_mtime = get_workstream_status_mtime(task_id) if task_id else None
                     output_mtime = get_output_file_mtime(output_file)
                     now_ts = time.time()
+                    ws_is_stale = (
+                        ws_mtime is not None
+                        and (now_ts - ws_mtime) > WORKSTREAM_STATUS_STALE_SECONDS
+                    )
                     file_is_stale = (
                         output_mtime is not None
                         and (now_ts - output_mtime) > MTIME_STALE_THRESHOLD_SECONDS
                     )
+                    effective_stale = ws_is_stale or file_is_stale
                     effective_running_threshold = (
-                        dead_threshold_missing if file_is_stale else dead_threshold_running
+                        dead_threshold_missing if effective_stale else dead_threshold_running
                     )
 
                     if elapsed > effective_running_threshold:
-                        stale_note = (
-                            f", file idle {int(now_ts - output_mtime)}s (mtime gate active)"
-                            if file_is_stale
-                            else ""
-                        )
+                        if ws_is_stale:
+                            stale_note = f", workstream/status.md idle {int(now_ts - ws_mtime)}s (ws gate active)"
+                        elif file_is_stale:
+                            stale_note = f", file idle {int(now_ts - output_mtime)}s (mtime gate active)"
+                        else:
+                            stale_note = ""
                         log.warning(
                             f"[reconciler] Agent {agent_id!r} output stuck at tool_use "
                             f"after {elapsed}s (>{effective_running_threshold}s{stale_note}) "
@@ -11182,8 +11199,8 @@ async def reconcile_agent_sessions() -> None:
                             id_or_task_id=agent_id,
                             status="dead",
                             result_summary=(
-                                f"Auto-closed by reconciler: output idle "
-                                f"after {elapsed}s"
+                                f"Auto-closed by reconciler: output idle after {elapsed}s"
+                                + (f" (workstream/status.md stale {int(now_ts - ws_mtime)}s)" if ws_is_stale else "")
                                 + (f" (mtime stale {int(now_ts - output_mtime)}s)" if file_is_stale else "")
                             ),
                         )
