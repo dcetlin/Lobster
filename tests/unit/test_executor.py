@@ -923,3 +923,113 @@ class TestDispatchViaInbox:
         output_ref = _get_output_ref(db_path, uow_id)
         result_data = _read_result_json(output_ref)
         assert result_data.get("executor_id") == expected_run_id
+
+
+# ---------------------------------------------------------------------------
+# Dispatch boundary log tests
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchBoundaryLog:
+    """Tests for _log_dispatch_boundary and the dispatch boundary contract.
+
+    The dispatch boundary log records every inbox dispatch attempt with
+    structured JSONL records.  The contract is:
+      - outcome is always "success" or "failure" (never "retry")
+      - dispatch_attempt is always 1 (no retry loop exists)
+    """
+
+    def test_success_record_contains_required_fields(self, tmp_path: Path) -> None:
+        """A successful dispatch writes a record with all required fields."""
+        from orchestration.executor import _log_dispatch_boundary
+        import orchestration.executor as executor_mod
+
+        log_file = tmp_path / "dispatch-boundary.jsonl"
+        orig = executor_mod._DISPATCH_BOUNDARY_LOG_TEMPLATE
+        executor_mod._DISPATCH_BOUNDARY_LOG_TEMPLATE = str(log_file)
+        try:
+            _log_dispatch_boundary(
+                uow_id="uow_test_001",
+                dispatch_attempt=1,
+                outcome="success",
+                msg_id="msg-abc",
+            )
+            records = [json.loads(line) for line in log_file.read_text().splitlines()]
+            assert len(records) == 1
+            rec = records[0]
+            assert rec["uow_id"] == "uow_test_001"
+            assert rec["dispatch_attempt"] == 1
+            assert rec["outcome"] == "success"
+            assert rec["msg_id"] == "msg-abc"
+            assert "failure_reason" not in rec
+            assert "ts" in rec
+        finally:
+            executor_mod._DISPATCH_BOUNDARY_LOG_TEMPLATE = orig
+
+    def test_failure_record_contains_failure_reason(self, tmp_path: Path) -> None:
+        """A failed dispatch writes a record with failure_reason."""
+        from orchestration.executor import _log_dispatch_boundary
+        import orchestration.executor as executor_mod
+
+        log_file = tmp_path / "dispatch-boundary.jsonl"
+        orig = executor_mod._DISPATCH_BOUNDARY_LOG_TEMPLATE
+        executor_mod._DISPATCH_BOUNDARY_LOG_TEMPLATE = str(log_file)
+        try:
+            _log_dispatch_boundary(
+                uow_id="uow_test_002",
+                dispatch_attempt=1,
+                outcome="failure",
+                failure_reason="inbox_write_failed: disk full",
+            )
+            records = [json.loads(line) for line in log_file.read_text().splitlines()]
+            assert len(records) == 1
+            rec = records[0]
+            assert rec["outcome"] == "failure"
+            assert rec["failure_reason"] == "inbox_write_failed: disk full"
+            assert "msg_id" not in rec
+        finally:
+            executor_mod._DISPATCH_BOUNDARY_LOG_TEMPLATE = orig
+
+    def test_dispatch_via_inbox_always_logs_attempt_1(self, tmp_path: Path) -> None:
+        """_dispatch_via_inbox always logs dispatch_attempt=1 (no retry loop)."""
+        import orchestration.executor as executor_mod
+
+        log_file = tmp_path / "dispatch-boundary.jsonl"
+        inbox_dir = tmp_path / "inbox"
+
+        orig_log = executor_mod._DISPATCH_BOUNDARY_LOG_TEMPLATE
+        orig_inbox = executor_mod._INBOX_DIR_TEMPLATE
+        executor_mod._DISPATCH_BOUNDARY_LOG_TEMPLATE = str(log_file)
+        executor_mod._INBOX_DIR_TEMPLATE = str(inbox_dir)
+        try:
+            _dispatch_via_inbox("test instructions", "uow_attempt_check")
+            records = [json.loads(line) for line in log_file.read_text().splitlines()]
+            assert len(records) == 1
+            assert records[0]["dispatch_attempt"] == 1
+            assert records[0]["outcome"] == "success"
+        finally:
+            executor_mod._DISPATCH_BOUNDARY_LOG_TEMPLATE = orig_log
+            executor_mod._INBOX_DIR_TEMPLATE = orig_inbox
+
+    def test_log_write_failure_does_not_raise(self, tmp_path: Path) -> None:
+        """Boundary log write failures are non-blocking (best-effort)."""
+        import orchestration.executor as executor_mod
+        from orchestration.executor import _log_dispatch_boundary
+
+        # Point to a path that cannot be created (file where dir expected)
+        blocker = tmp_path / "blocker"
+        blocker.write_text("not a directory")
+        bad_path = str(blocker / "subdir" / "dispatch-boundary.jsonl")
+
+        orig = executor_mod._DISPATCH_BOUNDARY_LOG_TEMPLATE
+        executor_mod._DISPATCH_BOUNDARY_LOG_TEMPLATE = bad_path
+        try:
+            # Should not raise — failure is swallowed and logged via logger
+            _log_dispatch_boundary(
+                uow_id="uow_test_003",
+                dispatch_attempt=1,
+                outcome="success",
+                msg_id="msg-xyz",
+            )
+        finally:
+            executor_mod._DISPATCH_BOUNDARY_LOG_TEMPLATE = orig
