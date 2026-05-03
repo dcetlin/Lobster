@@ -3220,6 +3220,35 @@ print(f'prune-pr-worktrees: {result.status}')
     fi
 
 
+    # Migration 95: Schedule pending-actions-nudge (systemd timer, crontab fallback)
+    # Type B cron-direct script that queries open action-item GitHub issues owned
+    # by Dan, buckets by age (3d/7d/14d), and sends a Telegram nudge if any bucket
+    # is non-empty. Runs daily at 15:00 UTC (07:00 PDT / 08:00 PST).
+    local PENDING_NUDGE_TIMER="lobster-pending-actions-nudge.timer"
+    local PENDING_NUDGE_SERVICE="lobster-pending-actions-nudge.service"
+    if ! systemctl is-enabled --quiet "$PENDING_NUDGE_TIMER" 2>/dev/null; then
+        local _pn_timer_src="$LOBSTER_DIR/services/$PENDING_NUDGE_TIMER"
+        local _pn_svc_src="$LOBSTER_DIR/services/$PENDING_NUDGE_SERVICE"
+        local _dst="/etc/systemd/system"
+        if [ -f "$_pn_timer_src" ] && [ -f "$_pn_svc_src" ]; then
+            if sudo cp "$_pn_timer_src" "$_dst/$PENDING_NUDGE_TIMER" \
+                && sudo cp "$_pn_svc_src" "$_dst/$PENDING_NUDGE_SERVICE"; then
+                sudo systemctl daemon-reload 2>/dev/null || true
+                sudo systemctl enable --now "$PENDING_NUDGE_TIMER" 2>/dev/null \
+                    && substep "Installed and enabled $PENDING_NUDGE_TIMER (Migration 95)" \
+                    || warn "Could not enable $PENDING_NUDGE_TIMER — check systemd permissions"
+                migrated=$((migrated + 1))
+            else
+                warn "Could not install $PENDING_NUDGE_TIMER systemd units"
+            fi
+        else
+            warn "Migration 95: service files not found in $LOBSTER_DIR/services/ — run after git pull"
+        fi
+    else
+        substep "pending-actions-nudge timer already installed — skipping"
+    fi
+
+
     # Migration 94: Register decision-router PostToolUse hook in settings.json.
     # Routes decision: footer blocks from send_reply messages to the decisions ledger.
     # Appends extracted decision text to ~/lobster-workspace/data/decisions-ledger.md.

@@ -172,7 +172,10 @@ If a file does not exist, skip it and continue — missing context files are not
    - Priority: `urgent`, `review-soon`, `someday`
    - Status: `needs-action`, `for-reference`, `needs-research`
 
-2. **Extract action items** — look for implicit todos ("need to", "should", "want to") and explicit todos ("todo", "remember to", "don't forget")
+2. **Extract action items** — look for implicit todos ("need to", "should", "want to") and explicit todos ("todo", "remember to", "don't forget"). For each action item, classify the owner:
+   - `owner: dan` — Dan needs to do this (decisions, human tasks, requires Dan's judgment or personal action)
+   - `owner: lobster` — Lobster will execute this (coding tasks, research, automated work, anything Lobster can do autonomously)
+   - Default to `owner: dan` when unclear. When calling `create_action_item`, always pass `item_owner` with the classified value.
 
 3. **Generate suggested next steps** based on content and context matches
 
