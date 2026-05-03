@@ -2235,6 +2235,11 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Optional: chat_id of the user who owns this task.",
                     },
+                    "principle_weights": {
+                        "type": "object",
+                        "description": "Optional: epistemic principle weight vector. Keys: pattern_perception, structural_coherence, attunement_over_assumption, elegant_economy, minimal_cognitive_friction. Values: 0.0-1.0.",
+                        "additionalProperties": {"type": "number"},
+                    },
                 },
                 "required": ["subject"],
             },
@@ -6562,6 +6567,10 @@ async def handle_create_task(args: dict) -> list[TextContent]:
     }
     if chat_id is not None:
         task["chat_id"] = chat_id
+
+    principle_weights = args.get("principle_weights")
+    if principle_weights is not None:
+        task["principle_weights"] = principle_weights
 
     data["tasks"].append(task)
     data["next_id"] = task_id + 1

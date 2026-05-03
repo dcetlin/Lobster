@@ -13,3 +13,14 @@
 
 ## Items Needing Follow-up
 <!-- Populated automatically -->
+
+## Principle Audit
+<!-- Populated by nightly consolidation when principle_weights were assigned.
+
+For each response sent in the past 24 hours where principle_weights were assigned:
+- attunement_over_assumption > 0.8: did the response name causal vs symptom layers?
+- elegant_economy > 0.8: did the response stay near minimum viable output?
+- minimal_cognitive_friction > 0.8: did the response lead with signal?
+
+Flag any case where the weight was high but the behavioral marker is absent.
+Candidates for lessons.md promotion (requires 2-session confirmation before promoting). -->
