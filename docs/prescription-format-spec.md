@@ -1,8 +1,34 @@
 # Prescription Format Specification
 
 *WOS-UoW: uow_20260502_08b895*
-*Schema version: 1.0.0*
-*Effective: 2026-05-03*
+*Schema version: 0.1.0*
+*Status: Design Specification — Not Yet Implemented*
+
+---
+
+> **IMPORTANT — Design Specification, Not Production Format**
+>
+> This document specifies the **v2 prescription format** that the WOS pipeline is being
+> designed to adopt. It does **not** describe the format currently produced by the Steward
+> or consumed by the Executor in production.
+>
+> **Current production format:** The production Steward writes `WorkflowArtifact` — a
+> flat 5-field front-matter + prose `.md` format (`uow_id`, `executor_type`,
+> `constraints`, `prescribed_skills`, `instructions`) as defined in
+> `src/orchestration/workflow_artifact.py`. The Executor reads this format via
+> `from_frontmatter()`. The 7-section JSON structure described in this spec is **not**
+> what `steward.py` currently writes or what `executor.py` currently reads.
+>
+> **Implementation track:** The v2 format will be implemented in issues
+> [#574](https://github.com/dcetlin/Lobster/issues/574) (Steward v2 prescription
+> generation), [#576](https://github.com/dcetlin/Lobster/issues/576) (migration
+> framework), [#577](https://github.com/dcetlin/Lobster/issues/577) (evaluation pass),
+> and [#578](https://github.com/dcetlin/Lobster/issues/578) (observability). Until those
+> issues are resolved, this spec describes the **target format**, not the current
+> production behavior.
+>
+> Any agent using this document as orientation should consult `src/orchestration/workflow_artifact.py`
+> for the authoritative description of the current production prescription format.
 
 ---
 
@@ -39,10 +65,12 @@ upstream signal that moved the UoW from `ready-for-steward` into the prescribe b
 | `completion_gap` | string | yes | Human-readable rationale for why the UoW is not yet `done`. On `first_execution` this is an empty string. | String; may be empty only when `reentry_posture == "first_execution"`. |
 | `executor_outcome` | string or null | yes | The `outcome` field from the Executor's `result.json`, if present. Null on first execution or when no result file exists. | Enum: `complete`, `partial`, `failed`, `blocked`, or `null`. |
 | `prior_cycle_count` | integer | yes | `steward_cycles` value at the time this prescription was produced. Zero on first execution. | Integer ≥ 0. |
+| `corrective_intent` | boolean | no | When `true`, signals that this prescription is specifically designed to correct a prior failure — not merely retry. Used as a machine-traceable indicator for the `remediation` posture. | Boolean. May be omitted when `executor_posture != "remediation"`. |
 
 **Invariants:**
 - When `reentry_posture == "first_execution"`, `prior_cycle_count` must be `0` and `completion_gap` must be `""`.
 - When `executor_outcome` is non-null, it must be one of the `ExecutorOutcome` values defined in `executor-contract.md`.
+- When `audit_metadata.executor_posture == "remediation"`, the Steward should set `corrective_intent = true` to provide an auditable trace signal. The schema does not enforce this — it is a Steward prescriber responsibility.
 
 ---
 
@@ -173,8 +201,22 @@ upstream signal that moved the UoW from `ready-for-steward` into the prescribe b
   - `first_execution` → `first_execution`
   - Any orphan posture (`executor_orphan`, `executing_orphan`, `diagnosing_orphan`) → `continuation`
   - `execution_complete` with `is_complete=False`, `execution_partial`, `execution_failed` → `continuation`
-  - `execution_failed` with corrective intent → `remediation`
+  - `execution_failed` with `diagnosis.corrective_intent == true` → `remediation` (see note below)
   - `execution_blocked` after unblock → `continuation`
+
+> **Note — `remediation` posture and corrective intent:** The distinction between
+> `execution_failed → continuation` and `execution_failed → remediation` is a
+> **human-judgment call made by the Steward LLM prescriber**. It is not enforced by the
+> JSON Schema — the schema permits `executor_posture = "remediation"` without requiring
+> any specific field value in `diagnosis`. The Steward prescriber must set
+> `executor_posture = "remediation"` only when the prescription is specifically designed
+> to correct a prior failure (e.g., addressing a root cause identified in the prior
+> cycle, not merely retrying the same instructions). To make this judgment machine-
+> traceable, the schema includes an optional `diagnosis.corrective_intent` boolean field:
+> when `executor_posture = "remediation"`, the Steward should set
+> `diagnosis.corrective_intent = true`. This field is advisory — its absence does not
+> invalidate a prescription — but its presence provides an auditable signal for the
+> corrective-trace system.
 
 ---
 

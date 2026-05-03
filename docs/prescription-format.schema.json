@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/SiderealPress/lobster/docs/prescription-format.schema.json",
+  "$id": "https://github.com/dcetlin/Lobster/blob/main/docs/prescription-format.schema.json",
   "title": "WOS Prescription",
   "description": "Formal schema for the 7-section prescription format produced by the Steward and consumed by the Executor in the Lobster Work Orchestration System (WOS) pipeline. Schema version 1.0.0.",
   "type": "object",
@@ -67,6 +67,10 @@
           "type": "integer",
           "minimum": 0,
           "description": "steward_cycles value at the time this prescription was produced. Zero on first execution."
+        },
+        "corrective_intent": {
+          "type": "boolean",
+          "description": "When true, signals that this prescription is specifically designed to correct a prior failure. Advisory field — the Steward should set this when audit_metadata.executor_posture is 'remediation'. Not enforced by the schema."
         }
       }
     },
