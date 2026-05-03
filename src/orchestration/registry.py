@@ -580,6 +580,13 @@ class Registry:
         file_scope: list[str] | None = None,
     ) -> UpsertResult:
         """Core upsert logic returning typed UpsertResult."""
+        if issue_number is None:
+            raise ValueError(
+                "issue_number must not be None: the dedup query "
+                "'WHERE source_issue_number = ?' silently returns no rows for NULL, "
+                "allowing duplicate UoW rows to be created for the same issue."
+            )
+
         if sweep_date is None:
             sweep_date = datetime.now(timezone.utc).date().isoformat()
 
@@ -594,19 +601,21 @@ class Registry:
             conn.execute("BEGIN IMMEDIATE")
 
             # Cross-sweep-date pre-check: any non-terminal record for this issue?
-            # 'cancelled' is a terminal status (UoWStatus.CANCELLED) that allows
-            # re-proposal after a cancellation.
-            # 'closed' is a legacy DB status predating the UoWStatus enum; treat it
-            # as terminal so that legacy rows do not permanently block re-proposal.
+            # Uses _TERMINAL_STATUSES_FOR_ISSUE_CHECK as the single source of truth
+            # for what counts as terminal — same constant used by has_active_uow_for_issue.
+            # This eliminates the risk of the two lists drifting when new statuses are added.
+            _terminal_placeholders = ", ".join(
+                "?" * len(self._TERMINAL_STATUSES_FOR_ISSUE_CHECK)
+            )
             existing = conn.execute(
-                """
+                f"""
                 SELECT id, status FROM uow_registry
                 WHERE source_issue_number = ?
-                  AND status NOT IN ('done', 'failed', 'expired', 'cancelled', 'closed')
+                  AND status NOT IN ({_terminal_placeholders})
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
-                (issue_number,),
+                (issue_number, *self._TERMINAL_STATUSES_FOR_ISSUE_CHECK),
             ).fetchone()
 
             if existing:
