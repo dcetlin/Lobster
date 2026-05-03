@@ -63,8 +63,6 @@ def _load_startup_sweep():
 _sweep_mod = _load_startup_sweep()
 run_startup_sweep = _sweep_mod.run_startup_sweep
 _is_heartbeat_recent = _sweep_mod._is_heartbeat_recent
-HEARTBEAT_SKIP_THRESHOLD_SECONDS = _sweep_mod.HEARTBEAT_SKIP_THRESHOLD_SECONDS
-DISPATCH_WINDOW_SECONDS = _sweep_mod.DISPATCH_WINDOW_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -284,12 +282,12 @@ class TestIsHeartbeatRecent:
 
     def test_heartbeat_skip_threshold_constant_is_positive_integer(self) -> None:
         """HEARTBEAT_SKIP_THRESHOLD_SECONDS is a named positive integer constant."""
-        assert isinstance(HEARTBEAT_SKIP_THRESHOLD_SECONDS, int)
-        assert HEARTBEAT_SKIP_THRESHOLD_SECONDS > 0
+        assert isinstance(_sweep_mod.HEARTBEAT_SKIP_THRESHOLD_SECONDS, int)
+        assert _sweep_mod.HEARTBEAT_SKIP_THRESHOLD_SECONDS > 0
 
     def test_heartbeat_skip_threshold_constant_is_at_least_60(self) -> None:
         """Must be at least 2× a typical 30-s heartbeat interval."""
-        assert HEARTBEAT_SKIP_THRESHOLD_SECONDS >= 60
+        assert _sweep_mod.HEARTBEAT_SKIP_THRESHOLD_SECONDS >= 60
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +390,7 @@ class TestHeartbeatGateInPopulationFour:
         """
         dispatch_ago = 1800
         # Heartbeat is after dispatch + window, so classification is kill_during_execution
-        heartbeat_at = _iso_ago(dispatch_ago - DISPATCH_WINDOW_SECONDS - 120)
+        heartbeat_at = _iso_ago(dispatch_ago - _sweep_mod.DISPATCH_WINDOW_SECONDS - 120)
         self._make_uow_over_ttl(
             tmp_db,
             uow_id="uow-stale-001",

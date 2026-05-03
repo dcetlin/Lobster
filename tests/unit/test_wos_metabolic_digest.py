@@ -62,15 +62,9 @@ def _load_handlers_module():
 md = _load_digest_module()
 
 # ---------------------------------------------------------------------------
-# Constants — from the audit doc and issue, NOT derived from implementation
+# Constants — non-mirrored test fixtures
 # ---------------------------------------------------------------------------
 
-OUTCOME_PEARL = "pearl"
-OUTCOME_HEAT = "heat"
-OUTCOME_SEED = "seed"
-OUTCOME_SHIT = "shit"
-
-DEFAULT_LOOKBACK_HOURS = 24   # daily digest window
 STALL_THRESHOLD_HOURS = 6     # stalled section threshold in the digest
 
 
@@ -193,91 +187,91 @@ def _insert_audit_entry(db: Path, uow_id: str, to_status: str, hours_ago: float 
 class TestClassifyUow:
     def test_failed_status_is_shit(self):
         uow = _uow(status="failed", close_reason="execution error")
-        assert md.classify_uow(uow) == OUTCOME_SHIT
+        assert md.classify_uow(uow) == md.OUTCOME_SHIT
 
     def test_expired_status_is_shit(self):
         uow = _uow(status="expired", close_reason="ttl exceeded")
-        assert md.classify_uow(uow) == OUTCOME_SHIT
+        assert md.classify_uow(uow) == md.OUTCOME_SHIT
 
     def test_cancelled_status_is_shit(self):
         uow = _uow(status="cancelled", close_reason="user_closed")
-        assert md.classify_uow(uow) == OUTCOME_SHIT
+        assert md.classify_uow(uow) == md.OUTCOME_SHIT
 
     def test_ttl_in_close_reason_is_shit(self):
         uow = _uow(status="done", close_reason="ttl_exceeded after 4h")
-        assert md.classify_uow(uow) == OUTCOME_SHIT
+        assert md.classify_uow(uow) == md.OUTCOME_SHIT
 
     def test_hard_cap_in_close_reason_is_shit(self):
         uow = _uow(status="done", close_reason="hard_cap reached")
-        assert md.classify_uow(uow) == OUTCOME_SHIT
+        assert md.classify_uow(uow) == md.OUTCOME_SHIT
 
     def test_user_closed_in_close_reason_is_shit(self):
         uow = _uow(status="done", close_reason="user_closed by admin")
-        assert md.classify_uow(uow) == OUTCOME_SHIT
+        assert md.classify_uow(uow) == md.OUTCOME_SHIT
 
     def test_pr_in_close_reason_is_pearl(self):
         uow = _uow(status="done", close_reason="opened pr #123")
-        assert md.classify_uow(uow) == OUTCOME_PEARL
+        assert md.classify_uow(uow) == md.OUTCOME_PEARL
 
     def test_implementation_in_close_reason_is_pearl(self):
         uow = _uow(status="done", close_reason="implementation complete")
-        assert md.classify_uow(uow) == OUTCOME_PEARL
+        assert md.classify_uow(uow) == md.OUTCOME_PEARL
 
     def test_commit_in_close_reason_is_pearl(self):
         uow = _uow(status="done", close_reason="committed changes")
-        assert md.classify_uow(uow) == OUTCOME_PEARL
+        assert md.classify_uow(uow) == md.OUTCOME_PEARL
 
     def test_issue_in_close_reason_is_seed(self):
         uow = _uow(status="done", close_reason="spawned issue #456")
-        assert md.classify_uow(uow) == OUTCOME_SEED
+        assert md.classify_uow(uow) == md.OUTCOME_SEED
 
     def test_seed_keyword_in_close_reason_is_seed(self):
         uow = _uow(status="done", close_reason="seeded follow-on work")
-        assert md.classify_uow(uow) == OUTCOME_SEED
+        assert md.classify_uow(uow) == md.OUTCOME_SEED
 
     def test_spawn_keyword_in_close_reason_is_seed(self):
         uow = _uow(status="done", close_reason="spawn new uow for subtask")
-        assert md.classify_uow(uow) == OUTCOME_SEED
+        assert md.classify_uow(uow) == md.OUTCOME_SEED
 
     def test_review_in_close_reason_is_heat(self):
         uow = _uow(status="done", close_reason="completed review of design doc")
-        assert md.classify_uow(uow) == OUTCOME_HEAT
+        assert md.classify_uow(uow) == md.OUTCOME_HEAT
 
     def test_analysis_in_close_reason_is_heat(self):
         uow = _uow(status="done", close_reason="analysis complete")
-        assert md.classify_uow(uow) == OUTCOME_HEAT
+        assert md.classify_uow(uow) == md.OUTCOME_HEAT
 
     def test_design_in_close_reason_is_heat(self):
         uow = _uow(status="done", close_reason="design specification written")
-        assert md.classify_uow(uow) == OUTCOME_HEAT
+        assert md.classify_uow(uow) == md.OUTCOME_HEAT
 
     def test_done_with_no_signal_is_shit(self):
         # Done with empty close_reason and no output_ref: no verifiable output
         uow = _uow(status="done", close_reason="", output_ref="")
-        assert md.classify_uow(uow) == OUTCOME_SHIT
+        assert md.classify_uow(uow) == md.OUTCOME_SHIT
 
     def test_source_issue_mention_without_creation_is_not_seed(self):
         # "issue analysis complete" mentions an issue being worked on, not a new issue
         # created. Bare "issue" substring must NOT classify as seed — this is the
         # false-positive the phrase-level matching is designed to prevent.
         uow = _uow(status="done", close_reason="issue analysis complete")
-        assert md.classify_uow(uow) == OUTCOME_HEAT
+        assert md.classify_uow(uow) == md.OUTCOME_HEAT
 
     def test_pr_closing_source_issue_is_pearl_not_seed(self):
         # "issue referenced in pr" describes a PR that closes a source issue —
         # the UoW produced a PR (pearl), not a new seed issue.
         # Bare "issue" substring must NOT win over "pr" here.
         uow = _uow(status="done", close_reason="issue referenced in pr")
-        assert md.classify_uow(uow) == OUTCOME_PEARL
+        assert md.classify_uow(uow) == md.OUTCOME_PEARL
 
     def test_creation_phrase_opened_issue_is_seed(self):
         # Explicit creation verb + "issue" → seed, regardless of other keywords
         uow = _uow(status="done", close_reason="opened issue #789 for follow-up")
-        assert md.classify_uow(uow) == OUTCOME_SEED
+        assert md.classify_uow(uow) == md.OUTCOME_SEED
 
     def test_creation_phrase_created_issue_is_seed(self):
         uow = _uow(status="done", close_reason="created issue #100 to track regressions")
-        assert md.classify_uow(uow) == OUTCOME_SEED
+        assert md.classify_uow(uow) == md.OUTCOME_SEED
 
 
 # ---------------------------------------------------------------------------
@@ -287,14 +281,14 @@ class TestClassifyUow:
 class TestAggregateByClassification:
     def test_all_four_keys_always_present(self):
         groups = md.aggregate_by_classification([])
-        assert set(groups.keys()) == {OUTCOME_PEARL, OUTCOME_HEAT, OUTCOME_SEED, OUTCOME_SHIT}
+        assert set(groups.keys()) == {md.OUTCOME_PEARL, md.OUTCOME_HEAT, md.OUTCOME_SEED, md.OUTCOME_SHIT}
 
     def test_all_keys_present_even_when_categories_empty(self):
-        pairs = [(_uow(close_reason="opened pr #1"), OUTCOME_PEARL)]
+        pairs = [(_uow(close_reason="opened pr #1"), md.OUTCOME_PEARL)]
         groups = md.aggregate_by_classification(pairs)
-        assert OUTCOME_HEAT in groups
-        assert OUTCOME_SEED in groups
-        assert OUTCOME_SHIT in groups
+        assert md.OUTCOME_HEAT in groups
+        assert md.OUTCOME_SEED in groups
+        assert md.OUTCOME_SHIT in groups
 
     def test_uows_routed_to_correct_group(self):
         pearl = _uow(uow_id="p1", close_reason="opened pr #1")
@@ -303,18 +297,18 @@ class TestAggregateByClassification:
         shit = _uow(uow_id="sh1", status="failed")
 
         pairs = [
-            (pearl, OUTCOME_PEARL),
-            (heat, OUTCOME_HEAT),
-            (seed, OUTCOME_SEED),
-            (shit, OUTCOME_SHIT),
+            (pearl, md.OUTCOME_PEARL),
+            (heat, md.OUTCOME_HEAT),
+            (seed, md.OUTCOME_SEED),
+            (shit, md.OUTCOME_SHIT),
         ]
         groups = md.aggregate_by_classification(pairs)
 
-        assert len(groups[OUTCOME_PEARL]) == 1
-        assert len(groups[OUTCOME_HEAT]) == 1
-        assert len(groups[OUTCOME_SEED]) == 1
-        assert len(groups[OUTCOME_SHIT]) == 1
-        assert groups[OUTCOME_PEARL][0]["id"] == "p1"
+        assert len(groups[md.OUTCOME_PEARL]) == 1
+        assert len(groups[md.OUTCOME_HEAT]) == 1
+        assert len(groups[md.OUTCOME_SEED]) == 1
+        assert len(groups[md.OUTCOME_SHIT]) == 1
+        assert groups[md.OUTCOME_PEARL][0]["id"] == "p1"
 
 
 # ---------------------------------------------------------------------------
@@ -372,8 +366,8 @@ class TestFormatDigest:
         pearl = _uow(uow_id="p1", close_reason="opened pr #1")
         shit = _uow(uow_id="sh1", status="failed")
         groups = md.aggregate_by_classification([
-            (pearl, OUTCOME_PEARL),
-            (shit, OUTCOME_SHIT),
+            (pearl, md.OUTCOME_PEARL),
+            (shit, md.OUTCOME_SHIT),
         ])
         text = md.format_digest(groups, [], 24, "2026-04-22T09:00:00+00:00")
         assert "1 pearl" in text
@@ -399,7 +393,7 @@ class TestFormatDigest:
 
     def test_register_breakdown_present_when_uows_exist(self):
         pearl = _uow(uow_id="p1", close_reason="opened pr", register="operational")
-        groups = md.aggregate_by_classification([(pearl, OUTCOME_PEARL)])
+        groups = md.aggregate_by_classification([(pearl, md.OUTCOME_PEARL)])
         text = md.format_digest(groups, [], 24, "2026-04-22T09:00:00+00:00")
         assert "Register breakdown" in text
         assert "operational" in text
@@ -442,7 +436,7 @@ class TestQueryCompletedUows:
         u = _uow(uow_id="uow-done", status="done", close_reason="pr merged")
         _insert_uow_row(db_path, u)
         _insert_audit_entry(db_path, "uow-done", "done", hours_ago=1)
-        results = md.query_completed_uows(db_path, DEFAULT_LOOKBACK_HOURS)
+        results = md.query_completed_uows(db_path, md.DEFAULT_LOOKBACK_HOURS)
         ids = [r["id"] for r in results]
         assert "uow-done" in ids
 
@@ -451,12 +445,12 @@ class TestQueryCompletedUows:
         u = _uow(uow_id="uow-old", status="done", close_reason="pr merged")
         _insert_uow_row(db_path, u)
         _insert_audit_entry(db_path, "uow-old", "done", hours_ago=48)
-        results = md.query_completed_uows(db_path, DEFAULT_LOOKBACK_HOURS)
+        results = md.query_completed_uows(db_path, md.DEFAULT_LOOKBACK_HOURS)
         ids = [r["id"] for r in results]
         assert "uow-old" not in ids
 
     def test_absent_db_returns_empty_list(self, tmp_path):
-        results = md.query_completed_uows(tmp_path / "nonexistent.db", DEFAULT_LOOKBACK_HOURS)
+        results = md.query_completed_uows(tmp_path / "nonexistent.db", md.DEFAULT_LOOKBACK_HOURS)
         assert results == []
 
 

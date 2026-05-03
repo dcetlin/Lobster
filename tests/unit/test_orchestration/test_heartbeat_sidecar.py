@@ -59,6 +59,8 @@ REPO_ROOT = Path(__file__).parent.parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import importlib.util
+
 from src.orchestration.registry import Registry, UoWStatus
 from src.orchestration.heartbeat_sidecar import (
     write_heartbeats_for_active_uows,
@@ -67,14 +69,33 @@ from src.orchestration.heartbeat_sidecar import (
 )
 
 # ---------------------------------------------------------------------------
+# Load steward-heartbeat module for production constants
+# ---------------------------------------------------------------------------
+
+_STEWARD_HB_PATH = REPO_ROOT / "scheduled-tasks" / "steward-heartbeat.py"
+
+_steward_hb_spec = importlib.util.spec_from_file_location(
+    "steward_heartbeat_sidecar_const", _STEWARD_HB_PATH
+)
+_steward_hb = importlib.util.module_from_spec(_steward_hb_spec)
+# Register module in sys.modules BEFORE exec_module so dataclasses can
+# resolve cls.__module__ (Python 3.12 requirement).
+_steward_hb_patches = {
+    "src.orchestration.steward": MagicMock(),
+    "src.orchestration.github_sync": MagicMock(),
+    "src.orchestration.paths": MagicMock(REGISTRY_DB=Path("/tmp/test_registry.db")),
+    "startup_sweep": MagicMock(),
+    "steward_heartbeat_sidecar_const": _steward_hb,
+}
+with patch.dict("sys.modules", _steward_hb_patches):
+    _steward_hb_spec.loader.exec_module(_steward_hb)
+
+# ---------------------------------------------------------------------------
 # Named constants from spec
 # ---------------------------------------------------------------------------
 
 # Default heartbeat_ttl — matches registry.write_heartbeat contract
 DEFAULT_HEARTBEAT_TTL_SECONDS: int = 300
-
-# Buffer added by steward-heartbeat to TTL before declaring stall
-HEARTBEAT_STALL_BUFFER_SECONDS: int = 30
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +410,7 @@ class TestSidecarPreventsFlaseStalls:
 
         # After sidecar, the observation loop should NOT flag this UoW as stale
         stale_uows = registry.get_stale_heartbeat_uows(
-            buffer_seconds=HEARTBEAT_STALL_BUFFER_SECONDS
+            buffer_seconds=_steward_hb.HEARTBEAT_STALL_BUFFER_SECONDS
         )
         stale_ids = [u.id for u in stale_uows]
         assert uow_id not in stale_ids, (

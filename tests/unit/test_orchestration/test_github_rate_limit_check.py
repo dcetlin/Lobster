@@ -50,7 +50,6 @@ def _load_heartbeat():
 
 _hb = _load_heartbeat()
 check_github_rate_limit = _hb.check_github_rate_limit
-GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD = _hb.GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD
 
 
 # ---------------------------------------------------------------------------
@@ -58,8 +57,8 @@ GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD = _hb.GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD
 # ---------------------------------------------------------------------------
 
 def test_threshold_is_positive_integer():
-    assert isinstance(GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD, int)
-    assert GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD > 0
+    assert isinstance(_hb.GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD, int)
+    assert _hb.GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD > 0
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +98,7 @@ def test_rate_limit_not_ok_when_remaining_below_threshold():
 
 def test_rate_limit_ok_at_exact_threshold():
     """ok=True when remaining == threshold (boundary: threshold is the minimum allowed)."""
-    threshold = GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD
+    threshold = _hb.GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD
     with patch("subprocess.run", return_value=_mock_subprocess_result(_rate_json(threshold))):
         result = check_github_rate_limit()
     assert result.ok is True
