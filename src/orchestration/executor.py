@@ -1352,9 +1352,13 @@ def _log_dispatch_boundary(
     Args:
         uow_id: The UoW being dispatched.
         dispatch_attempt: Attempt number (1 for first attempt, 2+ for retries).
-        outcome: One of "success", "retry", "failure".
+            Currently always 1 — retry logic is not implemented at this layer;
+            TTL recovery in the Observation Loop handles re-queue on stall.
+        outcome: One of "success" or "failure".
+            "retry" is reserved — not implemented. No code path currently
+            produces this value; dispatch_attempt is always 1.
         msg_id: The inbox message ID (on success).
-        failure_reason: Reason for failure or retry (on non-success).
+        failure_reason: Reason for failure (on non-success).
     """
     record = {
         "ts": _now_iso(),
