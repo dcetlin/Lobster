@@ -3849,7 +3849,7 @@ def _process_uow(
         is_infra_event = _is_infrastructure_event(return_reason)
         new_execution_attempts = uow.execution_attempts + (0 if is_infra_event else 1)
 
-        if new_execution_attempts > MAX_RETRIES:
+        if new_execution_attempts >= MAX_RETRIES:
             # Execution retry cap exceeded — escalate to needs-human-review.
             escalation_entry = {
                 "event": "retry_cap_exceeded",
