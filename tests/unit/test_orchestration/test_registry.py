@@ -277,6 +277,91 @@ class TestUpsert:
         conn2.close()
         assert row["status"] == "pending"
 
+    def test_repropose_active_issue_returns_upsert_skipped(self, registry, db_path):
+        """Re-proposing an issue with an existing non-terminal UoW must return UpsertSkipped.
+
+        Regression test for the intake dedup bug: if a UoW already exists for
+        an issue in any non-terminal status (proposed, ready-for-steward, active,
+        etc.), a subsequent upsert for the same issue must be idempotent — no
+        duplicate row created.
+        """
+        from src.orchestration.registry import UpsertInserted, UpsertSkipped
+
+        ISSUE_NUMBER = 42
+        DAY_1 = "2026-04-01"
+        DAY_2 = "2026-04-02"
+
+        # Insert initial UoW in proposed status.
+        first = registry.upsert(
+            issue_number=ISSUE_NUMBER, title="Issue 42", sweep_date=DAY_1,
+            success_criteria="Completion criteria.",
+        )
+        assert isinstance(first, UpsertInserted)
+
+        # Transition to a non-terminal in-flight status.
+        registry.set_status_direct(first.id, "ready-for-steward")
+
+        # Second upsert on a different sweep_date must be skipped.
+        second = registry.upsert(
+            issue_number=ISSUE_NUMBER, title="Issue 42", sweep_date=DAY_2,
+            success_criteria="Completion criteria.",
+        )
+        assert isinstance(second, UpsertSkipped), (
+            f"Expected UpsertSkipped but got {type(second).__name__}"
+        )
+
+        # Exactly one row for issue 42 in the registry.
+        conn = _open_db(db_path)
+        rows = conn.execute(
+            "SELECT id FROM uow_registry WHERE source_issue_number = ?",
+            (ISSUE_NUMBER,),
+        ).fetchall()
+        conn.close()
+        assert len(rows) == 1, f"Expected exactly 1 row for issue {ISSUE_NUMBER}, got {len(rows)}"
+
+    def test_repropose_terminal_issue_creates_new_uow(self, registry, db_path):
+        """Re-proposing an issue whose only UoW is terminal must create a new UoW.
+
+        Verifies that terminal statuses (done, closed) correctly allow
+        re-proposal — the dedup gate must not block legitimate re-intake.
+        """
+        from src.orchestration.registry import UpsertInserted
+
+        ISSUE_NUMBER = 43
+        DAY_1 = "2026-04-01"
+        DAY_2 = "2026-04-02"
+        DAY_3 = "2026-04-03"
+
+        # Insert and mark done.
+        first = registry.upsert(
+            issue_number=ISSUE_NUMBER, title="Issue 43", sweep_date=DAY_1,
+            success_criteria="Completion criteria.",
+        )
+        registry.set_status_direct(first.id, "done")
+
+        second = registry.upsert(
+            issue_number=ISSUE_NUMBER, title="Issue 43 reopened", sweep_date=DAY_2,
+            success_criteria="Completion criteria.",
+        )
+        assert isinstance(second, UpsertInserted), (
+            f"Expected UpsertInserted after done, got {type(second).__name__}"
+        )
+
+        # Also verify 'closed' (legacy terminal status) allows re-proposal.
+        registry.set_status_direct(second.id, "done")
+        conn = _open_db(db_path)
+        conn.execute("UPDATE uow_registry SET status='closed' WHERE id=?", (second.id,))
+        conn.commit()
+        conn.close()
+
+        third = registry.upsert(
+            issue_number=ISSUE_NUMBER, title="Issue 43 re-reopened", sweep_date=DAY_3,
+            success_criteria="Completion criteria.",
+        )
+        assert isinstance(third, UpsertInserted), (
+            f"Expected UpsertInserted after closed, got {type(third).__name__}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Issue #488: success_criteria enforcement and issue_url population
