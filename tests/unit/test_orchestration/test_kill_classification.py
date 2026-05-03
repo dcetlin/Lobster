@@ -52,13 +52,6 @@ if str(REPO_ROOT) not in sys.path:
 
 
 # ---------------------------------------------------------------------------
-# Named constants under test
-# ---------------------------------------------------------------------------
-
-DISPATCH_WINDOW_SECONDS: int  # loaded from startup_sweep module below
-
-
-# ---------------------------------------------------------------------------
 # Load startup_sweep module (lives in scheduled-tasks/)
 # ---------------------------------------------------------------------------
 
@@ -77,7 +70,6 @@ def _load_startup_sweep():
 _sweep_mod = _load_startup_sweep()
 run_startup_sweep = _sweep_mod.run_startup_sweep
 _classify_executing_orphan_kill_type = _sweep_mod._classify_executing_orphan_kill_type
-DISPATCH_WINDOW_SECONDS = _sweep_mod.DISPATCH_WINDOW_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -260,12 +252,12 @@ def registry(tmp_db: Path) -> Registry:
 
 class TestDispatchWindowConstant:
     def test_is_positive_integer(self) -> None:
-        assert isinstance(DISPATCH_WINDOW_SECONDS, int)
-        assert DISPATCH_WINDOW_SECONDS > 0
+        assert isinstance(_sweep_mod.DISPATCH_WINDOW_SECONDS, int)
+        assert _sweep_mod.DISPATCH_WINDOW_SECONDS > 0
 
     def test_is_at_least_60_seconds(self) -> None:
         """Must be long enough to absorb agent startup jitter."""
-        assert DISPATCH_WINDOW_SECONDS >= 60
+        assert _sweep_mod.DISPATCH_WINDOW_SECONDS >= 60
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +346,7 @@ class TestClassifyExecutingOrphanKillType:
         """
         dispatch_ts = _iso_ago(1800)
         # Heartbeat written DISPATCH_WINDOW_SECONDS + 60 after dispatch (clearly working)
-        heartbeat_after_window = _iso_ago(1800 - DISPATCH_WINDOW_SECONDS - 60)
+        heartbeat_after_window = _iso_ago(1800 - _sweep_mod.DISPATCH_WINDOW_SECONDS - 60)
         result = _classify_executing_orphan_kill_type(
             dispatch_ts=dispatch_ts,
             heartbeat_at=heartbeat_after_window,
@@ -525,7 +517,7 @@ class TestStartupSweepKillClassification:
         """
         dispatch_ago = 1800
         # Heartbeat written well after dispatch + window (agent was working)
-        heartbeat_at = _iso_ago(dispatch_ago - DISPATCH_WINDOW_SECONDS - 120)
+        heartbeat_at = _iso_ago(dispatch_ago - _sweep_mod.DISPATCH_WINDOW_SECONDS - 120)
         self._make_uow_with_dispatch(
             tmp_db,
             uow_id="uow-kill-during-001",
