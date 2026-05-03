@@ -46,7 +46,7 @@ Before consulting any gate, classify the message as ACTION or DESIGN_OPEN. These
 | **7-Second Rule** | Any tool call not in {wait_for_messages, check_inbox, mark_processing, mark_processed, mark_failed, send_reply} must go to a background subagent. | Structural |
 | **Design Gate** | Message is DESIGN_OPEN when no concrete output artifact can be stated in one sentence. | Advisory |
 | **Bias to Action** | Classifier returned ACTION. Proceed with implementation without asking for confirmation. | Advisory |
-| **Dispatch template** | Every Task call must include `Minimum viable output:` and `Boundary: do not produce` in prompt. **Long-running gate:** If Minimum viable output implies >15 min, prepend the workstream scaffolding preamble (mkdir workstream, write status.md, heartbeat every ~5 min) before any other prompt content. See CLAUDE.md "Long-Running Dispatch Preamble" for the full template. | Advisory |
+| **Dispatch template** | Every Task call must include `Minimum viable output:`, `Boundary: do not produce`, and a YAML frontmatter block with `task_id: <slug>` at the top of the prompt (preferred; legacy `Your task_id is: <slug>` still accepted). **Long-running gate:** If Minimum viable output implies >15 min, prepend the workstream scaffolding preamble (mkdir workstream, write status.md, heartbeat every ~5 min) before any other prompt content. See CLAUDE.md "Long-Running Dispatch Preamble" for the full template. | Advisory |
 | **No self-relay** | When `sent_reply_to_user == True` or type is `subagent_notification`, mark_processed without send_reply. | Structural |
 | **Relay filter** | Key signal in send_reply must be in paragraph 1, not buried. | Advisory |
 | **PR Merge Gate** | Every code PR must pass oracle review before merge. Flow: open PR → oracle agent → writes `oracle/verdicts/pr-{number}.md` → if first line is `VERDICT: APPROVED` dispatch merge agent; if `NEEDS_CHANGES` dispatch fix agent → re-oracle → repeat. Merge agent must check `oracle/verdicts/pr-{number}.md` first line is `VERDICT: APPROVED` before merging, then move the file to `oracle/verdicts/archive/pr-{number}.md`. | Advisory |
@@ -814,3 +814,28 @@ A **commitment** = you told the user you'll answer or do something later.
 **When fulfilled:** `update_task(task_id, status="done")` immediately.
 
 **Idempotency:** Check `list_tasks()` for existing `DEFERRED:` task before creating.
+
+---
+
+## Post-Decision Review Loop
+
+### Vision Field Citation Traces (intent-anchoring protocol)
+
+After any routing decision that cites a `vision.yaml` field, apply this corrective trace check:
+
+**Structural test:** Would a different value for this field have produced a different decision structure? If yes → citation is structural (no trace needed). If no → citation is inferential.
+
+**If inferential, emit one trace line:**
+```
+[TRACE:INFERENTIAL] field=<vision_field_name> decision=<routing_decision_made> reason=<one clause>
+```
+
+Write the trace line to:
+`~/lobster-workspace/assessments/intent-anchoring-traces/trace-log.md`
+
+Append only — one line per trace, with ISO timestamp prefix:
+```
+2026-05-02T00:00:00Z [TRACE:INFERENTIAL] field=... decision=... reason=...
+```
+
+This trace is not an error signal. It is attunement development data. Do not suppress traces or route decisions differently because of them — the observation must be independent of the decision.
