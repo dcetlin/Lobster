@@ -21,6 +21,7 @@ Browse available skills for your Lobster assistant. Install any skill with one c
 | [Buy Things](./buy-things/) | Purchase items via Telegram — search products, confirm with you, and complete checkout using Camofox browser automation | Tool | Available |
 | [Gmail](./gmail/) | Read and search your Gmail inbox via chat — authenticate once with Google OAuth, then check email, find messages, and get summaries on demand | Integration | Available |
 | [Lobster Dev](./lobster-dev/) | Lobster development context — staging Docker setup, active dev patterns, and known dev environment quirks. Activate when developing or debugging Lobster itself. | Context | Available |
+| [Skill Builder](./skill-builder/) | Guides Lobster users through creating custom skills — scaffolds the correct file layout, explains the two-location model (repo vs instance), and wires MCP tool registration. | Workflow | Available |
 
 ## Templates
 

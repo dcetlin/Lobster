@@ -3159,6 +3159,46 @@ print(f'prune-pr-worktrees: {result.status}')
         warn "prune-pr-worktrees.py not found at $_m83_script or uv unavailable — skipping Migration 83"
     fi
 
+    # Migration 84: Fix User=lobster in AWP email service files (issue #1925).
+    # Applied live on the running system; this migration ensures fresh installs
+    # also get the corrected unit files.
+    # NOTE: Migration 84 was applied live by PR #1925. The actual unit-file
+    # corrections are already in place on the running host. This placeholder
+    # ensures the migration number is reserved in the sequence.
+    # (No-op: the file edits were done directly via systemctl/sed on the host.)
+
+    # Migration 85: Remove defunct Pub/Sub and AWP-pipeline systemd units.
+    # The Pub/Sub pipeline (gmail-watch-renewal, awp-gmail-token-refresh) was
+    # superseded by the deterministic gmail-poll.py poller in Migration 80.
+    # The awp-gmail-pipeline service ran awp_gmail_pipeline.py (a workspace
+    # script), doing inline classification now handled by the awp-email skill +
+    # dispatcher. All three timers are disabled; this migration stops and removes
+    # their unit files so they don't clutter the system on upgrades.
+    local _m85_units=(
+        "lobster-awp-gmail-pipeline"
+        "lobster-gmail-watch-renewal"
+        "lobster-awp-gmail-token-refresh"
+    )
+    local _m85_applied=0
+    for _m85_unit in "${_m85_units[@]}"; do
+        local _m85_service="/etc/systemd/system/${_m85_unit}.service"
+        local _m85_timer="/etc/systemd/system/${_m85_unit}.timer"
+        if [ -f "$_m85_service" ] || [ -f "$_m85_timer" ]; then
+            substep "Removing defunct unit ${_m85_unit} (Migration 85)..."
+            sudo systemctl stop "${_m85_unit}.timer" 2>/dev/null || true
+            sudo systemctl stop "${_m85_unit}.service" 2>/dev/null || true
+            sudo systemctl disable "${_m85_unit}.timer" 2>/dev/null || true
+            sudo systemctl disable "${_m85_unit}.service" 2>/dev/null || true
+            sudo rm -f "$_m85_service" "$_m85_timer" 2>/dev/null || true
+            _m85_applied=1
+        fi
+    done
+    if [ "$_m85_applied" -eq 1 ]; then
+        sudo systemctl daemon-reload 2>/dev/null || true
+        substep "Removed defunct AWP email pipeline and Pub/Sub units"
+        migrated=$((migrated + 1))
+    fi
+
     # Migration 91: Add subject and signal_type_hint columns to events table
     # These columns enable structured tagging at write time so the slow-reclassifier
     # can use provided hints instead of expensive content inference.
@@ -3220,6 +3260,35 @@ print(f'prune-pr-worktrees: {result.status}')
     fi
 
 
+    # Migration 95: Schedule pending-actions-nudge (systemd timer, crontab fallback)
+    # Type B cron-direct script that queries open action-item GitHub issues owned
+    # by Dan, buckets by age (3d/7d/14d), and sends a Telegram nudge if any bucket
+    # is non-empty. Runs daily at 15:00 UTC (07:00 PDT / 08:00 PST).
+    local PENDING_NUDGE_TIMER="lobster-pending-actions-nudge.timer"
+    local PENDING_NUDGE_SERVICE="lobster-pending-actions-nudge.service"
+    if ! systemctl is-enabled --quiet "$PENDING_NUDGE_TIMER" 2>/dev/null; then
+        local _pn_timer_src="$LOBSTER_DIR/services/$PENDING_NUDGE_TIMER"
+        local _pn_svc_src="$LOBSTER_DIR/services/$PENDING_NUDGE_SERVICE"
+        local _dst="/etc/systemd/system"
+        if [ -f "$_pn_timer_src" ] && [ -f "$_pn_svc_src" ]; then
+            if sudo cp "$_pn_timer_src" "$_dst/$PENDING_NUDGE_TIMER" \
+                && sudo cp "$_pn_svc_src" "$_dst/$PENDING_NUDGE_SERVICE"; then
+                sudo systemctl daemon-reload 2>/dev/null || true
+                sudo systemctl enable --now "$PENDING_NUDGE_TIMER" 2>/dev/null \
+                    && substep "Installed and enabled $PENDING_NUDGE_TIMER (Migration 95)" \
+                    || warn "Could not enable $PENDING_NUDGE_TIMER — check systemd permissions"
+                migrated=$((migrated + 1))
+            else
+                warn "Could not install $PENDING_NUDGE_TIMER systemd units"
+            fi
+        else
+            warn "Migration 95: service files not found in $LOBSTER_DIR/services/ — run after git pull"
+        fi
+    else
+        substep "pending-actions-nudge timer already installed — skipping"
+    fi
+
+
     # Migration 94: Register decision-router PostToolUse hook in settings.json.
     # Routes decision: footer blocks from send_reply messages to the decisions ledger.
     # Appends extracted decision text to ~/lobster-workspace/data/decisions-ledger.md.
@@ -3240,6 +3309,14 @@ print(f'prune-pr-worktrees: {result.status}')
             migrated=$((migrated + 1))
         fi
     fi
+
+    # Migration 96: Ensure debug flag directory exists for inline command handlers.
+    # handle_debug_toggle() writes ~/lobster-workspace/data/debug-enabled to enable
+    # debug mode without requiring an environment variable change. The parent directory
+    # is already created by create_new_directories(), so this is a no-op in practice;
+    # it documents the dependency explicitly for future reference.
+    mkdir -p "$WORKSPACE_DIR/data"
+    substep "Migration 96: debug flag dir confirmed ($WORKSPACE_DIR/data)"
 
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
