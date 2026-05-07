@@ -61,6 +61,7 @@ WORKSTREAM SETUP (do this first):
 1. mkdir -p ~/lobster-workspace/workstreams/<task-slug>/
 2. Write ~/lobster-workspace/workstreams/<task-slug>/status.md immediately (task_id, start time, goal, step 1).
 3. Rewrite status.md every ~5 min: current step, % complete, next step. Write failures explicitly.
+4. Call write_result at completion: task_id, sent_reply_to_user=True/False, brief summary.
 ```
 
 Signals: cloning, migrations, merging many commits, "full"/"complete"/"all"/"migrate" in prompt, WOS UoW with estimated_cycles > 1.
