@@ -47,6 +47,7 @@
 | **phase2-design-review** | WOS-adjacent — was already disabled | No | Every 30 min | Already disabled — no action |
 | **philosophy-explore-1** | No — was already disabled | No | Every 4 hours | Already disabled — no action |
 | **surface-queue-delivery** | No — was already disabled | No | Daily at 08:00 | Already disabled — no action |
+| **wos-hourly-observation** | Yes — was already disabled in jobs.json | No (jobs.json) | 06:00–12:00 UTC hourly | Disabled systemd timer |
 
 ---
 
