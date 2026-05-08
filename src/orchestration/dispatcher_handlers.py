@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from .registry import Registry
 
 from .registry import ApproveConfirmed, ApproveExpired, ApproveNotFound, ApproveSkipped
-from .paths import LOBSTER_WORKSPACE as _LOBSTER_WORKSPACE, WOS_CONFIG as _WOS_CONFIG_PATH_FROM_PATHS, WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG
+from .paths import LOBSTER_WORKSPACE as _LOBSTER_WORKSPACE, WOS_CONFIG as _WOS_CONFIG_PATH_FROM_PATHS, WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG, JOBS_JSON as _JOBS_JSON_PATH
 from .steward import ReturnReasonClassification, MAX_RETRIES as _STEWARD_MAX_RETRIES, _HARD_CAP_CYCLES
 
 
@@ -87,6 +87,111 @@ def _write_wos_config(config: dict) -> None:
     with tmp.open("w") as fh:
         json.dump(config, fh)
     tmp.rename(_WOS_CONFIG_PATH)
+
+
+# ---------------------------------------------------------------------------
+# WOS-core job list — canonical gate list for wos start / wos stop
+# ---------------------------------------------------------------------------
+#
+# These are the jobs that constitute the WOS pipeline. All 14 are toggled
+# atomically when the operator runs `wos start` or `wos stop`. The source of
+# truth for which jobs are WOS-core is the `wos_core: true` field in
+# jobs.json (instance config). This constant mirrors that list so that the
+# toggle function can be tested independently of a live jobs.json, and so
+# that missing entries are detectable at toggle time.
+#
+# wos-health-monitor is listed here but may not be present in jobs.json on
+# all instances (it was previously managed via systemd only). The toggle
+# function skips entries not found in jobs.json and surfaces them in its
+# return value.
+#
+_WOS_CORE_JOBS: frozenset[str] = frozenset({
+    "executor-heartbeat",
+    "steward-heartbeat",
+    "issue-sweeper",
+    "uow-reflection",
+    "pattern-candidate-sweep",
+    "github-issue-cultivator",
+    "proposals-authorship",
+    "wos-overnight-loop",
+    "wos-hourly-observation",
+    "wos-queue-monitor",
+    "wos-health-check",
+    "wos-metabolic-digest",
+    "wos-pr-sweeper",
+    "wos-health-monitor",
+})
+
+
+def _read_jobs_json() -> dict:
+    """Read jobs.json and return its contents. Returns empty jobs dict on error."""
+    try:
+        with _JOBS_JSON_PATH.open() as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {"jobs": {}}
+
+
+def _write_jobs_json(data: dict) -> None:
+    """Write jobs.json atomically (write-then-rename)."""
+    tmp = _JOBS_JSON_PATH.with_suffix(".json.tmp")
+    with tmp.open("w") as fh:
+        json.dump(data, fh, indent=2)
+    tmp.rename(_JOBS_JSON_PATH)
+
+
+def toggle_wos_core_jobs(enabled: bool) -> dict:
+    """Enable or disable all WOS-core jobs atomically.
+
+    Reads jobs.json, sets the `enabled` field on every job where
+    `wos_core == True`, and writes both jobs.json and wos-config.json
+    atomically. The `execution_enabled` flag in wos-config.json is also
+    updated to match.
+
+    Jobs listed in _WOS_CORE_JOBS but absent from jobs.json are silently
+    skipped and reported in the `not_found` list of the return value.
+
+    Returns a summary dict:
+        {
+            "toggled": [list of job names that were updated],
+            "not_found": [list of job names absent from jobs.json],
+            "new_state": "enabled" | "disabled",
+        }
+
+    This function is pure with respect to side effects: all I/O is
+    isolated to two atomic file writes at the end, after all mutations
+    are computed in memory.
+    """
+    jobs_data = _read_jobs_json()
+    jobs = jobs_data.get("jobs", {})
+
+    toggled: list[str] = []
+    not_found: list[str] = []
+
+    # Compute the updated jobs dict without mutating the original.
+    updated_jobs = {
+        name: ({**entry, "enabled": enabled} if entry.get("wos_core") else entry)
+        for name, entry in jobs.items()
+    }
+
+    # Identify which WOS-core jobs were toggled vs. not found.
+    for job_name in sorted(_WOS_CORE_JOBS):
+        if job_name in jobs and jobs[job_name].get("wos_core"):
+            toggled.append(job_name)
+        else:
+            not_found.append(job_name)
+
+    # Write both files atomically. If either write fails, raise — the caller
+    # (handle_wos_start / handle_wos_stop) catches OSError and reports it.
+    _write_jobs_json({**jobs_data, "jobs": updated_jobs})
+    config = read_wos_config()
+    _write_wos_config({**config, "execution_enabled": enabled})
+
+    return {
+        "toggled": toggled,
+        "not_found": not_found,
+        "new_state": "enabled" if enabled else "disabled",
+    }
 
 
 def handle_approve(uow_id: str, *, registry: "Registry") -> str:
@@ -455,8 +560,10 @@ def handle_wos_start() -> str:
     """
     Handle /wos start (or "wos start").
 
-    Sets execution_enabled: true in wos-config.json so that executor-heartbeat
-    dispatches UoWs on its next cycle (within ~90 seconds).
+    Enables all WOS-core jobs atomically: sets `enabled: true` on every job
+    tagged `wos_core: true` in jobs.json, and sets `execution_enabled: true`
+    in wos-config.json so that executor-heartbeat dispatches UoWs on its next
+    cycle (within ~90 seconds).
 
     Idempotent: calling /wos start when already started returns a notice.
 
@@ -465,33 +572,41 @@ def handle_wos_start() -> str:
     config = read_wos_config()
     if config.get("execution_enabled"):
         return (
-            "WOS execution is already enabled.\n"
+            "WOS pipeline is already running.\n"
             "executor-heartbeat is dispatching UoWs normally."
         )
 
     try:
-        _write_wos_config({**config, "execution_enabled": True})
+        result = toggle_wos_core_jobs(enabled=True)
     except OSError as exc:
         return (
-            f"Failed to write wos-config.json: {exc}\n"
-            f"Path: `{_WOS_CONFIG_PATH}`"
+            f"Failed to enable WOS-core jobs: {exc}\n"
+            f"Config: `{_WOS_CONFIG_PATH}`"
         )
 
-    return (
-        "WOS execution enabled.\n"
-        "executor-heartbeat will dispatch ready-for-executor UoWs on its next cycle "
-        "(within ~90 seconds).\n"
-        f"Config: `{_WOS_CONFIG_PATH}`"
-    )
+    toggled_count = len(result["toggled"])
+    lines = [
+        f"WOS pipeline started. {toggled_count} WOS-core jobs enabled.",
+        "executor-heartbeat will dispatch ready-for-executor UoWs on its next "
+        "cycle (within ~90 seconds).",
+    ]
+    if result["not_found"]:
+        lines.append(
+            f"Note: {len(result['not_found'])} WOS-core job(s) not in jobs.json "
+            f"(may be systemd-only): {', '.join(sorted(result['not_found']))}"
+        )
+    return "\n".join(lines)
 
 
 def handle_wos_stop() -> str:
     """
     Handle /wos stop (or "wos stop").
 
-    Sets execution_enabled: false in wos-config.json so that executor-heartbeat
-    skips dispatch on its next cycle. UoWs already active are not affected —
-    TTL recovery will handle any that stall.
+    Pauses all WOS-core jobs atomically: sets `enabled: false` on every job
+    tagged `wos_core: true` in jobs.json, and sets `execution_enabled: false`
+    in wos-config.json so that executor-heartbeat skips dispatch on its next
+    cycle. UoWs already active are not affected — TTL recovery will handle
+    any that stall.
 
     Idempotent: calling /wos stop when already stopped returns a notice.
 
@@ -500,24 +615,29 @@ def handle_wos_stop() -> str:
     config = read_wos_config()
     if not config.get("execution_enabled"):
         return (
-            "WOS execution is already disabled.\n"
+            "WOS pipeline is already paused.\n"
             "executor-heartbeat is skipping dispatch."
         )
 
     try:
-        _write_wos_config({**config, "execution_enabled": False})
+        result = toggle_wos_core_jobs(enabled=False)
     except OSError as exc:
         return (
-            f"Failed to write wos-config.json: {exc}\n"
-            f"Path: `{_WOS_CONFIG_PATH}`"
+            f"Failed to disable WOS-core jobs: {exc}\n"
+            f"Config: `{_WOS_CONFIG_PATH}`"
         )
 
-    return (
-        "WOS execution disabled.\n"
-        "executor-heartbeat will skip dispatch on its next cycle (within ~90 seconds).\n"
-        "UoWs already active will continue running; TTL recovery handles any that stall.\n"
-        f"Config: `{_WOS_CONFIG_PATH}`"
-    )
+    toggled_count = len(result["toggled"])
+    lines = [
+        f"WOS pipeline paused. {toggled_count} WOS-core jobs disabled.",
+        "UoWs already active will continue running; TTL recovery handles any that stall.",
+    ]
+    if result["not_found"]:
+        lines.append(
+            f"Note: {len(result['not_found'])} WOS-core job(s) not in jobs.json "
+            f"(may be systemd-only): {', '.join(sorted(result['not_found']))}"
+        )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1701,3 +1821,43 @@ def route_callback_message(msg: dict[str, Any], *, registry: "Registry | None" =
 
     # Not a WOS callback — signal the dispatcher to use its own handling
     return {"action": "send_reply", "text": f"Unknown callback: {data}", "chat_id": chat_id, "handled": False}
+
+
+# ---------------------------------------------------------------------------
+# Help text — update when new commands are added
+# ---------------------------------------------------------------------------
+
+COMMAND_HELP: str = """Lobster command index
+
+System status:
+  status / health     — usage %, WOS state, active agents
+  usage               — Claude quota windows and reset times
+  usage full          — full usage report (spawns subagent)
+  agents              — list active subagent sessions
+  inbox               — queue depth and processing state
+
+WOS control:
+  wos start  — enable WOS pipeline (all 14 WOS-core jobs + execution_enabled)
+  wos stop   — pause WOS pipeline (all 14 WOS-core jobs + execution_enabled)
+  wos status [status] — show active + queued UoWs
+  wos unblock         — clear BOOTUP_CANDIDATE_GATE flag
+
+Decision:
+  /approve <uow-id>   — approve a proposed UoW
+  /decide <uow-id> <action> — resolve a blocked UoW
+
+Restart:
+  restart mcp         — restart MCP server (auto-reconnects)
+  restart dispatcher  — instructions to restart dispatcher process
+
+Debug:
+  debug on / debug off — toggle debug flag file
+
+Help:
+  help / /help        — this index
+"""
+
+
+def handle_help() -> str:
+    """Handle 'help' / '/help' command — return command index."""
+    return COMMAND_HELP
