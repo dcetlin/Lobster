@@ -184,6 +184,10 @@ WORKSTREAM SETUP (do this first, before any other work):
    Update: current step, % complete estimate, last completed milestone, next step.
    If you are blocked or failing, write that explicitly — stalled state is recoverable; silent state is not.
 
+4. Call write_result at completion:
+   write_result(task_id="<task-slug>", sent_reply_to_user=False, status="success", text="<one-sentence summary>")
+   If you sent a reply to the user directly: write_result(task_id="<task-slug>", sent_reply_to_user=True)
+
 Do not defer workstream creation. If you die without writing status.md, the reconciler has nothing to recover from.
 ```
 
