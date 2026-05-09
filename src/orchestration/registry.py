@@ -275,6 +275,13 @@ class UoW:
     #   Computed deterministically by _compute_prescription_confidence() in steward.py.
     #   Steward-private (excluded from executor_uow_view). Data collection only.
     prescription_confidence: float | None = None
+    # trigger_message_id: inbox message_id of the Telegram conversation that caused
+    #   this UoW to be created (populated after migration 0022).
+    #   NULL for UoWs created by the automated cultivator (GitHub-sweep path) or
+    #   registry_cli commands — those have no associated Telegram message.
+    #   TEXT matches inbox message_id format: "{ts}_{telegram_msg_id}", e.g.
+    #   "1778365681821_8563". No foreign key — inbox messages live in a separate DB.
+    trigger_message_id: str | None = None
 
 
 def _now_iso() -> str:
@@ -477,6 +484,7 @@ class Registry:
             juice_quality=d.get("juice_quality"),
             juice_rationale=d.get("juice_rationale"),
             prescription_confidence=d.get("prescription_confidence"),
+            trigger_message_id=d.get("trigger_message_id"),
         )
 
     def _write_audit(
@@ -514,6 +522,7 @@ class Registry:
         register: str = "operational",
         source_ref: str | None = None,
         file_scope: list[str] | None = None,
+        trigger_message_id: str | None = None,
     ) -> UpsertResult:
         """
         Propose a UoW for a GitHub issue.
@@ -553,6 +562,10 @@ class Registry:
             file_scope: List of file/directory paths touched by this issue (extracted from
                 issue body). Used by shard_dispatch to detect overlap between concurrent UoWs.
                 None means the UoW is treated as independent (serial execution is safe default).
+            trigger_message_id: Inbox message_id of the Telegram conversation that initiated
+                this UoW (e.g. "1778365681821_8563"). NULL for cultivator-driven UoWs (no
+                associated Telegram message). Stored for dashboard join queries linking
+                Telegram conversations to execution outcomes.
         """
         if not success_criteria or not success_criteria.strip():
             raise ValueError(
@@ -564,6 +577,7 @@ class Registry:
             source_repo=source_repo, issue_url=issue_url,
             register=register, source_ref=source_ref,
             file_scope=file_scope,
+            trigger_message_id=trigger_message_id,
         )
 
     def _upsert_typed(
@@ -578,6 +592,7 @@ class Registry:
         register: str = "operational",
         source_ref: str | None = None,
         file_scope: list[str] | None = None,
+        trigger_message_id: str | None = None,
     ) -> UpsertResult:
         """Core upsert logic returning typed UpsertResult."""
         if sweep_date is None:
@@ -686,8 +701,9 @@ class Registry:
                     id, type, source, source_issue_number, sweep_date,
                     status, posture, created_at, updated_at, summary,
                     success_criteria, route_reason, route_evidence, trigger,
-                    issue_url, register, uow_mode, source_ref, file_scope
-                ) VALUES (?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}', ?, ?, ?, ?, ?)
+                    issue_url, register, uow_mode, source_ref, file_scope,
+                    trigger_message_id
+                ) VALUES (?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     uow_id,
@@ -706,6 +722,7 @@ class Registry:
                     register,  # uow_mode mirrors register at germination time
                     source_ref,
                     file_scope_json,
+                    trigger_message_id,
                 ),
             )
             conn.commit()
@@ -1312,6 +1329,30 @@ class Registry:
             if row is None:
                 return None
             return row["started_at"]
+        finally:
+            conn.close()
+
+    def get_uow_trigger(self, uow_id: str) -> str | None:
+        """
+        Return the trigger_message_id for a UoW, or None if absent.
+
+        trigger_message_id is the inbox message_id of the Telegram conversation
+        that caused this UoW to be created (migration 0022). Returns None for
+        UoWs created by the automated cultivator (no associated Telegram message)
+        or for UoWs created before migration 0022 was applied.
+
+        Useful for dashboard join queries: registry.get_uow_trigger(uow_id)
+        → message_id → fetch_message(message_id) → full conversation context.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT trigger_message_id FROM uow_registry WHERE id = ?",
+                (uow_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return row["trigger_message_id"]
         finally:
             conn.close()
 

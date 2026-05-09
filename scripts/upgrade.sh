@@ -3650,6 +3650,42 @@ print('executor_pid column added')
         substep "Migration 104: registry.db not found or sqlite3 unavailable — skipping (auto-migration will create table on next run)"
     fi
 
+    # Migration 105: Add trigger_message_id column to uow_registry (issue #1108).
+    #
+    # The column is added by src/orchestration/migrations/0022_add_trigger_message_id.sql,
+    # which runs automatically when Registry() is instantiated (via _run_migrations).
+    # This entry exists as a marker so the upgrade timeline reflects the change.
+    # No manual action needed — the migration runner is idempotent.
+    local registry_db_105
+    registry_db_105="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/orchestration/registry.db"
+    if [ -f "$registry_db_105" ] && command -v sqlite3 >/dev/null 2>&1; then
+        if ! sqlite3 "$registry_db_105" "PRAGMA table_info(uow_registry);" 2>/dev/null | grep -q "trigger_message_id"; then
+            substep "Migration 105: trigger_message_id column absent — will be added on next Registry() init (auto-migration)"
+        else
+            substep "Migration 105: trigger_message_id column already present — skipping"
+        fi
+    else
+        substep "Migration 105: registry.db not found or sqlite3 unavailable — skipping (auto-migration will add column on next run)"
+    fi
+
+    # Migration 106: Create activity_timeline SQL view (issue #1108).
+    #
+    # The view is created by src/orchestration/migrations/0023_create_activity_timeline_view.sql,
+    # which runs automatically when Registry() is instantiated (via _run_migrations).
+    # This entry exists as a marker so the upgrade timeline reflects the change.
+    # No manual action needed — the migration runner is idempotent.
+    local registry_db_106
+    registry_db_106="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/orchestration/registry.db"
+    if [ -f "$registry_db_106" ] && command -v sqlite3 >/dev/null 2>&1; then
+        if ! sqlite3 "$registry_db_106" "SELECT name FROM sqlite_master WHERE type='view' AND name='activity_timeline';" 2>/dev/null | grep -q "activity_timeline"; then
+            substep "Migration 106: activity_timeline view absent — will be created on next Registry() init (auto-migration)"
+        else
+            substep "Migration 106: activity_timeline view already present — skipping"
+        fi
+    else
+        substep "Migration 106: registry.db not found or sqlite3 unavailable — skipping (auto-migration will create view on next run)"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
