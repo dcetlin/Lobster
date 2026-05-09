@@ -659,21 +659,48 @@ with open('$tmp_state', 'w') as f:
         # from stale quota messages left in the append-only log by prior sessions.
         # awk resets its capture window each time it sees a SESSION_START sentinel,
         # so `current_session_output` contains only what this session wrote.
+        #
+        # Two distinct quota message patterns observed in practice:
+        #   "You've hit your limit · resets Xam (UTC)"   — 5-hour session window
+        #   "You're out of extra usage · resets ..."     — weekly quota exhausted
+        # The phrase is the discriminator; the reset timestamp in the message
+        # is human-readable only and not used for sleep calculation here.
         local current_session_output
         current_session_output=$(awk '/^=== SESSION_START /{buf=""} {buf=buf"\n"$0} END{print buf}' \
             "$LOG_DIR/claude-session.log" 2>/dev/null)
         if echo "$current_session_output" | grep -qi "out of extra usage\|you.ve hit your limit\|hit your limit\|you.re out of"; then
-            log "QUOTA EXHAUSTED: Detected usage quota error. Sleeping until midnight UTC."
+            # Classify quota type from the message text to send a specific alert.
+            local quota_type="unknown"
+            if echo "$current_session_output" | grep -qi "out of extra usage\|you.re out of"; then
+                quota_type="weekly"
+            elif echo "$current_session_output" | grep -qi "you.ve hit your limit\|hit your limit"; then
+                quota_type="session"
+            fi
+
+            log "QUOTA EXHAUSTED: Detected usage quota error (type=$quota_type). Sleeping until midnight UTC."
             local now midnight_utc sleep_secs wake_time_et
             now=$(date +%s)
             midnight_utc=$(date -u -d 'tomorrow 00:00:00' +%s)
             sleep_secs=$(( midnight_utc - now ))
             wake_time_et=$(TZ="America/New_York" date -d "@$midnight_utc" "+%-I:%M %p ET")
-            write_state "quota_wait" "sleeping until midnight UTC ($wake_time_et), ${sleep_secs}s"
-            send_telegram_alert "⏸ *Lobster Quota Exhausted*
+            write_state "quota_wait" "sleeping until midnight UTC ($wake_time_et), ${sleep_secs}s, type=$quota_type"
+
+            local quota_alert_text
+            if [[ "$quota_type" == "session" ]]; then
+                quota_alert_text="⏸ *Session Quota Hit*
+
+Usage quota hit (5h session limit). Sleeping until quota resets. Will auto-restart."
+            elif [[ "$quota_type" == "weekly" ]]; then
+                quota_alert_text="⏸ *Weekly Quota Hit*
+
+Usage quota hit (weekly limit). Sleeping until midnight UTC ($wake_time_et). Will auto-restart at quota reset."
+            else
+                quota_alert_text="⏸ *Lobster Quota Exhausted*
 
 Usage quota hit. Sleeping until midnight UTC ($wake_time_et).
 Will auto-restart at quota reset. No action needed."
+            fi
+            send_telegram_alert "$quota_alert_text"
             sleep "$sleep_secs"
             log "QUOTA WAIT COMPLETE: Midnight UTC reached, resuming restart."
 
