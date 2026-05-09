@@ -2185,7 +2185,7 @@ else:
 
     # Migration 60: Register inject-bootup-context.py SessionStart hooks in settings.json
     # Adds two SessionStart entries: one empty-matcher entry for all fresh sessions
-    # (must run after write-dispatcher-session-id so role detection works), and one
+    # (must run after the launcher writes the startup flag — see issue #1908), and one
     # compact-matcher entry so bootup content is re-injected after context compaction.
     if [ -f "$CLAUDE_SETTINGS" ]; then
         chmod +x "$LOBSTER_DIR/hooks/inject-bootup-context.py" 2>/dev/null || true
@@ -3317,6 +3317,166 @@ print(f'prune-pr-worktrees: {result.status}')
     # it documents the dependency explicitly for future reference.
     mkdir -p "$WORKSPACE_DIR/data"
     substep "Migration 96: debug flag dir confirmed ($WORKSPACE_DIR/data)"
+
+    # Migration 97: Remove write-dispatcher-session-id SessionStart hook from settings.json
+    # (upstream issue #1908). Dispatcher detection now uses the launcher-written startup flag
+    # file instead of a UUID written by this hook. The hook file is deleted; the settings.json
+    # entry must be removed from existing installs.
+    if [ -f "$CLAUDE_SETTINGS" ] && command -v jq &>/dev/null; then
+        if jq -e '.hooks.SessionStart[]? | select(.hooks[]?.command | contains("write-dispatcher-session-id"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
+            TMP_SETTINGS=$(mktemp)
+            jq 'del(.hooks.SessionStart[] | select(.hooks[]?.command | contains("write-dispatcher-session-id")))' \
+                "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+            substep "Removed write-dispatcher-session-id hook from settings.json (Migration 97)"
+            migrated=$((migrated + 1))
+        else
+            substep "write-dispatcher-session-id hook not found in settings.json — skipping Migration 97"
+        fi
+    else
+        substep "settings.json not found or jq unavailable — skipping Migration 97"
+    fi
+
+
+    # Migration 98: Install LOBSTER-INFLIGHT-REMINDERS cron entry (upstream issue #1686).
+    # check-inflight-reminders.py runs every 3 minutes to detect stale subagent work
+    # and drop reminder messages into the dispatcher inbox.
+    local INFLIGHT_MARKER="# LOBSTER-INFLIGHT-REMINDERS"
+    local INFLIGHT_SCRIPT="$LOBSTER_DIR/scripts/check-inflight-reminders.py"
+    if [ -f "$INFLIGHT_SCRIPT" ]; then
+        chmod +x "$INFLIGHT_SCRIPT" 2>/dev/null || true
+        if ! crontab -l 2>/dev/null | grep -qF "$INFLIGHT_MARKER"; then
+            "$LOBSTER_DIR/scripts/cron-manage.sh" add "$INFLIGHT_MARKER" \
+                "*/3 * * * * uv run $INFLIGHT_SCRIPT >> $HOME/lobster-workspace/logs/inflight-reminders.log 2>&1 $INFLIGHT_MARKER" 2>/dev/null && {
+                substep "Added LOBSTER-INFLIGHT-REMINDERS cron entry (check-inflight-reminders.py, every 3 min)"
+                migrated=$((migrated + 1))
+            } || warn "Could not add LOBSTER-INFLIGHT-REMINDERS cron entry — check cron-manage.sh"
+        fi
+    else
+        warn "check-inflight-reminders.py not found at $INFLIGHT_SCRIPT — skipping Migration 98"
+    fi
+
+    # Migration 99: Fix on-compact.py hook matcher + add source-field self-gate (upstream issue #1947/#1984).
+    # matcher="compact" is unreliable in CC 2.1.119 (~37% fire rate since April 17).
+    # The correct pattern is matcher="" + self-gate inside the script.
+    # The self-gate now checks data["source"] == "compact" (CC-documented primary field)
+    # with data["hook_name"] == "compact" as a fallback for older CC versions.
+    # This migration:
+    #   1. Changes the on-compact.py SessionStart entry from matcher="compact" to matcher=""
+    #   2. Removes the redundant inject-bootup-context.py compact-matcher entry
+    #      (already covered by the empty-matcher entry that fires on all session types)
+    if [ -f "$CLAUDE_SETTINGS" ] && command -v python3 &>/dev/null; then
+        local _m99_needs_fix=0
+        if python3 -c "
+import json, sys
+with open('$CLAUDE_SETTINGS') as f:
+    d = json.load(f)
+hooks = d.get('hooks', {}).get('SessionStart', [])
+for h in hooks:
+    cmd = h.get('hooks', [{}])[0].get('command', '')
+    if 'on-compact' in cmd and h.get('matcher') == 'compact':
+        sys.exit(0)  # needs fix
+sys.exit(1)  # already correct
+" 2>/dev/null; then
+            _m99_needs_fix=1
+        fi
+        if [ "$_m99_needs_fix" -eq 1 ]; then
+            substep "Fixing on-compact.py hook matcher (Migration 99)..."
+            TMP_SETTINGS=$(mktemp)
+            python3 - "$CLAUDE_SETTINGS" "$TMP_SETTINGS" << 'M99_PYEOF'
+import json, sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src) as f:
+    data = json.load(f)
+session_start = data.get('hooks', {}).get('SessionStart', [])
+updated = []
+for entry in session_start:
+    cmd = entry.get('hooks', [{}])[0].get('command', '')
+    # Change on-compact.py from matcher="compact" to matcher=""
+    if 'on-compact' in cmd and entry.get('matcher') == 'compact':
+        entry = dict(entry, matcher='')
+    # Remove the redundant inject-bootup-context.py compact-matcher entry
+    # (the empty-matcher entry already fires on all session types including compact)
+    elif 'inject-bootup-context' in cmd and entry.get('matcher') == 'compact':
+        continue
+    updated.append(entry)
+data['hooks']['SessionStart'] = updated
+with open(dst, 'w') as f:
+    json.dump(data, f, indent=2)
+    f.write('\n')
+M99_PYEOF
+            if [ $? -eq 0 ] && [ -s "$TMP_SETTINGS" ]; then
+                mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+                success "Fixed on-compact.py hook matcher (matcher='' + removed redundant compact inject-bootup-context entry)"
+                migrated=$((migrated + 1))
+            else
+                rm -f "$TMP_SETTINGS"
+                warn "Migration 99: failed to update $CLAUDE_SETTINGS"
+            fi
+        else
+            info "Migration 99: on-compact.py hook already uses matcher='' — no change needed"
+        fi
+    else
+        info "Migration 99: settings.json not found or python3 unavailable — skipping"
+    fi
+
+    # Migration 100: Fix context-monitor PostToolUse matcher (upstream issue #1985).
+    # The matcher "Bash|mcp__lobster-inbox__|Agent" treats the middle segment as
+    # an exact tool name — no tool is named exactly "mcp__lobster-inbox__", so the
+    # hook never fired on any MCP call. The fix adds .* to match all mcp__lobster-inbox__*
+    # tools: "Bash|mcp__lobster-inbox__.*|Agent".
+    if [ -f "$CLAUDE_SETTINGS" ] && command -v jq &>/dev/null; then
+        if jq -e '.hooks.PostToolUse[]? | select(.matcher == "Bash|mcp__lobster-inbox__|Agent")' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
+            TMP_SETTINGS=$(mktemp)
+            jq '(.hooks.PostToolUse[]? | select(.matcher == "Bash|mcp__lobster-inbox__|Agent") | .matcher) = "Bash|mcp__lobster-inbox__.*|Agent"' \
+                "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+            substep "Fixed context-monitor matcher: mcp__lobster-inbox__ → mcp__lobster-inbox__.* (Migration 100)"
+            migrated=$((migrated + 1))
+        else
+            substep "context-monitor matcher already correct or hook absent — skipping Migration 100"
+        fi
+    else
+        substep "settings.json not found or jq unavailable — skipping Migration 100"
+    fi
+
+    # Migration 101: Remove pretooluse-heartbeat.py PreToolUse hook from settings.json.
+    # hooks/pretooluse-heartbeat.py was the original PreToolUse heartbeat (issue #1439,
+    # PR #1562). It was superseded by hooks/pre-tool-heartbeat.py (issue #1786, PR #1817)
+    # which adds a dispatcher-only guard so subagent tool calls cannot falsely keep the
+    # heartbeat fresh. The old hook was never deleted from some local-dev installs where
+    # it was registered via earlier migrations; this migration removes it from settings.json
+    # on any install that still has it.
+    if [ -f "$CLAUDE_SETTINGS" ] && command -v jq &>/dev/null; then
+        local _m101_present
+        _m101_present=$(jq -r '
+            [.hooks.PreToolUse[]?.hooks[]? |
+             select((.command // "") | test("pretooluse-heartbeat\\.py"))]
+            | length' "$CLAUDE_SETTINGS" 2>/dev/null || echo "0")
+
+        if [[ "${_m101_present:-0}" -gt 0 ]]; then
+            local _m101_tmp
+            _m101_tmp=$(mktemp)
+            if jq '
+                .hooks.PreToolUse = (
+                    .hooks.PreToolUse // [] |
+                    map(select(
+                        (.hooks // [] | any(.command // "" | test("pretooluse-heartbeat\\.py")))
+                        | not
+                    ))
+                )
+            ' "$CLAUDE_SETTINGS" > "$_m101_tmp" \
+                && mv "$_m101_tmp" "$CLAUDE_SETTINGS" 2>/dev/null; then
+                substep "Migration 101: removed pretooluse-heartbeat.py PreToolUse hook from settings.json"
+                migrated=$((migrated + 1))
+            else
+                rm -f "$_m101_tmp" 2>/dev/null || true
+                warn "Migration 101: could not update settings.json — jq transform failed"
+            fi
+        else
+            substep "Migration 101: pretooluse-heartbeat.py hook not present in settings.json — skipping"
+        fi
+    else
+        substep "Migration 101: settings.json or jq not found — skipping"
+    fi
 
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
