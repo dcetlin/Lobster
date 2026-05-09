@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -39,6 +40,18 @@ if TYPE_CHECKING:
 from .registry import ApproveConfirmed, ApproveExpired, ApproveNotFound, ApproveSkipped
 from .paths import LOBSTER_WORKSPACE as _LOBSTER_WORKSPACE, WOS_CONFIG as _WOS_CONFIG_PATH_FROM_PATHS, WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG, JOBS_JSON as _JOBS_JSON_PATH
 from .steward import ReturnReasonClassification, MAX_RETRIES as _STEWARD_MAX_RETRIES, _HARD_CAP_CYCLES
+
+
+# ---------------------------------------------------------------------------
+# Control event type constants
+# ---------------------------------------------------------------------------
+
+class ControlEventType(StrEnum):
+    """Named constants for dispatcher control event types written to control_events."""
+
+    WOS_START = "wos_start"
+    WOS_STOP = "wos_stop"
+    WOS_ABORT = "wos_abort"
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +292,7 @@ def handle_decide_close(uow_id: str, *, registry: "Registry") -> str:
     """
     rows = registry.decide_close(uow_id)
     if rows == 1:
-        registry.log_control_event("wos_abort", {"uow_id": uow_id, "result": "closed"})
+        registry.log_control_event(ControlEventType.WOS_ABORT, {"uow_id": uow_id, "result": "closed"})
         return (
             f"UoW `{uow_id}` closed.\n"
             f"Status: `blocked \u2192 failed` (reason: user_closed)"
@@ -609,7 +622,7 @@ def handle_wos_start(*, registry: "Registry | None" = None) -> str:
 
     reg = registry if registry is not None else _Registry()
     reg.log_control_event(
-        "wos_start",
+        ControlEventType.WOS_START,
         {"toggled": sorted(result["toggled"]), "not_found": sorted(result["not_found"])},
     )
 
@@ -666,7 +679,7 @@ def handle_wos_stop(*, registry: "Registry | None" = None) -> str:
 
     reg = registry if registry is not None else _Registry()
     reg.log_control_event(
-        "wos_stop",
+        ControlEventType.WOS_STOP,
         {"toggled": sorted(result["toggled"]), "not_found": sorted(result["not_found"])},
     )
 

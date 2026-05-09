@@ -6,7 +6,7 @@ Issue #1104: add control_events to WOS registry for dispatcher command timeline.
 Behavior under test:
 
 Migration:
-- Migration 0020 adds a control_events table with columns: id, ts, event_type, payload
+- Migration 0021 adds a control_events table with columns: id, ts, event_type, payload
 - The table is append-only; no schema enforcement on payload
 
 Registry.log_control_event:
@@ -46,16 +46,18 @@ _SRC = _REPO_ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from orchestration.dispatcher_handlers import ControlEventType
+
 # ---------------------------------------------------------------------------
 # Named constants (spec §control_events)
 # ---------------------------------------------------------------------------
 
 CONTROL_EVENT_TABLE = "control_events"
 
-# Event types guaranteed to exist per spec
-_EVENT_TYPE_WOS_START = "wos_start"
-_EVENT_TYPE_WOS_STOP = "wos_stop"
-_EVENT_TYPE_WOS_ABORT = "wos_abort"
+# Event types — imported from production code rather than mirrored here
+_EVENT_TYPE_WOS_START = ControlEventType.WOS_START
+_EVENT_TYPE_WOS_STOP = ControlEventType.WOS_STOP
+_EVENT_TYPE_WOS_ABORT = ControlEventType.WOS_ABORT
 
 _REQUIRED_EVENT_TYPES = {_EVENT_TYPE_WOS_START, _EVENT_TYPE_WOS_STOP, _EVENT_TYPE_WOS_ABORT}
 
@@ -90,7 +92,7 @@ def _query_control_events(registry) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 class TestControlEventsMigration:
-    """Migration 0020 creates the control_events table with the correct schema."""
+    """Migration 0021 creates the control_events table with the correct schema."""
 
     def test_table_exists_after_registry_init(self, tmp_path):
         """Registry() auto-applies migrations; control_events table must be created."""
@@ -368,8 +370,8 @@ class TestDispatcherControlEventWrites:
 # ---------------------------------------------------------------------------
 
 def test_required_event_types_are_defined():
-    """The spec-required event type strings are defined as named constants in this test."""
-    assert _EVENT_TYPE_WOS_START == "wos_start"
-    assert _EVENT_TYPE_WOS_STOP == "wos_stop"
-    assert _EVENT_TYPE_WOS_ABORT == "wos_abort"
+    """The spec-required event type strings are defined as ControlEventType members in production code."""
+    assert ControlEventType.WOS_START == "wos_start"
+    assert ControlEventType.WOS_STOP == "wos_stop"
+    assert ControlEventType.WOS_ABORT == "wos_abort"
     assert _REQUIRED_EVENT_TYPES == {"wos_start", "wos_stop", "wos_abort"}

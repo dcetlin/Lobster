@@ -1961,7 +1961,7 @@ class Registry:
 
         Table:
             control_events(id, ts, event_type, payload)
-            Created by migration 0020.
+            Created by migration 0021.
         """
         import sys
 

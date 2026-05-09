@@ -3638,10 +3638,10 @@ print('executor_pid column added')
     # which runs automatically when Registry() is instantiated (via _run_migrations).
     # This entry exists as a marker so the upgrade timeline reflects the change.
     # No manual action needed — the migration runner is idempotent.
-    local _registry_db_ce
-    _registry_db_ce="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/orchestration/registry.db"
-    if [ -f "$_registry_db_ce" ] && command -v sqlite3 >/dev/null 2>&1; then
-        if ! sqlite3 "$_registry_db_ce" "PRAGMA table_info(control_events);" 2>/dev/null | grep -q "event_type"; then
+    local registry_db
+    registry_db="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/orchestration/registry.db"
+    if [ -f "$registry_db" ] && command -v sqlite3 >/dev/null 2>&1; then
+        if ! sqlite3 "$registry_db" "PRAGMA table_info(control_events);" 2>/dev/null | grep -q "event_type"; then
             substep "Migration 104: control_events table absent — will be created on next Registry() init (auto-migration)"
         else
             substep "Migration 104: control_events table already present — skipping"
