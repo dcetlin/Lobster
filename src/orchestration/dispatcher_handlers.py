@@ -690,6 +690,12 @@ WOS_MESSAGE_TYPE_DISPATCH: dict[str, str] = {
     # before the spawn-gate because this handler legitimately returns action="send_reply"
     # (surface PR attention items to Dan). No subagent spawn required.
     "wos_pr_sweep_result": "handle_wos_pr_sweep_result",
+    # Per-cycle completion ping: written by wos_completion_notifier.py when a UoW
+    # transitions to Done or Failed in _process_uow(). Fast-path — dispatched before the
+    # spawn-gate; returns action="send_reply" to deliver the pre-formatted ping to Dan.
+    # Non-fatal write: steward.py swallows inbox write errors so the Done/Failed
+    # registry transition is never blocked.
+    "wos_done": "handle_wos_done",
 }
 
 
@@ -1485,6 +1491,46 @@ def handle_wos_pr_sweep_result(msg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def handle_wos_done(msg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Handle a ``wos_done`` inbox message — per-cycle ping for a UoW Done/Failed transition.
+
+    Called by route_wos_message when the dispatcher receives a message written by
+    wos_completion_notifier.py at the end of the Done() or fail_uow() branch.
+
+    This handler is a fast-path: it returns action="send_reply" so the dispatcher
+    delivers the pre-formatted Telegram ping to Dan directly, without spawning a
+    subagent. It is dispatched before the spawn-gate (which applies only to execution
+    message types that must always spawn a subagent).
+
+    The ping text is pre-formatted by wos_completion_notifier._select_format_and_build
+    in one of three variants:
+    - Short-form: pearl outcome with ≤1 execution attempt (two-line terse format)
+    - Rich-form: non-pearl outcome or >1 execution attempt (labelled multi-field format)
+    - Failed-form: UoW that failed (failed prefix, topology, tokens, failure summary)
+
+    Pure function — no side effects, no I/O.
+
+    Args:
+        msg: The raw wos_done inbox message dict.  Expected fields:
+            - ``text`` (str): Pre-formatted ping text from wos_completion_notifier.
+            - ``chat_id`` (str): Admin chat_id to deliver the ping to.
+            - ``uow_id`` (str): The UoW ID (included for observability).
+
+    Returns:
+        A dict with action="send_reply" and the ping text.
+    """
+    _default_chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
+    text: str = msg.get("text", "WOS UoW completion notification (no detail available)")
+    chat_id: str = str(msg.get("chat_id", _default_chat_id))
+    return {
+        "action": "send_reply",
+        "text": text,
+        "chat_id": chat_id,
+        "message_type": "wos_done",
+    }
+
+
 def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
     """
     Route an inbox message whose `type` is listed in WOS_MESSAGE_TYPE_DISPATCH.
@@ -1633,6 +1679,33 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
                     f"WOS PR sweep handler raised an error "
                     f"({type(exc).__name__}: {exc}). "
                     "PR sweep results were NOT delivered. Check logs."
+                ),
+                "message_type": msg_type,
+            }
+
+    # ---------------------------------------------------------------------------
+    # wos_done fast-path: per-cycle completion ping written by wos_completion_notifier.py
+    # at the end of the Done() or fail_uow() branch in steward._process_uow().
+    # Always returns action="send_reply" — no subagent spawn required.
+    # ---------------------------------------------------------------------------
+    if msg_type == "wos_done":
+        try:
+            done_result = handle_wos_done(msg)
+            done_result["message_type"] = msg_type
+            return done_result
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).error(
+                "route_wos_message: handle_wos_done raised %s: %s — "
+                "returning send_reply alert",
+                type(exc).__name__, exc,
+            )
+            return {
+                "action": "send_reply",
+                "text": (
+                    f"WOS completion ping handler raised an error "
+                    f"({type(exc).__name__}: {exc}). "
+                    "Completion ping was NOT delivered. Check logs."
                 ),
                 "message_type": msg_type,
             }
