@@ -88,4 +88,5 @@
 | 2026-05-09 | PR #1084 | Round 1 | APPROVED |
 | 2026-05-09 | PR #1095 | Round 1 | APPROVED |
 | 2026-05-09 | PR #1096 | Round 1 | APPROVED |
+| 2026-05-09 | PR #1058 | Round 1 | APPROVED |
 | 2026-05-09 | PR #1097 | Round 2 | APPROVED |
