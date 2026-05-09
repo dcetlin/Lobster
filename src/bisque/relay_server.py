@@ -70,8 +70,8 @@ UPLOADS_DIR = _MESSAGES / "bisque-uploads"
 # Maximum file upload size: 50 MB
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
-# MIME types we serve inline (images, video); everything else is an attachment
-_INLINE_MIME_PREFIXES = ("image/", "video/", "audio/")
+# MIME types we serve inline (images, video, audio, HTML); everything else is an attachment
+_INLINE_MIME_PREFIXES = ("image/", "video/", "audio/", "text/html")
 
 # Map content-type prefixes to file extensions for raw binary uploads
 _MIME_EXT_MAP: dict[str, str] = {
