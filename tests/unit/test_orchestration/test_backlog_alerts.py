@@ -98,9 +98,6 @@ _save_backlog_state = _MODULE._save_backlog_state
 _backlog_state_path = _MODULE._backlog_state_path
 check_backlog_alerts = _MODULE.check_backlog_alerts
 BacklogAlertResult = _MODULE.BacklogAlertResult
-TOXICITY_CONSECUTIVE_CYCLES = _MODULE.TOXICITY_CONSECUTIVE_CYCLES
-STARVATION_CONSECUTIVE_CYCLES = _MODULE.STARVATION_CONSECUTIVE_CYCLES
-STARVATION_MIN_DEPTH = _MODULE.STARVATION_MIN_DEPTH
 _BACKLOG_STATE_MAX_AGE_SECONDS = _MODULE._BACKLOG_STATE_MAX_AGE_SECONDS
 
 
@@ -258,7 +255,7 @@ class TestCheckBacklogAlerts:
         """After one cycle, saved depths length <= max(TOXICITY_CONSECUTIVE_CYCLES+1, STARVATION_CONSECUTIVE_CYCLES)."""
         registry = _make_registry()
         seed = list(range(10))  # 10 depths
-        expected_max = max(TOXICITY_CONSECUTIVE_CYCLES + 1, STARVATION_CONSECUTIVE_CYCLES)
+        expected_max = max(_MODULE.TOXICITY_CONSECUTIVE_CYCLES + 1, _MODULE.STARVATION_CONSECUTIVE_CYCLES)
 
         saved_state = {}
 

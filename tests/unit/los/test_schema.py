@@ -26,15 +26,15 @@ from src.los.db import (
     find_duplicate,
     increment_mention_count,
 )
+from src.los.extractor import PRIORITY_DEFAULT  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
-# Priority constants (no enum in production — local-only, not status mirrors)
+# Priority constants (local test-only values)
 # ---------------------------------------------------------------------------
 
 PRIORITY_HIGH = 1
 PRIORITY_LOW = 10
-PRIORITY_DEFAULT = 5
 
 
 # ---------------------------------------------------------------------------
