@@ -3632,6 +3632,24 @@ print('executor_pid column added')
         substep "Migration 103: registry DB not found — skipping (will be applied on first Registry init)"
     fi
 
+    # Migration 104: Add control_events table to WOS registry (issue #1104).
+    #
+    # The table is created by src/orchestration/migrations/0021_add_control_events.sql,
+    # which runs automatically when Registry() is instantiated (via _run_migrations).
+    # This entry exists as a marker so the upgrade timeline reflects the change.
+    # No manual action needed — the migration runner is idempotent.
+    local registry_db
+    registry_db="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/orchestration/registry.db"
+    if [ -f "$registry_db" ] && command -v sqlite3 >/dev/null 2>&1; then
+        if ! sqlite3 "$registry_db" "PRAGMA table_info(control_events);" 2>/dev/null | grep -q "event_type"; then
+            substep "Migration 104: control_events table absent — will be created on next Registry() init (auto-migration)"
+        else
+            substep "Migration 104: control_events table already present — skipping"
+        fi
+    else
+        substep "Migration 104: registry.db not found or sqlite3 unavailable — skipping (auto-migration will create table on next run)"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

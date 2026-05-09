@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -39,6 +40,18 @@ if TYPE_CHECKING:
 from .registry import ApproveConfirmed, ApproveExpired, ApproveNotFound, ApproveSkipped
 from .paths import LOBSTER_WORKSPACE as _LOBSTER_WORKSPACE, WOS_CONFIG as _WOS_CONFIG_PATH_FROM_PATHS, WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG, JOBS_JSON as _JOBS_JSON_PATH
 from .steward import ReturnReasonClassification, MAX_RETRIES as _STEWARD_MAX_RETRIES, _HARD_CAP_CYCLES
+
+
+# ---------------------------------------------------------------------------
+# Control event type constants
+# ---------------------------------------------------------------------------
+
+class ControlEventType(StrEnum):
+    """Named constants for dispatcher control event types written to control_events."""
+
+    WOS_START = "wos_start"
+    WOS_STOP = "wos_stop"
+    WOS_ABORT = "wos_abort"
 
 
 # ---------------------------------------------------------------------------
@@ -272,12 +285,14 @@ def handle_decide_close(uow_id: str, *, registry: "Registry") -> str:
     Handle a decide_close action for a UoW.
 
     Called when Dan selects "Close" after the Steward surfaces a stuck UoW,
-    or sends a message matching "decide close <uow-id>".
+    or sends a message matching "decide close <uow-id>" / "wos abort <uow-id>".
 
-    Transitions blocked → failed with reason=user_closed.
+    Transitions blocked → failed with reason=user_closed. Writes a 'wos_abort'
+    control event to the registry log when the close succeeds.
     """
     rows = registry.decide_close(uow_id)
     if rows == 1:
+        registry.log_control_event(ControlEventType.WOS_ABORT, {"uow_id": uow_id, "result": "closed"})
         return (
             f"UoW `{uow_id}` closed.\n"
             f"Status: `blocked \u2192 failed` (reason: user_closed)"
@@ -557,7 +572,7 @@ def handle_wos_unblock() -> str:
     )
 
 
-def handle_wos_start() -> str:
+def handle_wos_start(*, registry: "Registry | None" = None) -> str:
     """
     Handle /wos start (or "wos start").
 
@@ -568,8 +583,16 @@ def handle_wos_start() -> str:
 
     Idempotent: calling /wos start when already started returns a notice.
 
+    Args:
+        registry: Optional Registry instance. When omitted (the default), a new
+            Registry() is created for the control event write. Callers may pass
+            an existing instance to avoid opening a second connection (useful in
+            tests that need to inspect the written rows).
+
     Returns a human-readable Telegram message describing the outcome.
     """
+    from .registry import Registry as _Registry  # local import — keeps module importable without DB
+
     config = read_wos_config()
     if config.get("execution_enabled"):
         return (
@@ -596,10 +619,17 @@ def handle_wos_start() -> str:
             f"Note: {len(result['not_found'])} WOS-core job(s) not in jobs.json "
             f"(may be systemd-only): {', '.join(sorted(result['not_found']))}"
         )
+
+    reg = registry if registry is not None else _Registry()
+    reg.log_control_event(
+        ControlEventType.WOS_START,
+        {"toggled": sorted(result["toggled"]), "not_found": sorted(result["not_found"])},
+    )
+
     return "\n".join(lines)
 
 
-def handle_wos_stop() -> str:
+def handle_wos_stop(*, registry: "Registry | None" = None) -> str:
     """
     Handle /wos stop (or "wos stop").
 
@@ -611,8 +641,16 @@ def handle_wos_stop() -> str:
 
     Idempotent: calling /wos stop when already stopped returns a notice.
 
+    Args:
+        registry: Optional Registry instance. When omitted (the default), a new
+            Registry() is created for the control event write. Callers may pass
+            an existing instance to avoid opening a second connection (useful in
+            tests that need to inspect the written rows).
+
     Returns a human-readable Telegram message describing the outcome.
     """
+    from .registry import Registry as _Registry  # local import — keeps module importable without DB
+
     config = read_wos_config()
     if not config.get("execution_enabled"):
         return (
@@ -638,6 +676,13 @@ def handle_wos_stop() -> str:
             f"Note: {len(result['not_found'])} WOS-core job(s) not in jobs.json "
             f"(may be systemd-only): {', '.join(sorted(result['not_found']))}"
         )
+
+    reg = registry if registry is not None else _Registry()
+    reg.log_control_event(
+        ControlEventType.WOS_STOP,
+        {"toggled": sorted(result["toggled"]), "not_found": sorted(result["not_found"])},
+    )
+
     return "\n".join(lines)
 
 
