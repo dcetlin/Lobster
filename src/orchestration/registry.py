@@ -1935,6 +1935,71 @@ class Registry:
         finally:
             conn.close()
 
+    def log_control_event(
+        self,
+        event_type: str,
+        payload: dict | None = None,
+    ) -> None:
+        """
+        Append one row to the control_events table.
+
+        This is an append-only write — it never updates or deletes rows. Each row
+        records a single dispatcher control action (e.g. 'wos_start', 'wos_stop',
+        'wos_abort') with an optional JSON payload for contextual data such as
+        uow_id or pr_number.
+
+        Non-fatal: if the control_events table has not yet been created (pre-migration
+        install) or any other error occurs, the failure is logged to stderr and
+        swallowed. The calling handler continues normally — a missing control log
+        entry is never worth crashing a dispatcher command.
+
+        Args:
+            event_type: Short string identifying the event, e.g. 'wos_start',
+                'wos_stop', 'wos_abort', 'oracle_dispatched', 'merge_dispatched'.
+            payload: Optional dict of contextual data (uow_id, pr_number, etc.).
+                Serialized to JSON text in the payload column.
+
+        Table:
+            control_events(id, ts, event_type, payload)
+            Created by migration 0020.
+        """
+        import sys
+
+        payload_json: str | None = None
+        if payload is not None:
+            try:
+                payload_json = json.dumps(payload)
+            except (TypeError, ValueError) as exc:
+                print(
+                    f"[Registry.log_control_event] payload serialization failed "
+                    f"for event_type={event_type!r}: {exc}",
+                    file=sys.stderr,
+                )
+                payload_json = None
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO control_events (event_type, payload)
+                VALUES (?, ?)
+                """,
+                (event_type, payload_json),
+            )
+            conn.commit()
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            print(
+                f"[Registry.log_control_event] failed to write event_type={event_type!r}: {exc}",
+                file=sys.stderr,
+            )
+        finally:
+            conn.close()
+
     def fail_uow(self, uow_id: str, reason: str) -> None:
         """
         Transition a UoW to 'failed'.
