@@ -48,6 +48,7 @@ from src.orchestration.config import TimeoutConfig
 from src.orchestration.vision_routing import resolve_vision_route
 from src.ooda.fast_thorough_selector import select_path as _ooda_select_path, cite_basis as _ooda_cite_basis
 from src.orchestration.gate_fired import translate_eligibility_to_gate
+from src.orchestration.wos_completion_notifier import notify_uow_done, notify_uow_failed
 
 log = logging.getLogger("steward")
 
@@ -4438,6 +4439,24 @@ def _process_uow(
             next_action="done",
             artifact_dir=artifact_dir,
         )
+
+        # Per-cycle completion ping (spec: wos-completion-report-spec.md §Per-Cycle Ping).
+        # Non-fatal: inbox write failure must not block the Done registry transition.
+        # outcome_category is not mapped to UoW dataclass; pass None (degrades gracefully).
+        # current_log_str contains the updated steward_log including steward_closure event.
+        if not dry_run:
+            notify_uow_done(
+                uow_id=uow_id,
+                uow_title=uow.summary,
+                primary_outcome=None,  # not yet mapped to UoW dataclass; notifier falls back to 'seed'
+                steward_cycles=cycles,
+                execution_attempts=uow.execution_attempts,
+                token_usage=None,      # not yet mapped to UoW dataclass; notifier shows 'unknown'
+                artifacts=uow.artifacts,
+                steward_log=current_log_str,
+                gate_fired="none",     # not yet in schema; populated after migration 0019
+            )
+
         return Done(uow_id=uow_id)
 
     # 4b-orphan: executing_orphan short-circuit.
@@ -4487,6 +4506,20 @@ def _process_uow(
             next_action="failed",
             artifact_dir=artifact_dir,
         )
+
+        # Per-cycle failure ping (spec: wos-completion-report-spec.md §Per-Cycle Ping).
+        # Non-fatal: inbox write failure must not block the Surfaced return.
+        if not dry_run:
+            notify_uow_failed(
+                uow_id=uow_id,
+                uow_title=uow.summary,
+                gate_fired="none",         # not yet in schema; populated after migration 0019
+                steward_cycles=cycles,
+                execution_attempts=uow.execution_attempts,
+                token_usage=None,          # not yet mapped to UoW dataclass; shows 'unknown'
+                failure_summary=orphan_reason,
+            )
+
         return Surfaced(uow_id=uow_id, condition=surface_condition)
 
     # 4c: Prescribe another Executor pass

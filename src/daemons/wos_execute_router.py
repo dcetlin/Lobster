@@ -52,6 +52,7 @@ import logging
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import time
 import uuid
@@ -75,7 +76,6 @@ for _p in [str(_REPO_ROOT), str(_SRC_ROOT)]:
 # ---------------------------------------------------------------------------
 
 from orchestration.dispatcher_handlers import route_wos_message, read_wos_config  # noqa: E402
-from orchestration.executor import _dispatch_via_claude_p  # noqa: E402
 from agents.session_store import get_active_sessions  # noqa: E402
 from utils.inbox_write import write_inbox_message  # noqa: E402
 
@@ -317,6 +317,83 @@ def _write_send_reply_alert(text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Non-blocking subprocess dispatch
+# ---------------------------------------------------------------------------
+
+#: claude binary — resolved from PATH at call time.
+_CLAUDE_BIN: str = "claude"
+
+#: Maximum turns for a dispatched claude -p agent.
+_MAX_TURNS: int = 40
+
+
+def _dispatch_via_popen(instructions: str, uow_id: str) -> str:
+    """
+    Dispatch a functional-engineer subagent via ``claude -p`` without blocking.
+
+    Uses ``subprocess.Popen`` with ``start_new_session=True`` so the child
+    process runs in its own process group and is NOT killed when systemd sends
+    SIGTERM to this daemon.
+
+    The child process runs independently.  The daemon does NOT wait for it
+    to complete — the subagent's handoff mechanism is ``write_result``
+    (called at agent completion), not the subprocess return code.
+
+    Returns a ``run_id`` string for audit correlation (``uow_id`` + timestamp).
+
+    Raises ``FileNotFoundError`` if the claude binary is not on PATH.
+    Raises ``OSError`` for other process creation errors.
+
+    This replaces the synchronous ``_dispatch_via_claude_p`` call pattern in
+    the router.  The synchronous path (``executor._dispatch_via_claude_p``)
+    is intentionally retained for the executor-heartbeat path (CI / recovery
+    scenarios where blocking is acceptable).
+
+    Design note: ``start_new_session=True`` creates a new Unix session (and
+    therefore a new process group) for the child.  This is the minimal
+    isolation required: the child is no longer in the daemon's process group,
+    so a SIGTERM or SIGKILL targeting the daemon's group does not propagate.
+    ``close_fds=True`` (the Python default) ensures the daemon's open file
+    descriptors are not inherited by the child.
+    """
+    run_id = f"{uow_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+
+    command = [
+        _CLAUDE_BIN,
+        "-p",
+        "--dangerously-skip-permissions",
+        "--max-turns", str(_MAX_TURNS),
+        "--",   # end-of-options sentinel: prevents prompts starting with '---'
+                # from being parsed as CLI flags
+        instructions,
+    ]
+
+    # Pass an explicit env so CLAUDE_CODE_OAUTH_TOKEN is present even when
+    # this daemon was started by systemd with a stripped environment.
+    try:
+        from orchestration.steward import _build_claude_env
+        env = _build_claude_env()
+    except Exception:
+        env = None  # Fall back to inheriting the current environment
+
+    subprocess.Popen(
+        command,
+        start_new_session=True,  # Insulates child from SIGTERM sent to daemon
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        env=env,
+    )
+
+    log.info(
+        "dispatch: spawned claude -p for uow_id=%s run_id=%s (non-blocking, new session)",
+        uow_id, run_id,
+    )
+    return run_id
+
+
+# ---------------------------------------------------------------------------
 # Core routing logic
 # ---------------------------------------------------------------------------
 
@@ -360,15 +437,15 @@ def _route_single_message(msg: dict) -> None:
         task_id: str = decision.get("task_id", f"wos-{uow_id}")
         prompt: str = decision.get("prompt", "")
         # route_wos_message returns task_id as "wos-{uow_id}"; strip prefix
-        # to get the bare uow_id expected by _dispatch_via_claude_p
+        # to get the bare uow_id expected by _dispatch_via_popen
         bare_uow_id = task_id.removeprefix("wos-")
 
         log.info("route: dispatching subagent for uow_id=%s task_id=%s", uow_id, task_id)
         try:
-            run_id = _dispatch_via_claude_p(instructions=prompt, uow_id=bare_uow_id)
+            run_id = _dispatch_via_popen(instructions=prompt, uow_id=bare_uow_id)
             log.info("route: dispatch succeeded run_id=%s uow_id=%s", run_id, uow_id)
         except Exception as exc:
-            log.error("route: _dispatch_via_claude_p raised for %s: %s", uow_id, exc)
+            log.error("route: _dispatch_via_popen raised for %s: %s", uow_id, exc)
             _release_message_failed(message_id)
             _write_alert(
                 f"wos-execute-router: subprocess dispatch failed for "
