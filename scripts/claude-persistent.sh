@@ -677,13 +677,30 @@ with open('$tmp_state', 'w') as f:
                 quota_type="session"
             fi
 
-            log "QUOTA EXHAUSTED: Detected usage quota error (type=$quota_type). Sleeping until midnight UTC."
-            local now midnight_utc sleep_secs wake_time_et
+            log "QUOTA EXHAUSTED: Detected usage quota error (type=$quota_type). Parsing actual reset time."
+            local now reset_ts sleep_secs wake_time_et
             now=$(date +%s)
-            midnight_utc=$(date -u -d 'tomorrow 00:00:00' +%s)
-            sleep_secs=$(( midnight_utc - now ))
-            wake_time_et=$(TZ="America/New_York" date -d "@$midnight_utc" "+%-I:%M %p ET")
-            write_state "quota_wait" "sleeping until midnight UTC ($wake_time_et), ${sleep_secs}s, type=$quota_type"
+            
+            # Extract reset time from error like "resets 6pm (UTC)"
+            local reset_str=$(echo "$current_session_output" | grep -oP 'resets \K[^(]+' | head -1 | xargs)
+            
+            if [[ -n "$reset_str" ]]; then
+                reset_ts=$(date -u -d "$reset_str" +%s 2>/dev/null || echo "")
+                if [[ -z "$reset_ts" ]] || [[ $reset_ts -lt $now ]]; then
+                    reset_ts=$(date -u -d "tomorrow $reset_str" +%s 2>/dev/null || echo "")
+                fi
+            fi
+            
+            if [[ -z "$reset_ts" ]] || [[ $reset_ts -lt $now ]]; then
+                reset_ts=$(date -u -d 'tomorrow 00:00:00' +%s)
+                log "QUOTA: Using midnight UTC fallback"
+            else
+                log "QUOTA: Parsed reset time from error: $reset_str"
+            fi
+            
+            sleep_secs=$(( reset_ts - now ))
+            wake_time_et=$(TZ="America/New_York" date -d "@$reset_ts" "+%-I:%M %p ET")
+            write_state "quota_wait" "sleeping until quota reset time ($wake_time_et), ${sleep_secs}s, type=$quota_type"
 
             local quota_alert_text
             if [[ "$quota_type" == "session" ]]; then
