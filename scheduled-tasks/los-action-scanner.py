@@ -3,17 +3,20 @@
 LOS Action Item Scanner — Lobster Scheduled Job
 
 Runs hourly. Scans the past hour of conversation history for action
-commitments Dan has made, extracts them via the LLM extractor, and
-writes them to self_action_items.db.
+commitments Dan has made, extracts them, and writes them to self_action_items.db.
 
-This is a Type A job (LLM subagent): the MCP conversation history tool
-requires the context of a running Lobster session — the scanner reads
-recent messages via the inbox_server's conversation history, then calls
-Claude to extract commitments.
+This is a Type A job (LLM subagent): the subagent reads recent messages,
+uses its native intelligence to extract action commitments from each message,
+then calls parse_llm_response() + extract_action_items() to persist them to the DB.
+
+The extraction step is performed by the subagent (Claude natively) — this
+script handles message collection only, emitting candidates as JSON to stdout.
+The subagent formats extracted items as JSON and calls parse_llm_response() then
+extract_action_items() from src.los.extractor before persisting to the DB.
 
 Type B (cron-direct) was considered but rejected: the extraction step
-requires the Anthropic SDK (LLM call), which carries cost and latency —
-making it unsuitable for sub-15-minute cron runs. Hourly is appropriate.
+requires LLM reasoning — making it unsuitable for sub-15-minute cron runs.
+Hourly is appropriate.
 
 jobs.json entry:
     {
@@ -36,7 +39,6 @@ import json
 import logging
 import os
 import sys
-import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -48,9 +50,7 @@ _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from src.los.db import connect, get_open_items, DEFAULT_DB_PATH  # noqa: E402
-from src.los.extractor import extract_action_items  # noqa: E402
-from src.utils.inbox_write import _inbox_dir, _task_outputs_dir  # noqa: E402
+from src.utils.inbox_write import _task_outputs_dir  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -132,50 +132,6 @@ def _load_processed_messages(since: datetime) -> list[dict]:
     return messages
 
 
-def _scan_and_extract(
-    conn,
-    messages: list[dict],
-    dry_run: bool = False,
-) -> list[dict]:
-    """Run extraction on each message. Returns list of extraction result summaries."""
-    results = []
-    for msg in messages:
-        text = msg.get("text", "").strip()
-        if not text or len(text) < 10:
-            continue
-        source_id = msg.get("id") or msg.get("message_id", "")
-        source = "telegram"
-
-        if dry_run:
-            log.info("[dry-run] Would extract from: %s...", text[:80])
-            results.append({"msg_id": source_id, "extracted": [], "dry_run": True})
-            continue
-
-        try:
-            extracted = extract_action_items(
-                conn=conn,
-                text=text,
-                source=source,
-                source_message_id=str(source_id),
-            )
-            if extracted:
-                log.info(
-                    "Extracted %d action item(s) from msg %s: %s",
-                    len(extracted),
-                    source_id,
-                    [i.text[:60] for i in extracted],
-                )
-            results.append({
-                "msg_id": source_id,
-                "extracted": [{"id": i.id, "text": i.text} for i in extracted],
-            })
-        except Exception as exc:
-            log.warning("Extraction failed for msg %s: %s", source_id, exc)
-            results.append({"msg_id": source_id, "extracted": [], "error": str(exc)})
-
-    return results
-
-
 def _write_task_output(output: str, status: str = "success") -> None:
     """Write output to the task outputs directory."""
     try:
@@ -214,21 +170,28 @@ def main() -> None:
         _write_task_output("No messages in lookback window.", status="success")
         return
 
-    if args.dry_run:
-        conn = None
-    else:
-        conn = connect(DEFAULT_DB_PATH)
-
-    try:
-        results = _scan_and_extract(conn, messages, dry_run=args.dry_run)
-    finally:
-        if conn:
-            conn.close()
-
-    total_extracted = sum(len(r.get("extracted", [])) for r in results)
-    summary = f"Scanned {len(messages)} messages, extracted {total_extracted} action items."
-    log.info(summary)
-    _write_task_output(summary, status="success")
+    # Emit the candidate messages as JSON for the subagent to process.
+    # The subagent reads each message, uses its native intelligence to extract
+    # action commitments, then calls parse_llm_response() + extract_action_items()
+    # from src.los.extractor to persist them to the DB.
+    candidate_texts = [
+        {
+            "msg_id": msg.get("id") or msg.get("message_id", ""),
+            "text": msg.get("text", "").strip(),
+        }
+        for msg in messages
+        if len(msg.get("text", "").strip()) >= 10
+    ]
+    log.info(
+        "Emitting %d candidate message(s) for subagent extraction.",
+        len(candidate_texts),
+    )
+    import json as _json
+    print(_json.dumps({"candidates": candidate_texts}, indent=2))
+    _write_task_output(
+        f"Collected {len(candidate_texts)} candidate messages for subagent extraction.",
+        status="success",
+    )
 
 
 if __name__ == "__main__":

@@ -1,18 +1,22 @@
 """
 LOS — Action Item Extractor
 
-Extracts first-person action commitments from text using Claude claude-haiku-4-5.
-Side effects (DB writes) happen at the end — pure extraction logic is testable
-without a DB.
+Persists pre-extracted action commitments to the DB. Extraction itself is
+performed by the calling subagent (Claude natively) — this module handles
+only the parsing and persistence boundary.
 
-Usage:
+Usage (from a subagent that has already identified action items):
+
     from src.los.db import connect
-    from src.los.extractor import extract_action_items
+    from src.los.extractor import extract_action_items, parse_llm_response
 
     conn = connect()
-    items = extract_action_items(
+    # The subagent produces a JSON string such as:
+    #   '[{"text": "Call Sarah about the contract", "priority": 3}]'
+    items = parse_llm_response(raw_json)
+    saved = extract_action_items(
         conn=conn,
-        text="I need to call Sarah about the contract.",
+        items=items,
         source="telegram",
         source_message_id="msg_123",
     )
@@ -23,8 +27,6 @@ import json
 import logging
 import sqlite3
 from typing import Optional
-
-import anthropic
 
 from .db import (
     ActionItem,
@@ -40,37 +42,21 @@ log = logging.getLogger(__name__)
 # Constants (named after spec requirements — don't use magic literals)
 # ---------------------------------------------------------------------------
 
-EXTRACTION_MODEL = "claude-haiku-4-5"
-MAX_TOKENS = 512
 PRIORITY_MIN = 1
 PRIORITY_MAX = 10
 PRIORITY_DEFAULT = 5
 
-_SYSTEM_PROMPT = (
-    "You are an action-commitment detector. Given text from Dan's voice note, "
-    "journal entry, or Telegram message, extract only first-person commitments "
-    "Dan has made to do something himself.\n\n"
-    "Rules:\n"
-    "- Include: 'I need to', 'I should', 'I want to', 'I'm going to', "
-    "'I have to', 'remind me to', 'I promised to'\n"
-    "- Exclude: thoughts, questions, observations, things Lobster should do, "
-    "system tasks, pure emotions\n"
-    "- Each commitment becomes one todo item with a short, imperative title "
-    "(e.g. 'Call Sarah about the contract')\n"
-    "- Assign priority as an integer from 1 (urgent) to 10 (low/aspirational): "
-    "1-3 = explicit urgency/deadline, 4-6 = clear intent, 7-10 = vague/aspirational\n\n"
-    "Return JSON only: [{\"text\": \"...\", \"priority\": <int>}]\n"
-    "If no action commitments found, return []"
-)
-
 
 # ---------------------------------------------------------------------------
-# Pure extraction helpers
+# Pure parsing helper
 # ---------------------------------------------------------------------------
 
 
 def parse_llm_response(raw: str) -> list[dict]:
-    """Parse the LLM JSON response into a list of validated item dicts.
+    """Parse a subagent's JSON extraction output into a list of validated item dicts.
+
+    The subagent is expected to produce JSON of the form:
+        [{"text": "...", "priority": <int>}]
 
     Returns an empty list on any error — callers must handle [] gracefully.
     Each returned dict is guaranteed to have 'text' (str) and 'priority' (int).
@@ -78,11 +64,11 @@ def parse_llm_response(raw: str) -> list[dict]:
     try:
         parsed = json.loads(raw.strip())
     except (json.JSONDecodeError, ValueError):
-        log.warning("LOS extractor: failed to parse LLM response as JSON")
+        log.warning("LOS extractor: failed to parse subagent response as JSON")
         return []
 
     if not isinstance(parsed, list):
-        log.warning("LOS extractor: LLM response was not a list")
+        log.warning("LOS extractor: subagent response was not a list")
         return []
 
     valid = []
@@ -104,19 +90,6 @@ def parse_llm_response(raw: str) -> list[dict]:
     return valid
 
 
-def _call_llm(text: str) -> list[dict]:
-    """Call Claude haiku to extract action items. Returns parsed list or []."""
-    client = anthropic.Anthropic()
-    message = client.messages.create(
-        model=EXTRACTION_MODEL,
-        max_tokens=MAX_TOKENS,
-        system=_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": text}],
-    )
-    raw = message.content[0].text
-    return parse_llm_response(raw)
-
-
 # ---------------------------------------------------------------------------
 # Side-effectful entry point (DB writes at the boundary)
 # ---------------------------------------------------------------------------
@@ -124,29 +97,27 @@ def _call_llm(text: str) -> list[dict]:
 
 def extract_action_items(
     conn: sqlite3.Connection,
-    text: str,
+    items: list[dict],
     source: str,
     source_message_id: Optional[str],
 ) -> list[ActionItem]:
-    """Extract action items from text and persist them to the DB.
+    """Persist pre-extracted action items to the DB.
 
-    For each extracted item:
+    `items` is a list of dicts with 'text' (str) and 'priority' (int) keys,
+    as produced by parse_llm_response. The calling subagent is responsible
+    for extracting these from the source text using its native intelligence.
+
+    For each item:
     - If a duplicate exists (open/snoozed), increments mention_count
     - Otherwise, inserts a new row
 
     Returns the list of inserted or updated ActionItem objects.
-    Returns [] if the LLM finds nothing or the API call fails.
+    Returns [] when items is empty.
     """
-    try:
-        llm_items = _call_llm(text)
-    except Exception as exc:
-        log.warning("LOS extractor: LLM call failed (%s), skipping extraction", exc)
-        return []
-
     from .db import get_item_by_id
 
     result: list[ActionItem] = []
-    for item_dict in llm_items:
+    for item_dict in items:
         item_text = item_dict["text"]
         priority = item_dict["priority"]
 
