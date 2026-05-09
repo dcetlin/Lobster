@@ -638,6 +638,16 @@ STUCK_HEARTBEAT_CONSECUTIVE_INTERVALS: int = 2
 STUCK_HEARTBEAT_MIN_DELTA: int = 0
 
 
+# ---------------------------------------------------------------------------
+# Named constants — backlog alert governor (Phase 2d)
+# ---------------------------------------------------------------------------
+
+TOXICITY_CONSECUTIVE_CYCLES: int = 3    # N strictly-increasing depth readings → toxicity
+STARVATION_CONSECUTIVE_CYCLES: int = 3  # N readings at/below threshold → starvation
+STARVATION_MIN_DEPTH: int = 0           # depth <= this value counts as starvation cycle
+_BACKLOG_STATE_MAX_AGE_SECONDS: int = 900  # 15 min — reset history if gap exceeds this
+
+
 @dataclass(frozen=True, slots=True)
 class StuckHeartbeatResult:
     """Pure result value returned by detect_stuck_heartbeat_uows."""
@@ -765,6 +775,146 @@ def detect_stuck_heartbeat_uows(
 
 
 # ---------------------------------------------------------------------------
+# Phase 2d: Backlog alerts — asymmetric governor (toxicity + starvation)
+# ---------------------------------------------------------------------------
+
+def _backlog_state_path() -> Path:
+    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+    return workspace / "logs" / "backlog-alert-state.json"
+
+
+def _load_backlog_state() -> dict:
+    """Load depth history from state file; return fresh state if absent or stale."""
+    path = _backlog_state_path()
+    try:
+        raw = json.loads(path.read_text())
+        last_updated = raw.get("last_updated")
+        if last_updated:
+            age = (_utc_now() - _parse_iso(last_updated)).total_seconds()
+            if age > _BACKLOG_STATE_MAX_AGE_SECONDS:
+                log.info(
+                    "Backlog alert state is stale (%.0fs > %ds) — resetting history",
+                    age, _BACKLOG_STATE_MAX_AGE_SECONDS,
+                )
+                return {"depths": [], "last_updated": None}
+        return raw
+    except Exception:
+        return {"depths": [], "last_updated": None}
+
+
+def _save_backlog_state(state: dict) -> None:
+    """Write depth history to state file atomically."""
+    path = _backlog_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+@dataclass(frozen=True, slots=True)
+class BacklogAlertResult:
+    """Pure result value returned by check_backlog_alerts."""
+    backlog_depth: int
+    toxicity_alert: bool
+    starvation_alert: bool
+
+
+def check_backlog_alerts(
+    registry,
+    dry_run: bool = False,
+) -> BacklogAlertResult:
+    """
+    Asymmetric governor — check ready-for-executor queue depth for toxicity
+    and starvation over consecutive heartbeat cycles.
+
+    Toxicity: depth has been strictly increasing for TOXICITY_CONSECUTIVE_CYCLES
+    consecutive cycles — executor is under-capacity relative to cultivator output.
+
+    Starvation: depth has been <= STARVATION_MIN_DEPTH for
+    STARVATION_CONSECUTIVE_CYCLES consecutive cycles — cultivator not proposing
+    or germinator not germinating; queue depth zero is not rest, it is throughput
+    death.
+
+    Cycle history is persisted to backlog-alert-state.json so consecutive-cycle
+    detection works across separate cron invocations. State older than
+    _BACKLOG_STATE_MAX_AGE_SECONDS is discarded (avoids false alerts after
+    planned downtime or steward disable).
+
+    In dry_run mode: detects conditions and logs them but does NOT write state
+    file or call _append_observation.
+
+    Returns BacklogAlertResult(backlog_depth, toxicity_alert, starvation_alert).
+    """
+    try:
+        ready = registry.list(status="ready-for-executor")
+        depth = len(ready)
+    except Exception as e:
+        log.warning("Backlog alert check: failed to query registry — %s", e)
+        return BacklogAlertResult(backlog_depth=0, toxicity_alert=False, starvation_alert=False)
+
+    state = _load_backlog_state()
+    depths: list[int] = state.get("depths", [])
+
+    depths.append(depth)
+    max_history = max(TOXICITY_CONSECUTIVE_CYCLES + 1, STARVATION_CONSECUTIVE_CYCLES)
+    depths = depths[-max_history:]
+
+    # Toxicity: last TOXICITY_CONSECUTIVE_CYCLES+1 depths are all strictly increasing.
+    toxicity_alert = False
+    needed_for_toxicity = TOXICITY_CONSECUTIVE_CYCLES + 1
+    if len(depths) >= needed_for_toxicity:
+        tail = depths[-needed_for_toxicity:]
+        if all(tail[i] < tail[i + 1] for i in range(len(tail) - 1)):
+            toxicity_alert = True
+
+    # Starvation: last STARVATION_CONSECUTIVE_CYCLES depths are all <= threshold.
+    starvation_alert = False
+    if len(depths) >= STARVATION_CONSECUTIVE_CYCLES:
+        tail = depths[-STARVATION_CONSECUTIVE_CYCLES:]
+        if all(d <= STARVATION_MIN_DEPTH for d in tail):
+            starvation_alert = True
+
+    if not dry_run:
+        state["depths"] = depths
+        state["last_updated"] = _now_iso()
+        _save_backlog_state(state)
+
+    if toxicity_alert:
+        growth = depths[-1] - depths[-needed_for_toxicity]
+        msg = (
+            f"backlog_toxicity: ready-for-executor queue growing for "
+            f"{TOXICITY_CONSECUTIVE_CYCLES} consecutive cycles "
+            f"(current_depth={depth}, growth=+{growth} over {TOXICITY_CONSECUTIVE_CYCLES} cycles) "
+            f"— executor under-capacity relative to cultivator output"
+        )
+        log.warning("%s", msg)
+        if not dry_run:
+            _append_observation(msg)
+
+    if starvation_alert:
+        msg = (
+            f"backlog_starvation: ready-for-executor queue at zero for "
+            f"{STARVATION_CONSECUTIVE_CYCLES} consecutive cycles "
+            f"(current_depth={depth}) "
+            f"— cultivator not proposing or germinator not germinating; "
+            f"throughput death, not rest"
+        )
+        log.warning("%s", msg)
+        if not dry_run:
+            _append_observation(msg)
+
+    log.debug(
+        "Backlog alert check: depth=%d toxicity=%s starvation=%s history=%s",
+        depth, toxicity_alert, starvation_alert, depths,
+    )
+    return BacklogAlertResult(
+        backlog_depth=depth,
+        toxicity_alert=toxicity_alert,
+        starvation_alert=starvation_alert,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -878,6 +1028,20 @@ def main() -> int:
         )
     except Exception:
         log.exception("Stuck-agent detection failed — continuing to Steward main loop")
+
+    # Phase 2d: Backlog alerts — asymmetric governor (toxicity + starvation).
+    # Runs regardless of execution_enabled so monitoring is active even when WOS is paused.
+    log.info("--- Phase 2d: Backlog alerts ---")
+    try:
+        backlog_result = check_backlog_alerts(registry, dry_run=dry_run)
+        log.info(
+            "Backlog alert check complete: depth=%d toxicity=%s starvation=%s",
+            backlog_result.backlog_depth,
+            backlog_result.toxicity_alert,
+            backlog_result.starvation_alert,
+        )
+    except Exception:
+        log.exception("Backlog alert check failed — continuing to Steward main loop")
 
     # execution_enabled gate — mirrors the executor-heartbeat pattern.
     # Phases 0–2 (stale agent cleanup, startup sweep, observation loop) always
