@@ -451,7 +451,7 @@ class TestDispatchFailure:
         _write_msg(router.INBOX_DIR, msg1)
         _write_msg(router.INBOX_DIR, msg2)
 
-        def fake_dispatch(instructions: str, uow_id: str) -> str:
+        def fake_dispatch(instructions: str, uow_id: str, registry: object = None) -> str:
             if "fail" in uow_id:
                 raise RuntimeError("dispatch failed")
             return "run-ok"

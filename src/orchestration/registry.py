@@ -2785,6 +2785,167 @@ class Registry:
         finally:
             conn.close()
 
+    # -----------------------------------------------------------------------
+    # Executor PID tracking methods (migration 0020)
+    # -----------------------------------------------------------------------
+
+    def set_executor_pid(self, uow_id: str, pid: int) -> None:
+        """
+        Store the OS process ID of the dispatched subprocess for a UoW.
+
+        Called by the executor immediately after Popen(...) succeeds so that
+        the process group can be killed later via kill_executor(). Stored in
+        the executor_pid column (nullable INTEGER, migration 0020).
+
+        Args:
+            uow_id: The UoW identifier.
+            pid: The OS PID returned by Popen.pid.
+        """
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE uow_registry
+                SET executor_pid = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (pid, now, uow_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_executor_pid(self, uow_id: str) -> int | None:
+        """
+        Return the stored executor PID for a UoW, or None if absent.
+
+        Returns None when:
+        - The UoW has no stored PID (executor_pid IS NULL).
+        - The UoW does not exist.
+        - The executor_pid column has not yet been migrated (migration 0020).
+
+        Args:
+            uow_id: The UoW identifier.
+
+        Returns:
+            Integer PID if stored, None otherwise.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT executor_pid FROM uow_registry WHERE id = ?",
+                (uow_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return row["executor_pid"]
+        except Exception as exc:
+            log.debug(
+                "get_executor_pid: failed for uow_id=%s — %s: %s",
+                uow_id, type(exc).__name__, exc,
+            )
+            return None
+        finally:
+            conn.close()
+
+    def clear_executor_pid(self, uow_id: str) -> None:
+        """
+        Clear the stored executor PID for a UoW (set to NULL).
+
+        Called when:
+        - The UoW completes normally (wos_completion.py).
+        - The UoW is killed via kill_executor().
+        - The UoW is re-queued by orphan recovery.
+
+        Idempotent: no-op if executor_pid is already NULL or the UoW is not found.
+
+        Args:
+            uow_id: The UoW identifier.
+        """
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE uow_registry
+                SET executor_pid = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, uow_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def kill_executor(self, uow_id: str) -> bool:
+        """
+        Kill the subprocess associated with a UoW by sending SIGTERM to its process group.
+
+        Looks up the stored executor_pid and sends SIGTERM to the entire process group
+        via os.killpg(os.getpgid(pid), signal.SIGTERM). This reaches subprocesses that
+        spawn children (e.g. claude -p spawning shell commands).
+
+        Clears executor_pid after a successful kill or if the process is already gone
+        (ProcessLookupError — process exited between PID read and kill call).
+
+        Args:
+            uow_id: The UoW identifier.
+
+        Returns:
+            True if the process was found and SIGTERM was sent successfully.
+            False in three cases:
+              - executor_pid IS NULL (no PID stored, or UoW not found): no action taken.
+              - ProcessLookupError: process already exited; executor_pid is cleared.
+              - PermissionError: process is still running but owned by another user;
+                executor_pid is RETAINED (not cleared) so future abort attempts can
+                still see the PID. Callers that need to distinguish these two False
+                cases should call get_executor_pid() after a False return:
+                  - PID still present → PermissionError (process alive, unowned)
+                  - PID is None       → ProcessLookupError (process already gone)
+
+        Note:
+            ProcessLookupError is handled gracefully — the process already exited.
+            In that case, executor_pid is cleared and False is returned, because no
+            kill signal was actually delivered.
+
+            PermissionError is also handled gracefully — the process is running but
+            unowned. executor_pid is retained so the caller can report accurately and
+            a subsequent abort attempt is still possible (e.g., after privilege change).
+        """
+        import os
+        import signal
+
+        pid = self.get_executor_pid(uow_id)
+        if pid is None:
+            return False
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            self.clear_executor_pid(uow_id)
+            return True
+        except PermissionError:
+            # Process is still running but we lack permission to signal it.
+            # Do NOT clear the PID — the process is alive; clearing would make
+            # a future abort attempt silently do nothing (False rather than error).
+            log.warning(
+                "kill_executor: PermissionError sending SIGTERM to pid=%d "
+                "(uow_id=%s) — process is still running but unowned",
+                pid, uow_id,
+            )
+            return False
+        except ProcessLookupError:
+            # Process already exited — clean up stale PID.
+            self.clear_executor_pid(uow_id)
+            return False
+
 
 # ---------------------------------------------------------------------------
 # Steward/Executor schema validation

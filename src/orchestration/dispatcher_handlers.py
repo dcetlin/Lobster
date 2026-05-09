@@ -12,6 +12,7 @@ The dispatcher calls these handlers when it recognizes:
   /wos unblock                         → handle_wos_unblock()
   /wos start                           → handle_wos_start()
   /wos stop                            → handle_wos_stop()
+  wos abort <uow-id>                   → handle_wos_abort(uow_id, registry)
   decide retry <uow-id>                → handle_decide_retry(uow_id, registry)
   decide close <uow-id>                → handle_decide_close(uow_id, registry)
   type: "wos_execute"                  → handle_wos_execute(uow_id, instructions, output_ref)
@@ -638,6 +639,72 @@ def handle_wos_stop() -> str:
             f"(may be systemd-only): {', '.join(sorted(result['not_found']))}"
         )
     return "\n".join(lines)
+
+
+def handle_wos_abort(uow_id: str, *, registry: "Registry") -> str:
+    """
+    Handle 'wos abort <uow_id>'.
+
+    Sends SIGTERM to the process group of the subprocess dispatched for the
+    given UoW. This kills the running worker explicitly without waiting for
+    TTL recovery (which takes up to 24 hours).
+
+    The kill targets the entire process group (os.killpg) so that any child
+    processes spawned by the subagent (e.g. claude -p spawning shell commands)
+    are also terminated.
+
+    Flow:
+      1. Look up executor_pid via registry.get_executor_pid(uow_id).
+      2. If None (no running process): report not found — nothing to kill.
+      3. If found: call registry.kill_executor(uow_id) which sends SIGTERM
+         and clears executor_pid on success or ProcessLookupError.
+
+    Returns a human-readable Telegram message describing the outcome.
+
+    Note: The registry transition from executing/active to failed/ready-for-steward
+    is NOT performed here — the killed subprocess will fail to write its result
+    file, and TTL/heartbeat recovery will detect the missing result and re-queue
+    the UoW on the next observation cycle. This preserves the existing recovery
+    path and avoids a conflicting state transition race.
+
+    Args:
+        uow_id: The UoW identifier to abort.
+        registry: The Registry instance to query and update.
+    """
+    pid = registry.get_executor_pid(uow_id)
+    if pid is None:
+        return (
+            f"UoW `{uow_id}`: no running process found (executor_pid is not set).\n"
+            "The UoW may not have been dispatched via subprocess, or it already completed.\n"
+            "Run `/wos status active` or `/wos status executing` to check current state."
+        )
+
+    killed = registry.kill_executor(uow_id)
+    if killed:
+        return (
+            f"UoW `{uow_id}` aborted: sent SIGTERM to process group of PID {pid}.\n"
+            "The subprocess and its children have been signaled for termination.\n"
+            "TTL/heartbeat recovery will re-queue the UoW on the next observation cycle."
+        )
+
+    # kill_executor returned False — two distinct cases depending on whether the PID was retained.
+    # PermissionError: process still running but unowned → PID retained.
+    # ProcessLookupError: process already gone → PID cleared.
+    retained_pid = registry.get_executor_pid(uow_id)
+    if retained_pid is not None:
+        # PermissionError path: process alive but we cannot signal it.
+        return (
+            f"UoW `{uow_id}`: cannot kill PID {pid} — permission denied.\n"
+            "The process may still be running (owned by a different user).\n"
+            "executor_pid has been retained for future abort attempts."
+        )
+    else:
+        # ProcessLookupError path: process already exited, stale PID cleared.
+        return (
+            f"UoW `{uow_id}`: process PID {pid} was already gone (ProcessLookupError).\n"
+            "The subprocess may have exited before the abort command reached it.\n"
+            "executor_pid has been cleared. The UoW will be re-queued by heartbeat recovery."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1435,6 +1502,43 @@ def parse_diagnose_command(text: str) -> str | None:
     return None
 
 
+def parse_wos_abort_command(text: str) -> str | None:
+    """
+    Parse a ``wos abort <uow_id>`` Telegram command and return the UoW ID.
+
+    Matches ``wos abort <uow_id>`` (case-insensitive, leading/trailing whitespace
+    ignored). Returns the uow_id token if the command matches; None otherwise.
+
+    The dispatcher calls this alongside other 'wos ...' command parsers before
+    routing the command to handle_wos_abort().
+
+    Args:
+        text: The raw Telegram message text.
+
+    Returns:
+        The ``uow_id`` token if the command matches; ``None`` otherwise.
+
+    Examples::
+
+        parse_wos_abort_command("wos abort uow_20260426_abc123")
+        # → "uow_20260426_abc123"
+
+        parse_wos_abort_command("WOS ABORT uow_20260426_abc123")
+        # → "uow_20260426_abc123"
+
+        parse_wos_abort_command("wos start")
+        # → None
+    """
+    stripped = text.strip()
+    lower = stripped.lower()
+    if lower.startswith("wos abort "):
+        remainder = stripped[len("wos abort "):].strip()
+        tokens = remainder.split()
+        if tokens:
+            return tokens[0]
+    return None
+
+
 def _load_instructions_from_artifact(uow_id: str) -> str:
     """
     Load prescribed instructions from the WorkflowArtifact file for uow_id.
@@ -1914,6 +2018,7 @@ WOS control:
   wos stop   — pause WOS pipeline (all 14 WOS-core jobs + execution_enabled)
   wos status [status] — show active + queued UoWs
   wos unblock         — clear BOOTUP_CANDIDATE_GATE flag
+  wos abort <uow-id>  — send SIGTERM to running subprocess for a UoW
 
 Decision:
   /approve <uow-id>   — approve a proposed UoW

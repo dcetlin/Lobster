@@ -889,6 +889,17 @@ def maybe_complete_wos_uow(
             uow_id,
         )
 
+        # Clear executor PID on completion so kill_executor is a no-op
+        # for already-finished UoWs (migration 0020).
+        try:
+            registry.clear_executor_pid(uow_id)
+        except Exception as pid_exc:
+            # Non-fatal: executor_pid column may not exist on pre-0020 installs.
+            log.debug(
+                "maybe_complete_wos_uow: clear_executor_pid failed for UoW %r — %s: %s",
+                uow_id, type(pid_exc).__name__, pid_exc,
+            )
+
         # Post-completion steward trigger (issue #912): wake the steward immediately
         # so it prescribes the next UoW in seconds rather than waiting up to 3 minutes
         # for the next cron tick. Non-fatal — cron remains the recovery fallback.
