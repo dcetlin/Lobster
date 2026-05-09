@@ -3599,6 +3599,39 @@ ADWEOF
         substep "Migration 102: jobs.json not found — skipping"
     fi
 
+    # Migration 103: Add executor_pid column to uow_registry for subprocess PID tracking.
+    # Enables 'wos abort <uow_id>' to kill running subprocesses via SIGTERM.
+    # The column is nullable INTEGER — NULL means no subprocess PID is stored.
+    local _registry_db="$WORKSPACE_DIR/orchestration/registry.db"
+    if [ -f "$_registry_db" ]; then
+        local _has_pid_col
+        _has_pid_col=$(uv run python3 -c "
+import sqlite3
+conn = sqlite3.connect('$_registry_db')
+cols = [row[1] for row in conn.execute('PRAGMA table_info(uow_registry)').fetchall()]
+print('yes' if 'executor_pid' in cols else 'no')
+conn.close()
+" 2>/dev/null || echo "error")
+        if [ "$_has_pid_col" = "no" ]; then
+            uv run python3 -c "
+import sqlite3
+conn = sqlite3.connect('$_registry_db')
+conn.execute('ALTER TABLE uow_registry ADD COLUMN executor_pid INTEGER NULL')
+conn.commit()
+conn.close()
+print('executor_pid column added')
+"
+            migrated=$((migrated + 1))
+            substep "Migration 103: added executor_pid column to uow_registry"
+        elif [ "$_has_pid_col" = "yes" ]; then
+            substep "Migration 103: executor_pid column already present — skipping"
+        else
+            substep "Migration 103: could not check registry DB — skipping"
+        fi
+    else
+        substep "Migration 103: registry DB not found — skipping (will be applied on first Registry init)"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
