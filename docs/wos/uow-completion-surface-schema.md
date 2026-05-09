@@ -2,6 +2,14 @@
 
 *Status: Design — 2026-05-09*
 
+> **Design specification — not current production behavior.**
+>
+> **Current production state:** The Done() branch in `steward.py` (~line 4440) writes no completion notification. The `uow_registry` table has no `gate_fired` column; `_check_dispatch_eligibility()` returns action-verb strings (`"escalate"`, `"pause"`, `"throttle"`, `"dispatch"`) that are consumed inline and discarded. There is no `wos_done` inbox message type. Seeds are captured only implicitly via `artifacts` with `category='seed'`. For current authoritative completion behavior, read `src/orchestration/steward.py` Done() branch directly.
+>
+> **Implementation issues:** The gaps between this spec and production are tracked in the following issues (to be filed): (1) notification layer + `wos_done` message type; (2) `gate_fired` registry column (migration 0019); (3) `seeds_surfaced` structured `write_result` extension.
+>
+> **Agent orientation:** If you are reading this document to understand how UoW completion currently works, consult `steward.py` Done() branch — not this document. This spec describes the target state. Nothing in this document is implemented. Treat all field descriptions as design intent until the implementation issues above are closed.
+
 ---
 
 ## Purpose
@@ -86,7 +94,10 @@ class UoWCompletionSurface:
 
     # --- Topology signal ---
     # Which dispatch eligibility gate fired during steward cycles for this UoW.
-    # Derived from _check_dispatch_eligibility() return value.
+    # Derived from _check_dispatch_eligibility(), but stores the translated
+    # pattern name — NOT the function's action-verb return value.
+    # Translation: "escalate"→"spiral", "pause"→"dead_end",
+    #              "throttle"→"burst", "dispatch"→"none".
     # 'none' means all cycles returned 'dispatch' (clean execution).
     # Source: NEW FIELD — gate verdict not currently written to registry.
     gate_fired: GateFired = "none"
@@ -155,7 +166,7 @@ class UoWCompletionSurface:
 | `register` | `uow_registry.register` | Present |
 | `primary_outcome` | `uow_registry.outcome_category` | Present (migration 0018) |
 | `seeds_surfaced` | New structured field in `write_result` payload | **Missing** |
-| `gate_fired` | `_check_dispatch_eligibility()` return value | **Missing** — not written to registry |
+| `gate_fired` | `_check_dispatch_eligibility()` return value, translated to pattern name (see Plumbing Additions) | **Missing** — not written to registry |
 | `steward_cycles` | `uow_registry.steward_cycles` | Present |
 | `lifetime_cycles` | `uow_registry.lifetime_cycles` | Present |
 | `token_usage` | `uow_registry.token_usage` | Present (migration 0015) |
@@ -171,11 +182,24 @@ class UoWCompletionSurface:
 
 ### Addition 1: `gate_fired` registry field
 
-**What is missing:** `_check_dispatch_eligibility()` computes a verdict (`spiral`/`dead_end`/`burst`/`dispatch`) but the result is consumed inline and discarded. There is no per-UoW record of which gate fired across cycles.
+**What is missing:** `_check_dispatch_eligibility()` computes a verdict but the result is consumed inline and discarded. There is no per-UoW record of which gate fired across cycles.
+
+**Vocabulary translation — required before writing to the registry:**
+
+`_check_dispatch_eligibility()` returns action-verb strings. The `gate_fired` column stores semantic pattern names. These are not the same vocabulary — an implementation that writes the function's return value directly to the `gate_fired` column will store the wrong values. The translation mapping is:
+
+| `_check_dispatch_eligibility()` return value | `gate_fired` column value (pattern name) |
+|---|---|
+| `"escalate"` | `"spiral"` |
+| `"pause"` | `"dead_end"` |
+| `"throttle"` | `"burst"` |
+| `"dispatch"` | `"none"` |
+
+This translation must be explicit in the implementation — a named mapping dict or equivalent. The `gate_fired` column stores the pattern name (matching the `GateFired` literal type defined in the schema above), not the action verb returned by the function.
 
 **What is needed:**
 - Add `gate_fired TEXT NULL` column to `uow_registry` (new migration, e.g. 0019).
-- In `_process_uow()`, when `_check_dispatch_eligibility()` returns a non-`dispatch` verdict, write it to the registry via an UPDATE (or pass through `_write_steward_fields`).
+- In `_process_uow()`, when `_check_dispatch_eligibility()` returns a non-`"dispatch"` verdict, translate via the mapping above and write the pattern name to the registry via an UPDATE (or pass through `_write_steward_fields`).
 - Logic: track the highest-severity gate that fired during this UoW's lifecycle. Precedence: `spiral` > `dead_end` > `burst` > `none`. Once written, only upgrade — never downgrade.
 
 **Size estimate:** Small. One migration (3 lines of SQL), one registry write in `_process_uow()` (~10 lines), one UoW dataclass field. No schema design work needed — the values are already defined as string literals.
