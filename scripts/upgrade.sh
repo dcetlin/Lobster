@@ -3478,6 +3478,127 @@ M99_PYEOF
         substep "Migration 101: settings.json or jq not found — skipping"
     fi
 
+    # Migration 102: Register LOS scheduled jobs (los-action-scanner, los-weekly-review)
+    # and create the self_action_items.db data directory.
+    # los-action-scanner: hourly Type A job that scans conversation history for action
+    #   commitments and writes them to ~/lobster-user-config/data/self_action_items.db.
+    # los-weekly-review: weekly Sunday Type A job that surfaces dismissed items.
+    local _los_data_dir="$HOME/lobster-user-config/data"
+    local _m102_jobs_file="$WORKSPACE_DIR/scheduled-jobs/jobs.json"
+    if [ -f "$_m102_jobs_file" ]; then
+        # Create the data directory for self_action_items.db
+        mkdir -p "$_los_data_dir" 2>/dev/null || true
+
+        # Check if either job is missing and add both if needed
+        local _m102_scanner_missing _m102_review_missing
+        _m102_scanner_missing=0
+        _m102_review_missing=0
+        uv run python3 -c "import json,sys; d=json.load(open('$_m102_jobs_file')); sys.exit(0 if 'los-action-scanner' in d.get('jobs',{}) else 1)" 2>/dev/null || _m102_scanner_missing=1
+        uv run python3 -c "import json,sys; d=json.load(open('$_m102_jobs_file')); sys.exit(0 if 'los-weekly-review' in d.get('jobs',{}) else 1)" 2>/dev/null || _m102_review_missing=1
+
+        if [[ "$_m102_scanner_missing" -eq 1 || "$_m102_review_missing" -eq 1 ]]; then
+            uv run python3 - <<'PYEOF'
+import json, os
+from datetime import datetime, timezone
+from pathlib import Path
+
+workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+jobs_file = workspace / "scheduled-jobs" / "jobs.json"
+try:
+    data = json.loads(jobs_file.read_text())
+except Exception:
+    data = {"jobs": {}}
+
+data.setdefault("jobs", {})
+now = datetime.now(timezone.utc).isoformat()
+changed = False
+
+if "los-action-scanner" not in data["jobs"]:
+    data["jobs"]["los-action-scanner"] = {
+        "name": "los-action-scanner",
+        "schedule": "0 * * * *",
+        "schedule_human": "Hourly",
+        "task_file": "tasks/los-action-scanner.md",
+        "created_at": now,
+        "updated_at": now,
+        "enabled": True,
+        "last_run": None,
+        "last_status": None,
+        "dispatch": "subagent",
+    }
+    print("Added los-action-scanner to jobs.json")
+    changed = True
+else:
+    print("los-action-scanner already in jobs.json — skipped")
+
+if "los-weekly-review" not in data["jobs"]:
+    data["jobs"]["los-weekly-review"] = {
+        "name": "los-weekly-review",
+        "schedule": "0 8 * * 0",
+        "schedule_human": "Sundays at 08:00",
+        "task_file": "tasks/los-weekly-review.md",
+        "created_at": now,
+        "updated_at": now,
+        "enabled": True,
+        "last_run": None,
+        "last_status": None,
+        "dispatch": "subagent",
+    }
+    print("Added los-weekly-review to jobs.json")
+    changed = True
+else:
+    print("los-weekly-review already in jobs.json — skipped")
+
+if changed:
+    jobs_file.write_text(json.dumps(data, indent=2))
+PYEOF
+            migrated=$((migrated + 1))
+            substep "Migration 102: registered LOS jobs (los-action-scanner, los-weekly-review)"
+        else
+            substep "Migration 102: LOS jobs already registered — skipping"
+        fi
+
+        # Append the LOS todos section to the async-deep-work task if not already present.
+        local _adw_task="$WORKSPACE_DIR/scheduled-jobs/tasks/async-deep-work.md"
+        if [ -f "$_adw_task" ] && ! grep -q "LOS Todos Section" "$_adw_task" 2>/dev/null; then
+            cat >> "$_adw_task" << 'ADWEOF'
+
+---
+
+### LOS Todos Section (append to morning digest)
+
+After writing the Phase Criteria Check section (Step 2b), query the LOS action items database and append a todos section **at the bottom of the Telegram notification** (Step 4).
+
+```python
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path.home() / "lobster"))
+from src.los.db import connect, get_open_items
+from src.los.digest import build_digest_footer
+
+conn = connect()
+try:
+    items = get_open_items(conn, limit=10)
+    footer = build_digest_footer(items)
+finally:
+    conn.close()
+```
+
+If `footer` is non-empty, append it to the Telegram message sent in Step 4.
+If `footer` is empty (no open todos), skip this section entirely — no extra message.
+The footer already includes a `/todos` prompt for the interactive view.
+
+**DB location**: `~/lobster-user-config/data/self_action_items.db`
+If the file does not exist yet (LOS not yet seeded), skip this section silently.
+ADWEOF
+            substep "Migration 102: added LOS todos section to async-deep-work task"
+        else
+            substep "Migration 102: LOS todos section already present in async-deep-work.md — skipping"
+        fi
+    else
+        substep "Migration 102: jobs.json not found — skipping"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

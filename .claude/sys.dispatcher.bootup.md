@@ -831,10 +831,26 @@ If `reacted_to_text` is empty: use `get_conversation_history` to get context.
        job_name = data.removeprefix("job-confirm-no-")
        send_reply(chat_id=chat_id, text="Job cancelled.", source=source)
 
-7. else:
+   # LOS (Life Operating System) callbacks — todo-done-{id}, todo-dismiss-{id}, todo-snooze-{id}-{date}
+   # These are handled synchronously (no DB lock, instant status change, deterministic).
+elif data.startswith("todo-"):
+       from src.los.callbacks import route_los_callback
+       result = route_los_callback(msg)
+       if result["handled"]:
+           send_reply(chat_id=chat_id, text=result["text"], source=source)
+       else:
+           send_reply(chat_id=chat_id, text=f"Unknown todo callback: {data}", source=source)
+
+7. elif data.startswith("decide_retry:") or data.startswith("decide_close:"):
+       from src.orchestration.dispatcher_handlers import route_callback_message
+       result = route_callback_message(msg)
+       if result["handled"]:
+           send_reply(chat_id=chat_id, text=result["text"], source=source)
+
+8. else:
        send_reply(chat_id=chat_id, text=f"Unknown callback: {data}", source=source)
 
-8. mark_processed(message_id)
+9. mark_processed(message_id)
 ```
 
 ### Telegram-specific
@@ -987,6 +1003,34 @@ This rule is unconditional — even if the session processed zero messages, the 
 - The current MESSAGE_COUNT at time of compaction
 
 **On context_warning:** Write a tombstone inline as step 2 (see context_warning handler above) — this is faster and more reliable than spawning a subagent, and ensures the record survives even if wind-down is interrupted.
+
+---
+
+## LOS (Life Operating System) Commands
+
+**`/todos`** — display Dan's current action items with interactive buttons.
+
+```python
+# Dispatch to a todos-query subagent
+Task(
+    subagent_type="lobster-generalist",
+    run_in_background=True,
+    prompt=(
+        f"---\ntask_id: los-todos-{chat_id}\nchat_id: {chat_id}\nsource: {source}\n---\n\n"
+        + open(Path.home() / "lobster-workspace/scheduled-jobs/tasks/los-todos-query.md").read()
+    ),
+)
+send_reply(chat_id=chat_id, text="Checking your todos...", source=source)
+```
+
+**LOS callback routing** — `todo-done-{id}`, `todo-dismiss-{id}`, `todo-snooze-{id}-{date}` callbacks
+are handled in the Button callbacks section above (see `data.startswith("todo-")`).
+
+**Natural language triggers** for `/todos` — also recognize these phrases as equivalent to `/todos`:
+- "what's on my list"
+- "show my todos"
+- "what do I need to do"
+- "show action items"
 
 ---
 
