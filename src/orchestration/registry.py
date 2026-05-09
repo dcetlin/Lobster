@@ -594,19 +594,20 @@ class Registry:
             conn.execute("BEGIN IMMEDIATE")
 
             # Cross-sweep-date pre-check: any non-terminal record for this issue?
-            # 'cancelled' is a terminal status (UoWStatus.CANCELLED) that allows
-            # re-proposal after a cancellation.
-            # 'closed' is a legacy DB status predating the UoWStatus enum; treat it
-            # as terminal so that legacy rows do not permanently block re-proposal.
+            # Uses _TERMINAL_STATUSES_FOR_ISSUE_CHECK — single source of truth
+            # shared with has_active_uow_for_issue() — so both dedup paths
+            # stay in sync when terminal statuses are added or removed.
+            _terminal = self._TERMINAL_STATUSES_FOR_ISSUE_CHECK
+            _placeholders = ", ".join("?" * len(_terminal))
             existing = conn.execute(
-                """
+                f"""
                 SELECT id, status FROM uow_registry
                 WHERE source_issue_number = ?
-                  AND status NOT IN ('done', 'failed', 'expired', 'cancelled', 'closed')
+                  AND status NOT IN ({_placeholders})
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
-                (issue_number,),
+                (issue_number, *_terminal),
             ).fetchone()
 
             if existing:
@@ -1023,6 +1024,65 @@ class Registry:
                 (issue_number, *self._TERMINAL_STATUSES_FOR_ISSUE_CHECK),
             ).fetchone()
             return row is not None
+        finally:
+            conn.close()
+
+    def reactivate_if_no_active(self, uow_id: str, issue_number: int) -> bool:
+        """Atomically reactivate a terminal UoW to proposed IFF no non-terminal row exists.
+
+        Combines the has_active_uow_for_issue check and the status update in a
+        single BEGIN IMMEDIATE transaction to eliminate the TOCTOU race between
+        the check and the write.
+
+        Returns True if the UoW was reactivated, False if skipped (because a
+        non-terminal row already exists for this issue).
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            _terminal = self._TERMINAL_STATUSES_FOR_ISSUE_CHECK
+            _placeholders = ", ".join("?" * len(_terminal))
+            conflict = conn.execute(
+                f"""
+                SELECT id FROM uow_registry
+                WHERE source_issue_number = ?
+                  AND status NOT IN ({_placeholders})
+                LIMIT 1
+                """,
+                (issue_number, *_terminal),
+            ).fetchone()
+
+            if conflict:
+                conn.commit()
+                return False
+
+            row = conn.execute(
+                "SELECT status FROM uow_registry WHERE id = ?", (uow_id,)
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return False
+
+            old_status = row["status"]
+            now = _now_iso()
+            self._write_audit(
+                conn,
+                uow_id=uow_id,
+                event="status_change",
+                from_status=old_status,
+                to_status=UoWStatus.PROPOSED,
+                note="reactivation (atomic dedup guard)",
+            )
+            conn.execute(
+                "UPDATE uow_registry SET status = ?, updated_at = ? WHERE id = ?",
+                (UoWStatus.PROPOSED, now, uow_id),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 

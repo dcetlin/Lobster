@@ -701,3 +701,59 @@ class TestReactivationDedup:
     ) -> None:
         """Registry.has_active_uow_for_issue must return False for an issue with no UoWs."""
         assert registry.has_active_uow_for_issue(99999) is False
+
+
+class TestAtomicReactivation:
+    """Tests for Registry.reactivate_if_no_active — the atomic check+write
+    that prevents TOCTOU races in the reactivation path."""
+
+    def test_reactivate_if_no_active_succeeds_when_no_conflict(
+        self, registry: Registry
+    ) -> None:
+        """Reactivation succeeds when no non-terminal UoW exists for the issue."""
+        upsert = registry.upsert(issue_number=90, title="Expired", success_criteria="Done.")
+        registry.set_status_direct(upsert.id, "expired")
+
+        result = registry.reactivate_if_no_active(upsert.id, issue_number=90)
+        assert result is True
+
+        proposed = registry.query(status="proposed")
+        assert len(proposed) == 1
+        assert proposed[0].id == upsert.id
+
+    def test_reactivate_if_no_active_skipped_when_active_exists(
+        self, registry: Registry
+    ) -> None:
+        """Reactivation is skipped when a non-terminal UoW already exists.
+
+        This is the core dedup scenario: scan() created a new proposed row,
+        then tend() tries to reactivate the old expired row atomically.
+        """
+        ISSUE_NUMBER = 91
+
+        # Old UoW archived to expired.
+        old = registry.upsert(issue_number=ISSUE_NUMBER, title="Old", success_criteria="Done.")
+        registry.set_status_direct(old.id, "expired")
+
+        # New UoW created by scan() on a different sweep_date.
+        new = registry.upsert(
+            issue_number=ISSUE_NUMBER, title="New", success_criteria="Done.",
+            sweep_date="2099-01-01",
+        )
+        assert isinstance(new, UpsertInserted)
+
+        # Atomic reactivation must be skipped — new proposed row exists.
+        result = registry.reactivate_if_no_active(old.id, issue_number=ISSUE_NUMBER)
+        assert result is False
+
+        # Only one proposed UoW — the new one.
+        proposed = registry.query(status="proposed")
+        assert len(proposed) == 1
+        assert proposed[0].id == new.id
+
+    def test_reactivate_if_no_active_returns_false_for_missing_uow(
+        self, registry: Registry
+    ) -> None:
+        """Returns False when the UoW ID does not exist in the registry."""
+        result = registry.reactivate_if_no_active("nonexistent_uow_id", issue_number=999)
+        assert result is False

@@ -560,16 +560,42 @@ class GardenCaretaker:
     def _reactivate_uow(self, uow: UoW) -> int:
         """Reactivate an archived/terminal UoW back to proposed. Returns 1 if done.
 
-        Idempotency guard: if scan() already created a new proposed UoW for the
-        same issue on a different sweep_date while this UoW was terminal, skip
-        reactivation to prevent a duplicate proposed row.  This closes the race
-        where archived → scan creates new row → tend reactivates old row.
+        Uses Registry.reactivate_if_no_active() which combines the dedup check
+        and the status update in a single BEGIN IMMEDIATE transaction, eliminating
+        the TOCTOU race where a concurrent intake could insert a new proposed row
+        between the check and the write.
         """
         issue_number = self._extract_issue_number(uow.source or "")
-        if issue_number is not None and self.registry.has_active_uow_for_issue(issue_number):
+        if issue_number is None:
+            # Cannot extract issue number — fall back to direct reactivation.
+            # This path is rare (only UoWs with malformed source_ref).
+            try:
+                self.registry.set_status_direct(uow.id, UoWStatus.PROPOSED)
+                self.registry.append_audit_log(uow.id, {
+                    "event": "reactivated_by_caretaker",
+                    "actor": "garden_caretaker",
+                    "classification": "source_reopened",
+                    "from_status": str(uow.status),
+                    "to_status": "proposed",
+                    "source_ref": uow.source,
+                    "timestamp": _now_iso(),
+                })
+                logger.info("tend: reactivated UoW %s → proposed (source reopened, no issue_number)", uow.id)
+                return 1
+            except Exception as exc:
+                logger.warning("tend: failed to reactivate UoW %s: %s", uow.id, exc)
+                return 0
+
+        try:
+            reactivated = self.registry.reactivate_if_no_active(uow.id, issue_number)
+        except Exception as exc:
+            logger.warning("tend: failed to reactivate UoW %s: %s", uow.id, exc)
+            return 0
+
+        if not reactivated:
             logger.info(
                 "tend: skipping reactivation of UoW %s — a non-terminal UoW already exists "
-                "for issue #%d (dedup guard)",
+                "for issue #%d (atomic dedup guard)",
                 uow.id, issue_number,
             )
             self.registry.append_audit_log(uow.id, {
@@ -582,24 +608,17 @@ class GardenCaretaker:
             })
             return 0
 
-        # Use set_status_direct — the UoW is in a terminal state and we need
-        # to bypass the conditional transition guard.
-        try:
-            self.registry.set_status_direct(uow.id, UoWStatus.PROPOSED)
-            self.registry.append_audit_log(uow.id, {
-                "event": "reactivated_by_caretaker",
-                "actor": "garden_caretaker",
-                "classification": "source_reopened",
-                "from_status": str(uow.status),
-                "to_status": "proposed",
-                "source_ref": uow.source,
-                "timestamp": _now_iso(),
-            })
-            logger.info("tend: reactivated UoW %s → proposed (source reopened)", uow.id)
-            return 1
-        except Exception as exc:
-            logger.warning("tend: failed to reactivate UoW %s: %s", uow.id, exc)
-            return 0
+        self.registry.append_audit_log(uow.id, {
+            "event": "reactivated_by_caretaker",
+            "actor": "garden_caretaker",
+            "classification": "source_reopened",
+            "from_status": str(uow.status),
+            "to_status": "proposed",
+            "source_ref": uow.source,
+            "timestamp": _now_iso(),
+        })
+        logger.info("tend: reactivated UoW %s → proposed (source reopened)", uow.id)
+        return 1
 
     @staticmethod
     def _extract_issue_number(source_ref: str) -> int | None:
