@@ -554,6 +554,17 @@ launch_claude() {
     local dispatcher_pid_file="$MESSAGES_DIR/config/dispatcher.pid"
     mkdir -p "$(dirname "$dispatcher_pid_file")"
 
+    # Write a session-start sentinel to the session log BEFORE launching Claude.
+    # The quota-exhaustion check reads this log after Claude exits; without a
+    # per-session boundary the check can match "You've hit your limit" lines
+    # that were written by a previous session (the log is append-only and never
+    # rotated), producing a false-positive that puts the system to sleep until
+    # midnight even when the current quota is fine.  The sentinel is a fixed
+    # string that awk uses to reset its scan window, so only lines from the
+    # current session are tested.
+    echo "=== SESSION_START attempt=$attempt ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) ===" \
+        >> "$LOG_DIR/claude-session.log"
+
     (
         echo "$BASHPID" > "$dispatcher_pid_file"
         # Write the dispatcher startup flag so inject-bootup-context.py can
@@ -643,8 +654,15 @@ with open('$tmp_state', 'w') as f:
         log "Claude exited with code $exit_code. Will restart after backoff."
         write_state "restarting" "exit_code=$exit_code"
 
-        # Detect quota exhaustion — sleep until midnight UTC before retrying
-        if tail -20 "$LOG_DIR/claude-session.log" 2>/dev/null | grep -qi "out of extra usage\|you.ve hit your limit\|hit your limit\|you.re out of"; then
+        # Detect quota exhaustion — sleep until midnight UTC before retrying.
+        # Only scan output from the *current* session to avoid false positives
+        # from stale quota messages left in the append-only log by prior sessions.
+        # awk resets its capture window each time it sees a SESSION_START sentinel,
+        # so `current_session_output` contains only what this session wrote.
+        local current_session_output
+        current_session_output=$(awk '/^=== SESSION_START /{buf=""} {buf=buf"\n"$0} END{print buf}' \
+            "$LOG_DIR/claude-session.log" 2>/dev/null)
+        if echo "$current_session_output" | grep -qi "out of extra usage\|you.ve hit your limit\|hit your limit\|you.re out of"; then
             log "QUOTA EXHAUSTED: Detected usage quota error. Sleeping until midnight UTC."
             local now midnight_utc sleep_secs wake_time_et
             now=$(date +%s)
@@ -694,8 +712,8 @@ Will auto-restart at quota reset. No action needed."
             return 1
         fi
 
-        # Detect auth failures from session log
-        if tail -5 "$LOG_DIR/claude-session.log" 2>/dev/null | grep -q "authentication_error\|OAuth token has expired\|API usage limits"; then
+        # Detect auth failures from session log (current session only)
+        if echo "$current_session_output" | grep -q "authentication_error\|OAuth token has expired\|API usage limits"; then
             AUTH_FAIL_COUNT=$((AUTH_FAIL_COUNT + 1))
             if [[ $AUTH_FAIL_COUNT -ge 3 ]] && [[ "$AUTH_FAIL_ALERTED" != "true" ]]; then
                 AUTH_FAIL_ALERTED=true
