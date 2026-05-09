@@ -7,12 +7,12 @@ commitments Dan has made, extracts them, and writes them to self_action_items.db
 
 This is a Type A job (LLM subagent): the subagent reads recent messages,
 uses its native intelligence to extract action commitments from each message,
-then calls persist_extracted_items() to write them to the DB.
+then calls parse_llm_response() + extract_action_items() to persist them to the DB.
 
 The extraction step is performed by the subagent (Claude natively) — this
-script handles message collection and DB persistence only. The subagent
-formats extracted items as JSON and calls parse_llm_response() before
-persisting via extract_action_items().
+script handles message collection only, emitting candidates as JSON to stdout.
+The subagent formats extracted items as JSON and calls parse_llm_response() then
+extract_action_items() from src.los.extractor before persisting to the DB.
 
 Type B (cron-direct) was considered but rejected: the extraction step
 requires LLM reasoning — making it unsuitable for sub-15-minute cron runs.
@@ -50,9 +50,7 @@ _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from src.los.db import connect, get_open_items, DEFAULT_DB_PATH  # noqa: E402
-from src.los.extractor import extract_action_items, parse_llm_response  # noqa: E402
-from src.utils.inbox_write import _inbox_dir, _task_outputs_dir  # noqa: E402
+from src.utils.inbox_write import _task_outputs_dir  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -134,39 +132,6 @@ def _load_processed_messages(since: datetime) -> list[dict]:
     return messages
 
 
-def persist_extracted_items(
-    conn,
-    source_id: str,
-    source: str,
-    items_json: str,
-) -> list[dict]:
-    """Persist a subagent's extracted items for one message to the DB.
-
-    `items_json` is the JSON string the subagent produced for this message,
-    e.g. '[{"text": "Call Sarah", "priority": 3}]'.
-
-    Returns a list of {"id": ..., "text": ...} dicts for each persisted item.
-    """
-    items = parse_llm_response(items_json)
-    if not items:
-        return []
-
-    extracted = extract_action_items(
-        conn=conn,
-        items=items,
-        source=source,
-        source_message_id=str(source_id),
-    )
-    if extracted:
-        log.info(
-            "Persisted %d action item(s) from msg %s: %s",
-            len(extracted),
-            source_id,
-            [i.text[:60] for i in extracted],
-        )
-    return [{"id": i.id, "text": i.text} for i in extracted]
-
-
 def _write_task_output(output: str, status: str = "success") -> None:
     """Write output to the task outputs directory."""
     try:
@@ -207,7 +172,8 @@ def main() -> None:
 
     # Emit the candidate messages as JSON for the subagent to process.
     # The subagent reads each message, uses its native intelligence to extract
-    # action commitments, then calls persist_extracted_items() to write them to the DB.
+    # action commitments, then calls parse_llm_response() + extract_action_items()
+    # from src.los.extractor to persist them to the DB.
     candidate_texts = [
         {
             "msg_id": msg.get("id") or msg.get("message_id", ""),

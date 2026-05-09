@@ -37,29 +37,39 @@ Filter to messages from the past hour only (compare timestamp to `datetime.now(U
 
 ### Step 3: Extract action items
 
-For each user message with at least 10 characters of text:
-1. Import and call `extract_action_items` from `src.los.extractor`
-2. Pass the message text, source="telegram", source_message_id=<message id>
-3. The extractor handles dedup automatically — no need to check manually
+The scanner script emits candidate messages as JSON to stdout. Read that JSON, then for each candidate message:
+
+1. Use your native intelligence to identify action commitments in the message text. Produce a JSON array of items in the format: `[{"text": "...", "priority": <1-10>}]`. If no action items are present, produce `[]`.
+2. Call `parse_llm_response` on your JSON string to validate and normalise the items.
+3. Call `extract_action_items` with the parsed items to persist them to the DB.
+
+The extractor handles dedup automatically — no need to check manually.
 
 ```python
 import sys
 sys.path.insert(0, str(Path.home() / "lobster"))
 
 from src.los.db import connect
-from src.los.extractor import extract_action_items
+from src.los.extractor import extract_action_items, parse_llm_response
 
 conn = connect()
 try:
-    for msg in user_messages:
-        items = extract_action_items(
+    # candidates is the list from the scanner's JSON output:
+    # {"candidates": [{"msg_id": "...", "text": "..."}]}
+    for candidate in candidates:
+        # Produce your own JSON extraction for this message text:
+        raw_json = '<your extracted JSON array here>'
+        items = parse_llm_response(raw_json)
+        if not items:
+            continue
+        saved = extract_action_items(
             conn=conn,
-            text=msg["text"],
+            items=items,
             source="telegram",
-            source_message_id=msg.get("id"),
+            source_message_id=candidate.get("msg_id"),
         )
-        if items:
-            print(f"Extracted: {[i.text for i in items]}")
+        if saved:
+            print(f"Extracted: {[i.text for i in saved]}")
 finally:
     conn.close()
 ```
