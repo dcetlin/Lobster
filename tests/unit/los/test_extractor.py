@@ -2,39 +2,30 @@
 Tests for LOS action item extractor.
 
 Tests verify:
-- The extractor correctly calls the LLM with the right prompt
-- It handles the response correctly, mapping fields to ActionItem-like dicts
+- parse_llm_response correctly validates and normalizes subagent JSON output
+- extract_action_items persists items to the DB
 - Dedup logic fires when a duplicate is found
-- The extractor writes to the DB (side-effectful boundary)
-- Empty LLM responses are handled gracefully
+- Empty item lists are handled gracefully
 
-All Anthropic API calls are mocked — no production hits in unit tests.
+No Anthropic API calls occur anywhere in this module — extraction is
+performed by the calling subagent, not by extractor.py.
 """
 from __future__ import annotations
 
 import json
 import sqlite3
-import tempfile
 from pathlib import Path
-from typing import Any
-from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.los.db import connect, get_open_items, get_item_by_id, find_duplicate
+from src.los.db import connect, get_open_items, get_item_by_id, find_duplicate, compute_dedup_key
 from src.los.extractor import (
     extract_action_items,
     parse_llm_response,
-    compute_dedup_key,
-    EXTRACTION_MODEL,
+    PRIORITY_MIN,
+    PRIORITY_MAX,
+    PRIORITY_DEFAULT,
 )
-
-
-# ---------------------------------------------------------------------------
-# Constants from spec
-# ---------------------------------------------------------------------------
-
-EXTRACTION_MODEL_EXPECTED = "claude-haiku-4-5"
 
 
 # ---------------------------------------------------------------------------
@@ -54,22 +45,10 @@ def conn(db_path: Path) -> sqlite3.Connection:
     c.close()
 
 
-def _make_anthropic_response(items: list[dict]) -> MagicMock:
-    """Build a mock Anthropic response with the given items as JSON content."""
-    mock_response = MagicMock()
-    mock_response.content = [MagicMock()]
-    mock_response.content[0].text = json.dumps(items)
-    return mock_response
-
-
 # ---------------------------------------------------------------------------
-# Unit tests for pure helpers
+# Unit tests for compute_dedup_key (lives in db — tested here for
+# convenience since test_extractor covers the full extraction flow)
 # ---------------------------------------------------------------------------
-
-
-def test_extraction_model_is_haiku() -> None:
-    """Extractor must use claude-haiku-4-5 for cost efficiency (spec requirement)."""
-    assert EXTRACTION_MODEL == EXTRACTION_MODEL_EXPECTED
 
 
 def test_compute_dedup_key_is_deterministic() -> None:
@@ -101,6 +80,11 @@ def test_compute_dedup_key_returns_16_char_hex() -> None:
     assert all(c in "0123456789abcdef" for c in key)
 
 
+# ---------------------------------------------------------------------------
+# Unit tests for parse_llm_response — pure function, no DB
+# ---------------------------------------------------------------------------
+
+
 class TestParseLlmResponse:
     """Tests for parse_llm_response — pure function, no DB or API calls."""
 
@@ -120,12 +104,12 @@ class TestParseLlmResponse:
         assert items == []
 
     def test_invalid_json_returns_empty(self) -> None:
-        """When the LLM returns malformed JSON, extractor must return empty list."""
+        """When the subagent returns malformed JSON, parser must return empty list."""
         items = parse_llm_response("not json at all")
         assert items == []
 
     def test_non_list_json_returns_empty(self) -> None:
-        """When the LLM returns a dict instead of a list, must return empty."""
+        """When the subagent returns a dict instead of a list, must return empty."""
         raw = json.dumps({"text": "something"})
         items = parse_llm_response(raw)
         assert items == []
@@ -141,78 +125,58 @@ class TestParseLlmResponse:
         assert items[0]["text"] == "Valid item"
 
     def test_priority_clamped_to_valid_range(self) -> None:
-        """Priority must be clamped to [1, 10]."""
+        """Priority must be clamped to [PRIORITY_MIN, PRIORITY_MAX]."""
         raw = json.dumps([
             {"text": "Too urgent", "priority": -5},
             {"text": "Too low", "priority": 100},
         ])
         items = parse_llm_response(raw)
-        assert items[0]["priority"] == 1
-        assert items[1]["priority"] == 10
+        assert items[0]["priority"] == PRIORITY_MIN
+        assert items[1]["priority"] == PRIORITY_MAX
 
-    def test_missing_priority_defaults_to_5(self) -> None:
-        """When priority is absent, default to 5."""
+    def test_missing_priority_defaults_to_five(self) -> None:
+        """When priority is absent, default to PRIORITY_DEFAULT."""
         raw = json.dumps([{"text": "Do something"}])
         items = parse_llm_response(raw)
-        assert items[0]["priority"] == 5
+        assert items[0]["priority"] == PRIORITY_DEFAULT
 
 
 # ---------------------------------------------------------------------------
-# Integration tests for extract_action_items (mocked Claude)
+# Tests for extract_action_items — DB persistence, no API calls
 # ---------------------------------------------------------------------------
 
 
 class TestExtractActionItems:
-    """Tests for extract_action_items — end-to-end with mocked Anthropic client."""
+    """Tests for extract_action_items — verifies DB persistence behavior.
 
-    def test_calls_anthropic_with_haiku_model(self, conn: sqlite3.Connection) -> None:
-        """extract_action_items must call the Anthropic API with claude-haiku-4-5."""
-        llm_items = [{"text": "Follow up with the bank", "priority": 4}]
-        mock_response = _make_anthropic_response(llm_items)
+    The caller (a subagent) provides pre-extracted items; extract_action_items
+    handles only dedup checking and DB writes.
+    """
 
-        with patch("src.los.extractor.anthropic.Anthropic") as MockClient:
-            instance = MockClient.return_value
-            instance.messages.create.return_value = mock_response
-
-            extract_action_items(
-                conn=conn,
-                text="I need to follow up with the bank this week.",
-                source="telegram",
-                source_message_id="msg_001",
-            )
-
-            call_kwargs = instance.messages.create.call_args[1]
-            assert call_kwargs["model"] == EXTRACTION_MODEL_EXPECTED
-
-    def test_writes_extracted_items_to_db(self, conn: sqlite3.Connection) -> None:
-        """Extracted items must be persisted to the action_items table."""
-        llm_items = [
+    def test_writes_provided_items_to_db(self, conn: sqlite3.Connection) -> None:
+        """Provided items must be persisted to the action_items table."""
+        items = [
             {"text": "Call dentist", "priority": 3},
             {"text": "Renew passport", "priority": 6},
         ]
-        mock_response = _make_anthropic_response(llm_items)
 
-        with patch("src.los.extractor.anthropic.Anthropic") as MockClient:
-            instance = MockClient.return_value
-            instance.messages.create.return_value = mock_response
-
-            result = extract_action_items(
-                conn=conn,
-                text="I need to call the dentist and renew my passport.",
-                source="telegram",
-                source_message_id="msg_002",
-            )
+        result = extract_action_items(
+            conn=conn,
+            items=items,
+            source="telegram",
+            source_message_id="msg_002",
+        )
 
         assert len(result) == 2
-        items = get_open_items(conn)
-        texts = {item.text for item in items}
+        open_items = get_open_items(conn)
+        texts = {item.text for item in open_items}
         assert "Call dentist" in texts
         assert "Renew passport" in texts
 
     def test_dedup_increments_mention_count_instead_of_inserting(
         self, conn: sqlite3.Connection
     ) -> None:
-        """When an extracted item matches an existing open item, mention_count must increment."""
+        """When an item matches an existing open item, mention_count must increment."""
         from src.los.db import insert_action_item
 
         existing_id = insert_action_item(
@@ -222,19 +186,12 @@ class TestExtractActionItems:
             source_message_id="msg_first",
         )
 
-        llm_items = [{"text": "Call dentist", "priority": 3}]
-        mock_response = _make_anthropic_response(llm_items)
-
-        with patch("src.los.extractor.anthropic.Anthropic") as MockClient:
-            instance = MockClient.return_value
-            instance.messages.create.return_value = mock_response
-
-            extract_action_items(
-                conn=conn,
-                text="I still need to call the dentist.",
-                source="telegram",
-                source_message_id="msg_003",
-            )
+        extract_action_items(
+            conn=conn,
+            items=[{"text": "Call dentist", "priority": 3}],
+            source="telegram",
+            source_message_id="msg_003",
+        )
 
         item = get_item_by_id(conn, existing_id)
         assert item.mention_count == 2
@@ -244,60 +201,28 @@ class TestExtractActionItems:
         dentist_items = [i for i in all_open if i.text == "Call dentist"]
         assert len(dentist_items) == 1
 
-    def test_empty_llm_response_returns_empty_list(self, conn: sqlite3.Connection) -> None:
-        """When LLM finds no action items, extract_action_items must return []."""
-        mock_response = _make_anthropic_response([])
-
-        with patch("src.los.extractor.anthropic.Anthropic") as MockClient:
-            instance = MockClient.return_value
-            instance.messages.create.return_value = mock_response
-
-            result = extract_action_items(
-                conn=conn,
-                text="Nice day today!",
-                source="telegram",
-                source_message_id="msg_004",
-            )
+    def test_empty_items_returns_empty_list(self, conn: sqlite3.Connection) -> None:
+        """When items list is empty, extract_action_items must return []."""
+        result = extract_action_items(
+            conn=conn,
+            items=[],
+            source="telegram",
+            source_message_id="msg_004",
+        )
 
         assert result == []
-        items = get_open_items(conn)
-        assert len(items) == 0
-
-    def test_llm_failure_returns_empty_list_without_raising(
-        self, conn: sqlite3.Connection
-    ) -> None:
-        """When the Anthropic API call fails, extract_action_items must return []
-        rather than propagating the exception to the caller."""
-        with patch("src.los.extractor.anthropic.Anthropic") as MockClient:
-            instance = MockClient.return_value
-            instance.messages.create.side_effect = Exception("API unavailable")
-
-            result = extract_action_items(
-                conn=conn,
-                text="I need to call Sarah.",
-                source="telegram",
-                source_message_id="msg_005",
-            )
-
-        assert result == []
+        assert get_open_items(conn) == []
 
     def test_source_and_message_id_stored_correctly(self, conn: sqlite3.Connection) -> None:
         """Source and source_message_id must be stored in the inserted row."""
-        llm_items = [{"text": "Fix the leak", "priority": 2}]
-        mock_response = _make_anthropic_response(llm_items)
-
-        with patch("src.los.extractor.anthropic.Anthropic") as MockClient:
-            instance = MockClient.return_value
-            instance.messages.create.return_value = mock_response
-
-            result = extract_action_items(
-                conn=conn,
-                text="I need to fix the leak in the bathroom.",
-                source="voice_note",
-                source_message_id="vn_007",
-            )
+        result = extract_action_items(
+            conn=conn,
+            items=[{"text": "Fix the leak", "priority": 2}],
+            source="voice_note",
+            source_message_id="vn_007",
+        )
 
         assert len(result) == 1
-        items = get_open_items(conn)
-        assert items[0].source == "voice_note"
-        assert items[0].source_message_id == "vn_007"
+        open_items = get_open_items(conn)
+        assert open_items[0].source == "voice_note"
+        assert open_items[0].source_message_id == "vn_007"
