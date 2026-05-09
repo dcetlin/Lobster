@@ -833,7 +833,7 @@ If `reacted_to_text` is empty: use `get_conversation_history` to get context.
 
    # LOS (Life Operating System) callbacks — todo-done-{id}, todo-dismiss-{id}, todo-snooze-{id}-{date}
    # These are handled synchronously (no DB lock, instant status change, deterministic).
-elif data.startswith("todo-"):
+7. elif data.startswith("todo-"):
        from src.los.callbacks import route_los_callback
        result = route_los_callback(msg)
        if result["handled"]:
@@ -841,16 +841,16 @@ elif data.startswith("todo-"):
        else:
            send_reply(chat_id=chat_id, text=f"Unknown todo callback: {data}", source=source)
 
-7. elif data.startswith("decide_retry:") or data.startswith("decide_close:"):
+8. elif data.startswith("decide_retry:") or data.startswith("decide_close:"):
        from src.orchestration.dispatcher_handlers import route_callback_message
        result = route_callback_message(msg)
        if result["handled"]:
            send_reply(chat_id=chat_id, text=result["text"], source=source)
 
-8. else:
+9. else:
        send_reply(chat_id=chat_id, text=f"Unknown callback: {data}", source=source)
 
-9. mark_processed(message_id)
+10. mark_processed(message_id)
 ```
 
 ### Telegram-specific

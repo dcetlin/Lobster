@@ -17,8 +17,21 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
 from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Status enum — single source of truth for the status domain
+# ---------------------------------------------------------------------------
+
+
+class ActionItemStatus(StrEnum):
+    OPEN = "open"
+    DONE = "done"
+    DISMISSED = "dismissed"
+    SNOOZED = "snoozed"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -31,7 +44,7 @@ DEFAULT_DB_PATH = _USER_CONFIG_DIR / "data" / "self_action_items.db"
 # Schema — exactly as specified in the task prompt
 # ---------------------------------------------------------------------------
 
-DB_SCHEMA_SQL = """
+DB_SCHEMA_SQL = f"""
 CREATE TABLE IF NOT EXISTS action_items (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     text             TEXT NOT NULL,
@@ -40,7 +53,7 @@ CREATE TABLE IF NOT EXISTS action_items (
     extracted_at     TEXT NOT NULL,
     priority         INTEGER DEFAULT 5,
     mention_count    INTEGER DEFAULT 1,
-    status           TEXT DEFAULT 'open',
+    status           TEXT DEFAULT '{ActionItemStatus.OPEN}',
     snoozed_until    TEXT,
     done_at          TEXT,
     dismissed_at     TEXT,
@@ -160,9 +173,9 @@ def insert_action_item(
         INSERT INTO action_items
             (text, source, source_message_id, extracted_at, priority, status,
              mention_count, dedup_key, notes)
-        VALUES (?, ?, ?, ?, ?, 'open', 1, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
         """,
-        (text, source, source_message_id, extracted_at, priority, dedup_key, notes),
+        (text, source, source_message_id, extracted_at, priority, ActionItemStatus.OPEN, dedup_key, notes),
     )
     conn.commit()
     return cursor.lastrowid
@@ -171,8 +184,8 @@ def insert_action_item(
 def mark_done(conn: sqlite3.Connection, item_id: int) -> None:
     """Set status='done' and record done_at timestamp."""
     conn.execute(
-        "UPDATE action_items SET status='done', done_at=? WHERE id=?",
-        (_now_iso(), item_id),
+        "UPDATE action_items SET status=?, done_at=? WHERE id=?",
+        (ActionItemStatus.DONE, _now_iso(), item_id),
     )
     conn.commit()
 
@@ -183,8 +196,8 @@ def mark_dismissed(conn: sqlite3.Connection, item_id: int) -> None:
     Dismissed items are NOT deleted — they remain reviewable in weekly review.
     """
     conn.execute(
-        "UPDATE action_items SET status='dismissed', dismissed_at=? WHERE id=?",
-        (_now_iso(), item_id),
+        "UPDATE action_items SET status=?, dismissed_at=? WHERE id=?",
+        (ActionItemStatus.DISMISSED, _now_iso(), item_id),
     )
     conn.commit()
 
@@ -192,8 +205,8 @@ def mark_dismissed(conn: sqlite3.Connection, item_id: int) -> None:
 def mark_snoozed(conn: sqlite3.Connection, item_id: int, until_date: str) -> None:
     """Set status='snoozed' with a custom date (YYYY-MM-DD format)."""
     conn.execute(
-        "UPDATE action_items SET status='snoozed', snoozed_until=? WHERE id=?",
-        (until_date, item_id),
+        "UPDATE action_items SET status=?, snoozed_until=? WHERE id=?",
+        (ActionItemStatus.SNOOZED, until_date, item_id),
     )
     conn.commit()
 
@@ -232,12 +245,12 @@ def get_open_items(
     cursor = conn.execute(
         """
         SELECT * FROM action_items
-        WHERE status = 'open'
-          OR (status = 'snoozed' AND snoozed_until < datetime('now'))
+        WHERE status = ?
+          OR (status = ? AND snoozed_until < datetime('now'))
         ORDER BY priority ASC, mention_count DESC, extracted_at ASC
         LIMIT ?
         """,
-        (limit,),
+        (ActionItemStatus.OPEN, ActionItemStatus.SNOOZED, limit),
     )
     return [_row_to_item(row) for row in cursor.fetchall()]
 
@@ -250,11 +263,11 @@ def get_dismissed_items_since(
     cursor = conn.execute(
         """
         SELECT * FROM action_items
-        WHERE status = 'dismissed'
+        WHERE status = ?
           AND dismissed_at >= ?
         ORDER BY dismissed_at DESC
         """,
-        (since_iso,),
+        (ActionItemStatus.DISMISSED, since_iso),
     )
     return [_row_to_item(row) for row in cursor.fetchall()]
 
@@ -273,10 +286,10 @@ def find_duplicate(
         """
         SELECT * FROM action_items
         WHERE dedup_key = ?
-          AND status IN ('open', 'snoozed')
+          AND status IN (?, ?)
         LIMIT 1
         """,
-        (key,),
+        (key, ActionItemStatus.OPEN, ActionItemStatus.SNOOZED),
     )
     row = cursor.fetchone()
     return _row_to_item(row) if row else None

@@ -14,6 +14,7 @@ import pytest
 
 from src.los.db import (
     ActionItem,
+    ActionItemStatus,
     DB_SCHEMA_SQL,
     connect,
     insert_action_item,
@@ -28,13 +29,8 @@ from src.los.db import (
 
 
 # ---------------------------------------------------------------------------
-# Constants (mirror what the spec names — named so tests stay aligned to spec)
+# Priority constants (no enum in production — local-only, not status mirrors)
 # ---------------------------------------------------------------------------
-
-STATUS_OPEN = "open"
-STATUS_DONE = "done"
-STATUS_DISMISSED = "dismissed"
-STATUS_SNOOZED = "snoozed"
 
 PRIORITY_HIGH = 1
 PRIORITY_LOW = 10
@@ -128,7 +124,7 @@ def test_insert_action_item_stores_all_fields(conn: sqlite3.Connection, sample_i
     assert item.source == sample_item["source"]
     assert item.source_message_id == sample_item["source_message_id"]
     assert item.priority == sample_item["priority"]
-    assert item.status == STATUS_OPEN
+    assert item.status == ActionItemStatus.OPEN
     assert item.mention_count == 1
 
 
@@ -212,7 +208,7 @@ def test_mark_done_sets_status_and_done_at(conn: sqlite3.Connection, sample_item
     row_id = insert_action_item(conn, **sample_item)
     mark_done(conn, row_id)
     item = get_item_by_id(conn, row_id)
-    assert item.status == STATUS_DONE
+    assert item.status == ActionItemStatus.DONE
     assert item.done_at is not None
 
 
@@ -224,7 +220,7 @@ def test_mark_dismissed_sets_status_and_dismissed_at(conn: sqlite3.Connection, s
     row_id = insert_action_item(conn, **sample_item)
     mark_dismissed(conn, row_id)
     item = get_item_by_id(conn, row_id)
-    assert item.status == STATUS_DISMISSED
+    assert item.status == ActionItemStatus.DISMISSED
     assert item.dismissed_at is not None
     assert item is not None, "Dismissed items must remain in DB for weekly review"
 
@@ -234,7 +230,7 @@ def test_mark_snoozed_sets_status_and_date(conn: sqlite3.Connection, sample_item
     row_id = insert_action_item(conn, **sample_item)
     mark_snoozed(conn, row_id, "2026-06-01")
     item = get_item_by_id(conn, row_id)
-    assert item.status == STATUS_SNOOZED
+    assert item.status == ActionItemStatus.SNOOZED
     assert item.snoozed_until == "2026-06-01"
 
 
