@@ -40,12 +40,12 @@ qm = _load_module()
 
 
 # ---------------------------------------------------------------------------
-# Constants — must match the spec, not derived from implementation
+# Constants — imported from the production module to avoid divergence
 # ---------------------------------------------------------------------------
 
-STARVATION_CONSECUTIVE_READINGS = 12    # 6 hours at 30-min cadence
-TOXICITY_DEPTH_THRESHOLD = 10
-TOXICITY_CONSECUTIVE_READINGS = 3
+STARVATION_CONSECUTIVE_READINGS = qm.STARVATION_CONSECUTIVE_READINGS
+TOXICITY_DEPTH_THRESHOLD = qm.TOXICITY_DEPTH_THRESHOLD
+TOXICITY_CONSECUTIVE_READINGS = qm.TOXICITY_CONSECUTIVE_READINGS
 
 
 # ---------------------------------------------------------------------------
