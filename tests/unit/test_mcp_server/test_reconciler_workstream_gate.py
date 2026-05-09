@@ -12,9 +12,17 @@ server.
 """
 
 import os
+import sys
 import time
+from pathlib import Path
 
 import pytest
+
+_ROOT = Path(__file__).parents[3]
+if str(_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(_ROOT / "src"))
+
+from agents.session_store import WORKSTREAM_STATUS_STALE_SECONDS  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -24,7 +32,6 @@ import pytest
 DEFAULT_DEAD_THRESHOLD_SECONDS = 30 * 60
 DEFAULT_DEAD_THRESHOLD_RUNNING_SECONDS = 120 * 60
 MTIME_STALE_THRESHOLD_SECONDS = 15 * 60
-WORKSTREAM_STATUS_STALE_SECONDS = 600  # 10 min
 
 
 # ---------------------------------------------------------------------------

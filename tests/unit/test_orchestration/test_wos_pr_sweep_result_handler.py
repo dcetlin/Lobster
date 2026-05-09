@@ -47,7 +47,6 @@ _sys.modules["wos_pr_sweeper"] = _sweeper
 _spec.loader.exec_module(_sweeper)
 
 _should_notify = _sweeper._should_notify
-NOTIFICATION_COOLDOWN_HOURS = _sweeper.NOTIFICATION_COOLDOWN_HOURS
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +187,7 @@ class TestDeduplicationCooldown:
     def test_notified_beyond_cooldown_returns_true(self):
         key = "SiderealPress/lobster#101"
         old_iso = (
-            datetime.now(timezone.utc) - timedelta(hours=NOTIFICATION_COOLDOWN_HOURS + 1)
+            datetime.now(timezone.utc) - timedelta(hours=_sweeper.NOTIFICATION_COOLDOWN_HOURS + 1)
         ).isoformat()
         state = {key: {"last_notified_at": old_iso}}
         assert _should_notify(key, state) is True
