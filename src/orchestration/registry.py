@@ -1814,6 +1814,67 @@ class Registry:
         finally:
             conn.close()
 
+    def write_gate_fired(self, uow_id: str, gate_value: str) -> None:
+        """
+        Write gate_fired to the registry with upgrade-only semantics.
+
+        Called by run_steward_cycle when _check_dispatch_eligibility returns a
+        non-dispatch verdict. The gate_fired column records the most severe
+        dispatch topology gate seen across all dispatch attempts for a UoW.
+
+        Upgrade-only: only writes when gate_value has strictly higher severity
+        than the current stored value. Uses CASE expression to enforce this in
+        SQL atomically.
+
+        Severity order (spec §Schema Additions §1):
+            spiral=3 > dead_end=2 > burst=1 > none=0
+
+        No-op when:
+        - uow_id does not exist in the registry
+        - gate_value has equal or lower severity than the current stored value
+
+        The column is added by migration 0019. On installations before the
+        migration runs, this method will raise sqlite3.OperationalError (no such
+        column). Callers should guard with try/except or ensure migration runs first.
+
+        Args:
+            uow_id: The WOS unit-of-work ID.
+            gate_value: One of 'spiral', 'dead_end', 'burst', or 'none'.
+        """
+        from orchestration.gate_fired import _GATE_SEVERITY
+
+        new_severity = _GATE_SEVERITY.get(gate_value, 0)
+
+        # Map each gate_value to its severity in SQL via CASE.
+        # Use CASE to implement: only write if new severity > current severity.
+        # NULL gate_fired is treated as severity 0 (same as 'none').
+        severity_case = " ".join([
+            "CASE gate_fired",
+            "WHEN 'spiral' THEN 3",
+            "WHEN 'dead_end' THEN 2",
+            "WHEN 'burst' THEN 1",
+            "ELSE 0",
+            "END",
+        ])
+
+        conn = self._connect()
+        try:
+            conn.execute(
+                f"""
+                UPDATE uow_registry
+                SET gate_fired = ?, updated_at = ?
+                WHERE id = ?
+                  AND {new_severity} > COALESCE({severity_case}, 0)
+                """,
+                (gate_value, _now_iso(), uow_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def fail_uow(self, uow_id: str, reason: str) -> None:
         """
         Transition a UoW to 'failed'.

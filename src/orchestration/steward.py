@@ -47,6 +47,7 @@ from src.orchestration.error_capture import (
 from src.orchestration.config import TimeoutConfig
 from src.orchestration.vision_routing import resolve_vision_route
 from src.ooda.fast_thorough_selector import select_path as _ooda_select_path, cite_basis as _ooda_cite_basis
+from src.orchestration.gate_fired import translate_eligibility_to_gate
 from src.orchestration.wos_completion_notifier import notify_uow_done, notify_uow_failed
 
 log = logging.getLogger("steward")
@@ -5379,6 +5380,11 @@ def run_steward_cycle(
                         "eligibility": _eligibility,
                         "timestamp": _now_iso(),
                     })
+                    try:
+                        _gate = translate_eligibility_to_gate(_eligibility)
+                        registry.write_gate_fired(uow_id, _gate)
+                    except Exception as _gate_exc:
+                        log.warning("write_gate_fired failed for %s: %s", uow_id, _gate_exc)
                 skipped += 1
                 continue
         elif _eligibility != "dispatch":
@@ -5395,6 +5401,11 @@ def run_steward_cycle(
                     "eligibility": _eligibility,
                     "timestamp": _now_iso(),
                 })
+                try:
+                    _gate = translate_eligibility_to_gate(_eligibility)
+                    registry.write_gate_fired(uow_id, _gate)
+                except Exception as _gate_exc:
+                    log.warning("write_gate_fired failed for %s: %s", uow_id, _gate_exc)
             skipped += 1
             continue
 
