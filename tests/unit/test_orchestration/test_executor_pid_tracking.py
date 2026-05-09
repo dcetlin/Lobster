@@ -22,6 +22,8 @@ Kill path:
 - test_kill_executor_clears_pid_after_successful_kill: PID cleared after kill
 - test_kill_executor_handles_process_already_gone: ProcessLookupError → False, PID cleared
 - test_kill_executor_clears_pid_when_process_already_gone: PID cleared even on ProcessLookupError
+- test_kill_executor_returns_false_on_permission_error: PermissionError → False, PID retained
+- test_kill_executor_preserves_pid_on_permission_error: PID NOT cleared on PermissionError (process still alive)
 
 Dispatcher command parsing:
 - test_parse_wos_abort_extracts_uow_id: parses "wos abort <uow_id>"
@@ -264,6 +266,39 @@ def test_kill_executor_clears_pid_when_process_already_gone(
         registry.kill_executor(uow_id)
 
     assert registry.get_executor_pid(uow_id) is None
+
+
+def test_kill_executor_returns_false_on_permission_error(
+    registry: Registry, db_path: Path
+) -> None:
+    """kill_executor returns False when os.killpg raises PermissionError (process still running but unowned)."""
+    uow_id = _insert_uow(db_path)
+    registry.set_executor_pid(uow_id, FAKE_PID)
+
+    with patch("os.getpgid", return_value=FAKE_PID), \
+         patch("os.killpg", side_effect=PermissionError("operation not permitted")):
+        result = registry.kill_executor(uow_id)
+
+    assert result is False
+
+
+def test_kill_executor_preserves_pid_on_permission_error(
+    registry: Registry, db_path: Path
+) -> None:
+    """kill_executor does NOT clear executor_pid when PermissionError is raised.
+
+    The process is still running — clearing the PID would make a future abort
+    attempt silently return False with no kill attempt (no PID stored).
+    """
+    uow_id = _insert_uow(db_path)
+    registry.set_executor_pid(uow_id, FAKE_PID)
+
+    with patch("os.getpgid", return_value=FAKE_PID), \
+         patch("os.killpg", side_effect=PermissionError("operation not permitted")):
+        registry.kill_executor(uow_id)
+
+    # PID must still be present — process is alive but unowned
+    assert registry.get_executor_pid(uow_id) == FAKE_PID
 
 
 # ---------------------------------------------------------------------------

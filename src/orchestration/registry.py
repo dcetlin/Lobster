@@ -2919,6 +2919,16 @@ class Registry:
             os.killpg(os.getpgid(pid), signal.SIGTERM)
             self.clear_executor_pid(uow_id)
             return True
+        except PermissionError:
+            # Process is still running but we lack permission to signal it.
+            # Do NOT clear the PID — the process is alive; clearing would make
+            # a future abort attempt silently do nothing (False rather than error).
+            log.warning(
+                "kill_executor: PermissionError sending SIGTERM to pid=%d "
+                "(uow_id=%s) — process is still running but unowned",
+                pid, uow_id,
+            )
+            return False
         except ProcessLookupError:
             # Process already exited — clean up stale PID.
             self.clear_executor_pid(uow_id)

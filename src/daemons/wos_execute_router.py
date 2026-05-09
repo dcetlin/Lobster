@@ -327,7 +327,11 @@ _CLAUDE_BIN: str = "claude"
 _MAX_TURNS: int = 40
 
 
-def _dispatch_via_popen(instructions: str, uow_id: str) -> str:
+def _dispatch_via_popen(
+    instructions: str,
+    uow_id: str,
+    registry: object = None,
+) -> str:
     """
     Dispatch a functional-engineer subagent via ``claude -p`` without blocking.
 
@@ -338,6 +342,12 @@ def _dispatch_via_popen(instructions: str, uow_id: str) -> str:
     The child process runs independently.  The daemon does NOT wait for it
     to complete — the subagent's handoff mechanism is ``write_result``
     (called at agent completion), not the subprocess return code.
+
+    When ``registry`` is provided, the child's PID is written to
+    ``executor_pid`` in the UoW row immediately after ``Popen`` succeeds.
+    This enables ``wos abort <uow_id>`` to send SIGTERM to the process group.
+    PID write is best-effort — any failure is logged at WARNING level and does
+    not block dispatch.
 
     Returns a ``run_id`` string for audit correlation (``uow_id`` + timestamp).
 
@@ -376,7 +386,7 @@ def _dispatch_via_popen(instructions: str, uow_id: str) -> str:
     except Exception:
         env = None  # Fall back to inheriting the current environment
 
-    subprocess.Popen(
+    proc = subprocess.Popen(
         command,
         start_new_session=True,  # Insulates child from SIGTERM sent to daemon
         stdin=subprocess.DEVNULL,
@@ -385,6 +395,22 @@ def _dispatch_via_popen(instructions: str, uow_id: str) -> str:
         close_fds=True,
         env=env,
     )
+
+    # Write PID to registry so `wos abort` can send SIGTERM to the process group.
+    # Best-effort: any failure is logged but does not abort the dispatch.
+    if registry is not None:
+        try:
+            registry.set_executor_pid(uow_id, proc.pid)
+            log.info(
+                "dispatch: stored executor_pid=%d for uow_id=%s",
+                proc.pid, uow_id,
+            )
+        except Exception as exc:
+            log.warning(
+                "dispatch: failed to store executor_pid for uow_id=%s — %s: %s "
+                "(wos abort will not work for this UoW)",
+                uow_id, type(exc).__name__, exc,
+            )
 
     log.info(
         "dispatch: spawned claude -p for uow_id=%s run_id=%s (non-blocking, new session)",
@@ -440,9 +466,26 @@ def _route_single_message(msg: dict) -> None:
         # to get the bare uow_id expected by _dispatch_via_popen
         bare_uow_id = task_id.removeprefix("wos-")
 
+        # Resolve registry for PID tracking (best-effort: None if unavailable).
+        # PID tracking enables `wos abort <uow_id>` to SIGTERM the process group.
+        # Lazily imported to avoid pulling orchestration.registry into the module
+        # namespace at load time (the router tests mock orchestration at import).
+        _registry = None
+        try:
+            from orchestration.registry import Registry as _Registry
+            from orchestration.paths import REGISTRY_DB
+            if REGISTRY_DB.exists():
+                _registry = _Registry(REGISTRY_DB)
+        except Exception as _exc:
+            log.warning(
+                "route: could not open registry for PID tracking (uow_id=%s) — %s: %s "
+                "(wos abort will not work for this UoW)",
+                uow_id, type(_exc).__name__, _exc,
+            )
+
         log.info("route: dispatching subagent for uow_id=%s task_id=%s", uow_id, task_id)
         try:
-            run_id = _dispatch_via_popen(instructions=prompt, uow_id=bare_uow_id)
+            run_id = _dispatch_via_popen(instructions=prompt, uow_id=bare_uow_id, registry=_registry)
             log.info("route: dispatch succeeded run_id=%s uow_id=%s", run_id, uow_id)
         except Exception as exc:
             log.error("route: _dispatch_via_popen raised for %s: %s", uow_id, exc)
