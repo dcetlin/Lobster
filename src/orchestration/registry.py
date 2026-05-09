@@ -2901,13 +2901,25 @@ class Registry:
             uow_id: The UoW identifier.
 
         Returns:
-            True if the process was found and SIGTERM was sent.
-            False if no PID was stored (executor_pid IS NULL) or the UoW was not found.
+            True if the process was found and SIGTERM was sent successfully.
+            False in three cases:
+              - executor_pid IS NULL (no PID stored, or UoW not found): no action taken.
+              - ProcessLookupError: process already exited; executor_pid is cleared.
+              - PermissionError: process is still running but owned by another user;
+                executor_pid is RETAINED (not cleared) so future abort attempts can
+                still see the PID. Callers that need to distinguish these two False
+                cases should call get_executor_pid() after a False return:
+                  - PID still present → PermissionError (process alive, unowned)
+                  - PID is None       → ProcessLookupError (process already gone)
 
         Note:
             ProcessLookupError is handled gracefully — the process already exited.
             In that case, executor_pid is cleared and False is returned, because no
             kill signal was actually delivered.
+
+            PermissionError is also handled gracefully — the process is running but
+            unowned. executor_pid is retained so the caller can report accurately and
+            a subsequent abort attempt is still possible (e.g., after privilege change).
         """
         import os
         import signal

@@ -375,3 +375,41 @@ def test_handle_wos_abort_process_already_gone(
     # Reply should indicate the process was already gone (not an error)
     assert "already" in reply.lower() or "gone" in reply.lower() or "exited" in reply.lower()
     assert uow_id in reply
+
+
+def test_handle_wos_abort_permission_error_on_kill(
+    registry: Registry, db_path: Path
+) -> None:
+    """handle_wos_abort reports permission denied (not ProcessLookupError) when kill_executor returns False due to PermissionError.
+
+    The PermissionError case means:
+    - The process is STILL RUNNING (not gone)
+    - executor_pid is RETAINED (not cleared)
+    - The correct message must reflect all three facts
+
+    This test guards against the pre-fix bug where both False-return cases
+    produced the ProcessLookupError message ("was already gone", "pid cleared"),
+    which was wrong on all three counts for the PermissionError path.
+    """
+    uow_id = _insert_uow(db_path)
+    registry.set_executor_pid(uow_id, FAKE_PID)
+
+    with patch("os.getpgid", return_value=FAKE_PID), \
+         patch("os.killpg", side_effect=PermissionError("operation not permitted")):
+        reply = handle_wos_abort(uow_id, registry=registry)
+
+    # Must mention permission denial — not ProcessLookupError language
+    assert "permission" in reply.lower() or "denied" in reply.lower(), (
+        f"Expected 'permission' or 'denied' in reply, got: {reply!r}"
+    )
+    # Must NOT claim the process is gone (it isn't)
+    assert "already gone" not in reply.lower() and "processlookup" not in reply.lower(), (
+        f"Reply incorrectly used ProcessLookupError language for PermissionError: {reply!r}"
+    )
+    # Must mention the UoW ID and PID
+    assert uow_id in reply
+    assert str(FAKE_PID) in reply
+    # Must NOT claim PID was cleared (it wasn't)
+    assert "executor_pid has been cleared" not in reply, (
+        f"Reply incorrectly claimed PID cleared on PermissionError: {reply!r}"
+    )

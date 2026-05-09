@@ -686,7 +686,20 @@ def handle_wos_abort(uow_id: str, *, registry: "Registry") -> str:
             "The subprocess and its children have been signaled for termination.\n"
             "TTL/heartbeat recovery will re-queue the UoW on the next observation cycle."
         )
+
+    # kill_executor returned False — two distinct cases depending on whether the PID was retained.
+    # PermissionError: process still running but unowned → PID retained.
+    # ProcessLookupError: process already gone → PID cleared.
+    retained_pid = registry.get_executor_pid(uow_id)
+    if retained_pid is not None:
+        # PermissionError path: process alive but we cannot signal it.
+        return (
+            f"UoW `{uow_id}`: cannot kill PID {pid} — permission denied.\n"
+            "The process may still be running (owned by a different user).\n"
+            "executor_pid has been retained for future abort attempts."
+        )
     else:
+        # ProcessLookupError path: process already exited, stale PID cleared.
         return (
             f"UoW `{uow_id}`: process PID {pid} was already gone (ProcessLookupError).\n"
             "The subprocess may have exited before the abort command reached it.\n"
