@@ -3776,6 +3776,98 @@ COOKIE_EOF
         touch "$_todos_log" 2>/dev/null || true
     fi
 
+    # Migration 109: Add vault-watcher cron entries (two entries for 30s polling).
+    # vault-watcher.py (detection + debounce) fires every 30 seconds via two cron
+    # entries: one at :00 and one at :30 (via sleep 30). vault-processor.py is NOT
+    # a cron entry — it is invoked exclusively by vault-watcher.py.
+    local VAULT_WATCHER_MARKER="# LOBSTER-VAULT-WATCHER"
+    local VAULT_WATCHER_HALF_MARKER="# LOBSTER-VAULT-WATCHER-HALF"
+    if ! crontab -l 2>/dev/null | grep -q "$VAULT_WATCHER_MARKER"; then
+        if ! $DRY_RUN; then
+            "$LOBSTER_DIR/scripts/cron-manage.sh" add "$VAULT_WATCHER_MARKER" \
+                "* * * * * cd $HOME/lobster && uv run scheduled-tasks/vault-watcher.py >> ${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/scheduled-jobs/logs/vault-watcher.log 2>&1 $VAULT_WATCHER_MARKER"
+            substep "Migration 109: added vault-watcher cron entry (every minute, :00s)"
+        else
+            substep "Migration 109 (dry-run): would add vault-watcher cron entry"
+        fi
+        migrated=$((migrated + 1))
+    else
+        substep "Migration 109: vault-watcher cron entry already present — skipping"
+    fi
+
+    if ! crontab -l 2>/dev/null | grep -q "$VAULT_WATCHER_HALF_MARKER"; then
+        if ! $DRY_RUN; then
+            "$LOBSTER_DIR/scripts/cron-manage.sh" add "$VAULT_WATCHER_HALF_MARKER" \
+                "* * * * * sleep 30 && cd $HOME/lobster && uv run scheduled-tasks/vault-watcher.py >> ${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/scheduled-jobs/logs/vault-watcher.log 2>&1 $VAULT_WATCHER_HALF_MARKER"
+            substep "Migration 109: added vault-watcher-half cron entry (every minute, :30s offset)"
+        else
+            substep "Migration 109 (dry-run): would add vault-watcher-half cron entry"
+        fi
+        migrated=$((migrated + 1))
+    else
+        substep "Migration 109: vault-watcher-half cron entry already present — skipping"
+    fi
+
+    # Ensure vault-watcher log file exists.
+    local _vault_watcher_log="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/scheduled-jobs/logs/vault-watcher.log"
+    if [ ! -f "$_vault_watcher_log" ] && ! $DRY_RUN; then
+        touch "$_vault_watcher_log" 2>/dev/null || true
+    fi
+
+    # Upsert vault-watcher and vault-processor entries into jobs.json.
+    local _jobs_file="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/scheduled-jobs/jobs.json"
+    if [ -f "$_jobs_file" ] && ! uv run python3 -c "import json,sys; d=json.load(open('$_jobs_file')); sys.exit(0 if 'vault-watcher' in d.get('jobs',{}) else 1)" 2>/dev/null; then
+        uv run python3 - <<'PYEOF'
+import json, os
+from datetime import datetime, timezone
+from pathlib import Path
+
+workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+jobs_file = workspace / "scheduled-jobs" / "jobs.json"
+try:
+    data = json.loads(jobs_file.read_text())
+except Exception:
+    data = {"jobs": {}}
+
+data.setdefault("jobs", {})
+now = datetime.now(timezone.utc).isoformat()
+
+if "vault-watcher" not in data["jobs"]:
+    data["jobs"]["vault-watcher"] = {
+        "name": "vault-watcher",
+        "type": "B",
+        "dispatch": "cron-direct",
+        "schedule": "every 30s (two cron entries)",
+        "schedule_human": "Every 30 seconds (two cron entries)",
+        "task_file": None,
+        "created_at": now,
+        "updated_at": now,
+        "enabled": True,
+        "last_run": None,
+        "last_status": None,
+    }
+
+if "vault-watcher-half" not in data["jobs"]:
+    data["jobs"]["vault-watcher-half"] = {
+        "name": "vault-watcher-half",
+        "type": "B",
+        "dispatch": "cron-direct",
+        "schedule": "every 30s offset (second cron entry)",
+        "schedule_human": "Every 30 seconds (offset entry)",
+        "task_file": None,
+        "created_at": now,
+        "updated_at": now,
+        "enabled": True,
+        "last_run": None,
+        "last_status": None,
+    }
+
+jobs_file.write_text(json.dumps(data, indent=2))
+print("Added vault-watcher and vault-watcher-half entries to jobs.json")
+PYEOF
+        migrated=$((migrated + 1))
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
