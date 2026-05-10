@@ -3382,7 +3382,7 @@ sys.exit(1)  # already correct
         if [ "$_m99_needs_fix" -eq 1 ]; then
             substep "Fixing on-compact.py hook matcher (Migration 99)..."
             TMP_SETTINGS=$(mktemp)
-            python3 - "$CLAUDE_SETTINGS" "$TMP_SETTINGS" << 'M99_PYEOF'
+            uv run python3 - "$CLAUDE_SETTINGS" "$TMP_SETTINGS" << 'M99_PYEOF'
 import json, sys
 src, dst = sys.argv[1], sys.argv[2]
 with open(src) as f:
