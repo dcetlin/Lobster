@@ -30,7 +30,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 SCRIPT_PATH = (
-    Path(__file__).parent.parent.parent
+    Path(__file__).parent.parent.parent.parent
     / "scheduled-tasks"
     / "cc-usage-poller.py"
 )
@@ -45,10 +45,10 @@ def _load_module():
 
 cp = _load_module()
 
-# Named constants mirrored from module — changes here are intentional and
-# signal a spec change, not just an implementation change.
-ADMIN_CHAT_ID = 8075091586
-SENTINEL_PREFIX = "/tmp/cc-usage-cookie-expired-alert-"
+# Constants imported from production module — importing rather than
+# re-declaring prevents silent divergence when values change in the module.
+ADMIN_CHAT_ID = cp.ADMIN_CHAT_ID
+SENTINEL_PREFIX = cp.COOKIE_EXPIRY_SENTINEL_PREFIX
 
 
 # ---------------------------------------------------------------------------

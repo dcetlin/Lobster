@@ -85,7 +85,7 @@ STATE_FILE_PATH = Path.home() / ".claude" / "cc-budget" / "state.json"
 SOURCE_TAG = "cc-usage-poller"
 
 # Telegram chat_id for cookie-expiry alert delivery
-ADMIN_CHAT_ID = 8075091586
+ADMIN_CHAT_ID: int = int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586"))
 
 # Sentinel file prefix — one file per calendar date prevents repeated alerts
 # Format: /tmp/cc-usage-cookie-expired-alert-YYYY-MM-DD

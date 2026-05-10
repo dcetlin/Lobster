@@ -3736,6 +3736,7 @@ print('executor_pid column added')
 # Get it from: DevTools → Application → Cookies → claude.ai → sessionKey
 # The value looks like: sk-ant-sid01-...
 COOKIE_EOF
+            chmod 600 "$_cookie_config"
             substep "Migration 107: created cookie config placeholder at $_cookie_config"
         else
             substep "Migration 107 (dry-run): would create cookie config at $_cookie_config"
