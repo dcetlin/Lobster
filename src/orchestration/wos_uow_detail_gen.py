@@ -39,6 +39,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import markdown as _markdown_lib
+
 # ---------------------------------------------------------------------------
 # Pricing constants — Sonnet 4.6
 # ---------------------------------------------------------------------------
@@ -46,6 +48,27 @@ from typing import Any
 SONNET_4_6_INPUT_PER_MTK = 3.0        # $3.00 per 1M input tokens
 SONNET_4_6_OUTPUT_PER_MTK = 15.0      # $15.00 per 1M output tokens
 SONNET_4_6_CACHE_READ_PER_MTK = 0.30  # $0.30 per 1M cache_read tokens
+
+# ---------------------------------------------------------------------------
+# Markdown rendering — pure function, no side effects
+# ---------------------------------------------------------------------------
+
+#: Extensions that improve fidelity for typical UoW content (checklists, code fences, tables).
+_MARKDOWN_EXTENSIONS = ["fenced_code", "tables", "nl2br"]
+
+
+def _render_markdown(text: str) -> str:
+    """Convert a markdown string to sanitized HTML.
+
+    Pure function: accepts a string, returns an HTML string.
+    Empty/whitespace-only input returns an empty string.
+    The output is intended for direct injection into an HTML page — the caller
+    is responsible for placing it inside an appropriately styled container.
+    """
+    if not text or not text.strip():
+        return ""
+    return _markdown_lib.markdown(text, extensions=_MARKDOWN_EXTENSIONS)
+
 
 # ---------------------------------------------------------------------------
 # Path resolution — all through canonical sources, no inline derivation
@@ -353,6 +376,25 @@ h2{{font-size:.85rem;font-weight:600;margin-bottom:10px;color:var(--text2);text-
 .legend{{display:flex;gap:12px;font-size:.65rem;color:var(--text3);flex-wrap:wrap;margin-top:3px}}
 .leg{{display:flex;align-items:center;gap:4px}}
 .legdot{{width:8px;height:8px;border-radius:2px}}
+.md-content{{font-size:.83rem;line-height:1.6}}
+.md-content p{{margin:0 0 8px}}
+.md-content p:last-child{{margin-bottom:0}}
+.md-content ul,.md-content ol{{margin:0 0 8px;padding-left:1.4em}}
+.md-content li{{margin-bottom:2px}}
+.md-content strong{{font-weight:600}}
+.md-content em{{font-style:italic}}
+.md-content code{{font-family:monospace;font-size:.82em;background:var(--surface2);border:1px solid var(--border);border-radius:3px;padding:1px 4px}}
+.md-content pre{{background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:10px;overflow-x:auto;font-size:.78rem;margin:0 0 8px}}
+.md-content pre code{{background:none;border:none;padding:0}}
+.md-content h1,.md-content h2,.md-content h3{{font-weight:600;margin:0 0 6px;color:var(--text)}}
+.md-content h1{{font-size:.9rem}}
+.md-content h2{{font-size:.85rem}}
+.md-content h3{{font-size:.82rem}}
+.md-content blockquote{{border-left:3px solid var(--border);padding-left:10px;color:var(--text2);margin:0 0 8px}}
+.md-content table{{border-collapse:collapse;font-size:.78rem;margin-bottom:8px}}
+.md-content th,.md-content td{{padding:4px 8px;border:1px solid var(--border)}}
+.md-content th{{background:var(--surface2);font-weight:600}}
+.md-content a{{color:var(--accent)}}
 </style>
 </head>
 <body>
@@ -498,7 +540,7 @@ if (u.prescription_confidence != null) {{
 const html = `
   <div class="sec">
     <h2>Summary</h2>
-    <div class="sumtxt">${{u.summary || '(no summary)'}}</div>
+    <div class="sumtxt md-content">${{D.summary_html || u.summary || '(no summary)'}}</div>
     <div style="margin-bottom:10px">
       ${{statusBadge(u.status)}} ${{outcomeBadge(u.outcome_category)}}
       ${{u.gate_fired && u.gate_fired !== 'none' ? `<span class="badge bf" style="margin-left:4px">gate: ${{u.gate_fired}}</span>` : ''}}
@@ -516,7 +558,7 @@ const html = `
     </div>
   </div>
 
-  ${{u.success_criteria ? `<div class="sec"><h2>Success Criteria</h2><div style="font-size:.83rem">${{u.success_criteria}}</div></div>` : ''}}
+  ${{D.success_criteria_html ? `<div class="sec"><h2>Success Criteria</h2><div class="md-content">${{D.success_criteria_html}}</div></div>` : ''}}
 
   <div class="sec">
     <h2>Execution Stats</h2>
@@ -527,7 +569,7 @@ const html = `
       <div class="scard"><div class="n">${{u.retry_count||0}}</div><div class="l">Retries</div></div>
     </div>
     ${{confBar ? `<div style="margin-top:8px"><div style="font-size:.68rem;color:var(--text3);margin-bottom:3px;text-transform:uppercase;letter-spacing:.04em">Prescription Confidence</div>${{confBar}}</div>` : ''}}
-    ${{u.close_reason ? `<div style="margin-top:10px"><div style="font-size:.68rem;color:var(--text3);text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px">Close Reason</div><div style="font-size:.8rem">${{u.close_reason}}</div></div>` : ''}}
+    ${{D.close_reason_html ? `<div style="margin-top:10px"><div style="font-size:.68rem;color:var(--text3);text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px">Close Reason</div><div class="md-content">${{D.close_reason_html}}</div></div>` : ''}}
   </div>
 
   <div class="sec">
@@ -605,6 +647,11 @@ def generate_html(
         "elapsed_seconds": elapsed,
         "estimated_cost_usd": round(cost, 6) if cost is not None else None,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        # Pre-rendered markdown fields — avoids client-side markdown parsing.
+        # Only populated when the source field is non-empty.
+        "summary_html": _render_markdown(uow_data.get("summary") or ""),
+        "success_criteria_html": _render_markdown(uow_data.get("success_criteria") or ""),
+        "close_reason_html": _render_markdown(uow_data.get("close_reason") or ""),
     }
 
     d_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)

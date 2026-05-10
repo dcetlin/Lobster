@@ -448,6 +448,46 @@ class TestEstimateCost:
 
 
 # ---------------------------------------------------------------------------
+# _render_markdown — pure markdown-to-HTML conversion
+# ---------------------------------------------------------------------------
+
+class TestRenderMarkdown:
+    def test_empty_string_returns_empty(self):
+        from src.orchestration.wos_uow_detail_gen import _render_markdown
+        assert _render_markdown("") == ""
+
+    def test_whitespace_only_returns_empty(self):
+        from src.orchestration.wos_uow_detail_gen import _render_markdown
+        assert _render_markdown("   \n  ") == ""
+
+    def test_plain_text_becomes_paragraph(self):
+        from src.orchestration.wos_uow_detail_gen import _render_markdown
+        result = _render_markdown("PR merged and tests pass")
+        assert "<p>" in result
+        assert "PR merged and tests pass" in result
+
+    def test_bullet_list_becomes_ul_li(self):
+        from src.orchestration.wos_uow_detail_gen import _render_markdown
+        result = _render_markdown("- item one\n- item two")
+        assert "<ul>" in result
+        assert "<li>" in result
+        assert "item one" in result
+        assert "item two" in result
+
+    def test_bold_text_becomes_strong(self):
+        from src.orchestration.wos_uow_detail_gen import _render_markdown
+        result = _render_markdown("**important**")
+        assert "<strong>" in result
+        assert "important" in result
+
+    def test_heading_becomes_h_tag(self):
+        from src.orchestration.wos_uow_detail_gen import _render_markdown
+        result = _render_markdown("## Section heading")
+        assert "<h2>" in result
+        assert "Section heading" in result
+
+
+# ---------------------------------------------------------------------------
 # generate_html
 # ---------------------------------------------------------------------------
 
@@ -551,6 +591,112 @@ class TestGenerateHtml:
         # Should not raise
         html = generate_html(uow_data, [], [], [], None)
         assert "<!DOCTYPE html>" in html
+
+    def test_success_criteria_markdown_rendered_as_html(self):
+        """Markdown in success_criteria must appear as HTML tags, not raw text."""
+        from src.orchestration.wos_uow_detail_gen import generate_html
+        uow_data = {
+            "id": "uow_20260501_md1",
+            "summary": "Test",
+            "status": "done",
+            "created_at": "2026-05-01T10:00:00+00:00",
+            "updated_at": "2026-05-01T11:00:00+00:00",
+            "started_at": None,
+            "completed_at": None,
+            "source_issue_number": None,
+            "issue_url": None,
+            "outcome_category": None,
+            "steward_cycles": 0,
+            "lifetime_cycles": 0,
+            "execution_attempts": 0,
+            "retry_count": 0,
+            "token_usage": None,
+            "posture": "solo",
+            "register": "operational",
+            "close_reason": None,
+            "prescription_confidence": None,
+            "success_criteria": "- All tests pass\n- PR merged to main",
+            "gate_fired": None,
+        }
+        html = generate_html(uow_data, [], [], [], None)
+        # The rendered HTML must contain list tags, not raw markdown hyphens as text
+        assert "<ul>" in html
+        assert "<li>" in html
+        assert "All tests pass" in html
+
+    def test_close_reason_markdown_rendered_as_html(self):
+        """Markdown in close_reason must appear as HTML tags, not raw text."""
+        from src.orchestration.wos_uow_detail_gen import generate_html
+        uow_data = {
+            "id": "uow_20260501_md2",
+            "summary": "Test",
+            "status": "closed",
+            "created_at": "2026-05-01T10:00:00+00:00",
+            "updated_at": "2026-05-01T11:00:00+00:00",
+            "started_at": None,
+            "completed_at": None,
+            "source_issue_number": None,
+            "issue_url": None,
+            "outcome_category": None,
+            "steward_cycles": 0,
+            "lifetime_cycles": 0,
+            "execution_attempts": 0,
+            "retry_count": 0,
+            "token_usage": None,
+            "posture": "solo",
+            "register": "operational",
+            "close_reason": "**Blocked**: dependency not resolved",
+            "prescription_confidence": None,
+            "success_criteria": "",
+            "gate_fired": None,
+        }
+        html = generate_html(uow_data, [], [], [], None)
+        # Bold markdown must produce <strong>, not raw ** characters
+        assert "<strong>" in html
+        assert "Blocked" in html
+
+    def test_empty_success_criteria_produces_empty_html_field(self):
+        """When success_criteria is empty, success_criteria_html in the payload must be empty.
+
+        The template conditionally renders the section only when success_criteria_html is
+        non-empty (evaluated at runtime in JS). This test verifies that the server-side
+        payload correctly produces an empty string for empty input, which prevents the
+        section from appearing in the browser.
+        """
+        from src.orchestration.wos_uow_detail_gen import generate_html
+        import json as _json
+        uow_data = {
+            "id": "uow_20260501_md3",
+            "summary": "Test",
+            "status": "done",
+            "created_at": "2026-05-01T10:00:00+00:00",
+            "updated_at": "2026-05-01T11:00:00+00:00",
+            "started_at": None,
+            "completed_at": None,
+            "source_issue_number": None,
+            "issue_url": None,
+            "outcome_category": None,
+            "steward_cycles": 0,
+            "lifetime_cycles": 0,
+            "execution_attempts": 0,
+            "retry_count": 0,
+            "token_usage": None,
+            "posture": "solo",
+            "register": "operational",
+            "close_reason": None,
+            "prescription_confidence": None,
+            "success_criteria": "",
+            "gate_fired": None,
+        }
+        html = generate_html(uow_data, [], [], [], None)
+        # Extract the embedded JSON payload from the HTML
+        # The payload is embedded as: const D = {...};
+        import re as _re
+        match = _re.search(r'const D = (\{.*?\});', html, _re.DOTALL)
+        assert match is not None, "Could not find D JSON payload in HTML"
+        payload = _json.loads(match.group(1))
+        # Empty success_criteria must produce empty rendered HTML — JS will evaluate this as falsy
+        assert payload["success_criteria_html"] == ""
 
 
 # ---------------------------------------------------------------------------
