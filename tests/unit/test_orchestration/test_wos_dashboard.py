@@ -1060,12 +1060,6 @@ class TestReadCcBudgetState:
 # _format_cc_quota_widget
 # ---------------------------------------------------------------------------
 
-# Named constants matching spec requirements
-CC_QUOTA_STALE_THRESHOLD_MINUTES = 60
-CC_QUOTA_COLOR_GREEN_MAX = 70       # <70% is green
-CC_QUOTA_COLOR_YELLOW_MAX = 90      # 70-89% is yellow/orange; >=90% is red
-
-
 class TestFormatCcQuotaWidget:
     def _now(self) -> datetime:
         return datetime(2026, 5, 10, 18, 50, 0, tzinfo=timezone.utc)
@@ -1124,8 +1118,8 @@ class TestFormatCcQuotaWidget:
         from src.orchestration.wos_dashboard import _format_cc_quota_widget
         state = {"five_hour_pct": 40.0, "seven_day_pct": 20.0, "fetched_at": "2026-05-10T18:42:00Z"}
         html = _format_cc_quota_widget(state, self._now())
-        # Green CSS color or class should appear
-        assert "green" in html.lower() or "#" in html  # color indicator present
+        # Green CSS hex color should appear
+        assert "#1a7a3c" in html
 
     def test_red_color_at_or_above_90_percent(self):
         """Percentages at or above 90% are colored red (high usage)."""
