@@ -609,12 +609,7 @@ def generate_html(
 
     d_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
 
-    return (
-        _HTML_TEMPLATE
-        .replace("{uow_id}", uow_id)
-        .replace("{uow_id_display}", uow_id)
-        .replace("{D_JSON}", d_json)
-    )
+    return _HTML_TEMPLATE.format(uow_id=uow_id, uow_id_display=uow_id, D_JSON=d_json)
 
 
 # ---------------------------------------------------------------------------
