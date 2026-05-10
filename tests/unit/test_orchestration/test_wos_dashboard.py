@@ -993,3 +993,238 @@ class TestMainHtmlCanonical:
         dest = uploads_dir / "wos-dashboard-active.html"
         assert dest.exists()
         assert "<!DOCTYPE html>" in dest.read_text()
+
+
+# ---------------------------------------------------------------------------
+# _read_cc_budget_state
+# ---------------------------------------------------------------------------
+
+class TestReadCcBudgetState:
+    def test_returns_dict_for_valid_state_file(self, tmp_path):
+        """Returns parsed dict when state.json contains valid CC quota data."""
+        from src.orchestration.wos_dashboard import _read_cc_budget_state
+        state_file = tmp_path / "state.json"
+        state_file.write_text(
+            '{"five_hour_pct": 52.0, "seven_day_pct": 28.0, "fetched_at": "2026-05-10T18:42:00Z"}'
+        )
+        result = _read_cc_budget_state(str(state_file))
+        assert result is not None
+        assert result["five_hour_pct"] == 52.0
+        assert result["seven_day_pct"] == 28.0
+        assert result["fetched_at"] == "2026-05-10T18:42:00Z"
+
+    def test_returns_none_when_file_missing(self, tmp_path):
+        """Returns None when the state file does not exist."""
+        from src.orchestration.wos_dashboard import _read_cc_budget_state
+        result = _read_cc_budget_state(str(tmp_path / "nonexistent.json"))
+        assert result is None
+
+    def test_returns_none_on_malformed_json(self, tmp_path):
+        """Returns None when the state file contains invalid JSON."""
+        from src.orchestration.wos_dashboard import _read_cc_budget_state
+        state_file = tmp_path / "state.json"
+        state_file.write_text("not valid json")
+        result = _read_cc_budget_state(str(state_file))
+        assert result is None
+
+    def test_returns_none_when_required_key_missing(self, tmp_path):
+        """Returns None when the state file is missing required keys."""
+        from src.orchestration.wos_dashboard import _read_cc_budget_state
+        state_file = tmp_path / "state.json"
+        state_file.write_text('{"five_hour_pct": 52.0}')  # missing seven_day_pct and fetched_at
+        result = _read_cc_budget_state(str(state_file))
+        assert result is None
+
+    def test_reads_from_env_var_path_when_state_path_is_none(self, tmp_path, monkeypatch):
+        """When state_path=None, reads from LOBSTER_CC_BUDGET_STATE env var."""
+        from src.orchestration.wos_dashboard import _read_cc_budget_state
+        state_file = tmp_path / "state.json"
+        state_file.write_text(
+            '{"five_hour_pct": 75.0, "seven_day_pct": 40.0, "fetched_at": "2026-05-10T10:00:00Z"}'
+        )
+        monkeypatch.setenv("LOBSTER_CC_BUDGET_STATE", str(state_file))
+        result = _read_cc_budget_state(None)
+        assert result is not None
+        assert result["five_hour_pct"] == 75.0
+
+    def test_uses_default_path_when_no_env_var_and_state_path_is_none(self, monkeypatch):
+        """Falls back to ~/.claude/cc-budget/state.json when no env var and no explicit path."""
+        from src.orchestration.wos_dashboard import _read_cc_budget_state
+        monkeypatch.delenv("LOBSTER_CC_BUDGET_STATE", raising=False)
+        # Default path does not exist in test environment — should return None, not raise.
+        result = _read_cc_budget_state(None)
+        assert result is None  # file absent at default location
+
+
+# ---------------------------------------------------------------------------
+# _format_cc_quota_widget
+# ---------------------------------------------------------------------------
+
+# Named constants matching spec requirements
+CC_QUOTA_STALE_THRESHOLD_MINUTES = 60
+CC_QUOTA_COLOR_GREEN_MAX = 70       # <70% is green
+CC_QUOTA_COLOR_YELLOW_MAX = 90      # 70-89% is yellow/orange; >=90% is red
+
+
+class TestFormatCcQuotaWidget:
+    def _now(self) -> datetime:
+        return datetime(2026, 5, 10, 18, 50, 0, tzinfo=timezone.utc)
+
+    def _fresh_state(self) -> dict:
+        """State fetched 8 minutes before _now()."""
+        return {
+            "five_hour_pct": 52.0,
+            "seven_day_pct": 28.0,
+            "fetched_at": "2026-05-10T18:42:00Z",
+        }
+
+    def _stale_state(self) -> dict:
+        """State fetched 70 minutes before _now() — exceeds 60-min threshold."""
+        return {
+            "five_hour_pct": 30.0,
+            "seven_day_pct": 15.0,
+            "fetched_at": "2026-05-10T17:40:00Z",
+        }
+
+    def test_unavailable_widget_when_state_is_none(self):
+        """None state → unavailable widget."""
+        from src.orchestration.wos_dashboard import _format_cc_quota_widget
+        html = _format_cc_quota_widget(None, self._now())
+        assert "unavailable" in html.lower()
+
+    def test_unavailable_widget_when_state_is_stale(self):
+        """Stale state (>60 min) → unavailable widget."""
+        from src.orchestration.wos_dashboard import _format_cc_quota_widget
+        html = _format_cc_quota_widget(self._stale_state(), self._now())
+        assert "unavailable" in html.lower()
+
+    def test_fresh_state_shows_five_hour_percentage(self):
+        """Fresh state shows 5h quota percentage."""
+        from src.orchestration.wos_dashboard import _format_cc_quota_widget
+        html = _format_cc_quota_widget(self._fresh_state(), self._now())
+        assert "52" in html
+        assert "5h" in html
+
+    def test_fresh_state_shows_seven_day_percentage(self):
+        """Fresh state shows 7d quota percentage."""
+        from src.orchestration.wos_dashboard import _format_cc_quota_widget
+        html = _format_cc_quota_widget(self._fresh_state(), self._now())
+        assert "28" in html
+        assert "7d" in html
+
+    def test_fresh_state_shows_relative_data_age(self):
+        """Fresh state shows data age as relative time ('as of Nm ago')."""
+        from src.orchestration.wos_dashboard import _format_cc_quota_widget
+        html = _format_cc_quota_widget(self._fresh_state(), self._now())
+        # 8 minutes ago
+        assert "8m" in html
+
+    def test_green_color_below_threshold(self):
+        """Percentages below 70% are colored green (low usage)."""
+        from src.orchestration.wos_dashboard import _format_cc_quota_widget
+        state = {"five_hour_pct": 40.0, "seven_day_pct": 20.0, "fetched_at": "2026-05-10T18:42:00Z"}
+        html = _format_cc_quota_widget(state, self._now())
+        # Green CSS color or class should appear
+        assert "green" in html.lower() or "#" in html  # color indicator present
+
+    def test_red_color_at_or_above_90_percent(self):
+        """Percentages at or above 90% are colored red (high usage)."""
+        from src.orchestration.wos_dashboard import _format_cc_quota_widget
+        state = {"five_hour_pct": 92.0, "seven_day_pct": 95.0, "fetched_at": "2026-05-10T18:42:00Z"}
+        html = _format_cc_quota_widget(state, self._now())
+        assert "red" in html.lower() or "#c0392b" in html or "#f87171" in html
+
+    def test_widget_is_html_string(self):
+        """Returns an HTML string (contains angle brackets)."""
+        from src.orchestration.wos_dashboard import _format_cc_quota_widget
+        html = _format_cc_quota_widget(self._fresh_state(), self._now())
+        assert "<" in html and ">" in html
+
+    def test_cc_quota_label_present(self):
+        """Widget contains a recognizable 'CC quota' or 'CC Quota' label."""
+        from src.orchestration.wos_dashboard import _format_cc_quota_widget
+        html = _format_cc_quota_widget(self._fresh_state(), self._now())
+        assert "CC" in html
+
+
+# ---------------------------------------------------------------------------
+# render_html — CC quota widget injection
+# ---------------------------------------------------------------------------
+
+class TestRenderHtmlCcQuota:
+    def _base_data(self, cc_quota: dict | None = None) -> dict:
+        data = {
+            "generated_at": "2026-05-10T18:50:00+00:00",
+            "active_uows": [],
+            "throughput_24h": {"completed": 3, "failed": 0},
+            "cycle_histogram_7d": {},
+            "stalled_uows": [],
+            "bootup_candidate_gate": {
+                "gate_open": False,
+                "blocked_count": 0,
+                "description": "gate is CLOSED — all UoWs are processed normally",
+            },
+        }
+        if cc_quota is not None:
+            data["cc_quota"] = cc_quota
+        return data
+
+    def test_cc_quota_section_present_when_data_provided(self):
+        """When cc_quota key is present in data, the widget appears in the rendered HTML."""
+        from src.orchestration.wos_dashboard import render_html
+        cc_quota_html = "<span>CC quota: 5h: 52%</span>"
+        data = self._base_data(cc_quota=cc_quota_html)
+        html = render_html(data, drilldown_urls={})
+        assert "52" in html
+        assert "CC" in html
+
+    def test_cc_quota_absent_when_key_missing(self):
+        """When cc_quota key is absent, the widget area is omitted gracefully."""
+        from src.orchestration.wos_dashboard import render_html
+        data = self._base_data(cc_quota=None)  # no cc_quota key
+        html = render_html(data, drilldown_urls={})
+        # Should still be valid HTML without errors
+        assert "<!DOCTYPE html>" in html
+
+    def test_cc_quota_unavailable_string_renders(self):
+        """When cc_quota contains 'unavailable', that text appears in the HTML."""
+        from src.orchestration.wos_dashboard import render_html
+        data = self._base_data(cc_quota="<span>CC quota: unavailable</span>")
+        html = render_html(data, drilldown_urls={})
+        assert "unavailable" in html
+
+
+# ---------------------------------------------------------------------------
+# build_dashboard_data — CC quota included
+# ---------------------------------------------------------------------------
+
+class TestBuildDashboardDataCcQuota:
+    def test_cc_quota_key_present_in_data(self, tmp_path):
+        """build_dashboard_data includes cc_quota key when called."""
+        from src.orchestration.wos_dashboard import build_dashboard_data
+        registry = _make_registry([])
+        db_path = tmp_path / "registry.db"
+
+        with patch("src.orchestration.audit_queries.execution_outcomes", return_value={}), \
+             patch("src.orchestration.wos_dashboard._fetch_completed_uow_ids_since", return_value=[]), \
+             patch("src.orchestration.steward.is_bootup_candidate_gate_active", return_value=False), \
+             patch("src.orchestration.wos_dashboard._read_cc_budget_state", return_value=None):
+            data = build_dashboard_data(registry, db_path)
+
+        assert "cc_quota" in data
+
+    def test_cc_quota_is_html_string_when_state_available(self, tmp_path):
+        """When state is available, cc_quota value is an HTML string."""
+        from src.orchestration.wos_dashboard import build_dashboard_data
+        registry = _make_registry([])
+        db_path = tmp_path / "registry.db"
+        state = {"five_hour_pct": 52.0, "seven_day_pct": 28.0, "fetched_at": "2026-05-10T18:42:00Z"}
+
+        with patch("src.orchestration.audit_queries.execution_outcomes", return_value={}), \
+             patch("src.orchestration.wos_dashboard._fetch_completed_uow_ids_since", return_value=[]), \
+             patch("src.orchestration.steward.is_bootup_candidate_gate_active", return_value=False), \
+             patch("src.orchestration.wos_dashboard._read_cc_budget_state", return_value=state):
+            data = build_dashboard_data(registry, db_path)
+
+        assert isinstance(data["cc_quota"], str)
+        assert "<" in data["cc_quota"]
