@@ -14,10 +14,26 @@ Tests cover:
 - generate_drilldown_urls: generates URL map for given UoW IDs, skips on error
 - render_html: produces valid HTML with UoW table and drilldown links when urls provided
 - render_html: renders UoW IDs as plain text when no drilldown URLs provided
+- render_html: displays issue title when provided
+- render_html: displays category badge when provided
 - main(): exits 0, text format default
 - main(): --format json outputs valid JSON
-- main(): --format html outputs valid HTML
+- main(): --format html writes to canonical filename and outputs URL
 - main(): --with-drilldowns flag calls generate_drilldown_urls
+- _fetch_issue_metadata: returns {title, labels} dict for valid issue URL
+- _fetch_issue_metadata: returns None when issue URL is missing or empty
+- _fetch_issue_metadata: returns None on subprocess failure
+- _fetch_issue_metadata: returns None on malformed JSON
+- _enrich_uow_with_github_metadata: injects title and category when issue_url present
+- _enrich_uow_with_github_metadata: passthrough with defaults when no issue_url
+- _enrich_uow_with_github_metadata: graceful fallback when metadata fetch returns None
+- _derive_category_from_labels: type:bug → "bug"
+- _derive_category_from_labels: type:feat → "feature"
+- _derive_category_from_labels: workstream:wos → "wos"
+- _derive_category_from_labels: type: preferred over workstream: when both present
+- _derive_category_from_labels: no matching labels → "general"
+- _derive_category_from_labels: empty labels → "general"
+- upload_html: writes to canonical filename, returns stable URL
 """
 
 from __future__ import annotations
@@ -465,22 +481,28 @@ class TestMain:
         # Text output has section headers, not JSON
         assert "[1]" in out
 
-    def test_format_html_outputs_html(self, tmp_path, capsys):
+    def test_format_html_outputs_canonical_url(self, tmp_path, capsys):
+        """--format html outputs the stable canonical URL (not raw HTML) to stdout."""
         from src.orchestration.wos_dashboard import main
         db = tmp_path / "registry.db"
-        with self._patch_all(tmp_path):
+        uploads_dir = tmp_path / "bisque-uploads"
+        with self._patch_all(tmp_path), \
+             patch("src.orchestration.wos_dashboard._uploads_dir", return_value=uploads_dir), \
+             patch("src.orchestration.wos_dashboard._bisque_base_url", return_value="http://test:9101"):
             rc = main(["--db", str(db), "--format", "html"])
         assert rc == 0
-        out = capsys.readouterr().out
-        assert "<!DOCTYPE html>" in out
-        assert "WOS Dashboard" in out
+        out = capsys.readouterr().out.strip()
+        assert out == "http://test:9101/files/wos-dashboard-active.html"
 
     def test_with_drilldowns_calls_generate_drilldown_urls(self, tmp_path, capsys):
         """--with-drilldowns causes generate_drilldown_urls to be called for each active UoW."""
         from src.orchestration.wos_dashboard import main
         db = tmp_path / "registry.db"
+        uploads_dir = tmp_path / "bisque-uploads"
         with self._patch_all(tmp_path), \
-             patch("src.orchestration.wos_dashboard.generate_drilldown_urls", return_value={}) as mock_gen:
+             patch("src.orchestration.wos_dashboard.generate_drilldown_urls", return_value={}) as mock_gen, \
+             patch("src.orchestration.wos_dashboard._uploads_dir", return_value=uploads_dir), \
+             patch("src.orchestration.wos_dashboard._bisque_base_url", return_value="http://test:9101"):
             rc = main(["--db", str(db), "--format", "html", "--with-drilldowns"])
         assert rc == 0
         mock_gen.assert_called_once()
@@ -489,8 +511,11 @@ class TestMain:
         """Without --with-drilldowns, generate_drilldown_urls is NOT called."""
         from src.orchestration.wos_dashboard import main
         db = tmp_path / "registry.db"
+        uploads_dir = tmp_path / "bisque-uploads"
         with self._patch_all(tmp_path), \
-             patch("src.orchestration.wos_dashboard.generate_drilldown_urls", return_value={}) as mock_gen:
+             patch("src.orchestration.wos_dashboard.generate_drilldown_urls", return_value={}) as mock_gen, \
+             patch("src.orchestration.wos_dashboard._uploads_dir", return_value=uploads_dir), \
+             patch("src.orchestration.wos_dashboard._bisque_base_url", return_value="http://test:9101"):
             rc = main(["--db", str(db), "--format", "html"])
         assert rc == 0
         mock_gen.assert_not_called()
@@ -639,3 +664,332 @@ class TestRenderHtml:
         urls = {"uow_stalled_x": "http://test:9101/files/stalled.html"}
         html = render_html(data, drilldown_urls=urls)
         assert 'href="http://test:9101/files/stalled.html"' in html
+
+    def test_issue_title_displayed_in_active_row(self):
+        """When a UoW row has an issue_title, it appears prominently in the row HTML."""
+        from src.orchestration.wos_dashboard import render_html
+        data = self._base_data()
+        data["active_uows"] = [{
+            "id": "uow_20260101_abc",
+            "status": "active",
+            "steward_cycles": 3,
+            "time_in_state_seconds": 600,
+            "issue_title": "Fix flaky CI pipeline",
+            "category": "bug",
+        }]
+        html = render_html(data, drilldown_urls={})
+        assert "Fix flaky CI pipeline" in html
+
+    def test_category_badge_displayed_in_active_row(self):
+        """When a UoW row has a category, a badge appears in the row HTML."""
+        from src.orchestration.wos_dashboard import render_html
+        data = self._base_data()
+        data["active_uows"] = [{
+            "id": "uow_20260101_abc",
+            "status": "active",
+            "steward_cycles": 3,
+            "time_in_state_seconds": 600,
+            "issue_title": "Some feature",
+            "category": "feature",
+        }]
+        html = render_html(data, drilldown_urls={})
+        assert "feature" in html
+
+    def test_missing_title_renders_empty_dash(self):
+        """When issue_title is absent from a UoW row, render falls back gracefully."""
+        from src.orchestration.wos_dashboard import render_html
+        data = self._base_data()
+        # base_data has a UoW without issue_title/category keys
+        html = render_html(data, drilldown_urls={})
+        # Should render without error and include the UoW id
+        assert "uow_20260101_abc" in html
+
+
+# ---------------------------------------------------------------------------
+# _fetch_issue_metadata
+# ---------------------------------------------------------------------------
+
+class TestFetchIssueMetadata:
+    _URL = "https://github.com/SiderealPress/lobster/issues/42"
+
+    def test_returns_title_and_labels_for_valid_issue_url(self):
+        """Returns {title, labels} dict when gh CLI returns both fields."""
+        from src.orchestration.wos_dashboard import _fetch_issue_metadata
+        fake_result = MagicMock()
+        fake_result.returncode = 0
+        fake_result.stdout = '{"title": "Fix flaky CI pipeline", "labels": [{"name": "type:bug"}]}'
+        with patch("subprocess.run", return_value=fake_result):
+            result = _fetch_issue_metadata(self._URL)
+        assert result is not None
+        assert result["title"] == "Fix flaky CI pipeline"
+        assert result["labels"] == [{"name": "type:bug"}]
+
+    def test_uses_single_combined_gh_call(self):
+        """Verifies only one subprocess.run call is made (combined --json title,labels)."""
+        from src.orchestration.wos_dashboard import _fetch_issue_metadata
+        fake_result = MagicMock()
+        fake_result.returncode = 0
+        fake_result.stdout = '{"title": "My Issue", "labels": []}'
+        with patch("subprocess.run", return_value=fake_result) as mock_run:
+            _fetch_issue_metadata(self._URL)
+        assert mock_run.call_count == 1
+        cmd = mock_run.call_args[0][0]
+        assert "--json" in cmd
+        # The json fields argument must contain both title and labels in a single call
+        json_arg = cmd[cmd.index("--json") + 1]
+        assert "title" in json_arg
+        assert "labels" in json_arg
+
+    def test_returns_none_when_issue_url_is_none(self):
+        """Returns None when no issue URL is provided."""
+        from src.orchestration.wos_dashboard import _fetch_issue_metadata
+        assert _fetch_issue_metadata(None) is None
+
+    def test_returns_none_when_issue_url_is_empty(self):
+        """Returns None when issue URL is an empty string."""
+        from src.orchestration.wos_dashboard import _fetch_issue_metadata
+        assert _fetch_issue_metadata("") is None
+
+    def test_returns_none_on_subprocess_failure(self):
+        """Returns None when gh CLI returns non-zero exit code."""
+        from src.orchestration.wos_dashboard import _fetch_issue_metadata
+        fake_result = MagicMock()
+        fake_result.returncode = 1
+        fake_result.stdout = ""
+        with patch("subprocess.run", return_value=fake_result):
+            assert _fetch_issue_metadata(self._URL) is None
+
+    def test_returns_none_on_subprocess_exception(self):
+        """Returns None when subprocess.run raises an exception."""
+        from src.orchestration.wos_dashboard import _fetch_issue_metadata
+        with patch("subprocess.run", side_effect=Exception("gh not found")):
+            assert _fetch_issue_metadata(self._URL) is None
+
+    def test_returns_none_on_malformed_json(self):
+        """Returns None when gh CLI returns unparseable JSON."""
+        from src.orchestration.wos_dashboard import _fetch_issue_metadata
+        fake_result = MagicMock()
+        fake_result.returncode = 0
+        fake_result.stdout = "not valid json"
+        with patch("subprocess.run", return_value=fake_result):
+            assert _fetch_issue_metadata(self._URL) is None
+
+    def test_empty_labels_normalised_to_list(self):
+        """Returns labels as empty list when gh returns null or absent labels field."""
+        from src.orchestration.wos_dashboard import _fetch_issue_metadata
+        fake_result = MagicMock()
+        fake_result.returncode = 0
+        fake_result.stdout = '{"title": "My Issue"}'
+        with patch("subprocess.run", return_value=fake_result):
+            result = _fetch_issue_metadata(self._URL)
+        assert result is not None
+        assert result["labels"] == []
+
+
+# ---------------------------------------------------------------------------
+# _enrich_uow_with_github_metadata
+# ---------------------------------------------------------------------------
+
+class TestEnrichUowWithGithubMetadata:
+    _URL = "https://github.com/SiderealPress/lobster/issues/42"
+
+    def _uow_with_url(self) -> dict:
+        return {
+            "id": "uow_20260101_abc",
+            "status": "active",
+            "steward_cycles": 2,
+            "time_in_state_seconds": 300,
+            "issue_url": self._URL,
+        }
+
+    def _uow_without_url(self) -> dict:
+        return {
+            "id": "uow_20260101_xyz",
+            "status": "active",
+            "steward_cycles": 1,
+            "time_in_state_seconds": 60,
+            "issue_url": None,
+        }
+
+    def test_injects_title_and_category_when_issue_url_present(self):
+        """When issue_url is present and metadata fetch succeeds, title and category are injected."""
+        from src.orchestration.wos_dashboard import _enrich_uow_with_github_metadata
+        metadata = {"title": "Fix flaky CI pipeline", "labels": [{"name": "type:bug"}]}
+        with patch("src.orchestration.wos_dashboard._fetch_issue_metadata", return_value=metadata):
+            result = _enrich_uow_with_github_metadata(self._uow_with_url())
+        assert result["issue_title"] == "Fix flaky CI pipeline"
+        assert result["category"] == "bug"
+        # Original fields are preserved
+        assert result["id"] == "uow_20260101_abc"
+        assert result["steward_cycles"] == 2
+
+    def test_passthrough_with_defaults_when_no_issue_url(self):
+        """UoW without issue_url gets issue_title=None and category='general' without any gh call."""
+        from src.orchestration.wos_dashboard import _enrich_uow_with_github_metadata
+        with patch("src.orchestration.wos_dashboard._fetch_issue_metadata") as mock_fetch:
+            result = _enrich_uow_with_github_metadata(self._uow_without_url())
+        mock_fetch.assert_not_called()
+        assert result["issue_title"] is None
+        assert result["category"] == "general"
+        assert result["id"] == "uow_20260101_xyz"
+
+    def test_graceful_fallback_when_metadata_fetch_returns_none(self):
+        """When _fetch_issue_metadata returns None, defaults are used and no exception raised."""
+        from src.orchestration.wos_dashboard import _enrich_uow_with_github_metadata
+        with patch("src.orchestration.wos_dashboard._fetch_issue_metadata", return_value=None):
+            result = _enrich_uow_with_github_metadata(self._uow_with_url())
+        assert result["issue_title"] is None
+        assert result["category"] == "general"
+        # Original fields are still preserved
+        assert result["id"] == "uow_20260101_abc"
+
+    def test_original_uow_dict_is_not_mutated(self):
+        """_enrich_uow_with_github_metadata returns a new dict; the original is unchanged."""
+        from src.orchestration.wos_dashboard import _enrich_uow_with_github_metadata
+        original = self._uow_with_url()
+        original_copy = dict(original)
+        metadata = {"title": "A title", "labels": []}
+        with patch("src.orchestration.wos_dashboard._fetch_issue_metadata", return_value=metadata):
+            _enrich_uow_with_github_metadata(original)
+        assert original == original_copy  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# _derive_category_from_labels
+# ---------------------------------------------------------------------------
+
+class TestDeriveCategoryFromLabels:
+    def test_type_bug_returns_bug(self):
+        """type:bug label → category 'bug'."""
+        from src.orchestration.wos_dashboard import _derive_category_from_labels
+        labels = [{"name": "type:bug"}, {"name": "priority:high"}]
+        assert _derive_category_from_labels(labels) == "bug"
+
+    def test_type_feat_returns_feature(self):
+        """type:feat label → category 'feature'."""
+        from src.orchestration.wos_dashboard import _derive_category_from_labels
+        labels = [{"name": "type:feat"}]
+        assert _derive_category_from_labels(labels) == "feature"
+
+    def test_type_label_preferred_over_workstream(self):
+        """When both type: and workstream: labels present, type: wins."""
+        from src.orchestration.wos_dashboard import _derive_category_from_labels
+        labels = [{"name": "workstream:wos"}, {"name": "type:bug"}]
+        assert _derive_category_from_labels(labels) == "bug"
+
+    def test_workstream_label_used_when_no_type(self):
+        """workstream:wos → category 'wos' when no type: label present."""
+        from src.orchestration.wos_dashboard import _derive_category_from_labels
+        labels = [{"name": "workstream:wos"}, {"name": "priority:high"}]
+        assert _derive_category_from_labels(labels) == "wos"
+
+    def test_no_matching_labels_returns_general(self):
+        """No type: or workstream: labels → 'general'."""
+        from src.orchestration.wos_dashboard import _derive_category_from_labels
+        labels = [{"name": "priority:high"}, {"name": "status:blocked"}]
+        assert _derive_category_from_labels(labels) == "general"
+
+    def test_empty_labels_returns_general(self):
+        """Empty labels list → 'general'."""
+        from src.orchestration.wos_dashboard import _derive_category_from_labels
+        assert _derive_category_from_labels([]) == "general"
+
+    def test_none_labels_returns_general(self):
+        """None labels → 'general'."""
+        from src.orchestration.wos_dashboard import _derive_category_from_labels
+        assert _derive_category_from_labels(None) == "general"
+
+    def test_type_enhancement_returns_enhancement(self):
+        """type:enhancement label → category 'enhancement' (value after colon)."""
+        from src.orchestration.wos_dashboard import _derive_category_from_labels
+        labels = [{"name": "type:enhancement"}]
+        assert _derive_category_from_labels(labels) == "enhancement"
+
+
+# ---------------------------------------------------------------------------
+# upload_html
+# ---------------------------------------------------------------------------
+
+class TestUploadHtml:
+    def test_writes_to_canonical_filename(self, tmp_path):
+        """upload_html writes the HTML to wos-dashboard-active.html in bisque-uploads."""
+        from src.orchestration.wos_dashboard import upload_html
+
+        uploads_dir = tmp_path / "bisque-uploads"
+        with patch("src.orchestration.wos_dashboard._uploads_dir", return_value=uploads_dir), \
+             patch("src.orchestration.wos_dashboard._bisque_base_url", return_value="http://test:9101"):
+            url = upload_html("<html>test</html>")
+
+        assert url == "http://test:9101/files/wos-dashboard-active.html"
+        dest = uploads_dir / "wos-dashboard-active.html"
+        assert dest.exists()
+        assert dest.read_text() == "<html>test</html>"
+
+    def test_returns_stable_canonical_url(self, tmp_path):
+        """Calling upload_html twice returns the same URL (stable filename)."""
+        from src.orchestration.wos_dashboard import upload_html
+
+        uploads_dir = tmp_path / "bisque-uploads"
+        with patch("src.orchestration.wos_dashboard._uploads_dir", return_value=uploads_dir), \
+             patch("src.orchestration.wos_dashboard._bisque_base_url", return_value="http://test:9101"):
+            url1 = upload_html("<html>v1</html>")
+            url2 = upload_html("<html>v2</html>")
+
+        assert url1 == url2
+        assert url1 == "http://test:9101/files/wos-dashboard-active.html"
+
+    def test_creates_uploads_dir_if_missing(self, tmp_path):
+        """upload_html creates the bisque-uploads directory when it doesn't exist."""
+        from src.orchestration.wos_dashboard import upload_html
+
+        uploads_dir = tmp_path / "nested" / "bisque-uploads"
+        assert not uploads_dir.exists()
+        with patch("src.orchestration.wos_dashboard._uploads_dir", return_value=uploads_dir), \
+             patch("src.orchestration.wos_dashboard._bisque_base_url", return_value="http://test:9101"):
+            upload_html("<html>test</html>")
+
+        assert uploads_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# main() — html format writes canonical file and outputs URL
+# ---------------------------------------------------------------------------
+
+class TestMainHtmlCanonical:
+    def _patch_all(self, tmp_path: Path):
+        from contextlib import ExitStack
+        stack = ExitStack()
+        registry = _make_registry([])
+        registry.list.return_value = []
+
+        stack.enter_context(patch("src.orchestration.registry.Registry", return_value=registry))
+        stack.enter_context(patch("src.orchestration.audit_queries.execution_outcomes", return_value={}))
+        stack.enter_context(patch("src.orchestration.wos_dashboard._fetch_completed_uow_ids_since", return_value=[]))
+        stack.enter_context(patch("src.orchestration.steward.BOOTUP_CANDIDATE_GATE", False))
+        return stack
+
+    def test_html_format_outputs_canonical_url(self, tmp_path, capsys):
+        """--format html outputs the canonical URL to stdout, not raw HTML."""
+        from src.orchestration.wos_dashboard import main
+        db = tmp_path / "registry.db"
+        uploads_dir = tmp_path / "bisque-uploads"
+        with self._patch_all(tmp_path), \
+             patch("src.orchestration.wos_dashboard._uploads_dir", return_value=uploads_dir), \
+             patch("src.orchestration.wos_dashboard._bisque_base_url", return_value="http://test:9101"):
+            rc = main(["--db", str(db), "--format", "html"])
+        assert rc == 0
+        out = capsys.readouterr().out.strip()
+        assert out == "http://test:9101/files/wos-dashboard-active.html"
+
+    def test_html_format_writes_file_to_bisque_uploads(self, tmp_path):
+        """--format html writes wos-dashboard-active.html to the bisque-uploads dir."""
+        from src.orchestration.wos_dashboard import main
+        db = tmp_path / "registry.db"
+        uploads_dir = tmp_path / "bisque-uploads"
+        with self._patch_all(tmp_path), \
+             patch("src.orchestration.wos_dashboard._uploads_dir", return_value=uploads_dir), \
+             patch("src.orchestration.wos_dashboard._bisque_base_url", return_value="http://test:9101"):
+            main(["--db", str(db), "--format", "html"])
+        dest = uploads_dir / "wos-dashboard-active.html"
+        assert dest.exists()
+        assert "<!DOCTYPE html>" in dest.read_text()
