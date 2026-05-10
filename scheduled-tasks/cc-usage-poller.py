@@ -39,6 +39,7 @@ import logging
 import os
 import sys
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -82,6 +83,95 @@ STATE_FILE_PATH = Path.home() / ".claude" / "cc-budget" / "state.json"
 # Source tag written into state.json to distinguish poller-written data
 # from hook-written data
 SOURCE_TAG = "cc-usage-poller"
+
+# Telegram chat_id for cookie-expiry alert delivery
+ADMIN_CHAT_ID = 8075091586
+
+# Sentinel file prefix — one file per calendar date prevents repeated alerts
+# Format: /tmp/cc-usage-cookie-expired-alert-YYYY-MM-DD
+COOKIE_EXPIRY_SENTINEL_PREFIX = "/tmp/cc-usage-cookie-expired-alert-"
+
+# Text of the cookie-expiry Telegram alert
+COOKIE_EXPIRY_ALERT_TEXT = (
+    "⚠️ CC usage cookie expired — paste a new session key into "
+    "~/lobster-user-config/cc-usage-session-cookie\n\n"
+    "Get it from: claude.ai → DevTools → Application → Cookies → sessionKey"
+)
+
+# ---------------------------------------------------------------------------
+# Cookie-expiry alert — inbox injection with per-day rate limiting
+# ---------------------------------------------------------------------------
+
+
+def _inbox_dir() -> Path:
+    """Return the inbox directory path, respecting LOBSTER_MESSAGES env override."""
+    messages_base = Path(os.environ.get("LOBSTER_MESSAGES", Path.home() / "messages"))
+    return messages_base / "inbox"
+
+
+def _cookie_expiry_alert_already_sent_today() -> bool:
+    """
+    Return True if a cookie-expiry alert sentinel exists for today's date.
+
+    Sentinel file format: /tmp/cc-usage-cookie-expired-alert-YYYY-MM-DD
+    Creates one sentinel per calendar day to prevent alert floods when the
+    cron runs every 30 minutes and the cookie stays expired all day.
+    """
+    today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+    return Path(f"{COOKIE_EXPIRY_SENTINEL_PREFIX}{today}").exists()
+
+
+def _write_cookie_expiry_alert(http_code: int, dry_run: bool = False) -> None:
+    """
+    Write a cookie-expiry alert to the Lobster inbox and touch the daily sentinel.
+
+    The dispatcher picks up the inbox message on its next cycle and delivers
+    it to the user via Telegram. Fire-and-forget — no delivery confirmation.
+
+    Rate-limited to one alert per calendar day via /tmp sentinel file.
+    In dry_run mode: logs the intent but does not write files.
+    """
+    if _cookie_expiry_alert_already_sent_today():
+        log.info("Cookie-expiry alert already sent today — skipping duplicate")
+        return
+
+    msg_id = str(uuid.uuid4())
+    msg = {
+        "id": msg_id,
+        "source": "system",
+        "type": "message",
+        "chat_id": ADMIN_CHAT_ID,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "text": COOKIE_EXPIRY_ALERT_TEXT,
+    }
+
+    if dry_run:
+        log.info(
+            "[dry-run] Would write cookie-expiry alert (HTTP %d) to inbox: %s",
+            http_code,
+            msg["text"][:80],
+        )
+        return
+
+    try:
+        inbox = _inbox_dir()
+        inbox.mkdir(parents=True, exist_ok=True)
+        tmp_path = inbox / f"{msg_id}.json.tmp"
+        dest_path = inbox / f"{msg_id}.json"
+        tmp_path.write_text(json.dumps(msg, indent=2), encoding="utf-8")
+        tmp_path.rename(dest_path)
+        log.info("Wrote cookie-expiry alert %s to inbox", msg_id)
+    except Exception as exc:
+        log.warning("Failed to write cookie-expiry alert to inbox: %s", exc)
+        return
+
+    # Touch the sentinel — prevents re-alerting for the rest of today
+    try:
+        today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+        Path(f"{COOKIE_EXPIRY_SENTINEL_PREFIX}{today}").touch()
+    except Exception as exc:
+        log.warning("Failed to write cookie-expiry sentinel: %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # jobs.json enabled gate
@@ -330,6 +420,7 @@ def main(dry_run: bool = False) -> int:
                 USAGE_API_URL,
                 COOKIE_CONFIG_PATH,
             )
+            _write_cookie_expiry_alert(exc.code, dry_run=dry_run)
         else:
             log.error("HTTP %d from %s — will retry on next cron run", exc.code, USAGE_API_URL)
         return 0
