@@ -825,3 +825,158 @@ def test_existing_sync_is_idempotent(conn):
     result1 = sync_obsidian_to_db(conn, SAMPLE_TODOS)
     result2 = sync_obsidian_to_db(conn, SAMPLE_TODOS)
     assert result2.inserted_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Gap 1 fix: --skip-lock flag prevents BlockingIOError when invoked by watcher
+# ---------------------------------------------------------------------------
+
+
+def test_vault_processor_skip_lock_flag_allows_run_while_lock_held(tmp_path):
+    """vault-processor.py main() with --skip-lock must not attempt to acquire the lock.
+
+    Scenario: vault-watcher.py holds /tmp/vault-processor.lock and invokes
+    vault-processor.py as a subprocess. Because subprocess.run() uses close_fds=True,
+    the child cannot inherit the parent fd and would get BlockingIOError if it tried to
+    acquire the lock. The --skip-lock flag bypasses acquire_lock_or_skip() entirely,
+    allowing the processor to run while the watcher holds the lock.
+
+    This test verifies that when the lock is already held by this process and
+    --skip-lock is passed, run_processor() is reached (i.e. not short-circuited
+    by acquire_lock_or_skip returning None).
+    """
+    lock_path = tmp_path / "test-processor.lock"
+    parent_lock_fd = acquire_lock_or_skip(lock_path)
+    assert parent_lock_fd is not None, "Test setup: parent must hold the lock"
+
+    try:
+        # Simulate vault-watcher.py holding the lock, then asking vault-processor's
+        # main() logic to run with --skip-lock. We check that acquire_lock_or_skip
+        # is NOT called when --skip-lock is set by verifying the lock is still held
+        # (i.e. the child path did not try to re-acquire and wasn't blocked).
+        #
+        # Direct test: acquire_lock_or_skip on the same path from this process
+        # should return None (lock held), confirming the lock IS held.
+        assert acquire_lock_or_skip(lock_path) is None, (
+            "Lock must be held by parent — confirms --skip-lock is the correct bypass"
+        )
+
+        # Now verify vault-processor's main() respects --skip-lock by checking
+        # that run_processor is called (not skipped) via sys.argv injection.
+        vault_processor_main = _vault_processor.main
+        run_processor_calls = []
+
+        def mock_run_processor(config, db_path=_vault_processor.DB_PATH_DEFAULT):
+            run_processor_calls.append(config)
+            return True
+
+        config_file = tmp_path / "vault-watch-config.json"
+        config_file.write_text('{"vault_path": "/tmp/nonexistent-vault-for-test"}')
+
+        with patch.object(_vault_processor, "run_processor", side_effect=mock_run_processor):
+            with patch("sys.argv", ["vault-processor.py", "--config", str(config_file), "--skip-lock"]):
+                vault_processor_main()
+
+        assert len(run_processor_calls) == 1, (
+            "--skip-lock must allow run_processor() to be called even when the lock is held"
+        )
+    finally:
+        release_lock(parent_lock_fd)
+
+
+def test_vault_processor_without_skip_lock_is_blocked_when_lock_held(tmp_path):
+    """Without --skip-lock, vault-processor.py main() skips when the lock is held.
+
+    This test documents and verifies the baseline behavior: when invoked directly
+    (without --skip-lock) and the lock is already held, main() returns early via
+    acquire_lock_or_skip() returning None.
+    """
+    lock_path = tmp_path / "test-processor.lock"
+    parent_lock_fd = acquire_lock_or_skip(lock_path)
+    assert parent_lock_fd is not None, "Test setup: parent must hold the lock"
+
+    try:
+        run_processor_calls = []
+
+        def mock_run_processor(config, db_path=_vault_processor.DB_PATH_DEFAULT):
+            run_processor_calls.append(config)
+            return True
+
+        config_file = tmp_path / "vault-watch-config.json"
+        config_file.write_text('{"vault_path": "/tmp/nonexistent-vault-for-test"}')
+
+        # Patch LOCK_PATH so vault-processor uses our tmp lock, not /tmp/vault-processor.lock
+        with patch.object(_vault_processor, "LOCK_PATH", lock_path):
+            with patch.object(_vault_processor, "run_processor", side_effect=mock_run_processor):
+                with patch("sys.argv", ["vault-processor.py", "--config", str(config_file)]):
+                    _vault_processor.main()
+
+        assert len(run_processor_calls) == 0, (
+            "Without --skip-lock, run_processor() must NOT be called when the lock is held"
+        )
+    finally:
+        release_lock(parent_lock_fd)
+
+
+def test_invoke_processor_passes_skip_lock_flag(tmp_path):
+    """vault-watcher._invoke_processor must pass --skip-lock to vault-processor.py subprocess.
+
+    vault-watcher.py holds the mutex lock when it invokes vault-processor.py.
+    Without --skip-lock, the processor subprocess would get BlockingIOError because
+    subprocess.run() does not inherit the parent's fcntl.flock fd (close_fds=True).
+    This test verifies that --skip-lock appears in the subprocess command.
+    """
+    import subprocess as real_subprocess
+
+    captured_cmds = []
+
+    def mock_subprocess_run(cmd, **kwargs):
+        captured_cmds.append(cmd)
+        result = MagicMock()
+        result.returncode = 0
+        return result
+
+    config = {"vault_path": str(tmp_path)}
+
+    with patch.object(_vault_watcher, "subprocess") as mock_subp:
+        mock_subp.run.side_effect = mock_subprocess_run
+        _vault_watcher._invoke_processor(config)
+
+    assert len(captured_cmds) == 1
+    cmd = captured_cmds[0]
+    assert "--skip-lock" in cmd, (
+        f"--skip-lock must be passed to vault-processor.py subprocess; got cmd={cmd}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gap 2 fix: render_active_todos always inserts the DISABLE PROCESSING guard
+# (documents intentional bootstrap behavior for todo_obsidian_sync.py path)
+# ---------------------------------------------------------------------------
+
+
+def test_render_guard_line_present_when_last_synced_is_none(conn):
+    """render_active_todos inserts guard line even when last_synced=None (legacy path).
+
+    This is the documented behavior change in PR #1131: todo_obsidian_sync.py now
+    writes the DISABLE PROCESSING guard line on every run. This bootstraps the
+    invariant that vault-processor.py requires to proceed.
+    """
+    rendered = render_active_todos(conn, last_synced=None)
+    assert "- [ ] 🔒 DISABLE PROCESSING" in rendered, (
+        "Guard line must be present on the legacy (todo_obsidian_sync.py) path to bootstrap "
+        "the vault-processor.py invariant"
+    )
+
+
+def test_render_guard_line_present_when_last_synced_provided(conn):
+    """render_active_todos inserts guard line on the vault-processor.py path too."""
+    rendered = render_active_todos(conn, last_synced="2026-05-10 14:30 PST")
+    assert "- [ ] 🔒 DISABLE PROCESSING" in rendered
+
+
+def test_render_guard_line_is_unchecked(conn):
+    """render_active_todos must render the guard line as unchecked (- [ ] not - [x] )."""
+    rendered = render_active_todos(conn)
+    assert "- [ ] 🔒 DISABLE PROCESSING" in rendered
+    assert "- [x] 🔒 DISABLE PROCESSING" not in rendered

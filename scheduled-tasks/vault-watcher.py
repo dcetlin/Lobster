@@ -309,11 +309,12 @@ def _get_remote_head(vault_path: Path, timeout: int = 30) -> Optional[str]:
 def _invoke_processor(config: dict, lock_path: Path = LOCK_PATH) -> None:
     """Invoke vault-processor.py as a subprocess.
 
-    The processor inherits the lock file descriptor (the OS keeps it open
-    across fork/exec). vault-processor.py re-acquires the same lock when
-    invoked directly — this is fine because the watcher will have released
-    it before the processor starts (the lock is released in the finally block
-    of main() after invoking the processor synchronously).
+    vault-watcher.py holds the process mutex (/tmp/vault-processor.lock) for
+    the full duration of this call. subprocess.run() defaults to close_fds=True,
+    so the lock fd is NOT inherited by the child process. vault-processor.py
+    therefore receives --skip-lock, which tells it to skip its own
+    acquire_lock_or_skip() call — mutual exclusion is already guaranteed by the
+    parent's held lock.
 
     We invoke the processor synchronously (blocking) so that vault-watcher.py
     holds the lock for the duration of the processor run and the next watcher
@@ -322,7 +323,7 @@ def _invoke_processor(config: dict, lock_path: Path = LOCK_PATH) -> None:
     processor_script = Path(__file__).parent / "vault-processor.py"
     config_path = str(CONFIG_PATH)
 
-    cmd = [sys.executable, str(processor_script), "--config", config_path]
+    cmd = [sys.executable, str(processor_script), "--config", config_path, "--skip-lock"]
     log.info("Invoking vault-processor.py")
     result = subprocess.run(
         cmd,

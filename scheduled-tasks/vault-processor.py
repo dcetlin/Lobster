@@ -612,6 +612,16 @@ def main() -> None:
         default=str(DB_PATH_DEFAULT),
         help="Path to self_action_items.db",
     )
+    parser.add_argument(
+        "--skip-lock",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip acquiring the process mutex lock. Use ONLY when invoked by vault-watcher.py, "
+            "which holds the lock on behalf of this process. Passing this flag when the caller "
+            "does not hold the lock removes the mutual-exclusion guarantee."
+        ),
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -619,16 +629,24 @@ def main() -> None:
 
     config = _load_config(config_path)
 
-    # When invoked directly (not via vault-watcher.py), acquire the lock ourselves
-    lock_fd = acquire_lock_or_skip(LOCK_PATH)
-    if lock_fd is None:
-        log.info("skipping: processor already running (lock held)")
-        return
-
-    try:
+    if args.skip_lock:
+        # vault-watcher.py holds /tmp/vault-processor.lock for the duration of this run.
+        # subprocess.run(close_fds=True) does not inherit the parent fd, so re-acquiring
+        # the lock here would always fail with BlockingIOError. The watcher already holds
+        # the lock, so mutual exclusion is guaranteed — skip the acquire.
+        log.debug("--skip-lock set: skipping lock acquisition (vault-watcher.py holds the lock)")
         run_processor(config, db_path)
-    finally:
-        release_lock(lock_fd)
+    else:
+        # When invoked directly (not via vault-watcher.py), acquire the lock ourselves
+        lock_fd = acquire_lock_or_skip(LOCK_PATH)
+        if lock_fd is None:
+            log.info("skipping: processor already running (lock held)")
+            return
+
+        try:
+            run_processor(config, db_path)
+        finally:
+            release_lock(lock_fd)
 
 
 if __name__ == "__main__":
