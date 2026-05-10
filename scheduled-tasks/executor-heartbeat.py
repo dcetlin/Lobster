@@ -148,6 +148,82 @@ def _warn_if_legacy_registry_exists() -> None:
 RECOVERY_STALE_MINUTES: int = 5
 
 # ---------------------------------------------------------------------------
+# CC quota gate — skip UoW dispatch when the 5-hour Claude Code quota is
+# critically low (>= 90%). Subagents are expensive; dispatching when quota
+# is nearly exhausted wastes the remaining headroom and can cause subagents
+# to fail partway through with quota errors.
+#
+# Fail-open: if the state file is absent or stale (> 60 min old), proceed
+# normally. Absent/stale data must never block dispatch.
+# ---------------------------------------------------------------------------
+
+#: Percentage threshold above which dispatch is skipped for the cycle.
+CC_QUOTA_SKIP_THRESHOLD: float = 90.0
+
+#: State file is considered stale if last_updated is older than this many seconds.
+_CC_QUOTA_FRESHNESS_SECONDS: int = 60 * 60  # 60 minutes
+
+
+def _read_cc_quota() -> float | None:
+    """Return five_hour_pct from the CC budget state file, or None if unavailable.
+
+    Reads the state.json written by cc-usage-poller.py.  The file shape is:
+
+        {
+          "rate_limits": {
+            "five_hour": {"pct": <float>, "resets_at": "<ISO8601>"},
+            "seven_day":  {"pct": <float>, "resets_at": "<ISO8601>"}
+          },
+          "last_updated": "<ISO8601>",
+          "ts": <unix-int>,
+          "source": "cc-usage-poller"
+        }
+
+    Returns the float value when the file exists AND last_updated is within the
+    last 60 minutes. Returns None when:
+    - The file does not exist (LOBSTER_CC_BUDGET_STATE or ~/.claude/cc-budget/state.json)
+    - The file is stale (last_updated older than 60 minutes)
+    - The file is unreadable or malformed
+
+    None signals "no usable data" — callers must treat None as "proceed normally"
+    (fail-open). Only a fresh float >= CC_QUOTA_SKIP_THRESHOLD should cause a skip.
+
+    Pure function: reads the filesystem, parses JSON, computes staleness. No
+    side effects — the caller owns all logging and the skip decision.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    state_path = Path(
+        os.environ.get(
+            "LOBSTER_CC_BUDGET_STATE",
+            Path.home() / ".claude" / "cc-budget" / "state.json",
+        )
+    )
+
+    try:
+        raw = state_path.read_text()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+    try:
+        data = json.loads(raw)
+        pct = float(data["rate_limits"]["five_hour"]["pct"])
+        last_updated_str = data["last_updated"]
+        last_updated = datetime.fromisoformat(last_updated_str.replace("Z", "+00:00"))
+        if last_updated.tzinfo is None:
+            last_updated = last_updated.replace(tzinfo=timezone.utc)
+    except (KeyError, ValueError, TypeError):
+        return None
+
+    age = datetime.now(timezone.utc) - last_updated
+    if age > timedelta(seconds=_CC_QUOTA_FRESHNESS_SECONDS):
+        return None
+
+    return pct
+
+# ---------------------------------------------------------------------------
 # GitHub API rate limit pre-dispatch check
 #
 # Subagents dispatched by the executor call `gh issue view` as step 1.
@@ -662,6 +738,21 @@ def main() -> int:
                 rate_status.remaining,
                 GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD,
             )
+
+    # CC quota gate — skip dispatch when the 5-hour Claude Code quota is
+    # critically low. Fail-open: absent or stale data (> 60 min old) does
+    # not block dispatch — only fresh data at or above the threshold does.
+    cc_pct = _read_cc_quota()
+    if cc_pct is not None and cc_pct >= CC_QUOTA_SKIP_THRESHOLD:
+        log.info(
+            "cc_quota=%.1f%% — skipping dispatch cycle (threshold=%.1f%%)",
+            cc_pct,
+            CC_QUOTA_SKIP_THRESHOLD,
+        )
+        log.info("Executor heartbeat complete")
+        return 0
+    if cc_pct is not None:
+        log.debug("CC quota ok: %.1f%% (threshold=%.1f%%)", cc_pct, CC_QUOTA_SKIP_THRESHOLD)
 
     try:
         result = run_executor_cycle(registry, dry_run=dry_run)
