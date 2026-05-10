@@ -627,13 +627,6 @@ class Registry:
 
             if existing:
                 skip_reason = f"existing record {existing['id']} is in '{existing['status']}' status"
-                self._write_audit(
-                    conn,
-                    uow_id=existing["id"],
-                    event="skipped",
-                    note=f"upsert skipped: {skip_reason}",
-                )
-                conn.commit()
                 return UpsertSkipped(id=existing["id"], reason=skip_reason)
 
             # Check for same-date UNIQUE conflict (terminal record from a prior run today).
@@ -654,13 +647,6 @@ class Registry:
                     f"terminal record {same_date_row['id']} (status={same_date_row['status']}) "
                     f"already exists for sweep_date={sweep_date}; will re-propose on next sweep date"
                 )
-                self._write_audit(
-                    conn,
-                    uow_id=same_date_row["id"],
-                    event="skipped",
-                    note=f"upsert skipped: {skip_reason}",
-                )
-                conn.commit()
                 return UpsertSkipped(id=same_date_row["id"], reason=skip_reason)
 
             uow_id = _generate_uow_id()
