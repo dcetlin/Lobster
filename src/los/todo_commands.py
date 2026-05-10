@@ -13,7 +13,8 @@ Supported command forms:
 Dispatcher integration:
     from src.los.todo_commands import route_todo_command
 
-    if msg.get("text", "").lower().startswith("/todo"):
+    text = msg.get("text", "").lower()
+    if text.startswith("/todo ") or text == "/todo":
         reply = route_todo_command(msg)
         send_reply(chat_id=chat_id, text=reply, source=source)
 
