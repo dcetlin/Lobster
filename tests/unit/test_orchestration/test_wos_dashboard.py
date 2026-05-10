@@ -20,9 +20,13 @@ Tests cover:
 - main(): --format json outputs valid JSON
 - main(): --format html writes to canonical filename and outputs URL
 - main(): --with-drilldowns flag calls generate_drilldown_urls
-- _fetch_issue_title: returns title for valid issue URL
-- _fetch_issue_title: returns None when issue URL is missing
-- _fetch_issue_title: returns None on subprocess failure
+- _fetch_issue_metadata: returns {title, labels} dict for valid issue URL
+- _fetch_issue_metadata: returns None when issue URL is missing or empty
+- _fetch_issue_metadata: returns None on subprocess failure
+- _fetch_issue_metadata: returns None on malformed JSON
+- _enrich_uow_with_github_metadata: injects title and category when issue_url present
+- _enrich_uow_with_github_metadata: passthrough with defaults when no issue_url
+- _enrich_uow_with_github_metadata: graceful fallback when metadata fetch returns None
 - _derive_category_from_labels: type:bug → "bug"
 - _derive_category_from_labels: type:feat → "feature"
 - _derive_category_from_labels: workstream:wos → "wos"
@@ -702,59 +706,152 @@ class TestRenderHtml:
 
 
 # ---------------------------------------------------------------------------
-# _fetch_issue_title
+# _fetch_issue_metadata
 # ---------------------------------------------------------------------------
 
-class TestFetchIssueTitle:
-    def test_returns_title_for_valid_issue_url(self):
-        """Returns issue title string when gh CLI succeeds."""
-        from src.orchestration.wos_dashboard import _fetch_issue_title
-        import subprocess
+class TestFetchIssueMetadata:
+    _URL = "https://github.com/SiderealPress/lobster/issues/42"
+
+    def test_returns_title_and_labels_for_valid_issue_url(self):
+        """Returns {title, labels} dict when gh CLI returns both fields."""
+        from src.orchestration.wos_dashboard import _fetch_issue_metadata
         fake_result = MagicMock()
         fake_result.returncode = 0
-        fake_result.stdout = '{"title": "Fix flaky CI pipeline"}'
+        fake_result.stdout = '{"title": "Fix flaky CI pipeline", "labels": [{"name": "type:bug"}]}'
         with patch("subprocess.run", return_value=fake_result):
-            title = _fetch_issue_title("https://github.com/SiderealPress/lobster/issues/42")
-        assert title == "Fix flaky CI pipeline"
+            result = _fetch_issue_metadata(self._URL)
+        assert result is not None
+        assert result["title"] == "Fix flaky CI pipeline"
+        assert result["labels"] == [{"name": "type:bug"}]
+
+    def test_uses_single_combined_gh_call(self):
+        """Verifies only one subprocess.run call is made (combined --json title,labels)."""
+        from src.orchestration.wos_dashboard import _fetch_issue_metadata
+        fake_result = MagicMock()
+        fake_result.returncode = 0
+        fake_result.stdout = '{"title": "My Issue", "labels": []}'
+        with patch("subprocess.run", return_value=fake_result) as mock_run:
+            _fetch_issue_metadata(self._URL)
+        assert mock_run.call_count == 1
+        cmd = mock_run.call_args[0][0]
+        assert "--json" in cmd
+        # The json fields argument must contain both title and labels in a single call
+        json_arg = cmd[cmd.index("--json") + 1]
+        assert "title" in json_arg
+        assert "labels" in json_arg
 
     def test_returns_none_when_issue_url_is_none(self):
         """Returns None when no issue URL is provided."""
-        from src.orchestration.wos_dashboard import _fetch_issue_title
-        result = _fetch_issue_title(None)
-        assert result is None
+        from src.orchestration.wos_dashboard import _fetch_issue_metadata
+        assert _fetch_issue_metadata(None) is None
 
     def test_returns_none_when_issue_url_is_empty(self):
         """Returns None when issue URL is an empty string."""
-        from src.orchestration.wos_dashboard import _fetch_issue_title
-        result = _fetch_issue_title("")
-        assert result is None
+        from src.orchestration.wos_dashboard import _fetch_issue_metadata
+        assert _fetch_issue_metadata("") is None
 
     def test_returns_none_on_subprocess_failure(self):
         """Returns None when gh CLI returns non-zero exit code."""
-        from src.orchestration.wos_dashboard import _fetch_issue_title
+        from src.orchestration.wos_dashboard import _fetch_issue_metadata
         fake_result = MagicMock()
         fake_result.returncode = 1
         fake_result.stdout = ""
         with patch("subprocess.run", return_value=fake_result):
-            result = _fetch_issue_title("https://github.com/SiderealPress/lobster/issues/42")
-        assert result is None
+            assert _fetch_issue_metadata(self._URL) is None
 
     def test_returns_none_on_subprocess_exception(self):
         """Returns None when subprocess.run raises an exception."""
-        from src.orchestration.wos_dashboard import _fetch_issue_title
+        from src.orchestration.wos_dashboard import _fetch_issue_metadata
         with patch("subprocess.run", side_effect=Exception("gh not found")):
-            result = _fetch_issue_title("https://github.com/SiderealPress/lobster/issues/42")
-        assert result is None
+            assert _fetch_issue_metadata(self._URL) is None
 
     def test_returns_none_on_malformed_json(self):
         """Returns None when gh CLI returns unparseable JSON."""
-        from src.orchestration.wos_dashboard import _fetch_issue_title
+        from src.orchestration.wos_dashboard import _fetch_issue_metadata
         fake_result = MagicMock()
         fake_result.returncode = 0
         fake_result.stdout = "not valid json"
         with patch("subprocess.run", return_value=fake_result):
-            result = _fetch_issue_title("https://github.com/SiderealPress/lobster/issues/42")
-        assert result is None
+            assert _fetch_issue_metadata(self._URL) is None
+
+    def test_empty_labels_normalised_to_list(self):
+        """Returns labels as empty list when gh returns null or absent labels field."""
+        from src.orchestration.wos_dashboard import _fetch_issue_metadata
+        fake_result = MagicMock()
+        fake_result.returncode = 0
+        fake_result.stdout = '{"title": "My Issue"}'
+        with patch("subprocess.run", return_value=fake_result):
+            result = _fetch_issue_metadata(self._URL)
+        assert result is not None
+        assert result["labels"] == []
+
+
+# ---------------------------------------------------------------------------
+# _enrich_uow_with_github_metadata
+# ---------------------------------------------------------------------------
+
+class TestEnrichUowWithGithubMetadata:
+    _URL = "https://github.com/SiderealPress/lobster/issues/42"
+
+    def _uow_with_url(self) -> dict:
+        return {
+            "id": "uow_20260101_abc",
+            "status": "active",
+            "steward_cycles": 2,
+            "time_in_state_seconds": 300,
+            "issue_url": self._URL,
+        }
+
+    def _uow_without_url(self) -> dict:
+        return {
+            "id": "uow_20260101_xyz",
+            "status": "active",
+            "steward_cycles": 1,
+            "time_in_state_seconds": 60,
+            "issue_url": None,
+        }
+
+    def test_injects_title_and_category_when_issue_url_present(self):
+        """When issue_url is present and metadata fetch succeeds, title and category are injected."""
+        from src.orchestration.wos_dashboard import _enrich_uow_with_github_metadata
+        metadata = {"title": "Fix flaky CI pipeline", "labels": [{"name": "type:bug"}]}
+        with patch("src.orchestration.wos_dashboard._fetch_issue_metadata", return_value=metadata):
+            result = _enrich_uow_with_github_metadata(self._uow_with_url())
+        assert result["issue_title"] == "Fix flaky CI pipeline"
+        assert result["category"] == "bug"
+        # Original fields are preserved
+        assert result["id"] == "uow_20260101_abc"
+        assert result["steward_cycles"] == 2
+
+    def test_passthrough_with_defaults_when_no_issue_url(self):
+        """UoW without issue_url gets issue_title=None and category='general' without any gh call."""
+        from src.orchestration.wos_dashboard import _enrich_uow_with_github_metadata
+        with patch("src.orchestration.wos_dashboard._fetch_issue_metadata") as mock_fetch:
+            result = _enrich_uow_with_github_metadata(self._uow_without_url())
+        mock_fetch.assert_not_called()
+        assert result["issue_title"] is None
+        assert result["category"] == "general"
+        assert result["id"] == "uow_20260101_xyz"
+
+    def test_graceful_fallback_when_metadata_fetch_returns_none(self):
+        """When _fetch_issue_metadata returns None, defaults are used and no exception raised."""
+        from src.orchestration.wos_dashboard import _enrich_uow_with_github_metadata
+        with patch("src.orchestration.wos_dashboard._fetch_issue_metadata", return_value=None):
+            result = _enrich_uow_with_github_metadata(self._uow_with_url())
+        assert result["issue_title"] is None
+        assert result["category"] == "general"
+        # Original fields are still preserved
+        assert result["id"] == "uow_20260101_abc"
+
+    def test_original_uow_dict_is_not_mutated(self):
+        """_enrich_uow_with_github_metadata returns a new dict; the original is unchanged."""
+        from src.orchestration.wos_dashboard import _enrich_uow_with_github_metadata
+        original = self._uow_with_url()
+        original_copy = dict(original)
+        metadata = {"title": "A title", "labels": []}
+        with patch("src.orchestration.wos_dashboard._fetch_issue_metadata", return_value=metadata):
+            _enrich_uow_with_github_metadata(original)
+        assert original == original_copy  # unchanged
 
 
 # ---------------------------------------------------------------------------

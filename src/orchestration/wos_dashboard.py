@@ -32,8 +32,10 @@ Design:
   it maps over UoW IDs and isolates per-UoW errors without aborting the whole batch.
 - upload_html() is the single bisque upload point for the dashboard; it writes to a
   canonical filename so the URL is stable across regenerations.
-- _fetch_issue_title() and _derive_category_from_labels() are pure/near-pure enrichment
-  helpers that surface GitHub metadata without mutating the registry.
+- _fetch_issue_metadata() and _derive_category_from_labels() are pure/near-pure enrichment
+  helpers that surface GitHub metadata without mutating the registry. A single gh CLI call
+  fetches both title and labels in one round-trip, eliminating the semantic inconsistency
+  window that two sequential calls would create.
 """
 
 from __future__ import annotations
@@ -139,21 +141,23 @@ def upload_html(html: str) -> str:
 # GitHub metadata enrichment — near-pure helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_issue_title(issue_url: str | None) -> str | None:
-    """Fetch the GitHub issue title from its URL using the gh CLI.
+def _fetch_issue_metadata(issue_url: str | None) -> dict | None:
+    """Fetch title and labels for a GitHub issue in a single gh CLI call.
 
-    Returns the title string on success, None if the URL is absent, the CLI
-    call fails, or the JSON response is malformed. Never raises.
+    Returns {"title": str | None, "labels": list[dict]} on success, or None
+    if the URL is absent, the CLI call fails, or the JSON response is malformed.
+    Never raises.
 
-    Parses the issue number and repo from the URL rather than calling the
-    GitHub REST API directly — gh CLI handles auth automatically.
+    A single combined call (--json title,labels) eliminates the semantic
+    inconsistency window that two sequential calls would create, and halves
+    the subprocess overhead per UoW.
     """
     if not issue_url:
         return None
 
     try:
         result = subprocess.run(
-            ["gh", "issue", "view", issue_url, "--json", "title"],
+            ["gh", "issue", "view", issue_url, "--json", "title,labels"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -161,31 +165,10 @@ def _fetch_issue_title(issue_url: str | None) -> str | None:
         if result.returncode != 0:
             return None
         data = json.loads(result.stdout)
-        return data.get("title") or None
-    except Exception:
-        return None
-
-
-def _fetch_issue_labels(issue_url: str | None) -> list[dict] | None:
-    """Fetch labels for a GitHub issue via its URL using the gh CLI.
-
-    Returns a list of label dicts (each with at least a 'name' key), or None
-    on failure. Never raises.
-    """
-    if not issue_url:
-        return None
-
-    try:
-        result = subprocess.run(
-            ["gh", "issue", "view", issue_url, "--json", "labels"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            return None
-        data = json.loads(result.stdout)
-        return data.get("labels") or []
+        return {
+            "title": data.get("title") or None,
+            "labels": data.get("labels") or [],
+        }
     except Exception:
         return None
 
@@ -230,19 +213,19 @@ def _enrich_uow_with_github_metadata(uow_row: dict) -> dict:
     Adds 'issue_title' and 'category' keys. Either may be None/default if the
     GitHub call fails (non-fatal — the row renders without enrichment).
 
-    Called per-UoW at render time. Side effect: subprocess call to gh CLI.
+    Called per-UoW at render time. Side effect: one subprocess call to gh CLI,
+    which fetches title and labels in a single round-trip via _fetch_issue_metadata.
     """
     issue_url = uow_row.get("issue_url")
     if not issue_url:
         return {**uow_row, "issue_title": None, "category": "general"}
 
-    # Fetch title and labels in two separate calls to reuse existing helpers.
-    # A combined call (--json title,labels) would be slightly faster but the
-    # helpers are independently testable and the latency difference is negligible
-    # for a dashboard with typically <20 active UoWs.
-    title = _fetch_issue_title(issue_url)
-    labels = _fetch_issue_labels(issue_url)
-    category = _derive_category_from_labels(labels)
+    metadata = _fetch_issue_metadata(issue_url)
+    if metadata is None:
+        return {**uow_row, "issue_title": None, "category": "general"}
+
+    title = metadata["title"]
+    category = _derive_category_from_labels(metadata["labels"])
 
     return {**uow_row, "issue_title": title, "category": category}
 
