@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""
+CC Usage Poller — poll claude.ai for accurate Claude Code quota data.
+
+Hits the claude.ai internal usage API with a stored session cookie to get
+authoritative 5-hour and 7-day quota percentages. Writes results to
+~/.claude/cc-budget/state.json so the data survives idle-through-reset
+cycles that leave the statusLine hook-written data stale.
+
+Problem context: state.json is only updated when Claude Code actively
+reports quota via the statusLine hook. During idle periods — including
+weekly quota resets — the file retains pre-reset numbers indefinitely.
+Observed in production: 138h stale (2026-05-04 → 2026-05-10). This
+poller eliminates that drift.
+
+Cron schedule (every 30 minutes):
+    */30 * * * * cd ~/lobster && uv run scheduled-tasks/cc-usage-poller.py >> ~/lobster-workspace/scheduled-jobs/logs/cc-usage-poller.log 2>&1 # LOBSTER-CC-USAGE-POLLER
+
+Type B dispatch: cron calls this script directly (no inbox/ message, no
+dispatcher involvement). The jobs.json enabled gate is checked at the top
+of main() so that runtime enable/disable is respected without touching cron.
+
+Session cookie:
+    Store the sessionKey cookie value (from claude.ai DevTools → Application
+    → Cookies → sessionKey) in ~/lobster-user-config/cc-usage-session-cookie
+    as a single plain-text line with no quotes.
+
+Run standalone:
+    uv run ~/lobster/scheduled-tasks/cc-usage-poller.py [--dry-run]
+
+Related issue: dcetlin/Lobster#1101
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import urllib.request
+import urllib.error
+
+# ---------------------------------------------------------------------------
+# Path setup — allow running as a script or via importlib (tests)
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ",
+)
+log = logging.getLogger("cc-usage-poller")
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# The internal Claude API endpoint that returns quota usage.
+# Same endpoint ClaudeMeter (eddmann) uses: https://github.com/eddmann/ClaudeMeter
+USAGE_API_URL = "https://claude.ai/api/usage"
+
+# Cookie config file — stores the claude.ai sessionKey value
+COOKIE_CONFIG_PATH = Path.home() / "lobster-user-config" / "cc-usage-session-cookie"
+
+# State file — written by this script and by the statusLine hook (cc-usage-collect.sh)
+STATE_FILE_PATH = Path.home() / ".claude" / "cc-budget" / "state.json"
+
+# Source tag written into state.json to distinguish poller-written data
+# from hook-written data
+SOURCE_TAG = "cc-usage-poller"
+
+# ---------------------------------------------------------------------------
+# jobs.json enabled gate
+# ---------------------------------------------------------------------------
+
+
+def _is_job_enabled(job_name: str) -> bool:
+    """
+    Return True if the job is enabled in jobs.json, False if explicitly disabled.
+
+    Defaults to True when jobs.json is absent, the entry is missing, or the
+    file is unreadable — mirrors the gate logic in other Type B jobs.
+    """
+    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+    jobs_file = workspace / "scheduled-jobs" / "jobs.json"
+    try:
+        data = json.loads(jobs_file.read_text())
+        return bool(data.get("jobs", {}).get(job_name, {}).get("enabled", True))
+    except Exception:
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Cookie reading — pure function, no side effects
+# ---------------------------------------------------------------------------
+
+
+def read_session_cookie(cookie_path: Path) -> str | None:
+    """
+    Read the session cookie from the config file.
+
+    Returns None (not an error) when:
+    - File does not exist — cookie not yet configured
+    - File exists but contains only comments or whitespace
+
+    Returns the cookie string when a non-comment, non-empty line is found.
+    """
+    if not cookie_path.exists():
+        return None
+    lines = cookie_path.read_text().splitlines()
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return stripped
+    return None
+
+
+# ---------------------------------------------------------------------------
+# API call — isolated side effect
+# ---------------------------------------------------------------------------
+
+
+def fetch_usage(session_cookie: str) -> dict[str, Any]:
+    """
+    Make an authenticated GET to USAGE_API_URL.
+
+    Returns the parsed JSON response body.
+
+    Raises:
+        urllib.error.HTTPError — for 4xx/5xx responses
+        urllib.error.URLError — for network-level errors
+        json.JSONDecodeError — if the response body is not valid JSON
+        ValueError — if required keys are missing from the response
+    """
+    request = urllib.request.Request(
+        USAGE_API_URL,
+        headers={
+            "Cookie": f"sessionKey={session_cookie}",
+            "Accept": "application/json",
+            "User-Agent": "lobster-cc-usage-poller/1.0",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        body = response.read().decode("utf-8")
+    return json.loads(body)
+
+
+# ---------------------------------------------------------------------------
+# Response parsing — pure function
+# ---------------------------------------------------------------------------
+
+
+def parse_usage_response(data: dict[str, Any]) -> dict[str, Any]:
+    """
+    Extract quota fields from the API response.
+
+    The claude.ai /api/usage endpoint returns a structure like:
+    {
+      "rate_limits": {
+        "five_hour": { "used_percentage": 24.5, "resets_at": 1712345678 },
+        "seven_day":  { "used_percentage": 31.2, "resets_at": 1712987654 }
+      }
+    }
+
+    This is the same shape the statusLine hook receives, so the same field
+    paths are used. Returns a normalized dict suitable for merging into
+    state.json.
+
+    Raises ValueError if expected keys are absent.
+    """
+    rate_limits = data.get("rate_limits")
+    if not rate_limits:
+        # Try alternate response shape where usage is nested under a
+        # "usage" key — some endpoint variants return this
+        rate_limits = data.get("usage", {}).get("rate_limits")
+    if not rate_limits:
+        raise ValueError(
+            f"Expected 'rate_limits' key in response. Got keys: {list(data.keys())}"
+        )
+
+    five_hour = rate_limits.get("five_hour", {})
+    seven_day = rate_limits.get("seven_day", {})
+
+    # Normalize: accept both 'used_percentage' (API) and 'pct' (state.json) spellings
+    def _pct(obj: dict) -> float | None:
+        v = obj.get("used_percentage") or obj.get("pct")
+        return float(v) if v is not None else None
+
+    def _resets_at(obj: dict) -> int | None:
+        v = obj.get("resets_at")
+        return int(v) if v is not None else None
+
+    return {
+        "five_hour_pct": _pct(five_hour),
+        "five_hour_resets_at": _resets_at(five_hour),
+        "seven_day_pct": _pct(seven_day),
+        "seven_day_resets_at": _resets_at(seven_day),
+    }
+
+
+# ---------------------------------------------------------------------------
+# State file merge — pure function, produces new state dict
+# ---------------------------------------------------------------------------
+
+
+def merge_into_state(existing: dict[str, Any], parsed: dict[str, Any]) -> dict[str, Any]:
+    """
+    Merge parsed usage fields into the existing state.json content.
+
+    Preserves all fields not written by this script (v, session_cost_usd,
+    snapshots) so the hook-written data is not lost.
+    """
+    now_unix = int(datetime.now(tz=timezone.utc).timestamp())
+    now_iso = datetime.now(tz=timezone.utc).isoformat()
+
+    updated = dict(existing)
+    updated["v"] = existing.get("v", 1)
+    updated["ts"] = now_unix
+    updated["rate_limits"] = {
+        "five_hour": {
+            "pct": parsed["five_hour_pct"],
+            "resets_at": parsed["five_hour_resets_at"],
+        },
+        "seven_day": {
+            "pct": parsed["seven_day_pct"],
+            "resets_at": parsed["seven_day_resets_at"],
+        },
+    }
+    updated["last_updated"] = now_iso
+    updated["source"] = SOURCE_TAG
+    return updated
+
+
+# ---------------------------------------------------------------------------
+# Atomic state write — isolated side effect
+# ---------------------------------------------------------------------------
+
+
+def write_state_atomically(state: dict[str, Any], state_path: Path) -> None:
+    """
+    Write state dict to state_path atomically via a temp file + rename.
+
+    Creates parent directories if needed. Atomic rename prevents a partial
+    write from leaving state_path in a corrupted state.
+    """
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=state_path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            json.dump(state, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, state_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Load existing state — handles missing file gracefully
+# ---------------------------------------------------------------------------
+
+
+def load_existing_state(state_path: Path) -> dict[str, Any]:
+    """Return the current state.json contents, or {} if absent or unreadable."""
+    try:
+        return json.loads(state_path.read_text())
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main(dry_run: bool = False) -> int:
+    """
+    Poll claude.ai for CC quota data and write to state.json.
+
+    Returns 0 on success, 1 on hard failure (unexpected errors).
+    Auth failures and missing cookie return 0 (graceful skip — cron retries).
+    """
+    if not _is_job_enabled("cc-usage-poller"):
+        log.info("cc-usage-poller is disabled in jobs.json — skipping")
+        return 0
+
+    # Step 1: Read session cookie
+    cookie = read_session_cookie(COOKIE_CONFIG_PATH)
+    if cookie is None:
+        log.warning(
+            "Session cookie not configured. Create %s and paste your claude.ai "
+            "sessionKey cookie value (from DevTools → Application → Cookies → sessionKey). "
+            "Skipping this run.",
+            COOKIE_CONFIG_PATH,
+        )
+        return 0
+
+    if dry_run:
+        log.info("[dry-run] Would poll %s with session cookie from %s", USAGE_API_URL, COOKIE_CONFIG_PATH)
+        log.info("[dry-run] Would write to %s", STATE_FILE_PATH)
+        return 0
+
+    # Step 2: Fetch usage from claude.ai
+    try:
+        raw_response = fetch_usage(cookie)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            log.error(
+                "Auth error %d from %s — session cookie may be expired. "
+                "Refresh it: DevTools → Application → Cookies → sessionKey → copy value → "
+                "paste into %s",
+                exc.code,
+                USAGE_API_URL,
+                COOKIE_CONFIG_PATH,
+            )
+        else:
+            log.error("HTTP %d from %s — will retry on next cron run", exc.code, USAGE_API_URL)
+        return 0
+    except urllib.error.URLError as exc:
+        log.error("Network error polling %s: %s — will retry on next cron run", USAGE_API_URL, exc.reason)
+        return 0
+
+    # Step 3: Parse response
+    try:
+        parsed = parse_usage_response(raw_response)
+    except (ValueError, KeyError) as exc:
+        snippet = json.dumps(raw_response)[:300]
+        log.error(
+            "Failed to parse usage response: %s. Raw response snippet: %s",
+            exc,
+            snippet,
+        )
+        return 0
+
+    # Step 4: Merge into existing state
+    existing = load_existing_state(STATE_FILE_PATH)
+    new_state = merge_into_state(existing, parsed)
+
+    # Step 5: Write atomically
+    try:
+        write_state_atomically(new_state, STATE_FILE_PATH)
+    except OSError as exc:
+        log.error("Failed to write state file %s: %s", STATE_FILE_PATH, exc)
+        return 1
+
+    log.info(
+        "Updated %s — 5h: %.1f%% (resets_at: %s), 7d: %.1f%% (resets_at: %s)",
+        STATE_FILE_PATH,
+        parsed["five_hour_pct"] or 0.0,
+        parsed["five_hour_resets_at"],
+        parsed["seven_day_pct"] or 0.0,
+        parsed["seven_day_resets_at"],
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Poll claude.ai for CC quota data")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Log what would be done without making any HTTP requests or writing files",
+    )
+    args = parser.parse_args()
+    sys.exit(main(dry_run=args.dry_run))

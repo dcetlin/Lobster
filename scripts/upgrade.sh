@@ -3703,6 +3703,51 @@ print('executor_pid column added')
         substep "Migration 93: context-handoff.json absent — skipping"
     fi
 
+    # Migration 107: Add cc-usage-poller cron entry and cookie config slot (issue #1101).
+    #
+    # cc-usage-poller.py is a Type B cron script that polls claude.ai/api/usage with a
+    # stored session cookie every 30 minutes, writing authoritative quota percentages to
+    # ~/.claude/cc-budget/state.json. This fixes idle-through-reset staleness: the file
+    # was previously only updated by the statusLine hook during active CC sessions.
+    #
+    # The cookie config file is created as a comment-only placeholder if it does not
+    # exist. The user must paste their claude.ai sessionKey cookie value to activate
+    # polling — the script exits gracefully (return 0) until the cookie is present.
+    local CC_USAGE_POLLER_MARKER="# LOBSTER-CC-USAGE-POLLER"
+    if ! crontab -l 2>/dev/null | grep -q "$CC_USAGE_POLLER_MARKER"; then
+        if ! $DRY_RUN; then
+            "$LOBSTER_DIR/scripts/cron-manage.sh" add "$CC_USAGE_POLLER_MARKER" \
+                "*/30 * * * * cd $HOME/lobster && uv run scheduled-tasks/cc-usage-poller.py >> ${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/scheduled-jobs/logs/cc-usage-poller.log 2>&1 $CC_USAGE_POLLER_MARKER"
+            substep "Migration 107: added cc-usage-poller cron entry (every 30 minutes)"
+        else
+            substep "Migration 107 (dry-run): would add cc-usage-poller cron entry"
+        fi
+        migrated=$((migrated + 1))
+    else
+        substep "Migration 107: cc-usage-poller cron entry already present — skipping"
+    fi
+
+    # Create the session cookie config file if it does not exist.
+    local _cookie_config="${LOBSTER_USER_CONFIG:-$HOME/lobster-user-config}/cc-usage-session-cookie"
+    if [ ! -f "$_cookie_config" ]; then
+        if ! $DRY_RUN; then
+            cat > "$_cookie_config" <<'COOKIE_EOF'
+# Paste your claude.ai session cookie here (single line, no quotes)
+# Get it from: DevTools → Application → Cookies → claude.ai → sessionKey
+# The value looks like: sk-ant-sid01-...
+COOKIE_EOF
+            substep "Migration 107: created cookie config placeholder at $_cookie_config"
+        else
+            substep "Migration 107 (dry-run): would create cookie config at $_cookie_config"
+        fi
+    fi
+
+    # Ensure log file exists.
+    local _cc_log="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/scheduled-jobs/logs/cc-usage-poller.log"
+    if [ ! -f "$_cc_log" ] && ! $DRY_RUN; then
+        touch "$_cc_log" 2>/dev/null || true
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
