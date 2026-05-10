@@ -231,6 +231,112 @@ def _enrich_uow_with_github_metadata(uow_row: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# CC quota widget — pure functions reading ~/.claude/cc-budget/state.json
+# ---------------------------------------------------------------------------
+
+# Stale threshold: state older than this is treated as unavailable.
+CC_QUOTA_STALE_THRESHOLD_MINUTES = 60
+
+# Color thresholds: <70% green, 70–89% yellow/orange, ≥90% red.
+CC_QUOTA_COLOR_GREEN_MAX = 70
+CC_QUOTA_COLOR_RED_MIN = 90
+
+
+def _read_cc_budget_state(state_path: str | None = None) -> dict | None:
+    """Read CC budget state from state.json and return the parsed dict, or None.
+
+    Pure read: no side effects beyond file I/O. Returns None when:
+    - File is absent or unreadable
+    - JSON is malformed
+    - Required keys (five_hour_pct, seven_day_pct, fetched_at) are missing
+
+    Path resolution order:
+    1. state_path argument (if provided)
+    2. LOBSTER_CC_BUDGET_STATE env var
+    3. ~/.claude/cc-budget/state.json (default)
+    """
+    if state_path is None:
+        state_path = os.environ.get(
+            "LOBSTER_CC_BUDGET_STATE",
+            str(Path.home() / ".claude" / "cc-budget" / "state.json"),
+        )
+    try:
+        text = Path(state_path).read_text(encoding="utf-8")
+        data = json.loads(text)
+        # Validate required keys are present
+        if not all(k in data for k in ("five_hour_pct", "seven_day_pct", "fetched_at")):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _cc_quota_color(pct: float) -> str:
+    """Return a CSS color string for the given usage percentage.
+
+    <70%  → green (#1a7a3c)
+    70–89% → orange (#a06000)
+    ≥90%  → red (#c0392b)
+    """
+    if pct >= CC_QUOTA_COLOR_RED_MIN:
+        return "#c0392b"
+    if pct >= CC_QUOTA_COLOR_GREEN_MAX:
+        return "#a06000"
+    return "#1a7a3c"
+
+
+def _format_cc_quota_widget(state: dict | None, now: datetime) -> str:
+    """Return an HTML string for the CC quota widget.
+
+    Handles two cases:
+    - state is None or stale (>60 min): shows "CC quota: unavailable"
+    - state is fresh: shows 5h%, 7d%, and relative data age
+
+    Pure function: no side effects. All inputs are arguments.
+    """
+    # Determine if state is usable (present and fresh).
+    if state is not None:
+        try:
+            fetched_at_str = state["fetched_at"].replace("Z", "+00:00")
+            fetched_at = datetime.fromisoformat(fetched_at_str)
+            age_minutes = (now - fetched_at).total_seconds() / 60
+            if age_minutes > CC_QUOTA_STALE_THRESHOLD_MINUTES:
+                state = None  # treat as unavailable
+        except Exception:
+            state = None
+
+    if state is None:
+        return (
+            "<div style='display:inline-flex;align-items:center;gap:8px;"
+            "font-size:.8rem;color:var(--text3)'>"
+            "<strong>CC quota:</strong> <span>unavailable</span></div>"
+        )
+
+    five_pct = state["five_hour_pct"]
+    seven_pct = state["seven_day_pct"]
+
+    # Relative age string (e.g. "8m ago")
+    age_seconds = int((now - fetched_at).total_seconds())
+    if age_seconds < 60:
+        age_str = f"{age_seconds}s ago"
+    else:
+        age_str = f"{age_seconds // 60}m ago"
+
+    five_color = _cc_quota_color(five_pct)
+    seven_color = _cc_quota_color(seven_pct)
+
+    return (
+        "<div style='display:inline-flex;align-items:center;gap:10px;"
+        "font-size:.8rem;flex-wrap:wrap'>"
+        f"<strong>CC quota:</strong>"
+        f"<span style='color:{five_color};font-weight:600'>5h: {five_pct:.0f}%</span>"
+        f"<span style='color:{seven_color};font-weight:600'>7d: {seven_pct:.0f}%</span>"
+        f"<span style='color:var(--text3);font-size:.72rem'>as of {age_str}</span>"
+        "</div>"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Pure data-gathering functions
 # ---------------------------------------------------------------------------
 
@@ -397,14 +503,20 @@ def build_dashboard_data(
 
     This function is the composition point: each sub-query is pure and
     independently testable; build_dashboard_data just calls them in sequence.
+
+    cc_quota is included as a pre-rendered HTML string so render_html stays
+    a pure function — all state reads and formatting happen here.
     """
+    now = datetime.now(timezone.utc)
+    cc_state = _read_cc_budget_state()
     return {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": now.isoformat(),
         "active_uows": _active_uows(registry),
         "throughput_24h": _throughput_24h(registry_path),
         "cycle_histogram_7d": _cycle_histogram_last_7d(registry, registry_path),
         "stalled_uows": _stalled_uows(registry),
         "bootup_candidate_gate": _bootup_gate_status(registry),
+        "cc_quota": _format_cc_quota_widget(cc_state, now),
     }
 
 
@@ -563,6 +675,9 @@ def render_html(data: dict[str, Any], drilldown_urls: dict[str, str]) -> str:
     - Status badge + category badge (derived from GitHub labels)
     - Steward cycle count
     - Time in current state
+
+    The CC quota widget (data["cc_quota"]) is injected near the top of the page,
+    alongside the status summary, as a pre-rendered HTML string.
     """
     generated_at = data.get("generated_at", "")
     active = data.get("active_uows", [])
@@ -570,6 +685,7 @@ def render_html(data: dict[str, Any], drilldown_urls: dict[str, str]) -> str:
     hist = data.get("cycle_histogram_7d", {})
     stalls = data.get("stalled_uows", [])
     gate = data.get("bootup_candidate_gate", {})
+    cc_quota_html = data.get("cc_quota") or ""
 
     # --- Active UoWs table ---
     if active:
@@ -671,6 +787,7 @@ h2{{font-size:.8rem;font-weight:600;margin-bottom:10px;color:var(--text2);text-t
 <h1>WOS Dashboard</h1>
 <p class="meta">Generated {generated_at}</p>
 {drilldown_note}
+{f'<div class="sec" style="padding:10px 14px;margin-bottom:8px">{cc_quota_html}</div>' if cc_quota_html else ''}
 
 <div class="sec">
   <h2>Active UoWs ({len(active)})</h2>
