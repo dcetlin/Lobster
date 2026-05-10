@@ -71,6 +71,36 @@ CREATE INDEX IF NOT EXISTS idx_action_items_dedup_key
     ON action_items(dedup_key);
 """
 
+# Additive migrations — applied after initial schema creation.
+# These ALTER TABLE statements are safe to run on a DB that already has the
+# columns (SQLite silently no-ops duplicate ADD COLUMN via the IF NOT EXISTS guard
+# we implement in _apply_migrations). New fresh DBs get all columns via
+# CREATE TABLE + migrations in one connect() call.
+_SCHEMA_MIGRATIONS = [
+    "ALTER TABLE action_items ADD COLUMN workstream TEXT",
+    "ALTER TABLE action_items ADD COLUMN project TEXT",
+    "ALTER TABLE action_items ADD COLUMN action_type TEXT DEFAULT 'task'",
+    "ALTER TABLE action_items ADD COLUMN github_issue_url TEXT",
+    "ALTER TABLE action_items ADD COLUMN archived_at TEXT",
+    "ALTER TABLE action_items ADD COLUMN last_activity_at TEXT",
+]
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """Run additive column migrations against the open connection.
+
+    Each migration is applied only if the column is not already present.
+    This makes connect() safe to call against both fresh and existing DBs.
+    """
+    cur = conn.execute("PRAGMA table_info(action_items)")
+    existing_columns = {row[1] for row in cur.fetchall()}
+    for sql in _SCHEMA_MIGRATIONS:
+        # Extract column name from "ALTER TABLE action_items ADD COLUMN <name> ..."
+        col = sql.split("ADD COLUMN")[1].strip().split()[0]
+        if col not in existing_columns:
+            conn.execute(sql)
+    conn.commit()
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -104,6 +134,11 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
 
     Creates parent directories if needed. Returns an open connection.
     Callers are responsible for closing the connection.
+
+    On each call:
+    1. Creates the table and indices via DB_SCHEMA_SQL if not already present.
+    2. Applies any additive column migrations via _apply_migrations so that
+       both fresh DBs and existing production DBs have all expected columns.
     """
     path = db_path or DEFAULT_DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -111,6 +146,7 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.executescript(DB_SCHEMA_SQL)
     conn.commit()
+    _apply_migrations(conn)
     return conn
 
 
