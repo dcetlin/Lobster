@@ -13,6 +13,20 @@ weekly quota resets — the file retains pre-reset numbers indefinitely.
 Observed in production: 138h stale (2026-05-04 → 2026-05-10). This
 poller eliminates that drift.
 
+API flow:
+    1. GET /api/bootstrap  → find the org with CC plan (seat_tier check)
+    2. GET /api/organizations/{org_id}/usage  → quota percentages
+
+Both endpoints are on claude.ai and protected by Cloudflare. The script
+uses cloudscraper to handle the CF JS challenge automatically.
+
+Response shape from /api/organizations/{org_id}/usage:
+    {
+      "five_hour":  { "utilization": 51.0, "resets_at": "<ISO8601>" },
+      "seven_day":  { "utilization": 28.0, "resets_at": "<ISO8601>" },
+      ...
+    }
+
 Cron schedule (every 30 minutes):
     */30 * * * * cd ~/lobster && uv run scheduled-tasks/cc-usage-poller.py >> ~/lobster-workspace/scheduled-jobs/logs/cc-usage-poller.log 2>&1 # LOBSTER-CC-USAGE-POLLER
 
@@ -25,11 +39,21 @@ Session cookie:
     → Cookies → sessionKey) in ~/lobster-user-config/cc-usage-session-cookie
     as a single plain-text line with no quotes.
 
+Dependencies (auto-installed by uv):
+    cloudscraper — handles Cloudflare IUAM/bot-detection challenges
+
 Run standalone:
     uv run ~/lobster/scheduled-tasks/cc-usage-poller.py [--dry-run]
 
 Related issue: dcetlin/Lobster#1101
 """
+
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "cloudscraper",
+# ]
+# ///
 
 from __future__ import annotations
 
@@ -43,9 +67,6 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-import urllib.request
-import urllib.error
 
 # ---------------------------------------------------------------------------
 # Path setup — allow running as a script or via importlib (tests)
@@ -70,9 +91,11 @@ log = logging.getLogger("cc-usage-poller")
 # Constants
 # ---------------------------------------------------------------------------
 
-# The internal Claude API endpoint that returns quota usage.
-# Same endpoint ClaudeMeter (eddmann) uses: https://github.com/eddmann/ClaudeMeter
-USAGE_API_URL = "https://claude.ai/api/usage"
+# Bootstrap endpoint — returns account info and org memberships
+BOOTSTRAP_URL = "https://claude.ai/api/bootstrap"
+
+# Org usage endpoint template — substitute org UUID
+ORG_USAGE_URL = "https://claude.ai/api/organizations/{org_id}/usage"
 
 # Cookie config file — stores the claude.ai sessionKey value
 COOKIE_CONFIG_PATH = Path.home() / "lobster-user-config" / "cc-usage-session-cookie"
@@ -93,9 +116,9 @@ COOKIE_EXPIRY_SENTINEL_PREFIX = "/tmp/cc-usage-cookie-expired-alert-"
 
 # Text of the cookie-expiry Telegram alert
 COOKIE_EXPIRY_ALERT_TEXT = (
-    "⚠️ CC usage cookie expired — paste a new session key into "
+    "CC usage cookie expired — paste a new session key into "
     "~/lobster-user-config/cc-usage-session-cookie\n\n"
-    "Get it from: claude.ai → DevTools → Application → Cookies → sessionKey"
+    "Get it from: claude.ai -> DevTools -> Application -> Cookies -> sessionKey"
 )
 
 # ---------------------------------------------------------------------------
@@ -220,33 +243,99 @@ def read_session_cookie(cookie_path: Path) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# HTTP client — cloudscraper bypasses Cloudflare IUAM/bot-detection
+# ---------------------------------------------------------------------------
+
+
+def _make_scraper(session_cookie: str):
+    """
+    Create a cloudscraper session with the sessionKey cookie set.
+
+    cloudscraper handles Cloudflare's JavaScript challenge (IUAM) automatically,
+    which plain urllib/requests cannot do. The sessionKey cookie is set on the
+    claude.ai domain.
+    """
+    import cloudscraper  # type: ignore[import-untyped]
+
+    scraper = cloudscraper.create_scraper()
+    scraper.cookies.set("sessionKey", session_cookie, domain="claude.ai")
+    return scraper
+
+
+# ---------------------------------------------------------------------------
+# Org discovery — find the org with the CC plan via /api/bootstrap
+# ---------------------------------------------------------------------------
+
+
+def discover_cc_org_id(scraper: Any) -> str:
+    """
+    Call /api/bootstrap and return the org UUID for the Claude Code plan.
+
+    Strategy: prefer the org with seat_tier containing 'claude_max' or
+    'pro' (CC plan). Fall back to the first non-individual org. If only
+    one org exists, return it.
+
+    Raises ValueError if no org can be identified.
+    Raises requests.HTTPError / CloudScraper exceptions on auth failure.
+    """
+    resp = scraper.get(BOOTSTRAP_URL, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    memberships = data.get("account", {}).get("memberships", [])
+    if not memberships:
+        raise ValueError("No org memberships found in /api/bootstrap response")
+
+    # Score each membership: higher score = more likely the CC plan org
+    def _score(m: dict) -> int:
+        org = m.get("organization", {})
+        name = (org.get("name") or "").lower()
+        seat_tier = (m.get("seat_tier") or "").lower()
+        score = 0
+        # Prefer orgs with claude_max or pro tier
+        if "claude_max" in seat_tier or "max" in seat_tier:
+            score += 10
+        if "pro" in seat_tier:
+            score += 5
+        # Avoid "individual org" (usually a personal placeholder)
+        if "individual" in name:
+            score -= 3
+        return score
+
+    best = max(memberships, key=_score)
+    org_id = best.get("organization", {}).get("uuid")
+    if not org_id:
+        raise ValueError("Could not extract org UUID from bootstrap membership")
+
+    org_name = best.get("organization", {}).get("name", "unknown")
+    seat_tier = best.get("seat_tier", "unknown")
+    log.info("Using org '%s' (id=%s, seat_tier=%s)", org_name, org_id, seat_tier)
+    return org_id
+
+
+# ---------------------------------------------------------------------------
 # API call — isolated side effect
 # ---------------------------------------------------------------------------
 
 
 def fetch_usage(session_cookie: str) -> dict[str, Any]:
     """
-    Make an authenticated GET to USAGE_API_URL.
+    Discover the CC org and fetch usage from /api/organizations/{org_id}/usage.
 
     Returns the parsed JSON response body.
 
     Raises:
-        urllib.error.HTTPError — for 4xx/5xx responses
-        urllib.error.URLError — for network-level errors
+        requests.HTTPError — for 4xx/5xx responses (after CF challenge is handled)
+        requests.ConnectionError / Timeout — for network-level errors
         json.JSONDecodeError — if the response body is not valid JSON
-        ValueError — if required keys are missing from the response
+        ValueError — if org discovery fails
     """
-    request = urllib.request.Request(
-        USAGE_API_URL,
-        headers={
-            "Cookie": f"sessionKey={session_cookie}",
-            "Accept": "application/json",
-            "User-Agent": "lobster-cc-usage-poller/1.0",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        body = response.read().decode("utf-8")
-    return json.loads(body)
+    scraper = _make_scraper(session_cookie)
+    org_id = discover_cc_org_id(scraper)
+    url = ORG_USAGE_URL.format(org_id=org_id)
+    resp = scraper.get(url, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
 
 
 # ---------------------------------------------------------------------------
@@ -256,43 +345,37 @@ def fetch_usage(session_cookie: str) -> dict[str, Any]:
 
 def parse_usage_response(data: dict[str, Any]) -> dict[str, Any]:
     """
-    Extract quota fields from the API response.
+    Extract quota fields from the /api/organizations/{org_id}/usage response.
 
-    The claude.ai /api/usage endpoint returns a structure like:
+    The endpoint returns a structure like:
     {
-      "rate_limits": {
-        "five_hour": { "used_percentage": 24.5, "resets_at": 1712345678 },
-        "seven_day":  { "used_percentage": 31.2, "resets_at": 1712987654 }
-      }
+      "five_hour":  { "utilization": 51.0, "resets_at": "<ISO8601>" },
+      "seven_day":  { "utilization": 28.0, "resets_at": "<ISO8601>" },
+      "seven_day_sonnet": { "utilization": 42.0, "resets_at": "<ISO8601>" },
+      ...
     }
 
-    This is the same shape the statusLine hook receives, so the same field
-    paths are used. Returns a normalized dict suitable for merging into
-    state.json.
-
+    Returns a normalized dict suitable for merging into state.json.
     Raises ValueError if expected keys are absent.
     """
-    rate_limits = data.get("rate_limits")
-    if not rate_limits:
-        # Try alternate response shape where usage is nested under a
-        # "usage" key — some endpoint variants return this
-        rate_limits = data.get("usage", {}).get("rate_limits")
-    if not rate_limits:
+    five_hour = data.get("five_hour")
+    seven_day = data.get("seven_day")
+
+    if five_hour is None and seven_day is None:
         raise ValueError(
-            f"Expected 'rate_limits' key in response. Got keys: {list(data.keys())}"
+            f"Expected 'five_hour' or 'seven_day' keys in response. Got keys: {list(data.keys())}"
         )
 
-    five_hour = rate_limits.get("five_hour", {})
-    seven_day = rate_limits.get("seven_day", {})
-
-    # Normalize: accept both 'used_percentage' (API) and 'pct' (state.json) spellings
-    def _pct(obj: dict) -> float | None:
-        v = obj.get("used_percentage") or obj.get("pct")
+    def _pct(obj: dict | None) -> float | None:
+        if obj is None:
+            return None
+        v = obj.get("utilization")
         return float(v) if v is not None else None
 
-    def _resets_at(obj: dict) -> int | None:
-        v = obj.get("resets_at")
-        return int(v) if v is not None else None
+    def _resets_at(obj: dict | None) -> str | None:
+        if obj is None:
+            return None
+        return obj.get("resets_at")
 
     return {
         "five_hour_pct": _pct(five_hour),
@@ -396,36 +479,39 @@ def main(dry_run: bool = False) -> int:
     if cookie is None:
         log.warning(
             "Session cookie not configured. Create %s and paste your claude.ai "
-            "sessionKey cookie value (from DevTools → Application → Cookies → sessionKey). "
+            "sessionKey cookie value (from DevTools -> Application -> Cookies -> sessionKey). "
             "Skipping this run.",
             COOKIE_CONFIG_PATH,
         )
         return 0
 
     if dry_run:
-        log.info("[dry-run] Would poll %s with session cookie from %s", USAGE_API_URL, COOKIE_CONFIG_PATH)
+        log.info(
+            "[dry-run] Would call %s then %s with session cookie from %s",
+            BOOTSTRAP_URL,
+            ORG_USAGE_URL,
+            COOKIE_CONFIG_PATH,
+        )
         log.info("[dry-run] Would write to %s", STATE_FILE_PATH)
         return 0
 
-    # Step 2: Fetch usage from claude.ai
+    # Step 2: Fetch usage from claude.ai (via cloudscraper to handle CF challenge)
     try:
         raw_response = fetch_usage(cookie)
-    except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403):
+    except Exception as exc:
+        # Detect auth errors from requests/cloudscraper HTTPError
+        http_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if http_code in (401, 403):
             log.error(
-                "Auth error %d from %s — session cookie may be expired. "
-                "Refresh it: DevTools → Application → Cookies → sessionKey → copy value → "
+                "Auth error %d from claude.ai — session cookie may be expired. "
+                "Refresh it: DevTools -> Application -> Cookies -> sessionKey -> copy value -> "
                 "paste into %s",
-                exc.code,
-                USAGE_API_URL,
+                http_code,
                 COOKIE_CONFIG_PATH,
             )
-            _write_cookie_expiry_alert(exc.code, dry_run=dry_run)
-        else:
-            log.error("HTTP %d from %s — will retry on next cron run", exc.code, USAGE_API_URL)
-        return 0
-    except urllib.error.URLError as exc:
-        log.error("Network error polling %s: %s — will retry on next cron run", USAGE_API_URL, exc.reason)
+            _write_cookie_expiry_alert(http_code, dry_run=dry_run)
+            return 0
+        log.error("Error fetching usage from claude.ai: %s — will retry on next cron run", exc)
         return 0
 
     # Step 3: Parse response
