@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -36,11 +35,16 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 def _default_registry_path() -> Path:
-    env_override = os.environ.get("REGISTRY_DB_PATH")
-    if env_override:
-        return Path(env_override)
-    workspace = os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
-    return Path(workspace) / "orchestration" / "registry.db"
+    """Return the canonical registry DB path.
+
+    Delegates to the REGISTRY_DB constant from paths.py so that all WOS
+    modules resolve the DB path consistently via REGISTRY_DB_PATH env var
+    (or the workspace default). Previously this function re-derived the path
+    inline, which could silently diverge from paths.REGISTRY_DB if the env
+    var resolution logic changed in one place but not the other.
+    """
+    from src.orchestration.paths import REGISTRY_DB  # local import to keep module importable without DB
+    return REGISTRY_DB
 
 
 # ---------------------------------------------------------------------------
