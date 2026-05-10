@@ -102,12 +102,25 @@ self_action_items.db  ←── CANONICAL SOURCE OF TRUTH
 
 ### 4a. Lobster → Obsidian (write direction)
 
-Trigger: nightly LOS sweep, or on-demand via Telegram command.
+**Sole writer:** `todo_obsidian_sync.py` (runs every 30 min) is the **exclusive** writer of
+`ACTIVE TODOS.md`. No other job — including any future LOS nightly sweep — should call
+`render_active_todos()` or write this file directly.
 
-Process:
-1. Query `action_items` where `status IN ('open', 'snoozed')` ordered by priority, workstream, extracted_at.
-2. Render `✅ ACTIVE TODOS.md` with the symbol hierarchy (see Section 6).
-3. Commit to `~/obsidian-vault/` and push.
+Rationale: if a second job regenerates the file independently, it creates a race condition
+where Dan's unsynced Obsidian checkmarks are overwritten before `todo_obsidian_sync.py` can
+read and persist them to the DB. See the module docstring in `todo_obsidian_sync.py` for
+the full failure sequence.
+
+Any future LOS nightly sweep should write **only** to the DB (archival, extraction, etc.).
+The file regeneration step is `todo_obsidian_sync.py`'s responsibility.
+
+Process (performed by `todo_obsidian_sync.py` in a single atomic pass):
+1. git pull the vault (get latest Mac edits)
+2. Read Dan's checkmarks from ACTIVE TODOS.md
+3. Persist checkmark changes to DB
+4. Query `action_items` where `status IN ('open', 'snoozed')` ordered by priority, workstream, extracted_at.
+5. Render `✅ ACTIVE TODOS.md` with the symbol hierarchy (see Section 6).
+6. Commit to `~/obsidian-vault/` and push.
 
 ### 4b. Obsidian → Lobster (read direction)
 
@@ -145,7 +158,7 @@ Items are archived (not deleted) when:
 
 Archived items do not appear in `ACTIVE TODOS.md`. They remain in the DB and are queryable via `status = 'archived'`.
 
-The nightly LOS sweep runs archival before rendering ACTIVE TODOS.md. This keeps the view clean without destroying history.
+Any future LOS nightly sweep runs archival before the next `todo_obsidian_sync.py` pass regenerates ACTIVE TODOS.md. The sweep writes only to the DB; `todo_obsidian_sync.py` picks up the archival changes on its next run and omits archived items from the rendered file.
 
 ---
 

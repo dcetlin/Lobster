@@ -6,6 +6,28 @@ Reads ACTIVE TODOS.md from the obsidian vault and syncs human edits back
 into the canonical self_action_items.db, then regenerates the file from DB
 and commits it.
 
+SOLE WRITER OF ACTIVE TODOS.md
+-------------------------------
+This script is the exclusive writer of ACTIVE TODOS.md in the Obsidian vault.
+No other script or job (including any future LOS nightly sweep) should call
+render_active_todos() or write to this file directly.
+
+Rationale: a race condition arises if any other job regenerates ACTIVE TODOS.md
+independently. The sequence that causes data loss:
+  1. Dan checks off items in Obsidian on his Mac.
+  2. Obsidian-git pushes the vault to the VPS.
+  3. A second writer (e.g. LOS nightly at 3am) reads the DB and regenerates
+     ACTIVE TODOS.md before this sync job runs — overwriting Dan's checkmarks.
+  4. This sync job runs, finds no checkmarks in the file, and never marks those
+     items done in the DB.
+
+Keeping this script as the sole writer removes the race: checkmarks are always
+read before the file is overwritten, in a single atomic pass.
+
+# ACTIVE TODOS.md is written exclusively by todo_obsidian_sync.py to prevent
+# the race condition where a second writer overwrites unsynced Obsidian checkmarks
+# before this script can persist them to the DB.
+
 Flow:
   1. git pull the obsidian vault (pull latest edits from Mac)
   2. Parse ACTIVE TODOS.md:
