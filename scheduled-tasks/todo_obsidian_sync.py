@@ -269,26 +269,31 @@ def parse_active_todos(content: str) -> ParsedTodos:
 
     current_section: str = "active"       # default band
     current_workstream: Optional[str] = None
+    current_parent_item_id: Optional[int] = None  # item_id of last top-level item seen
 
     for line in content.splitlines():
         # Detect top-level section (priority band)
         if _URGENT_HEADER_RE.search(line):
             current_section = "urgent"
             current_workstream = None
+            current_parent_item_id = None
             continue
         if _ACTIVE_HEADER_RE.search(line):
             current_section = "active"
             current_workstream = None
+            current_parent_item_id = None
             continue
         if _SOMEDAY_HEADER_RE.search(line):
             current_section = "someday"
             current_workstream = None
+            current_parent_item_id = None
             continue
 
         # Detect workstream subsection (### name)
         ws_match = _WORKSTREAM_SECTION_RE.match(line)
         if ws_match:
             current_workstream = ws_match.group(1)
+            current_parent_item_id = None
             continue
 
         # Try subtask (2-space indent) first
@@ -299,6 +304,9 @@ def parse_active_todos(content: str) -> ParsedTodos:
             text, item_id, parent_id = _parse_item_text(raw_text)
             if not text:
                 continue
+            # If no <!-- parent:N --> comment, fall back to last top-level parent seen
+            if parent_id is None:
+                parent_id = current_parent_item_id
             item = ParsedItem(
                 text=text,
                 dedup_key=compute_dedup_key(text),
@@ -323,6 +331,9 @@ def parse_active_todos(content: str) -> ParsedTodos:
         text, item_id, _parent_id = _parse_item_text(raw_text)
         if not text:
             continue
+
+        # Track this item's id for subtasks without an explicit <!-- parent:N --> comment
+        current_parent_item_id = item_id
 
         item = ParsedItem(
             text=text,
