@@ -16,6 +16,11 @@ drilldown HTML page for each active and stalled UoW via wos_uow_detail_gen.gener
 then links each UoW row to its detail page. Generating drilldowns for all UoWs can be
 slow if the queue is large; it is off by default.
 
+With --format html, the dashboard is written to a canonical stable filename
+(wos-dashboard-active.html) in the bisque-uploads directory and the public URL is
+printed to stdout. This makes the URL stable across regenerations:
+  http://<PUBLIC_IP>:9101/files/wos-dashboard-active.html
+
 Exits 0 on success.
 
 Design:
@@ -25,6 +30,10 @@ Design:
 - Composable: build_dashboard_data() returns a plain dict usable by all renderers.
 - generate_drilldown_urls() is the single composition point for drilldown side effects;
   it maps over UoW IDs and isolates per-UoW errors without aborting the whole batch.
+- upload_html() is the single bisque upload point for the dashboard; it writes to a
+  canonical filename so the URL is stable across regenerations.
+- _fetch_issue_title() and _derive_category_from_labels() are pure/near-pure enrichment
+  helpers that surface GitHub metadata without mutating the registry.
 """
 
 from __future__ import annotations
@@ -32,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -51,13 +61,201 @@ def _default_registry_path() -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Bisque upload helpers — side-effectful, isolated
+# ---------------------------------------------------------------------------
+
+# Canonical filename for the dashboard HTML file in bisque-uploads.
+# Using a stable name (not a UUID) makes the URL cross-linkable and bookmarkable.
+DASHBOARD_CANONICAL_FILENAME = "wos-dashboard-active.html"
+
+
+def _uploads_dir() -> Path:
+    """Return the bisque-uploads directory path."""
+    messages_dir = Path(
+        os.environ.get("LOBSTER_INBOX_DIR", str(Path.home() / "messages" / "inbox"))
+    ).parent
+    return messages_dir / "bisque-uploads"
+
+
+def _bisque_base_url() -> str:
+    """Return the HTTP base URL of the bisque relay server.
+
+    Priority:
+    1. BISQUE_RELAY_HTTP_URL env var
+    2. LOBSTER_PUBLIC_IP env var with default port 9101
+    3. Parse ~/lobster-config/config.env
+    4. curl ifconfig.me fallback
+    5. localhost last resort
+    """
+    env_url = os.environ.get("BISQUE_RELAY_HTTP_URL", "").strip()
+    if env_url:
+        return env_url.rstrip("/")
+
+    public_ip = os.environ.get("LOBSTER_PUBLIC_IP", "").strip()
+    if not public_ip:
+        config_file = Path.home() / "lobster-config" / "config.env"
+        if config_file.exists():
+            for line in config_file.read_text().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("LOBSTER_PUBLIC_IP="):
+                    public_ip = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+                if stripped.startswith("BISQUE_RELAY_HTTP_URL="):
+                    return stripped.split("=", 1)[1].strip().strip('"').strip("'").rstrip("/")
+
+    if not public_ip:
+        try:
+            result = subprocess.run(
+                ["curl", "-s", "--max-time", "5", "-4", "ifconfig.me"],
+                capture_output=True, text=True, timeout=6,
+            )
+            public_ip = result.stdout.strip()
+        except Exception:
+            pass
+
+    port = os.environ.get("BISQUE_RELAY_PORT", "9101")
+    if public_ip:
+        return f"http://{public_ip}:{port}"
+    return f"http://localhost:{port}"
+
+
+def upload_html(html: str) -> str:
+    """Write the dashboard HTML to the canonical filename and return its public URL.
+
+    Writes to wos-dashboard-active.html (stable across regenerations).
+    Returns the full public URL: {base_url}/files/wos-dashboard-active.html
+
+    Side effects: writes to ~/messages/bisque-uploads/wos-dashboard-active.html
+    """
+    uploads = _uploads_dir()
+    uploads.mkdir(parents=True, exist_ok=True)
+    dest = uploads / DASHBOARD_CANONICAL_FILENAME
+    dest.write_text(html, encoding="utf-8")
+    base_url = _bisque_base_url()
+    return f"{base_url}/files/{DASHBOARD_CANONICAL_FILENAME}"
+
+
+# ---------------------------------------------------------------------------
+# GitHub metadata enrichment — near-pure helpers
+# ---------------------------------------------------------------------------
+
+def _fetch_issue_title(issue_url: str | None) -> str | None:
+    """Fetch the GitHub issue title from its URL using the gh CLI.
+
+    Returns the title string on success, None if the URL is absent, the CLI
+    call fails, or the JSON response is malformed. Never raises.
+
+    Parses the issue number and repo from the URL rather than calling the
+    GitHub REST API directly — gh CLI handles auth automatically.
+    """
+    if not issue_url:
+        return None
+
+    try:
+        result = subprocess.run(
+            ["gh", "issue", "view", issue_url, "--json", "title"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout)
+        return data.get("title") or None
+    except Exception:
+        return None
+
+
+def _fetch_issue_labels(issue_url: str | None) -> list[dict] | None:
+    """Fetch labels for a GitHub issue via its URL using the gh CLI.
+
+    Returns a list of label dicts (each with at least a 'name' key), or None
+    on failure. Never raises.
+    """
+    if not issue_url:
+        return None
+
+    try:
+        result = subprocess.run(
+            ["gh", "issue", "view", issue_url, "--json", "labels"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout)
+        return data.get("labels") or []
+    except Exception:
+        return None
+
+
+def _derive_category_from_labels(labels: list[dict] | None) -> str:
+    """Derive a display category from GitHub labels.
+
+    Taxonomy:
+    - type:* → use the value after the colon (e.g. type:bug → "bug",
+      type:feat → "feature")
+    - workstream:* → use the value after the colon as category (fallback
+      when no type: label is present)
+    - no matching label → "general"
+
+    type: labels take priority over workstream: labels when both are present.
+    """
+    if not labels:
+        return "general"
+
+    type_label: str | None = None
+    workstream_label: str | None = None
+
+    for label in labels:
+        name = label.get("name", "")
+        if name.startswith("type:") and type_label is None:
+            value = name[len("type:"):]
+            # Normalize common aliases
+            type_label = "feature" if value == "feat" else value
+        elif name.startswith("workstream:") and workstream_label is None:
+            workstream_label = name[len("workstream:"):]
+
+    if type_label:
+        return type_label
+    if workstream_label:
+        return workstream_label
+    return "general"
+
+
+def _enrich_uow_with_github_metadata(uow_row: dict) -> dict:
+    """Fetch issue title and category from GitHub and return an enriched UoW dict.
+
+    Adds 'issue_title' and 'category' keys. Either may be None/default if the
+    GitHub call fails (non-fatal — the row renders without enrichment).
+
+    Called per-UoW at render time. Side effect: subprocess call to gh CLI.
+    """
+    issue_url = uow_row.get("issue_url")
+    if not issue_url:
+        return {**uow_row, "issue_title": None, "category": "general"}
+
+    # Fetch title and labels in two separate calls to reuse existing helpers.
+    # A combined call (--json title,labels) would be slightly faster but the
+    # helpers are independently testable and the latency difference is negligible
+    # for a dashboard with typically <20 active UoWs.
+    title = _fetch_issue_title(issue_url)
+    labels = _fetch_issue_labels(issue_url)
+    category = _derive_category_from_labels(labels)
+
+    return {**uow_row, "issue_title": title, "category": category}
+
+
+# ---------------------------------------------------------------------------
 # Pure data-gathering functions
 # ---------------------------------------------------------------------------
 
 def _active_uows(registry: Any) -> list[dict]:
     """Return UoWs in active, ready-for-executor, or executing state.
 
-    Each dict has: id, status, steward_cycles, time_in_state_seconds.
+    Each dict has: id, status, steward_cycles, time_in_state_seconds,
+    issue_url (raw, for downstream enrichment).
     """
     from src.orchestration.registry import UoWStatus
     active_statuses = {
@@ -86,6 +284,7 @@ def _active_uows(registry: Any) -> list[dict]:
             "status": str(uow.status),
             "steward_cycles": uow.steward_cycles,
             "time_in_state_seconds": time_in_state,
+            "issue_url": getattr(uow, "issue_url", None),
         })
 
     return result
@@ -341,8 +540,31 @@ def _uow_id_cell(uow_id: str, drilldown_urls: dict[str, str]) -> str:
     """Return an HTML table cell for a UoW ID, optionally linked to its drilldown page."""
     url = drilldown_urls.get(uow_id)
     if url:
-        return f'<td class="uid"><a href="{url}" target="_blank">{uow_id} ↗</a></td>'
+        return f'<td class="uid"><a href="{url}" target="_blank">{uow_id} &#x2197;</a></td>'
     return f'<td class="uid">{uow_id}</td>'
+
+
+def _active_uow_row(u: dict, drilldown_urls: dict[str, str]) -> str:
+    """Render a single active-UoW table row, including title and category badge.
+
+    Columns: UoW ID (linked if drilldown available), issue title (or em-dash),
+    status badge + category badge, steward cycle count, time in state.
+    """
+    title_display = u.get("issue_title") or "—"
+    category = u.get("category") or "general"
+    id_cell = _uow_id_cell(u["id"], drilldown_urls)
+    category_badge = f"<span class='badge bc' style='margin-left:4px'>{category}</span>"
+
+    return (
+        f"<tr>"
+        f"{id_cell}"
+        f"<td style='font-size:.78rem;color:var(--text2)'>{title_display}</td>"
+        f"<td><span class='badge {_status_badge_class(u['status'])}'>{u['status']}</span>"
+        f"{category_badge}</td>"
+        f"<td>{u['steward_cycles']}</td>"
+        f"<td>{_fmt_duration(u['time_in_state_seconds'])}</td>"
+        f"</tr>"
+    )
 
 
 def render_html(data: dict[str, Any], drilldown_urls: dict[str, str]) -> str:
@@ -351,6 +573,13 @@ def render_html(data: dict[str, Any], drilldown_urls: dict[str, str]) -> str:
     Pure function: no IO. drilldown_urls maps uow_id → public URL for any UoWs
     that have a pre-generated drilldown page. Rows with no entry in drilldown_urls
     show the UoW ID as plain text.
+
+    Each active UoW row now shows:
+    - UoW ID (linked if drilldown URL available)
+    - Issue title (fetched from GitHub; "—" if absent)
+    - Status badge + category badge (derived from GitHub labels)
+    - Steward cycle count
+    - Time in current state
     """
     generated_at = data.get("generated_at", "")
     active = data.get("active_uows", [])
@@ -362,18 +591,13 @@ def render_html(data: dict[str, Any], drilldown_urls: dict[str, str]) -> str:
     # --- Active UoWs table ---
     if active:
         active_rows = "\n".join(
-            f"<tr>"
-            f"{_uow_id_cell(u['id'], drilldown_urls)}"
-            f"<td><span class='badge {_status_badge_class(u['status'])}'>{u['status']}</span></td>"
-            f"<td>{u['steward_cycles']}</td>"
-            f"<td>{_fmt_duration(u['time_in_state_seconds'])}</td>"
-            f"</tr>"
+            _active_uow_row(u, drilldown_urls)
             for u in active
         )
         active_section = f"""
         <table class="tbl">
           <thead><tr>
-            <th>UoW ID</th><th>Status</th><th>Cycles</th><th>In State</th>
+            <th>UoW ID</th><th>Title</th><th>Status / Category</th><th>Cycles</th><th>In State</th>
           </tr></thead>
           <tbody>{active_rows}</tbody>
         </table>"""
@@ -577,7 +801,16 @@ def main(argv: list[str] | None = None) -> int:
                 db_path=registry_path,
                 ledger_path=ledger_path,
             )
-        print(render_html(data, drilldown_urls=drilldown_urls), end="")
+        # Enrich each active UoW with title and category from GitHub.
+        # Errors per-UoW are non-fatal: _enrich_uow_with_github_metadata never raises.
+        data["active_uows"] = [
+            _enrich_uow_with_github_metadata(u)
+            for u in data["active_uows"]
+        ]
+        html = render_html(data, drilldown_urls=drilldown_urls)
+        # Write to canonical filename in bisque-uploads and print the stable URL.
+        url = upload_html(html)
+        print(url)
     else:
         print(render_text(data), end="")
 
