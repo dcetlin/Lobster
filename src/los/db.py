@@ -73,9 +73,14 @@ CREATE INDEX IF NOT EXISTS idx_action_items_dedup_key
 
 # Additive migrations — applied after initial schema creation.
 # These ALTER TABLE statements are safe to run on a DB that already has the
-# columns (SQLite silently no-ops duplicate ADD COLUMN via the IF NOT EXISTS guard
-# we implement in _apply_migrations). New fresh DBs get all columns via
-# CREATE TABLE + migrations in one connect() call.
+# columns (skipped via PRAGMA table_info pre-check in _apply_migrations). New
+# fresh DBs get all columns via CREATE TABLE + migrations in one connect() call.
+#
+# CONSTRAINT: every entry must be a simple single-column ALTER TABLE statement
+# of the form "ALTER TABLE action_items ADD COLUMN <name> <type>". Compound or
+# multi-column ADD COLUMN statements are not supported — _apply_migrations
+# extracts the column name via string split and will silently misbehave if this
+# constraint is violated.
 _SCHEMA_MIGRATIONS = [
     "ALTER TABLE action_items ADD COLUMN workstream TEXT",
     "ALTER TABLE action_items ADD COLUMN project TEXT",

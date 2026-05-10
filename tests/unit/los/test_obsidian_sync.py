@@ -35,6 +35,7 @@ from src.los.db import (
     connect,
     insert_action_item,
     mark_done,
+    mark_snoozed,
     get_item_by_id,
     ActionItemStatus,
 )
@@ -462,3 +463,31 @@ def test_render_has_generation_header(conn: sqlite3.Connection) -> None:
     """render_active_todos must include the '# ✅ ACTIVE TODOS' title."""
     output = render_active_todos(conn)
     assert "# ✅ ACTIVE TODOS" in output
+
+
+def test_render_excludes_future_snoozed_items(conn: sqlite3.Connection) -> None:
+    """Items snoozed until a future date must be absent from render output.
+
+    This test is the regression guard for the SQL defect where the WHERE clause
+    tautologically included all snoozed rows regardless of snoozed_until.
+    """
+    row_id = insert_action_item(conn, text="Snoozed future task", source="telegram", source_message_id=None)
+    # Snooze until a date far in the future — this item should be hidden
+    mark_snoozed(conn, row_id, "2099-12-31")
+
+    output = render_active_todos(conn)
+    assert "Snoozed future task" not in output, (
+        "Future-snoozed item must not appear in render output — snooze is not working"
+    )
+
+
+def test_render_includes_past_snoozed_items(conn: sqlite3.Connection) -> None:
+    """Items whose snooze period has expired (snoozed_until in the past) must appear in render output."""
+    row_id = insert_action_item(conn, text="Expired snooze task", source="telegram", source_message_id=None)
+    # Snooze until a date already in the past — item should resurface
+    mark_snoozed(conn, row_id, "2000-01-01")
+
+    output = render_active_todos(conn)
+    assert "Expired snooze task" in output, (
+        "Past-expired snoozed item must appear in render output — snooze expiry is not working"
+    )

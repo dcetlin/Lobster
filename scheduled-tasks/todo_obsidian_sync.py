@@ -100,7 +100,14 @@ PRIORITY_SOMEDAY_DEFAULT = 8
 
 _VAULT_DEFAULT = Path.home() / "lobster-workspace" / "obsidian-vault"
 _DB_DEFAULT = Path.home() / "lobster-user-config" / "data" / "self_action_items.db"
-_WORKSPACE = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+
+
+def _get_workspace() -> Path:
+    """Return the workspace path, reading LOBSTER_WORKSPACE at call time (not import time).
+
+    Deferred to function call so tests can override via monkeypatch.setenv.
+    """
+    return Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
 
 # ---------------------------------------------------------------------------
 # Data structures (immutable / pure)
@@ -374,7 +381,7 @@ def render_active_todos(conn) -> str:
         """
         SELECT id, text, priority, workstream, source, status
         FROM action_items
-        WHERE status IN ('open', 'snoozed')
+        WHERE status = 'open'
            OR (status = 'snoozed' AND snoozed_until < datetime('now'))
         ORDER BY priority ASC, workstream ASC, extracted_at ASC
         """,
@@ -544,7 +551,7 @@ def _git_commit_and_push(vault_path: Path, todos_path: Path, timestamp: str) -> 
 def _is_job_enabled(job_name: str) -> bool:
     """Return True if the job is enabled in jobs.json."""
     try:
-        jobs_file = _WORKSPACE / "scheduled-jobs" / "jobs.json"
+        jobs_file = _get_workspace() / "scheduled-jobs" / "jobs.json"
         with jobs_file.open() as fh:
             data = json.load(fh)
         entry = data.get("jobs", {}).get(job_name, {})
