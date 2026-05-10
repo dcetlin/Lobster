@@ -3749,6 +3749,33 @@ COOKIE_EOF
         touch "$_cc_log" 2>/dev/null || true
     fi
 
+    # Migration 108: Add todo-obsidian-sync cron entry.
+    #
+    # todo_obsidian_sync.py is a Type B cron script that reads ACTIVE TODOS.md
+    # from the Obsidian vault, syncs human edits (checkmarks, new items, priority
+    # moves) back into self_action_items.db, then regenerates the file from DB
+    # and commits it. Runs every 30 minutes to pick up vault changes before the
+    # next LOS sweep.
+    local TODO_OBSIDIAN_SYNC_MARKER="# LOBSTER-TODO-OBSIDIAN-SYNC"
+    if ! crontab -l 2>/dev/null | grep -q "$TODO_OBSIDIAN_SYNC_MARKER"; then
+        if ! $DRY_RUN; then
+            "$LOBSTER_DIR/scripts/cron-manage.sh" add "$TODO_OBSIDIAN_SYNC_MARKER" \
+                "*/30 * * * * cd $HOME/lobster && uv run scheduled-tasks/todo_obsidian_sync.py >> ${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/scheduled-jobs/logs/todo-obsidian-sync.log 2>&1 $TODO_OBSIDIAN_SYNC_MARKER"
+            substep "Migration 108: added todo-obsidian-sync cron entry (every 30 minutes)"
+        else
+            substep "Migration 108 (dry-run): would add todo-obsidian-sync cron entry"
+        fi
+        migrated=$((migrated + 1))
+    else
+        substep "Migration 108: todo-obsidian-sync cron entry already present — skipping"
+    fi
+
+    # Ensure log file exists.
+    local _todos_log="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/scheduled-jobs/logs/todo-obsidian-sync.log"
+    if [ ! -f "$_todos_log" ] && ! $DRY_RUN; then
+        touch "$_todos_log" 2>/dev/null || true
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
