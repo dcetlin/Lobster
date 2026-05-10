@@ -148,6 +148,70 @@ def _warn_if_legacy_registry_exists() -> None:
 RECOVERY_STALE_MINUTES: int = 5
 
 # ---------------------------------------------------------------------------
+# CC quota gate — skip UoW dispatch when the 5-hour Claude Code quota is
+# critically low (>= 90%). Subagents are expensive; dispatching when quota
+# is nearly exhausted wastes the remaining headroom and can cause subagents
+# to fail partway through with quota errors.
+#
+# Fail-open: if the state file is absent or stale (> 60 min old), proceed
+# normally. Absent/stale data must never block dispatch.
+# ---------------------------------------------------------------------------
+
+#: Percentage threshold above which dispatch is skipped for the cycle.
+CC_QUOTA_SKIP_THRESHOLD: float = 90.0
+
+#: State file is considered stale if fetched_at is older than this many seconds.
+_CC_QUOTA_FRESHNESS_SECONDS: int = 60 * 60  # 60 minutes
+
+
+def _read_cc_quota() -> float | None:
+    """Return five_hour_pct from the CC budget state file, or None if unavailable.
+
+    Returns the float value when the file exists AND fetched_at is within the
+    last 60 minutes. Returns None when:
+    - The file does not exist (LOBSTER_CC_BUDGET_STATE or ~/.claude/cc-budget/state.json)
+    - The file is stale (fetched_at older than 60 minutes)
+    - The file is unreadable or malformed
+
+    None signals "no usable data" — callers must treat None as "proceed normally"
+    (fail-open). Only a fresh float >= CC_QUOTA_SKIP_THRESHOLD should cause a skip.
+
+    Pure function: reads the filesystem, parses JSON, computes staleness. No
+    side effects — the caller owns all logging and the skip decision.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    state_path = Path(
+        os.environ.get(
+            "LOBSTER_CC_BUDGET_STATE",
+            Path.home() / ".claude" / "cc-budget" / "state.json",
+        )
+    )
+
+    try:
+        raw = state_path.read_text()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+    try:
+        data = json.loads(raw)
+        pct = float(data["five_hour_pct"])
+        fetched_at_str = data["fetched_at"]
+        fetched_at = datetime.fromisoformat(fetched_at_str.replace("Z", "+00:00"))
+        if fetched_at.tzinfo is None:
+            fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+    except (KeyError, ValueError, TypeError):
+        return None
+
+    age = datetime.now(timezone.utc) - fetched_at
+    if age > timedelta(seconds=_CC_QUOTA_FRESHNESS_SECONDS):
+        return None
+
+    return pct
+
+# ---------------------------------------------------------------------------
 # GitHub API rate limit pre-dispatch check
 #
 # Subagents dispatched by the executor call `gh issue view` as step 1.
@@ -662,6 +726,21 @@ def main() -> int:
                 rate_status.remaining,
                 GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD,
             )
+
+    # CC quota gate — skip dispatch when the 5-hour Claude Code quota is
+    # critically low. Fail-open: absent or stale data (> 60 min old) does
+    # not block dispatch — only fresh data at or above the threshold does.
+    cc_pct = _read_cc_quota()
+    if cc_pct is not None and cc_pct >= CC_QUOTA_SKIP_THRESHOLD:
+        log.info(
+            "cc_quota=%.1f%% — skipping dispatch cycle (threshold=%.1f%%)",
+            cc_pct,
+            CC_QUOTA_SKIP_THRESHOLD,
+        )
+        log.info("Executor heartbeat complete")
+        return 0
+    if cc_pct is not None:
+        log.debug("CC quota ok: %.1f%% (threshold=%.1f%%)", cc_pct, CC_QUOTA_SKIP_THRESHOLD)
 
     try:
         result = run_executor_cycle(registry, dry_run=dry_run)
