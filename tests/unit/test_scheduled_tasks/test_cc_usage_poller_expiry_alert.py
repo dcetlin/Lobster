@@ -21,9 +21,14 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-import urllib.error
 
 import pytest
+
+try:
+    import requests.exceptions as _req_exc
+    _RequestsHTTPError = _req_exc.HTTPError
+except ImportError:  # pragma: no cover
+    _RequestsHTTPError = Exception
 
 # ---------------------------------------------------------------------------
 # Load the module under test from its script path
@@ -55,14 +60,10 @@ SENTINEL_PREFIX = cp.COOKIE_EXPIRY_SENTINEL_PREFIX
 # Helper — build a fake HTTPError for a given HTTP status code
 # ---------------------------------------------------------------------------
 
-def _http_error(code: int) -> urllib.error.HTTPError:
-    return urllib.error.HTTPError(
-        url="https://claude.ai/api/usage",
-        code=code,
-        msg=f"HTTP {code}",
-        hdrs=None,
-        fp=None,
-    )
+def _http_error(code: int) -> "_RequestsHTTPError":
+    mock_response = MagicMock()
+    mock_response.status_code = code
+    return _RequestsHTTPError(response=mock_response)
 
 
 # ---------------------------------------------------------------------------
