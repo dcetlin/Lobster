@@ -222,7 +222,7 @@ def test_parse_done_subtask_has_parent_id() -> None:
     """Done subtask must have parent_id set."""
     result = parse_active_todos(SUBTASK_TODOS)
     done_sub = next(item for item in result.done if item.text == "Old subtask done")
-    assert done_sub.parent_id == 44 or done_sub.parent_id == 42  # parent:42 from comment
+    assert done_sub.parent_id == 42  # parent:42 from comment
 
 
 def test_parse_top_level_items_have_no_parent_id() -> None:
