@@ -1009,7 +1009,10 @@ send_reply(chat_id=chat_id, text="Checking your todos...", source=source)
 ```python
 from src.los.todo_commands import route_todo_command
 
-# msg.text starts with "/todo"
+# msg.text starts with "/todo " (note trailing space) or is exactly "/todo"
+# Do NOT use a bare startswith("/todo") — that would also match "/todos" (the
+# existing LOS command that dispatches the full item list subagent).
+# Correct condition: text.startswith("/todo ") or text == "/todo"
 reply = route_todo_command(msg)
 send_reply(chat_id=chat_id, text=reply, source=source)
 mark_processed(message_id)

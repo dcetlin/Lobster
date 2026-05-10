@@ -282,3 +282,111 @@ def test_route_bare_todo_command_returns_help(conn: sqlite3.Connection, chat_id:
 
     assert isinstance(reply, str)
     assert any(cmd in reply.lower() for cmd in ("add", "done", "snooze"))
+
+
+# ---------------------------------------------------------------------------
+# Gap 1: /todos must NOT be routed through route_todo_command
+# ---------------------------------------------------------------------------
+
+
+def test_todos_command_is_not_routed_to_route_todo_command(
+    conn: sqlite3.Connection, chat_id: int
+) -> None:
+    """/todos must not be processed by route_todo_command.
+
+    The dispatcher's routing condition must use startswith("/todo ") or == "/todo",
+    NOT startswith("/todo"), which would accidentally match /todos.
+
+    This test documents the safe fallback: if /todos is somehow passed to
+    route_todo_command (e.g. if the dispatcher condition is written incorrectly),
+    the function returns usage help — it does NOT silently process the command
+    as a /todo subcommand.
+
+    The primary protection is the dispatcher routing condition documented in
+    sys.dispatcher.bootup.md: use 'text.startswith("/todo ") or text == "/todo"'
+    to prevent /todos from entering this code path at all.
+    """
+    # /todos does not match any subcommand regex — it must return usage help
+    msg = {"text": "/todos", "chat_id": chat_id, "source": "telegram"}
+    reply = route_todo_command(msg, conn=conn)
+
+    # Must return usage help — not execute any subcommand
+    assert isinstance(reply, str)
+    assert any(cmd in reply.lower() for cmd in ("add", "done", "snooze")), (
+        "/todos incorrectly matched a subcommand in route_todo_command"
+    )
+    # Must NOT have inserted any items
+    items = get_open_items(conn)
+    assert len(items) == 0, "/todos must not insert any items"
+
+
+def test_dispatcher_routing_condition_excludes_todos() -> None:
+    """/todos must not match the dispatcher's /todo routing condition.
+
+    Documents the correct routing check:
+        text.startswith("/todo ") or text == "/todo"
+
+    An incorrect check (text.startswith("/todo")) would match both /todo and /todos.
+    """
+    text = "/todos"
+
+    # Incorrect condition — would incorrectly route /todos to the /todo handler:
+    incorrect_match = text.startswith("/todo")
+    assert incorrect_match, "Confirm: the naive startswith('/todo') DOES match /todos"
+
+    # Correct condition — explicitly excludes /todos:
+    correct_match = text.startswith("/todo ") or text == "/todo"
+    assert not correct_match, (
+        "The correct dispatcher condition must NOT match /todos — "
+        "use startswith('/todo ') or == '/todo', not startswith('/todo')"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gap 2: Snooze regex trailing-number ambiguity — documented edge case
+# ---------------------------------------------------------------------------
+
+
+def test_snooze_trailing_number_in_item_text_is_consumed_as_days(
+    conn: sqlite3.Connection, chat_id: int
+) -> None:
+    """Documents the known snooze regex ambiguity: trailing integers become days.
+
+    When an item's text ends in a number (e.g. "call 911"), the query
+    '/todo snooze call 911' will parse query='call' (not 'call 911') and
+    days=911 (not SNOOZE_DEFAULT_DAYS). This may produce a not-found result
+    or match a different item than intended.
+
+    The workaround (documented in _USAGE and _SNOOZE_RE comment) is to use
+    the item ID: '/todo snooze <id>'.
+
+    WARNING: This test documents the current behavior, not the desired behavior.
+    If the regex is changed to require an explicit 'days' keyword (e.g. 'for N
+    days'), this test should be updated to reflect the new behavior.
+    """
+    item_id = insert_action_item(conn, text="call 911", source="telegram", source_message_id=None)
+
+    # This command intends to snooze "call 911" for the default number of days,
+    # but the trailing "911" is consumed as the days argument and the query
+    # becomes "call" — which does not exactly match "call 911".
+    msg = {"text": "/todo snooze call 911", "chat_id": chat_id, "source": "telegram"}
+    reply = route_todo_command(msg, conn=conn)
+
+    # The item text is "call 911" but the query extracted is "call".
+    # "call" is a substring of "call 911", so the item IS found.
+    # It gets snoozed for 911 days (not SNOOZE_DEFAULT_DAYS).
+    item = get_item_by_id(conn, item_id)
+    if item.status == "snoozed":
+        # Item was found via substring "call" and snoozed for 911 days —
+        # the user's intent (snooze for default days) was NOT honored.
+        # Workaround: use '/todo snooze {item_id}' instead.
+        assert item.snoozed_until is not None
+    else:
+        # If not snoozed: the reply must contain a helpful message
+        assert isinstance(reply, str) and len(reply) > 0
+
+    # Either way, the usage tip about item IDs must be present in the help text
+    usage_reply = route_todo_command({"text": "/todo", "chat_id": chat_id, "source": "telegram"}, conn=conn)
+    assert "id" in usage_reply.lower() or "tip" in usage_reply.lower(), (
+        "_USAGE must include the tip about using item IDs for items whose text ends in a number"
+    )

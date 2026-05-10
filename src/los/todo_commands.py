@@ -246,7 +246,13 @@ _ADD_RE = re.compile(r"^/todo\s+add\s+(.+)$", re.IGNORECASE)
 _DONE_RE = re.compile(r"^/todo\s+done\s+(.+)$", re.IGNORECASE)
 
 # /todo snooze <query> [<days>]
-# Days are optional — if omitted, defaults to SNOOZE_DEFAULT_DAYS
+# Days are optional — if omitted, defaults to SNOOZE_DEFAULT_DAYS.
+#
+# AMBIGUITY: A trailing integer is always parsed as the days argument.
+# If an item's text ends in a number (e.g. "call 911"), a query like
+# "/todo snooze call 911" will parse query='call' and days=911, not
+# query='call 911' and days=None.
+# Use the item ID to avoid this: "/todo snooze <id>" for items whose text ends in a number.
 _SNOOZE_RE = re.compile(r"^/todo\s+snooze\s+(.+?)(?:\s+(\d+))?\s*$", re.IGNORECASE)
 
 _USAGE = (
@@ -255,7 +261,10 @@ _USAGE = (
     "  /todo done <id or text>   — mark item done\n"
     "  /todo snooze <id or text> [days]  — snooze item (default: "
     f"{SNOOZE_DEFAULT_DAYS} days)\n"
-    "  /todos                    — show current open items"
+    "  /todos                    — show current open items\n"
+    "\n"
+    "Tip: for items whose text ends in a number, use the item ID\n"
+    "  (e.g. '/todo snooze 42' instead of '/todo snooze call 911')."
 )
 
 
