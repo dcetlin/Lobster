@@ -88,6 +88,7 @@ _SCHEMA_MIGRATIONS = [
     "ALTER TABLE action_items ADD COLUMN github_issue_url TEXT",
     "ALTER TABLE action_items ADD COLUMN archived_at TEXT",
     "ALTER TABLE action_items ADD COLUMN last_activity_at TEXT",
+    "ALTER TABLE action_items ADD COLUMN parent_id INTEGER REFERENCES action_items(id)",
 ]
 
 
@@ -127,6 +128,7 @@ class ActionItem:
     dismissed_at: Optional[str]
     notes: Optional[str]
     dedup_key: Optional[str]
+    parent_id: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +178,7 @@ def compute_dedup_key(text: str) -> str:
 
 
 def _row_to_item(row: sqlite3.Row) -> ActionItem:
+    keys = row.keys()
     return ActionItem(
         id=row["id"],
         text=row["text"],
@@ -190,6 +193,7 @@ def _row_to_item(row: sqlite3.Row) -> ActionItem:
         dismissed_at=row["dismissed_at"],
         notes=row["notes"],
         dedup_key=row["dedup_key"],
+        parent_id=row["parent_id"] if "parent_id" in keys else None,
     )
 
 
@@ -205,6 +209,7 @@ def insert_action_item(
     source_message_id: Optional[str],
     priority: int = 5,
     notes: Optional[str] = None,
+    parent_id: Optional[int] = None,
 ) -> int:
     """Insert a new action item. Returns the row id."""
     dedup_key = compute_dedup_key(text)
@@ -213,10 +218,10 @@ def insert_action_item(
         """
         INSERT INTO action_items
             (text, source, source_message_id, extracted_at, priority, status,
-             mention_count, dedup_key, notes)
-        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+             mention_count, dedup_key, notes, parent_id)
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
         """,
-        (text, source, source_message_id, extracted_at, priority, ActionItemStatus.OPEN, dedup_key, notes),
+        (text, source, source_message_id, extracted_at, priority, ActionItemStatus.OPEN, dedup_key, notes, parent_id),
     )
     conn.commit()
     return cursor.lastrowid
@@ -309,6 +314,23 @@ def get_dismissed_items_since(
         ORDER BY dismissed_at DESC
         """,
         (ActionItemStatus.DISMISSED, since_iso),
+    )
+    return [_row_to_item(row) for row in cursor.fetchall()]
+
+
+def get_subtasks(
+    conn: sqlite3.Connection,
+    parent_id: int,
+) -> list[ActionItem]:
+    """Return open/snoozed subtasks for a given parent_id, ordered by extracted_at."""
+    cursor = conn.execute(
+        """
+        SELECT * FROM action_items
+        WHERE parent_id = ?
+          AND (status = ? OR (status = ? AND snoozed_until < datetime('now')))
+        ORDER BY extracted_at ASC
+        """,
+        (parent_id, ActionItemStatus.OPEN, ActionItemStatus.SNOOZED),
     )
     return [_row_to_item(row) for row in cursor.fetchall()]
 

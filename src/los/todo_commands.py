@@ -5,10 +5,11 @@ Routes /todo subcommands and natural-language patterns to the action items DB.
 This is the dispatcher entry point for all TODO mutations coming through Telegram.
 
 Supported command forms:
-    /todo add <text>      — insert item (source='telegram', priority=5)
-    /todo done <query>    — mark item done (query = id or partial text)
-    /todo snooze <query> [days]  — snooze item for N days (default: SNOOZE_DEFAULT_DAYS)
-    /todo                 — returns usage help
+    /todo add <text>                    — insert item (source='telegram', priority=5)
+    /todo add <text> --parent <id>      — insert subtask under parent item <id>
+    /todo done <query>                  — mark item done (query = id or partial text)
+    /todo snooze <query> [days]         — snooze item for N days (default: SNOOZE_DEFAULT_DAYS)
+    /todo                               — returns usage help
 
 Dispatcher integration:
     from src.los.todo_commands import route_todo_command
@@ -134,6 +135,7 @@ def handle_todo_add(
     *,
     chat_id: int,
     source: str = "telegram",
+    parent_id: Optional[int] = None,
     conn: Optional[sqlite3.Connection] = None,
     db_path: Optional[Path] = None,
 ) -> str:
@@ -141,6 +143,9 @@ def handle_todo_add(
 
     If the item already exists (same normalized text), increments mention_count
     instead of inserting a duplicate.
+
+    If parent_id is given, inserts as a subtask under that parent. Errors if the
+    parent does not exist or is itself a subtask (depth cap: 2 levels only).
     """
     _own_conn = False
     if conn is None:
@@ -148,6 +153,14 @@ def handle_todo_add(
         _own_conn = True
 
     try:
+        # Validate parent_id if provided
+        if parent_id is not None:
+            parent_item = get_item_by_id(conn, parent_id)
+            if parent_item is None:
+                return f"No item with ID {parent_id}"
+            if parent_item.parent_id is not None:
+                return "Cannot nest deeper than 2 levels"
+
         existing = find_duplicate(conn, text)
         if existing is not None:
             increment_mention_count(conn, existing.id)
@@ -162,7 +175,10 @@ def handle_todo_add(
             source=source,
             source_message_id=None,
             priority=PRIORITY_DEFAULT,
+            parent_id=parent_id,
         )
+        if parent_id is not None:
+            return f"Added #{item_id} (subtask of #{parent_id}): \"{text[:60]}\""
         return f"Added #{item_id}: \"{text[:60]}\""
     finally:
         if _own_conn:
@@ -240,8 +256,9 @@ def handle_todo_snooze(
 # Command parser (pure — no DB access)
 # ---------------------------------------------------------------------------
 
-# /todo add <text>
-_ADD_RE = re.compile(r"^/todo\s+add\s+(.+)$", re.IGNORECASE)
+# /todo add <text> [--parent <id>]
+# --parent must come last (simplest parsing).
+_ADD_RE = re.compile(r"^/todo\s+add\s+(.+?)(?:\s+--parent\s+(\d+))?\s*$", re.IGNORECASE)
 
 # /todo done <query>
 _DONE_RE = re.compile(r"^/todo\s+done\s+(.+)$", re.IGNORECASE)
@@ -258,11 +275,12 @@ _SNOOZE_RE = re.compile(r"^/todo\s+snooze\s+(.+?)(?:\s+(\d+))?\s*$", re.IGNORECA
 
 _USAGE = (
     "Usage:\n"
-    "  /todo add <text>          — add item to your list\n"
-    "  /todo done <id or text>   — mark item done\n"
-    "  /todo snooze <id or text> [days]  — snooze item (default: "
+    "  /todo add <text>                   — add item to your list\n"
+    "  /todo add <text> --parent <id>     — add subtask under item <id>\n"
+    "  /todo done <id or text>            — mark item done\n"
+    "  /todo snooze <id or text> [days]   — snooze item (default: "
     f"{SNOOZE_DEFAULT_DAYS} days)\n"
-    "  /todos                    — show current open items\n"
+    "  /todos                             — show current open items\n"
     "\n"
     "Tip: for items whose text ends in a number, use the item ID\n"
     "  (e.g. '/todo snooze 42' instead of '/todo snooze call 911')."
@@ -291,10 +309,13 @@ def route_todo_command(
 
     m = _ADD_RE.match(text)
     if m:
+        item_text = m.group(1).strip()
+        parent_id = int(m.group(2)) if m.group(2) else None
         return handle_todo_add(
-            m.group(1).strip(),
+            item_text,
             chat_id=chat_id,
             source=source,
+            parent_id=parent_id,
             conn=conn,
             db_path=db_path,
         )

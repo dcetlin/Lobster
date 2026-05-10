@@ -193,7 +193,66 @@ Symbol hierarchy (no markdown tables, consistent with Dan's preferences):
 
 ---
 
-## 7. GitHub Links — Phase 2
+## 7. Subtasks
+
+### Schema
+
+A `parent_id` column links a subtask to its parent:
+
+```sql
+parent_id INTEGER REFERENCES action_items(id)
+```
+
+Added via `_SCHEMA_MIGRATIONS` in `src/los/db.py`. NULL means top-level item.
+
+### Depth Cap
+
+Maximum 2 levels: task → subtask. Grandchildren are not supported. Enforcement:
+- DB: no constraint (kept simple); enforced in `handle_todo_add` and sync parsing.
+- `handle_todo_add` rejects `--parent <id>` if the target item already has a `parent_id`.
+- `todo_obsidian_sync.py` never nests indented items further than one level.
+
+### Obsidian Rendering
+
+Top-level items render with an `<!-- id:N -->` anchor comment:
+
+```markdown
+- [ ] Fix the sync bug <!-- id:42 -->
+  - [ ] Write failing test <!-- id:43 parent:42 -->
+  - [ ] Implement fix <!-- id:44 parent:42 -->
+```
+
+Rules:
+- Subtasks appear immediately after their parent (not in a separate section).
+- 2-space indent is the visual signal in Obsidian; `parent:N` is the machine signal.
+- Only open/snoozed subtasks are rendered (done subtasks are excluded).
+
+### Sync Parsing
+
+`parse_active_todos()` distinguishes:
+- `^- \[.?\] ` (no leading spaces) → top-level item
+- `^  - \[.?\] ` (2-space indent) → subtask
+
+For subtasks:
+- `parent_id` is extracted from `<!-- parent:N -->` comment.
+- `[x]` → `mark_done()` for that item.
+- New `[ ]` items (no id in DB): inserted with `parent_id` set.
+- Existing `[ ]` items (found by dedup_key): no-op or priority update (same as top-level).
+
+### Telegram Command
+
+```
+/todo add <text> --parent <id>
+```
+
+- `--parent` must come last.
+- Errors:
+  - "No item with ID N" — if parent does not exist.
+  - "Cannot nest deeper than 2 levels" — if parent already has a parent_id.
+
+---
+
+## 8. GitHub Links — Phase 2
 
 GitHub issue URLs are stored in `github_issue_url` on each action item.
 
