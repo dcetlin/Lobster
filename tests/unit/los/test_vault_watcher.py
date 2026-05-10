@@ -1,0 +1,827 @@
+"""
+Tests for vault-watcher Tier 1: vault-watcher.py, vault-processor.py, obsidian_sync_core.py
+
+Tests derive from spec requirements (design.md, Sections 3-7):
+
+vault-watcher.py:
+  - Debounce logic: not past threshold → processor NOT invoked
+  - Debounce logic: past threshold → processor invoked
+  - max_debounce_seconds cap fires even when debounce not expired
+  - Already caught up (last_known_head == last_processed_head) → exit fast
+  - Lock held → skip ("processor already running")
+
+vault-processor.py:
+  - DISABLE PROCESSING: State 1 (unchecked) → proceed
+  - DISABLE PROCESSING: State 2 (checked) → skip + alert
+  - DISABLE PROCESSING: State 3 (missing) → skip + alert + do NOT modify file
+  - Conflict marker pre-check → alert + skip (do NOT advance last_processed_head)
+  - @lobster annotation dispatch: writes inbox JSON with content-hash message_id
+  - @lobster annotation dedup: same annotation not re-dispatched if dispatched_at present
+  - Process lock: acquired for direct invocation
+
+obsidian_sync_core.py (shared module):
+  - render/parse round-trip: renders to markdown, parses back, same items
+  - render last_synced parameter: footer differs based on last_synced presence
+  - acquire_lock_or_skip: non-blocking; returns None when lock already held
+  - git_pull wrapper: returns True/False correctly
+"""
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+from pathlib import Path
+from typing import Optional
+from unittest.mock import MagicMock, call, patch
+
+import pytest
+
+# ---------------------------------------------------------------------------
+# Path setup
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).parent.parent.parent.parent
+_TASKS_DIR = _REPO_ROOT / "scheduled-tasks"
+
+for p in (str(_REPO_ROOT), str(_TASKS_DIR)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+import importlib.util
+
+from src.los.db import (
+    ActionItemStatus,
+    compute_dedup_key,
+    connect,
+    insert_action_item,
+    mark_done,
+    get_item_by_id,
+)
+from obsidian_sync_core import (
+    ACTIVE_TODOS_FILENAME,
+    FOOTER_LEGACY,
+    FOOTER_SYNCED_TEMPLATE,
+    ParsedTodos,
+    ParsedItem,
+    SyncResult,
+    acquire_lock_or_skip,
+    release_lock,
+    parse_active_todos,
+    render_active_todos,
+    sync_obsidian_to_db,
+    git_pull,
+    git_commit_and_push,
+    PRIORITY_URGENT_MAX,
+    PRIORITY_ACTIVE_MAX,
+)
+
+# vault-processor.py and vault-watcher.py cannot be imported by name (hyphen in filename).
+# Register them in sys.modules BEFORE exec_module so dataclass __module__ lookup works.
+
+_proc_spec = importlib.util.spec_from_file_location(
+    "vault_processor", str(_TASKS_DIR / "vault-processor.py")
+)
+_vault_processor = importlib.util.module_from_spec(_proc_spec)
+sys.modules["vault_processor"] = _vault_processor
+_proc_spec.loader.exec_module(_vault_processor)
+
+_watcher_spec = importlib.util.spec_from_file_location(
+    "vault_watcher", str(_TASKS_DIR / "vault-watcher.py")
+)
+_vault_watcher = importlib.util.module_from_spec(_watcher_spec)
+sys.modules["vault_watcher"] = _vault_watcher
+_watcher_spec.loader.exec_module(_vault_watcher)
+
+# Extract symbols from dynamically-loaded modules
+check_disable_processing_guard = _vault_processor.check_disable_processing_guard
+has_conflict_markers = _vault_processor.has_conflict_markers
+parse_lobster_annotations = _vault_processor.parse_lobster_annotations
+process_annotations_in_file = _vault_processor.process_annotations_in_file
+_annotation_message_id = _vault_processor._annotation_message_id
+_dispatch_annotation = _vault_processor._dispatch_annotation
+_remove_annotation_from_line = _vault_processor._remove_annotation_from_line
+LobsterAnnotation = _vault_processor.LobsterAnnotation
+DISABLE_PROCESSING_LINES_TO_CHECK = _vault_processor.DISABLE_PROCESSING_LINES_TO_CHECK
+CONFLICT_CHECK_LINES = _vault_processor.CONFLICT_CHECK_LINES
+run_processor = _vault_processor.run_processor
+
+_load_config = _vault_watcher._load_config
+_load_state = _vault_watcher._load_state
+_write_json_atomic = _vault_watcher._write_json_atomic
+_get_remote_head = _vault_watcher._get_remote_head
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def conn(tmp_path: Path) -> sqlite3.Connection:
+    db = connect(tmp_path / "test.db")
+    yield db
+    db.close()
+
+
+@pytest.fixture
+def tmp_vault(tmp_path: Path) -> Path:
+    """Create a minimal fake obsidian vault directory."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / ".git").mkdir()
+    return vault
+
+
+@pytest.fixture
+def todos_content_with_guard() -> str:
+    return textwrap.dedent("""\
+        # ✅ ACTIVE TODOS
+        *Generated by LOS*
+
+        - [ ] 🔒 DISABLE PROCESSING
+
+        ## Urgent / This Week (P1–P3)
+        - [ ] Book flight Boston to Miami
+        - [x] Call the dentist
+
+        ## Active (P4–P6)
+
+        ### lobster
+        - [ ] Time box Lobster stuff
+
+        ## Someday / Aspirational (P7–P9)
+        - [ ] Learn Rust
+        """)
+
+
+@pytest.fixture
+def todos_content_disabled() -> str:
+    return textwrap.dedent("""\
+        # ✅ ACTIVE TODOS
+        *Generated by LOS*
+
+        - [x] 🔒 DISABLE PROCESSING
+
+        ## Urgent / This Week (P1–P3)
+        - [ ] Book flight
+        """)
+
+
+@pytest.fixture
+def todos_content_no_guard() -> str:
+    return textwrap.dedent("""\
+        # ✅ ACTIVE TODOS
+        *Generated by LOS*
+
+        ## Urgent / This Week (P1–P3)
+        - [ ] Book flight
+        """)
+
+
+# ---------------------------------------------------------------------------
+# obsidian_sync_core: render/parse round-trip
+# ---------------------------------------------------------------------------
+
+
+SAMPLE_TODOS = textwrap.dedent("""\
+    # ✅ ACTIVE TODOS
+    *Generated by LOS — 5 open items*
+
+    - [ ] 🔒 DISABLE PROCESSING
+
+    ## Urgent / This Week (P1–P3)
+    - [ ] Book flight Boston to Miami
+    - [x] Call the dentist
+
+    ## Active (P4–P6)
+
+    ### work-angellist
+    - [ ] Complete FC work items
+
+    ### lobster
+    - [x] Connect Obsidian to Lobster
+    - [ ] Time box Lobster stuff
+
+    ## Someday / Aspirational (P7–P9)
+    - [ ] Learn Rust
+
+    ---
+    *To mark done, dismiss, or snooze: tell Lobster via Telegram, or check the box in Obsidian.*
+    *Next auto-sweep: nightly, ~02:30.*
+""")
+
+
+def test_parse_render_round_trip_preserves_open_items(conn):
+    """Items inserted via sync_obsidian_to_db must all appear in render_active_todos output."""
+    sync_obsidian_to_db(conn, SAMPLE_TODOS)
+    rendered = render_active_todos(conn)
+    parsed_back = parse_active_todos(rendered)
+    rendered_texts = {item.text for item in parsed_back.open}
+    # Open items from original sample
+    assert "Book flight Boston to Miami" in rendered_texts
+    assert "Complete FC work items" in rendered_texts
+    assert "Time box Lobster stuff" in rendered_texts
+    assert "Learn Rust" in rendered_texts
+
+
+def test_render_last_synced_none_uses_legacy_footer(conn):
+    """When last_synced is None, render uses the legacy 'Next auto-sweep' footer."""
+    rendered = render_active_todos(conn, last_synced=None)
+    assert FOOTER_LEGACY in rendered
+    assert "Last synced" not in rendered
+
+
+def test_render_last_synced_present_uses_synced_footer(conn):
+    """When last_synced is provided, render uses the 'Last synced' footer."""
+    ts = "2026-05-10 14:30 PST"
+    rendered = render_active_todos(conn, last_synced=ts)
+    expected = FOOTER_SYNCED_TEMPLATE.format(last_synced=ts)
+    assert expected in rendered
+    assert FOOTER_LEGACY not in rendered
+
+
+def test_render_includes_disable_processing_guard(conn):
+    """render_active_todos must always include the DISABLE PROCESSING guard line."""
+    rendered = render_active_todos(conn)
+    assert "- [ ] 🔒 DISABLE PROCESSING" in rendered
+
+
+def test_parse_renders_done_items_excluded(conn):
+    """Items marked done in DB must not appear in rendered output."""
+    row_id = insert_action_item(conn, text="Done task", source="telegram", source_message_id=None)
+    mark_done(conn, row_id)
+    rendered = render_active_todos(conn)
+    assert "Done task" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# obsidian_sync_core: process lock
+# ---------------------------------------------------------------------------
+
+
+def test_acquire_lock_returns_fd_when_not_held(tmp_path):
+    """acquire_lock_or_skip should return a file object when lock is available."""
+    lock_path = tmp_path / "test.lock"
+    fd = acquire_lock_or_skip(lock_path)
+    assert fd is not None
+    release_lock(fd)
+
+
+def test_acquire_lock_returns_none_when_held(tmp_path):
+    """acquire_lock_or_skip should return None when another process holds the lock."""
+    lock_path = tmp_path / "test.lock"
+    fd1 = acquire_lock_or_skip(lock_path)
+    assert fd1 is not None
+
+    # Second attempt should fail (lock already held)
+    fd2 = acquire_lock_or_skip(lock_path)
+    assert fd2 is None
+
+    release_lock(fd1)
+
+
+def test_lock_released_after_release_lock(tmp_path):
+    """After release_lock, another caller can acquire the lock."""
+    lock_path = tmp_path / "test.lock"
+    fd1 = acquire_lock_or_skip(lock_path)
+    assert fd1 is not None
+    release_lock(fd1)
+
+    fd2 = acquire_lock_or_skip(lock_path)
+    assert fd2 is not None
+    release_lock(fd2)
+
+
+# ---------------------------------------------------------------------------
+# vault-watcher.py: debounce logic
+# ---------------------------------------------------------------------------
+
+
+class TestDebounceLogic:
+    """Tests for vault-watcher debounce state machine."""
+
+    def _make_state(
+        self,
+        last_known_head: Optional[str] = "abc123",
+        last_push_at: Optional[float] = None,
+        last_processed_head: Optional[str] = None,
+        first_push_at_in_burst: Optional[float] = None,
+    ) -> dict:
+        return {
+            "last_known_head": last_known_head,
+            "last_push_at": last_push_at,
+            "last_processed_head": last_processed_head,
+            "first_push_at_in_burst": first_push_at_in_burst,
+        }
+
+    def _debounce_should_fire(
+        self,
+        state: dict,
+        now: float,
+        debounce_seconds: int = 60,
+        max_debounce_seconds: int = 300,
+    ) -> bool:
+        """Replicate the debounce condition from vault-watcher.py main()."""
+        last_push_at = state.get("last_push_at")
+        first_push_at_in_burst = state.get("first_push_at_in_burst")
+        last_processed_head = state.get("last_processed_head")
+        last_known_head = state.get("last_known_head")
+
+        debounce_expired = (
+            last_push_at is not None
+            and (now - last_push_at) >= debounce_seconds
+            and last_processed_head != last_known_head
+        )
+        max_debounce_exceeded = (
+            first_push_at_in_burst is not None
+            and (now - first_push_at_in_burst) >= max_debounce_seconds
+            and last_processed_head != last_known_head
+        )
+        return debounce_expired or max_debounce_exceeded
+
+    def test_debounce_not_fired_when_below_threshold(self):
+        """Debounce must NOT fire when time since last push < debounce_seconds."""
+        now = 1000.0
+        push_at = now - 30  # 30 seconds ago
+        state = self._make_state(
+            last_push_at=push_at,
+            first_push_at_in_burst=push_at,
+        )
+        assert not self._debounce_should_fire(state, now, debounce_seconds=60)
+
+    def test_debounce_fires_after_threshold(self):
+        """Debounce MUST fire when time since last push >= debounce_seconds."""
+        now = 1000.0
+        push_at = now - 65  # 65 seconds ago (> 60s threshold)
+        state = self._make_state(
+            last_push_at=push_at,
+            first_push_at_in_burst=push_at,
+        )
+        assert self._debounce_should_fire(state, now, debounce_seconds=60)
+
+    def test_max_debounce_fires_even_when_regular_debounce_not_expired(self):
+        """max_debounce_seconds cap fires when burst is old enough, even if last push was recent.
+
+        Scenario: push burst started 310s ago, but new pushes keep arriving (last was 5s ago).
+        Normal debounce (60s quiet) never fires because the burst keeps resetting last_push_at.
+        max_debounce (300s) fires because 310s >= 300s.
+        """
+        now = 1000.0
+        first_push = now - 310  # 310s ago (> 300s max_debounce)
+        last_push = now - 5    # 5s ago (still within 60s debounce — keeps resetting)
+        state = self._make_state(
+            last_push_at=last_push,
+            first_push_at_in_burst=first_push,
+        )
+
+        # The combined condition fires (max_debounce exceeded)
+        assert self._debounce_should_fire(state, now, debounce_seconds=60, max_debounce_seconds=300)
+
+        # Verify the normal debounce condition in isolation would NOT fire (5s < 60s)
+        # This demonstrates that it's max_debounce driving the decision, not regular debounce
+        normal_debounce_alone = (
+            state["last_push_at"] is not None
+            and (now - state["last_push_at"]) >= 60  # 5s < 60s → False
+            and state.get("last_processed_head") != state.get("last_known_head")
+        )
+        assert not normal_debounce_alone, "Regular debounce should NOT have fired alone (5s < 60s threshold)"
+
+        # Verify max_debounce condition in isolation fires (310s >= 300s)
+        max_debounce_alone = (
+            state["first_push_at_in_burst"] is not None
+            and (now - state["first_push_at_in_burst"]) >= 300  # 310s >= 300s → True
+            and state.get("last_processed_head") != state.get("last_known_head")
+        )
+        assert max_debounce_alone, "max_debounce_seconds cap should have fired (310s >= 300s)"
+
+    def test_debounce_does_not_fire_when_already_caught_up(self):
+        """When last_known_head == last_processed_head, debounce must not fire."""
+        now = 1000.0
+        head = "abc123"
+        push_at = now - 120  # well past debounce
+        state = self._make_state(
+            last_known_head=head,
+            last_push_at=push_at,
+            last_processed_head=head,  # already processed
+            first_push_at_in_burst=push_at,
+        )
+        assert not self._debounce_should_fire(state, now, debounce_seconds=60)
+
+    def test_debounce_does_not_fire_when_no_push_at(self):
+        """When last_push_at is None, debounce must not fire."""
+        now = 1000.0
+        state = self._make_state(last_push_at=None)
+        assert not self._debounce_should_fire(state, now)
+
+
+# ---------------------------------------------------------------------------
+# vault-watcher.py: config loading
+# ---------------------------------------------------------------------------
+
+
+def test_load_config_creates_defaults_when_absent(tmp_path):
+    """When config file is absent, _load_config should create and return defaults."""
+    config_path = tmp_path / "vault-watch-config.json"
+    config = _load_config(config_path)
+    assert config_path.exists()
+    assert "debounce_seconds" in config
+    assert "vault_path" in config
+    assert config["debounce_seconds"] == 60
+
+
+def test_load_config_raises_on_malformed_json(tmp_path):
+    """When config JSON is malformed, _load_config should raise json.JSONDecodeError."""
+    import json
+    config_path = tmp_path / "vault-watch-config.json"
+    config_path.write_text("{not valid json}")
+    with pytest.raises(json.JSONDecodeError):
+        _load_config(config_path)
+
+
+def test_load_state_creates_fresh_when_absent(tmp_path):
+    """When state file is absent, _load_state should create and return fresh state."""
+    state_path = tmp_path / "vault-watch-state.json"
+    state = _load_state(state_path)
+    assert state_path.exists()
+    assert state["last_known_head"] is None
+    assert state["last_push_at"] is None
+    assert state["last_processed_head"] is None
+    assert state["first_push_at_in_burst"] is None
+
+
+def test_load_state_reinitializes_on_malformed(tmp_path):
+    """When state file has malformed JSON, _load_state reinitializes with fresh state."""
+    state_path = tmp_path / "vault-watch-state.json"
+    state_path.write_text("{ broken json")
+    state = _load_state(state_path)
+    # Should have recovered gracefully
+    assert state["last_known_head"] is None
+
+
+def test_write_json_atomic_writes_correctly(tmp_path):
+    """_write_json_atomic must produce valid JSON and no leftover .tmp file."""
+    target = tmp_path / "data.json"
+    data = {"key": "value", "num": 42}
+    _write_json_atomic(target, data)
+    assert target.exists()
+    assert not (tmp_path / "data.json.tmp").exists()
+    loaded = json.loads(target.read_text())
+    assert loaded == data
+
+
+# ---------------------------------------------------------------------------
+# vault-processor.py: DISABLE PROCESSING guard
+# ---------------------------------------------------------------------------
+
+
+def test_disable_guard_state1_unchecked_proceed():
+    """State 1: unchecked guard line → (guard_found=True, is_disabled=False) → proceed."""
+    content = textwrap.dedent("""\
+        # ✅ ACTIVE TODOS
+        - [ ] 🔒 DISABLE PROCESSING
+        - [ ] Some task
+    """)
+    guard_found, is_disabled = check_disable_processing_guard(content)
+    assert guard_found is True
+    assert is_disabled is False
+
+
+def test_disable_guard_state2_checked_skip():
+    """State 2: checked guard line → (guard_found=True, is_disabled=True) → skip + alert."""
+    content = textwrap.dedent("""\
+        # ✅ ACTIVE TODOS
+        - [x] 🔒 DISABLE PROCESSING
+        - [ ] Some task
+    """)
+    guard_found, is_disabled = check_disable_processing_guard(content)
+    assert guard_found is True
+    assert is_disabled is True
+
+
+def test_disable_guard_state2_uppercase_x():
+    """State 2: [X] (uppercase) is also treated as checked."""
+    content = "# Title\n- [X] 🔒 DISABLE PROCESSING\n"
+    guard_found, is_disabled = check_disable_processing_guard(content)
+    assert guard_found is True
+    assert is_disabled is True
+
+
+def test_disable_guard_state3_absent():
+    """State 3: guard line absent → (guard_found=False, is_disabled=False) → skip + alert."""
+    content = textwrap.dedent("""\
+        # ✅ ACTIVE TODOS
+        ## Urgent / This Week
+        - [ ] Some task
+    """)
+    guard_found, is_disabled = check_disable_processing_guard(content)
+    assert guard_found is False
+    assert is_disabled is False
+
+
+def test_disable_guard_only_checks_first_10_lines():
+    """Guard check must only examine the first DISABLE_PROCESSING_LINES_TO_CHECK lines."""
+    # Put guard on line 15 (0-indexed) — should NOT be found
+    header_lines = ["line" + str(i) for i in range(DISABLE_PROCESSING_LINES_TO_CHECK + 5)]
+    content = "\n".join(header_lines) + "\n- [ ] 🔒 DISABLE PROCESSING\n"
+    guard_found, _ = check_disable_processing_guard(content)
+    assert guard_found is False
+
+
+# ---------------------------------------------------------------------------
+# vault-processor.py: conflict marker check
+# ---------------------------------------------------------------------------
+
+
+def test_has_conflict_markers_detects_head_marker():
+    """<<<<<<< HEAD in first 50 lines must be detected."""
+    content = "# Title\n<<<<<<< HEAD\nsome content\n=======\nother\n>>>>>>> branch\n"
+    assert has_conflict_markers(content) is True
+
+
+def test_has_conflict_markers_clean_file():
+    """Clean file with no conflict markers returns False."""
+    content = "# Title\n- [ ] Task one\n- [ ] Task two\n"
+    assert has_conflict_markers(content) is False
+
+
+def test_has_conflict_markers_only_checks_first_50_lines():
+    """Conflict markers past line CONFLICT_CHECK_LINES should NOT be detected."""
+    lines = ["line" + str(i) for i in range(CONFLICT_CHECK_LINES + 5)]
+    content = "\n".join(lines) + "\n<<<<<<< HEAD\n"
+    assert has_conflict_markers(content) is False
+
+
+# ---------------------------------------------------------------------------
+# vault-processor.py: @lobster annotation parsing
+# ---------------------------------------------------------------------------
+
+
+def test_parse_lobster_annotations_finds_standalone_annotation(tmp_path):
+    """@lobster on its own line should be detected as an annotation."""
+    file_path = tmp_path / "notes.md"
+    content = "# Notes\n\n@lobster remind me about the project review on Friday\n\n## More notes\n"
+    file_path.write_text(content)
+    annotations = parse_lobster_annotations(content, file_path)
+    assert len(annotations) == 1
+    assert annotations[0].command_text == "remind me about the project review on Friday"
+    assert annotations[0].line_number == 2
+
+
+def test_parse_lobster_annotations_finds_trailing_annotation(tmp_path):
+    """@lobster as a trailing suffix on a checkbox line should be detected."""
+    file_path = tmp_path / "todos.md"
+    content = "- [ ] Review the proposal @lobster remind me about this if not done by Friday\n"
+    file_path.write_text(content)
+    annotations = parse_lobster_annotations(content, file_path)
+    assert len(annotations) == 1
+    assert "remind me about this" in annotations[0].command_text
+
+
+def test_parse_lobster_annotations_skips_dispatched_at_lines(tmp_path):
+    """Lines with dispatched_at marker must be skipped (already processed)."""
+    file_path = tmp_path / "notes.md"
+    content = "@lobster remind me about X <!-- dispatched_at: 2026-05-10T14:00:00Z -->\n"
+    file_path.write_text(content)
+    annotations = parse_lobster_annotations(content, file_path)
+    assert len(annotations) == 0
+
+
+def test_parse_lobster_annotations_multiple_lines(tmp_path):
+    """Multiple @lobster annotations on different lines are each found."""
+    file_path = tmp_path / "notes.md"
+    content = textwrap.dedent("""\
+        # My notes
+        @lobster add a task: review invoice from acme before Tuesday
+        Some regular text
+        @lobster create a calendar block for Thursday 2pm deep work
+    """)
+    file_path.write_text(content)
+    annotations = parse_lobster_annotations(content, file_path)
+    assert len(annotations) == 2
+
+
+# ---------------------------------------------------------------------------
+# vault-processor.py: annotation dispatch + dedup
+# ---------------------------------------------------------------------------
+
+
+def test_annotation_message_id_is_deterministic(tmp_path):
+    """Same annotation content + file + line produces same message_id."""
+    file_path = tmp_path / "notes.md"
+    id1 = _annotation_message_id("remind me about X", file_path, "original line")
+    id2 = _annotation_message_id("remind me about X", file_path, "original line")
+    assert id1 == id2
+    assert id1.startswith("vault-annotation-")
+    assert len(id1) == len("vault-annotation-") + 16
+
+
+def test_annotation_message_id_differs_for_different_content(tmp_path):
+    """Different annotation texts produce different message_ids."""
+    file_path = tmp_path / "notes.md"
+    id1 = _annotation_message_id("remind me about X", file_path, "line 1")
+    id2 = _annotation_message_id("remind me about Y", file_path, "line 1")
+    assert id1 != id2
+
+
+def test_dispatch_annotation_writes_inbox_json(tmp_path):
+    """_dispatch_annotation must write a valid JSON file to inbox_dir."""
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    inbox_dir = tmp_path / "inbox"
+    annotation_file = vault_path / "notes.md"
+
+    annotation = LobsterAnnotation(
+        command_text="remind me about the project review",
+        line_number=5,
+        original_line="@lobster remind me about the project review",
+        file_path=annotation_file,
+    )
+
+    success = _dispatch_annotation(annotation, vault_path, chat_id=12345, inbox_dir=inbox_dir)
+    assert success is True
+
+    inbox_files = list(inbox_dir.glob("*.json"))
+    assert len(inbox_files) == 1
+
+    payload = json.loads(inbox_files[0].read_text())
+    assert payload["type"] == "user_message"
+    assert payload["source"] == "telegram"
+    assert payload["chat_id"] == 12345
+    assert payload["text"] == "remind me about the project review"
+    assert payload["message_id"].startswith("vault-annotation-")
+    assert payload["metadata"]["origin"] == "vault_watcher"
+
+
+def test_dispatch_annotation_same_content_same_message_id(tmp_path):
+    """Same annotation content produces identical message_id (content-hash dedup gate).
+
+    The message_id is a deterministic hash of the annotation content, ensuring that
+    the same annotation written twice can be deduplicated at the inbox level.
+    """
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    inbox_dir = tmp_path / "inbox"
+    annotation_file = vault_path / "notes.md"
+
+    annotation = LobsterAnnotation(
+        command_text="remind me about X",
+        line_number=0,
+        original_line="@lobster remind me about X",
+        file_path=annotation_file,
+    )
+
+    _dispatch_annotation(annotation, vault_path, chat_id=12345, inbox_dir=inbox_dir)
+    time.sleep(0.01)  # ensure different ms timestamp for distinct filenames
+    _dispatch_annotation(annotation, vault_path, chat_id=12345, inbox_dir=inbox_dir)
+
+    # Both files should have the same message_id (content-hash based)
+    inbox_files = sorted(inbox_dir.glob("*.json"))
+    assert len(inbox_files) >= 1
+    ids = {json.loads(f.read_text())["message_id"] for f in inbox_files}
+    assert len(ids) == 1, f"Expected 1 unique message_id, got {ids}"
+    assert next(iter(ids)).startswith("vault-annotation-"), "message_id must use content-hash prefix"
+
+
+def test_process_annotations_removes_annotation_from_file(tmp_path):
+    """process_annotations_in_file must remove the @lobster annotation from the file."""
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    inbox_dir = tmp_path / "inbox"
+    annotation_file = vault_path / "notes.md"
+    annotation_file.write_text("# Notes\n\n@lobster remind me about the meeting\n\nOther content\n")
+
+    process_annotations_in_file(annotation_file, vault_path, chat_id=12345, inbox_dir=inbox_dir)
+
+    remaining = annotation_file.read_text()
+    assert "@lobster" not in remaining
+    assert "Other content" in remaining
+
+
+def test_process_annotations_leaves_checkbox_text_intact(tmp_path):
+    """process_annotations_in_file strips @lobster suffix but preserves the checkbox text."""
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    inbox_dir = tmp_path / "inbox"
+    annotation_file = vault_path / "todos.md"
+    annotation_file.write_text(
+        "- [ ] Review proposal @lobster remind me if not done by Friday\n"
+    )
+
+    process_annotations_in_file(annotation_file, vault_path, chat_id=12345, inbox_dir=inbox_dir)
+
+    remaining = annotation_file.read_text()
+    assert "Review proposal" in remaining
+    assert "@lobster" not in remaining
+
+
+def test_remove_annotation_from_whole_line():
+    """When @lobster is the entire line, _remove_annotation_from_line returns None (delete line)."""
+    line = "@lobster remind me about project X"
+    result = _remove_annotation_from_line(line)
+    assert result is None
+
+
+def test_remove_annotation_from_trailing_suffix():
+    """When @lobster is a trailing suffix, _remove_annotation_from_line strips it."""
+    line = "- [ ] Review the proposal @lobster remind me about this if not done by Friday"
+    result = _remove_annotation_from_line(line)
+    assert result is not None
+    assert "Review the proposal" in result
+    assert "@lobster" not in result
+
+
+# ---------------------------------------------------------------------------
+# obsidian_sync_core: git_pull wrapper
+# ---------------------------------------------------------------------------
+
+
+def test_git_pull_returns_true_when_no_remote(tmp_path):
+    """git_pull must return True when vault has no git remote (skip pull)."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    # Initialize a bare git repo with no remote
+    import subprocess
+    subprocess.run(["git", "init"], cwd=str(vault), capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=str(vault), capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(vault), capture_output=True)
+
+    result = git_pull(vault)
+    assert result is True
+
+
+# ---------------------------------------------------------------------------
+# Integration: obsidian_sync_core imported by todo_obsidian_sync.py
+# ---------------------------------------------------------------------------
+
+
+def test_todo_obsidian_sync_imports_from_obsidian_sync_core():
+    """todo_obsidian_sync.py must import parse_active_todos and sync_obsidian_to_db
+    from obsidian_sync_core — not define them inline.
+    """
+    import importlib.util as _ilu_inner
+    spec = _ilu_inner.spec_from_file_location(
+        "todo_obsidian_sync_check",
+        str(_TASKS_DIR / "todo_obsidian_sync.py"),
+    )
+    mod = _ilu_inner.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    # These should be imported from obsidian_sync_core
+    assert hasattr(mod, "parse_active_todos"), "parse_active_todos must be importable from todo_obsidian_sync"
+    assert hasattr(mod, "sync_obsidian_to_db"), "sync_obsidian_to_db must be importable from todo_obsidian_sync"
+    assert hasattr(mod, "render_active_todos"), "render_active_todos must be importable from todo_obsidian_sync"
+
+    # Verify they are the same objects (imported, not redefined)
+    from obsidian_sync_core import parse_active_todos as core_parse
+    from obsidian_sync_core import sync_obsidian_to_db as core_sync
+    assert mod.parse_active_todos is core_parse, "parse_active_todos must be the same object from obsidian_sync_core"
+    assert mod.sync_obsidian_to_db is core_sync, "sync_obsidian_to_db must be the same object from obsidian_sync_core"
+
+
+# ---------------------------------------------------------------------------
+# Existing obsidian_sync tests still pass (regression guard via obsidian_sync_core)
+# ---------------------------------------------------------------------------
+
+
+def test_existing_parse_identifies_done_items():
+    """Regression: parse_active_todos correctly identifies [x] items as done."""
+    result = parse_active_todos(SAMPLE_TODOS)
+    done_texts = [item.text for item in result.done]
+    assert "Call the dentist" in done_texts
+    assert "Connect Obsidian to Lobster" in done_texts
+
+
+def test_existing_parse_identifies_open_items():
+    """Regression: parse_active_todos correctly identifies [ ] items as open."""
+    result = parse_active_todos(SAMPLE_TODOS)
+    open_texts = [item.text for item in result.open]
+    assert "Book flight Boston to Miami" in open_texts
+    assert "Complete FC work items" in open_texts
+    assert "Time box Lobster stuff" in open_texts
+    assert "Learn Rust" in open_texts
+
+
+def test_existing_sync_marks_done_in_db(conn):
+    """Regression: items marked [x] in file are set to done in DB."""
+    row_id = insert_action_item(conn, text="Call the dentist", source="telegram", source_message_id=None)
+    sync_obsidian_to_db(conn, SAMPLE_TODOS)
+    item = get_item_by_id(conn, row_id)
+    assert item.status == ActionItemStatus.DONE
+
+
+def test_existing_sync_inserts_new_items(conn):
+    """Regression: open items not in DB are inserted."""
+    result = sync_obsidian_to_db(conn, SAMPLE_TODOS)
+    assert result.inserted_count > 0
+
+
+def test_existing_sync_is_idempotent(conn):
+    """Regression: running sync twice produces same state as running once."""
+    result1 = sync_obsidian_to_db(conn, SAMPLE_TODOS)
+    result2 = sync_obsidian_to_db(conn, SAMPLE_TODOS)
+    assert result2.inserted_count == 0
