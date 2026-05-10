@@ -428,6 +428,25 @@ def handle_wos_status(status: str | None, *, registry: "Registry") -> str:
     return "\n".join(lines)
 
 
+def handle_wos_dashboard() -> str:
+    """
+    Generate a fresh WOS HTML dashboard from live registry data and upload to Bisque.
+
+    Calls wos_dashboard_gen.generate_and_upload() which:
+      1. Queries the registry DB for all UoW data (status counts, audit trail, etc.)
+      2. Reads the token ledger for Claude Code usage stats
+      3. Renders a self-contained HTML file with embedded JSON
+      4. Writes it to ~/messages/bisque-uploads/ with a UUID filename
+      5. Returns the public Bisque URL
+
+    Returns a formatted reply string with the URL.
+    """
+    from src.orchestration.wos_dashboard_gen import generate_and_upload
+
+    url = generate_and_upload()
+    return f"WOS Dashboard ready: {url}"
+
+
 def handle_wos_execute(uow_id: str, instructions: str, output_ref: str) -> str:
     """
     Build the Task prompt for a wos_execute inbox message.
