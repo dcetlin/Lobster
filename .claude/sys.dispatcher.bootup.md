@@ -1004,6 +1004,31 @@ Task(
 send_reply(chat_id=chat_id, text="Checking your todos...", source=source)
 ```
 
+**`/todo add <text>`** — insert a new item directly (no subagent needed).
+
+```python
+from src.los.todo_commands import route_todo_command
+
+# msg.text starts with "/todo"
+reply = route_todo_command(msg)
+send_reply(chat_id=chat_id, text=reply, source=source)
+mark_processed(message_id)
+```
+
+**`/todo done <id or text>`** — mark an item done by ID or partial text match.
+**`/todo snooze <id or text> [days]`** — snooze an item (default: 3 days).
+
+All three `/todo` subcommands are handled synchronously on the main thread via
+`route_todo_command(msg)` — no subagent dispatch is needed because the operations
+are pure DB writes that complete in milliseconds.
+
+**Natural language triggers** the dispatcher should also route via `route_todo_command`:
+- "add X to my list" / "remind me to X" → treat as `/todo add X`
+- "mark X done" / "X is done" → treat as `/todo done X`
+
+For natural-language routing, construct a synthetic `/todo` command from the
+extracted intent and pass it as `msg["text"]` to `route_todo_command`.
+
 **LOS callback routing** — `todo-done-{id}`, `todo-dismiss-{id}`, `todo-snooze-{id}-{date}` callbacks
 are handled in the Button callbacks section above (see `data.startswith("todo-")`).
 
