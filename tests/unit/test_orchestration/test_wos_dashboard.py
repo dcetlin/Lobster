@@ -11,8 +11,13 @@ Tests cover:
 - build_dashboard_data: assembles all sections into a single dict
 - render_text: renders expected section headers and data
 - render_text: empty states render '(none)' placeholders
+- generate_drilldown_urls: generates URL map for given UoW IDs, skips on error
+- render_html: produces valid HTML with UoW table and drilldown links when urls provided
+- render_html: renders UoW IDs as plain text when no drilldown URLs provided
 - main(): exits 0, text format default
 - main(): --format json outputs valid JSON
+- main(): --format html outputs valid HTML
+- main(): --with-drilldowns flag calls generate_drilldown_urls
 """
 
 from __future__ import annotations
@@ -459,3 +464,178 @@ class TestMain:
         out = capsys.readouterr().out
         # Text output has section headers, not JSON
         assert "[1]" in out
+
+    def test_format_html_outputs_html(self, tmp_path, capsys):
+        from src.orchestration.wos_dashboard import main
+        db = tmp_path / "registry.db"
+        with self._patch_all(tmp_path):
+            rc = main(["--db", str(db), "--format", "html"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "<!DOCTYPE html>" in out
+        assert "WOS Dashboard" in out
+
+    def test_with_drilldowns_calls_generate_drilldown_urls(self, tmp_path, capsys):
+        """--with-drilldowns causes generate_drilldown_urls to be called for each active UoW."""
+        from src.orchestration.wos_dashboard import main
+        db = tmp_path / "registry.db"
+        with self._patch_all(tmp_path), \
+             patch("src.orchestration.wos_dashboard.generate_drilldown_urls", return_value={}) as mock_gen:
+            rc = main(["--db", str(db), "--format", "html", "--with-drilldowns"])
+        assert rc == 0
+        mock_gen.assert_called_once()
+
+    def test_without_drilldowns_does_not_call_generate_drilldown_urls(self, tmp_path, capsys):
+        """Without --with-drilldowns, generate_drilldown_urls is NOT called."""
+        from src.orchestration.wos_dashboard import main
+        db = tmp_path / "registry.db"
+        with self._patch_all(tmp_path), \
+             patch("src.orchestration.wos_dashboard.generate_drilldown_urls", return_value={}) as mock_gen:
+            rc = main(["--db", str(db), "--format", "html"])
+        assert rc == 0
+        mock_gen.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# generate_drilldown_urls
+# ---------------------------------------------------------------------------
+
+class TestGenerateDrilldownUrls:
+    def test_returns_url_map_for_given_uow_ids(self):
+        """generate_drilldown_urls returns {uow_id: url} for each id that succeeds."""
+        from src.orchestration.wos_dashboard import generate_drilldown_urls
+
+        def fake_generate(uow_id, db_path=None, ledger_path=None):
+            return f"http://test:9101/files/{uow_id}.html"
+
+        with patch(
+            "src.orchestration.wos_uow_detail_gen.generate_and_upload",
+            side_effect=fake_generate,
+        ):
+            result = generate_drilldown_urls(
+                uow_ids=["uow_a", "uow_b"],
+                db_path=None,
+                ledger_path=None,
+            )
+
+        assert result == {
+            "uow_a": "http://test:9101/files/uow_a.html",
+            "uow_b": "http://test:9101/files/uow_b.html",
+        }
+
+    def test_skips_uow_on_error_without_raising(self):
+        """If generate_and_upload raises for one UoW, that UoW is omitted; others succeed."""
+        from src.orchestration.wos_dashboard import generate_drilldown_urls
+
+        def fake_generate(uow_id, db_path=None, ledger_path=None):
+            if uow_id == "uow_bad":
+                raise ValueError("UoW not found")
+            return f"http://test:9101/files/{uow_id}.html"
+
+        with patch(
+            "src.orchestration.wos_uow_detail_gen.generate_and_upload",
+            side_effect=fake_generate,
+        ):
+            result = generate_drilldown_urls(
+                uow_ids=["uow_good", "uow_bad"],
+                db_path=None,
+                ledger_path=None,
+            )
+
+        assert "uow_good" in result
+        assert "uow_bad" not in result
+
+    def test_empty_ids_returns_empty_dict(self):
+        from src.orchestration.wos_dashboard import generate_drilldown_urls
+        result = generate_drilldown_urls(uow_ids=[], db_path=None, ledger_path=None)
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# render_html
+# ---------------------------------------------------------------------------
+
+class TestRenderHtml:
+    def _base_data(self) -> dict:
+        return {
+            "generated_at": "2026-05-10T12:00:00+00:00",
+            "active_uows": [
+                {
+                    "id": "uow_20260101_abc",
+                    "status": "active",
+                    "steward_cycles": 3,
+                    "time_in_state_seconds": 600,
+                }
+            ],
+            "throughput_24h": {"completed": 5, "failed": 1},
+            "cycle_histogram_7d": {"cycles=1": 3, "cycles=2": 1},
+            "stalled_uows": [],
+            "bootup_candidate_gate": {
+                "gate_open": False,
+                "blocked_count": 0,
+                "description": "gate is CLOSED — all UoWs are processed normally",
+            },
+        }
+
+    def test_output_is_valid_html(self):
+        from src.orchestration.wos_dashboard import render_html
+        html = render_html(self._base_data(), drilldown_urls={})
+        assert "<!DOCTYPE html>" in html
+        assert "<html" in html
+        assert "</html>" in html
+
+    def test_uow_id_appears_in_html(self):
+        from src.orchestration.wos_dashboard import render_html
+        html = render_html(self._base_data(), drilldown_urls={})
+        assert "uow_20260101_abc" in html
+
+    def test_drilldown_link_rendered_when_url_provided(self):
+        """UoW ID cell becomes a link when a drilldown URL is available."""
+        from src.orchestration.wos_dashboard import render_html
+        urls = {"uow_20260101_abc": "http://test:9101/files/abc.html"}
+        html = render_html(self._base_data(), drilldown_urls=urls)
+        assert 'href="http://test:9101/files/abc.html"' in html
+        assert "uow_20260101_abc" in html
+
+    def test_no_link_when_no_drilldown_url(self):
+        """When drilldown_urls is empty, UoW ID appears as plain text (no href link for it)."""
+        from src.orchestration.wos_dashboard import render_html
+        html = render_html(self._base_data(), drilldown_urls={})
+        # The uow id appears but there should be no drilldown href for it
+        assert "uow_20260101_abc" in html
+        assert "http://test:9101/files/" not in html
+
+    def test_dashboard_title_in_html(self):
+        from src.orchestration.wos_dashboard import render_html
+        html = render_html(self._base_data(), drilldown_urls={})
+        assert "WOS Dashboard" in html
+
+    def test_throughput_numbers_in_html(self):
+        from src.orchestration.wos_dashboard import render_html
+        html = render_html(self._base_data(), drilldown_urls={})
+        assert "5" in html   # completed count
+        assert "1" in html   # failed count
+
+    def test_stall_section_present(self):
+        from src.orchestration.wos_dashboard import render_html
+        data = self._base_data()
+        data["stalled_uows"] = [{
+            "id": "uow_stalled",
+            "status": "ready-for-steward",
+            "time_in_state_seconds": 3600,
+        }]
+        html = render_html(data, drilldown_urls={})
+        assert "uow_stalled" in html
+
+    def test_drilldown_links_for_stalled_uow(self):
+        """Stalled UoWs also get drilldown links when URLs are available."""
+        from src.orchestration.wos_dashboard import render_html
+        data = self._base_data()
+        data["stalled_uows"] = [{
+            "id": "uow_stalled_x",
+            "status": "ready-for-steward",
+            "time_in_state_seconds": 3600,
+        }]
+        urls = {"uow_stalled_x": "http://test:9101/files/stalled.html"}
+        html = render_html(data, drilldown_urls=urls)
+        assert 'href="http://test:9101/files/stalled.html"' in html
