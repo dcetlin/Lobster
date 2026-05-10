@@ -9,9 +9,8 @@ Named after behaviors:
   - test_skips_run_when_cookie_file_absent
   - test_skips_run_when_cookie_contains_only_comments
   - test_reads_cookie_from_first_non_comment_line
-  - test_parse_standard_rate_limits_response
-  - test_parse_response_with_alternate_used_percentage_key
-  - test_parse_response_raises_when_rate_limits_absent
+  - test_parse_standard_usage_response
+  - test_parse_response_raises_when_expected_keys_absent
   - test_merge_preserves_existing_snapshots_and_cost
   - test_merge_overwrites_rate_limits_and_timestamps
   - test_merge_sets_source_tag_to_poller
@@ -27,14 +26,22 @@ import importlib
 import importlib.util
 import json
 import textwrap
-import urllib.error
 from datetime import datetime
-from io import BytesIO
 from pathlib import Path
 from types import ModuleType
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+
+# requests exceptions are available at test-time through the cloudscraper
+# dependency pulled in by the poller script.
+try:
+    import requests.exceptions as _req_exc
+    _RequestsHTTPError = _req_exc.HTTPError
+    _RequestsConnectionError = _req_exc.ConnectionError
+except ImportError:  # pragma: no cover
+    _RequestsHTTPError = Exception
+    _RequestsConnectionError = Exception
 
 # ---------------------------------------------------------------------------
 # Load the script under test via importlib (it lives in scheduled-tasks/,
@@ -65,11 +72,11 @@ SOURCE_TAG = _mod.SOURCE_TAG
 # Fixtures
 # ---------------------------------------------------------------------------
 
+# Shape matches /api/organizations/{org_id}/usage as documented in cc-usage-poller.py:
+# { "five_hour": {"utilization": <float>, "resets_at": "<ISO8601>"}, "seven_day": {...}, ... }
 STANDARD_API_RESPONSE = {
-    "rate_limits": {
-        "five_hour": {"used_percentage": 24.5, "resets_at": 1712345678},
-        "seven_day": {"used_percentage": 31.2, "resets_at": 1712987654},
-    }
+    "five_hour": {"utilization": 24.5, "resets_at": "2026-05-10T12:00:00Z"},
+    "seven_day": {"utilization": 31.2, "resets_at": "2026-05-17T12:00:00Z"},
 }
 
 EXISTING_STATE = {
@@ -145,53 +152,25 @@ def test_reads_cookie_ignoring_leading_whitespace(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_parse_standard_rate_limits_response() -> None:
-    """Standard API response with five_hour and seven_day is parsed correctly."""
+def test_parse_standard_usage_response() -> None:
+    """Standard API response with five_hour and seven_day at top level is parsed correctly."""
     result = parse_usage_response(STANDARD_API_RESPONSE)
     assert result["five_hour_pct"] == 24.5
     assert result["seven_day_pct"] == 31.2
-    assert result["five_hour_resets_at"] == 1712345678
-    assert result["seven_day_resets_at"] == 1712987654
+    assert result["five_hour_resets_at"] == "2026-05-10T12:00:00Z"
+    assert result["seven_day_resets_at"] == "2026-05-17T12:00:00Z"
 
 
-def test_parse_response_with_used_percentage_key() -> None:
-    """'used_percentage' key in API response maps to *_pct in parsed output."""
-    response = {
-        "rate_limits": {
-            "five_hour": {"used_percentage": 50.0, "resets_at": 999},
-            "seven_day": {"used_percentage": 75.0, "resets_at": 888},
-        }
-    }
-    result = parse_usage_response(response)
-    assert result["five_hour_pct"] == 50.0
-    assert result["seven_day_pct"] == 75.0
-
-
-def test_parse_response_with_pct_key_fallback() -> None:
-    """If 'used_percentage' is absent, 'pct' key is accepted as fallback."""
-    response = {
-        "rate_limits": {
-            "five_hour": {"pct": 33.0, "resets_at": 111},
-            "seven_day": {"pct": 66.0, "resets_at": 222},
-        }
-    }
-    result = parse_usage_response(response)
-    assert result["five_hour_pct"] == 33.0
-    assert result["seven_day_pct"] == 66.0
-
-
-def test_parse_response_raises_when_rate_limits_absent() -> None:
-    """Response without 'rate_limits' key raises ValueError with a descriptive message."""
-    with pytest.raises(ValueError, match="rate_limits"):
+def test_parse_response_raises_when_expected_keys_absent() -> None:
+    """Response without 'five_hour' or 'seven_day' keys raises ValueError."""
+    with pytest.raises(ValueError, match="five_hour"):
         parse_usage_response({"some_other_key": "value"})
 
 
 def test_parse_response_tolerates_missing_five_hour() -> None:
-    """If five_hour is absent from rate_limits, pct is None rather than raising."""
+    """If five_hour is absent, five_hour_pct is None rather than raising."""
     response = {
-        "rate_limits": {
-            "seven_day": {"used_percentage": 42.0, "resets_at": 333},
-        }
+        "seven_day": {"utilization": 42.0, "resets_at": "2026-05-17T12:00:00Z"},
     }
     result = parse_usage_response(response)
     assert result["five_hour_pct"] is None
@@ -204,9 +183,9 @@ def test_parse_response_tolerates_missing_five_hour() -> None:
 
 PARSED_USAGE = {
     "five_hour_pct": 24.5,
-    "five_hour_resets_at": 1712345678,
+    "five_hour_resets_at": "2026-05-10T12:00:00Z",
     "seven_day_pct": 31.2,
-    "seven_day_resets_at": 1712987654,
+    "seven_day_resets_at": "2026-05-17T12:00:00Z",
 }
 
 
@@ -222,8 +201,8 @@ def test_merge_overwrites_rate_limits_with_fresh_data() -> None:
     result = merge_into_state(EXISTING_STATE, PARSED_USAGE)
     assert result["rate_limits"]["five_hour"]["pct"] == 24.5
     assert result["rate_limits"]["seven_day"]["pct"] == 31.2
-    assert result["rate_limits"]["five_hour"]["resets_at"] == 1712345678
-    assert result["rate_limits"]["seven_day"]["resets_at"] == 1712987654
+    assert result["rate_limits"]["five_hour"]["resets_at"] == "2026-05-10T12:00:00Z"
+    assert result["rate_limits"]["seven_day"]["resets_at"] == "2026-05-17T12:00:00Z"
 
 
 def test_merge_sets_source_tag_to_poller() -> None:
@@ -294,17 +273,19 @@ def test_missing_cookie_exits_gracefully(tmp_path: Path) -> None:
 
 
 def test_auth_error_returns_0_not_1(tmp_path: Path) -> None:
-    """A 401 auth error is handled gracefully — returns 0 so cron does not stop retrying."""
+    """A 401 auth error is handled gracefully — returns 0 so cron does not stop retrying.
+
+    Production code detects auth errors via `exc.response.status_code` (the
+    requests/cloudscraper interface), so we inject a requests.HTTPError with a
+    mock response object carrying status_code=401.
+    """
     cookie_path = tmp_path / "cc-usage-session-cookie"
     cookie_path.write_text("sk-ant-fake-cookie\n")
 
-    http_error = urllib.error.HTTPError(
-        url="https://claude.ai/api/usage",
-        code=401,
-        msg="Unauthorized",
-        hdrs=None,  # type: ignore[arg-type]
-        fp=BytesIO(b""),
-    )
+    mock_response = MagicMock()
+    mock_response.status_code = 401
+    http_error = _RequestsHTTPError(response=mock_response)
+
     with (
         patch.object(_mod, "COOKIE_CONFIG_PATH", cookie_path),
         patch.object(_mod, "fetch_usage", side_effect=http_error),
@@ -314,14 +295,14 @@ def test_auth_error_returns_0_not_1(tmp_path: Path) -> None:
 
 
 def test_network_error_returns_0_not_1(tmp_path: Path) -> None:
-    """A network error is handled gracefully — returns 0 so cron does not stop retrying."""
+    """A network-level connection error is handled gracefully — returns 0."""
     cookie_path = tmp_path / "cc-usage-session-cookie"
     cookie_path.write_text("sk-ant-fake-cookie\n")
 
-    url_error = urllib.error.URLError(reason="Name or service not known")
+    conn_error = _RequestsConnectionError("Name or service not known")
     with (
         patch.object(_mod, "COOKIE_CONFIG_PATH", cookie_path),
-        patch.object(_mod, "fetch_usage", side_effect=url_error),
+        patch.object(_mod, "fetch_usage", side_effect=conn_error),
     ):
         result = main()
     assert result == 0
