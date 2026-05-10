@@ -85,6 +85,7 @@ from src.los.db import (
     connect,
     find_duplicate,
     get_item_by_id,
+    get_subtasks,
     insert_action_item,
     mark_done,
 )
@@ -143,6 +144,8 @@ class ParsedItem:
     dedup_key: str
     priority: int                    # representative priority for this item's band
     workstream: Optional[str]
+    item_id: Optional[int] = None    # extracted from <!-- id:N --> comment, if present
+    parent_id: Optional[int] = None  # extracted from <!-- parent:N --> comment, if present
 
 
 @dataclass
@@ -180,11 +183,20 @@ _SOMEDAY_HEADER_RE = re.compile(r"##\s+Someday\s*/\s*Aspirational", re.IGNORECAS
 # Workstream subsection: ### <name>
 _WORKSTREAM_SECTION_RE = re.compile(r"^###\s+(\S+)", re.MULTILINE)
 
-# Checkbox line: "- [ ] text  *(source)*" or "- [x] text  *(source)*"
+# Top-level checkbox line: "- [ ] text" or "- [x] text" (no leading spaces)
 _CHECKBOX_RE = re.compile(r"^- \[(?P<checked>[ xX])\]\s+(?P<text>.+)$")
+
+# Subtask checkbox line: "  - [ ] text" or "  - [x] text" (exactly 2-space indent)
+_SUBTASK_CHECKBOX_RE = re.compile(r"^  - \[(?P<checked>[ xX])\]\s+(?P<text>.+)$")
 
 # Trailing workstream annotation: "  *(workstream)*" at end of line
 _ANNOTATION_RE = re.compile(r"\s+\*\([^)]+\)\*\s*$")
+
+# HTML comment: <!-- id:N --> or <!-- id:N parent:P -->
+_ID_COMMENT_RE = re.compile(r"<!--\s*id:(?P<id>\d+)(?:\s+parent:(?P<parent>\d+))?\s*-->")
+
+# Strip HTML comment from text
+_HTML_COMMENT_RE = re.compile(r"\s*<!--[^>]*-->")
 
 
 def _priority_for_section(section: str) -> int:
@@ -209,6 +221,26 @@ def _is_in_same_priority_band(db_priority: int, file_priority: int) -> bool:
     return _band(db_priority) == _band(file_priority)
 
 
+def _parse_item_text(raw_text: str) -> tuple[str, Optional[int], Optional[int]]:
+    """Extract clean text, item_id, and parent_id from a raw checkbox text.
+
+    Returns (text, item_id, parent_id).
+    HTML comments (<!-- id:N --> or <!-- id:N parent:P -->) are stripped from text.
+    """
+    id_match = _ID_COMMENT_RE.search(raw_text)
+    item_id: Optional[int] = None
+    parent_id: Optional[int] = None
+    if id_match:
+        item_id = int(id_match.group("id"))
+        if id_match.group("parent"):
+            parent_id = int(id_match.group("parent"))
+
+    # Strip HTML comments and workstream annotations from text
+    text = _HTML_COMMENT_RE.sub("", raw_text)
+    text = _ANNOTATION_RE.sub("", text).strip()
+    return text, item_id, parent_id
+
+
 def parse_active_todos(content: str) -> ParsedTodos:
     """Parse ACTIVE TODOS.md content into open and done item lists.
 
@@ -225,6 +257,11 @@ def parse_active_todos(content: str) -> ParsedTodos:
 
     Item text:
       - The trailing '*(source)*' annotation is stripped.
+      - The '<!-- id:N -->' and '<!-- id:N parent:P -->' comments are extracted then stripped.
+
+    Subtasks:
+      - Lines with 2-space indent ("  - [ ] text") are subtasks.
+      - parent_id is extracted from the <!-- parent:N --> comment.
     """
     result = ParsedTodos()
     if not content.strip():
@@ -254,16 +291,36 @@ def parse_active_todos(content: str) -> ParsedTodos:
             current_workstream = ws_match.group(1)
             continue
 
-        # Parse checkbox lines
+        # Try subtask (2-space indent) first
+        sub_match = _SUBTASK_CHECKBOX_RE.match(line)
+        if sub_match:
+            checked = sub_match.group("checked").strip().lower() == "x"
+            raw_text = sub_match.group("text")
+            text, item_id, parent_id = _parse_item_text(raw_text)
+            if not text:
+                continue
+            item = ParsedItem(
+                text=text,
+                dedup_key=compute_dedup_key(text),
+                priority=_priority_for_section(current_section),
+                workstream=current_workstream,
+                item_id=item_id,
+                parent_id=parent_id,
+            )
+            if checked:
+                result.done.append(item)
+            else:
+                result.open.append(item)
+            continue
+
+        # Parse top-level checkbox lines
         cb_match = _CHECKBOX_RE.match(line)
         if not cb_match:
             continue
 
         checked = cb_match.group("checked").strip().lower() == "x"
         raw_text = cb_match.group("text")
-
-        # Strip trailing *(workstream)* annotation
-        text = _ANNOTATION_RE.sub("", raw_text).strip()
+        text, item_id, _parent_id = _parse_item_text(raw_text)
         if not text:
             continue
 
@@ -272,6 +329,8 @@ def parse_active_todos(content: str) -> ParsedTodos:
             dedup_key=compute_dedup_key(text),
             priority=_priority_for_section(current_section),
             workstream=current_workstream,
+            item_id=item_id,
+            parent_id=None,  # top-level items never have a parent
         )
 
         if checked:
@@ -330,13 +389,15 @@ def sync_obsidian_to_db(conn, content: str) -> SyncResult:
         existing = _find_any_status(conn, item.dedup_key)
 
         if existing is None:
-            # New item — insert
+            # New item — insert. For subtasks (item.parent_id is set), pass parent_id.
+            # For existing items identified by item_id comment, skip insertion (handled below).
             row_id = insert_action_item(
                 conn=conn,
                 text=item.text,
                 source=OBSIDIAN_SOURCE,
                 source_message_id=None,
                 priority=item.priority,
+                parent_id=item.parent_id,
             )
             # Apply workstream if available
             if item.workstream:
@@ -346,7 +407,7 @@ def sync_obsidian_to_db(conn, content: str) -> SyncResult:
                 )
                 conn.commit()
             result.inserted_count += 1
-            log.info("Inserted: %r (priority=%d, workstream=%s)", item.text, item.priority, item.workstream)
+            log.info("Inserted: %r (priority=%d, workstream=%s, parent_id=%s)", item.text, item.priority, item.workstream, item.parent_id)
             continue
 
         # Item exists — check if it's already done (leave it done, DB is authoritative)
@@ -389,22 +450,35 @@ def _find_any_status(conn, dedup_key: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 
+def _render_item_line(item_id: int, text: str) -> str:
+    """Render a top-level item line with id comment."""
+    return f"- [ ] {text} <!-- id:{item_id} -->"
+
+
+def _render_subtask_line(item_id: int, text: str, parent_id: int) -> str:
+    """Render a subtask line with 2-space indent and id+parent comment."""
+    return f"  - [ ] {text} <!-- id:{item_id} parent:{parent_id} -->"
+
+
 def render_active_todos(conn) -> str:
     """Generate ACTIVE TODOS.md content from DB.
 
-    Renders items with status IN ('open', 'snoozed') ordered by priority, workstream, extracted_at.
-    Items already done or dismissed are excluded.
+    Renders top-level items (parent_id IS NULL) with status IN ('open', 'snoozed'),
+    ordered by priority, workstream, extracted_at. For each top-level item, renders
+    its open subtasks (WHERE parent_id = ?) immediately after, indented 2 spaces.
 
-    Returns the full markdown string.
+    Items already done or dismissed are excluded. Subtask lines include
+    '<!-- id:N parent:P -->' comments; parent lines include '<!-- id:N -->'.
+
+    Returns the full markdown string. Same DB state always produces identical output.
     """
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
     cur = conn.execute(
         """
-        SELECT id, text, priority, workstream, source, status
+        SELECT id, text, priority, workstream
         FROM action_items
-        WHERE status = 'open'
-           OR (status = 'snoozed' AND snoozed_until < datetime('now'))
+        WHERE parent_id IS NULL
+          AND (status = 'open'
+               OR (status = 'snoozed' AND snoozed_until < datetime('now')))
         ORDER BY priority ASC, workstream ASC, extracted_at ASC
         """,
     )
@@ -429,17 +503,24 @@ def render_active_todos(conn) -> str:
 
     lines: list[str] = [
         "# ✅ ACTIVE TODOS",
-        f"*Generated by LOS — {total} open items as of {today}*",
+        f"*Generated by LOS — {total} open items*",
         "",
     ]
+
+    def _append_item_with_subtasks(row) -> None:
+        """Append the parent item line followed by any open subtasks."""
+        row_id = row[0]
+        text = row[1]
+        lines.append(_render_item_line(row_id, text))
+        subtasks = get_subtasks(conn, row_id)
+        for sub in subtasks:
+            lines.append(_render_subtask_line(sub.id, sub.text, row_id))
 
     # --- Urgent section ---
     lines.append("## Urgent / This Week (P1–P3)")
     if urgent_items:
         for row in urgent_items:
-            ws = row[3] or ""
-            annotation = f"  *({ws})*" if ws else ""
-            lines.append(f"- [ ] {row[1]}{annotation}")
+            _append_item_with_subtasks(row)
     else:
         lines.append("*(none)*")
     lines.append("")
@@ -451,9 +532,7 @@ def render_active_todos(conn) -> str:
         for workstream in sorted(active_items.keys()):
             lines.append(f"### {workstream}")
             for row in active_items[workstream]:
-                ws = row[3] or ""
-                annotation = f"  *({ws})*" if ws else ""
-                lines.append(f"- [ ] {row[1]}{annotation}")
+                _append_item_with_subtasks(row)
             lines.append("")
     else:
         lines.append("*(none)*")
@@ -463,9 +542,7 @@ def render_active_todos(conn) -> str:
     lines.append("## Someday / Aspirational (P7–P9)")
     if someday_items:
         for row in someday_items:
-            ws = row[3] or ""
-            annotation = f"  *({ws})*" if ws else ""
-            lines.append(f"- [ ] {row[1]}{annotation}")
+            _append_item_with_subtasks(row)
     else:
         lines.append("*(none)*")
     lines.append("")
@@ -481,8 +558,13 @@ def render_active_todos(conn) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _git_pull(vault_path: Path) -> None:
-    """Pull latest changes from obsidian vault remote (if remote exists)."""
+def _git_pull(vault_path: Path) -> bool:
+    """Pull latest changes from obsidian vault remote (if remote exists).
+
+    Returns True if pull succeeded (or was skipped because no remote), False if
+    the pull failed.  Callers should skip the commit/push cycle on False to
+    avoid creating a diverged commit on top of a broken rebase state.
+    """
     # Check if a remote exists before attempting pull
     result = subprocess.run(
         ["git", "remote"],
@@ -492,7 +574,7 @@ def _git_pull(vault_path: Path) -> None:
     )
     if not result.stdout.strip():
         log.info("No git remote configured in vault — skipping pull")
-        return
+        return True
     pull = subprocess.run(
         ["git", "pull", "--rebase", "--autostash"],
         cwd=str(vault_path),
@@ -500,9 +582,13 @@ def _git_pull(vault_path: Path) -> None:
         text=True,
     )
     if pull.returncode != 0:
-        log.warning("git pull failed (non-fatal): %s", pull.stderr.strip())
-    else:
-        log.info("git pull: %s", pull.stdout.strip() or "up to date")
+        log.error(
+            "git pull --rebase failed (skipping push for this cycle): %s",
+            pull.stderr.strip(),
+        )
+        return False
+    log.info("git pull: %s", pull.stdout.strip() or "up to date")
+    return True
 
 
 def _git_commit_and_push(vault_path: Path, todos_path: Path, timestamp: str) -> bool:
@@ -602,9 +688,10 @@ def main() -> None:
     db_path = Path(args.db)
     todos_path = vault_path / ACTIVE_TODOS_FILENAME
 
-    # Step 1: git pull vault
+    # Step 1: git pull vault (must succeed before we write anything)
+    pull_ok = True
     if vault_path.exists() and (vault_path / ".git").exists():
-        _git_pull(vault_path)
+        pull_ok = _git_pull(vault_path)
     else:
         log.warning("Vault directory not found or not a git repo: %s", vault_path)
 
@@ -639,14 +726,18 @@ def main() -> None:
         todos_path.write_text(new_content, encoding="utf-8")
         log.info("Wrote regenerated ACTIVE TODOS.md (%d chars)", len(new_content))
 
-        # Step 5: Commit and push
+        # Step 5: Commit and push (only when pull succeeded — avoids pushing
+        # on top of a failed rebase and creating a diverged history)
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         if vault_path.exists() and (vault_path / ".git").exists():
-            committed = _git_commit_and_push(vault_path, todos_path, timestamp)
-            if committed:
-                log.info("Vault updated and committed")
+            if not pull_ok:
+                log.warning("Skipping commit/push because git pull failed")
             else:
-                log.info("No vault changes to commit")
+                committed = _git_commit_and_push(vault_path, todos_path, timestamp)
+                if committed:
+                    log.info("Vault updated and committed")
+                else:
+                    log.info("No vault changes to commit")
 
     finally:
         conn.close()
