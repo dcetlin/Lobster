@@ -160,17 +160,29 @@ RECOVERY_STALE_MINUTES: int = 5
 #: Percentage threshold above which dispatch is skipped for the cycle.
 CC_QUOTA_SKIP_THRESHOLD: float = 90.0
 
-#: State file is considered stale if fetched_at is older than this many seconds.
+#: State file is considered stale if last_updated is older than this many seconds.
 _CC_QUOTA_FRESHNESS_SECONDS: int = 60 * 60  # 60 minutes
 
 
 def _read_cc_quota() -> float | None:
     """Return five_hour_pct from the CC budget state file, or None if unavailable.
 
-    Returns the float value when the file exists AND fetched_at is within the
+    Reads the state.json written by cc-usage-poller.py.  The file shape is:
+
+        {
+          "rate_limits": {
+            "five_hour": {"pct": <float>, "resets_at": "<ISO8601>"},
+            "seven_day":  {"pct": <float>, "resets_at": "<ISO8601>"}
+          },
+          "last_updated": "<ISO8601>",
+          "ts": <unix-int>,
+          "source": "cc-usage-poller"
+        }
+
+    Returns the float value when the file exists AND last_updated is within the
     last 60 minutes. Returns None when:
     - The file does not exist (LOBSTER_CC_BUDGET_STATE or ~/.claude/cc-budget/state.json)
-    - The file is stale (fetched_at older than 60 minutes)
+    - The file is stale (last_updated older than 60 minutes)
     - The file is unreadable or malformed
 
     None signals "no usable data" — callers must treat None as "proceed normally"
@@ -197,15 +209,15 @@ def _read_cc_quota() -> float | None:
 
     try:
         data = json.loads(raw)
-        pct = float(data["five_hour_pct"])
-        fetched_at_str = data["fetched_at"]
-        fetched_at = datetime.fromisoformat(fetched_at_str.replace("Z", "+00:00"))
-        if fetched_at.tzinfo is None:
-            fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+        pct = float(data["rate_limits"]["five_hour"]["pct"])
+        last_updated_str = data["last_updated"]
+        last_updated = datetime.fromisoformat(last_updated_str.replace("Z", "+00:00"))
+        if last_updated.tzinfo is None:
+            last_updated = last_updated.replace(tzinfo=timezone.utc)
     except (KeyError, ValueError, TypeError):
         return None
 
-    age = datetime.now(timezone.utc) - fetched_at
+    age = datetime.now(timezone.utc) - last_updated
     if age > timedelta(seconds=_CC_QUOTA_FRESHNESS_SECONDS):
         return None
 
