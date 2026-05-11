@@ -457,12 +457,29 @@ def test_render_includes_open_items_as_checkboxes(conn: sqlite3.Connection) -> N
     assert "- [ ] Buy milk" in output
 
 
-def test_render_excludes_done_items(conn: sqlite3.Connection) -> None:
-    """render_active_todos must not include items with status='done'."""
+def test_render_excludes_done_items_from_open_sections(conn: sqlite3.Connection) -> None:
+    """Done items must not appear in the open (Urgent/Active/Someday) sections.
+
+    render_active_todos intentionally includes recently-completed items in a
+    trailing '<!-- done since last reset -->' block so users can see what they
+    finished today.  The critical invariant is that done items do NOT appear as
+    open checkboxes in the main body — only in the trailing done section.
+    """
     row_id = insert_action_item(conn, text="Done task", source="telegram", source_message_id=None)
     mark_done(conn, row_id)
     output = render_active_todos(conn)
-    assert "Done task" not in output
+
+    # Split on the first '---' separator — everything before it is the open
+    # items body; everything after may include the done-since-last-reset block.
+    open_body, _sep, done_section = output.partition("\n---\n")
+
+    assert "Done task" not in open_body, (
+        "Done item must not appear in the open items sections (Urgent/Active/Someday)"
+    )
+    # Complementary: recently-done item appears in the trailing section.
+    assert "Done task" in done_section, (
+        "Recently-done item must appear in the trailing '<!-- done since last reset -->' block"
+    )
 
 
 def test_render_has_generation_header(conn: sqlite3.Connection) -> None:
