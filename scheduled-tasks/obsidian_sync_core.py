@@ -21,13 +21,14 @@ from __future__ import annotations
 import fcntl
 import logging
 import os
+import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Optional
-import re
-import sys
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # Path setup (allow import from scheduled-tasks/ without installing)
@@ -139,6 +140,86 @@ ID_COMMENT_RE = re.compile(r"<!--\s*id:(?P<id>\d+)(?:\s+parent:(?P<parent>\d+))?
 
 # Strip HTML comment from text
 HTML_COMMENT_RE = re.compile(r"\s*<!--[^>]*-->")
+
+# Attribution sub-bullet pattern — exported for use by callers and future phases.
+# Matches:  "  - [[...]]" (obsidian wiki-link) or "  - [telegram msg · ...]" etc.
+# Note: the label-only form "[telegram msg]" (no middot, produced when created_at_iso
+# is absent) is not matched here but is idempotent: re-rendering produces the same string.
+ATTRIBUTION_LINE_RE = re.compile(r"^  - (?:\[\[.+\]\]|\[(?:telegram msg|voicenote|direct) ·)")
+
+# ---------------------------------------------------------------------------
+# Attribution (pure functions — no I/O or DB access)
+# ---------------------------------------------------------------------------
+
+_LA_TZ = ZoneInfo("America/Los_Angeles")
+
+# Source type labels used in archaeology-register attributions
+_SOURCE_LABEL: dict[str, str] = {
+    "telegram": "telegram msg",
+    "voice": "voicenote",
+    "direct": "direct",
+}
+
+
+def format_attribution(
+    source: str,
+    source_ref: Optional[str],
+    source_section: Optional[str],
+    created_at_iso: Optional[str],
+) -> Optional[str]:
+    """Return the attribution string for a todo item, or None if attribution is not applicable.
+
+    Rules (Phase 1 — display pass from existing data):
+    - source='obsidian': wiki-link form.
+        - source_ref present: [[source_ref#source_section]] or [[source_ref]]
+        - source_ref absent: omit attribution (no doc name to link)
+    - source='telegram', 'voice', 'direct': archaeology register.
+        - created_at_iso present: "[<label> · Mon May 11 · 10:35 AM PDT]"
+        - created_at_iso absent or unparseable: "[<label>]" (label only, no timestamp)
+    - source not in known set: None (skip attribution)
+
+    This is a pure function — no I/O, no DB access.
+    """
+    if not source:
+        return None
+
+    if source.startswith("obsidian"):
+        if not source_ref:
+            return None
+        # Strip the legacy "obsidian:ACTIVE TODOS.md" prefix if source is the obsidian source
+        # constant — use source_ref as the actual doc name
+        ref = source_ref
+        # Remove common file extensions that Obsidian doesn't show in wiki-links
+        if ref.endswith(".md"):
+            ref = ref[:-3]
+        if source_section:
+            return f"[[{ref}#{source_section}]]"
+        return f"[[{ref}]]"
+
+    label = _SOURCE_LABEL.get(source)
+    if label is None:
+        return None
+
+    if not created_at_iso:
+        return f"[{label}]"
+
+    try:
+        dt_utc = datetime.fromisoformat(created_at_iso.replace("Z", "+00:00"))
+        dt_la = dt_utc.astimezone(_LA_TZ)
+    except (ValueError, AttributeError):
+        return f"[{label}]"
+
+    # Determine timezone abbreviation: PDT (DST) or PST (standard)
+    tz_abbr = "PDT" if dt_la.dst() and dt_la.dst().total_seconds() != 0 else "PST"
+
+    date_str = dt_la.strftime("%a %b %-d")
+    time_str = dt_la.strftime("%-I:%M %p")
+    return f"[{label} · {date_str} · {time_str} {tz_abbr}]"
+
+
+def _render_attribution_line(attribution: str) -> str:
+    """Wrap an attribution string as a 2-space-indented sub-bullet."""
+    return f"  - {attribution}"
 
 
 # ---------------------------------------------------------------------------
@@ -545,12 +626,20 @@ def apply_status_delta(file_content: str, conn) -> str:
     # --- Pass 3: find open/snoozed items that are NOT yet in the file ---
     # These are items added via Telegram (source != obsidian) that need to
     # appear in the file so Dan can see and manage them.
-    items_to_append: list[tuple[int, str, int]] = []  # (id, text, priority)
+
+    # Detect optional Phase 2+ columns for attribution
+    _delta_cols = {row[1] for row in conn.execute("PRAGMA table_info(action_items)").fetchall()}
+    _delta_source_ref = "source_ref" if "source_ref" in _delta_cols else "NULL AS source_ref"
+    _delta_source_section = "source_section" if "source_section" in _delta_cols else "NULL AS source_section"
+
+    # items_to_append: (id, text, priority, source, extracted_at, source_ref, source_section)
+    items_to_append: list[tuple] = []
     if file_dedup_keys:
         placeholders = ",".join("?" * len(file_dedup_keys))
         cur2 = conn.execute(
             f"""
-            SELECT id, text, priority
+            SELECT id, text, priority, source, extracted_at,
+                   {_delta_source_ref}, {_delta_source_section}
             FROM action_items
             WHERE status IN ('open', 'snoozed')
               AND parent_id IS NULL
@@ -562,15 +651,16 @@ def apply_status_delta(file_content: str, conn) -> str:
     else:
         # No items in file at all — append everything open/snoozed
         cur2 = conn.execute(
-            """
-            SELECT id, text, priority
+            f"""
+            SELECT id, text, priority, source, extracted_at,
+                   {_delta_source_ref}, {_delta_source_section}
             FROM action_items
             WHERE status IN ('open', 'snoozed')
               AND parent_id IS NULL
             ORDER BY priority ASC, extracted_at ASC
             """,
         )
-    items_to_append = [(row[0], row[1], row[2]) for row in cur2.fetchall()]
+    items_to_append = list(cur2.fetchall())
 
     if not items_to_append:
         return "".join(out_lines)
@@ -596,8 +686,19 @@ def apply_status_delta(file_content: str, conn) -> str:
     out_lines.append(_LOBSTER_ADDITIONS_MARKER + "\n")
     out_lines.append("*Items added via Telegram — move or edit freely:*\n")
     out_lines.append("\n")
-    for item_id, item_text, _priority in items_to_append:
+    for row in items_to_append:
+        item_id, item_text = row[0], row[1]
+        item_source = row[3] if len(row) > 3 else None
+        item_extracted_at = row[4] if len(row) > 4 else None
+        item_source_ref = row[5] if len(row) > 5 else None
+        item_source_section = row[6] if len(row) > 6 else None
+
         out_lines.append(f"- [ ] {item_text} <!-- id:{item_id} -->\n")
+        attribution = format_attribution(
+            item_source or "", item_source_ref, item_source_section, item_extracted_at
+        )
+        if attribution:
+            out_lines.append(_render_attribution_line(attribution) + "\n")
         log.info("Delta: appended new item from DB: %r (id=%d)", item_text[:60], item_id)
     out_lines.append(_LOBSTER_ADDITIONS_END + "\n")
 
@@ -679,9 +780,17 @@ def render_active_todos(
     change.  The guard line does not affect todo_obsidian_sync.py's own logic
     (it does not read or check the guard).
     """
+    # Detect optional Phase 2+ columns (source_ref, source_section).
+    # In Phase 1 these don't exist; falling back to NULL keeps attribution
+    # working without schema changes.
+    _cols = {row[1] for row in conn.execute("PRAGMA table_info(action_items)").fetchall()}
+    _source_ref_expr = "source_ref" if "source_ref" in _cols else "NULL AS source_ref"
+    _source_section_expr = "source_section" if "source_section" in _cols else "NULL AS source_section"
+
     cur = conn.execute(
-        """
-        SELECT id, text, priority, workstream
+        f"""
+        SELECT id, text, priority, workstream, source, extracted_at,
+               {_source_ref_expr}, {_source_section_expr}
         FROM action_items
         WHERE parent_id IS NULL
           AND (status = 'open'
@@ -746,7 +855,20 @@ def render_active_todos(
     def _append_item_with_subtasks(row) -> None:
         row_id = row[0]
         text = row[1]
+        # row indices: 0=id, 1=text, 2=priority, 3=workstream,
+        #              4=source, 5=extracted_at, 6=source_ref, 7=source_section
+        source = row[4] if len(row) > 4 else None
+        extracted_at = row[5] if len(row) > 5 else None
+        source_ref = row[6] if len(row) > 6 else None
+        source_section = row[7] if len(row) > 7 else None
+
         lines.append(_render_item_line(row_id, text))
+
+        # Attribution sub-bullet: only for top-level items with a source set
+        attribution = format_attribution(source or "", source_ref, source_section, extracted_at)
+        if attribution:
+            lines.append(_render_attribution_line(attribution))
+
         subtasks = get_subtasks(conn, row_id)
         for sub in subtasks:
             lines.append(_render_subtask_line(sub.id, sub.text, row_id))
