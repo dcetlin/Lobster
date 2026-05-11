@@ -44,6 +44,9 @@ from obsidian_sync_core import (  # noqa: E402
     format_attribution,
     _render_attribution_line,
     ATTRIBUTION_LINE_RE,
+    apply_status_delta,
+    _LOBSTER_ADDITIONS_MARKER,
+    _LOBSTER_ADDITIONS_END,
 )
 from todo_obsidian_sync import (  # noqa: E402
     ParsedTodos,
@@ -824,3 +827,280 @@ def test_render_subtasks_do_not_get_attribution(conn: sqlite3.Connection) -> Non
         assert not (
             ATTRIBUTION_LINE_RE.match(next_line) and "Subtask item" not in next_line
         ), f"Unexpected attribution after subtask: {next_line!r}"
+
+
+# ---------------------------------------------------------------------------
+# apply_status_delta — checkbox flip behavior
+# Named constants matching the spec requirements (prevents magic literals)
+# ---------------------------------------------------------------------------
+
+# How many empty polls trigger cooldown — not applicable here, but the naming
+# convention carries: every spec-derived threshold gets a constant.
+DISABLE_PROCESSING_GUARD = "- [ ] DISABLE PROCESSING"
+DISABLE_PROCESSING_GUARD_EMOJI = "- [ ] 🔒 DISABLE PROCESSING"
+
+
+def _make_conn(tmp_path: Path) -> sqlite3.Connection:
+    """Create a fresh in-memory-equivalent DB in tmp_path for a single test."""
+    return connect(tmp_path / "delta_test.db")
+
+
+# ---------------------------------------------------------------------------
+# Test 1: DB says done, file shows [ ] → file gets flipped to [x]
+# ---------------------------------------------------------------------------
+
+def test_apply_delta_flips_open_to_done_when_db_says_done(tmp_path: Path) -> None:
+    """DB status=done + file shows '- [ ] ...' → output contains '- [x] ...'."""
+    db = _make_conn(tmp_path)
+    row_id = insert_action_item(db, text="Review the contract", source="telegram", source_message_id=None)
+    mark_done(db, row_id)
+
+    file_content = "## Active (P4–P6)\n- [ ] Review the contract\n"
+
+    result = apply_status_delta(file_content, db)
+
+    assert "- [x] Review the contract" in result
+    assert "- [ ] Review the contract" not in result
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 2: DB says open, file shows [x] → file gets flipped back to [ ]
+# ---------------------------------------------------------------------------
+
+def test_apply_delta_flips_done_to_open_when_db_says_open(tmp_path: Path) -> None:
+    """DB status=open + file shows '- [x] ...' → output contains '- [ ] ...'."""
+    db = _make_conn(tmp_path)
+    insert_action_item(db, text="Write the report", source="telegram", source_message_id=None)
+    # DB status is 'open' (default) — file shows it as checked
+
+    file_content = "## Active (P4–P6)\n- [x] Write the report\n"
+
+    result = apply_status_delta(file_content, db)
+
+    assert "- [ ] Write the report" in result
+    assert "- [x] Write the report" not in result
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 3: DB says snoozed (not done), file shows [x] → flip back to [ ]
+# ---------------------------------------------------------------------------
+
+def test_apply_delta_flips_done_to_open_when_db_says_snoozed(tmp_path: Path) -> None:
+    """DB status=snoozed (not done) + file shows '[x]' → flip back to '[ ]'.
+
+    Snoozed items are not done; they are temporarily hidden. If the file shows
+    them as checked while the DB has them snoozed, the function must restore the
+    open checkbox to match the DB's 'not done' intent.
+    """
+    db = _make_conn(tmp_path)
+    row_id = insert_action_item(db, text="Plan the roadmap", source="telegram", source_message_id=None)
+    mark_snoozed(db, row_id, "2099-12-31")  # snoozed far in the future → status='snoozed'
+
+    # Verify the DB has it snoozed (not done)
+    item = get_item_by_id(db, row_id)
+    assert item.status == ActionItemStatus.SNOOZED
+
+    file_content = "## Active (P4–P6)\n- [x] Plan the roadmap\n"
+
+    result = apply_status_delta(file_content, db)
+
+    # Snoozed = not done → file's [x] must be flipped back to [ ]
+    assert "- [ ] Plan the roadmap" in result
+    assert "- [x] Plan the roadmap" not in result
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 4: Item in DB not in file → appended in lobster-additions block
+# ---------------------------------------------------------------------------
+
+def test_apply_delta_appends_db_only_item_in_additions_block(tmp_path: Path) -> None:
+    """Open item in DB that does not appear in file is appended in <!-- lobster-additions --> block."""
+    db = _make_conn(tmp_path)
+    # Item in DB that is NOT in the file
+    insert_action_item(db, text="Send weekly update", source="telegram", source_message_id=None)
+
+    # File has a different item so file_dedup_keys is non-empty
+    file_content = "## Active (P4–P6)\n- [ ] Unrelated task already in file\n"
+
+    result = apply_status_delta(file_content, db)
+
+    assert _LOBSTER_ADDITIONS_MARKER in result
+    assert "Send weekly update" in result
+    assert _LOBSTER_ADDITIONS_END in result
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Existing additions block is replaced (not duplicated) on second run
+# ---------------------------------------------------------------------------
+
+def test_apply_delta_replaces_additions_block_not_duplicated(tmp_path: Path) -> None:
+    """Running apply_status_delta twice produces exactly one additions block, not two."""
+    db = _make_conn(tmp_path)
+    insert_action_item(db, text="Follow up with Alice", source="telegram", source_message_id=None)
+
+    # File has an unrelated item so the DB item needs to be appended
+    file_content = "## Active (P4–P6)\n- [ ] Anchor item in file\n"
+
+    # First run — produces additions block
+    result_first = apply_status_delta(file_content, db)
+    assert result_first.count(_LOBSTER_ADDITIONS_MARKER) == 1
+
+    # Second run — must not duplicate the block
+    result_second = apply_status_delta(result_first, db)
+    assert result_second.count(_LOBSTER_ADDITIONS_MARKER) == 1, (
+        "Additions block was duplicated on second run"
+    )
+    assert result_second.count(_LOBSTER_ADDITIONS_END) == 1
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 6: DISABLE PROCESSING guard line is never touched
+# ---------------------------------------------------------------------------
+
+def test_apply_delta_never_modifies_disable_processing_guard(tmp_path: Path) -> None:
+    """The '- [ ] DISABLE PROCESSING' guard line must pass through unchanged even if the
+    DB happens to have a dedup_key that matches.
+
+    The guard line is exempt from checkbox flipping by spec — vault-processor.py
+    uses its unchecked state as a sentinel to proceed.
+    """
+    db = _make_conn(tmp_path)
+    # Insert a DB item whose text is exactly "DISABLE PROCESSING" — the function
+    # must skip it regardless due to the explicit guard check in the implementation.
+    insert_action_item(db, text="DISABLE PROCESSING", source="direct", source_message_id=None)
+    mark_done(db, 1)  # DB says done
+
+    file_content = "- [ ] 🔒 DISABLE PROCESSING\n- [ ] Normal task\n"
+    # Also insert a DB item for "Normal task" to confirm other items are still processed
+    insert_action_item(db, text="Normal task", source="telegram", source_message_id=None)
+    mark_done(db, 2)
+
+    result = apply_status_delta(file_content, db)
+
+    lines = result.splitlines()
+    # The guard line must remain '- [ ]' (unchecked)
+    guard_lines = [l for l in lines if "DISABLE PROCESSING" in l]
+    assert guard_lines, "DISABLE PROCESSING guard line disappeared"
+    for guard_line in guard_lines:
+        assert "- [ ]" in guard_line, (
+            f"DISABLE PROCESSING guard was modified: {guard_line!r}"
+        )
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 7: Subtask items (parent_id IS NOT NULL) are excluded from additions block
+# ---------------------------------------------------------------------------
+
+def test_apply_delta_excludes_subtasks_from_additions_block(tmp_path: Path) -> None:
+    """Items with parent_id IS NOT NULL must not appear in the additions block.
+
+    Only top-level items (parent_id IS NULL) are appended — subtasks belong
+    structurally under their parent and should never be floated to the top level.
+    """
+    db = _make_conn(tmp_path)
+    parent_id = insert_action_item(
+        db, text="Parent action item", source="telegram", source_message_id=None
+    )
+    # Subtask — has parent_id set
+    insert_action_item(
+        db, text="Subtask under parent", source="telegram", source_message_id=None,
+        parent_id=parent_id,
+    )
+
+    # File has an anchor item so the additions block will be generated
+    # Neither the parent nor subtask appears in the file
+    file_content = "## Active (P4–P6)\n- [ ] Anchor item already in file\n"
+
+    result = apply_status_delta(file_content, db)
+
+    assert _LOBSTER_ADDITIONS_MARKER in result, "Expected additions block to be present"
+    # Parent should appear (parent_id IS NULL)
+    assert "Parent action item" in result
+    # Subtask must NOT appear in the additions block
+    assert "Subtask under parent" not in result, (
+        "Subtask with parent_id should not appear in lobster-additions block"
+    )
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Attribution line is appended alongside item in additions block
+#          when source_ref is present (or source is telegram with timestamp)
+# ---------------------------------------------------------------------------
+
+def test_apply_delta_appends_attribution_in_additions_block(tmp_path: Path) -> None:
+    """Items appended to the additions block must include an attribution sub-bullet
+    when source type supports attribution (telegram with timestamp).
+
+    The attribution sub-bullet appears immediately after the item's checkbox line
+    inside the additions block, matching the format produced by format_attribution().
+    """
+    db = _make_conn(tmp_path)
+    # Insert with explicit extracted_at so format_attribution produces a full timestamp
+    db.execute(
+        """
+        INSERT INTO action_items
+            (text, source, source_message_id, extracted_at, priority, status, mention_count, dedup_key)
+        VALUES (?, 'telegram', NULL, ?, 5, 'open', 1, ?)
+        """,
+        (
+            "Schedule dentist appointment",
+            "2026-05-11T22:37:00+00:00",
+            compute_dedup_key("Schedule dentist appointment"),
+        ),
+    )
+    db.commit()
+
+    # File has anchor item; the telegram item needs to be appended
+    file_content = "## Active (P4–P6)\n- [ ] Anchor item in file\n"
+
+    result = apply_status_delta(file_content, db)
+
+    assert "Schedule dentist appointment" in result
+    # Attribution sub-bullet must appear in the block — format is "[telegram msg · ...]"
+    assert "[telegram msg ·" in result, (
+        "Expected telegram attribution sub-bullet in additions block"
+    )
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 9: Idempotency — running apply_status_delta twice produces same result
+# ---------------------------------------------------------------------------
+
+def test_apply_delta_is_idempotent(tmp_path: Path) -> None:
+    """Running apply_status_delta twice on the same file+DB state produces identical output.
+
+    This is the core contract: the function must not accumulate changes across
+    repeated calls. The second call sees the same DB state and must produce the
+    same string as the first.
+    """
+    db = _make_conn(tmp_path)
+    # Mix of scenarios: DB-done item shown open, DB-open item shown done, and
+    # an item in DB but absent from file
+    done_id = insert_action_item(db, text="Finished task", source="telegram", source_message_id=None)
+    mark_done(db, done_id)
+
+    open_id = insert_action_item(db, text="Open task", source="telegram", source_message_id=None)
+
+    insert_action_item(db, text="Telegram only task", source="telegram", source_message_id=None)
+
+    file_content = (
+        "## Active (P4–P6)\n"
+        "- [ ] Finished task\n"    # DB=done, file=open → will be flipped to [x]
+        "- [x] Open task\n"        # DB=open, file=done → will be flipped to [ ]
+    )
+
+    result_first = apply_status_delta(file_content, db)
+    result_second = apply_status_delta(result_first, db)
+
+    assert result_first == result_second, (
+        "apply_status_delta is not idempotent: second call produced different output"
+    )
+    db.close()
