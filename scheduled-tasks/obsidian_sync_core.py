@@ -42,6 +42,7 @@ from src.los.db import (
     connect,
     get_subtasks,
     insert_action_item,
+    mark_deleted,
     mark_done,
     get_item_by_id,
 )
@@ -100,12 +101,14 @@ class SyncResult:
     inserted_count: int = 0
     priority_changed_count: int = 0
     skipped_already_done: int = 0
+    deleted_count: int = 0
 
     def __str__(self) -> str:
         return (
             f"done={self.done_count} inserted={self.inserted_count} "
             f"priority_changed={self.priority_changed_count} "
-            f"skipped_already_done={self.skipped_already_done}"
+            f"skipped_already_done={self.skipped_already_done} "
+            f"deleted={self.deleted_count}"
         )
 
 
@@ -313,13 +316,23 @@ def sync_obsidian_to_db(conn, content: str) -> SyncResult:
           - In DB + different priority band → update priority
       - Open items that are already done in DB → left alone (DB is authoritative)
 
+    After processing all file items:
+      - DB items with status='open' whose dedup_key was NOT seen in this sync
+        pass → mark as status='deleted' with deleted_at=now(). These were
+        intentionally removed from the file without being checked off.
+
     Returns a SyncResult summarising what was changed.
     """
     result = SyncResult()
     parsed = parse_active_todos(content)
 
+    # Collect dedup_keys of every item present in the file (open or done),
+    # so we can detect DB open items that have silently disappeared.
+    seen_dedup_keys: set[str] = set()
+
     # --- Process done items ---
     for item in parsed.done:
+        seen_dedup_keys.add(item.dedup_key)
         existing = _find_any_status(conn, item.dedup_key)
         if existing is None:
             continue
@@ -331,6 +344,7 @@ def sync_obsidian_to_db(conn, content: str) -> SyncResult:
 
     # --- Process open items ---
     for item in parsed.open:
+        seen_dedup_keys.add(item.dedup_key)
         existing = _find_any_status(conn, item.dedup_key)
 
         if existing is None:
@@ -368,6 +382,26 @@ def sync_obsidian_to_db(conn, content: str) -> SyncResult:
                 item.text, existing["priority"], item.priority,
             )
 
+    # --- Mark deleted: open DB items not seen in this sync pass ---
+    # Only applies to items from OBSIDIAN_SOURCE — items entered via other
+    # channels (Telegram, etc.) are not subject to file-deletion detection.
+    if seen_dedup_keys:
+        placeholders = ",".join("?" * len(seen_dedup_keys))
+        cur = conn.execute(
+            f"""
+            SELECT id, text, dedup_key FROM action_items
+            WHERE status = 'open'
+              AND source = ?
+              AND dedup_key NOT IN ({placeholders})
+            """,
+            (OBSIDIAN_SOURCE, *seen_dedup_keys),
+        )
+        absent_rows = cur.fetchall()
+        for row in absent_rows:
+            mark_deleted(conn, row[0])
+            result.deleted_count += 1
+            log.info("Marked deleted (removed from file): %r (id=%d)", row[1], row[0])
+
     return result
 
 
@@ -384,7 +418,38 @@ def _render_subtask_line(item_id: int, text: str, parent_id: int) -> str:
     return f"  - [ ] {text} <!-- id:{item_id} parent:{parent_id} -->"
 
 
-def render_active_todos(conn, last_synced: Optional[str] = None) -> str:
+def _done_since_cutoff_utc(done_reset_hour_pst: int = 5) -> datetime:
+    """Return the most recent daily cutoff as a UTC datetime.
+
+    The cutoff is ``done_reset_hour_pst`` hours in Pacific Time.  Because PST
+    is UTC-8 and PDT is UTC-7, the conservative UTC equivalent is:
+
+        hour_utc = done_reset_hour_pst + 8   (PST — the later of the two)
+
+    This means the window stays open slightly longer during PDT, which is the
+    safer direction (items persist a bit longer rather than disappearing early).
+
+    Algorithm:
+    1. Compute today's cutoff at ``done_reset_hour_pst + 8`` UTC.
+    2. If now < cutoff (we haven't reached today's cutoff yet), use yesterday's.
+    """
+    now_utc = datetime.now(timezone.utc)
+    cutoff_hour_utc = done_reset_hour_pst + 8  # PST offset; safe for PDT too
+    today_cutoff = now_utc.replace(
+        hour=cutoff_hour_utc, minute=0, second=0, microsecond=0
+    )
+    if now_utc < today_cutoff:
+        # We haven't passed today's cutoff — roll back to yesterday's
+        from datetime import timedelta
+        today_cutoff -= timedelta(days=1)
+    return today_cutoff
+
+
+def render_active_todos(
+    conn,
+    last_synced: Optional[str] = None,
+    done_reset_hour_pst: int = 5,
+) -> str:
     """Generate ACTIVE TODOS.md content from DB.
 
     Parameters
@@ -396,9 +461,15 @@ def render_active_todos(conn, last_synced: Optional[str] = None) -> str:
         "Last synced: <timestamp>. Next sync on push."
         When absent (legacy todo_obsidian_sync.py path), the footer retains
         "Next auto-sweep: nightly, ~02:30." for backward compatibility.
+    done_reset_hour_pst:
+        Hour in Pacific Standard Time (default 5, i.e. 5 AM PST = 13:00 UTC)
+        after which done items from the previous window stop appearing in the
+        file.  Done items completed since the most recent cutoff are rendered
+        as ``- [x]`` in a separate section below all open items.
 
-    Returns the full markdown string. Same DB state + same last_synced always
-    produces identical output (pure w.r.t. inputs).
+    Returns the full markdown string. Same DB state + same last_synced +
+    same done_reset_hour_pst always produces identical output (pure w.r.t.
+    inputs, assuming now() is held constant).
 
     Behavior note (PR #1131): This function always inserts the
     "- [ ] 🔒 DISABLE PROCESSING" guard line near the top of the rendered
@@ -420,6 +491,22 @@ def render_active_todos(conn, last_synced: Optional[str] = None) -> str:
         """,
     )
     rows = cur.fetchall()
+
+    # Fetch done items completed since the most recent daily cutoff
+    cutoff_utc = _done_since_cutoff_utc(done_reset_hour_pst)
+    cutoff_iso = cutoff_utc.isoformat()
+    cur_done = conn.execute(
+        """
+        SELECT id, text
+        FROM action_items
+        WHERE parent_id IS NULL
+          AND status = 'done'
+          AND done_at >= ?
+        ORDER BY done_at ASC
+        """,
+        (cutoff_iso,),
+    )
+    recently_done_rows = cur_done.fetchall()
 
     urgent_items = []
     active_items: dict[str, list] = {}
@@ -495,6 +582,15 @@ def render_active_todos(conn, last_synced: Optional[str] = None) -> str:
     else:
         lines.append("*(none)*")
     lines.append("")
+
+    # --- Recently done section (visible until next daily reset) ---
+    if recently_done_rows:
+        lines.append("---")
+        lines.append("<!-- done since last reset -->")
+        for row in recently_done_rows:
+            lines.append(f"- [x] {row[1]} <!-- id:{row[0]} -->")
+        lines.append("")
+
     lines.append("---")
     lines.append("*To mark done, dismiss, or snooze: tell Lobster via Telegram, or check the box in Obsidian.*")
 

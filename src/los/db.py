@@ -32,6 +32,7 @@ class ActionItemStatus(StrEnum):
     DONE = "done"
     DISMISSED = "dismissed"
     SNOOZED = "snoozed"
+    DELETED = "deleted"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -89,6 +90,7 @@ _SCHEMA_MIGRATIONS = [
     "ALTER TABLE action_items ADD COLUMN archived_at TEXT",
     "ALTER TABLE action_items ADD COLUMN last_activity_at TEXT",
     "ALTER TABLE action_items ADD COLUMN parent_id INTEGER REFERENCES action_items(id)",
+    "ALTER TABLE action_items ADD COLUMN deleted_at TEXT",
 ]
 
 
@@ -244,6 +246,19 @@ def mark_dismissed(conn: sqlite3.Connection, item_id: int) -> None:
     conn.execute(
         "UPDATE action_items SET status=?, dismissed_at=? WHERE id=?",
         (ActionItemStatus.DISMISSED, _now_iso(), item_id),
+    )
+    conn.commit()
+
+
+def mark_deleted(conn: sqlite3.Connection, item_id: int) -> None:
+    """Set status='deleted' and record deleted_at timestamp.
+
+    Used when an item disappears from ACTIVE TODOS.md without being checked off —
+    the user intentionally removed it rather than completing it.
+    """
+    conn.execute(
+        "UPDATE action_items SET status=?, deleted_at=? WHERE id=?",
+        (ActionItemStatus.DELETED, _now_iso(), item_id),
     )
     conn.commit()
 

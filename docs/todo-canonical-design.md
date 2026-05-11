@@ -28,7 +28,7 @@ source_message_id TEXT
 extracted_at     TEXT NOT NULL          -- ISO-8601
 priority         INTEGER DEFAULT 5      -- 1=urgent, 5=normal, 7=someday; lower = higher priority
 mention_count    INTEGER DEFAULT 1
-status           TEXT DEFAULT 'open'    -- 'open' | 'done' | 'archived' | 'snoozed' | 'dismissed'
+status           TEXT DEFAULT 'open'    -- 'open' | 'done' | 'archived' | 'snoozed' | 'dismissed' | 'deleted'
 snoozed_until    TEXT
 done_at          TEXT
 dismissed_at     TEXT
@@ -42,6 +42,7 @@ action_type      TEXT                   -- 'task' | 'habit' | 'vision' | 'remind
 github_issue_url TEXT                   -- populated at extraction-time or enrichment pass
 archived_at      TEXT                   -- set when moved to archived status
 last_activity_at TEXT                   -- updated on any status change, mention, or note addition
+deleted_at       TEXT                   -- set when item is removed from ACTIVE TODOS.md without being checked off
 ```
 
 Migration SQL (additive, non-destructive):
@@ -114,6 +115,8 @@ the full failure sequence.
 Any future LOS nightly sweep should write **only** to the DB (archival, extraction, etc.).
 The file regeneration step is `todo_obsidian_sync.py`'s responsibility.
 
+**Vault-watcher transition (Tier 1):** When vault-watcher ships, `vault-processor.py` takes over as the write path for DB sync and ACTIVE TODOS.md rendering. `todo_obsidian_sync.py` will be retired or demoted to a fallback. The sole-writer contract holds — only the designated writer changes. Implementation note: the handoff requires removing `todo_obsidian_sync.py` from cron and enabling vault-processor.py. Both scripts share `obsidian_sync_core.py` for rendering logic.
+
 Process (performed by `todo_obsidian_sync.py` in a single atomic pass):
 1. git pull the vault (get latest Mac edits)
 2. Read Dan's checkmarks from ACTIVE TODOS.md
@@ -132,6 +135,12 @@ Process:
 3. For each `- [x]` item: find matching row in DB by text fuzzy match (normalized), set `status = 'done'`, `done_at = now`.
 4. For new `- [ ]` items not in DB (detected by absence of dedup_key match): insert with `source = 'obsidian:ACTIVE TODOS.md'`, `action_type = 'task'`.
 5. For rearrangements (priority changes by section): update `priority` field if the item moved to a different section.
+6. For DB items with `status = 'open'` whose `dedup_key` was not seen in this sync pass: set `status = 'deleted'`, `deleted_at = now`. These were intentionally removed from the file without being checked off. Only applies to items with `source = 'obsidian:ACTIVE TODOS.md'` — Telegram and voice note items are not subject to file-deletion detection.
+
+**3-way sync distinction (Obsidian → DB):**
+- `[ ]` present in file → `status = 'open'` (no change or insert)
+- `[x]` present in file → `status = 'done'`
+- absent from file (was open in DB) → `status = 'deleted'`
 
 **Dedup key:**
 ```python
@@ -280,4 +289,4 @@ Extraction-time population: when the LOS journal sweep finds text like `(#113)` 
 - Telegram "add to list" handler
 - Archival automation in LOS nightly sweep
 
-These are Tier 1/Tier 2 work from the personal-todo-system workstream design.
+These are Tier 1/Tier 2 work from the los workstream design.

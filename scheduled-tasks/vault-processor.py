@@ -554,7 +554,12 @@ def run_processor(config: dict, db_path: Path = DB_PATH_DEFAULT) -> bool:
         from zoneinfo import ZoneInfo
         pst = ZoneInfo("America/Los_Angeles")
         last_synced = datetime.now(pst).strftime("%Y-%m-%d %H:%M PST")
-        new_todos_content = render_active_todos(conn, last_synced=last_synced)
+        done_reset_hour_pst: int = config.get("done_reset_hour_pst", 5)
+        new_todos_content = render_active_todos(
+            conn,
+            last_synced=last_synced,
+            done_reset_hour_pst=done_reset_hour_pst,
+        )
 
         if not new_todos_content:
             log.error("render_active_todos returned empty content — skipping write")
