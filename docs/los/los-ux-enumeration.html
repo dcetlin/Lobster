@@ -337,6 +337,32 @@ body.light-mode .note-warn { background: rgba(245,158,11,.08); }
 .design-note .decision { color: var(--accent4); font-weight: 700; }
 body.light-mode .design-note { background: rgba(167,139,250,.06); }
 
+/* Future-work taxonomy tags */
+.tag {
+  display: inline-block;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-right: 6px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+/* Dark mode tag colors */
+.tag-DECISION { background: rgba(245,158,11,.18); color: #f59e0b; border: 1px solid rgba(245,158,11,.35); }
+.tag-BUILD    { background: rgba(52,211,153,.15);  color: #34d399; border: 1px solid rgba(52,211,153,.3); }
+.tag-REMOVE   { background: rgba(251,146,60,.15);  color: #fb923c; border: 1px solid rgba(251,146,60,.3); }
+.tag-DEFER    { background: rgba(92,100,128,.18);  color: #9aa0bb; border: 1px solid rgba(92,100,128,.35); }
+.tag-TRACK    { background: rgba(110,168,254,.13); color: #6ea8fe; border: 1px solid rgba(110,168,254,.3); }
+/* Light mode overrides */
+body.light-mode .tag-DECISION { background: rgba(245,158,11,.12); color: #b45309; border-color: rgba(245,158,11,.4); }
+body.light-mode .tag-BUILD    { background: rgba(52,211,153,.12);  color: #059669; border-color: rgba(52,211,153,.4); }
+body.light-mode .tag-REMOVE   { background: rgba(251,146,60,.12);  color: #c2410c; border-color: rgba(251,146,60,.4); }
+body.light-mode .tag-DEFER    { background: rgba(92,100,128,.12);  color: #4a5068; border-color: rgba(92,100,128,.4); }
+body.light-mode .tag-TRACK    { background: rgba(110,168,254,.10); color: #2563eb; border-color: rgba(110,168,254,.4); }
+
 /* State system table */
 .state-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 12px; margin-bottom: 8px; }
 .state-table th { text-align: left; color: var(--text3); font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; padding: 6px 10px; border-bottom: 1px solid var(--border); }
@@ -430,7 +456,7 @@ code { color: var(--accent); font-family: 'SF Mono', 'Fira Code', monospace; fon
           <td>done</td>
           <td>Completed. Retained in DB for weekly review. DB is authoritative — Obsidian checkbox reverts if unchecked.</td>
           <td>Dan checks the box in Obsidian, or <code>/todo done</code> via Telegram.</td>
-          <td>open (not yet implemented — reopen is planned)</td>
+          <td>open (<span class="tag tag-BUILD">BUILD</span> not yet implemented — reopen is planned)</td>
         </tr>
         <tr>
           <td>snoozed</td>
@@ -452,7 +478,7 @@ code { color: var(--accent); font-family: 'SF Mono', 'Fira Code', monospace; fon
         </tr>
       </tbody>
     </table>
-    <div style="margin-top: 8px; font-size: 11px; color: var(--text3);">Valid transitions: open ↔ snoozed &nbsp;|&nbsp; open → done &nbsp;|&nbsp; open → dismissed &nbsp;|&nbsp; open → deleted (Obsidian-sourced) &nbsp;|&nbsp; reopen (done → open) is &#9675; PLANNED.</div>
+    <div style="margin-top: 8px; font-size: 11px; color: var(--text3);">Valid transitions: open ↔ snoozed &nbsp;|&nbsp; open → done &nbsp;|&nbsp; open → dismissed &nbsp;|&nbsp; open → deleted (Obsidian-sourced) &nbsp;|&nbsp; <span class="tag tag-BUILD">BUILD</span> reopen (done → open) &#9675; PLANNED.</div>
   </div>
 
   <div class="action-card" onclick="toggleItemComment('s1-1', this)" title="Tap to comment on §1.1">
@@ -500,7 +526,7 @@ code { color: var(--accent); font-family: 'SF Mono', 'Fira Code', monospace; fon
         <li><code>apply_status_delta()</code>: DB says done, file shows <code>[ ]</code> → flips back to <code>[x]</code></li>
       </ol>
     </div>
-    <div class="note-warn"><strong>Note:</strong> DB is authoritative for done status. Once done, unchecking in Obsidian reverts on next sync. Reopening a done item is &#9675; PLANNED (no Telegram command today).</div>
+    <div class="note-warn"><strong>Note:</strong> DB is authoritative for done status. Once done, unchecking in Obsidian reverts on next sync. <span class="tag tag-BUILD">BUILD</span> Reopening a done item: &#9675; PLANNED — no Telegram command today.</div>
     <div class="inline-comment-area" id="item-comment-s1-2">
       <div class="inline-comment-label">§1.2 — item comment</div>
       <textarea class="inline-comment-input" id="ici-s1-2" placeholder="Comment on §1.2…" rows="2" onclick="event.stopPropagation()"></textarea>
@@ -533,7 +559,7 @@ code { color: var(--accent); font-family: 'SF Mono', 'Fira Code', monospace; fon
         <li><strong>② Notification trigger</strong> — "Remind me about this at time/event T." The item stays open; Lobster pings Dan at the specified moment. This is a different behavior: the item is not hidden, a notification is added. <em>This does not exist yet.</em> It requires a scheduled alert mechanism, not a state change.</li>
         <li><strong>③ Visual declutter</strong> — "I know it's there; hide it from view until I ask." No date, no reminder — just suppressed from the active view. Closer to a soft-dismiss than a deferral. <em>Partially overlaps ① today</em> (a long snooze achieves this), but the intent is different: the user is not setting a return date, just reducing clutter.</li>
       </ul>
-      <div style="margin-top: 8px;"><span class="decision">Design decision needed:</span> Current snooze = ① + ③ (temporal deferral that also visually hides). Should we also build ②? Archetype ② is the higher-leverage bet for a personal assistant — the user shouldn't have to initiate recall; Lobster should push. These three could be separate commands or a unified "snooze with optional remind" model.</div>
+      <div style="margin-top: 8px;"><span class="tag tag-DECISION">DECISION</span> Current snooze = ① + ③ (temporal deferral that also visually hides). Should we also build ②? Archetype ② is the higher-leverage bet for a personal assistant — the user shouldn't have to initiate recall; Lobster should push. These three could be separate commands or a unified "snooze with optional remind" model.</div>
     </div>
     <div class="inline-comment-area" id="item-comment-s1-3">
       <div class="inline-comment-label">§1.3 — item comment</div>
@@ -569,7 +595,7 @@ code { color: var(--accent); font-family: 'SF Mono', 'Fira Code', monospace; fon
     <div class="note-warn">
       <strong>Why does origin affect the deletion scan?</strong><br>
       Today, the deletion scan (<code>sync_obsidian_to_db()</code>) only marks items as <code>deleted</code> if their <code>source='obsidian:ACTIVE TODOS.md'</code>. The rationale was: Obsidian items were explicitly added to the file by Dan; if they're gone from the file, Dan removed them, so deletion is the correct inference. Telegram-sourced items were <em>written to the file by Lobster</em> (in the additions block); their absence from the file could mean the block wasn't rendered yet, not that Dan deleted them — so deletion was unsafe to infer.<br><br>
-      <strong>Position going forward:</strong> This origin-branching in the state machine is a pragmatic holdover, not a design principle. Source should be provenance metadata only — it should describe <em>where the item came from</em>, not <em>how the state machine behaves</em>. The right long-term fix is smarter deletion inference (e.g., a deletion confirmation flow, or tracking render vs. user-removal separately). See §2.5–§2.7 for the broader Source Parity principle.
+      <strong>Position going forward:</strong> <span class="tag tag-REMOVE">REMOVE</span> This origin-branching in the state machine is a pragmatic holdover, not a design principle. Source should be provenance metadata only — it should describe <em>where the item came from</em>, not <em>how the state machine behaves</em>. The right long-term fix is smarter deletion inference (e.g., a deletion confirmation flow, or tracking render vs. user-removal separately). See §2.5–§2.7 for the broader Source Parity principle.
     </div>
     <div class="inline-comment-area" id="item-comment-s1-4">
       <div class="inline-comment-label">§1.4 — item comment</div>
@@ -610,7 +636,7 @@ code { color: var(--accent); font-family: 'SF Mono', 'Fira Code', monospace; fon
     <div class="design-note">
       <strong>Design: Category Grouping Within Priority</strong><br>
       Items under a priority section (e.g., Active) are further grouped by workstream subsection (<code>### LOS</code>, <code>### Site</code>, etc.). This grouping currently serves two functions simultaneously: <em>spatial organization</em> (items cluster visually) and <em>tagging</em> (DB <code>workstream</code> field is set from the subsection header).<br><br>
-      The coupling is convenient but creates questions: What if an item belongs to a workstream but shouldn't be grouped with others from that workstream? What if the best spatial grouping doesn't align with the workstream taxonomy? The current model treats "where it appears" and "what it belongs to" as the same signal. This is fine for now but may eventually need to be two separate fields — a display section and a workstream tag — especially as the todo file grows in density.
+      The coupling is convenient but creates questions: What if an item belongs to a workstream but shouldn't be grouped with others from that workstream? What if the best spatial grouping doesn't align with the workstream taxonomy? The current model treats "where it appears" and "what it belongs to" as the same signal. <span class="tag tag-TRACK">TRACK</span> This is fine for now but may eventually need to be two separate fields — a display section and a workstream tag — especially as the todo file grows in density.
     </div>
     <div class="inline-comment-area" id="item-comment-s2-1">
       <div class="inline-comment-label">§2.1 — item comment</div>
@@ -669,7 +695,7 @@ code { color: var(--accent); font-family: 'SF Mono', 'Fira Code', monospace; fon
         <li><strong>(b) Insert in most appropriate section + [NEW] flag</strong> — Lobster infers priority and places the item, but decorates it with a <code>[NEW]</code> inline comment. The flag disappears once Dan moves or touches the item. Requires inference + decoration tracking.</li>
         <li><strong>(c) Separate "Inbox" section</strong> — All Lobster-generated items land in a dedicated <code>## Inbox</code> section at the top of the file. Dan triages from Inbox into priority sections. Clean separation, maximum visibility. Adds a triage step Dan currently doesn't have.</li>
       </ul>
-      <div style="margin-top: 8px;"><span class="decision">Design decision needed:</span> Option (c) is most structurally clean and is consistent with the "extension of mind" framing — the Inbox is the cognitive buffer. Option (a) is easiest to implement today. Option (b) requires tracking that doesn't exist yet.</div>
+      <div style="margin-top: 8px;"><span class="tag tag-DECISION">DECISION</span> Option (c) is most structurally clean and is consistent with the "extension of mind" framing — the Inbox is the cognitive buffer. Option (a) is easiest to implement today. Option (b) requires tracking that doesn't exist yet.</div>
     </div>
     <div class="inline-comment-area" id="item-comment-s2-3">
       <div class="inline-comment-label">§2.3 — item comment</div>
@@ -698,7 +724,7 @@ code { color: var(--accent); font-family: 'SF Mono', 'Fira Code', monospace; fon
       <strong>Design: Priority–Section Coupling</strong><br>
       The Obsidian file structure encodes priority as spatial position: items under <code>## Urgent</code> are P1–P3, <code>## Active</code> is P4–P6, <code>## Someday</code> is P7–P9. This is elegant because the file is readable without any metadata — the structure is the priority system. Dan's intuition ("tool for my mind") aligns naturally with spatial layout.<br><br>
       The tension: priority (urgency/importance) and spatial section (grouping/organization) are currently the same concept. That means you cannot mark something as urgent-priority without moving it to the top section, and you cannot organize the Someday section into subsections without implying it's all P7–P9. As the system grows, these two concerns may want to diverge — for example, an item that is <em>strategically important</em> but genuinely long-horizon might benefit from a separate priority signal independent of section placement.<br><br>
-      <span class="decision">Structural debt, not urgent.</span> The markdown/hierarchical model is expressive enough for the current scale. The coupling is a limitation of the format, not a design mistake. If this ever becomes a pain point, the right move is an explicit <code>priority:</code> tag in the item text (e.g., <code>- [ ] Fix login flow <!-- priority:urgent --></code>), but that introduces complexity that isn't justified today.
+      <span class="tag tag-DEFER">DEFER</span> The markdown/hierarchical model is expressive enough for the current scale. The coupling is a limitation of the format, not a design mistake. If this ever becomes a pain point, the right move is an explicit <code>priority:</code> tag in the item text (e.g., <code>- [ ] Fix login flow &lt;!-- priority:urgent --&gt;</code>), but that introduces complexity that isn't justified today.
     </div>
     <div class="inline-comment-area" id="item-comment-s2-4">
       <div class="inline-comment-label">§2.4 — item comment</div>
@@ -722,7 +748,7 @@ code { color: var(--accent); font-family: 'SF Mono', 'Fira Code', monospace; fon
         <li>Old text is absent from file → deletion scan: <code>mark_deleted()</code> if <code>source='obsidian:ACTIVE TODOS.md'</code></li>
       </ol>
     </div>
-    <div class="note-warn"><strong>Gap:</strong> If item was Telegram-sourced, the deletion scan skips it — DB has two open rows (old + new text). No automated dedup. &#9675; PLANNED.</div>
+    <div class="note-warn"><strong>Gap:</strong> If item was Telegram-sourced, the deletion scan skips it — DB has two open rows (old + new text). <span class="tag tag-BUILD">BUILD</span> No automated dedup — &#9675; PLANNED.</div>
     <div class="design-note">
       <strong>Architectural Principle: Source Parity</strong><br>
       The fact that this gap is <em>source-dependent</em> points to a deeper structural issue worth naming explicitly. The current system branches on <code>source</code> in multiple places: deletion scan, additions block rendering, file-presence inference. Each branch was added for a pragmatic reason, but together they make the state machine source-aware in ways that should not be necessary.<br><br>
@@ -754,7 +780,7 @@ code { color: var(--accent); font-family: 'SF Mono', 'Fira Code', monospace; fon
     <div class="note-warn"><strong>Important:</strong> Only <code>obsidian</code>-sourced items get deletion-detected. Telegram-sourced items removed from the file will reappear in the additions block on next render.</div>
     <div class="design-note">
       <strong>Design note:</strong> Why shouldn't all sourced items get the same deletion treatment? The current asymmetry exists because the system can't distinguish "Dan deleted this Telegram-sourced line" from "Lobster just hasn't written it to the file yet." Obsidian-sourced items don't have this ambiguity — if they're in the DB and not in the file, Dan removed them.<br><br>
-      The Source Parity goal would remove this distinction. One path: track whether a Lobster-added item has been successfully rendered to the file (a <code>rendered_at</code> timestamp or <code>rendered=true</code> flag). Once rendered, its absence from the file can be confidently attributed to Dan's intent, and the deletion scan can treat it the same as Obsidian-sourced items. The system should trust and defer to Dan regardless of origin — the current asymmetry is a workaround for a gap in render tracking, not an intended feature.
+      The Source Parity goal would remove this distinction. <span class="tag tag-BUILD">BUILD</span> One path: track whether a Lobster-added item has been successfully rendered to the file (a <code>rendered_at</code> timestamp or <code>rendered=true</code> flag). Once rendered, its absence from the file can be confidently attributed to Dan's intent, and the deletion scan can treat it the same as Obsidian-sourced items. The system should trust and defer to Dan regardless of origin — the current asymmetry is a workaround for a gap in render tracking, not an intended feature.
     </div>
     <div class="inline-comment-area" id="item-comment-s2-6">
       <div class="inline-comment-label">§2.6 — item comment</div>
@@ -781,7 +807,7 @@ code { color: var(--accent); font-family: 'SF Mono', 'Fira Code', monospace; fon
     </div>
     <div class="note-ok"><strong>Fully preserved:</strong> Non-checkbox content survives all sync cycles without modification. This is a core design guarantee of the delta approach.</div>
     <div class="design-note">
-      <strong>Design note — subbullets and origin:</strong> Subbullets (non-checkbox lines) are file-only constructs. They have no DB representation and no source attribution. This is a deliberate simplicity choice — the delta approach passes them through unchanged, which is the safest and most predictable behavior. The question "why does origin matter here?" doesn't apply to subbullets because they aren't tracked at all. If rich note-taking on todos becomes a priority (e.g., linking notes to items in the DB), subbullets would need promotion to a tracked concept — but that's a significant scope increase. Today's "pass through unchanged" guarantee is the right default for a system optimizing for antifragility over feature richness.
+      <strong>Design note — subbullets and origin:</strong> Subbullets (non-checkbox lines) are file-only constructs. They have no DB representation and no source attribution. This is a deliberate simplicity choice — the delta approach passes them through unchanged, which is the safest and most predictable behavior. The question "why does origin matter here?" doesn't apply to subbullets because they aren't tracked at all. <span class="tag tag-DEFER">DEFER</span> If rich note-taking on todos becomes a priority (e.g., linking notes to items in the DB), subbullets would need promotion to a tracked concept — but that's a significant scope increase not justified today.
     </div>
     <div class="inline-comment-area" id="item-comment-s2-7">
       <div class="inline-comment-label">§2.7 — item comment</div>
@@ -826,7 +852,7 @@ code { color: var(--accent); font-family: 'SF Mono', 'Fira Code', monospace; fon
         <li>Dispatcher picks up inbox JSON and processes as a normal user message</li>
       </ol>
     </div>
-    <div class="note-warn"><strong>Gap — No acknowledgement ping:</strong> After dispatch, Dan receives no "received your annotation" Telegram message. The annotation is silently consumed. The <code>dispatched_at:</code> comment is written and immediately removed — no trace remains in the file. Dan must infer dispatch from the annotation line disappearing on next pull.<br><br>Planned mitigation (&#9675; PLANNED, Tier 2a): Obsidian plugin will show inline status decorations (<em>dispatched / open / done</em>) on <code>@lobster</code> lines.</div>
+    <div class="note-warn"><strong>Gap — No acknowledgement ping:</strong> After dispatch, Dan receives no "received your annotation" Telegram message. The annotation is silently consumed. The <code>dispatched_at:</code> comment is written and immediately removed — no trace remains in the file. Dan must infer dispatch from the annotation line disappearing on next pull.<br><br><span class="tag tag-BUILD">BUILD</span> Planned mitigation (&#9675; PLANNED, Tier 2a): Obsidian plugin will show inline status decorations (<em>dispatched / open / done</em>) on <code>@lobster</code> lines.</div>
     <div class="note">Deduplication: each annotation gets a SHA-256 content-hash <code>message_id</code>. If the same annotation fires twice (retry scenario), the dispatcher's dedup gate prevents double-processing.</div>
     <div class="inline-comment-area" id="item-comment-s3-1">
       <div class="inline-comment-label">§3.1 — item comment</div>
@@ -851,7 +877,7 @@ code { color: var(--accent); font-family: 'SF Mono', 'Fira Code', monospace; fon
         <li>Any reply produced by the command goes to Telegram (chat_id from config)</li>
       </ol>
     </div>
-    <div class="note">No special @lobster command vocabulary beyond what Telegram accepts. Vault-specific semantics (link to issue, snooze annotation) are &#9675; PLANNED for Tier 2 extensions.</div>
+    <div class="note">No special @lobster command vocabulary beyond what Telegram accepts. <span class="tag tag-BUILD">BUILD</span> Vault-specific semantics (link to issue, snooze annotation) are &#9675; PLANNED for Tier 2 extensions.</div>
     <div class="design-note">
       <strong>§3.2 vs. §3.1 — what's the difference?</strong><br>
       <strong>§3.1</strong> covers the <em>infrastructure</em> of @lobster annotations: how they're detected, marked, dispatched to the inbox, and removed from the file. It describes the wiring regardless of what you write after <code>@lobster</code>.<br><br>
@@ -970,9 +996,9 @@ code { color: var(--accent); font-family: 'SF Mono', 'Fira Code', monospace; fon
     <div class="design-note">
       <strong>Design note — structure, views, and flexibility</strong><br>
       The current section structure is a good default but it should be treated as <em>convention, not law</em>. The system works best when it bends to how Dan's mind works, not the other way around. A few directions worth noting:<br><br>
-      <strong>Views:</strong> The Obsidian file is one view — a flat, spatially-organized list. As the item count grows, other views become useful: by workstream, by staleness (items untouched for 7+ days), by snooze expiry, by a custom filter. These don't require changing the file structure; they're computed views over the DB. This is where Lobster can add leverage without touching the vault format.<br><br>
-      <strong>Antifragility:</strong> The system should be robust to structural experiments. Dan reshuffling headers, adding new subsections, or trying different organizational schemes should produce graceful degradation (items default to Active priority) rather than silent data corruption. The current failure mode (silent priority misassignment) is suboptimal — the system should alert when it can't parse a header, not silently fall back.<br><br>
-      <strong>Extension of mind:</strong> The most important structural property is that the file remains a <em>direct cognitive interface</em>. Every affordance Lobster adds — auto-placement, [NEW] flags, inline decorations — must earn its place by reducing cognitive friction, not adding to it. When in doubt, prefer invisible infrastructure over visible UI chrome.
+      <span class="tag tag-DEFER">DEFER</span> <strong>Views:</strong> The Obsidian file is one view — a flat, spatially-organized list. As the item count grows, other views become useful: by workstream, by staleness (items untouched for 7+ days), by snooze expiry, by a custom filter. These don't require changing the file structure; they're computed views over the DB. This is where Lobster can add leverage without touching the vault format.<br><br>
+      <span class="tag tag-BUILD">BUILD</span> <strong>Antifragility:</strong> The system should be robust to structural experiments. Dan reshuffling headers, adding new subsections, or trying different organizational schemes should produce graceful degradation (items default to Active priority) rather than silent data corruption. The current failure mode (silent priority misassignment) is suboptimal — the system should alert when it can't parse a header, not silently fall back.<br><br>
+      <span class="tag tag-TRACK">TRACK</span> <strong>Extension of mind:</strong> The most important structural property is that the file remains a <em>direct cognitive interface</em>. Every affordance Lobster adds — auto-placement, [NEW] flags, inline decorations — must earn its place by reducing cognitive friction, not adding to it. When in doubt, prefer invisible infrastructure over visible UI chrome.
     </div>
     <div class="inline-comment-area" id="item-comment-s4-4">
       <div class="inline-comment-label">§4.4 — item comment</div>
@@ -1001,13 +1027,13 @@ code { color: var(--accent); font-family: 'SF Mono', 'Fira Code', monospace; fon
     </div>
     <div class="lifecycle">
       <ol>
-        <li>No acknowledgement ping for @lobster annotation dispatch — Tier 2a plugin will provide inline decorations</li>
-        <li>Reopen a done item: no Telegram command today; requires direct DB action</li>
-        <li>Edit text of an existing item: creates duplicate; no merge/reconcile UI</li>
-        <li>Retire <code>todo_obsidian_sync.py</code> cron: scheduled 2026-05-13 after 48h validation</li>
-        <li>Tier 2a Obsidian plugin (Mac): hotkey capture, quick-add modal, @lobster inline decorations, DISABLE PROCESSING ribbon toggle, status bar</li>
-        <li>Tier 2b surfacing: idle nudges for items open &gt;72h, today-view panel</li>
-        <li>GitHub webhook mode: replace git-fetch polling with push webhook (~1s vs. ~30s detection)</li>
+        <li><span class="tag tag-BUILD">BUILD</span> No acknowledgement ping for @lobster annotation dispatch — Tier 2a plugin will provide inline decorations</li>
+        <li><span class="tag tag-BUILD">BUILD</span> Reopen a done item: no Telegram command today; requires direct DB action</li>
+        <li><span class="tag tag-BUILD">BUILD</span> Edit text of an existing item: creates duplicate; no merge/reconcile UI</li>
+        <li><span class="tag tag-REMOVE">REMOVE</span> Retire <code>todo_obsidian_sync.py</code> cron: scheduled 2026-05-13 after 48h validation</li>
+        <li><span class="tag tag-BUILD">BUILD</span> Tier 2a Obsidian plugin (Mac): hotkey capture, quick-add modal, @lobster inline decorations, DISABLE PROCESSING ribbon toggle, status bar</li>
+        <li><span class="tag tag-BUILD">BUILD</span> Tier 2b surfacing: idle nudges for items open &gt;72h, today-view panel</li>
+        <li><span class="tag tag-BUILD">BUILD</span> GitHub webhook mode: replace git-fetch polling with push webhook (~1s vs. ~30s detection)</li>
       </ol>
     </div>
     <div class="inline-comment-area" id="item-comment-s5-1">
@@ -1082,7 +1108,7 @@ code { color: var(--accent); font-family: 'SF Mono', 'Fira Code', monospace; fon
       <tr>
         <td>Item text edited in Obsidian</td>
         <td>Old item becomes <code>status='deleted'</code>; new text inserted as new row</td>
-        <td>If Telegram-sourced: DB has two rows. No automated dedup. &#9675; PLANNED.</td>
+        <td>If Telegram-sourced: DB has two rows. <span class="tag tag-BUILD">BUILD</span> No automated dedup — &#9675; PLANNED.</td>
       </tr>
       <tr>
         <td>lobster-additions block corrupted</td>
