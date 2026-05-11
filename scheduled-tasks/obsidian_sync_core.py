@@ -5,7 +5,8 @@ obsidian_sync_core.py — Shared sync/render/git logic for Obsidian vault integr
 Public API used by both todo_obsidian_sync.py and vault-processor.py:
   - parse_active_todos(content)       — pure parser; no I/O
   - sync_obsidian_to_db(conn, content) — syncs markdown edits to DB
-  - render_active_todos(conn, last_synced=None) — generates markdown from DB
+  - apply_status_delta(file_content, conn) — update checkboxes in-place; preserve structure
+  - render_active_todos(conn, last_synced=None) — generates markdown from DB (bootstrap only)
   - git_pull(vault_path)              — git pull --rebase --autostash
   - git_commit_and_push(vault_path, files, message) — stage, commit, push
   - acquire_lock_or_skip(lock_path)   — cross-process fcntl.flock (non-blocking)
@@ -406,7 +407,205 @@ def sync_obsidian_to_db(conn, content: str) -> SyncResult:
 
 
 # ---------------------------------------------------------------------------
-# Render (pure generation — no DB writes)
+# Delta-apply (structure-preserving update — only checkbox prefixes change)
+# ---------------------------------------------------------------------------
+
+# Marker blocks managed by Lobster at the bottom of the file
+_LOBSTER_ADDITIONS_MARKER = "<!-- lobster-additions -->"
+_LOBSTER_ADDITIONS_END = "<!-- /lobster-additions -->"
+
+# Any checkbox line (0 or more leading spaces): "- [ ]" or "- [x]"
+_ANY_CHECKBOX_RE = re.compile(r"^(\s*- \[)(?P<checked>[ xX])(\]\s+)(?P<text>.+)$")
+
+
+def _extract_item_text_for_lookup(raw_text: str) -> str:
+    """Strip HTML comments and workstream annotations from raw checkbox text.
+
+    Mirrors the normalization in _parse_item_text so dedup_key matches.
+    """
+    text = HTML_COMMENT_RE.sub("", raw_text)
+    text = ANNOTATION_RE.sub("", text).strip()
+    return text
+
+
+def apply_status_delta(file_content: str, conn) -> str:
+    """Update checkbox prefixes in-place without rewriting surrounding structure.
+
+    For each ``- [ ]`` or ``- [x]`` line in the file:
+    - Compute dedup_key from item text
+    - Look up DB status
+    - If DB says done and file shows ``[ ]`` → flip to ``[x]``
+    - If DB says open/snoozed and file shows ``[x]`` → flip to ``[ ]``
+    - All other lines (headers, subbullets, blank lines, non-todo lines) are
+      passed through unchanged.
+
+    Items in the DB that are open/snoozed but absent from the file (added via
+    Telegram or other non-obsidian sources) are appended at the bottom inside
+    a ``<!-- lobster-additions -->`` block so they don't disrupt Dan's structure.
+
+    The ``<!-- done since last reset -->`` section previously managed by
+    render_active_todos is not reproduced here — done items stay as ``[x]`` in
+    place until the 5am daily reset job removes them.
+
+    Returns the (possibly identical) updated file content string.
+    """
+    lines = file_content.splitlines(keepends=True)
+
+    # --- Pass 1: collect all dedup_keys already present in the file ---
+    file_dedup_keys: set[str] = set()
+    for raw_line in lines:
+        line = raw_line.rstrip("\n")
+        m = _ANY_CHECKBOX_RE.match(line)
+        if not m:
+            continue
+        raw_text = m.group("text")
+        item_text = _extract_item_text_for_lookup(raw_text)
+        if not item_text:
+            continue
+        # Skip the DISABLE PROCESSING guard
+        if "DISABLE PROCESSING" in item_text.upper():
+            continue
+        file_dedup_keys.add(compute_dedup_key(item_text))
+
+    # --- Build DB lookup: dedup_key → (id, status) ---
+    # Only fetch open/snoozed/done — deleted/dismissed items are not relevant.
+    db_by_key: dict[str, tuple[int, str]] = {}
+    cur = conn.execute(
+        """
+        SELECT id, dedup_key, status
+        FROM action_items
+        WHERE status IN ('open', 'snoozed', 'done')
+        """,
+    )
+    for row in cur.fetchall():
+        db_by_key[row[1]] = (row[0], row[2])
+
+    # --- Pass 2: rewrite checkbox prefixes in-place ---
+    out_lines: list[str] = []
+    in_additions_block = False
+
+    for raw_line in lines:
+        # Track whether we are inside the existing additions block
+        stripped = raw_line.rstrip("\n")
+        if stripped.strip() == _LOBSTER_ADDITIONS_MARKER:
+            in_additions_block = True
+            out_lines.append(raw_line)
+            continue
+        if stripped.strip() == _LOBSTER_ADDITIONS_END:
+            in_additions_block = False
+            out_lines.append(raw_line)
+            continue
+
+        # Lines inside the additions block get checkbox treatment too
+        m = _ANY_CHECKBOX_RE.match(stripped)
+        if not m:
+            out_lines.append(raw_line)
+            continue
+
+        raw_text = m.group("text")
+        item_text = _extract_item_text_for_lookup(raw_text)
+
+        # Skip the DISABLE PROCESSING guard — never touch it
+        if "DISABLE PROCESSING" in item_text.upper():
+            out_lines.append(raw_line)
+            continue
+
+        if not item_text:
+            out_lines.append(raw_line)
+            continue
+
+        dedup_key = compute_dedup_key(item_text)
+        current_checked = m.group("checked").strip().lower() == "x"
+        db_entry = db_by_key.get(dedup_key)
+
+        if db_entry is None:
+            # Not in DB — leave line as-is (may be a new item Dan just added)
+            out_lines.append(raw_line)
+            continue
+
+        _db_id, db_status = db_entry
+        db_done = db_status == ActionItemStatus.DONE
+
+        if db_done and not current_checked:
+            # DB says done but file shows open — flip to [x]
+            new_line = m.group(1) + "x" + m.group(3) + raw_text
+            eol = "\n" if raw_line.endswith("\n") else ""
+            out_lines.append(new_line + eol)
+            log.debug("Delta: marked [x] in file: %r", item_text[:60])
+        elif not db_done and current_checked:
+            # DB says open/snoozed but file shows done — flip back to [ ]
+            new_line = m.group(1) + " " + m.group(3) + raw_text
+            eol = "\n" if raw_line.endswith("\n") else ""
+            out_lines.append(new_line + eol)
+            log.debug("Delta: unmarked [ ] in file: %r", item_text[:60])
+        else:
+            # Already in sync — pass through unchanged
+            out_lines.append(raw_line)
+
+    # --- Pass 3: find open/snoozed items that are NOT yet in the file ---
+    # These are items added via Telegram (source != obsidian) that need to
+    # appear in the file so Dan can see and manage them.
+    items_to_append: list[tuple[int, str, int]] = []  # (id, text, priority)
+    if file_dedup_keys:
+        placeholders = ",".join("?" * len(file_dedup_keys))
+        cur2 = conn.execute(
+            f"""
+            SELECT id, text, priority
+            FROM action_items
+            WHERE status IN ('open', 'snoozed')
+              AND parent_id IS NULL
+              AND dedup_key NOT IN ({placeholders})
+            ORDER BY priority ASC, extracted_at ASC
+            """,
+            tuple(file_dedup_keys),
+        )
+    else:
+        # No items in file at all — append everything open/snoozed
+        cur2 = conn.execute(
+            """
+            SELECT id, text, priority
+            FROM action_items
+            WHERE status IN ('open', 'snoozed')
+              AND parent_id IS NULL
+            ORDER BY priority ASC, extracted_at ASC
+            """,
+        )
+    items_to_append = [(row[0], row[1], row[2]) for row in cur2.fetchall()]
+
+    if not items_to_append:
+        return "".join(out_lines)
+
+    # Strip existing additions block from the tail (we'll rewrite it)
+    # Find the last occurrence of _LOBSTER_ADDITIONS_MARKER in out_lines
+    tail_start: Optional[int] = None
+    for idx in range(len(out_lines) - 1, -1, -1):
+        if out_lines[idx].strip() == _LOBSTER_ADDITIONS_MARKER:
+            tail_start = idx
+            break
+
+    if tail_start is not None:
+        out_lines = out_lines[:tail_start]
+
+    # Ensure file ends with a newline before appending
+    if out_lines and not out_lines[-1].endswith("\n"):
+        out_lines[-1] = out_lines[-1] + "\n"
+    if not out_lines or out_lines[-1].strip() != "":
+        out_lines.append("\n")
+
+    # Append new items block
+    out_lines.append(_LOBSTER_ADDITIONS_MARKER + "\n")
+    out_lines.append("*Items added via Telegram — move or edit freely:*\n")
+    out_lines.append("\n")
+    for item_id, item_text, _priority in items_to_append:
+        out_lines.append(f"- [ ] {item_text} <!-- id:{item_id} -->\n")
+        log.info("Delta: appended new item from DB: %r (id=%d)", item_text[:60], item_id)
+    out_lines.append(_LOBSTER_ADDITIONS_END + "\n")
+
+    return "".join(out_lines)
+
+
+# ---------------------------------------------------------------------------
+# Render (pure generation — no DB writes; retained for bootstrap / fresh installs)
 # ---------------------------------------------------------------------------
 
 

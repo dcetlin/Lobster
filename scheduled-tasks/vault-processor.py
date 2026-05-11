@@ -51,6 +51,7 @@ if str(_TASKS_DIR) not in sys.path:
 from obsidian_sync_core import (  # noqa: E402
     ACTIVE_TODOS_FILENAME,
     acquire_lock_or_skip,
+    apply_status_delta,
     git_commit_and_push,
     git_pull,
     release_lock,
@@ -549,29 +550,24 @@ def run_processor(config: dict, db_path: Path = DB_PATH_DEFAULT) -> bool:
             log.info("No ACTIVE TODOS.md content — skipping sync")
             sync_result = None
 
-        # Step 8: render_active_todos() with current timestamp
-        log.info("Step 8: render_active_todos")
-        from zoneinfo import ZoneInfo
-        pst = ZoneInfo("America/Los_Angeles")
-        last_synced = datetime.now(pst).strftime("%Y-%m-%d %H:%M PST")
-        done_reset_hour_pst: int = config.get("done_reset_hour_pst", 5)
-        new_todos_content = render_active_todos(
-            conn,
-            last_synced=last_synced,
-            done_reset_hour_pst=done_reset_hour_pst,
-        )
+        # Step 8: apply_status_delta — update checkboxes in-place, preserve structure
+        log.info("Step 8: apply_status_delta")
+        new_todos_content = apply_status_delta(todos_content, conn)
 
         if not new_todos_content:
-            log.error("render_active_todos returned empty content — skipping write")
+            log.error("apply_status_delta returned empty content — skipping write")
             return False
 
     finally:
         conn.close()
 
-    # Write the regenerated file
-    todos_path.parent.mkdir(parents=True, exist_ok=True)
-    todos_path.write_text(new_todos_content, encoding="utf-8")
-    log.info("Wrote regenerated ACTIVE TODOS.md (%d chars)", len(new_todos_content))
+    # Write the updated file only when content actually changed
+    if new_todos_content == todos_content:
+        log.info("No checkbox changes — ACTIVE TODOS.md unchanged")
+    else:
+        todos_path.parent.mkdir(parents=True, exist_ok=True)
+        todos_path.write_text(new_todos_content, encoding="utf-8")
+        log.info("Wrote updated ACTIVE TODOS.md (%d chars)", len(new_todos_content))
 
     # Step 9: git add ACTIVE TODOS.md
     log.info("Step 9: git add ACTIVE TODOS.md")
