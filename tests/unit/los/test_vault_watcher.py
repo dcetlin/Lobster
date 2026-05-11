@@ -755,6 +755,177 @@ def test_git_pull_returns_true_when_no_remote(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# obsidian_sync_core: git_commit_and_push
+# ---------------------------------------------------------------------------
+#
+# All four tests use unittest.mock.patch to mock subprocess.run so no real git
+# calls are made. This mirrors the approach used throughout this test file for
+# vault-processor and vault-watcher subprocess interactions. The constant
+# NO_CHANGES_STATUS and REMOTE_NAME are named after spec requirements rather
+# than inline literals so a reader can map them back to the contract.
+
+# Named constants matching spec requirements (git_commit_and_push behavior)
+_GIT_STATUS_NO_CHANGES = ""         # `git status --porcelain` output when nothing is staged
+_GIT_STATUS_HAS_CHANGES = "M file"  # non-empty porcelain output when changes are staged
+_GIT_REMOTE_EXISTS = "origin\n"     # `git remote` output when a remote is configured
+_GIT_REMOTE_NONE = ""               # `git remote` output when no remote is configured
+
+
+def _make_run_result(returncode: int = 0, stdout: str = "", stderr: str = "") -> MagicMock:
+    """Build a mock subprocess.CompletedProcess with the given attributes."""
+    r = MagicMock()
+    r.returncode = returncode
+    r.stdout = stdout
+    r.stderr = stderr
+    return r
+
+
+def test_git_commit_and_push_happy_path_calls_add_commit_push_in_order(tmp_path):
+    """Happy path: when changes are staged, git add / git commit / git push are called.
+
+    Verifies the command sequence required by spec (PR 3, test case 1):
+    - git add for each staged file
+    - git status --porcelain to detect pending changes
+    - git commit -m <message>
+    - git remote to check for a remote
+    - git push
+    All subprocess calls return success (returncode=0). Function returns True.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    staged_file = vault / "ACTIVE TODOS.md"
+    staged_file.write_text("- [ ] test item")
+
+    call_log: list[list[str]] = []
+
+    def mock_run(cmd, **kwargs):
+        call_log.append(list(cmd))
+        if cmd[1] == "status":
+            return _make_run_result(stdout=_GIT_STATUS_HAS_CHANGES)
+        if cmd[1] == "remote":
+            return _make_run_result(stdout=_GIT_REMOTE_EXISTS)
+        return _make_run_result()
+
+    with patch("obsidian_sync_core.subprocess.run", side_effect=mock_run):
+        result = git_commit_and_push(vault, [staged_file], "sync: update ACTIVE TODOS.md")
+
+    assert result is True
+
+    commands_issued = [c[1] for c in call_log]  # second token is the git subcommand
+    assert "add" in commands_issued, "git add must be called when files are provided"
+    assert "commit" in commands_issued, "git commit must be called when changes are staged"
+    assert "push" in commands_issued, "git push must be called when a remote is configured"
+
+    # Order: add → status → commit → remote → push
+    add_idx = commands_issued.index("add")
+    status_idx = commands_issued.index("status")
+    commit_idx = commands_issued.index("commit")
+    push_idx = commands_issued.index("push")
+    assert add_idx < status_idx < commit_idx < push_idx, (
+        f"Expected add < status < commit < push, got indices: "
+        f"add={add_idx} status={status_idx} commit={commit_idx} push={push_idx}"
+    )
+
+
+def test_git_commit_and_push_returns_false_when_nothing_to_commit(tmp_path):
+    """No staged changes: function returns False and never calls git commit or git push.
+
+    Verifies spec PR 3 test case 2 — when `git status --porcelain` returns empty
+    output, the function exits early (no exception, no commit, no push).
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    staged_file = vault / "ACTIVE TODOS.md"
+    staged_file.write_text("- [ ] test item")
+
+    commit_called = []
+    push_called = []
+
+    def mock_run(cmd, **kwargs):
+        if cmd[1] == "commit":
+            commit_called.append(cmd)
+        if cmd[1] == "push":
+            push_called.append(cmd)
+        if cmd[1] == "status":
+            return _make_run_result(stdout=_GIT_STATUS_NO_CHANGES)
+        return _make_run_result()
+
+    with patch("obsidian_sync_core.subprocess.run", side_effect=mock_run):
+        result = git_commit_and_push(vault, [staged_file], "sync: update ACTIVE TODOS.md")
+
+    assert result is False, "Must return False when there is nothing to commit"
+    assert commit_called == [], "git commit must NOT be called when status is empty"
+    assert push_called == [], "git push must NOT be called when there is nothing to commit"
+
+
+def test_git_commit_and_push_returns_true_when_push_fails(tmp_path):
+    """Push failure is non-fatal: function returns True and does not raise.
+
+    Verifies spec PR 3 test case 3 — when `git push` exits non-zero, the function
+    logs a warning but still returns True (push failure is explicitly documented
+    as non-fatal in the git_commit_and_push docstring).
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    staged_file = vault / "ACTIVE TODOS.md"
+    staged_file.write_text("- [ ] test item")
+
+    def mock_run(cmd, **kwargs):
+        if cmd[1] == "status":
+            return _make_run_result(stdout=_GIT_STATUS_HAS_CHANGES)
+        if cmd[1] == "remote":
+            return _make_run_result(stdout=_GIT_REMOTE_EXISTS)
+        if cmd[1] == "push":
+            return _make_run_result(returncode=1, stderr="rejected: remote rejected push")
+        return _make_run_result()
+
+    with patch("obsidian_sync_core.subprocess.run", side_effect=mock_run):
+        result = git_commit_and_push(vault, [staged_file], "sync: update ACTIVE TODOS.md")
+
+    assert result is True, (
+        "Push failure must be non-fatal — function must return True even when git push fails"
+    )
+
+
+def test_git_commit_and_push_commit_message_appears_in_git_commit_call(tmp_path):
+    """Commit message argument is forwarded verbatim to `git commit -m`.
+
+    Verifies spec PR 3 test case 4 — the message passed by the caller must appear
+    in the `git commit -m <message>` subprocess call, unmodified.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    staged_file = vault / "ACTIVE TODOS.md"
+    staged_file.write_text("- [ ] test item")
+
+    EXPECTED_MESSAGE = "los: nightly sync 2026-05-11 — 3 items updated"
+
+    commit_cmd_seen: list[list[str]] = []
+
+    def mock_run(cmd, **kwargs):
+        if cmd[1] == "commit":
+            commit_cmd_seen.append(list(cmd))
+        if cmd[1] == "status":
+            return _make_run_result(stdout=_GIT_STATUS_HAS_CHANGES)
+        if cmd[1] == "remote":
+            return _make_run_result(stdout=_GIT_REMOTE_EXISTS)
+        return _make_run_result()
+
+    with patch("obsidian_sync_core.subprocess.run", side_effect=mock_run):
+        git_commit_and_push(vault, [staged_file], EXPECTED_MESSAGE)
+
+    assert len(commit_cmd_seen) == 1, "git commit must be called exactly once"
+    commit_cmd = commit_cmd_seen[0]
+    # Expected form: ["git", "commit", "-m", EXPECTED_MESSAGE]
+    assert "-m" in commit_cmd, "git commit must use the -m flag"
+    m_idx = commit_cmd.index("-m")
+    assert commit_cmd[m_idx + 1] == EXPECTED_MESSAGE, (
+        f"Commit message must be forwarded verbatim. "
+        f"Expected {EXPECTED_MESSAGE!r}, got {commit_cmd[m_idx + 1]!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Integration: obsidian_sync_core imported by todo_obsidian_sync.py
 # ---------------------------------------------------------------------------
 
