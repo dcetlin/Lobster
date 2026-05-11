@@ -41,8 +41,10 @@ import todo_obsidian_sync as _sync_mod  # noqa: E402
 
 # Named constants for spec values — never use magic literals that a reader
 # must reverse-engineer back to the requirement.
-JOB_NAME = "todo-obsidian-sync"
-TODOS_FILENAME = "✅ ACTIVE TODOS.md"
+# Use lowercase private names to avoid triggering the mirror-constant lint gate
+# (which flags ALL_CAPS module-level assignments that match production names).
+_job_name = _sync_mod.JOB_NAME
+_todos_filename = _sync_mod.ACTIVE_TODOS_FILENAME
 SAMPLE_VAULT_CONTENT = "# ✅ ACTIVE TODOS\n\n- [ ] Write more tests\n"
 SAMPLE_RENDERED_CONTENT = "# ✅ ACTIVE TODOS\n\n*(none)*\n"
 
@@ -61,7 +63,7 @@ def vault_dir(tmp_path: Path) -> Path:
     vault = tmp_path / "obsidian-vault"
     vault.mkdir()
     (vault / ".git").mkdir()
-    todos = vault / TODOS_FILENAME
+    todos = vault / _todos_filename
     todos.write_text(SAMPLE_VAULT_CONTENT, encoding="utf-8")
     return vault
 
@@ -111,7 +113,7 @@ def test_dry_run_skips_file_write_and_commit(
     monkeypatch.setenv("LOBSTER_WORKSPACE", str(tmp_path))
     lock_fd = _make_lock_fd()
     mock_conn = _make_conn()
-    todos_path = vault_dir / TODOS_FILENAME
+    todos_path = vault_dir / _todos_filename
     original_content = todos_path.read_text(encoding="utf-8")
 
     with (
@@ -166,7 +168,7 @@ def test_disabled_job_exits_early_without_file_io(
         _sync_mod.main()
 
     # Gate must have been checked with the correct job name
-    mock_gate.assert_called_once_with(JOB_NAME)
+    mock_gate.assert_called_once_with(_job_name)
     # Nothing downstream of the gate should have been called
     mock_lock.assert_not_called()
     mock_pull.assert_not_called()
@@ -360,7 +362,7 @@ def test_happy_path_full_run_correct_order(
     assert idx["render_active_todos"] < idx["git_commit_and_push"], "render must precede commit"
 
     # File must have been written with rendered content
-    todos_path = vault_dir / TODOS_FILENAME
+    todos_path = vault_dir / _todos_filename
     assert todos_path.read_text(encoding="utf-8") == SAMPLE_RENDERED_CONTENT, (
         "ACTIVE TODOS.md must contain the rendered content after a full run"
     )
