@@ -141,10 +141,11 @@ ID_COMMENT_RE = re.compile(r"<!--\s*id:(?P<id>\d+)(?:\s+parent:(?P<parent>\d+))?
 # Strip HTML comment from text
 HTML_COMMENT_RE = re.compile(r"\s*<!--[^>]*-->")
 
-# Attribution sub-bullet pattern — used to detect existing attribution lines
-# so idempotent renders can skip re-rendering them.
-# Matches:  "  - [[...]]" or "  - [telegram msg · ...]" etc.
-ATTRIBUTION_LINE_RE = re.compile(r"^  - (?:\[\[.+\]\]|\[(?:telegram msg|voicenote|direct|obsidian) ·)")
+# Attribution sub-bullet pattern — exported for use by callers and future phases.
+# Matches:  "  - [[...]]" (obsidian wiki-link) or "  - [telegram msg · ...]" etc.
+# Note: the label-only form "[telegram msg]" (no middot, produced when created_at_iso
+# is absent) is not matched here but is idempotent: re-rendering produces the same string.
+ATTRIBUTION_LINE_RE = re.compile(r"^  - (?:\[\[.+\]\]|\[(?:telegram msg|voicenote|direct) ·)")
 
 # ---------------------------------------------------------------------------
 # Attribution (pure functions — no I/O or DB access)
@@ -174,7 +175,7 @@ def format_attribution(
         - source_ref absent: omit attribution (no doc name to link)
     - source='telegram', 'voice', 'direct': archaeology register.
         - created_at_iso present: "[<label> · Mon May 11 · 10:35 AM PDT]"
-        - created_at_iso absent: "[<label> · Mon May 11]" (date only)
+        - created_at_iso absent or unparseable: "[<label>]" (label only, no timestamp)
     - source not in known set: None (skip attribution)
 
     This is a pure function — no I/O, no DB access.
@@ -200,13 +201,13 @@ def format_attribution(
         return None
 
     if not created_at_iso:
-        return None
+        return f"[{label}]"
 
     try:
         dt_utc = datetime.fromisoformat(created_at_iso.replace("Z", "+00:00"))
         dt_la = dt_utc.astimezone(_LA_TZ)
     except (ValueError, AttributeError):
-        return None
+        return f"[{label}]"
 
     # Determine timezone abbreviation: PDT (DST) or PST (standard)
     tz_abbr = "PDT" if dt_la.dst() and dt_la.dst().total_seconds() != 0 else "PST"

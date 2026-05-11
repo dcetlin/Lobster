@@ -569,13 +569,16 @@ def test_attribution_obsidian_source_constant_without_ref_returns_none() -> None
     assert result is None
 
 
-def test_attribution_missing_created_at_returns_none_for_non_obsidian() -> None:
-    """If created_at is None for telegram/voice/direct, return None (spec: omit time,
-    but with no date either we cannot render anything useful)."""
-    # The spec says "if created_at is missing or null: omit time, render just [telegram msg · Mon May 11]"
-    # However, with no created_at at all we have no date — return None.
-    result = format_attribution("telegram", None, None, None)
-    assert result is None
+def test_attribution_missing_created_at_returns_label_only_for_non_obsidian() -> None:
+    """If created_at is None for telegram/voice/direct, return the label-only form.
+
+    When no timestamp is available the function cannot render a date or time,
+    so it falls back to '[<label>]' rather than returning None. This preserves
+    attribution provenance (the source medium) without fabricating a timestamp.
+    """
+    assert format_attribution("telegram", None, None, None) == "[telegram msg]"
+    assert format_attribution("voice", None, None, None) == "[voicenote]"
+    assert format_attribution("direct", None, None, None) == "[direct]"
 
 
 def test_attribution_unknown_source_returns_none() -> None:
