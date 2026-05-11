@@ -7,6 +7,7 @@ Tests derive from spec requirements:
 - sync_obsidian_to_db() is idempotent — running twice produces the same result
 - Priority is updated when an item moves to a different section
 - Items already done in DB are not re-opened by sync
+- Attribution sub-bullets are rendered for all four source types
 
 No file system writes occur in unit tests — all vault and DB operations use
 in-memory or tmp-path fixtures.
@@ -38,6 +39,11 @@ from src.los.db import (
     mark_snoozed,
     get_item_by_id,
     ActionItemStatus,
+)
+from obsidian_sync_core import (  # noqa: E402
+    format_attribution,
+    _render_attribution_line,
+    ATTRIBUTION_LINE_RE,
 )
 from todo_obsidian_sync import (  # noqa: E402
     ParsedTodos,
@@ -491,3 +497,310 @@ def test_render_includes_past_snoozed_items(conn: sqlite3.Connection) -> None:
     assert "Expired snooze task" in output, (
         "Past-expired snoozed item must appear in render output — snooze expiry is not working"
     )
+
+
+# ---------------------------------------------------------------------------
+# format_attribution — pure function, all four source types
+# ---------------------------------------------------------------------------
+
+# Spec: "2026-05-11T22:37:00Z" (UTC) → PDT (UTC-7 in May) → 3:37 PM PDT on Mon May 11
+_SAMPLE_UTC_ISO = "2026-05-11T22:37:00Z"
+# January date → PST (UTC-8)
+_SAMPLE_UTC_ISO_PST = "2026-01-15T18:12:00Z"
+
+
+def test_attribution_telegram_produces_archaeology_anchor() -> None:
+    """source='telegram' must produce '[telegram msg · Mon May 11 · 3:37 PM PDT]'."""
+    result = format_attribution("telegram", None, None, _SAMPLE_UTC_ISO)
+    assert result == "[telegram msg · Mon May 11 · 3:37 PM PDT]"
+
+
+def test_attribution_voice_produces_voicenote_anchor() -> None:
+    """source='voice' must produce '[voicenote · Mon May 11 · 3:37 PM PDT]'."""
+    result = format_attribution("voice", None, None, _SAMPLE_UTC_ISO)
+    assert result == "[voicenote · Mon May 11 · 3:37 PM PDT]"
+
+
+def test_attribution_direct_produces_direct_anchor() -> None:
+    """source='direct' must produce '[direct · Mon May 11 · 3:37 PM PDT]'."""
+    result = format_attribution("direct", None, None, _SAMPLE_UTC_ISO)
+    assert result == "[direct · Mon May 11 · 3:37 PM PDT]"
+
+
+def test_attribution_uses_pst_in_winter() -> None:
+    """Timezone label must be PST (not PDT) when DST is not active."""
+    # January 15, 2026 18:12 UTC → 10:12 AM PST
+    result = format_attribution("telegram", None, None, _SAMPLE_UTC_ISO_PST)
+    assert result is not None
+    assert "PST" in result
+    assert "PDT" not in result
+
+
+def test_attribution_uses_pdt_in_summer() -> None:
+    """Timezone label must be PDT when DST is active (May)."""
+    result = format_attribution("telegram", None, None, _SAMPLE_UTC_ISO)
+    assert result is not None
+    assert "PDT" in result
+    assert "PST" not in result
+
+
+def test_attribution_obsidian_with_source_ref_produces_wiki_link() -> None:
+    """source='obsidian' with source_ref must produce '[[doc-name]]'."""
+    result = format_attribution("obsidian", "meetings/meeting-tania-2026-05-10.md", None, None)
+    assert result == "[[meetings/meeting-tania-2026-05-10]]"
+
+
+def test_attribution_obsidian_with_source_ref_and_section() -> None:
+    """source='obsidian' with source_ref and source_section must produce '[[doc#section]]'."""
+    result = format_attribution("obsidian", "meeting-tania-2026-05-10.md", "Next steps", None)
+    assert result == "[[meeting-tania-2026-05-10#Next steps]]"
+
+
+def test_attribution_obsidian_without_source_ref_returns_none() -> None:
+    """source='obsidian' without source_ref must return None — no doc to link."""
+    result = format_attribution("obsidian", None, None, None)
+    assert result is None
+
+
+def test_attribution_obsidian_source_constant_without_ref_returns_none() -> None:
+    """source='obsidian:ACTIVE TODOS.md' (the legacy OBSIDIAN_SOURCE constant) without
+    source_ref must return None — there is no meaningful link target."""
+    result = format_attribution(OBSIDIAN_SOURCE, None, None, None)
+    assert result is None
+
+
+def test_attribution_missing_created_at_returns_none_for_non_obsidian() -> None:
+    """If created_at is None for telegram/voice/direct, return None (spec: omit time,
+    but with no date either we cannot render anything useful)."""
+    # The spec says "if created_at is missing or null: omit time, render just [telegram msg · Mon May 11]"
+    # However, with no created_at at all we have no date — return None.
+    result = format_attribution("telegram", None, None, None)
+    assert result is None
+
+
+def test_attribution_unknown_source_returns_none() -> None:
+    """Unknown source values must return None (skip attribution)."""
+    result = format_attribution("unknown_source", None, None, _SAMPLE_UTC_ISO)
+    assert result is None
+
+
+def test_attribution_empty_source_returns_none() -> None:
+    """Empty source string must return None."""
+    result = format_attribution("", None, None, _SAMPLE_UTC_ISO)
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _render_attribution_line — indented sub-bullet
+# ---------------------------------------------------------------------------
+
+
+def test_render_attribution_line_uses_2space_indent() -> None:
+    """Attribution sub-bullet must be indented with exactly 2 spaces."""
+    line = _render_attribution_line("[telegram msg · Mon May 11 · 3:37 PM PDT]")
+    assert line.startswith("  - ")
+
+
+def test_render_attribution_line_matches_attribution_re() -> None:
+    """Attribution line output must match ATTRIBUTION_LINE_RE for idempotency detection."""
+    tg_line = _render_attribution_line("[telegram msg · Mon May 11 · 3:37 PM PDT]")
+    voice_line = _render_attribution_line("[voicenote · Mon May 11 · 9:45 AM PDT]")
+    direct_line = _render_attribution_line("[direct · Mon May 11 · 9:12 AM PDT]")
+    wiki_line = _render_attribution_line("[[meeting-tania-2026-05-10#Next steps]]")
+    assert ATTRIBUTION_LINE_RE.match(tg_line), f"telegram line did not match: {tg_line!r}"
+    assert ATTRIBUTION_LINE_RE.match(voice_line), f"voice line did not match: {voice_line!r}"
+    assert ATTRIBUTION_LINE_RE.match(direct_line), f"direct line did not match: {direct_line!r}"
+    assert ATTRIBUTION_LINE_RE.match(wiki_line), f"wiki-link line did not match: {wiki_line!r}"
+
+
+# ---------------------------------------------------------------------------
+# render_active_todos — attribution sub-bullets in rendered output
+# ---------------------------------------------------------------------------
+
+
+def test_render_includes_attribution_for_telegram_item(conn: sqlite3.Connection) -> None:
+    """render_active_todos must append an attribution sub-bullet for a telegram-sourced item."""
+    # Insert with a known UTC timestamp
+    conn.execute(
+        """
+        INSERT INTO action_items
+            (text, source, source_message_id, extracted_at, priority, status, mention_count, dedup_key)
+        VALUES (?, 'telegram', NULL, ?, 5, 'open', 1, ?)
+        """,
+        (
+            "Follow up on law hosting decision",
+            "2026-05-11T22:37:00+00:00",
+            compute_dedup_key("Follow up on law hosting decision"),
+        ),
+    )
+    conn.commit()
+
+    output = render_active_todos(conn)
+
+    assert "- [ ] Follow up on law hosting decision" in output
+    assert "  - [telegram msg · Mon May 11 · 3:37 PM PDT]" in output
+
+
+def test_render_includes_attribution_for_voice_item(conn: sqlite3.Connection) -> None:
+    """render_active_todos must append a voicenote attribution sub-bullet."""
+    conn.execute(
+        """
+        INSERT INTO action_items
+            (text, source, source_message_id, extracted_at, priority, status, mention_count, dedup_key)
+        VALUES (?, 'voice', NULL, ?, 8, 'open', 1, ?)
+        """,
+        (
+            "Think through vault-watcher Tier 2",
+            "2026-05-10T16:45:00+00:00",
+            compute_dedup_key("Think through vault-watcher Tier 2"),
+        ),
+    )
+    conn.commit()
+
+    output = render_active_todos(conn)
+
+    assert "  - [voicenote ·" in output
+
+
+def test_render_includes_attribution_for_direct_item(conn: sqlite3.Connection) -> None:
+    """render_active_todos must append a direct attribution sub-bullet."""
+    conn.execute(
+        """
+        INSERT INTO action_items
+            (text, source, source_message_id, extracted_at, priority, status, mention_count, dedup_key)
+        VALUES (?, 'direct', NULL, ?, 5, 'open', 1, ?)
+        """,
+        (
+            "Review this doc",
+            "2026-05-11T16:12:00+00:00",
+            compute_dedup_key("Review this doc"),
+        ),
+    )
+    conn.commit()
+
+    output = render_active_todos(conn)
+
+    assert "  - [direct ·" in output
+
+
+def test_render_omits_attribution_for_obsidian_item_without_source_ref(conn: sqlite3.Connection) -> None:
+    """Items sourced from obsidian without a source_ref must not get an attribution sub-bullet."""
+    # Legacy obsidian-sourced items (source = 'obsidian:ACTIVE TODOS.md') have no source_ref
+    conn.execute(
+        """
+        INSERT INTO action_items
+            (text, source, source_message_id, extracted_at, priority, status, mention_count, dedup_key)
+        VALUES (?, ?, NULL, ?, 5, 'open', 1, ?)
+        """,
+        (
+            "Plan the Tania ads campaign",
+            OBSIDIAN_SOURCE,
+            "2026-05-10T14:00:00+00:00",
+            compute_dedup_key("Plan the Tania ads campaign"),
+        ),
+    )
+    conn.commit()
+
+    output = render_active_todos(conn)
+
+    # The item itself must be present
+    assert "Plan the Tania ads campaign" in output
+    # But no attribution sub-bullet should follow it — no source_ref to link
+    lines = output.splitlines()
+    item_idx = next(
+        (i for i, line in enumerate(lines) if "Plan the Tania ads campaign" in line), None
+    )
+    assert item_idx is not None
+    # The line after the item (if it exists) must not be an attribution sub-bullet
+    if item_idx + 1 < len(lines):
+        next_line = lines[item_idx + 1]
+        assert not ATTRIBUTION_LINE_RE.match(next_line), (
+            f"Unexpected attribution sub-bullet after obsidian item: {next_line!r}"
+        )
+
+
+def test_render_attribution_appears_before_subtasks(conn: sqlite3.Connection) -> None:
+    """Attribution sub-bullet must appear directly after the item line, before any subtasks."""
+    # Insert parent item with telegram source
+    parent_id = conn.execute(
+        """
+        INSERT INTO action_items
+            (text, source, source_message_id, extracted_at, priority, status, mention_count, dedup_key)
+        VALUES (?, 'telegram', NULL, ?, 5, 'open', 1, ?)
+        """,
+        (
+            "Parent item with subtask",
+            "2026-05-11T22:37:00+00:00",
+            compute_dedup_key("Parent item with subtask"),
+        ),
+    ).lastrowid
+    conn.commit()
+
+    # Insert subtask
+    insert_action_item(
+        conn, text="Sub item under parent", source="telegram", source_message_id=None,
+        parent_id=parent_id,
+    )
+
+    output = render_active_todos(conn)
+    lines = output.splitlines()
+
+    # Find the parent item line
+    parent_idx = next(
+        (i for i, line in enumerate(lines) if "Parent item with subtask" in line and "  " not in line[:3]),
+        None,
+    )
+    assert parent_idx is not None, "Parent item not found in output"
+
+    # The line immediately after the parent must be the attribution sub-bullet
+    assert parent_idx + 1 < len(lines), "No lines after parent item"
+    attr_line = lines[parent_idx + 1]
+    assert ATTRIBUTION_LINE_RE.match(attr_line), (
+        f"Expected attribution sub-bullet at line {parent_idx + 1}, got: {attr_line!r}"
+    )
+
+    # Subtask must follow the attribution line
+    assert parent_idx + 2 < len(lines), "No lines after attribution"
+    subtask_line = lines[parent_idx + 2]
+    assert "Sub item under parent" in subtask_line
+
+
+def test_render_subtasks_do_not_get_attribution(conn: sqlite3.Connection) -> None:
+    """Subtasks (items with parent_id) must not receive their own attribution sub-bullet."""
+    parent_id = conn.execute(
+        """
+        INSERT INTO action_items
+            (text, source, source_message_id, extracted_at, priority, status, mention_count, dedup_key)
+        VALUES (?, 'telegram', NULL, ?, 5, 'open', 1, ?)
+        """,
+        (
+            "Top-level item",
+            "2026-05-11T22:37:00+00:00",
+            compute_dedup_key("Top-level item"),
+        ),
+    ).lastrowid
+    conn.commit()
+
+    insert_action_item(
+        conn, text="Subtask item", source="telegram", source_message_id=None,
+        parent_id=parent_id,
+    )
+
+    output = render_active_todos(conn)
+    lines = output.splitlines()
+
+    # Find the subtask line (2-space indent)
+    subtask_idx = next(
+        (i for i, line in enumerate(lines) if "Subtask item" in line), None
+    )
+    assert subtask_idx is not None
+
+    # The subtask line itself starts with "  - [ ]" — that's the subtask, not an attribution
+    # The line AFTER the subtask must not be an attribution sub-bullet for the subtask
+    if subtask_idx + 1 < len(lines):
+        next_line = lines[subtask_idx + 1]
+        # An attribution line would also start with "  - " but would match ATTRIBUTION_LINE_RE
+        # A subtask's content is not its own item, so no attribution should follow
+        assert not (
+            ATTRIBUTION_LINE_RE.match(next_line) and "Subtask item" not in next_line
+        ), f"Unexpected attribution after subtask: {next_line!r}"
