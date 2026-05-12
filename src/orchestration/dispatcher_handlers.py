@@ -154,6 +154,28 @@ def _write_jobs_json(data: dict) -> None:
     tmp.rename(_JOBS_JSON_PATH)
 
 
+def get_disabled_wos_core_jobs() -> list[str]:
+    """Return a sorted list of wos_core job names that are currently disabled.
+
+    Reads jobs.json and returns the names of all jobs where both:
+    - ``wos_core`` is truthy
+    - ``enabled`` is falsy (False, missing, or None)
+
+    Used by handle_wos_start to detect partially-enabled state: when
+    execution_enabled=True in wos-config.json but one or more wos_core jobs
+    are still disabled (e.g. due to a manual edit that bypassed toggle_wos_core_jobs).
+
+    Returns an empty list when all wos_core jobs are enabled or when jobs.json
+    is absent/unreadable.
+    """
+    jobs = _read_jobs_json().get("jobs", {})
+    return sorted(
+        name
+        for name, entry in jobs.items()
+        if entry.get("wos_core") and not entry.get("enabled", False)
+    )
+
+
 def toggle_wos_core_jobs(enabled: bool) -> dict:
     """Enable or disable all WOS-core jobs atomically.
 
@@ -581,7 +603,15 @@ def handle_wos_start(*, registry: "Registry | None" = None) -> str:
     in wos-config.json so that executor-heartbeat dispatches UoWs on its next
     cycle (within ~90 seconds).
 
-    Idempotent: calling /wos start when already started returns a notice.
+    Partial-recovery path: if execution_enabled is already True but some wos_core
+    jobs are disabled (e.g. due to a manual jobs.json edit that bypassed the toggle),
+    re-enables those jobs and reports the recovered names rather than silently
+    declaring "already running". This prevents a class of stall where a partial
+    enable leaves the steward (or other core jobs) disabled while the system
+    believes the pipeline is running.
+
+    Idempotent: calling /wos start when already fully started (all wos_core jobs
+    enabled) returns a notice without calling toggle_wos_core_jobs.
 
     Args:
         registry: Optional Registry instance. When omitted (the default), a new
@@ -595,10 +625,49 @@ def handle_wos_start(*, registry: "Registry | None" = None) -> str:
 
     config = read_wos_config()
     if config.get("execution_enabled"):
-        return (
-            "WOS pipeline is already running.\n"
-            "executor-heartbeat is dispatching UoWs normally."
+        # Detect partial-enable: execution is on but some wos_core jobs are still disabled.
+        disabled_core_jobs = get_disabled_wos_core_jobs()
+        if not disabled_core_jobs:
+            # Fully started — nothing to do.
+            return (
+                "WOS pipeline is already running.\n"
+                "executor-heartbeat is dispatching UoWs normally."
+            )
+
+        # Partial recovery: re-enable the disabled wos_core jobs via toggle.
+        try:
+            result = toggle_wos_core_jobs(enabled=True)
+        except OSError as exc:
+            return (
+                f"Failed to re-enable disabled WOS-core jobs: {exc}\n"
+                f"Config: `{_WOS_CONFIG_PATH}`"
+            )
+
+        lines = [
+            f"WOS partial recovery: {len(disabled_core_jobs)} wos_core job(s) were "
+            f"disabled while execution_enabled=true — re-enabled: "
+            f"{', '.join(disabled_core_jobs)}.",
+            "executor-heartbeat will dispatch ready-for-executor UoWs on its next "
+            "cycle (within ~90 seconds).",
+        ]
+        if result["not_found"]:
+            lines.append(
+                f"Note: {len(result['not_found'])} WOS-core job(s) not in jobs.json "
+                f"(may be systemd-only): {', '.join(sorted(result['not_found']))}"
+            )
+
+        reg = registry if registry is not None else _Registry()
+        reg.log_control_event(
+            ControlEventType.WOS_START,
+            {
+                "partial_recovery": True,
+                "recovered": sorted(disabled_core_jobs),
+                "toggled": sorted(result["toggled"]),
+                "not_found": sorted(result["not_found"]),
+            },
         )
+
+        return "\n".join(lines)
 
     try:
         result = toggle_wos_core_jobs(enabled=True)
