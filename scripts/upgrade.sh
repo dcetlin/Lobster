@@ -3906,6 +3906,87 @@ PYEOF
         migrated=$((migrated + 1))
     fi
 
+    # Migration 110: Register transcription-monitor and morning-delivery-flush in jobs.json
+    # as Type C (cron-direct) jobs, and correct any existing entries that were written with
+    # "type": "B" before the type label was standardized.
+    local _m110_jobs_file="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/scheduled-jobs/jobs.json"
+    if [ -f "$_m110_jobs_file" ]; then
+        local _m110_needs_fix
+        _m110_needs_fix=$(uv run python3 -c "
+import json, sys
+data = json.loads(open('$_m110_jobs_file').read())
+jobs = data.get('jobs', {})
+needs = (
+    jobs.get('transcription-monitor', {}).get('type') != 'C'
+    or jobs.get('morning-delivery-flush', {}).get('type') != 'C'
+)
+print('yes' if needs else 'no')
+" 2>/dev/null || echo "yes")
+        if [ "$_m110_needs_fix" = "yes" ]; then
+            uv run python3 - <<'PYEOF'
+import json, os
+from datetime import datetime, timezone
+from pathlib import Path
+
+workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+jobs_file = workspace / "scheduled-jobs" / "jobs.json"
+try:
+    data = json.loads(jobs_file.read_text())
+except Exception:
+    data = {"jobs": {}}
+
+data.setdefault("jobs", {})
+now = datetime.now(timezone.utc).isoformat()
+
+if "transcription-monitor" not in data["jobs"]:
+    data["jobs"]["transcription-monitor"] = {
+        "name": "transcription-monitor",
+        "type": "C",
+        "dispatch": "cron-direct",
+        "task_file": None,
+        "schedule": "*/5 * * * *",
+        "schedule_human": "Every 5 minutes",
+        "description": "Transcription keep-alive monitor: writes a progress ping to outbox/ while whisper-cli is running",
+        "enabled": True,
+        "created_at": now,
+        "updated_at": now,
+        "last_run": None,
+        "last_status": None,
+    }
+else:
+    data["jobs"]["transcription-monitor"]["type"] = "C"
+    data["jobs"]["transcription-monitor"]["updated_at"] = now
+
+if "morning-delivery-flush" not in data["jobs"]:
+    data["jobs"]["morning-delivery-flush"] = {
+        "name": "morning-delivery-flush",
+        "type": "C",
+        "dispatch": "cron-direct",
+        "task_file": None,
+        "schedule": "0 14 * * *",
+        "schedule_human": "Daily at 14:00 UTC",
+        "description": "Flush messages queued by the circadian delivery gate during off-peak hours",
+        "enabled": True,
+        "created_at": now,
+        "updated_at": now,
+        "last_run": None,
+        "last_status": None,
+    }
+else:
+    data["jobs"]["morning-delivery-flush"]["type"] = "C"
+    data["jobs"]["morning-delivery-flush"]["updated_at"] = now
+
+jobs_file.write_text(json.dumps(data, indent=2))
+print("Migration 110: transcription-monitor and morning-delivery-flush registered/corrected as Type C in jobs.json")
+PYEOF
+            migrated=$((migrated + 1))
+        else
+            substep "Migration 110: transcription-monitor and morning-delivery-flush already Type C in jobs.json — skipping"
+        fi
+    else
+        substep "Migration 110: jobs.json not found — skipping"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

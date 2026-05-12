@@ -40,7 +40,7 @@ if str(_THIS_DIR) not in sys.path:
 
 
 # ---------------------------------------------------------------------------
-# jobs.json enabled gate — Type B dispatch path
+# jobs.json enabled gate — Type C dispatch path
 # ---------------------------------------------------------------------------
 
 JOB_NAME = "granola-ingest"

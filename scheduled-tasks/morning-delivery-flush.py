@@ -40,7 +40,7 @@ JOB_NAME = "morning-delivery-flush"
 
 
 # ---------------------------------------------------------------------------
-# jobs.json enabled gate — Type B dispatch path
+# jobs.json enabled gate — Type C dispatch path
 # ---------------------------------------------------------------------------
 
 def _is_job_enabled(job_name: str) -> bool:

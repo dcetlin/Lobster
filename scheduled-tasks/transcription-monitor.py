@@ -49,7 +49,7 @@ from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
-# jobs.json enabled gate — Type B dispatch path
+# jobs.json enabled gate — Type C dispatch path
 # ---------------------------------------------------------------------------
 
 JOB_NAME = "transcription-monitor"
