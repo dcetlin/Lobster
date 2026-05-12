@@ -237,6 +237,40 @@ Include the GitHub activity summary in the synthesis for rolling-summary.md and 
 
    If handoff.md has no PR table, skip step 9b silently. If `gh` is unavailable, skip step 9b and note it in `write_result`. If the PR table format is unexpected, leave the table unchanged and note it in `write_result` — do not crash.
 
+   **9c. Update the WOS queue count in the System Health section of handoff.md.**
+
+   The WOS UoW count is fast-moving operational data — never carry it forward from prior prose. Always query the registry DB directly:
+
+   ```python
+   import sqlite3, pathlib, datetime
+
+   def _get_wos_queue_count(status: str = "ready-for-steward") -> tuple[int, str]:
+       """Query orchestration/registry.db directly — never carry forward prose count."""
+       db = pathlib.Path("~/lobster-workspace/orchestration/registry.db").expanduser()
+       if not db.exists():
+           return -1, "UNKNOWN"
+       conn = sqlite3.connect(str(db))
+       try:
+           row = conn.execute(
+               "SELECT COUNT(*) FROM uow_registry WHERE status = ?", (status,)
+           ).fetchone()
+           count = row[0] if row else 0
+       finally:
+           conn.close()
+       now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+       return count, now
+
+   count, as_of = _get_wos_queue_count()
+   if count == -1:
+       wos_count_line = "WOS queue: UNKNOWN — orchestration/registry.db not found at expected path"
+   else:
+       wos_count_line = f"WOS queue: {count} UoWs with status=ready-for-steward (as-of: {as_of})"
+   ```
+
+   In the System Health section of handoff.md, find the line containing `orchestration/registry.db has` or `UoWs in orchestration/registry.db` or `ready-for-steward` and replace the UoW count with `wos_count_line`. If no such line exists, append `wos_count_line` to the WOS pipeline bullet in System Health.
+
+   Write the updated count string; do not touch any other part of the System Health section.
+
 10. **Sync canonical files into the user model DB.**
    Run the bridge pass to push projects, priorities, and preferences from canonical markdown files into the user model DB. This also generates the pre-computed `_context.md` via `write_context_cache()`:
    ```bash
