@@ -196,15 +196,84 @@ class TestHandleWosStart:
         from src.orchestration.dispatcher_handlers import handle_wos_start
         return handle_wos_start
 
-    def test_idempotent_when_already_started(self):
-        """When execution_enabled is already True, return a notice without calling toggle."""
+    def _make_jobs_json_all_core_enabled(self) -> dict:
+        """Return a jobs.json with all wos_core jobs enabled."""
+        return {
+            "jobs": {
+                "executor-heartbeat": {"wos_core": True, "enabled": True},
+                "steward-heartbeat": {"wos_core": True, "enabled": True},
+            }
+        }
+
+    def _make_jobs_json_steward_disabled(self) -> dict:
+        """Return a jobs.json where steward-heartbeat is disabled but execution_enabled=True."""
+        return {
+            "jobs": {
+                "executor-heartbeat": {"wos_core": True, "enabled": True},
+                "steward-heartbeat": {"wos_core": True, "enabled": False},
+            }
+        }
+
+    def test_idempotent_when_already_started_and_all_core_jobs_enabled(self):
+        """When execution_enabled is True and all wos_core jobs are enabled, return a notice."""
         handle_wos_start = self._import()
-        with patch("src.orchestration.dispatcher_handlers.read_wos_config",
-                   return_value={"execution_enabled": True}):
+        jobs_data = self._make_jobs_json_all_core_enabled()
+        with (
+            patch("src.orchestration.dispatcher_handlers.read_wos_config",
+                  return_value={"execution_enabled": True}),
+            patch("src.orchestration.dispatcher_handlers._read_jobs_json",
+                  return_value=jobs_data),
+        ):
             result = handle_wos_start()
         assert "already" in result.lower()
-        # Should mention the pipeline is running
         assert "running" in result.lower()
+
+    def test_partial_recovery_when_execution_enabled_but_core_jobs_disabled(self):
+        """When execution_enabled=True but some wos_core jobs are disabled, re-enable them."""
+        handle_wos_start = self._import()
+        jobs_data = self._make_jobs_json_steward_disabled()
+        written = {}
+
+        def fake_write_jobs(data):
+            written["jobs"] = data
+
+        def fake_write_config(cfg):
+            written["config"] = cfg
+
+        with (
+            patch("src.orchestration.dispatcher_handlers.read_wos_config",
+                  return_value={"execution_enabled": True}),
+            patch("src.orchestration.dispatcher_handlers._read_jobs_json",
+                  return_value=jobs_data),
+            patch("src.orchestration.dispatcher_handlers._write_jobs_json",
+                  side_effect=fake_write_jobs),
+            patch("src.orchestration.dispatcher_handlers._write_wos_config",
+                  side_effect=fake_write_config),
+        ):
+            result = handle_wos_start()
+
+        # steward-heartbeat must be re-enabled
+        assert written["jobs"]["jobs"]["steward-heartbeat"]["enabled"] is True
+        # executor-heartbeat must remain enabled
+        assert written["jobs"]["jobs"]["executor-heartbeat"]["enabled"] is True
+        # Response must indicate a recovery was performed (not "already running")
+        assert "already" not in result.lower()
+        # Response must mention what was fixed
+        assert "steward-heartbeat" in result
+
+    def test_partial_recovery_does_not_fire_when_all_core_jobs_enabled(self):
+        """No toggle call occurs when execution_enabled=True and all wos_core jobs are enabled."""
+        handle_wos_start = self._import()
+        jobs_data = self._make_jobs_json_all_core_enabled()
+        with (
+            patch("src.orchestration.dispatcher_handlers.read_wos_config",
+                  return_value={"execution_enabled": True}),
+            patch("src.orchestration.dispatcher_handlers._read_jobs_json",
+                  return_value=jobs_data),
+            patch("src.orchestration.dispatcher_handlers.toggle_wos_core_jobs") as mock_toggle,
+        ):
+            handle_wos_start()
+        mock_toggle.assert_not_called()
 
     def test_start_calls_toggle_with_enabled_true(self):
         """Starting WOS should call toggle_wos_core_jobs(enabled=True)."""
