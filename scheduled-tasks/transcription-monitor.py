@@ -49,6 +49,29 @@ from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
+# jobs.json enabled gate — Type B dispatch path
+# ---------------------------------------------------------------------------
+
+JOB_NAME = "transcription-monitor"
+
+
+def _is_job_enabled(job_name: str) -> bool:
+    """
+    Return True if the job is enabled in jobs.json, False if explicitly disabled.
+
+    Defaults to True when jobs.json is absent, the entry is missing, or the
+    file is unreadable or malformed.
+    """
+    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+    jobs_file = workspace / "scheduled-jobs" / "jobs.json"
+    try:
+        data = json.loads(jobs_file.read_text())
+        return bool(data.get("jobs", {}).get(job_name, {}).get("enabled", True))
+    except Exception:
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 _MESSAGES = Path(os.environ.get("LOBSTER_MESSAGES", Path.home() / "messages"))
@@ -232,6 +255,8 @@ def atomic_write_json(dest: Path, data: dict) -> None:
 
 def main() -> int:
     """Run the transcription monitor. Returns 0 on success, 1 on error."""
+    if not _is_job_enabled(JOB_NAME):
+        return 0
 
     # Step 1: Check if whisper-cli is running.
     pid = find_whisper_pid()
