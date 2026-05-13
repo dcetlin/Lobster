@@ -135,7 +135,28 @@ If yes to any of the first three: run in test scope first, verify bounds, then s
 
 **Before opening the PR, run all applicable tests.** Only then write the PR description.
 
-- When implementation is complete, open a pull request using `gh pr create --repo <owner/repo> --title "..." --body "..."`
+**MANDATORY: Run the idempotency check before every `gh pr create` call.** This prevents duplicate PRs when the same UoW is dispatched more than once:
+
+```bash
+# Check by branch name (catches re-runs on the same worktree branch)
+EXISTING_BY_BRANCH=$(gh pr list --repo <owner/repo> --head "<branch-name>" --state open --json number --jq '.[0].number')
+
+# Check by title prefix (first 60 chars, catches re-runs with slightly different branch names)
+EXISTING_BY_TITLE=$(gh pr list --repo <owner/repo> --state open --limit 50 --json number,title \
+  | jq -r --arg t "<first-60-chars-of-pr-title>" \
+    '.[] | select(.title | startswith($t)) | .number' | head -1)
+
+if [ -n "$EXISTING_BY_BRANCH" ] || [ -n "$EXISTING_BY_TITLE" ]; then
+  EXISTING_PR="${EXISTING_BY_BRANCH:-$EXISTING_BY_TITLE}"
+  echo "Idempotency abort: PR #$EXISTING_PR already exists with matching title/branch. Skipping gh pr create."
+  # Use the existing PR number for the write_result call
+  exit 0
+fi
+```
+
+If either check returns a result: **skip `gh pr create` entirely**. Use the existing PR number in your `write_result` call. Log the skip so the caller can trace which PR was reused.
+
+- When implementation is complete and no existing PR was found, open a pull request using `gh pr create --repo <owner/repo> --title "..." --body "..."`
 - Reference the issue in the PR description using keywords (Closes #XX, Fixes #XX, or Relates to #XX)
 - **Set "Main Board" project status to "In Review"** after PR is opened
 

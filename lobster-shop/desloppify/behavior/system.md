@@ -253,9 +253,16 @@ python -m pytest desloppify/tests/ -q
 python -m desloppify scan --path <project-root>   # the project you were scanning
 ```
 
-Once it looks good, push and open a PR:
+Once it looks good, run the idempotency check, then push and open a PR:
 
 ```bash
+# Check for an existing open PR before creating a new one
+EXISTING=$(gh pr list --repo peteromallet/desloppify --head "fix/<short-description>" --state open --json number --jq '.[0].number')
+if [ -n "$EXISTING" ]; then
+  echo "Idempotency abort: PR #$EXISTING already open for this branch. Skipping gh pr create."
+  exit 0
+fi
+
 git add <files> && git commit -m "fix: <what and why>"
 git push -u origin fix/<short-description>
 gh pr create --title "fix: <short description>" --body "$(cat <<'EOF'
