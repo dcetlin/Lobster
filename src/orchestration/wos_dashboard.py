@@ -49,6 +49,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
+from src.orchestration.analytics import outcome_cost_correlation
+
 
 # ---------------------------------------------------------------------------
 # Path / DB resolution
@@ -507,8 +509,6 @@ def build_dashboard_data(
     cc_quota is included as a pre-rendered HTML string so render_html stays
     a pure function — all state reads and formatting happen here.
     """
-    from src.orchestration.analytics import outcome_cost_correlation
-
     now = datetime.now(timezone.utc)
     cc_state = _read_cc_budget_state()
     return {
