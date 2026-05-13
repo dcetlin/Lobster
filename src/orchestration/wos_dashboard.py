@@ -507,6 +507,8 @@ def build_dashboard_data(
     cc_quota is included as a pre-rendered HTML string so render_html stays
     a pure function — all state reads and formatting happen here.
     """
+    from src.orchestration.analytics import outcome_cost_correlation
+
     now = datetime.now(timezone.utc)
     cc_state = _read_cc_budget_state()
     return {
@@ -517,6 +519,7 @@ def build_dashboard_data(
         "stalled_uows": _stalled_uows(registry),
         "bootup_candidate_gate": _bootup_gate_status(registry),
         "cc_quota": _format_cc_quota_widget(cc_state, now),
+        "outcome_cost": outcome_cost_correlation(registry_path),
     }
 
 
