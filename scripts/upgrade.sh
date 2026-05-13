@@ -3987,6 +3987,27 @@ PYEOF
         substep "Migration 110: jobs.json not found — skipping"
     fi
 
+    # Migration 111: Add pending-actions-nudge cron entry (daily at 15:00 UTC).
+    # Script exists and has jobs.json enabled gate; cron entry was missing.
+    local PENDING_ACTIONS_NUDGE_MARKER="# LOBSTER-PENDING-ACTIONS-NUDGE"
+    if ! crontab -l 2>/dev/null | grep -q "$PENDING_ACTIONS_NUDGE_MARKER"; then
+        if ! $DRY_RUN; then
+            "$LOBSTER_DIR/scripts/cron-manage.sh" add "$PENDING_ACTIONS_NUDGE_MARKER" \
+                "0 15 * * * cd $HOME/lobster && uv run scheduled-tasks/pending-actions-nudge.py >> ${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/scheduled-jobs/logs/pending-actions-nudge.log 2>&1 $PENDING_ACTIONS_NUDGE_MARKER"
+            substep "Migration 111: added LOBSTER-PENDING-ACTIONS-NUDGE cron entry (daily at 15:00 UTC)"
+        else
+            substep "Migration 111 (dry-run): would add LOBSTER-PENDING-ACTIONS-NUDGE cron entry"
+        fi
+        # Ensure log file exists.
+        local _pan_log="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/scheduled-jobs/logs/pending-actions-nudge.log"
+        if [ ! -f "$_pan_log" ] && ! $DRY_RUN; then
+            touch "$_pan_log" 2>/dev/null || true
+        fi
+        migrated=$((migrated + 1))
+    else
+        substep "Migration 111: LOBSTER-PENDING-ACTIONS-NUDGE cron entry already present — skipping"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
