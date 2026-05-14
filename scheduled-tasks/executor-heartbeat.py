@@ -94,6 +94,9 @@ def _is_job_enabled(job_name: str) -> bool:
         return True
 
 
+_LEGACY_REGISTRY_WARNED: bool = False
+
+
 def _warn_if_legacy_registry_exists() -> None:
     """Log a warning if the deprecated legacy registry path exists and is non-empty.
 
@@ -102,6 +105,9 @@ def _warn_if_legacy_registry_exists() -> None:
     when its uow_registry table is empty. This function fires only if the file
     survived migration (non-empty or migration not yet run).
     """
+    global _LEGACY_REGISTRY_WARNED
+    if _LEGACY_REGISTRY_WARNED:
+        return
     workspace = Path(os.environ.get(
         "LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"
     ))
@@ -110,9 +116,7 @@ def _warn_if_legacy_registry_exists() -> None:
         return
     size = legacy_path.stat().st_size
     if size == 0:
-        # Zero-byte file — safe to ignore; Migration 86 handles non-zero files.
         return
-    # Count UoWs to distinguish an empty-schema file from one with actual data.
     try:
         import sqlite3
         conn = sqlite3.connect(str(legacy_path), timeout=5.0)
@@ -120,6 +124,7 @@ def _warn_if_legacy_registry_exists() -> None:
         conn.close()
     except Exception:
         uow_count = -1
+    _LEGACY_REGISTRY_WARNED = True
     if uow_count == 0:
         log.info(
             "Legacy registry DB at %s exists (%d bytes) but has 0 UoWs — "
