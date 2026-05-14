@@ -1756,7 +1756,7 @@ def handle_wos_done(msg: dict[str, Any]) -> dict[str, Any]:
     # original text is sent unchanged so the completion notification always fires.
     if uow_id:
         try:
-            from orchestration.wos_uow_detail_gen import generate_and_upload
+            from .wos_uow_detail_gen import generate_and_upload
             detail_url = generate_and_upload(uow_id=uow_id)
             text = f"{text}\n{detail_url}"
         except Exception as exc:
