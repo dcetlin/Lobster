@@ -2610,17 +2610,74 @@ def _count_oracle_passes(audit_entries: list[dict]) -> int:
     return sum(1 for e in audit_entries if e.get("event") == "oracle_approved")
 
 
-def _count_failed_or_blocked_transitions(audit_entries: list[dict]) -> int:
-    """Count audit entries where the UoW transitioned to failed or blocked.
+# Infrastructure kill reason codes that must NOT count toward the dead-end
+# threshold.  These represent session kills or platform-level dispatch failures
+# where no execution outcome was produced — the agent never confirmed work.
+#
+# Mapping to audit note["reason"] prefixes written by Registry.fail_uow:
+#   executing_orphan          → steward-detected: dispatched, write_result never received
+#   orphan_kill_before_start  → heartbeat-classified: session killed before work began
+#   orphan_kill_during_execution → heartbeat-classified: session killed mid-execution
+#   ttl_exceeded              → executor-heartbeat: active/executing state exceeded 4h TTL
+#
+# CalledProcessError and all other reasons are genuine execution failures and
+# DO count toward the threshold.
+DEAD_END_INFRA_KILL_REASONS: frozenset[str] = frozenset({
+    "executing_orphan",
+    "orphan_kill_before_start",
+    "orphan_kill_during_execution",
+    "ttl_exceeded",
+})
 
-    Includes both executor-driven failures (to_status='failed') and
-    Steward-driven surface/block transitions (to_status='blocked').
-    Used by the Dead-end pattern detector.
+
+def _is_infra_kill_audit_entry(entry: dict) -> bool:
+    """Return True when an audit entry records an infrastructure kill, not a genuine failure.
+
+    Parses the entry's note JSON and checks whether the ``reason`` field starts
+    with one of the DEAD_END_INFRA_KILL_REASONS codes.  Infrastructure kills are
+    session terminations by the platform (TTL eviction, orphan recovery) where
+    the agent never confirmed an execution outcome.
+
+    The ``reason`` values written by Registry.fail_uow follow the pattern
+    ``"<code>: <human-readable detail>"``, so a ``startswith`` check on each
+    code is the correct discriminant.
+
+    Pure function — no side effects, no I/O.
+    """
+    note = entry.get("note")
+    if not note:
+        return False
+    try:
+        note_data = json.loads(note)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    reason: str | None = note_data.get("reason") if isinstance(note_data, dict) else None
+    if not reason:
+        return False
+    return any(reason.startswith(code) for code in DEAD_END_INFRA_KILL_REASONS)
+
+
+def _count_failed_or_blocked_transitions(audit_entries: list[dict]) -> int:
+    """Count genuine failure/block transitions, excluding infrastructure kills.
+
+    Counts audit entries where the UoW transitioned to failed or blocked,
+    but skips entries where the failure reason is an infrastructure kill
+    (executing_orphan, orphan_kill_before_start, orphan_kill_during_execution,
+    ttl_exceeded).  Infrastructure kills are platform-level session terminations
+    where no execution outcome was produced — they must not consume the dead-end
+    budget.
+
+    Genuine failures (CalledProcessError, agent-reported failure, etc.) still
+    count.  Used by the Dead-end pattern detector.
 
     Pure function — reads only audit_entries; no side effects.
     """
     terminal = {"failed", "blocked"}
-    return sum(1 for e in audit_entries if e.get("to_status") in terminal)
+    return sum(
+        1
+        for e in audit_entries
+        if e.get("to_status") in terminal and not _is_infra_kill_audit_entry(e)
+    )
 
 
 def _check_dispatch_eligibility(

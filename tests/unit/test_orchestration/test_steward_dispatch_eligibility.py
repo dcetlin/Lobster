@@ -13,6 +13,7 @@ All threshold values are referenced from named constants, not magic literals.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -31,10 +32,12 @@ from src.orchestration.steward import (
     _check_dispatch_eligibility,
     _count_oracle_passes,
     _count_failed_or_blocked_transitions,
+    _is_infra_kill_audit_entry,
     SPIRAL_ORACLE_PASS_THRESHOLD,
     DEAD_END_FAILURE_THRESHOLD,
     BURST_BATCH_SIZE,
     BURST_BASELINE_QUEUE_DEPTH,
+    DEAD_END_INFRA_KILL_REASONS,
 )
 from src.orchestration.registry import UoW
 
@@ -80,13 +83,35 @@ def _oracle_approved_entries(n: int) -> list[dict[str, Any]]:
 
 
 def _blocked_or_failed_entries(n_failed: int = 0, n_blocked: int = 0) -> list[dict[str, Any]]:
-    """Return audit entries for failed and blocked transitions."""
+    """Return audit entries for genuine failed and blocked transitions (no infra note)."""
     entries = []
     for _ in range(n_failed):
         entries.append(_audit_entry("execution_failed", to_status="failed", from_status="active"))
     for _ in range(n_blocked):
         entries.append(_audit_entry("steward_surface", to_status="blocked", from_status="diagnosing"))
     return entries
+
+
+def _infra_kill_entry(reason_code: str) -> dict[str, Any]:
+    """Build an audit entry that represents an infrastructure kill via Registry.fail_uow.
+
+    The note format mirrors what Registry.fail_uow writes:
+        {"actor": "executor", "reason": "<code>: <detail>", "timestamp": "..."}
+    """
+    note = json.dumps({
+        "actor": "executor",
+        "reason": f"{reason_code}: infrastructure detail",
+        "timestamp": "2026-04-21T00:00:00+00:00",
+    })
+    return {
+        "ts": "2026-04-21T00:00:00+00:00",
+        "uow_id": "uow_20260421_aabbcc",
+        "event": "execution_failed",
+        "from_status": "active",
+        "to_status": "failed",
+        "agent": "executor",
+        "note": note,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +181,137 @@ class TestCountFailedOrBlockedTransitions:
             {"event": "expire", "to_status": "expired", "from_status": "proposed"},
         ]
         assert _count_failed_or_blocked_transitions(entries) == 0
+
+    def test_infra_kills_do_not_count_toward_dead_end(self):
+        """Infrastructure kill entries (to_status=failed, infra reason) are excluded."""
+        entries = [_infra_kill_entry(code) for code in DEAD_END_INFRA_KILL_REASONS]
+        assert _count_failed_or_blocked_transitions(entries) == 0
+
+    def test_genuine_failure_counts_even_when_infra_kills_present(self):
+        """A genuine failure still counts when mixed with infrastructure kills."""
+        entries = (
+            [_infra_kill_entry("executing_orphan"), _infra_kill_entry("ttl_exceeded")]
+            + _blocked_or_failed_entries(n_failed=1)
+        )
+        assert _count_failed_or_blocked_transitions(entries) == 1
+
+    def test_mixed_infra_and_real_only_real_ones_count(self):
+        """Only genuine failures count; infra kills in the same audit log are skipped."""
+        entries = (
+            [_infra_kill_entry("executing_orphan")] * 3
+            + _blocked_or_failed_entries(n_failed=2)
+        )
+        # 3 infra kills + 2 genuine = only 2 should count
+        assert _count_failed_or_blocked_transitions(entries) == 2
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: _is_infra_kill_audit_entry (pure function)
+# ---------------------------------------------------------------------------
+
+class TestIsInfraKillAuditEntry:
+    """_is_infra_kill_audit_entry discriminates infrastructure kills from genuine failures."""
+
+    def test_executing_orphan_reason_is_infra_kill(self):
+        entry = _infra_kill_entry("executing_orphan")
+        assert _is_infra_kill_audit_entry(entry) is True
+
+    def test_orphan_kill_before_start_is_infra_kill(self):
+        entry = _infra_kill_entry("orphan_kill_before_start")
+        assert _is_infra_kill_audit_entry(entry) is True
+
+    def test_orphan_kill_during_execution_is_infra_kill(self):
+        entry = _infra_kill_entry("orphan_kill_during_execution")
+        assert _is_infra_kill_audit_entry(entry) is True
+
+    def test_ttl_exceeded_is_infra_kill(self):
+        entry = _infra_kill_entry("ttl_exceeded")
+        assert _is_infra_kill_audit_entry(entry) is True
+
+    def test_called_process_error_is_not_infra_kill(self):
+        """CalledProcessError is a genuine execution failure, not an infrastructure kill."""
+        note = json.dumps({
+            "actor": "executor",
+            "reason": "CalledProcessError: Command returned non-zero exit status 1",
+            "timestamp": "2026-04-21T00:00:00+00:00",
+        })
+        entry = _audit_entry("execution_failed", to_status="failed")
+        entry["note"] = note
+        assert _is_infra_kill_audit_entry(entry) is False
+
+    def test_entry_without_note_is_not_infra_kill(self):
+        entry = _audit_entry("execution_failed", to_status="failed")
+        assert _is_infra_kill_audit_entry(entry) is False
+
+    def test_entry_with_non_json_note_is_not_infra_kill(self):
+        entry = _audit_entry("execution_failed", to_status="failed")
+        entry["note"] = "plain text reason"
+        assert _is_infra_kill_audit_entry(entry) is False
+
+    def test_entry_without_reason_field_is_not_infra_kill(self):
+        note = json.dumps({"actor": "executor", "timestamp": "2026-04-21T00:00:00+00:00"})
+        entry = _audit_entry("execution_failed", to_status="failed")
+        entry["note"] = note
+        assert _is_infra_kill_audit_entry(entry) is False
+
+    def test_dead_end_infra_kill_reasons_constant_covers_all_known_codes(self):
+        """DEAD_END_INFRA_KILL_REASONS covers the four infrastructure kill codes from the data audit."""
+        expected = {
+            "executing_orphan",
+            "orphan_kill_before_start",
+            "orphan_kill_during_execution",
+            "ttl_exceeded",
+        }
+        assert expected.issubset(DEAD_END_INFRA_KILL_REASONS)
+
+
+# ---------------------------------------------------------------------------
+# Integration: dead-end gate with infra-kill discrimination
+# ---------------------------------------------------------------------------
+
+class TestDeadEndGateInfraKillDiscrimination:
+    """Dead-end gate must not fire when all failures are infrastructure kills."""
+
+    def test_all_infra_kills_do_not_trigger_dead_end_gate(self):
+        """DEAD_END_FAILURE_THRESHOLD infra kills → dispatch (gate does not fire)."""
+        uow = _make_uow()
+        entries = [_infra_kill_entry("executing_orphan")] * DEAD_END_FAILURE_THRESHOLD
+        result = _check_dispatch_eligibility(uow, entries, queue_depth=1)
+        assert result == "dispatch"
+
+    def test_many_infra_kills_alone_do_not_trigger_dead_end_gate(self):
+        """More infra kills than the threshold → gate still does not fire."""
+        uow = _make_uow()
+        entries = [_infra_kill_entry("ttl_exceeded")] * (DEAD_END_FAILURE_THRESHOLD + 5)
+        result = _check_dispatch_eligibility(uow, entries, queue_depth=1)
+        assert result == "dispatch"
+
+    def test_real_failures_still_trigger_dead_end_gate(self):
+        """Genuine failures (no infra note) at threshold → gate fires as before."""
+        uow = _make_uow()
+        entries = _blocked_or_failed_entries(n_failed=DEAD_END_FAILURE_THRESHOLD)
+        result = _check_dispatch_eligibility(uow, entries, queue_depth=1)
+        assert result == "pause"
+
+    def test_infra_kills_plus_one_real_below_threshold_does_not_pause(self):
+        """Many infra kills + one genuine failure (below threshold) → dispatch, not pause."""
+        uow = _make_uow()
+        entries = (
+            [_infra_kill_entry("orphan_kill_during_execution")] * 5
+            + _blocked_or_failed_entries(n_failed=DEAD_END_FAILURE_THRESHOLD - 1)
+        )
+        result = _check_dispatch_eligibility(uow, entries, queue_depth=1)
+        assert result != "pause"
+
+    def test_infra_kills_plus_real_failures_at_threshold_triggers_pause(self):
+        """Infra kills do not dilute: DEAD_END_FAILURE_THRESHOLD real failures → pause."""
+        uow = _make_uow()
+        entries = (
+            [_infra_kill_entry("executing_orphan")] * 10
+            + _blocked_or_failed_entries(n_failed=DEAD_END_FAILURE_THRESHOLD)
+        )
+        result = _check_dispatch_eligibility(uow, entries, queue_depth=1)
+        assert result == "pause"
 
 
 # ---------------------------------------------------------------------------
