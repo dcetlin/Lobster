@@ -104,6 +104,10 @@ DISPATCHED_AT_RE = re.compile(r"\s*<!--\s*dispatched_at:[^>]*-->")
 # Files to exclude from annotation scan
 ANNOTATION_SCAN_EXCLUDES = {".git", ".obsidian"}
 
+# Commit message sentinel — vault-watcher.py skips commits bearing this tag
+# to prevent vault-processor output from triggering a re-run (self-trigger loop).
+LOBSTER_SYNC_SENTINEL = "[lobster-sync]"
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -581,7 +585,9 @@ def run_processor(config: dict, db_path: Path = DB_PATH_DEFAULT) -> bool:
     # Step 10: git commit + push
     log.info("Step 10: git commit + push")
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    commit_message = f"vault-watcher: sync [{timestamp}]"
+    # Include the sentinel so vault-watcher.py can skip this commit and avoid a
+    # self-trigger loop.  See LOBSTER_SYNC_SENTINEL.
+    commit_message = f"vault-watcher: sync [{timestamp}] {LOBSTER_SYNC_SENTINEL}"
 
     # Stage all modified files (annotation cleanups + todos render)
     all_staged = list({todos_path} | set(staging_files))

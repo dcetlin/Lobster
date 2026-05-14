@@ -96,6 +96,12 @@ DEFAULT_ANNOTATION_SCOPE = "all"
 MIN_DEBOUNCE_SECONDS = 10
 MAX_DEBOUNCE_SECONDS_CAP = 3600
 
+# Commit message sentinel used by vault-processor.py.
+# Commits bearing this tag were produced by the processor itself — vault-watcher
+# must advance last_processed_head without re-firing the processor, breaking the
+# self-trigger loop.
+LOBSTER_SYNC_SENTINEL = "[lobster-sync]"
+
 # ---------------------------------------------------------------------------
 # Jobs.json enabled gate (Type B compliance)
 # ---------------------------------------------------------------------------
@@ -301,6 +307,36 @@ def _get_remote_head(vault_path: Path, timeout: int = 30) -> Optional[str]:
     return sha
 
 
+def _get_commit_message(vault_path: Path, sha: str) -> Optional[str]:
+    """Return the one-line commit message for sha, or None on failure.
+
+    Pure read — does not modify the repo.
+    """
+    result = subprocess.run(
+        ["git", "log", "-1", "--format=%s", sha],
+        cwd=str(vault_path),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        log.warning("git log for %s failed: %s", sha[:12], result.stderr.strip())
+        return None
+    return result.stdout.strip() or None
+
+
+def _commit_is_lobster_sync(vault_path: Path, sha: str) -> bool:
+    """Return True if sha was produced by vault-processor.py (sentinel present).
+
+    vault-processor.py appends LOBSTER_SYNC_SENTINEL to every commit it makes.
+    When vault-watcher detects such a commit as a new HEAD, it must NOT re-fire
+    the processor — the change was the processor's own output, not user edits.
+    """
+    message = _get_commit_message(vault_path, sha)
+    if message is None:
+        return False
+    return LOBSTER_SYNC_SENTINEL in message
+
+
 # ---------------------------------------------------------------------------
 # Processor invocation
 # ---------------------------------------------------------------------------
@@ -392,6 +428,22 @@ def main() -> None:
             changed = (remote_head != state["last_known_head"])
 
             if changed:
+                # Check whether this commit was produced by vault-processor.py itself.
+                # If so, advancing last_processed_head without firing the processor
+                # breaks the self-trigger loop: processor commits → watcher detects
+                # → watcher sees sentinel → marks caught up → no re-fire.
+                if _commit_is_lobster_sync(vault_path, remote_head):
+                    log.info(
+                        "Skipping processor re-fire: HEAD %s bears %s (processor's own commit)",
+                        remote_head[:12],
+                        LOBSTER_SYNC_SENTINEL,
+                    )
+                    state["last_known_head"] = remote_head
+                    state["last_processed_head"] = remote_head
+                    state["first_push_at_in_burst"] = None
+                    _write_json_atomic(STATE_PATH, state)
+                    return
+
                 state["last_known_head"] = remote_head
                 state["last_push_at"] = now
                 if state.get("first_push_at_in_burst") is None:
