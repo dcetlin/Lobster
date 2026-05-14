@@ -121,7 +121,7 @@ def _warn_if_legacy_registry_exists() -> None:
     except Exception:
         uow_count = -1
     if uow_count == 0:
-        log.info(
+        log.debug(
             "Legacy registry DB at %s exists (%d bytes) but has 0 UoWs — "
             "run upgrade.sh to apply Migration 86 and remove it.",
             legacy_path, size,
