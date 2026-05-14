@@ -660,7 +660,7 @@ class Registry:
             # other fields callers choose to provide in the future).
             # Falls back to solo/classifier-unavailable if the YAML is absent.
             try:
-                from orchestration.routing_classifier import classify_posture
+                from .routing_classifier import classify_posture
                 classifier_result = classify_posture({"type": uow_type})
                 germination_posture = classifier_result.posture
                 germination_route_reason = classifier_result.route_reason
@@ -1928,7 +1928,7 @@ class Registry:
             uow_id: The WOS unit-of-work ID.
             gate_value: One of 'spiral', 'dead_end', 'burst', or 'none'.
         """
-        from orchestration.gate_fired import _GATE_SEVERITY
+        from .gate_fired import _GATE_SEVERITY
 
         new_severity = _GATE_SEVERITY.get(gate_value, 0)
 
