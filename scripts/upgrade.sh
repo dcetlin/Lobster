@@ -4008,6 +4008,35 @@ PYEOF
         substep "Migration 111: LOBSTER-PENDING-ACTIONS-NUDGE cron entry already present — skipping"
     fi
 
+    # Migration 112: Register check-pr-exists-before-create.py PreToolUse hook.
+    # Enforces gh pr create idempotency: blocks duplicate PR creation when an
+    # open PR already exists for the same branch/repo. Replaces advisory
+    # markdown instructions with structural enforcement (vision.yaml principle-3).
+    if [ -f "$CLAUDE_SETTINGS" ] && command -v jq >/dev/null 2>&1; then
+        local has_pr_create_gate
+        has_pr_create_gate=$(jq -r '
+            [.hooks.PreToolUse[]?.hooks[]?.command // empty]
+            | map(select(contains("check-pr-exists-before-create")))
+            | length
+        ' "$CLAUDE_SETTINGS" 2>/dev/null || echo "0")
+        if [ "${has_pr_create_gate:-0}" = "0" ] || [ "${has_pr_create_gate:-0}" = "" ]; then
+            TMP_SETTINGS=$(mktemp)
+            jq --arg cmd "python3 $LOBSTER_DIR/hooks/check-pr-exists-before-create.py" \
+               '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": $cmd,
+                    "timeout": 15
+                }]
+            }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+            substep "Registered check-pr-exists-before-create PreToolUse hook (Migration 112)"
+            migrated=$((migrated + 1))
+        else
+            substep "check-pr-exists-before-create hook already registered — skipping Migration 112"
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

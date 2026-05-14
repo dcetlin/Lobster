@@ -253,7 +253,7 @@ python -m pytest desloppify/tests/ -q
 python -m desloppify scan --path <project-root>   # the project you were scanning
 ```
 
-Once it looks good, push and open a PR:
+Once it looks good, push and open a PR. Duplicate PR prevention is enforced by the PreToolUse hook `check-pr-exists-before-create.py` -- no manual check needed.
 
 ```bash
 git add <files> && git commit -m "fix: <what and why>"

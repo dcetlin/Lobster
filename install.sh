@@ -428,6 +428,20 @@ HOOKEOF
         info "block-claude-p hook already configured"
     fi
 
+    # Block gh pr create when an open PR already exists for the same branch/repo
+    chmod +x "$INSTALL_DIR/hooks/check-pr-exists-before-create.py" 2>/dev/null || true
+    if ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | contains("check-pr-exists-before-create"))' "$_settings" > /dev/null 2>&1; then
+        _tmp=$(mktemp)
+        jq --arg cmd "python3 $INSTALL_DIR/hooks/check-pr-exists-before-create.py" \
+           '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": $cmd, "timeout": 15}]
+        }]' "$_settings" > "$_tmp" && mv "$_tmp" "$_settings"
+        success "check-pr-exists-before-create hook installed"
+    else
+        info "check-pr-exists-before-create hook already configured"
+    fi
+
     # Enforce task_id on register_agent calls
     chmod +x "$INSTALL_DIR/hooks/require-register-agent-task-id.py" 2>/dev/null || true
     if ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | contains("require-register-agent-task-id"))' "$_settings" > /dev/null 2>&1; then

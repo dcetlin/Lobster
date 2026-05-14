@@ -135,7 +135,7 @@ If yes to any of the first three: run in test scope first, verify bounds, then s
 
 **Before opening the PR, run all applicable tests.** Only then write the PR description.
 
-- When implementation is complete, open a pull request using `gh pr create --repo <owner/repo> --title "..." --body "..."`
+- When implementation is complete, open a pull request using `gh pr create --repo <owner/repo> --title "..." --body "..."`. Duplicate PR prevention is enforced by the PreToolUse hook `check-pr-exists-before-create.py` -- no manual check needed.
 - Reference the issue in the PR description using keywords (Closes #XX, Fixes #XX, or Relates to #XX)
 - **Set "Main Board" project status to "In Review"** after PR is opened
 
