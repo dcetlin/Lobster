@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 
+from src.orchestration.sweep_uow_promoter import SWEEP_SOURCE
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -124,7 +126,7 @@ class TestCreation:
         ).fetchone()
         conn.close()
         assert row is not None
-        assert row["source"] == "sweep"
+        assert row["source"] == SWEEP_SOURCE
         assert row["status"] == "proposed"
 
     def test_uow_has_correct_issue_url(self, registry, jobs_json_enabled, db_path):
@@ -166,7 +168,7 @@ class TestCreation:
             sweep_date=first_sweep_date,
             success_criteria="Smell Z remediated.",
             issue_url="https://github.com/dcetlin/Lobster/issues/400",
-            source_ref="sweep",
+            source_ref=SWEEP_SOURCE,
         )
         # Mark terminal
         conn = sqlite3.connect(str(db_path))

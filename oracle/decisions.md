@@ -363,3 +363,57 @@ The correct mitigation when Orient (#733) is implemented: replace the prose exce
 This implementation uses `user.base.context.md` as a proxy for the structural orient substrate that `current_focus.horizon.after_that` names as the next investment: "Orient implementation (#733) — the guardrail names the next structural investment once feedback loop is verifiably closed end-to-end."
 
 This ADR explicitly records that this is a proxy approach chosen for ergonomic benefit while the structural seam is not yet built. It does not foreclose the structural implementation — `_load_dan_register_excerpt` is a pure I/O boundary function that can be replaced with a vision.yaml query when Orient is ready. The behavioral default (inject orientation into prescriptions) is the durable change; the source (prose excerpt vs. structured field) is a replaceable implementation detail.
+
+---
+
+## ADR-008: Sweep-Filed GitHub Issues Automatically Promoted to Proposed WOS UoWs — Encoded Orientation
+
+**Date:** 2026-05-14
+**Status:** Accepted
+**PR:** #1153 (feat/sweep-uow-wiring)
+**Authorizing party:** Dan Cetlin — authorized in deep work session 2026-05-14
+
+### Context
+
+Before this PR, the negentropic sweep detected structural smells and filed GitHub issues, but those issues entered the WOS queue only when the cultivator ran its next cycle (typically the following morning at ~6 AM). The sweep had no direct actuator: the sensor-to-queue path had a 4–8 hour latency gap that operated as a de facto human-review window.
+
+The oracle PR #1153 verdict (Round 1) identified the PR's claim of "Decision from 2026-05-14 deep work digest: Lobster has delegated authority to promote sweep observations into the WOS queue" as an unverified Encoded Orientation authorization under constraint-3. No entry in `oracle/verdicts/`, `oracle/decisions.md`, or `vision.yaml open_decisions` reflected this decision. This ADR is the required logged prior.
+
+### Authorization
+
+Dan Cetlin authorized this behavioral default in the 2026-05-14 deep work session. The authorization: Lobster has delegated authority to promote sweep observations into the WOS queue as proposed UoWs immediately after the sweep files a GitHub issue, without waiting for the cultivator's next cycle.
+
+The oracle identified the 4-hour cultivator delay as a potentially intentional human-review window. Dan's explicit delegation of this authority to Lobster resolves that ambiguity: the delay was a structural gap, not a deliberate gate. Sweep-filed issues are categorically appropriate proposed work — they enter as `proposed` (same state the cultivator uses), not as auto-executed UoWs. The Steward remains the downstream quality filter.
+
+### What Changed
+
+After the sweep calls `gh issue create` for a new escalation item, it immediately calls `sweep-uow-promote.py`, which invokes `promote_sweep_issue()` in `src/orchestration/sweep_uow_promoter.py`. This creates a proposed UoW in the registry with:
+
+- `source = SWEEP_SOURCE` ("sweep") — distinguishes from cultivator-promoted UoWs
+- `source_issue_number` = the newly filed issue number
+- `status = "proposed"` — same entry state as cultivator-promoted UoWs
+- A default `success_criteria` string (refined by the Steward at germination)
+
+The promoter is gated by the `negentropic-sweep` job-enabled flag in `jobs.json`, co-locating sweep promotion with sweep execution. Dedup is enforced by `registry.upsert()`: if a non-terminal UoW already exists for the same `source_issue_number`, the call returns `SKIPPED_DEDUP` without writing a duplicate.
+
+### Why This Is an Encoded Orientation Decision
+
+The system now acts without Dan's real-time input after each sweep: every new sweep-filed issue enters the WOS pipeline as a proposed UoW without human review of that specific entry. This satisfies all three conditions under constraint-3: (a) the system acts without Dan's explicit per-issue input, (b) it establishes a durable behavioral default in the sweep-to-WOS path, and (c) the behavior is encoded in `sweep-uow-promote.py` and the updated `negentropic-sweep.md` task file.
+
+### Vision Anchor
+
+**Primary:** `core.operating_principles.principle-4` — "Integration rate before new feature rate. Wire what exists before building more. The missing arrows between existing systems are the velocity multiplier."
+
+The sweep and the WOS registry both existed before this PR. The sweep-to-WOS arrow was the missing integration. Wiring it directly (rather than continuing to route through the cultivator's daily cycle) is the minimum path from observation to queue entry.
+
+**Secondary:** `active_project.phase_intent` — "Registry populated by the issue sweeper, steward picks up." The phase intent explicitly names the sweeper as a population source for the registry. This PR makes that intent operative.
+
+### Constraint: Steward as the Downstream Filter
+
+The cultivator's pre-queue filtering is bypassed for sweep-originated items. Items enter at `proposed` status — the Steward evaluates readiness before advancing to `ready-for-steward`. The trade-off: sweep-filed items may be lower signal than cultivator-evaluated items, and the Steward bears the downstream quality responsibility. This is the accepted design: sweep items are directionally correct (they represent observed structural smells) even if not uniformly execution-ready.
+
+If sweep quality degrades, the correct response is to add a signal-quality check in `promote_sweep_issue()` before `registry.upsert()`, or to re-route sweep items through the cultivator's evaluation step. Neither change requires modifying this ADR — both are reversible at the call site.
+
+### Interaction with Cultivator Dedup
+
+On its next cycle, the cultivator's `promote_to_wos()` will encounter sweep-promoted UoWs via `registry.upsert()`'s non-terminal pre-check. These will be returned as `SKIPPED_DEDUP`. No duplicate UoWs will be created. The cultivator and sweep promoter are independent and dedup correctly.
