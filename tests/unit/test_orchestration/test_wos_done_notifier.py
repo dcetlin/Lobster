@@ -504,6 +504,26 @@ class TestHandleWosDone:
     def test_returns_text_from_message(self):
         expected_text = "UoW done: my uow [pearl]\n2 cycle(s) · 100 tokens · 0 seeds surfaced"
         msg = self._make_msg(text=expected_text)
+        # When the UoW is not in the registry (test env), generate_and_upload raises
+        # ValueError and the handler falls back to the original text unchanged.
+        result = handle_wos_done(msg)
+        assert result["text"].startswith(expected_text)
+
+    def test_appends_detail_url_when_generation_succeeds(self):
+        """When generate_and_upload succeeds, its URL is appended after a newline."""
+        from unittest.mock import patch as _patch
+        expected_text = "UoW done: test [pearl]\n1 cycle(s) · 100 tokens · 0 seeds surfaced"
+        fake_url = "http://1.2.3.4:9101/files/abc123.html"
+        msg = self._make_msg(text=expected_text, uow_id=_SAMPLE_UOW_ID)
+        with _patch("orchestration.wos_uow_detail_gen.generate_and_upload", return_value=fake_url):
+            result = handle_wos_done(msg)
+        assert result["text"] == f"{expected_text}\n{fake_url}"
+
+    def test_no_url_appended_when_uow_id_missing(self):
+        """When uow_id is absent, no detail URL is appended."""
+        expected_text = "UoW done: test [pearl]\n1 cycle(s) · 100 tokens · 0 seeds surfaced"
+        msg = self._make_msg(text=expected_text)
+        del msg["uow_id"]
         result = handle_wos_done(msg)
         assert result["text"] == expected_text
 
