@@ -56,7 +56,7 @@ from orchestration.config import TimeoutConfig
 
 log = logging.getLogger("executor")
 
-from orchestration.registry import Registry, UoW, UoWStatus
+from orchestration.registry import Registry, UoW, UoWStatus, UoWRegister
 from orchestration.result_writer import write_result as _write_subagent_result
 from orchestration.workflow_artifact import WorkflowArtifact, from_json, from_frontmatter
 from orchestration.error_capture import (
@@ -148,7 +148,7 @@ class ClaimSucceeded:
     uow_id: str
     output_ref: str
     artifact: WorkflowArtifact
-    register: str = "operational"
+    register: UoWRegister = UoWRegister.OPERATIONAL
 
 
 @dataclass(frozen=True)
@@ -568,7 +568,7 @@ class Executor:
                 _write_result_json(output_ref, null_result)
                 null_trace = _build_trace(
                     uow_id=uow_id,
-                    register=row["register"] if row["register"] else "operational",
+                    register=UoWRegister(row["register"] or "operational"),
                     outcome=ExecutorOutcome.FAILED,
                     execution_summary=null_reason,
                     surprises=[null_reason],
@@ -602,7 +602,7 @@ class Executor:
                     _write_result_json(output_ref, missing_result)
                     missing_trace = _build_trace(
                         uow_id=uow_id,
-                        register=row["register"] if row["register"] else "operational",
+                        register=UoWRegister(row["register"] or "operational"),
                         outcome=ExecutorOutcome.FAILED,
                         execution_summary=missing_reason,
                         surprises=[missing_reason],
@@ -643,7 +643,7 @@ class Executor:
                 _write_result_json(output_ref, deser_result)
                 deser_trace = _build_trace(
                     uow_id=uow_id,
-                    register=row["register"] if row["register"] else "operational",
+                    register=UoWRegister(row["register"] or "operational"),
                     outcome=ExecutorOutcome.FAILED,
                     execution_summary=deser_reason,
                     surprises=[str(e)],
@@ -657,7 +657,7 @@ class Executor:
                     reason=f"workflow_artifact deserialization failed: {e}",
                 )
 
-            register = row["register"] if row["register"] else "operational"
+            register = UoWRegister(row["register"] or "operational")
             return ClaimSucceeded(uow_id=uow_id, output_ref=output_ref, artifact=artifact, register=register)
 
         except Exception:

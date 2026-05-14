@@ -94,6 +94,30 @@ class UoWStatus(StrEnum):
         }
 
 
+class UoWType(StrEnum):
+    """UoW type tag — determines whether a UoW is dispatched for execution or routing."""
+    EXECUTABLE = "executable"
+    SEED = "seed"
+    ROUTING = "routing"
+    CLASSIFICATION = "classification"
+
+
+class UoWPosture(StrEnum):
+    """Dispatch posture — controls how the UoW is scheduled relative to other UoWs."""
+    SOLO = "solo"
+    SEQUENTIAL = "sequential"
+    REVIEW_LOOP = "review-loop"
+    FAN_OUT = "fan-out"
+
+
+class UoWRegister(StrEnum):
+    """Attentional register — determines executor type and completion evaluation policy."""
+    OPERATIONAL = "operational"
+    ITERATIVE_CONVERGENT = "iterative-convergent"
+    PHILOSOPHICAL = "philosophical"
+    HUMAN_JUDGMENT = "human-judgment"
+
+
 # ---------------------------------------------------------------------------
 # Named result types — no dict[str, Any] from decision functions
 # ---------------------------------------------------------------------------
@@ -169,8 +193,8 @@ class UoW:
     created_at: str
     updated_at: str
     sweep_date: str | None = None
-    type: str = "executable"
-    posture: str = "solo"
+    type: UoWType = UoWType.EXECUTABLE
+    posture: UoWPosture = UoWPosture.SOLO
     route_reason: str | None = None
     steward_notes: str = ""
     success_criteria: str = ""
@@ -209,7 +233,7 @@ class UoW:
     #   than reclassifying autonomously.
     # uow_mode: mirrors register; used for execution context selection by Executor.
     #   Kept separate to allow future divergence without a schema change.
-    register: str = "operational"
+    register: UoWRegister = UoWRegister.OPERATIONAL
     uow_mode: str | None = None
     # Delivery≠closure fields (populated after migration 0007)
     # closed_at: ISO timestamp written by Steward when it declares the loop done.
@@ -449,8 +473,8 @@ class Registry:
             created_at=d.get("created_at") or "",
             updated_at=d.get("updated_at") or "",
             sweep_date=d.get("sweep_date"),
-            type=d.get("type") or "executable",
-            posture=d.get("posture") or "solo",
+            type=UoWType(d.get("type") or "executable"),
+            posture=UoWPosture(d.get("posture") or "solo"),
             route_reason=d.get("route_reason"),
             steward_notes=d.get("steward_notes") or "",
             success_criteria=d.get("success_criteria") or "",
@@ -469,7 +493,7 @@ class Registry:
             source_last_seen_at=d.get("source_last_seen_at"),
             source_state=d.get("source_state"),
             issue_url=d.get("issue_url"),
-            register=d.get("register") or "operational",
+            register=UoWRegister(d.get("register") or "operational"),
             uow_mode=d.get("uow_mode"),
             closed_at=d.get("closed_at"),
             close_reason=d.get("close_reason"),
