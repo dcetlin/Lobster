@@ -532,10 +532,31 @@ def apply_status_delta(file_content: str, conn) -> str:
     """
     lines = file_content.splitlines(keepends=True)
 
-    # --- Pass 1: collect all dedup_keys already present in the file ---
+    # --- Pass 1: collect dedup_keys present in the *main body* of the file ---
+    # We deliberately exclude items inside the <!-- lobster-additions --> block.
+    #
+    # Why: Pass 3 rebuilds the additions block from scratch whenever new DB items
+    # arrive.  If additions-block items were included in file_dedup_keys they would
+    # be excluded from items_to_append, then disappear when the block is stripped
+    # and rewritten — causing the oscillation bug where items alternate between
+    # "present" and "absent" on consecutive runs.
+    #
+    # Using only the main-body keys means additions-block items are always eligible
+    # for re-inclusion in the rebuilt block, making the output stable across runs.
     file_dedup_keys: set[str] = set()
+    _in_additions = False
     for raw_line in lines:
-        line = raw_line.rstrip("\n")
+        stripped_line = raw_line.rstrip("\n")
+        if stripped_line.strip() == _LOBSTER_ADDITIONS_MARKER:
+            _in_additions = True
+            continue
+        if stripped_line.strip() == _LOBSTER_ADDITIONS_END:
+            _in_additions = False
+            continue
+        if _in_additions:
+            continue  # Skip lines inside the additions block
+
+        line = stripped_line
         m = _ANY_CHECKBOX_RE.match(line)
         if not m:
             continue

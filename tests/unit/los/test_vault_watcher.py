@@ -1151,3 +1151,415 @@ def test_render_guard_line_is_unchecked(conn):
     rendered = render_active_todos(conn)
     assert "- [ ] 🔒 DISABLE PROCESSING" in rendered
     assert "- [x] 🔒 DISABLE PROCESSING" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# Bug 1 fix: [lobster-sync] sentinel prevents self-trigger loop
+# ---------------------------------------------------------------------------
+
+# Named constants matching spec requirements (Bug 1 sentinel behavior)
+_LOBSTER_SYNC_SENTINEL = _vault_processor.LOBSTER_SYNC_SENTINEL
+_WATCHER_SENTINEL = _vault_watcher.LOBSTER_SYNC_SENTINEL
+
+
+def test_processor_commit_message_includes_lobster_sync_sentinel(tmp_path):
+    """vault-processor.py must include [lobster-sync] in commit messages it generates.
+
+    Spec: vault-processor commits must bear LOBSTER_SYNC_SENTINEL so vault-watcher
+    can distinguish them from user-generated commits and skip re-firing.
+    """
+    from unittest.mock import MagicMock, patch
+    import sqlite3
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / ".git").mkdir()
+
+    db_path = tmp_path / "test.db"
+    conn_real = connect(db_path)
+    conn_real.close()
+
+    commit_messages_seen: list[str] = []
+
+    def mock_git_commit_and_push(vault_path, files, message):
+        commit_messages_seen.append(message)
+        return True
+
+    config = {
+        "vault_path": str(vault),
+        "lobster_chat_id": None,
+        "watched_files": [],
+        "annotation_scope": "watched_only",
+    }
+
+    todos_path = vault / "✅ ACTIVE TODOS.md"
+    todos_path.write_text(
+        "# ✅ ACTIVE TODOS\n\n- [ ] 🔒 DISABLE PROCESSING\n\n## Urgent / This Week (P1–P3)\n*(none)*\n",
+        encoding="utf-8",
+    )
+
+    with (
+        patch("vault_processor.git_pull", return_value=True),
+        patch("vault_processor.git_commit_and_push", side_effect=mock_git_commit_and_push),
+        patch("vault_processor.connect", return_value=connect(db_path)),
+        patch("vault_processor.sync_obsidian_to_db"),
+        patch("vault_processor.apply_status_delta", return_value=todos_path.read_text()),
+    ):
+        run_processor(config, db_path)
+
+    assert len(commit_messages_seen) >= 1, "run_processor must attempt a commit"
+    for msg in commit_messages_seen:
+        assert _LOBSTER_SYNC_SENTINEL in msg, (
+            f"Commit message must contain {_LOBSTER_SYNC_SENTINEL!r} — got {msg!r}"
+        )
+
+
+def test_commit_is_lobster_sync_returns_true_for_sentinel_commit(tmp_path):
+    """_commit_is_lobster_sync returns True when the commit message contains the sentinel.
+
+    Spec: vault-watcher must detect processor-generated commits by the sentinel in
+    their commit messages, so it can skip re-firing the processor.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+
+    sentinel_message = f"vault-watcher: sync [2026-05-14T00:00:00Z] {_WATCHER_SENTINEL}"
+    non_sentinel_message = "vault-watcher: sync [2026-05-14T00:00:00Z]"
+
+    def mock_run(cmd, **kwargs):
+        r = MagicMock()
+        r.returncode = 0
+        if "log" in cmd:
+            r.stdout = sentinel_message + "\n"
+        else:
+            r.stdout = ""
+        return r
+
+    with patch.object(_vault_watcher, "subprocess") as mock_subp:
+        mock_subp.run.side_effect = mock_run
+        result = _vault_watcher._commit_is_lobster_sync(vault, "abc123def456")
+
+    assert result is True, "_commit_is_lobster_sync must return True for sentinel commit"
+
+
+def test_commit_is_lobster_sync_returns_false_for_user_commit(tmp_path):
+    """_commit_is_lobster_sync returns False when the commit lacks the sentinel.
+
+    Spec: user commits (from Obsidian app pushing changes) do NOT have the sentinel.
+    The watcher must treat them as real changes and fire the processor.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+
+    def mock_run(cmd, **kwargs):
+        r = MagicMock()
+        r.returncode = 0
+        if "log" in cmd:
+            r.stdout = "obsidian: auto-commit\n"  # No sentinel
+        else:
+            r.stdout = ""
+        return r
+
+    with patch.object(_vault_watcher, "subprocess") as mock_subp:
+        mock_subp.run.side_effect = mock_run
+        result = _vault_watcher._commit_is_lobster_sync(vault, "abc123def456")
+
+    assert result is False, "_commit_is_lobster_sync must return False for user commit"
+
+
+def test_commit_is_lobster_sync_returns_false_on_git_failure(tmp_path):
+    """_commit_is_lobster_sync returns False gracefully when git log fails.
+
+    Spec: network/git failures must not crash the watcher — treat as non-sentinel
+    (fire the processor, which is the safe direction: at worst an extra run).
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+
+    def mock_run(cmd, **kwargs):
+        r = MagicMock()
+        r.returncode = 1
+        r.stdout = ""
+        r.stderr = "fatal: bad object abc123"
+        return r
+
+    with patch.object(_vault_watcher, "subprocess") as mock_subp:
+        mock_subp.run.side_effect = mock_run
+        result = _vault_watcher._commit_is_lobster_sync(vault, "abc123def456")
+
+    assert result is False, "_commit_is_lobster_sync must return False on git failure"
+
+
+def test_watcher_skips_processor_for_lobster_sync_commit(tmp_path):
+    """vault-watcher main() must NOT invoke the processor when new HEAD is a [lobster-sync] commit.
+
+    Scenario: processor committed, HEAD advanced, watcher detects new HEAD.
+    Expected: watcher advances last_processed_head to match and returns without
+    calling _invoke_processor — breaking the self-trigger loop.
+
+    Spec: "vault-processor commits → watcher detects → watcher sees sentinel →
+    marks caught up → no re-fire"
+    """
+    import time
+
+    config_path = tmp_path / "vault-watch-config.json"
+    state_path = tmp_path / "vault-watch-state.json"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / ".git").mkdir()
+
+    _write_json_atomic(config_path, {
+        "enabled": True,
+        "vault_path": str(vault),
+        "debounce_seconds": 10,
+        "max_debounce_seconds": 60,
+        "watched_files": [],
+        "annotation_scope": "all",
+        "lobster_chat_id": None,
+        "webhook_mode": False,
+    })
+
+    OLD_HEAD = "aaa000"
+    NEW_HEAD = "bbb111"  # processor's commit
+
+    _write_json_atomic(state_path, {
+        "last_known_head": OLD_HEAD,
+        "last_push_at": time.time() - 120,
+        "last_processed_head": OLD_HEAD,
+        "first_push_at_in_burst": None,
+    })
+
+    invoke_calls: list[str] = []
+
+    def mock_invoke_processor(config, **kwargs):
+        invoke_calls.append("called")
+
+    with (
+        patch.object(_vault_watcher, "CONFIG_PATH", config_path),
+        patch.object(_vault_watcher, "STATE_PATH", state_path),
+        patch.object(_vault_watcher, "_is_job_enabled", return_value=True),
+        patch.object(_vault_watcher, "_get_remote_head", return_value=NEW_HEAD),
+        patch.object(_vault_watcher, "_commit_is_lobster_sync", return_value=True),
+        patch.object(_vault_watcher, "_invoke_processor", side_effect=mock_invoke_processor),
+        patch("vault_watcher.acquire_lock_or_skip", return_value=object()),
+        patch("vault_watcher.release_lock"),
+    ):
+        _vault_watcher.main()
+
+    assert len(invoke_calls) == 0, (
+        "vault-watcher must NOT invoke the processor when new HEAD is a [lobster-sync] commit"
+    )
+
+    # Verify state was advanced to mark the commit as processed
+    import json
+    new_state = json.loads(state_path.read_text())
+    assert new_state["last_processed_head"] == NEW_HEAD, (
+        "vault-watcher must advance last_processed_head to the lobster-sync commit SHA"
+    )
+
+
+def test_watcher_fires_processor_for_user_commit(tmp_path):
+    """vault-watcher main() MUST invoke the processor when new HEAD is a user commit.
+
+    Spec: only [lobster-sync] commits are skipped. User commits from Obsidian
+    must still fire the processor after the debounce expires.
+
+    To trigger debounce expiry without changing HEAD: the state shows that
+    last_known_head has been known (but unprocessed) for longer than debounce_seconds.
+    The remote_head matches last_known_head (no new change), so the watcher
+    falls through to the debounce check with an already-expired timer.
+
+    Note: _load_state() uses a default-arg bound to the original STATE_PATH constant,
+    so we patch _load_state directly to control what state main() sees.
+    """
+    import time
+
+    config_path = tmp_path / "vault-watch-config.json"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / ".git").mkdir()
+
+    DEBOUNCE_SECONDS = 10
+    _write_json_atomic(config_path, {
+        "enabled": True,
+        "vault_path": str(vault),
+        "debounce_seconds": DEBOUNCE_SECONDS,
+        "max_debounce_seconds": 60,
+        "watched_files": [],
+        "annotation_scope": "all",
+        "lobster_chat_id": None,
+        "webhook_mode": False,
+    })
+
+    USER_HEAD = "ccc222"  # user's commit (no sentinel), detected on a previous tick
+    OLD_PROCESSED = "aaa000"  # previously processed
+
+    # HEAD was already seen (last_known_head = USER_HEAD) but not yet processed.
+    # last_push_at is old enough for debounce to expire.
+    mock_state = {
+        "last_known_head": USER_HEAD,
+        "last_push_at": time.time() - (DEBOUNCE_SECONDS + 30),
+        "last_processed_head": OLD_PROCESSED,
+        "first_push_at_in_burst": time.time() - (DEBOUNCE_SECONDS + 30),
+    }
+
+    invoke_calls: list[str] = []
+
+    def mock_invoke_processor(config, **kwargs):
+        invoke_calls.append("called")
+
+    mock_config = {
+        "enabled": True,
+        "vault_path": str(vault),
+        "debounce_seconds": DEBOUNCE_SECONDS,
+        "max_debounce_seconds": 60,
+        "watched_files": [],
+        "annotation_scope": "all",
+        "lobster_chat_id": None,
+        "webhook_mode": False,
+    }
+
+    with (
+        patch.object(_vault_watcher, "_is_job_enabled", return_value=True),
+        # Patch both loaders directly: their default args are bound at definition time
+        # to module-level path constants, so patching the constants alone is insufficient.
+        patch.object(_vault_watcher, "_load_config", return_value=mock_config),
+        patch.object(_vault_watcher, "_load_state", return_value=mock_state),
+        patch.object(_vault_watcher, "_write_json_atomic"),
+        # Return the SAME head as last_known_head — HEAD is already known, debounce fires
+        patch.object(_vault_watcher, "_get_remote_head", return_value=USER_HEAD),
+        patch.object(_vault_watcher, "_commit_is_lobster_sync", return_value=False),
+        patch.object(_vault_watcher, "_invoke_processor", side_effect=mock_invoke_processor),
+        patch.object(_vault_watcher, "acquire_lock_or_skip", return_value=object()),
+        patch.object(_vault_watcher, "release_lock"),
+    ):
+        _vault_watcher.main()
+
+    assert len(invoke_calls) == 1, (
+        "vault-watcher must invoke the processor when debounce expires for an unprocessed user commit"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bug 2 fix: apply_status_delta additions-block oscillation
+# ---------------------------------------------------------------------------
+
+
+def test_apply_status_delta_additions_block_stable_on_second_run(conn):
+    """Items in the lobster-additions block must survive a second apply_status_delta run.
+
+    Scenario (oscillation bug):
+    - Run 1: Telegram item T not in file → appended to additions block; file committed
+    - Run 2: file now contains T in additions block; new telegram item U arrives
+      Without fix: T disappears (was in file_dedup_keys → excluded from items_to_append,
+      then stripped when block is rewritten for U)
+      With fix: T stays in the rebuilt additions block (not counted as "in main file")
+
+    Spec: "Items in DB → always present in ACTIVE TODOS.md; the reconciliation
+    output is stable across identical inputs"
+    """
+    from obsidian_sync_core import apply_status_delta, _LOBSTER_ADDITIONS_MARKER, _LOBSTER_ADDITIONS_END
+    from src.los.db import insert_action_item
+
+    # Insert telegram item T into DB
+    t_id = insert_action_item(conn, text="Telegram item T", source="telegram", source_message_id=None)
+    # Insert telegram item U into DB (will be "new" on run 2)
+    u_id = insert_action_item(conn, text="Telegram item U", source="telegram", source_message_id=None)
+
+    # Run 1: file has no additions block; T and U should both appear
+    file_content_run1 = (
+        "# ✅ ACTIVE TODOS\n\n"
+        "- [ ] 🔒 DISABLE PROCESSING\n\n"
+        "## Active (P4–P6)\n\n"
+        "*(none)*\n"
+    )
+    result_run1 = apply_status_delta(file_content_run1, conn)
+
+    # Both T and U must be in the additions block after run 1
+    assert "Telegram item T" in result_run1, "T must be appended after run 1"
+    assert "Telegram item U" in result_run1, "U must be appended after run 1"
+    assert _LOBSTER_ADDITIONS_MARKER in result_run1
+
+    # Run 2: simulate the file now containing both T and U in the additions block
+    # (as if the processor committed run 1's output and vault-watcher sees no new user commit)
+    # Run apply_status_delta again on the same content — output must be stable
+    result_run2 = apply_status_delta(result_run1, conn)
+
+    assert "Telegram item T" in result_run2, (
+        "T must still be present after run 2 — oscillation bug would remove it"
+    )
+    assert "Telegram item U" in result_run2, (
+        "U must still be present after run 2"
+    )
+    assert _LOBSTER_ADDITIONS_MARKER in result_run2
+
+
+def test_apply_status_delta_additions_block_stable_when_new_item_arrives(conn):
+    """When a new DB item arrives, existing additions-block items must be preserved.
+
+    Oscillation scenario:
+    - File contains additions block with item T (from previous run)
+    - New DB item V is inserted
+    - apply_status_delta is called: must include BOTH T (existing) and V (new)
+      Without fix: T disappears because it was in file_dedup_keys (whole file) →
+      excluded from items_to_append → stripped when block rebuilt for V
+    """
+    from obsidian_sync_core import apply_status_delta, _LOBSTER_ADDITIONS_MARKER, _LOBSTER_ADDITIONS_END
+    from src.los.db import insert_action_item
+
+    t_id = insert_action_item(conn, text="Existing item T", source="telegram", source_message_id=None)
+
+    # File already has T in the additions block (simulates committed state after run 1)
+    file_with_t = (
+        "# ✅ ACTIVE TODOS\n\n"
+        "- [ ] 🔒 DISABLE PROCESSING\n\n"
+        "## Active (P4–P6)\n\n"
+        "*(none)*\n\n"
+        f"{_LOBSTER_ADDITIONS_MARKER}\n"
+        "*Items added via Telegram — move or edit freely:*\n\n"
+        f"- [ ] Existing item T <!-- id:{t_id} -->\n"
+        f"{_LOBSTER_ADDITIONS_END}\n"
+    )
+
+    # Now insert new item V into DB
+    v_id = insert_action_item(conn, text="New item V", source="telegram", source_message_id=None)
+
+    result = apply_status_delta(file_with_t, conn)
+
+    assert "Existing item T" in result, (
+        "Existing additions-block item T must be preserved when new item V arrives"
+    )
+    assert "New item V" in result, (
+        "New item V must be appended to the additions block"
+    )
+    assert _LOBSTER_ADDITIONS_MARKER in result
+
+
+def test_apply_status_delta_main_body_items_excluded_from_additions_block(conn):
+    """Items in the main file body must NOT be re-added to the additions block.
+
+    Spec: once a user moves a Telegram item into the main body of ACTIVE TODOS.md,
+    it must not reappear in the additions block.
+    """
+    from obsidian_sync_core import apply_status_delta, _LOBSTER_ADDITIONS_MARKER
+    from src.los.db import insert_action_item
+
+    # Insert a telegram item into DB
+    t_id = insert_action_item(conn, text="Moved to main body", source="telegram", source_message_id=None)
+
+    # File has the item in its main body (user moved it out of the additions block)
+    file_with_main_body_item = (
+        "# ✅ ACTIVE TODOS\n\n"
+        "- [ ] 🔒 DISABLE PROCESSING\n\n"
+        "## Active (P4–P6)\n\n"
+        f"- [ ] Moved to main body <!-- id:{t_id} -->\n"
+    )
+
+    result = apply_status_delta(file_with_main_body_item, conn)
+
+    # The item appears in the main body — count occurrences to ensure no duplication
+    occurrences = result.count("Moved to main body")
+    assert occurrences == 1, (
+        f"Item in main body must appear exactly once, not be duplicated in additions block — "
+        f"found {occurrences} occurrences"
+    )
