@@ -2407,6 +2407,26 @@ else
     info "Skipping require-auditor-context-update SubagentStop hook (settings.json not yet created)"
 fi
 
+# Set up PreToolUse hook to block duplicate `gh pr create` calls.
+# Prevents duplicate PR clusters when the WOS executor re-dispatches the same
+# UoW without knowing an open PR already exists for that branch.
+chmod +x "$INSTALL_DIR/hooks/pre-tool-use-pr-idempotency.py" || true
+if [ -f "$CLAUDE_SETTINGS" ]; then
+    if ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | contains("pre-tool-use-pr-idempotency"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
+        TMP_SETTINGS=$(mktemp)
+        jq --arg cmd "python3 $INSTALL_DIR/hooks/pre-tool-use-pr-idempotency.py" \
+           '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": $cmd, "timeout": 15}]
+        }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+        success "pre-tool-use-pr-idempotency PreToolUse hook installed"
+    else
+        info "pre-tool-use-pr-idempotency hook already configured in Claude Code settings"
+    fi
+else
+    info "Skipping pre-tool-use-pr-idempotency hook (settings.json not yet created)"
+fi
+
 #===============================================================================
 # Python Environment
 #===============================================================================
