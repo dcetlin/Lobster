@@ -26,14 +26,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
-# ---------------------------------------------------------------------------
-# Constants matching the spec (Sonnet 4.6 pricing)
-# ---------------------------------------------------------------------------
-
-SONNET_4_6_INPUT_PER_MTK = 3.0     # $3 per 1M input tokens
-SONNET_4_6_OUTPUT_PER_MTK = 15.0   # $15 per 1M output tokens
-SONNET_4_6_CACHE_READ_PER_MTK = 0.30  # $0.30 per 1M cache_read tokens
+from src.orchestration.wos_uow_detail_gen import (
+    SONNET_4_6_CACHE_READ_PER_MTK,
+    SONNET_4_6_INPUT_PER_MTK,
+    SONNET_4_6_OUTPUT_PER_MTK,
+)
 
 
 # ---------------------------------------------------------------------------
