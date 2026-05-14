@@ -95,6 +95,30 @@ class UoWStatus(StrEnum):
 
 
 # ---------------------------------------------------------------------------
+# UoW type enum — classifies execution mode of the unit of work
+# ---------------------------------------------------------------------------
+
+class UoWType(StrEnum):
+    EXECUTABLE = "executable"  # standard agent-dispatched execution
+    INLINE = "inline"          # lightweight, no subagent dispatch
+
+
+# ---------------------------------------------------------------------------
+# UoW register enum — attentional configuration for completion evaluation
+#
+# These four values are canonical across the codebase (germinator, steward,
+# executor, dispatcher_handlers). If a new register is added, add it here
+# and update the executor's dispatch table and steward's register-aware logic.
+# ---------------------------------------------------------------------------
+
+class UoWRegister(StrEnum):
+    OPERATIONAL = "operational"
+    ITERATIVE_CONVERGENT = "iterative-convergent"
+    PHILOSOPHICAL = "philosophical"
+    HUMAN_JUDGMENT = "human-judgment"
+
+
+# ---------------------------------------------------------------------------
 # Named result types — no dict[str, Any] from decision functions
 # ---------------------------------------------------------------------------
 
@@ -169,7 +193,7 @@ class UoW:
     created_at: str
     updated_at: str
     sweep_date: str | None = None
-    type: str = "executable"
+    type: UoWType = UoWType.EXECUTABLE
     posture: str = "solo"
     route_reason: str | None = None
     steward_notes: str = ""
@@ -209,7 +233,7 @@ class UoW:
     #   than reclassifying autonomously.
     # uow_mode: mirrors register; used for execution context selection by Executor.
     #   Kept separate to allow future divergence without a schema change.
-    register: str = "operational"
+    register: UoWRegister = UoWRegister.OPERATIONAL
     uow_mode: str | None = None
     # Delivery≠closure fields (populated after migration 0007)
     # closed_at: ISO timestamp written by Steward when it declares the loop done.
@@ -286,6 +310,25 @@ class UoW:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _coerce_enum(raw: str | None, enum_cls: type, default: Any) -> Any:
+    """Convert a raw DB string to a StrEnum value.
+
+    Falls back to ``default`` for NULL or unrecognized values so that legacy
+    rows do not raise at the read boundary.  This is the only place where
+    unknown enum strings are tolerated — new writes always use enum values.
+    """
+    if raw is None:
+        return default
+    try:
+        return enum_cls(raw)
+    except ValueError:
+        log.debug(
+            "_coerce_enum: unknown value %r for %s, using default %r",
+            raw, enum_cls.__name__, default,
+        )
+        return default
 
 
 def _generate_uow_id() -> str:
@@ -449,7 +492,7 @@ class Registry:
             created_at=d.get("created_at") or "",
             updated_at=d.get("updated_at") or "",
             sweep_date=d.get("sweep_date"),
-            type=d.get("type") or "executable",
+            type=_coerce_enum(d.get("type"), UoWType, UoWType.EXECUTABLE),
             posture=d.get("posture") or "solo",
             route_reason=d.get("route_reason"),
             steward_notes=d.get("steward_notes") or "",
@@ -469,7 +512,7 @@ class Registry:
             source_last_seen_at=d.get("source_last_seen_at"),
             source_state=d.get("source_state"),
             issue_url=d.get("issue_url"),
-            register=d.get("register") or "operational",
+            register=_coerce_enum(d.get("register"), UoWRegister, UoWRegister.OPERATIONAL),
             uow_mode=d.get("uow_mode"),
             closed_at=d.get("closed_at"),
             close_reason=d.get("close_reason"),

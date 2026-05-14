@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from src.orchestration.registry import UoW
+from src.orchestration.registry import UoW, UoWStatus, UoWRegister
 from src.orchestration.paths import WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG
 from src.orchestration.error_capture import (
     run_subprocess_with_error_capture,
@@ -437,29 +437,8 @@ def _build_claude_env() -> dict[str, str]:
     return env
 
 
-# ---------------------------------------------------------------------------
-# Status enum (golden pattern: StrEnum so values serialize as plain strings)
-# ---------------------------------------------------------------------------
-
-class UoWStatus(StrEnum):
-    PROPOSED = "proposed"
-    PENDING = "pending"
-    READY_FOR_STEWARD = "ready-for-steward"
-    DIAGNOSING = "diagnosing"
-    READY_FOR_EXECUTOR = "ready-for-executor"
-    ACTIVE = "active"
-    DONE = "done"
-    BLOCKED = "blocked"
-    FAILED = "failed"
-    EXPIRED = "expired"
-    # NEEDS_HUMAN_REVIEW: retry cap exceeded; UoW awaits human decision.
-    NEEDS_HUMAN_REVIEW = "needs-human-review"
-
-    def is_terminal(self) -> bool:
-        return self in {UoWStatus.DONE, UoWStatus.FAILED, UoWStatus.EXPIRED}
-
-    def is_in_flight(self) -> bool:
-        return self in {UoWStatus.ACTIVE, UoWStatus.READY_FOR_EXECUTOR, UoWStatus.DIAGNOSING}
+# UoWStatus is the canonical source in registry.py; imported above.
+# The duplicate definition has been removed — use UoWStatus from the import.
 
 
 # ---------------------------------------------------------------------------
