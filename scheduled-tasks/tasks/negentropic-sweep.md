@@ -48,7 +48,19 @@ After writing the sweep file, read the Escalation List section of your output. F
    - Title: short description of the smell
    - Body: smell description, file/line reference if available, and what a fix would look like
    - Use label `bug` for behavioral/structural defects, `enhancement` for improvements
-3. Record each issue number in your sweep file under the escalation item
+   - Capture the issue number and URL from the output (e.g. `https://github.com/dcetlin/Lobster/issues/1234`)
+3. **After filing a new issue**, promote it to the WOS queue immediately:
+   ```bash
+   uv run ~/lobster/scheduled-tasks/sweep-uow-promote.py \
+     --issue-number <NUMBER> \
+     --title "<TITLE>" \
+     --issue-url "https://github.com/dcetlin/Lobster/issues/<NUMBER>"
+   ```
+   Record the one-line output (e.g. `wos-uow: created proposed UoW for issue #1234`) in your sweep file under the escalation item.
+   - If the script exits 0, the UoW was created or was already in the queue — either is correct.
+   - If the script exits non-zero, note the error in the sweep file but continue — issue filing is not blocked.
+   - Do NOT run this script for escalation items that were already linked to an existing issue (step 1 matched) — those may already have a UoW.
+4. Record each issue number in your sweep file under the escalation item
 
 An escalation item that has no GitHub issue when write_task_output is called is an incomplete OODA loop. The sweep is not done until every escalation item is either (a) linked to an existing issue, or (b) has a new issue filed in this run.
 
