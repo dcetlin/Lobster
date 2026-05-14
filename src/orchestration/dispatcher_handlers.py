@@ -1727,20 +1727,44 @@ def handle_wos_done(msg: dict[str, Any]) -> dict[str, Any]:
     - Rich-form: non-pearl outcome or >1 execution attempt (labelled multi-field format)
     - Failed-form: UoW that failed (failed prefix, topology, tokens, failure summary)
 
-    Pure function — no side effects, no I/O.
+    After assembling the ping text, this handler generates a per-UoW HTML drilldown
+    page via wos_uow_detail_gen.generate_and_upload and appends the public URL to the
+    message so Dan can tap through to token breakdown, audit trail, and corrective
+    traces. The HTML generation step is non-fatal: if the registry is absent (e.g. test
+    env), the UoW is not found, or the upload fails, the original text is sent unchanged.
 
     Args:
         msg: The raw wos_done inbox message dict.  Expected fields:
             - ``text`` (str): Pre-formatted ping text from wos_completion_notifier.
             - ``chat_id`` (str): Admin chat_id to deliver the ping to.
-            - ``uow_id`` (str): The UoW ID (included for observability).
+            - ``uow_id`` (str): The UoW ID — used to generate the HTML detail URL.
 
     Returns:
-        A dict with action="send_reply" and the ping text.
+        A dict with action="send_reply" and the ping text (with HTML detail URL when
+        generation succeeds).
     """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
     _default_chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
     text: str = msg.get("text", "WOS UoW completion notification (no detail available)")
     chat_id: str = str(msg.get("chat_id", _default_chat_id))
+    uow_id: str = msg.get("uow_id", "")
+
+    # Append the HTML drilldown URL when the UoW id is known and the detail page
+    # can be generated successfully.  Non-fatal: failures are logged and the
+    # original text is sent unchanged so the completion notification always fires.
+    if uow_id:
+        try:
+            from .wos_uow_detail_gen import generate_and_upload
+            detail_url = generate_and_upload(uow_id=uow_id)
+            text = f"{text}\n{detail_url}"
+        except Exception as exc:
+            _log.debug(
+                "handle_wos_done: could not generate HTML detail for UoW %r — %s: %s",
+                uow_id, type(exc).__name__, exc,
+            )
+
     return {
         "action": "send_reply",
         "text": text,
