@@ -2,8 +2,11 @@
 Circadian-aware message delivery for Lobster.
 
 Non-urgent scheduled-job outputs are held in a local queue and batched for
-delivery during Dan's morning window (06:00–10:00 America/Los_Angeles).
+delivery during the owner's morning window (06:00-10:00 in the configured timezone).
 Urgent messages (user replies, incident alerts) always deliver immediately.
+
+The morning window timezone is read from the owner's configured timezone
+(LOBSTER_USER_TZ env var > owner.toml > UTC fallback). No hardcoded timezone.
 
 Public API
 ----------
@@ -19,9 +22,8 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-_PACIFIC = ZoneInfo("America/Los_Angeles")
+from utils.timezone import get_owner_zoneinfo as _get_owner_zoneinfo
 
 # Keywords that signal an urgent job output (health failures, system alerts).
 # Checked case-insensitively against message text.
@@ -44,20 +46,20 @@ def _queue_path() -> Path:
 
 
 def is_morning_window(_now_fn=None) -> bool:
-    """True if current Pacific time is between 06:00 and 10:00 (inclusive of 06, exclusive of 10).
+    """True if current owner-timezone time is between 06:00 and 10:00 (inclusive of 06, exclusive of 10).
 
     Parameters
     ----------
     _now_fn:
         Optional callable that returns the current datetime (must be timezone-aware).
-        When None (default), uses ``datetime.now(_PACIFIC)``.
+        When None (default), uses ``datetime.now(_get_owner_zoneinfo())``.
         Inject a fixed-time callable in tests to avoid time-of-day dependency.
     """
     if _now_fn is not None:
-        now_pt = _now_fn()
+        now_local = _now_fn()
     else:
-        now_pt = datetime.now(_PACIFIC)
-    return 6 <= now_pt.hour < 10
+        now_local = datetime.now(_get_owner_zoneinfo())
+    return 6 <= now_local.hour < 10
 
 
 def is_non_urgent(message: dict) -> bool:

@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 from .registry import ApproveConfirmed, ApproveExpired, ApproveNotFound, ApproveSkipped
 from .paths import LOBSTER_WORKSPACE as _LOBSTER_WORKSPACE, WOS_CONFIG as _WOS_CONFIG_PATH_FROM_PATHS, WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG, JOBS_JSON as _JOBS_JSON_PATH
 from .steward import ReturnReasonClassification, MAX_RETRIES as _STEWARD_MAX_RETRIES, _HARD_CAP_CYCLES
+from utils.timezone import format_iso_for_user as _format_iso_for_user, get_owner_tz_name as _get_owner_tz_name
 
 
 # ---------------------------------------------------------------------------
@@ -2287,15 +2288,9 @@ def format_quota_message(state: dict | None) -> str:
         return _UNAVAILABLE
 
     def _fmt_reset(iso: str) -> str:
-        """Format an ISO reset timestamp as a short human-readable string (ET)."""
+        """Format an ISO reset timestamp in the owner's configured timezone."""
         try:
-            from datetime import datetime as _datetime
-            from zoneinfo import ZoneInfo
-
-            ts_str = iso.replace("Z", "+00:00")
-            ts = _datetime.fromisoformat(ts_str)
-            et = ts.astimezone(ZoneInfo("America/New_York"))
-            return et.strftime("%b %-d %-I:%M %p ET")
+            return _format_iso_for_user(iso, fmt="%b %-d %-I:%M %p %Z")
         except Exception:
             return iso[:16]  # fallback: truncated ISO
 

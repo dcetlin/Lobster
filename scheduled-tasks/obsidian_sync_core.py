@@ -28,8 +28,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Optional
-from zoneinfo import ZoneInfo
-
 # ---------------------------------------------------------------------------
 # Path setup (allow import from scheduled-tasks/ without installing)
 # ---------------------------------------------------------------------------
@@ -48,6 +46,7 @@ from src.los.db import (
     mark_done,
     get_item_by_id,
 )
+from src.utils.timezone import get_owner_zoneinfo as _get_owner_zoneinfo
 
 log = logging.getLogger("obsidian-sync-core")
 
@@ -151,8 +150,6 @@ ATTRIBUTION_LINE_RE = re.compile(r"^  - (?:\[\[.+\]\]|\[(?:telegram msg|voicenot
 # Attribution (pure functions — no I/O or DB access)
 # ---------------------------------------------------------------------------
 
-_LA_TZ = ZoneInfo("America/Los_Angeles")
-
 # Source type labels used in archaeology-register attributions
 _SOURCE_LABEL: dict[str, str] = {
     "telegram": "telegram msg",
@@ -205,15 +202,13 @@ def format_attribution(
 
     try:
         dt_utc = datetime.fromisoformat(created_at_iso.replace("Z", "+00:00"))
-        dt_la = dt_utc.astimezone(_LA_TZ)
+        dt_local = dt_utc.astimezone(_get_owner_zoneinfo())
     except (ValueError, AttributeError):
         return f"[{label}]"
 
-    # Determine timezone abbreviation: PDT (DST) or PST (standard)
-    tz_abbr = "PDT" if dt_la.dst() and dt_la.dst().total_seconds() != 0 else "PST"
-
-    date_str = dt_la.strftime("%a %b %-d")
-    time_str = dt_la.strftime("%-I:%M %p")
+    date_str = dt_local.strftime("%a %b %-d")
+    time_str = dt_local.strftime("%-I:%M %p")
+    tz_abbr = dt_local.strftime("%Z")
     return f"[{label} · {date_str} · {time_str} {tz_abbr}]"
 
 
