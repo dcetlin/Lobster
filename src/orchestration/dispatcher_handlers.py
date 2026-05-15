@@ -2290,8 +2290,6 @@ def format_quota_message(state: dict | None) -> str:
     def _fmt_reset(iso: str) -> str:
         """Format an ISO reset timestamp in the owner's configured timezone."""
         try:
-            tz_abbr = _get_owner_tz_name()
-            # Use the short abbreviated name that strftime %Z provides
             return _format_iso_for_user(iso, fmt="%b %-d %-I:%M %p %Z")
         except Exception:
             return iso[:16]  # fallback: truncated ISO
