@@ -4037,6 +4037,21 @@ PYEOF
         fi
     fi
 
+    # Migration 113: Copy dispatcher-quota-query.md and dispatcher-status-query.md task
+    # files to the workspace tasks directory. These task files are used by the /quota
+    # and /status dispatcher commands (issue #1165).
+    local tasks_dir="$WORKSPACE_DIR/scheduled-jobs/tasks"
+    for _task_file in "dispatcher-quota-query.md" "dispatcher-status-query.md"; do
+        local _src="$LOBSTER_DIR/scheduled-tasks/tasks/$_task_file"
+        local _dst="$tasks_dir/$_task_file"
+        if [ -f "$_src" ] && [ ! -f "$_dst" ]; then
+            mkdir -p "$tasks_dir"
+            cp "$_src" "$_dst"
+            substep "Installed dispatcher task file: $_task_file (Migration 113)"
+            migrated=$((migrated + 1))
+        fi
+    done
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
