@@ -4052,6 +4052,22 @@ PYEOF
         fi
     done
 
+    # Migration 114: Add timezone field to owner.toml if not already set.
+    # Ensures get_owner_tz_name() returns a meaningful default instead of UTC
+    # for existing installs that predate the LOBSTER_USER_TZ global tz config.
+    local _owner_toml="$LOBSTER_CONFIG_DIR/owner.toml"
+    if [ -f "$_owner_toml" ]; then
+        if ! grep -q "^timezone" "$_owner_toml"; then
+            echo 'timezone = "America/Los_Angeles"' >> "$_owner_toml"
+            substep "Migration 114: added timezone = America/Los_Angeles to owner.toml"
+            migrated=$((migrated + 1))
+        else
+            substep "Migration 114: timezone already set in owner.toml — skipping"
+        fi
+    else
+        substep "Migration 114: owner.toml not found — skipping"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
