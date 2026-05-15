@@ -2145,11 +2145,19 @@ def route_callback_message(msg: dict[str, Any], *, registry: "Registry | None" =
 COMMAND_HELP: str = """Lobster command index
 
 System status:
-  status / health     — usage %, WOS state, active agents
-  usage               — Claude quota windows and reset times
+  /status             — running agents, WOS state, CC usage snapshot
+  /quota              — CC quota windows and reset times (5h and 7d)
+  status / health     — usage %, WOS state, active agents (prose command)
+  usage               — Claude quota windows and reset times (prose command)
   usage full          — full usage report (spawns subagent)
   agents              — list active subagent sessions
   inbox               — queue depth and processing state
+
+LOS (action items):
+  /todos              — show open action items with Done/Snooze buttons
+  /todo add <text>    — add a new action item
+  /todo done <text>   — mark an item done by partial text or ID
+  /todo snooze <text> [days] — snooze an item (default: 3 days)
 
 WOS control:
   wos start  — enable WOS pipeline (all 14 WOS-core jobs + execution_enabled)
@@ -2162,6 +2170,14 @@ Decision:
   /approve <uow-id>   — approve a proposed UoW
   /decide <uow-id> <action> — resolve a blocked UoW
 
+Skills:
+  /shop               — list available skills
+  /shop install <name> — install and activate a skill
+  /skill activate/deactivate <name> — toggle a skill
+
+Review:
+  /re-review <PR URL or number> — re-run oracle review on a PR
+
 Restart:
   restart mcp         — restart MCP server (auto-reconnects)
   restart dispatcher  — instructions to restart dispatcher process
@@ -2170,10 +2186,172 @@ Debug:
   debug on / debug off — toggle debug flag file
 
 Help:
-  help / /help        — this index
+  /help / help        — this index
 """
 
 
 def handle_help() -> str:
     """Handle 'help' / '/help' command — return command index."""
     return COMMAND_HELP
+
+
+# ---------------------------------------------------------------------------
+# CC quota state — path and stale threshold
+# ---------------------------------------------------------------------------
+
+# Default path for the cc-budget state file written by cc-usage-poller.py.
+# Overridable via LOBSTER_CC_BUDGET_STATE env var or the state_path argument.
+_CC_BUDGET_STATE_PATH: Path = Path.home() / ".claude" / "cc-budget" / "state.json"
+
+# Data older than this many hours is treated as unavailable (poller may be down).
+QUOTA_STALE_THRESHOLD_HOURS: int = 2
+
+
+def read_quota_state(state_path: Path | None = None) -> dict | None:
+    """Read the CC budget state written by cc-usage-poller.
+
+    Pure read: no side effects beyond file I/O. Returns the parsed dict, or None
+    when the file is absent, unreadable, malformed, or missing ``rate_limits``.
+
+    Path resolution order:
+    1. ``state_path`` argument (if provided)
+    2. ``LOBSTER_CC_BUDGET_STATE`` env var
+    3. ``~/.claude/cc-budget/state.json`` (default)
+    """
+    resolved: Path
+    if state_path is not None:
+        resolved = state_path
+    else:
+        env_override = os.environ.get("LOBSTER_CC_BUDGET_STATE")
+        resolved = Path(env_override) if env_override else _CC_BUDGET_STATE_PATH
+
+    try:
+        text = resolved.read_text(encoding="utf-8")
+        data = json.loads(text)
+        # Require the rate_limits key written by cc-usage-poller (v2 schema).
+        if "rate_limits" not in data:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _is_quota_state_stale(state: dict) -> bool:
+    """Return True if the state's last_updated timestamp exceeds QUOTA_STALE_THRESHOLD_HOURS.
+
+    Falls back to False (fresh) when last_updated is absent or unparseable so that
+    partial state data is still surfaced rather than silently suppressed.
+    """
+    from datetime import datetime as _datetime, timezone as _timezone, timedelta as _timedelta
+
+    last_updated = state.get("last_updated")
+    if not last_updated:
+        return False  # no timestamp — assume fresh rather than suppress
+    try:
+        ts_str = last_updated.replace("Z", "+00:00")
+        ts = _datetime.fromisoformat(ts_str)
+        age = _datetime.now(_timezone.utc) - ts
+        return age > _timedelta(hours=QUOTA_STALE_THRESHOLD_HOURS)
+    except Exception:
+        return False
+
+
+def format_quota_message(state: dict | None) -> str:
+    """Format a CC usage string from the cc-budget state dict.
+
+    Returns the unavailable message when:
+    - ``state`` is None (file missing/unreadable)
+    - ``state`` is stale (older than QUOTA_STALE_THRESHOLD_HOURS)
+    - ``rate_limits`` keys are missing or malformed
+
+    Format when data is available:
+        CC usage: 5h 42% | 7d 15%. Resets 5h: May 15 4:10 PM ET / 7d: May 22 11:00 AM ET.
+
+    Pure function: no side effects. All inputs are arguments.
+    """
+    _UNAVAILABLE = "CC usage data unavailable — poller may not have run yet."
+
+    if state is None:
+        return _UNAVAILABLE
+
+    if _is_quota_state_stale(state):
+        return _UNAVAILABLE
+
+    try:
+        rl = state["rate_limits"]
+        five_pct = rl["five_hour"]["pct"]
+        seven_pct = rl["seven_day"]["pct"]
+        five_resets_at = rl["five_hour"]["resets_at"]
+        seven_resets_at = rl["seven_day"]["resets_at"]
+    except (KeyError, TypeError):
+        return _UNAVAILABLE
+
+    def _fmt_reset(iso: str) -> str:
+        """Format an ISO reset timestamp as a short human-readable string (ET)."""
+        try:
+            from datetime import datetime as _datetime
+            from zoneinfo import ZoneInfo
+
+            ts_str = iso.replace("Z", "+00:00")
+            ts = _datetime.fromisoformat(ts_str)
+            et = ts.astimezone(ZoneInfo("America/New_York"))
+            return et.strftime("%b %-d %-I:%M %p ET")
+        except Exception:
+            return iso[:16]  # fallback: truncated ISO
+
+    five_reset_str = _fmt_reset(five_resets_at)
+    seven_reset_str = _fmt_reset(seven_resets_at)
+
+    return (
+        f"CC usage: 5h {five_pct:.0f}% | 7d {seven_pct:.0f}%. "
+        f"Resets — 5h: {five_reset_str} / 7d: {seven_reset_str}."
+    )
+
+
+def format_status_message(
+    active_sessions: list[dict],
+    wos_config: dict,
+    status_counts: dict,
+    quota_state: dict | None,
+) -> str:
+    """Format a system status snapshot for Telegram display.
+
+    Assembles three lines from independently-sourced data:
+    - WOS execution state and queue depth from wos_config + status_counts
+    - Active agent count and IDs from active_sessions
+    - CC usage percentage from quota_state (or unavailable)
+
+    Pure function: all inputs are arguments; no file reads or MCP calls.
+
+    Example output:
+        ◉ WOS: enabled | 179 ready-for-steward | 1 executing
+        ◉ Agents: 2 running (task-a, task-b)
+        ◉ CC usage: 5h 42% | 7d 15%. Resets — 5h: May 15 4:10 PM ET / 7d: May 22 11:00 AM ET.
+    """
+    execution_enabled = bool(wos_config.get("execution_enabled", False))
+    wos_label = "enabled" if execution_enabled else "stopped"
+
+    # Build queue-depth string from status_counts
+    queue_parts: list[str] = []
+    for status, count in sorted(status_counts.items()):
+        if count > 0:
+            queue_parts.append(f"{count} {status}")
+    queue_str = " | ".join(queue_parts) if queue_parts else "0 UoWs"
+
+    wos_line = f"◉ WOS: {wos_label} | {queue_str}"
+
+    # Active agents line
+    agent_count = len(active_sessions)
+    if agent_count == 0:
+        agents_line = "◉ Agents: 0 running"
+    else:
+        agent_ids = [
+            s.get("task_id") or s.get("id") or "?"
+            for s in active_sessions
+        ]
+        agents_line = f"◉ Agents: {agent_count} running ({', '.join(agent_ids)})"
+
+    # CC usage line
+    quota_line = "◉ " + format_quota_message(quota_state)
+
+    return "\n".join([wos_line, agents_line, quota_line])

@@ -1043,6 +1043,50 @@ are handled in the Button callbacks section above (see `data.startswith("todo-")
 
 ---
 
+## System Status Commands
+
+**`/quota`** — show current CC (Claude Code) usage.
+
+Dispatch to a quota-query subagent (reads `~/.claude/cc-budget/state.json` — 7-second rule applies):
+
+```python
+Task(
+    subagent_type="lobster-generalist",
+    run_in_background=True,
+    prompt=(
+        f"---\ntask_id: quota-query-{chat_id}\nchat_id: {chat_id}\nsource: {source}\n---\n\n"
+        + open(Path.home() / "lobster-workspace/scheduled-jobs/tasks/dispatcher-quota-query.md").read()
+    ),
+)
+send_reply(chat_id=chat_id, text="Checking quota...", source=source)
+```
+
+**`/status`** — show system status snapshot (agents, WOS state, CC usage).
+
+Dispatch to a status-query subagent (reads files and DB — 7-second rule applies):
+
+```python
+Task(
+    subagent_type="lobster-generalist",
+    run_in_background=True,
+    prompt=(
+        f"---\ntask_id: status-query-{chat_id}\nchat_id: {chat_id}\nsource: {source}\n---\n\n"
+        + open(Path.home() / "lobster-workspace/scheduled-jobs/tasks/dispatcher-status-query.md").read()
+    ),
+)
+send_reply(chat_id=chat_id, text="Gathering status...", source=source)
+```
+
+**`/help`** — show command index. Handled inline, no subagent needed:
+
+```python
+from src.orchestration.dispatcher_handlers import handle_help
+
+send_reply(chat_id=chat_id, text=handle_help(), source=source, message_id=message_id)
+```
+
+---
+
 ## Skill System
 
 At message processing start (when skills are enabled), call `get_skill_context` to load assembled context from all active skills. Apply returned instructions alongside base context.
