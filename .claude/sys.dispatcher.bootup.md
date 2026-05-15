@@ -1077,6 +1077,22 @@ Task(
 send_reply(chat_id=chat_id, text="Gathering status...", source=source)
 ```
 
+**`/wos`** — show WOS pipeline state (active UoW count, status breakdown, Bisque dashboard link).
+
+Dispatch to a wos-query subagent (reads wos.db — 7-second rule applies):
+
+```python
+Task(
+    subagent_type="lobster-generalist",
+    run_in_background=True,
+    prompt=(
+        f"---\ntask_id: wos-query-{chat_id}\nchat_id: {chat_id}\nsource: {source}\n---\n\n"
+        + open(Path.home() / "lobster-workspace/scheduled-jobs/tasks/dispatcher-wos-query.md").read()
+    ),
+)
+send_reply(chat_id=chat_id, text="Querying WOS pipeline...", source=source)
+```
+
 **`/help`** — show command index. Handled inline, no subagent needed:
 
 ```python

@@ -2161,6 +2161,7 @@ LOS (action items):
   /todo snooze <text> [days] — snooze an item (default: 3 days)
 
 WOS control:
+  /wos                — active UoW count, pipeline status breakdown, Bisque link
   wos start  — enable WOS pipeline (all 14 WOS-core jobs + execution_enabled)
   wos stop   — pause WOS pipeline (all 14 WOS-core jobs + execution_enabled)
   wos status [status] — show active + queued UoWs

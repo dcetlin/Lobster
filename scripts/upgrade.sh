@@ -4068,6 +4068,20 @@ PYEOF
         substep "Migration 114: owner.toml not found — skipping"
     fi
 
+    # Migration 115: Copy dispatcher-wos-query.md task file to the workspace tasks
+    # directory. This task file is used by the /wos dispatcher command (issue #1171).
+    local _wos_task_file="dispatcher-wos-query.md"
+    local _wos_src="$LOBSTER_DIR/scheduled-tasks/tasks/$_wos_task_file"
+    local _wos_dst="$WORKSPACE_DIR/scheduled-jobs/tasks/$_wos_task_file"
+    if [ -f "$_wos_src" ] && [ ! -f "$_wos_dst" ]; then
+        mkdir -p "$WORKSPACE_DIR/scheduled-jobs/tasks"
+        cp "$_wos_src" "$_wos_dst"
+        substep "Installed dispatcher task file: $_wos_task_file (Migration 115)"
+        migrated=$((migrated + 1))
+    else
+        substep "Migration 115: $_wos_task_file already present or source missing — skipping"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
