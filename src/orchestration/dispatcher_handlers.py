@@ -2346,7 +2346,7 @@ def format_status_message(
         agents_line = "◉ Agents: 0 running"
     else:
         agent_ids = [
-            s.get("agent_id") or s.get("task_id") or "?"
+            s.get("task_id") or s.get("id") or "?"
             for s in active_sessions
         ]
         agents_line = f"◉ Agents: {agent_count} running ({', '.join(agent_ids)})"

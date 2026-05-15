@@ -15,20 +15,12 @@ import pytest
 
 from src.orchestration.dispatcher_handlers import (
     COMMAND_HELP,
+    QUOTA_STALE_THRESHOLD_HOURS,
     handle_help,
     read_quota_state,
     format_quota_message,
     format_status_message,
 )
-
-
-# ---------------------------------------------------------------------------
-# Constants matching the spec requirements
-# ---------------------------------------------------------------------------
-
-# Stale threshold in hours: data older than this is treated as unavailable.
-# Matches the poller's 30-minute schedule — 2 hours gives headroom for gaps.
-QUOTA_STALE_THRESHOLD_HOURS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -220,8 +212,8 @@ class TestFormatStatusMessage:
     def test_includes_agent_count_when_agents_present(self) -> None:
         """Active agent count (2) must appear when agents are running."""
         sessions = [
-            {"agent_id": "task-a", "description": "First task"},
-            {"agent_id": "task-b", "description": "Second task"},
+            {"task_id": "task-a", "description": "First task"},
+            {"task_id": "task-b", "description": "Second task"},
         ]
         result = format_status_message(
             active_sessions=sessions,
