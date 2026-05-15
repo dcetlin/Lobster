@@ -4008,6 +4008,35 @@ PYEOF
         substep "Migration 111: LOBSTER-PENDING-ACTIONS-NUDGE cron entry already present — skipping"
     fi
 
+    # Migration 112: Register pre-tool-use-pr-idempotency.py PreToolUse hook.
+    # Replaces advisory bash blocks in markdown files with a structural hook that
+    # hard-blocks `gh pr create` when an open PR already exists for the same branch.
+    if [ -f "$CLAUDE_SETTINGS" ] && command -v jq >/dev/null 2>&1; then
+        local has_pr_idempotency_hook
+        has_pr_idempotency_hook=$(jq -r '
+            [.hooks.PreToolUse[]?.hooks[]?.command // empty]
+            | map(select(contains("pre-tool-use-pr-idempotency")))
+            | length
+        ' "$CLAUDE_SETTINGS" 2>/dev/null || echo "0")
+        if [ "${has_pr_idempotency_hook:-0}" = "0" ] || [ "${has_pr_idempotency_hook:-0}" = "" ]; then
+            TMP_SETTINGS=$(mktemp)
+            jq --arg cmd "python3 $LOBSTER_DIR/hooks/pre-tool-use-pr-idempotency.py" \
+               '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": $cmd,
+                    "timeout": 15
+                }]
+            }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+            chmod +x "$LOBSTER_DIR/hooks/pre-tool-use-pr-idempotency.py" 2>/dev/null || true
+            substep "Registered pre-tool-use-pr-idempotency PreToolUse hook (Migration 112)"
+            migrated=$((migrated + 1))
+        else
+            substep "pre-tool-use-pr-idempotency hook already registered — skipping Migration 112"
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
