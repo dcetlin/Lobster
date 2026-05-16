@@ -1337,7 +1337,7 @@ def test_watcher_skips_processor_for_lobster_sync_commit(tmp_path):
     with (
         patch.object(_vault_watcher, "CONFIG_PATH", config_path),
         patch.object(_vault_watcher, "STATE_PATH", state_path),
-        patch.object(_vault_watcher, "_is_job_enabled", return_value=True),
+        patch.object(_vault_watcher, "is_job_enabled", return_value=True),
         patch.object(_vault_watcher, "_get_remote_head", return_value=NEW_HEAD),
         patch.object(_vault_watcher, "_commit_is_lobster_sync", return_value=True),
         patch.object(_vault_watcher, "_invoke_processor", side_effect=mock_invoke_processor),
@@ -1420,7 +1420,7 @@ def test_watcher_fires_processor_for_user_commit(tmp_path):
     }
 
     with (
-        patch.object(_vault_watcher, "_is_job_enabled", return_value=True),
+        patch.object(_vault_watcher, "is_job_enabled", return_value=True),
         # Patch both loaders directly: their default args are bound at definition time
         # to module-level path constants, so patching the constants alone is insufficient.
         patch.object(_vault_watcher, "_load_config", return_value=mock_config),

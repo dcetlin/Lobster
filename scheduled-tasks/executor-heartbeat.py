@@ -56,6 +56,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 from src.orchestration.paths import REGISTRY_DB
+from src.utils.jobs import is_job_enabled
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -70,30 +71,6 @@ log = logging.getLogger("executor-heartbeat")
 
 
 # ---------------------------------------------------------------------------
-# jobs.json enabled gate — Type C dispatch path
-# ---------------------------------------------------------------------------
-
-def _is_job_enabled(job_name: str) -> bool:
-    """
-    Return True if the job is enabled in jobs.json, False if explicitly disabled.
-
-    Defaults to True when:
-    - jobs.json is absent
-    - the job entry is missing
-    - the file is unreadable or malformed
-
-    This mirrors the gate logic in dispatch-job.sh so Type C (cron → script)
-    jobs respect the same runtime enable/disable toggle as Type A jobs.
-    """
-    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-    jobs_file = workspace / "scheduled-jobs" / "jobs.json"
-    try:
-        data = json.loads(jobs_file.read_text())
-        return bool(data.get("jobs", {}).get(job_name, {}).get("enabled", True))
-    except Exception:
-        return True
-
-
 def _warn_if_legacy_registry_exists() -> None:
     """Log a warning if the deprecated legacy registry path exists and is non-empty.
 
@@ -636,7 +613,7 @@ def main() -> int:
 
     # jobs.json enabled gate — respect runtime enable/disable toggled via
     # the dispatcher 'wos start/stop' commands or direct jobs.json edits.
-    if not _is_job_enabled("executor-heartbeat"):
+    if not is_job_enabled("executor-heartbeat"):
         log.info("Executor heartbeat: skipped (disabled in jobs.json)")
         return 0
 

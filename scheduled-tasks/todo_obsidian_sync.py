@@ -103,6 +103,7 @@ from obsidian_sync_core import (  # noqa: E402
     sync_obsidian_to_db,
 )
 from src.los.db import connect  # noqa: E402
+from src.utils.jobs import is_job_enabled  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -126,30 +127,6 @@ _DB_DEFAULT = Path.home() / "lobster-user-config" / "data" / "self_action_items.
 _LOCK_PATH = Path("/tmp/vault-processor.lock")
 
 
-def _get_workspace() -> Path:
-    """Return the workspace path, reading LOBSTER_WORKSPACE at call time (not import time).
-
-    Deferred to function call so tests can override via monkeypatch.setenv.
-    """
-    return Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-
-
-# ---------------------------------------------------------------------------
-# Jobs.json enabled gate (Type B compliance — must gate before any DB work)
-# ---------------------------------------------------------------------------
-
-
-def _is_job_enabled(job_name: str) -> bool:
-    """Return True if the job is enabled in jobs.json."""
-    try:
-        jobs_file = _get_workspace() / "scheduled-jobs" / "jobs.json"
-        with jobs_file.open() as fh:
-            data = json.load(fh)
-        entry = data.get("jobs", {}).get(job_name, {})
-        return bool(entry.get("enabled", True))
-    except Exception:
-        return True  # Safe default: enabled when unreadable
-
 
 # ---------------------------------------------------------------------------
 # Main entry point
@@ -163,7 +140,7 @@ def main() -> None:
     parser.add_argument("--db", default=str(_DB_DEFAULT), help="Path to self_action_items.db")
     args = parser.parse_args()
 
-    if not _is_job_enabled(JOB_NAME):
+    if not is_job_enabled(JOB_NAME):
         log.info("Job '%s' is disabled in jobs.json — exiting", JOB_NAME)
         return
 

@@ -50,6 +50,8 @@ _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from src.utils.jobs import is_job_enabled  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -98,33 +100,9 @@ def _registry_db_path() -> Path:
     return _workspace() / "orchestration" / "registry.db"
 
 
-def _jobs_file() -> Path:
-    return _workspace() / "scheduled-jobs" / "jobs.json"
-
-
 def _inbox_dir() -> Path:
     messages_base = Path(os.environ.get("LOBSTER_MESSAGES", Path.home() / "messages"))
     return messages_base / "inbox"
-
-
-# ---------------------------------------------------------------------------
-# jobs.json enabled gate — Type C dispatch pattern
-# ---------------------------------------------------------------------------
-
-def _is_job_enabled() -> bool:
-    """
-    Return True if this job is enabled in jobs.json, False if explicitly disabled.
-
-    Defaults to True when:
-    - jobs.json is absent
-    - the job entry is missing
-    - the file is unreadable or malformed
-    """
-    try:
-        data = json.loads(_jobs_file().read_text())
-        return bool(data.get("jobs", {}).get(JOB_NAME, {}).get("enabled", True))
-    except Exception:
-        return True
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +553,7 @@ def main() -> int:
                         help=f"Lookback window in hours (default: {DEFAULT_LOOKBACK_HOURS})")
     args = parser.parse_args()
 
-    if not _is_job_enabled():
+    if not is_job_enabled(JOB_NAME):
         log.info("Job '%s' is disabled in jobs.json — skipping", JOB_NAME)
         return 0
 
