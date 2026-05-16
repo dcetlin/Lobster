@@ -229,9 +229,14 @@ def _fetch_token_data(
     found = False
 
     for entry in entries:
-        task_id = entry.get("task_id", "") or ""
-        match = _UOW_PATTERN.search(task_id)
-        if match and match.group(0) == uow_id:
+        explicit_uow_id = entry.get("uow_id")
+        if explicit_uow_id:
+            matched = explicit_uow_id == uow_id
+        else:
+            task_id = entry.get("task_id", "") or ""
+            m = _UOW_PATTERN.search(task_id)
+            matched = bool(m) and m.group(0) == uow_id
+        if matched:
             found = True
             totals["input"] += entry.get("input", 0) or 0
             totals["output"] += entry.get("output", 0) or 0

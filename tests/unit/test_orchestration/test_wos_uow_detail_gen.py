@@ -26,14 +26,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
-# ---------------------------------------------------------------------------
-# Constants matching the spec (Sonnet 4.6 pricing)
-# ---------------------------------------------------------------------------
-
-SONNET_4_6_INPUT_PER_MTK = 3.0     # $3 per 1M input tokens
-SONNET_4_6_OUTPUT_PER_MTK = 15.0   # $15 per 1M output tokens
-SONNET_4_6_CACHE_READ_PER_MTK = 0.30  # $0.30 per 1M cache_read tokens
+from src.orchestration.wos_uow_detail_gen import (
+    SONNET_4_6_INPUT_PER_MTK,
+    SONNET_4_6_OUTPUT_PER_MTK,
+    SONNET_4_6_CACHE_READ_PER_MTK,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +382,73 @@ class TestFetchTokenData:
         result = _fetch_token_data(entries, uow_id)
         assert result is not None
         assert result["calls"] == 3
+
+    # ------------------------------------------------------------------
+    # Exact-match path: entry carries an explicit uow_id field
+    # ------------------------------------------------------------------
+
+    def test_exact_match_uow_id_field_includes_matching_entry(self):
+        """Entries with an explicit uow_id field that equals the target are included via the exact-match path."""
+        from src.orchestration.wos_uow_detail_gen import _fetch_token_data
+        target_uow_id = "uow_20260501_abc123"
+        entries = [
+            {
+                "ts": 2000,
+                "uow_id": target_uow_id,   # explicit uow_id — exact-match path fires
+                "input": 8000,
+                "output": 4000,
+                "cache_read": 16000,
+                "cache_write": 1000,
+                "model": "claude-sonnet-4-6",
+            },
+        ]
+        result = _fetch_token_data(entries, target_uow_id)
+        assert result is not None
+        assert result["calls"] == 1
+        assert result["input"] == 8000
+        assert result["output"] == 4000
+        assert result["cache_read"] == 16000
+
+    def test_exact_match_uow_id_field_excludes_mismatching_entry(self):
+        """Entries with an explicit uow_id field that does not match the target are excluded."""
+        from src.orchestration.wos_uow_detail_gen import _fetch_token_data
+        target_uow_id = "uow_20260501_abc123"
+        other_uow_id = "uow_20260501_other9"
+        entries = [
+            {
+                "ts": 2001,
+                "uow_id": other_uow_id,    # explicit uow_id pointing at a different UoW
+                "input": 9999,
+                "output": 9999,
+                "cache_read": 9999,
+                "cache_write": 9999,
+                "model": "claude-sonnet-4-6",
+            },
+        ]
+        result = _fetch_token_data(entries, target_uow_id)
+        assert result is None  # no matching entries → None
+
+    def test_exact_match_takes_priority_over_regex_fallback(self):
+        """When entry has explicit uow_id, exact-match determines inclusion — not regex on task_id."""
+        from src.orchestration.wos_uow_detail_gen import _fetch_token_data
+        target_uow_id = "uow_20260501_abc123"
+        other_uow_id = "uow_20260501_other9"
+        entries = [
+            {
+                # task_id would match target via regex, but explicit uow_id points elsewhere
+                "ts": 2002,
+                "uow_id": other_uow_id,
+                "task_id": f"wos-{target_uow_id}",
+                "input": 5000,
+                "output": 2000,
+                "cache_read": 1000,
+                "cache_write": 500,
+                "model": "claude-sonnet-4-6",
+            },
+        ]
+        result = _fetch_token_data(entries, target_uow_id)
+        # Exact-match on uow_id takes priority: uow_id is other_uow_id, so this entry is excluded
+        assert result is None
 
 
 # ---------------------------------------------------------------------------
