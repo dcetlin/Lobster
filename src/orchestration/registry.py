@@ -1188,6 +1188,36 @@ class Registry:
         finally:
             conn.close()
 
+    def write_dispatch_skip(self, uow_id: str, entry: dict[str, Any]) -> None:
+        """Write a dispatch_eligibility_skip record to dispatch_skip_log.
+
+        Kept out of audit_log to prevent noise from drowning forensic events.
+        The entry dict must contain 'eligibility'; other keys are optional.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO dispatch_skip_log (ts, uow_id, eligibility, steward_cycles, actor, note)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _now_iso(),
+                    uow_id,
+                    entry.get("eligibility", "unknown"),
+                    entry.get("steward_cycles"),
+                    entry.get("actor"),
+                    json.dumps(entry),
+                ),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def record_stall_detected(
         self,
         uow_id: str,

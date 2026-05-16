@@ -478,5 +478,135 @@ class TestDispatchEligibilityPrecedence:
         assert result == "pause"
 
 
+# ---------------------------------------------------------------------------
+# Integration: dispatch_eligibility_skip routed to dispatch_skip_log, not audit_log
+# ---------------------------------------------------------------------------
+
+class TestDispatchSkipRoutedToSeparateTable:
+    """dispatch_eligibility_skip events go to dispatch_skip_log, not audit_log.
+
+    Separation ensures the main audit_log retains its forensic signal-to-noise
+    ratio. These records previously constituted ~88% of audit_log volume.
+    """
+
+    @pytest.fixture
+    def registry(self, tmp_path):
+        """Registry backed by a temporary SQLite DB."""
+        from src.orchestration.registry import Registry
+        return Registry(tmp_path / "test_skip_log.db")
+
+    def test_throttle_skip_writes_to_dispatch_skip_log_not_audit_log(self, registry, tmp_path):
+        """A throttle-pattern skip routes to dispatch_skip_log, leaving audit_log clean."""
+        import sqlite3
+
+        uow_id = "uow_test_throttle_skip"
+        registry.write_dispatch_skip(uow_id, {
+            "actor": "steward",
+            "uow_id": uow_id,
+            "steward_cycles": 3,
+            "eligibility": "throttle",
+            "timestamp": "2026-05-16T00:00:00+00:00",
+        })
+
+        conn = sqlite3.connect(str(tmp_path / "test_skip_log.db"))
+
+        # audit_log must have no dispatch_eligibility_skip entries
+        audit_skip_count = conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE event = 'dispatch_eligibility_skip'"
+        ).fetchone()[0]
+        assert audit_skip_count == 0, (
+            f"Expected 0 dispatch_eligibility_skip entries in audit_log, got {audit_skip_count}"
+        )
+
+        # dispatch_skip_log must have exactly one entry with eligibility='throttle'
+        skip_rows = conn.execute(
+            "SELECT eligibility FROM dispatch_skip_log WHERE uow_id = ?",
+            (uow_id,),
+        ).fetchall()
+        assert len(skip_rows) == 1, f"Expected 1 row in dispatch_skip_log, got {len(skip_rows)}"
+        assert skip_rows[0][0] == "throttle"
+
+        conn.close()
+
+    def test_pause_skip_writes_to_dispatch_skip_log_not_audit_log(self, registry, tmp_path):
+        """A pause-pattern skip (dead-end) routes to dispatch_skip_log, leaving audit_log clean."""
+        import sqlite3
+
+        uow_id = "uow_test_pause_skip"
+        registry.write_dispatch_skip(uow_id, {
+            "actor": "steward",
+            "uow_id": uow_id,
+            "steward_cycles": 5,
+            "eligibility": "pause",
+            "timestamp": "2026-05-16T00:00:00+00:00",
+        })
+
+        conn = sqlite3.connect(str(tmp_path / "test_skip_log.db"))
+
+        audit_skip_count = conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE event = 'dispatch_eligibility_skip'"
+        ).fetchone()[0]
+        assert audit_skip_count == 0
+
+        skip_rows = conn.execute(
+            "SELECT eligibility FROM dispatch_skip_log WHERE uow_id = ?",
+            (uow_id,),
+        ).fetchall()
+        assert len(skip_rows) == 1
+        assert skip_rows[0][0] == "pause"
+
+        conn.close()
+
+    def test_multiple_skips_accumulate_in_dispatch_skip_log(self, registry, tmp_path):
+        """Multiple skip writes all land in dispatch_skip_log; audit_log remains empty of skips."""
+        import sqlite3
+
+        SKIP_COUNT = 5
+        for i in range(SKIP_COUNT):
+            registry.write_dispatch_skip(f"uow_multi_{i}", {
+                "actor": "steward",
+                "uow_id": f"uow_multi_{i}",
+                "steward_cycles": i + 1,
+                "eligibility": "throttle",
+                "timestamp": "2026-05-16T00:00:00+00:00",
+            })
+
+        conn = sqlite3.connect(str(tmp_path / "test_skip_log.db"))
+
+        audit_skip_count = conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE event = 'dispatch_eligibility_skip'"
+        ).fetchone()[0]
+        assert audit_skip_count == 0
+
+        skip_total = conn.execute(
+            "SELECT COUNT(*) FROM dispatch_skip_log"
+        ).fetchone()[0]
+        assert skip_total == SKIP_COUNT
+
+        conn.close()
+
+    def test_dispatch_skip_log_stores_eligibility_field(self, registry, tmp_path):
+        """Each dispatch_skip_log row carries the eligibility value for diagnostics."""
+        import sqlite3
+
+        for eligibility in ("throttle", "pause", "escalate"):
+            registry.write_dispatch_skip(f"uow_{eligibility}", {
+                "actor": "steward",
+                "uow_id": f"uow_{eligibility}",
+                "steward_cycles": 1,
+                "eligibility": eligibility,
+                "timestamp": "2026-05-16T00:00:00+00:00",
+            })
+
+        conn = sqlite3.connect(str(tmp_path / "test_skip_log.db"))
+        rows = conn.execute(
+            "SELECT eligibility FROM dispatch_skip_log ORDER BY eligibility"
+        ).fetchall()
+        conn.close()
+
+        stored = {r[0] for r in rows}
+        assert stored == {"throttle", "pause", "escalate"}
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

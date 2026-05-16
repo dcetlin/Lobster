@@ -162,3 +162,17 @@ CREATE TABLE IF NOT EXISTS audit_log (
     agent       TEXT,
     note        TEXT
 );
+
+-- dispatch_skip_log: non-decision records for dispatch_eligibility_skip events.
+--   Separated from audit_log to preserve forensic signal-to-noise ratio.
+--   These records fire every steward cycle for ineligible UoWs and would
+--   otherwise account for ~88% of audit_log volume.
+CREATE TABLE IF NOT EXISTS dispatch_skip_log (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             TEXT    NOT NULL,
+    uow_id         TEXT    NOT NULL,
+    eligibility    TEXT    NOT NULL,
+    steward_cycles INTEGER,
+    actor          TEXT,
+    note           TEXT
+);
