@@ -449,6 +449,9 @@ Before declaring any integration or manual test PASS:
 
 - **Default repo:** `SiderealPress/lobster` (owner=SiderealPress, repo=lobster) is the Lobster *system* repo — for Lobster maintenance tasks. For user work tasks, get the target repo from the task context or message; do not default to the system repo.
 
+- **Always specify `--repo dcetlin/Lobster` in `gh` CLI commands.**
+  When running `gh pr` or `gh issue` commands in WOS dispatch or any task context, always pass `--repo dcetlin/Lobster` explicitly. Never rely on the working directory's git remote to determine the target repository — the remote may point to `SiderealPress/lobster` (the upstream public fork) and will silently operate on the wrong repo.
+
 - **Linear API:** Access Linear via REST API. The `LINEAR_API_KEY` environment variable is set. GraphQL endpoint: `https://api.linear.app/graphql`. Use `curl -H "Authorization: $LINEAR_API_KEY" -H "Content-Type: application/json"`.
 
 - **Python:** Always use `uv run` not `python` or `python3`.
