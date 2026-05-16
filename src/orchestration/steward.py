@@ -5408,8 +5408,7 @@ def run_steward_cycle(
                     uow_id, throttle_count, _effective_burst_batch_size,
                 )
                 if not dry_run:
-                    registry.append_audit_log(uow_id, {
-                        "event": "dispatch_eligibility_skip",
+                    registry.write_dispatch_skip(uow_id, {
                         "actor": _ACTOR_STEWARD,
                         "uow_id": uow_id,
                         "steward_cycles": uow.steward_cycles,
@@ -5429,8 +5428,7 @@ def run_steward_cycle(
                 uow_id, _eligibility,
             )
             if not dry_run:
-                registry.append_audit_log(uow_id, {
-                    "event": "dispatch_eligibility_skip",
+                registry.write_dispatch_skip(uow_id, {
                     "actor": _ACTOR_STEWARD,
                     "uow_id": uow_id,
                     "steward_cycles": uow.steward_cycles,
