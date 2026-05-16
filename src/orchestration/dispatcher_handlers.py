@@ -500,6 +500,7 @@ def handle_wos_execute(uow_id: str, instructions: str, output_ref: str) -> str:
     return (
         f"---\n"
         f"task_id: wos-{uow_id}\n"
+        f"uow_id: {uow_id}\n"
         f"chat_id: 0\n"
         f"source: system\n"
         f"---\n\n"
