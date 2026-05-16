@@ -359,7 +359,7 @@ def test_e2e_main_dry_run_completes_without_exception(tmp_path: Path) -> None:
         [_MOD, "--dry-run", "--vault", str(vault), "--db", str(db_path)],
     ):
         # The job-enabled gate reads from jobs.json; patch it to return True
-        with patch(f"{_MOD}._is_job_enabled", return_value=True):
+        with patch(f"{_MOD}.is_job_enabled", return_value=True):
             # Should not raise
             _sync_mod.main()
 

@@ -117,7 +117,7 @@ def test_dry_run_skips_file_write_and_commit(
     original_content = todos_path.read_text(encoding="utf-8")
 
     with (
-        patch(f"{_MOD}._is_job_enabled", return_value=True),
+        patch(f"{_MOD}.is_job_enabled", return_value=True),
         patch(f"{_MOD}.acquire_lock_or_skip", return_value=lock_fd),
         patch(f"{_MOD}.release_lock") as mock_release,
         patch(f"{_MOD}.git_pull", return_value=True),
@@ -158,7 +158,7 @@ def test_disabled_job_exits_early_without_file_io(
     monkeypatch.setenv("LOBSTER_WORKSPACE", str(tmp_path))
 
     with (
-        patch(f"{_MOD}._is_job_enabled", return_value=False) as mock_gate,
+        patch(f"{_MOD}.is_job_enabled", return_value=False) as mock_gate,
         patch(f"{_MOD}.acquire_lock_or_skip") as mock_lock,
         patch(f"{_MOD}.git_pull") as mock_pull,
         patch(f"{_MOD}.sync_obsidian_to_db") as mock_sync,
@@ -196,7 +196,7 @@ def test_lock_contention_skips_gracefully(
     monkeypatch.setenv("LOBSTER_WORKSPACE", str(tmp_path))
 
     with (
-        patch(f"{_MOD}._is_job_enabled", return_value=True),
+        patch(f"{_MOD}.is_job_enabled", return_value=True),
         # Simulate lock already held by another process
         patch(f"{_MOD}.acquire_lock_or_skip", return_value=None),
         patch(f"{_MOD}.release_lock") as mock_release,
@@ -242,7 +242,7 @@ def test_pull_failure_skips_commit(
     mock_conn = _make_conn()
 
     with (
-        patch(f"{_MOD}._is_job_enabled", return_value=True),
+        patch(f"{_MOD}.is_job_enabled", return_value=True),
         patch(f"{_MOD}.acquire_lock_or_skip", return_value=lock_fd),
         patch(f"{_MOD}.release_lock"),
         patch(f"{_MOD}.git_pull", return_value=False) as mock_pull,
@@ -285,7 +285,7 @@ def test_missing_vault_directory_exits_cleanly(
     mock_conn = _make_conn()
 
     with (
-        patch(f"{_MOD}._is_job_enabled", return_value=True),
+        patch(f"{_MOD}.is_job_enabled", return_value=True),
         patch(f"{_MOD}.acquire_lock_or_skip", return_value=lock_fd),
         patch(f"{_MOD}.release_lock"),
         patch(f"{_MOD}.git_pull") as mock_pull,
@@ -337,7 +337,7 @@ def test_happy_path_full_run_correct_order(
         return _side_effect
 
     with (
-        patch(f"{_MOD}._is_job_enabled", return_value=True),
+        patch(f"{_MOD}.is_job_enabled", return_value=True),
         patch(f"{_MOD}.acquire_lock_or_skip", return_value=lock_fd),
         patch(f"{_MOD}.release_lock"),
         patch(f"{_MOD}.git_pull", side_effect=_record("git_pull", return_value=True)),

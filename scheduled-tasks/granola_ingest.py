@@ -23,7 +23,6 @@ Logs are written to ~/lobster-workspace/granola-notes/ingest.log
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import sys
@@ -35,8 +34,11 @@ from typing import Iterator
 # Bootstrap: ensure we can import sibling modules regardless of cwd
 # ---------------------------------------------------------------------------
 _THIS_DIR = Path(__file__).parent.resolve()
+_REPO_ROOT = _THIS_DIR.parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 # ---------------------------------------------------------------------------
@@ -45,21 +47,7 @@ if str(_THIS_DIR) not in sys.path:
 
 JOB_NAME = "granola-ingest"
 
-
-def _is_job_enabled(job_name: str) -> bool:
-    """
-    Return True if the job is enabled in jobs.json, False if explicitly disabled.
-
-    Defaults to True when jobs.json is absent, the entry is missing, or the
-    file is unreadable or malformed.
-    """
-    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-    jobs_file = workspace / "scheduled-jobs" / "jobs.json"
-    try:
-        data = json.loads(jobs_file.read_text())
-        return bool(data.get("jobs", {}).get(job_name, {}).get("enabled", True))
-    except Exception:
-        return True
+from src.utils.jobs import is_job_enabled  # noqa: E402
 
 from granola_client import GranolaClient, GranolaAPIError  # noqa: E402
 from granola_state import IncrementalFetcher, StateManager  # noqa: E402
@@ -168,7 +156,7 @@ def _fetch_notes_for_account(
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    if not _is_job_enabled(JOB_NAME):
+    if not is_job_enabled(JOB_NAME):
         return 0
 
     log = _setup_logging()
