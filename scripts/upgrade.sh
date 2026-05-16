@@ -222,6 +222,16 @@ preflight_checks() {
         success "Python venv found"
     fi
 
+    # Crontab group membership (needed for reliable cron-manage.sh operation)
+    # The crontab binary is setgid, but direct group membership is more reliable
+    # and prevents mkstemp failures in /var/spool/cron/ when the setgid path fails.
+    if id -nG "$USER" 2>/dev/null | grep -qw crontab; then
+        success "User $USER is in the crontab group"
+    else
+        warn "User $USER is not in the crontab group — cron entry writes may fail."
+        warn "Migration 46 will add $USER to the crontab group if sudo is available."
+    fi
+
     # Record current version/commit
     cd "$LOBSTER_DIR"
     if [ "$INSTALL_MODE" = "git" ]; then
@@ -1937,20 +1947,27 @@ if [ -f "$CLAUDE_SETTINGS" ] && command -v jq >/dev/null 2>&1; then
     # The MCP server process runs under PR_SET_NO_NEW_PRIVS (NoNewPrivs=1), which
     # suppresses setgid bits on child processes. The `crontab` binary is setgid-crontab,
     # so `crontab -` fails with "mkstemp: Permission denied" when called from the MCP
-    # server. Fix: add the lobster user to the crontab group so sync-crontab.sh can
+    # server. Fix: add the lobster user to the crontab group so cron-manage.sh can
     # write directly to /var/spool/cron/crontabs/$USER (group-writable directory) without
     # needing the setgid bit. Requires sudo; warns and skips if sudo is unavailable.
-    local CRONTAB_DIR="/var/spool/cron/crontabs"
-    if [ -d "$CRONTAB_DIR" ] && ! id -nG "$USER" | grep -qw "crontab"; then
+    #
+    # Note: we no longer gate this on the crontabs directory existing first. Group
+    # membership is a prerequisite for crontab writes, not a consequence of the directory
+    # state. The original [ -d "$CRONTAB_DIR" ] guard caused a bootstrap failure: if the
+    # crontabs directory did not exist when Migration 46 ran (e.g. fresh install), this
+    # step was skipped. The crontabs directory was then created by the first successful
+    # crontab write — but that write itself could fail without group membership. Now we
+    # ensure group membership unconditionally so any subsequent crontab call succeeds.
+    if ! id -nG "$USER" 2>/dev/null | grep -qw "crontab"; then
         if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
             sudo usermod -aG crontab "$USER" 2>/dev/null && {
-                substep "Added $USER to the crontab group (fixes NoNewPrivs crontab permission error)"
+                substep "Added $USER to the crontab group (fixes crontab permission errors)"
                 migrated=$((migrated + 1))
                 warn "Group membership change takes effect at next login. Run 'newgrp crontab' or restart the Lobster service to apply immediately."
             } || warn "Failed to add $USER to crontab group — run: sudo usermod -aG crontab $USER"
         else
             warn "Cannot add $USER to crontab group (sudo unavailable). Run manually: sudo usermod -aG crontab $USER"
-            warn "Until this is done, create_scheduled_job/update_scheduled_job/delete_scheduled_job will fail to sync crontab."
+            warn "Until this is done, cron-manage.sh calls may fail to write crontab entries."
         fi
     fi
 
