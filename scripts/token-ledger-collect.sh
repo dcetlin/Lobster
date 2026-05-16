@@ -253,7 +253,7 @@ except Exception:
 sys.exit(1)
 PYEOF3
 
-UOW_ID_VAL=$(python3 "${TMPPY3}" "${INPUT}" 2>/dev/null || true)
+UOW_ID_VAL=$(uv run python3 "${TMPPY3}" "${INPUT}" 2>/dev/null || true)
 rm -f "${TMPPY3}"
 
 if [[ -n "${PROMPT_TASK_ID}" ]]; then
