@@ -76,6 +76,8 @@ _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from src.utils.jobs import is_job_enabled  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -197,24 +199,6 @@ def _write_cookie_expiry_alert(http_code: int, dry_run: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
-# jobs.json enabled gate
-# ---------------------------------------------------------------------------
-
-
-def _is_job_enabled(job_name: str) -> bool:
-    """
-    Return True if the job is enabled in jobs.json, False if explicitly disabled.
-
-    Defaults to True when jobs.json is absent, the entry is missing, or the
-    file is unreadable — mirrors the gate logic in other Type B jobs.
-    """
-    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-    jobs_file = workspace / "scheduled-jobs" / "jobs.json"
-    try:
-        data = json.loads(jobs_file.read_text())
-        return bool(data.get("jobs", {}).get(job_name, {}).get("enabled", True))
-    except Exception:
-        return True
 
 
 # ---------------------------------------------------------------------------
@@ -470,7 +454,7 @@ def main(dry_run: bool = False) -> int:
     Returns 0 on success, 1 on hard failure (unexpected errors).
     Auth failures and missing cookie return 0 (graceful skip — cron retries).
     """
-    if not _is_job_enabled("cc-usage-poller"):
+    if not is_job_enabled("cc-usage-poller"):
         log.info("cc-usage-poller is disabled in jobs.json — skipping")
         return 0
 

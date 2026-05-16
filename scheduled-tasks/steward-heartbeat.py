@@ -58,6 +58,7 @@ if str(_REPO_ROOT) not in sys.path:
 from src.orchestration.paths import REGISTRY_DB
 from src.orchestration.steward import is_bootup_candidate_gate_active, run_steward_cycle
 from src.orchestration.github_sync import run_post_completion_sync
+from src.utils.jobs import is_job_enabled
 
 # ---------------------------------------------------------------------------
 # Startup sweep — imported from startup_sweep.py (Phase 1 concern)
@@ -81,30 +82,6 @@ log = logging.getLogger("steward-heartbeat")
 
 
 # ---------------------------------------------------------------------------
-# jobs.json enabled gate — Type C dispatch path
-# ---------------------------------------------------------------------------
-
-def _is_job_enabled(job_name: str) -> bool:
-    """
-    Return True if the job is enabled in jobs.json, False if explicitly disabled.
-
-    Defaults to True when:
-    - jobs.json is absent
-    - the job entry is missing
-    - the file is unreadable or malformed
-
-    This mirrors the enabled gate pattern used by all Type C (cron-direct) scripts
-    so runtime enable/disable (e.g. "wos stop") is respected without touching cron.
-    """
-    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-    jobs_file = workspace / "scheduled-jobs" / "jobs.json"
-    try:
-        data = json.loads(jobs_file.read_text())
-        return bool(data.get("jobs", {}).get(job_name, {}).get("enabled", True))
-    except Exception:
-        return True
-
-
 # ---------------------------------------------------------------------------
 # Named constants
 # ---------------------------------------------------------------------------
@@ -940,7 +917,7 @@ def main() -> int:
 
     # jobs.json enabled gate — respect runtime enable/disable toggled via
     # the dispatcher commands or direct jobs.json edits.
-    if not _is_job_enabled("steward-heartbeat"):
+    if not is_job_enabled("steward-heartbeat"):
         log.info("Steward heartbeat: skipped (disabled in jobs.json)")
         return 0
 

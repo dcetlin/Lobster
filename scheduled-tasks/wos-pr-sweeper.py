@@ -52,6 +52,7 @@ if str(_SRC_ROOT) not in sys.path:
 
 from src.orchestration.registry import WOSRegistry, UoWStatus
 from src.utils.inbox_write import _inbox_dir, _task_outputs_dir
+from src.utils.jobs import is_job_enabled
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -75,41 +76,6 @@ REPOS_TO_SCAN = [
     "dcetlin/Lobster",
     "SiderealPress/lobster",
 ]
-
-# ---------------------------------------------------------------------------
-# jobs.json enabled gate — Type C dispatch path
-# ---------------------------------------------------------------------------
-
-def _is_job_enabled(job_name: str) -> bool:
-    """
-    Return True if the job is enabled in jobs.json, False if explicitly disabled.
-
-    Defaults to True when:
-    - The job entry does not exist
-    - The job entry exists but has no 'enabled' field
-
-    This allows jobs to run by default after being added to cron, before
-    jobs.json is updated.
-    """
-    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-    jobs_file = workspace / "scheduled-jobs" / "jobs.json"
-
-    if not jobs_file.exists():
-        log.warning("jobs.json not found at %s — defaulting to enabled", jobs_file)
-        return True
-
-    try:
-        with jobs_file.open() as f:
-            data = json.load(f)
-            jobs = data.get("jobs", {})
-            job = jobs.get(job_name, {})
-            enabled = job.get("enabled", True)
-            log.info("Job %r enabled gate: %s", job_name, enabled)
-            return enabled
-    except Exception as exc:
-        log.error("Failed to read jobs.json — %s: %s", type(exc).__name__, exc)
-        return True  # Fail open
-
 
 # ---------------------------------------------------------------------------
 # Notification state — per-PR cooldown to prevent inbox flooding
@@ -466,7 +432,7 @@ def main():
     args = parser.parse_args()
 
     # Check enabled gate
-    if not _is_job_enabled("wos-pr-sweeper"):
+    if not is_job_enabled("wos-pr-sweeper"):
         log.info("Job disabled in jobs.json — exiting")
         return 0
 

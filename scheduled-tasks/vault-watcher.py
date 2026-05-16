@@ -58,6 +58,7 @@ if str(_TASKS_DIR) not in sys.path:
     sys.path.insert(0, str(_TASKS_DIR))
 
 from obsidian_sync_core import acquire_lock_or_skip, release_lock  # noqa: E402
+from src.utils.jobs import is_job_enabled  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -102,25 +103,6 @@ MAX_DEBOUNCE_SECONDS_CAP = 3600
 # self-trigger loop.
 LOBSTER_SYNC_SENTINEL = "[lobster-sync]"
 
-# ---------------------------------------------------------------------------
-# Jobs.json enabled gate (Type B compliance)
-# ---------------------------------------------------------------------------
-
-
-def _get_workspace() -> Path:
-    return Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-
-
-def _is_job_enabled(job_name: str) -> bool:
-    """Return True if the job is enabled in jobs.json."""
-    try:
-        jobs_file = _get_workspace() / "scheduled-jobs" / "jobs.json"
-        with jobs_file.open() as fh:
-            data = json.load(fh)
-        entry = data.get("jobs", {}).get(job_name, {})
-        return bool(entry.get("enabled", True))
-    except Exception:
-        return True  # Safe default: enabled when unreadable
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +359,7 @@ def _invoke_processor(config: dict, lock_path: Path = LOCK_PATH) -> None:
 
 def main() -> None:
     # Gate 1: jobs.json enabled check (Type B compliance — before any I/O)
-    if not _is_job_enabled(JOB_NAME) and not _is_job_enabled(JOB_NAME_HALF):
+    if not is_job_enabled(JOB_NAME) and not is_job_enabled(JOB_NAME_HALF):
         log.info("Job '%s' is disabled in jobs.json — exiting", JOB_NAME)
         return
 

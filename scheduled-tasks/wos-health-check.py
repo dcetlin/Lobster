@@ -40,6 +40,8 @@ _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from src.utils.jobs import is_job_enabled  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -95,10 +97,6 @@ def _log_file() -> Path:
     return _workspace() / "scheduled-jobs" / "logs" / "wos-health-check.log"
 
 
-def _jobs_file() -> Path:
-    return _workspace() / "scheduled-jobs" / "jobs.json"
-
-
 def _inbox_dir() -> Path:
     messages_base = Path(os.environ.get("LOBSTER_MESSAGES", Path.home() / "messages"))
     return messages_base / "inbox"
@@ -106,26 +104,6 @@ def _inbox_dir() -> Path:
 
 def _executor_log_file() -> Path:
     return _workspace() / "scheduled-jobs" / "logs" / "executor-heartbeat.log"
-
-
-# ---------------------------------------------------------------------------
-# jobs.json enabled gate — Type C dispatch pattern
-# ---------------------------------------------------------------------------
-
-def _is_job_enabled() -> bool:
-    """
-    Return True if this job is enabled in jobs.json, False if explicitly disabled.
-
-    Defaults to True when:
-    - jobs.json is absent
-    - the job entry is missing
-    - the file is unreadable or malformed
-    """
-    try:
-        data = json.loads(_jobs_file().read_text())
-        return bool(data.get("jobs", {}).get(JOB_NAME, {}).get("enabled", True))
-    except Exception:
-        return True
 
 
 # ---------------------------------------------------------------------------
@@ -492,7 +470,7 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Run checks but do not send inbox alerts")
     args = parser.parse_args()
 
-    if not _is_job_enabled():
+    if not is_job_enabled(JOB_NAME):
         log.info("Job '%s' is disabled in jobs.json — skipping", JOB_NAME)
         return 0
 

@@ -55,6 +55,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from src.utils.inbox_write import _inbox_dir, _task_outputs_dir, write_inbox_message  # noqa: E402
+from src.utils.jobs import is_job_enabled  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -137,26 +138,9 @@ def _assessments_dir() -> Path:
     return d
 
 
-def _jobs_file() -> Path:
-    return _workspace() / "scheduled-jobs" / "jobs.json"
-
-
 def _task_output_record_path(timestamp: str) -> Path:
     date_prefix = timestamp[:19].replace(":", "").replace("-", "").replace("T", "-")
     return _task_outputs_dir() / f"{date_prefix}-{JOB_NAME}.json"
-
-
-# ---------------------------------------------------------------------------
-# jobs.json enabled gate — Type C dispatch pattern
-# ---------------------------------------------------------------------------
-
-def _is_job_enabled() -> bool:
-    """Return True if this job is enabled in jobs.json. Defaults True when absent."""
-    try:
-        data = json.loads(_jobs_file().read_text())
-        return bool(data.get("jobs", {}).get(JOB_NAME, {}).get("enabled", True))
-    except Exception:
-        return True
 
 
 # ---------------------------------------------------------------------------
@@ -1208,7 +1192,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if not _is_job_enabled():
+    if not is_job_enabled(JOB_NAME):
         log.info("Job '%s' is disabled in jobs.json — skipping", JOB_NAME)
         return 0
 

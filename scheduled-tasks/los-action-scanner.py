@@ -51,6 +51,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from src.utils.inbox_write import _task_outputs_dir  # noqa: E402
+from src.utils.jobs import is_job_enabled  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -71,24 +72,6 @@ JOB_NAME = "los-action-scanner"
 DEFAULT_LOOKBACK_HOURS = 1
 ADMIN_CHAT_ID = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
 MESSAGES_DIR = Path(os.environ.get("LOBSTER_MESSAGES", Path.home() / "messages"))
-
-
-# ---------------------------------------------------------------------------
-# Jobs.json enabled gate — Type A dispatch compliance
-# ---------------------------------------------------------------------------
-
-
-def _is_job_enabled(job_name: str) -> bool:
-    """Return True if the job is enabled in jobs.json."""
-    try:
-        jobs_file = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace")) / "scheduled-jobs" / "jobs.json"
-        with jobs_file.open() as fh:
-            data = json.load(fh)
-        jobs = data.get("jobs", {})
-        entry = jobs.get(job_name, {})
-        return bool(entry.get("enabled", True))
-    except Exception:
-        return True  # Default to enabled when unreadable
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +139,7 @@ def main() -> None:
     parser.add_argument("--hours", type=int, default=DEFAULT_LOOKBACK_HOURS, help="Lookback window in hours")
     args = parser.parse_args()
 
-    if not _is_job_enabled(JOB_NAME):
+    if not is_job_enabled(JOB_NAME):
         log.info("Job %s is disabled in jobs.json — exiting.", JOB_NAME)
         return
 

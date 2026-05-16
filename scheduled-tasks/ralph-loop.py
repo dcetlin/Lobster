@@ -42,6 +42,8 @@ _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from src.utils.jobs import is_job_enabled  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -59,7 +61,6 @@ log = logging.getLogger("ralph-loop")
 
 JOB_NAME = "ralph-loop"
 WORKSPACE = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-JOBS_FILE = WORKSPACE / "scheduled-jobs" / "jobs.json"
 TASK_FILE = WORKSPACE / "scheduled-jobs" / "tasks" / "ralph-loop.md"
 INBOX_DIR = Path(os.environ.get("LOBSTER_MESSAGES", Path.home() / "messages")) / "inbox"
 RALPH_STATE_FILE = WORKSPACE / "data" / "ralph-state.json"
@@ -68,19 +69,6 @@ RALPH_STATE_FILE = WORKSPACE / "data" / "ralph-state.json"
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
-
-def _is_job_enabled() -> bool:
-    """Return True if ralph-loop is enabled in jobs.json.
-
-    Defaults to True when jobs.json is absent, the entry is missing, or the
-    file is malformed — mirrors the gate logic in dispatch-job.sh.
-    """
-    try:
-        data = json.loads(JOBS_FILE.read_text())
-        return bool(data.get("jobs", {}).get(JOB_NAME, {}).get("enabled", True))
-    except Exception:
-        return True
-
 
 def _load_ralph_state() -> dict:
     """Return current pipeline health state dict, initializing defaults if absent."""
@@ -153,7 +141,7 @@ def main() -> int:
 
     log.info("Pipeline health loop trigger starting%s", " (DRY RUN)" if dry_run else "")
 
-    if not _is_job_enabled():
+    if not is_job_enabled(JOB_NAME):
         log.info("Pipeline health loop: skipped (disabled in jobs.json)")
         return 0
 
