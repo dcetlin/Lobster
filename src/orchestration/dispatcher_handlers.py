@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 from .registry import ApproveConfirmed, ApproveExpired, ApproveNotFound, ApproveSkipped
 from .paths import LOBSTER_WORKSPACE as _LOBSTER_WORKSPACE, WOS_CONFIG as _WOS_CONFIG_PATH_FROM_PATHS, WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG, JOBS_JSON as _JOBS_JSON_PATH
 from .steward import ReturnReasonClassification, MAX_RETRIES as _STEWARD_MAX_RETRIES, _HARD_CAP_CYCLES
-from utils.timezone import format_iso_for_user as _format_iso_for_user, get_owner_tz_name as _get_owner_tz_name
+from src.utils.timezone import format_iso_for_user as _format_iso_for_user, get_owner_tz_name as _get_owner_tz_name
 
 
 # ---------------------------------------------------------------------------
