@@ -706,7 +706,7 @@ Injected by the MCP server after every 20 real user messages. Spawn session-note
    Build in_flight list: [{task_id, type, description, elapsed_minutes}, ...]
 3. Check ~/messages/processing/ — any message file present has been claimed (mark_processing called)
    but not yet answered. Build pending_responses list from those files (use sender and text fields).
-4. Spawn session-note-appender (run_in_background=True, subagent_type: "lobster-generalist"):
+4. Spawn session-note-appender (run_in_background=True, subagent_type: "session-note-appender"):
    - Pass: task_id: "session-note-appender", chat_id: 0, source: "system",
            session_file: <current_session_file>, activity: <recent activity>,
            in_flight: <in_flight list from step 2>,
