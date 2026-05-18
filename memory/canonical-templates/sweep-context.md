@@ -69,13 +69,13 @@ Naming a pattern without stating its effect on your analysis is not a citation �
 
 Before reading any domain-specific content, check the WOS throughput steady-state pattern. Given that a throughput stall is a high-signal system-health indicator, it must surface at the top of every sweep, not buried in the pattern-match section.
 
-1. Count open WOS UoWs: `gh issue list --repo dcetlin/Lobster --state open --label "wos:uow" --json number,title,updatedAt --limit 100`
+1. Count open WOS UoWs: `gh issue list --repo dcetlin/Lobster --state open --label "wos:executing" --json number,title,updatedAt --limit 100`
 
    **Label self-validation (required before trusting empty results):** Before treating a zero result as meaningful, verify the label actually exists in the repo:
    ```bash
-   gh label list --repo dcetlin/Lobster --json name --jq '.[].name' | grep -q '^wos:uow$' && echo "label found" || echo "label not found"
+   gh label list --repo dcetlin/Lobster --json name --jq '.[].name' | grep -q '^wos:executing$' && echo "label found" || echo "label not found"
    ```
-   If the label is not found, record "label not found — result unreliable" in your sweep output for this check and do not treat the count as meaningful. Do not fire a stall prescription based on a label-not-found result. Apply the same validation logic to any other label-based queries in this step (e.g., `wos:executing`) before treating their results as zero.
+   If the label is not found, record "label not found — result unreliable" in your sweep output for this check and do not treat the count as meaningful. Do not fire a stall prescription based on a label-not-found result. Apply the same validation logic to any other label-based queries in this step before treating their results as zero.
 
 2. For each open UoW, check the `updatedAt` field. If no UoW has been updated in the past 3 days, flag as a potential stall.
 3. Check the executor heartbeat log for recent dispatch events: `tail -50 ~/lobster-workspace/scheduled-jobs/logs/executor-heartbeat.log` (or the most recent executor-heartbeat log file).
