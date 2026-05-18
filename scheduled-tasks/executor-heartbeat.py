@@ -71,6 +71,13 @@ log = logging.getLogger("executor-heartbeat")
 
 
 # ---------------------------------------------------------------------------
+# Sentinel file written to /tmp/ after the first stale-registry warning fires
+# within a given boot session. Because /tmp/ is cleared on reboot, the warning
+# resurfaces once per boot — sufficient signal without flooding the log on every
+# 3-minute cron invocation.
+_REGISTRY_WARN_SENTINEL = "/tmp/lobster-wos-registry-warned"
+
+
 def _warn_if_legacy_registry_exists() -> None:
     """Log a warning if the deprecated legacy registry path exists and is non-empty.
 
@@ -78,6 +85,10 @@ def _warn_if_legacy_registry_exists() -> None:
     The legacy path (data/wos-registry.db) is removed by upgrade.sh Migration 86
     when its uow_registry table is empty. This function fires only if the file
     survived migration (non-empty or migration not yet run).
+
+    The warning is suppressed after the first detection per boot session via a
+    /tmp/ sentinel file, preventing the log from being flooded on every cron
+    invocation (~480 lines/day if left unchecked).
     """
     workspace = Path(os.environ.get(
         "LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"
@@ -104,12 +115,24 @@ def _warn_if_legacy_registry_exists() -> None:
             legacy_path, size,
         )
     else:
-        log.warning(
-            "Legacy registry DB at %s exists and is non-empty (%d bytes, %d UoWs). "
-            "Canonical path is %s. Run upgrade.sh (Migration 86) to safely relocate.",
-            legacy_path, size, uow_count,
-            workspace / "orchestration" / "registry.db",
-        )
+        if not os.path.exists(_REGISTRY_WARN_SENTINEL):
+            log.warning(
+                "Legacy registry DB at %s exists and is non-empty (%d bytes, %d UoWs). "
+                "Canonical path is %s. Run upgrade.sh (Migration 86) to safely relocate.",
+                legacy_path, size, uow_count,
+                workspace / "orchestration" / "registry.db",
+            )
+            # Touch sentinel so subsequent invocations within this boot session are silent.
+            try:
+                open(_REGISTRY_WARN_SENTINEL, "w").close()
+            except OSError:
+                pass  # /tmp/ write failure is non-fatal; warning will re-fire next cycle
+        else:
+            log.debug(
+                "Legacy registry DB still present (suppressed after first warning this "
+                "boot session): %s",
+                legacy_path,
+            )
 
 
 # ---------------------------------------------------------------------------
