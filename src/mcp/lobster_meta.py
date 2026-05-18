@@ -6,8 +6,8 @@ time. Fields are hints only — the dispatcher must never trust them blindly (a
 user message could trigger false matches). All classification is synchronous,
 pure Python, and <5ms — no LLM calls on this path.
 
-This module is intentionally dependency-free (like message_types.py) so it can
-be imported and tested without pulling in the full inbox_server stack.
+This module depends only on message_types.py (also dependency-free) and can be
+imported and tested without pulling in the full inbox_server stack.
 
 Fields populated:
   intent_class: "operational" | "emotional" | "code" | "question" | "reaction"
@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
+
+from src.mcp.message_types import INBOX_SYSTEM_TYPES as _SYSTEM_TYPES
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +106,7 @@ _URGENCY_LOW_PATTERN: re.Pattern[str] = re.compile(
 # Sources that produce user-facing messages
 # ---------------------------------------------------------------------------
 
+# bot-talk and gmail are system-originated; not user-facing even though they carry user content
 _USER_FACING_SOURCES: frozenset[str] = frozenset({
     "telegram",
     "slack",
@@ -111,32 +114,6 @@ _USER_FACING_SOURCES: frozenset[str] = frozenset({
     "signal",
     "whatsapp",
     "bisque",
-})
-
-# System message types that are never user-facing regardless of source
-_SYSTEM_TYPES: frozenset[str] = frozenset({
-    "self_check",
-    "subagent_result",
-    "subagent_error",
-    "subagent_ack",
-    "subagent_notification",
-    "subagent_observation",
-    "subagent_stale_check",
-    "subagent_recovered",
-    "agent_failed",
-    "compact_group",
-    "compact_reminder",
-    "cron_reminder",
-    "scheduled_reminder",
-    "update_notification",
-    "consolidation",
-    "observation",
-    "health_check",
-    "system",
-    "task-output",
-    "debug_observation",
-    "session_note_reminder",
-    "wos_execute",
 })
 
 
