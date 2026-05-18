@@ -2268,6 +2268,12 @@ Decision:
   /approve <uow-id>   — approve a proposed UoW
   /decide <uow-id> <action> — resolve a blocked UoW
 
+Config (user bootup files):
+  /config list                  — list all user config files with line counts
+  /config read <filename>       — show file contents (chunked if long)
+  /config search <query>        — search for text across all user config files
+  /config append <filename> <text> — append text to a user config file
+
 Skills:
   /shop               — list available skills
   /shop install <name> — install and activate a skill
@@ -2591,3 +2597,160 @@ def handle_usage_full() -> str:
     prompt (run usage-report.sh --format full, or fall back to state.json).
     """
     return "Spawning usage report agent..."
+
+
+# ---------------------------------------------------------------------------
+# /config — user bootup file access from Telegram (issue #1018)
+# ---------------------------------------------------------------------------
+
+# Allowlist of user config files accessible via /config commands.
+# System files in .claude/ are not included — those are protected.
+_USER_CONFIG_DIR: Path = Path.home() / "lobster-user-config" / "agents"
+_USER_CONFIG_FILENAMES: tuple[str, ...] = (
+    "user.base.bootup.md",
+    "user.base.context.md",
+    "user.dispatcher.bootup.md",
+    "user.subagent.bootup.md",
+    "system-audit.context.md",
+    "user.development.md",
+    "user.epistemic.md",
+)
+
+# Telegram message size limit (chars). Content beyond this is chunked.
+_TELEGRAM_CHAR_LIMIT: int = 4000
+
+
+def _config_file_path(filename: str) -> Path | None:
+    """Return the resolved path for a user config file, or None if not allowed."""
+    # Strip leading path components — accept bare filename or agents/filename
+    name = Path(filename).name
+    if name not in _USER_CONFIG_FILENAMES:
+        return None
+    p = _USER_CONFIG_DIR / name
+    return p if p.exists() else None
+
+
+def handle_config_list() -> str:
+    """Return a formatted list of user config files with line counts."""
+    lines: list[str] = ["User config files in ~/lobster-user-config/agents/:", ""]
+    found = False
+    for name in _USER_CONFIG_FILENAMES:
+        p = _USER_CONFIG_DIR / name
+        if p.exists():
+            try:
+                line_count = len(p.read_text(encoding="utf-8").splitlines())
+            except OSError:
+                line_count = 0
+            lines.append(f"  {name} ({line_count} lines)")
+            found = True
+    if not found:
+        lines.append("  (no user config files found)")
+    return "\n".join(lines)
+
+
+def handle_config_read(filename: str) -> tuple[str, bool]:
+    """Read a user config file and return (text, needs_chunking).
+
+    Returns (error_message, False) if the file is not found or not allowed.
+    Returns (content, True) if content exceeds _TELEGRAM_CHAR_LIMIT.
+    Returns (content, False) otherwise.
+    """
+    p = _config_file_path(filename)
+    if p is None:
+        name = Path(filename).name
+        if name not in _USER_CONFIG_FILENAMES:
+            return (
+                f"Not allowed: '{name}' is not in the user config allowlist.\n"
+                "Use /config list to see available files.",
+                False,
+            )
+        return (f"File not found: '{name}' (may not exist yet).", False)
+
+    try:
+        content = p.read_text(encoding="utf-8")
+    except OSError as exc:
+        return (f"Could not read '{p.name}': {exc}", False)
+
+    needs_chunking = len(content) > _TELEGRAM_CHAR_LIMIT
+    return (content, needs_chunking)
+
+
+def handle_config_search(query: str) -> str:
+    """Search for a term across all user config files.
+
+    Returns matching lines with filename and line number, formatted for Telegram.
+    """
+    if not query or not query.strip():
+        return "Usage: /config search <query>"
+
+    query = query.strip()
+    results: list[str] = []
+    matched_files = 0
+
+    for name in _USER_CONFIG_FILENAMES:
+        p = _USER_CONFIG_DIR / name
+        if not p.exists():
+            continue
+        try:
+            file_results: list[str] = []
+            for lineno, line in enumerate(
+                p.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                if query.lower() in line.lower():
+                    # Truncate long lines for Telegram readability
+                    display = line.rstrip()
+                    if len(display) > 120:
+                        display = display[:117] + "..."
+                    file_results.append(f"  L{lineno}: {display}")
+            if file_results:
+                results.append(f"{name}:")
+                results.extend(file_results)
+                matched_files += 1
+        except OSError:
+            continue
+
+    if not results:
+        return f"No matches for '{query}' in user config files."
+
+    header = f"Search results for '{query}' ({matched_files} file(s)):"
+    body = "\n".join(results)
+    full = f"{header}\n\n{body}"
+
+    # Truncate if over limit, with a note
+    if len(full) > _TELEGRAM_CHAR_LIMIT:
+        truncated = full[: _TELEGRAM_CHAR_LIMIT - 60]
+        full = truncated + f"\n\n... (truncated, {len(full)} chars total)"
+
+    return full
+
+
+def handle_config_append(filename: str, text: str) -> str:
+    """Append text to a user config file.
+
+    Returns a confirmation string or an error message.
+    """
+    if not text or not text.strip():
+        return "Usage: /config append <filename> <text>"
+
+    p = _config_file_path(filename)
+    if p is None:
+        name = Path(filename).name
+        if name not in _USER_CONFIG_FILENAMES:
+            return (
+                f"Not allowed: '{name}' is not in the user config allowlist.\n"
+                "Use /config list to see available files."
+            )
+        # File doesn't exist yet — create it
+        p = _USER_CONFIG_DIR / name
+
+    try:
+        _USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            # Ensure we start on a new line
+            f.write(f"\n{text.strip()}\n")
+        # Return a confirmation with the last 200 chars of the file for verification
+        content = p.read_text(encoding="utf-8")
+        tail = content[-200:].strip()
+        return f"Appended to {p.name}.\n\nTail:\n{tail}"
+    except OSError as exc:
+        return f"Could not write to '{p.name}': {exc}"
