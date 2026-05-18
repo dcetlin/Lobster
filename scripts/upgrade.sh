@@ -4136,6 +4136,42 @@ PYEOF
         substep "Migration 117: $_wos_uow_task_file already present or source missing — skipping"
     fi
 
+    # Migration 118: Update wos-metabolic-digest cron schedule from 09:00 UTC to
+    # 10:00 UTC (6 AM ET), aligning delivery with Dan's morning window
+    # (6-10 AM Eastern per user.base.bootup.md). The digest now uses
+    # outcome_category from the registry (real-time classification at write_result
+    # time) instead of heuristic re-classification, per the WOS completion report
+    # spec (docs/wos/wos-completion-report-spec.md).
+    local WOS_DIGEST_OLD="0 9 * * * cd $LOBSTER_DIR && uv run scheduled-tasks/wos-metabolic-digest.py"
+    local WOS_DIGEST_NEW="0 10 * * * cd $LOBSTER_DIR && uv run scheduled-tasks/wos-metabolic-digest.py >> $LOBSTER_WORKSPACE/scheduled-jobs/logs/wos-metabolic-digest.log 2>&1 # LOBSTER-WOS-METABOLIC-DIGEST"
+    local WOS_DIGEST_MARKER_118="# LOBSTER-WOS-METABOLIC-DIGEST"
+    if crontab -l 2>/dev/null | grep -F "0 9 * * *" | grep -q "wos-metabolic-digest"; then
+        # Remove old 09:00 entry and add new 10:00 entry
+        "$LOBSTER_DIR/scripts/cron-manage.sh" remove "$WOS_DIGEST_MARKER_118" 2>/dev/null || true
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$WOS_DIGEST_MARKER_118" "$WOS_DIGEST_NEW" \
+            && substep "Migration 118: updated wos-metabolic-digest cron from 09:00 to 10:00 UTC" \
+            || warn "Migration 118: could not update wos-metabolic-digest cron — check cron-manage.sh"
+        migrated=$((migrated + 1))
+    elif ! crontab -l 2>/dev/null | grep -qF "$WOS_DIGEST_MARKER_118"; then
+        # No entry at all — add the 10:00 entry fresh
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$WOS_DIGEST_MARKER_118" "$WOS_DIGEST_NEW" \
+            && substep "Migration 118: added wos-metabolic-digest cron entry at 10:00 UTC" \
+            || warn "Migration 118: could not add wos-metabolic-digest cron — check cron-manage.sh"
+        migrated=$((migrated + 1))
+    else
+        substep "Migration 118: wos-metabolic-digest cron already present — checking schedule"
+        if crontab -l 2>/dev/null | grep -F "$WOS_DIGEST_MARKER_118" | grep -q "^0 9 "; then
+            # Present but still at old 09:00 — update it
+            "$LOBSTER_DIR/scripts/cron-manage.sh" remove "$WOS_DIGEST_MARKER_118" 2>/dev/null || true
+            "$LOBSTER_DIR/scripts/cron-manage.sh" add "$WOS_DIGEST_MARKER_118" "$WOS_DIGEST_NEW" \
+                && substep "Migration 118: rescheduled wos-metabolic-digest from 09:00 to 10:00 UTC" \
+                || warn "Migration 118: reschedule failed — check cron-manage.sh"
+            migrated=$((migrated + 1))
+        else
+            substep "Migration 118: wos-metabolic-digest already at correct schedule — skipping"
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
