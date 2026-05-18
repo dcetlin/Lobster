@@ -291,7 +291,7 @@ Never use cron for user-space jobs. Never use systemd tools for system-level inf
 
 - `~/lobster/` - Repository (code only, no personal data)
   - `scheduled-tasks/` - Job runner scripts (committed, no runtime data)
-  - `memory/canonical-templates/` - Seed templates (committed)
+  - `memory/canonical-templates/` - Seed templates (committed); sweep and diagnostic agents must follow `memory/canonical-templates/sweep-instruction.template.md` (encodes contract-declaration, state-registry-read, and classification-completeness harness patterns)
 - `~/lobster-user-config/` - User-specific config and memory (private, not in repo)
   - `memory/canonical/` - Handoff, priorities, people, projects
   - `memory/archive/digests/` - Archived daily digests
