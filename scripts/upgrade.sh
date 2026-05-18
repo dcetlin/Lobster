@@ -4105,6 +4105,23 @@ PYEOF
         substep "Migration 115: $_wos_task_file already present or source missing — skipping"
     fi
 
+    # Migration 116: Replace ~/lobster-workspace/oracle/ with a symlink to ~/lobster/oracle/
+    # so agents writing to the workspace path transparently land in the repo location.
+    local _ws_oracle="$WORKSPACE_DIR/oracle"
+    local _repo_oracle="$LOBSTER_DIR/oracle"
+    if [ -L "$_ws_oracle" ]; then
+        substep "Migration 116: $_ws_oracle is already a symlink — skipping"
+    elif [ -d "$_ws_oracle" ]; then
+        rm -rf "$_ws_oracle"
+        ln -s "$_repo_oracle" "$_ws_oracle"
+        substep "Replaced $_ws_oracle directory with symlink to $_repo_oracle (Migration 116)"
+        migrated=$((migrated + 1))
+    else
+        ln -s "$_repo_oracle" "$_ws_oracle"
+        substep "Created symlink $_ws_oracle -> $_repo_oracle (Migration 116)"
+        migrated=$((migrated + 1))
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
