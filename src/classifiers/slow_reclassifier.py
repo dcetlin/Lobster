@@ -423,6 +423,165 @@ def write_pattern_event(conn: sqlite3.Connection, obs: PatternObservation) -> in
     return event_id
 
 
+# ---------------------------------------------------------------------------
+# Action routing — threshold-gated actions on pattern observations
+# ---------------------------------------------------------------------------
+
+_PATTERN_THRESHOLDS = {
+    "design_session":    DESIGN_SESSION_THRESHOLD,
+    "brainstorm_mode":   BRAINSTORM_THRESHOLD,
+    "complex_request":   COMPLEX_REQUEST_THRESHOLD,
+    "meta_thread":       META_THREAD_THRESHOLD,
+    "philosophy_thread": PHILOSOPHY_THREAD_THRESHOLD,
+}
+
+ACTION_CONFIDENCE_MINIMUM = "HIGH"
+
+_TASK_PATTERNS = {"design_session", "complex_request"}
+_DIGEST_PATTERNS = {"brainstorm_mode", "meta_thread", "philosophy_thread"}
+
+
+def ensure_pattern_actions_table(conn: sqlite3.Connection) -> None:
+    """Create the pattern_actions table if it does not exist."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pattern_actions (
+            pattern_event_id  INTEGER PRIMARY KEY,
+            pattern_type      TEXT NOT NULL,
+            action_type       TEXT NOT NULL,
+            action_ref        TEXT,
+            acted_at          TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
+
+def compute_pattern_confidence(obs: PatternObservation) -> str:
+    """Return 'HIGH', 'MEDIUM', or 'LOW' based on event count vs threshold."""
+    threshold = _PATTERN_THRESHOLDS.get(obs.pattern_type, 3)
+    if len(obs.event_ids) >= threshold * 2:
+        return "HIGH"
+    return "MEDIUM"
+
+
+def already_acted(conn: sqlite3.Connection, pattern_event_id: int) -> bool:
+    """Check whether an action has already been recorded for this pattern event."""
+    row = conn.execute(
+        "SELECT 1 FROM pattern_actions WHERE pattern_event_id = ?",
+        (pattern_event_id,)
+    ).fetchone()
+    return row is not None
+
+
+def create_task_for_pattern(obs: PatternObservation, pattern_event_id: int) -> str:
+    """Create a task entry in LOBSTER_WORKSPACE/tasks.json for a detected pattern."""
+    import uuid as _uuid
+    task_id = str(_uuid.uuid4())
+    subject = (
+        f"{obs.pattern_type.replace('_', ' ').title()} detected: "
+        f"{len(obs.event_ids)} events from {obs.source}"
+    )
+    tasks_path = LOBSTER_WORKSPACE / "tasks.json"
+    tasks: list[dict] = []
+    if tasks_path.exists():
+        try:
+            tasks = json.loads(tasks_path.read_text())
+        except Exception:
+            tasks = []
+    tasks.append({
+        "id": task_id,
+        "subject": subject,
+        "description": (
+            f"Auto-created by slow-reclassifier.\n"
+            f"Pattern: {obs.pattern_type}\n"
+            f"Contributing events: {obs.event_ids}\n"
+            f"Detected at: {obs.detected_at.isoformat()}"
+        ),
+        "status": "open",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source": "slow-reclassifier",
+    })
+    tasks_path.write_text(json.dumps(tasks, indent=2))
+    log.info("Created task for pattern %s: %s", obs.pattern_type, subject)
+    return subject
+
+
+def flag_for_digest(conn: sqlite3.Connection, obs: PatternObservation) -> int:
+    """Insert a digest_flag event for nightly digest consumption."""
+    content = (
+        f"digest_flag | {obs.pattern_type} | source: {obs.source}\n"
+        f"contributing events: {obs.event_ids}\n"
+        f"signal_type: {obs.signal_type} | detected: {obs.detected_at.isoformat()}"
+    )
+    metadata = json.dumps({
+        "pattern_type": obs.pattern_type,
+        "contributing_event_ids": obs.event_ids,
+        "valence": obs.valence,
+        "flagged_for": "nightly_digest",
+    })
+    cursor = conn.execute("""
+        INSERT INTO events (timestamp, type, source, content, metadata)
+        VALUES (?, 'digest_flag', ?, ?, ?)
+    """, (datetime.now(timezone.utc).isoformat(), obs.source, content, metadata))
+    conn.commit()
+    log.info("Flagged pattern %s for nightly digest (event %d)", obs.pattern_type, cursor.lastrowid)
+    return cursor.lastrowid
+
+
+def record_action(
+    conn: sqlite3.Connection,
+    pattern_event_id: int,
+    obs: PatternObservation,
+    action_type: str,
+    action_ref: str,
+) -> None:
+    """Record that an action was taken for a pattern event (idempotent)."""
+    conn.execute("""
+        INSERT OR IGNORE INTO pattern_actions
+            (pattern_event_id, pattern_type, action_type, action_ref, acted_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        pattern_event_id,
+        obs.pattern_type,
+        action_type,
+        action_ref,
+        datetime.now(timezone.utc).isoformat(),
+    ))
+    conn.commit()
+
+
+def route_pattern_to_action(
+    conn: sqlite3.Connection,
+    obs: PatternObservation,
+    pattern_event_id: int,
+) -> None:
+    """
+    Route a pattern observation to an action if confidence meets the threshold.
+
+    Actions are idempotent per pattern_event_id — calling twice on the same event
+    produces at most one action.
+    """
+    if already_acted(conn, pattern_event_id):
+        log.debug("Pattern event %d already acted on — skipping.", pattern_event_id)
+        return
+
+    confidence = compute_pattern_confidence(obs)
+    if confidence != ACTION_CONFIDENCE_MINIMUM:
+        log.debug(
+            "Pattern %s confidence=%s below %s — no action.",
+            obs.pattern_type, confidence, ACTION_CONFIDENCE_MINIMUM,
+        )
+        return
+
+    if obs.pattern_type in _TASK_PATTERNS:
+        action_ref = create_task_for_pattern(obs, pattern_event_id)
+        record_action(conn, pattern_event_id, obs, "task", action_ref)
+    elif obs.pattern_type in _DIGEST_PATTERNS:
+        digest_event_id = flag_for_digest(conn, obs)
+        record_action(conn, pattern_event_id, obs, "digest_flag", str(digest_event_id))
+    else:
+        log.warning("Unknown pattern type %s — no action routed.", obs.pattern_type)
+
+
 def write_run_log(
     processed: int,
     revised: int,
@@ -879,7 +1038,8 @@ def run_pass(conn: sqlite3.Connection) -> tuple[int, int, int]:
             )
 
             # Write a pattern_observation event to the events table
-            write_pattern_event(conn, pattern)
+            pattern_event_id = write_pattern_event(conn, pattern)
+            route_pattern_to_action(conn, pattern, pattern_event_id)
 
             # Revise the classification tag for each contributing event
             for event_id in pattern.event_ids:
@@ -955,6 +1115,7 @@ def run_once(
     conn = open_db(db_path)
     try:
         ensure_classification_table(conn)
+        ensure_pattern_actions_table(conn)
         processed, revised, patterns = run_pass(conn)
         elapsed_ms = (time.monotonic() - t0) * 1000
         write_run_log(processed, revised, patterns, elapsed_ms)
