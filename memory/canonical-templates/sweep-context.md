@@ -69,18 +69,19 @@ Naming a pattern without stating its effect on your analysis is not a citation �
 
 Before reading any domain-specific content, check the WOS throughput steady-state pattern. Given that a throughput stall is a high-signal system-health indicator, it must surface at the top of every sweep, not buried in the pattern-match section.
 
-**Deliberate-pause check (run first):** Read `~/lobster-workspace/data/wos-config.json`. If `execution_enabled` is `false`, WOS has been deliberately paused. In this case:
-- Skip throughput stall classification — low throughput is expected and correct.
-- Record at the top of the Detection Pass: "WOS deliberately paused (execution_enabled=false in wos-config.json) — throughput checks skipped. This is not a stall."
-- Proceed to domain-specific detection without flagging starvation.
+1. Count open WOS UoWs: `gh issue list --repo dcetlin/Lobster --state open --label "wos:uow" --json number,title,updatedAt --limit 100`
 
-If `execution_enabled` is `true` (or wos-config.json is absent), proceed with the throughput checks below:
+   **Label self-validation (required before trusting empty results):** Before treating a zero result as meaningful, verify the label actually exists in the repo:
+   ```bash
+   gh label list --repo dcetlin/Lobster --json name --jq '.[].name' | grep -q '^wos:uow$' && echo "label found" || echo "label not found"
+   ```
+   If the label is not found, record "label not found — result unreliable" in your sweep output for this check and do not treat the count as meaningful. Do not fire a stall prescription based on a label-not-found result. Apply the same validation logic to any other label-based queries in this step (e.g., `wos:executing`) before treating their results as zero.
 
-1. Count open WOS UoWs: `gh issue list --repo dcetlin/Lobster --state open --label "wos:executing" --json number,title,updatedAt --limit 100`
 2. For each open UoW, check the `updatedAt` field. If no UoW has been updated in the past 3 days, flag as a potential stall.
 3. Check the executor heartbeat log for recent dispatch events: `tail -50 ~/lobster-workspace/scheduled-jobs/logs/executor-heartbeat.log` (or the most recent executor-heartbeat log file).
-4. If throughput appears stalled (no UoW updates in >3 days, or no dispatch events in executor log within 3 days), record a **WOS throughput stall** finding immediately — at the top of the Detection Pass section in your sweep output, before any domain-specific findings.
-5. If stall duration appears to be >7 days, add to escalation list with a prescription: "investigate executor starvation."
+4. **execution_enabled gate (check before firing any stall prescription):** Read `~/lobster-workspace/data/wos-config.json`. If the file exists and `execution_enabled` is `false`, do NOT fire the throughput stall prescription. Instead, record: "WOS execution is deliberately paused (execution_enabled=False) — throughput analysis skipped; this is not a stall." Skip steps 4a and 5 below when this gate fires.
+   4a. If throughput appears stalled (no UoW updates in >3 days, or no dispatch events in executor log within 3 days), record a **WOS throughput stall** finding immediately — at the top of the Detection Pass section in your sweep output, before any domain-specific findings.
+5. If stall duration appears to be >7 days (and execution_enabled is not false), add to escalation list with a prescription: "investigate executor starvation."
 
 This check runs every night so that stalls are visible as soon as they occur, regardless of which domain is active. The `steady-state` pattern in the Pattern Match section is now satisfied by the evidence gathered here — do not re-run the throughput check in the Pattern Match step.
 
@@ -222,13 +223,33 @@ Append a `## Pipeline Layer — Ripeness Report` section to today's sweep file (
 **Summary:** N issues classified. N classification changes (comments posted). N `pipeline-reviewed` labels applied.
 ```
 
+### Step 1g: Contradiction Matrix Dead-Entry Detection (Night 2 only)
+
+**Run this step only on Night 2, before the detection pass.** Its purpose is to validate the Contradiction Matrix entries themselves — a missing referenced file is itself an entropy signal.
+
+The Contradiction Matrix below references these specific files. Before running any matrix check, verify each file exists:
+
+- `~/lobster-workspace/.claude/sys.subagent.bootup.md`
+- `~/lobster-user-config/agents/user.base.bootup.md`
+- `~/lobster-workspace/.claude/agents/` (directory — check it exists and is non-empty)
+- `~/lobster-workspace/.claude/sys.dispatcher.bootup.md`
+- `~/lobster-workspace/.claude/compact-ack-messages.json`
+- `~/lobster/CLAUDE.md`
+- `~/lobster-user-config/agents/subagents/` (directory — check it exists)
+
+For each file or directory that does not exist, add it to the Detection Pass as an entropy item:
+
+> "Contradiction Matrix references non-existent file: `<path>` — this matrix entry cannot be checked and the reference is dead. Check how many consecutive sweeps this file has been missing (look at recent sweep files in `~/lobster-workspace/hygiene/`) and surface: 'dead for N sweeps; remove or update the reference.'"
+
+Do not silently skip matrix checks for missing files — a missing file means the check produced no signal, and that is itself a signal worth recording.
+
 ### Step 2: Detection pass
 
 **Cross-file contradiction check (Night 2 only):** Cross-reference behavioral rules, gates, and heuristics that appear in more than one document — flag divergences. Scope this to concepts with behavioral consequence (gates, rules, heuristics) — not all concepts.
 
 **Contradiction Matrix (Night 2) — pre-specified file pairs:**
 
-Do not discover these pairs during scanning. Read each pair explicitly and check for divergence on the named concern.
+Do not discover these pairs during scanning. Read each pair explicitly and check for divergence on the named concern. (Files validated to exist in Step 1g — skip any pair where a file was flagged as missing.)
 
 | File A | File B | Check for |
 |--------|--------|-----------|
@@ -293,6 +314,20 @@ Act autonomously on items that meet the autonomy criteria below. For each action
 ### Step 4: Escalation list
 
 Items requiring user judgment. For each: what it is, why it requires escalation rather than autonomous action, and a proposed action for Dan to approve or redirect.
+
+**OODA Act-layer gap (check on every sweep — add as a priority item when condition is met):**
+
+After assembling the escalation list, check for the following compound condition:
+
+1. Read `~/lobster-workspace/data/wos-config.json`. Is `execution_enabled` false?
+2. Are there escalation items (open GitHub issues) that are 7 or more days old with no recent action (no comment, no label change, no PR linked)?
+   - Check age using: `gh issue list --repo dcetlin/Lobster --state open --label "needs-decision" --json number,title,createdAt,updatedAt` (or query the escalation list items directly by issue number)
+
+If both conditions are true — execution is paused AND old escalation items have no action taken — add this as a **priority item** at the top of the Escalation List section (not buried in the findings list):
+
+> "OODA Act-layer gap: Hygiene backlog cannot drain because the Act layer requires execution_enabled=True. [N] escalation items have been open for [X] days with no action taken. The loop closes only when execution restarts. These items are blocked, not forgotten — but the system cannot self-correct until execution is re-enabled."
+
+State the specific issue numbers, their age in days, and the count. This item surfaces the dependency chain explicitly so the cost of leaving execution paused is visible.
 
 ---
 
