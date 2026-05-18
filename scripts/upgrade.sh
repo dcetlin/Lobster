@@ -4122,6 +4122,20 @@ PYEOF
         migrated=$((migrated + 1))
     fi
 
+    # Migration 117: Copy dispatcher-wos-uow-detail.md task file to the workspace tasks
+    # directory. This task file is used by the /wos uow <id> dispatcher command.
+    local _wos_uow_task_file="dispatcher-wos-uow-detail.md"
+    local _wos_uow_src="$LOBSTER_DIR/scheduled-tasks/tasks/$_wos_uow_task_file"
+    local _wos_uow_dst="$WORKSPACE_DIR/scheduled-jobs/tasks/$_wos_uow_task_file"
+    if [ -f "$_wos_uow_src" ] && [ ! -f "$_wos_uow_dst" ]; then
+        mkdir -p "$WORKSPACE_DIR/scheduled-jobs/tasks"
+        cp "$_wos_uow_src" "$_wos_uow_dst"
+        substep "Installed dispatcher task file: $_wos_uow_task_file (Migration 117)"
+        migrated=$((migrated + 1))
+    else
+        substep "Migration 117: $_wos_uow_task_file already present or source missing — skipping"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
