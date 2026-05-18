@@ -186,6 +186,45 @@ class TestToggleWosCoreJobs:
         assert written_jobs["jobs"]["executor-heartbeat"]["enabled"] is False
         assert "executor-heartbeat" not in result["toggled"]
 
+    def _run_with_pause_reason(self, enabled: bool, pause_reason: str | None,
+                               existing_wos_config: dict | None = None):
+        """Run toggle_wos_core_jobs with a given pause_reason, return the written config."""
+        jobs_data = _make_jobs_json({"executor-heartbeat": _wos_core_entry("executor-heartbeat", not enabled)})
+        wos_config = existing_wos_config or {"execution_enabled": not enabled}
+        written = {}
+
+        toggle = self._import()
+        with (
+            patch("src.orchestration.dispatcher_handlers._read_jobs_json", return_value=jobs_data),
+            patch("src.orchestration.dispatcher_handlers._write_jobs_json"),
+            patch("src.orchestration.dispatcher_handlers.read_wos_config", return_value=wos_config),
+            patch("src.orchestration.dispatcher_handlers._write_wos_config",
+                  side_effect=lambda cfg: written.update({"config": cfg})),
+        ):
+            toggle(enabled=enabled, pause_reason=pause_reason)
+
+        return written.get("config", {})
+
+    def test_disable_with_user_command_writes_pause_reason(self):
+        """toggle_wos_core_jobs(enabled=False, pause_reason='user_command') writes
+        pause_reason to wos-config.json so the starvation guard can read it."""
+        written_config = self._run_with_pause_reason(
+            enabled=False, pause_reason="user_command",
+            existing_wos_config={"execution_enabled": True},
+        )
+        assert written_config.get("pause_reason") == "user_command"
+        assert written_config["execution_enabled"] is False
+
+    def test_enable_clears_pause_reason(self):
+        """toggle_wos_core_jobs(enabled=True) removes pause_reason from wos-config.json
+        regardless of what was previously stored."""
+        written_config = self._run_with_pause_reason(
+            enabled=True, pause_reason=None,
+            existing_wos_config={"execution_enabled": False, "pause_reason": "user_command"},
+        )
+        assert "pause_reason" not in written_config
+        assert written_config["execution_enabled"] is True
+
 
 # ---------------------------------------------------------------------------
 # handle_wos_start — idempotency and delegation
@@ -338,7 +377,7 @@ class TestHandleWosStop:
         assert "paused" in result.lower()
 
     def test_stop_calls_toggle_with_enabled_false(self):
-        """Stopping WOS should call toggle_wos_core_jobs(enabled=False)."""
+        """Stopping WOS should call toggle_wos_core_jobs(enabled=False, pause_reason='user_command')."""
         handle_wos_stop = self._import()
         mock_result = {"toggled": ["executor-heartbeat", "steward-heartbeat"],
                        "not_found": [], "new_state": "disabled"}
@@ -349,7 +388,7 @@ class TestHandleWosStop:
                   return_value=mock_result) as mock_toggle,
         ):
             result = handle_wos_stop()
-        mock_toggle.assert_called_once_with(enabled=False)
+        mock_toggle.assert_called_once_with(enabled=False, pause_reason="user_command")
         assert "2" in result  # toggled count
 
     def test_stop_reports_not_found_jobs(self):
