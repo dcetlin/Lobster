@@ -58,6 +58,7 @@ if str(_REPO_ROOT) not in sys.path:
 from src.orchestration.paths import REGISTRY_DB
 from src.orchestration.steward import is_bootup_candidate_gate_active, run_steward_cycle
 from src.orchestration.github_sync import run_post_completion_sync
+from src.orchestration.dispatcher_handlers import read_wos_config
 from src.utils.jobs import is_job_enabled
 
 # ---------------------------------------------------------------------------
@@ -869,16 +870,37 @@ def check_backlog_alerts(
             _append_observation(msg)
 
     if starvation_alert:
-        msg = (
-            f"backlog_starvation: ready-for-executor queue at zero for "
-            f"{STARVATION_CONSECUTIVE_CYCLES} consecutive cycles "
-            f"(current_depth={depth}) "
-            f"— cultivator not proposing or germinator not germinating; "
-            f"throughput death, not rest"
-        )
-        log.warning("%s", msg)
-        if not dry_run:
-            _append_observation(msg)
+        # Guard: suppress the starvation alert when WOS execution is intentionally
+        # paused by the user. An empty ready-for-executor queue is expected and
+        # benign when execution_enabled=false and pause_reason="user_command".
+        # The alert is still emitted when execution_enabled=false but pause_reason
+        # is absent or not "user_command" — an infrastructure-triggered disable
+        # is not safe to suppress.
+        try:
+            _starvation_wos_config = read_wos_config()
+        except Exception:
+            _starvation_wos_config = {}
+
+        if (
+            not _starvation_wos_config.get("execution_enabled", True)
+            and _starvation_wos_config.get("pause_reason") == "user_command"
+        ):
+            log.info(
+                "backlog_starvation suppressed: wos execution intentionally paused "
+                "(execution_enabled=false, pause_reason=user_command) — "
+                "empty queue is expected"
+            )
+        else:
+            msg = (
+                f"backlog_starvation: ready-for-executor queue at zero for "
+                f"{STARVATION_CONSECUTIVE_CYCLES} consecutive cycles "
+                f"(current_depth={depth}) "
+                f"— cultivator not proposing or germinator not germinating; "
+                f"throughput death, not rest"
+            )
+            log.warning("%s", msg)
+            if not dry_run:
+                _append_observation(msg)
 
     log.debug(
         "Backlog alert check: depth=%d toxicity=%s starvation=%s history=%s",
@@ -1025,7 +1047,7 @@ def main() -> int:
     # run because they are cheap and ensure state consistency even when WOS is
     # paused. Phase 3 (LLM prescription) and Phase 4 (GitHub sync) are skipped
     # when execution_enabled=false to prevent LLM cost drain.
-    from src.orchestration.dispatcher_handlers import is_execution_enabled
+    from src.orchestration.dispatcher_handlers import is_execution_enabled  # noqa: PLC0415
 
     # Alert condition 2: queue depth when execution is disabled (#618).
     # Check before skipping Phase 3 so the alert fires even when WOS is paused.

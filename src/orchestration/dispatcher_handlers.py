@@ -178,7 +178,7 @@ def get_disabled_wos_core_jobs() -> list[str]:
     )
 
 
-def toggle_wos_core_jobs(enabled: bool) -> dict:
+def toggle_wos_core_jobs(enabled: bool, pause_reason: str | None = None) -> dict:
     """Enable or disable all WOS-core jobs atomically.
 
     Reads jobs.json, sets the `enabled` field on every job where
@@ -188,6 +188,16 @@ def toggle_wos_core_jobs(enabled: bool) -> dict:
 
     Jobs listed in _WOS_CORE_JOBS but absent from jobs.json are silently
     skipped and reported in the `not_found` list of the return value.
+
+    Args:
+        enabled: True to enable WOS execution; False to disable.
+        pause_reason: Optional reason string written to wos-config.json when
+            disabling (``enabled=False``). Pass ``"user_command"`` when the
+            pause was explicitly requested by the user (via ``/wos stop``).
+            When ``enabled=True``, ``pause_reason`` is removed from the config
+            regardless of this argument. When ``enabled=False`` and
+            ``pause_reason`` is None, the field is left unchanged if already
+            present (preserves any prior reason written by an earlier call).
 
     Returns a summary dict:
         {
@@ -223,7 +233,16 @@ def toggle_wos_core_jobs(enabled: bool) -> dict:
     # (handle_wos_start / handle_wos_stop) catches OSError and reports it.
     _write_jobs_json({**jobs_data, "jobs": updated_jobs})
     config = read_wos_config()
-    _write_wos_config({**config, "execution_enabled": enabled})
+    new_config = {**config, "execution_enabled": enabled}
+    if enabled:
+        # Starting: clear pause_reason so monitoring knows execution is intentionally on.
+        new_config.pop("pause_reason", None)
+    elif pause_reason is not None:
+        # Stopping with an explicit reason: record it so monitors can suppress
+        # starvation alerts when the pause is intentional (user_command).
+        new_config["pause_reason"] = pause_reason
+    # else: stopping without a reason — leave any existing pause_reason unchanged.
+    _write_wos_config(new_config)
 
     return {
         "toggled": toggled,
@@ -748,7 +767,7 @@ def handle_wos_stop(*, registry: "Registry | None" = None) -> str:
         )
 
     try:
-        result = toggle_wos_core_jobs(enabled=False)
+        result = toggle_wos_core_jobs(enabled=False, pause_reason="user_command")
     except OSError as exc:
         return (
             f"Failed to disable WOS-core jobs: {exc}\n"
