@@ -9,6 +9,7 @@ The dispatcher calls these handlers when it recognizes:
   /approve <uow-id>                    → handle_approve(uow_id, registry)
   /decide <uow-id> <proceed|abandon|retry> → handle_decide(uow_id, action, registry)
   /wos status [status]                 → handle_wos_status(status, registry)
+  /wos uow <uow-id>                    → handle_wos_uow(uow_id, registry) → dispatcher spawns subagent
   /wos unblock                         → handle_wos_unblock()
   /wos start                           → handle_wos_start()
   /wos stop                            → handle_wos_stop()
@@ -864,6 +865,56 @@ def handle_wos_abort(uow_id: str, *, registry: "Registry") -> str:
             "The subprocess may have exited before the abort command reached it.\n"
             "executor_pid has been cleared. The UoW will be re-queued by heartbeat recovery."
         )
+
+
+def handle_wos_uow(uow_id: str, *, registry: "Registry") -> str:
+    """
+    Handle '/wos uow <uow_id>' — return a task file path for dispatcher subagent dispatch.
+
+    This function validates the UoW exists (or could exist via suffix match) and
+    returns the path to the task file that the dispatcher should use when spawning
+    the wos-uow-detail subagent.
+
+    The dispatcher is responsible for:
+      1. Reading the task file.
+      2. Spawning a lobster-generalist subagent with the task file content, injecting
+         `uow_id` into the prompt header.
+      3. Sending an ack reply ("Looking up UoW...").
+
+    Returns:
+        A string describing the outcome — either the task file path (success) or an
+        inline not-found message. When the UoW is not found, the dispatcher should
+        send the returned string directly to the user without spawning a subagent.
+
+    Note: Full detail formatting (timestamps, cycle counts, etc.) happens inside the
+    subagent using the task file. This function only performs a lightweight existence
+    check so the dispatcher can give an immediate "not found" response instead of
+    spawning a subagent that immediately fails.
+    """
+    # Quick existence check — if the exact ID is not found, try suffix match.
+    uow = registry.get(uow_id)
+    if uow is not None:
+        return "found"
+
+    # Try suffix match (user may have typed the trailing hex only, e.g. "abc123").
+    import sqlite3
+    conn = registry._connect()
+    try:
+        rows = conn.execute(
+            "SELECT id FROM uow_registry WHERE id LIKE ? ORDER BY created_at DESC",
+            (f"%{uow_id}",),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if len(rows) == 0:
+        return f"UoW `{uow_id}` not found in registry."
+    if len(rows) > 1:
+        ids = ", ".join(f"`{r['id']}`" for r in rows[:5])
+        suffix = f" (and {len(rows) - 5} more)" if len(rows) > 5 else ""
+        return f"Ambiguous ID — {len(rows)} UoWs end with `{uow_id}`: {ids}{suffix}"
+    # Exactly one suffix match.
+    return "found"
 
 
 # ---------------------------------------------------------------------------
@@ -2209,6 +2260,7 @@ WOS control:
   wos start  — enable WOS pipeline (all 14 WOS-core jobs + execution_enabled)
   wos stop   — pause WOS pipeline (all 14 WOS-core jobs + execution_enabled)
   wos status [status] — show active + queued UoWs
+  wos uow <uow-id>    — show detail for a specific UoW
   wos unblock         — clear BOOTUP_CANDIDATE_GATE flag
   wos abort <uow-id>  — send SIGTERM to running subprocess for a UoW
 

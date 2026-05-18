@@ -1093,6 +1093,45 @@ Task(
 send_reply(chat_id=chat_id, text="Querying WOS pipeline...", source=source)
 ```
 
+**`/wos uow <uow-id>`** — show detail for a specific Unit of Work.
+
+Accepts a full ID (`uow_20260501_abc123`) or just the trailing hex suffix (`abc123`).
+
+Dispatch to a wos-uow-detail subagent (reads wos.db — 7-second rule applies):
+
+```python
+from src.orchestration.dispatcher_handlers import handle_wos_uow
+from src.orchestration.registry import Registry
+
+registry = Registry()
+parts = msg["text"].strip().split(None, 2)
+# parts: ["wos", "uow", "<id>"]
+uow_id = parts[2].strip() if len(parts) >= 3 else ""
+
+if not uow_id:
+    send_reply(chat_id=chat_id, text="Usage: /wos uow <uow-id>", source=source)
+    mark_processed(message_id)
+else:
+    result = handle_wos_uow(uow_id, registry=registry)
+    if result != "found":
+        # Not found or ambiguous — send the error message inline, no subagent needed
+        send_reply(chat_id=chat_id, text=result, source=source, message_id=message_id)
+    else:
+        task_id = f"wos-uow-detail-{uow_id}"
+        task_file = open(Path.home() / "lobster-workspace/scheduled-jobs/tasks/dispatcher-wos-uow-detail.md").read()
+        Task(
+            subagent_type="lobster-generalist",
+            run_in_background=True,
+            prompt=(
+                f"---\ntask_id: {task_id}\nchat_id: {chat_id}\nsource: {source}\n---\n\n"
+                f"uow_id = {uow_id!r}\n\n"
+                + task_file
+            ),
+        )
+        send_reply(chat_id=chat_id, text=f"Looking up UoW `{uow_id}`...", source=source)
+        mark_processed(message_id)
+```
+
 **`/help`** — show command index. Handled inline, no subagent needed:
 
 ```python
