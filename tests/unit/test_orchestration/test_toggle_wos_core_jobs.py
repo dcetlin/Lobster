@@ -9,8 +9,14 @@ Behavior under test:
 - Jobs in _WOS_CORE_JOBS but absent from jobs.json appear in not_found (not toggled).
 - handle_wos_start returns an idempotent notice when execution is already enabled.
 - handle_wos_start calls toggle_wos_core_jobs(True) when starting from stopped state.
+- handle_wos_start re-enables systemd timers for WOS-core jobs that have them.
 - handle_wos_stop returns an idempotent notice when execution is already disabled.
 - handle_wos_stop calls toggle_wos_core_jobs(False) when stopping from running state.
+- handle_wos_stop disables systemd timers for WOS-core jobs that have them.
+- _toggle_systemd_timers enables/disables LOBSTER-MANAGED timers for WOS-core jobs.
+- _toggle_systemd_timers skips jobs without a timer unit file.
+- _toggle_systemd_timers skips timers missing the LOBSTER-MANAGED marker.
+- _toggle_systemd_timers continues when systemctl fails (permission error or other).
 - COMMAND_HELP mentions all 14 WOS-core jobs in its wos start/stop description.
 """
 
@@ -419,6 +425,265 @@ class TestHandleWosStop:
         ):
             result = handle_wos_stop()
         assert "Failed" in result or "failed" in result
+
+
+# ---------------------------------------------------------------------------
+# COMMAND_HELP — help text reflects the gating scope
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# _toggle_systemd_timers — unit tests with subprocess and file-system mocked
+# ---------------------------------------------------------------------------
+
+# Names the spec uses for the timer-backed WOS-core jobs.
+# The exact set is in _WOS_CORE_TIMER_JOBS; we test a representative subset.
+_TIMER_JOB = "issue-sweeper"
+_TIMER_UNIT = f"lobster-{_TIMER_JOB}.timer"
+_TIMER_PATH = f"/etc/systemd/system/{_TIMER_UNIT}"
+
+
+class TestToggleSystemdTimers:
+    """_toggle_systemd_timers enables/disables systemd timers for WOS-core jobs."""
+
+    def _import(self):
+        from src.orchestration.dispatcher_handlers import _toggle_systemd_timers
+        return _toggle_systemd_timers
+
+    def _run(self, enabled: bool, *, timer_file_exists: bool = True,
+             timer_is_managed: bool = True, subprocess_returncode: int = 0):
+        """Run _toggle_systemd_timers with mocked file system and subprocess."""
+        _toggle_systemd_timers = self._import()
+
+        import subprocess
+
+        def fake_path_exists(path):
+            # Only the one test timer exists (or not).
+            return timer_file_exists and str(path).endswith(_TIMER_UNIT)
+
+        def fake_path_read_text(path):
+            if timer_is_managed:
+                return "[Unit]\n# LOBSTER-MANAGED\n[Timer]\nOnCalendar=daily\n"
+            return "[Unit]\n[Timer]\nOnCalendar=daily\n"
+
+        fake_result = MagicMock()
+        fake_result.returncode = subprocess_returncode
+
+        toggled = []
+
+        def fake_run(cmd, **kwargs):
+            # Record what was called.
+            toggled.append(cmd)
+            return fake_result
+
+        with (
+            patch("src.orchestration.dispatcher_handlers._SYSTEMD_UNIT_DIR") as mock_dir,
+            patch("subprocess.run", side_effect=fake_run),
+        ):
+            # Make the mock Path support / operator and iteration
+            mock_unit_file = MagicMock()
+            mock_unit_file.exists.return_value = timer_file_exists
+            mock_unit_file.read_text.return_value = (
+                "[Unit]\n# LOBSTER-MANAGED\n[Timer]\nOnCalendar=daily\n"
+                if timer_is_managed
+                else "[Unit]\n[Timer]\nOnCalendar=daily\n"
+            )
+            mock_dir.__truediv__ = lambda self, name: mock_unit_file
+            result = _toggle_systemd_timers(enabled)
+
+        return result, toggled
+
+    def test_enable_calls_systemctl_enable_now_for_managed_timer(self):
+        """When enabled=True and the timer file has LOBSTER-MANAGED, systemctl enable --now is called."""
+        result, cmds = self._run(enabled=True)
+        # At least one systemctl call must have been made with 'enable'
+        enable_calls = [c for c in cmds if "enable" in c and "lobster-issue-sweeper.timer" in c]
+        assert len(enable_calls) >= 1, f"Expected enable call, got: {cmds}"
+
+    def test_disable_calls_systemctl_disable_now_for_managed_timer(self):
+        """When enabled=False and the timer file has LOBSTER-MANAGED, systemctl disable --now is called."""
+        result, cmds = self._run(enabled=False)
+        disable_calls = [c for c in cmds if "disable" in c and "lobster-issue-sweeper.timer" in c]
+        assert len(disable_calls) >= 1, f"Expected disable call, got: {cmds}"
+
+    def test_returns_list_of_toggled_timer_names(self):
+        """Return value is a list of timer unit names that were successfully toggled."""
+        result, _ = self._run(enabled=True)
+        assert isinstance(result, list)
+        # At least one timer should have been returned if the file exists and is managed
+        assert any("issue-sweeper" in name for name in result), f"Expected issue-sweeper in {result}"
+
+    def test_skips_timer_when_unit_file_absent(self):
+        """If the timer unit file does not exist, no systemctl call is made and name is excluded."""
+        result, cmds = self._run(enabled=True, timer_file_exists=False)
+        issue_sweeper_calls = [c for c in cmds if "issue-sweeper" in str(c)]
+        assert len(issue_sweeper_calls) == 0
+        assert not any("issue-sweeper" in name for name in result)
+
+    def test_skips_timer_without_lobster_managed_marker(self):
+        """Timers without the LOBSTER-MANAGED comment are not touched."""
+        result, cmds = self._run(enabled=True, timer_is_managed=False)
+        issue_sweeper_calls = [c for c in cmds if "issue-sweeper" in str(c)]
+        assert len(issue_sweeper_calls) == 0
+        assert not any("issue-sweeper" in name for name in result)
+
+    def test_continues_after_systemctl_failure(self):
+        """A non-zero return code from systemctl does not raise; function returns partial results."""
+        # Should not raise even when systemctl fails
+        result, cmds = self._run(enabled=True, subprocess_returncode=1)
+        # The function should still return a list (possibly empty on failure)
+        assert isinstance(result, list)
+
+    def test_continues_after_subprocess_exception(self):
+        """A subprocess exception (e.g. permission denied) does not propagate; returns empty list."""
+        from src.orchestration.dispatcher_handlers import _toggle_systemd_timers
+
+        with (
+            patch("src.orchestration.dispatcher_handlers._SYSTEMD_UNIT_DIR") as mock_dir,
+            patch("subprocess.run", side_effect=OSError("permission denied")),
+        ):
+            mock_unit_file = MagicMock()
+            mock_unit_file.exists.return_value = True
+            mock_unit_file.read_text.return_value = "[Unit]\n# LOBSTER-MANAGED\n"
+            mock_dir.__truediv__ = lambda self, name: mock_unit_file
+            result = _toggle_systemd_timers(True)
+
+        assert isinstance(result, list)
+
+
+# ---------------------------------------------------------------------------
+# handle_wos_start — systemd timer management
+# ---------------------------------------------------------------------------
+
+class TestHandleWosStartTimers:
+    """handle_wos_start re-enables systemd timers for WOS-core timer-backed jobs."""
+
+    def _mock_registry(self):
+        """Return a MagicMock that satisfies the Registry protocol."""
+        m = MagicMock()
+        m.log_control_event = MagicMock()
+        return m
+
+    def test_start_calls_toggle_systemd_timers_with_enabled_true(self):
+        """handle_wos_start calls _toggle_systemd_timers(True) to re-enable timers."""
+        from src.orchestration.dispatcher_handlers import handle_wos_start
+
+        mock_result = {"toggled": ["executor-heartbeat"], "not_found": [], "new_state": "enabled"}
+        with (
+            patch("src.orchestration.dispatcher_handlers.read_wos_config",
+                  return_value={"execution_enabled": False}),
+            patch("src.orchestration.dispatcher_handlers.toggle_wos_core_jobs",
+                  return_value=mock_result),
+            patch("src.orchestration.dispatcher_handlers._toggle_systemd_timers",
+                  return_value=["issue-sweeper"]) as mock_timers,
+        ):
+            handle_wos_start(registry=self._mock_registry())
+
+        mock_timers.assert_called_once_with(True)
+
+    def test_start_mentions_timer_count_when_timers_were_toggled(self):
+        """When timers were re-enabled, the reply notes how many were toggled."""
+        from src.orchestration.dispatcher_handlers import handle_wos_start
+
+        mock_result = {"toggled": ["executor-heartbeat"], "not_found": [], "new_state": "enabled"}
+        with (
+            patch("src.orchestration.dispatcher_handlers.read_wos_config",
+                  return_value={"execution_enabled": False}),
+            patch("src.orchestration.dispatcher_handlers.toggle_wos_core_jobs",
+                  return_value=mock_result),
+            patch("src.orchestration.dispatcher_handlers._toggle_systemd_timers",
+                  return_value=["issue-sweeper", "github-issue-cultivator"]),
+        ):
+            result = handle_wos_start(registry=self._mock_registry())
+
+        assert "2" in result or "timer" in result.lower()
+
+    def test_start_also_calls_toggle_timers_on_partial_recovery(self):
+        """Partial-recovery path also re-enables systemd timers."""
+        from src.orchestration.dispatcher_handlers import handle_wos_start
+
+        jobs_data = {
+            "jobs": {
+                "executor-heartbeat": {"wos_core": True, "enabled": True},
+                "steward-heartbeat": {"wos_core": True, "enabled": False},
+            }
+        }
+        mock_toggle_result = {
+            "toggled": ["steward-heartbeat"], "not_found": [], "new_state": "enabled"
+        }
+        with (
+            patch("src.orchestration.dispatcher_handlers.read_wos_config",
+                  return_value={"execution_enabled": True}),
+            patch("src.orchestration.dispatcher_handlers._read_jobs_json",
+                  return_value=jobs_data),
+            patch("src.orchestration.dispatcher_handlers.toggle_wos_core_jobs",
+                  return_value=mock_toggle_result),
+            patch("src.orchestration.dispatcher_handlers._toggle_systemd_timers",
+                  return_value=["issue-sweeper"]) as mock_timers,
+        ):
+            handle_wos_start(registry=self._mock_registry())
+
+        mock_timers.assert_called_once_with(True)
+
+
+# ---------------------------------------------------------------------------
+# handle_wos_stop — systemd timer management
+# ---------------------------------------------------------------------------
+
+class TestHandleWosStopTimers:
+    """handle_wos_stop disables systemd timers for WOS-core timer-backed jobs."""
+
+    def _mock_registry(self):
+        m = MagicMock()
+        m.log_control_event = MagicMock()
+        return m
+
+    def test_stop_calls_toggle_systemd_timers_with_enabled_false(self):
+        """handle_wos_stop calls _toggle_systemd_timers(False) to disable timers."""
+        from src.orchestration.dispatcher_handlers import handle_wos_stop
+
+        mock_result = {"toggled": ["executor-heartbeat", "steward-heartbeat"],
+                       "not_found": [], "new_state": "disabled"}
+        with (
+            patch("src.orchestration.dispatcher_handlers.read_wos_config",
+                  return_value={"execution_enabled": True}),
+            patch("src.orchestration.dispatcher_handlers.toggle_wos_core_jobs",
+                  return_value=mock_result),
+            patch("src.orchestration.dispatcher_handlers._toggle_systemd_timers",
+                  return_value=["issue-sweeper"]) as mock_timers,
+        ):
+            handle_wos_stop(registry=self._mock_registry())
+
+        mock_timers.assert_called_once_with(False)
+
+    def test_stop_mentions_timer_count_when_timers_were_disabled(self):
+        """When timers were disabled, the reply notes how many were toggled."""
+        from src.orchestration.dispatcher_handlers import handle_wos_stop
+
+        mock_result = {"toggled": ["executor-heartbeat"], "not_found": [], "new_state": "disabled"}
+        with (
+            patch("src.orchestration.dispatcher_handlers.read_wos_config",
+                  return_value={"execution_enabled": True}),
+            patch("src.orchestration.dispatcher_handlers.toggle_wos_core_jobs",
+                  return_value=mock_result),
+            patch("src.orchestration.dispatcher_handlers._toggle_systemd_timers",
+                  return_value=["issue-sweeper", "github-issue-cultivator"]),
+        ):
+            result = handle_wos_stop(registry=self._mock_registry())
+
+        assert "2" in result or "timer" in result.lower()
+
+    def test_stop_does_not_call_toggle_timers_when_already_stopped(self):
+        """When already stopped, the idempotent path does not call _toggle_systemd_timers."""
+        from src.orchestration.dispatcher_handlers import handle_wos_stop
+
+        with (
+            patch("src.orchestration.dispatcher_handlers.read_wos_config",
+                  return_value={"execution_enabled": False}),
+            patch("src.orchestration.dispatcher_handlers._toggle_systemd_timers") as mock_timers,
+        ):
+            handle_wos_stop(registry=self._mock_registry())
+
+        mock_timers.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -30,10 +30,14 @@ Import and call this table unconditionally — Python imports survive compaction
 from __future__ import annotations
 
 import json
+import logging
 import os
+import subprocess
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .registry import Registry
@@ -144,6 +148,98 @@ _WOS_CORE_JOBS: frozenset[str] = frozenset({
     "wos-pr-sweeper",
     "wos-health-monitor",
 })
+
+# ---------------------------------------------------------------------------
+# Systemd timer management for WOS-core jobs
+# ---------------------------------------------------------------------------
+#
+# A subset of WOS-core jobs are dispatched via systemd timers (not cron).
+# These timers call dispatch-job.sh, which reads the jobs.json `enabled` flag
+# as a second gate. When the timer is disabled, the job never fires regardless
+# of the jobs.json state — so wos start/stop must manage both layers.
+#
+# Jobs in this set have unit files at /etc/systemd/system/lobster-{job}.timer
+# and are managed only when the file exists AND contains the LOBSTER-MANAGED
+# comment (safety guard against touching unrelated timers).
+#
+_SYSTEMD_UNIT_DIR: Path = Path("/etc/systemd/system")
+
+_WOS_CORE_TIMER_JOBS: frozenset[str] = frozenset({
+    "issue-sweeper",
+    "github-issue-cultivator",
+    "pattern-candidate-sweep",
+    "uow-reflection",
+    "wos-overnight-loop",
+    "wos-hourly-observation",
+    "wos-health-monitor",
+})
+
+_LOBSTER_MANAGED_MARKER = "# LOBSTER-MANAGED"
+
+
+def _toggle_systemd_timers(enabled: bool) -> list[str]:
+    """Enable or disable systemd timers for WOS-core jobs that use them.
+
+    For each job in ``_WOS_CORE_TIMER_JOBS``:
+    - Checks whether ``/etc/systemd/system/lobster-{job}.timer`` exists.
+    - Reads the unit file and verifies it contains ``# LOBSTER-MANAGED`` (safety
+      guard: we never touch timers we did not install).
+    - Calls ``sudo systemctl enable --now`` or ``sudo systemctl disable --now``
+      depending on ``enabled``.
+    - Failures (non-zero exit, subprocess error, permission error) are logged
+      and skipped — this function never raises.
+
+    Returns a list of timer names that were successfully toggled.
+    """
+    action = "enable" if enabled else "disable"
+    toggled: list[str] = []
+
+    for job_name in sorted(_WOS_CORE_TIMER_JOBS):
+        timer_name = f"lobster-{job_name}.timer"
+        unit_path = _SYSTEMD_UNIT_DIR / timer_name
+
+        if not unit_path.exists():
+            continue
+
+        try:
+            unit_text = unit_path.read_text()
+        except OSError:
+            _log.debug("_toggle_systemd_timers: cannot read %s — skipping", unit_path)
+            continue
+
+        if _LOBSTER_MANAGED_MARKER not in unit_text:
+            _log.debug(
+                "_toggle_systemd_timers: %s lacks LOBSTER-MANAGED marker — skipping",
+                timer_name,
+            )
+            continue
+
+        try:
+            proc = subprocess.run(
+                ["sudo", "systemctl", f"{action}", "--now", timer_name],
+                capture_output=True,
+                timeout=15,
+            )
+            if proc.returncode == 0:
+                toggled.append(timer_name)
+                _log.info("_toggle_systemd_timers: %s %sd successfully", timer_name, action)
+            else:
+                _log.warning(
+                    "_toggle_systemd_timers: systemctl %s %s returned %d: %s",
+                    action,
+                    timer_name,
+                    proc.returncode,
+                    proc.stderr.decode(errors="replace").strip(),
+                )
+        except (OSError, subprocess.SubprocessError) as exc:
+            _log.warning(
+                "_toggle_systemd_timers: could not %s %s: %s",
+                action,
+                timer_name,
+                exc,
+            )
+
+    return toggled
 
 
 def _read_jobs_json() -> dict:
@@ -689,6 +785,8 @@ def handle_wos_start(*, registry: "Registry | None" = None) -> str:
                 f"Config: `{_WOS_CONFIG_PATH}`"
             )
 
+        timer_toggled = _toggle_systemd_timers(True)
+
         lines = [
             f"WOS partial recovery: {len(disabled_core_jobs)} wos_core job(s) were "
             f"disabled while execution_enabled=true — re-enabled: "
@@ -696,6 +794,11 @@ def handle_wos_start(*, registry: "Registry | None" = None) -> str:
             "executor-heartbeat will dispatch ready-for-executor UoWs on its next "
             "cycle (within ~90 seconds).",
         ]
+        if timer_toggled:
+            lines.append(
+                f"Systemd timers re-enabled ({len(timer_toggled)}): "
+                f"{', '.join(sorted(timer_toggled))}"
+            )
         if result["not_found"]:
             lines.append(
                 f"Note: {len(result['not_found'])} WOS-core job(s) not in jobs.json "
@@ -710,6 +813,7 @@ def handle_wos_start(*, registry: "Registry | None" = None) -> str:
                 "recovered": sorted(disabled_core_jobs),
                 "toggled": sorted(result["toggled"]),
                 "not_found": sorted(result["not_found"]),
+                "timers_toggled": sorted(timer_toggled),
             },
         )
 
@@ -723,12 +827,19 @@ def handle_wos_start(*, registry: "Registry | None" = None) -> str:
             f"Config: `{_WOS_CONFIG_PATH}`"
         )
 
+    timer_toggled = _toggle_systemd_timers(True)
+
     toggled_count = len(result["toggled"])
     lines = [
         f"WOS pipeline started. {toggled_count} WOS-core jobs enabled.",
         "executor-heartbeat will dispatch ready-for-executor UoWs on its next "
         "cycle (within ~90 seconds).",
     ]
+    if timer_toggled:
+        lines.append(
+            f"Systemd timers re-enabled ({len(timer_toggled)}): "
+            f"{', '.join(sorted(timer_toggled))}"
+        )
     if result["not_found"]:
         lines.append(
             f"Note: {len(result['not_found'])} WOS-core job(s) not in jobs.json "
@@ -738,7 +849,11 @@ def handle_wos_start(*, registry: "Registry | None" = None) -> str:
     reg = registry if registry is not None else _Registry()
     reg.log_control_event(
         ControlEventType.WOS_START,
-        {"toggled": sorted(result["toggled"]), "not_found": sorted(result["not_found"])},
+        {
+            "toggled": sorted(result["toggled"]),
+            "not_found": sorted(result["not_found"]),
+            "timers_toggled": sorted(timer_toggled),
+        },
     )
 
     return "\n".join(lines)
@@ -781,11 +896,18 @@ def handle_wos_stop(*, registry: "Registry | None" = None) -> str:
             f"Config: `{_WOS_CONFIG_PATH}`"
         )
 
+    timer_toggled = _toggle_systemd_timers(False)
+
     toggled_count = len(result["toggled"])
     lines = [
         f"WOS pipeline paused. {toggled_count} WOS-core jobs disabled.",
         "UoWs already active will continue running; TTL recovery handles any that stall.",
     ]
+    if timer_toggled:
+        lines.append(
+            f"Systemd timers disabled ({len(timer_toggled)}): "
+            f"{', '.join(sorted(timer_toggled))}"
+        )
     if result["not_found"]:
         lines.append(
             f"Note: {len(result['not_found'])} WOS-core job(s) not in jobs.json "
@@ -795,7 +917,11 @@ def handle_wos_stop(*, registry: "Registry | None" = None) -> str:
     reg = registry if registry is not None else _Registry()
     reg.log_control_event(
         ControlEventType.WOS_STOP,
-        {"toggled": sorted(result["toggled"]), "not_found": sorted(result["not_found"])},
+        {
+            "toggled": sorted(result["toggled"]),
+            "not_found": sorted(result["not_found"]),
+            "timers_toggled": sorted(timer_toggled),
+        },
     )
 
     return "\n".join(lines)
