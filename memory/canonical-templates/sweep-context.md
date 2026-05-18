@@ -73,7 +73,7 @@ Before reading any domain-specific content, check the WOS throughput steady-stat
 
    **Label self-validation (required before trusting empty results):** Before treating a zero result as meaningful, verify the label actually exists in the repo:
    ```bash
-   gh label list --repo dcetlin/Lobster --json name --jq '.[].name' | grep -q '^wos:executing$' && echo "label found" || echo "label not found"
+   gh label list --repo dcetlin/Lobster --limit 200 --json name --jq '.[].name' | grep -q '^wos:executing$' && echo "label found" || echo "label not found"
    ```
    If the label is not found, record "label not found — result unreliable" in your sweep output for this check and do not treat the count as meaningful. Do not fire a stall prescription based on a label-not-found result. Apply the same validation logic to any other label-based queries in this step before treating their results as zero.
 
@@ -477,9 +477,20 @@ Scan scope by domain:
 
 ---
 
+## Post-run cleanup
+
+After both pings are sent, archive sweep files older than 14 days:
+
+```bash
+mkdir -p ~/lobster-workspace/hygiene/archive/
+find ~/lobster-workspace/hygiene/ -maxdepth 1 -name "*-sweep.md" -mtime +14 -exec mv {} ~/lobster-workspace/hygiene/archive/ \;
+```
+
+Run this step unconditionally at the end of every sweep run.
+
 ## Final Step
 
-After both pings are sent, call `write_task_output` with:
+After the post-run cleanup, call `write_task_output` with:
 - job_name: `negentropic-sweep`
 - output: brief summary (domain covered, items found/acted/escalated, golden patterns named)
 - status: `success` (or `failed` if the run errored)
