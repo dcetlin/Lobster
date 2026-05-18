@@ -100,6 +100,16 @@ class TestWriteResultSchema:
         data = json.loads(_result_json_path(output_ref).read_text())
         assert "artifacts" not in data
 
+    def test_token_usage_included_when_provided(self, output_ref: str) -> None:
+        write_result(output_ref, status="done", summary="ok", token_usage=1234)
+        data = json.loads(_result_json_path(output_ref).read_text())
+        assert data["token_usage"] == 1234
+
+    def test_token_usage_omitted_when_none(self, output_ref: str) -> None:
+        write_result(output_ref, status="done", summary="ok")
+        data = json.loads(_result_json_path(output_ref).read_text())
+        assert "token_usage" not in data
+
 
 # ---------------------------------------------------------------------------
 # Path derivation tests

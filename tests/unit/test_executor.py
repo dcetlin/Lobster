@@ -39,6 +39,7 @@ from orchestration.executor import (
     _dispatch_via_inbox,
     _dispatch_via_claude_p,
     _noop_dispatcher,
+    _build_wos_context_block,
 )
 
 
@@ -923,3 +924,18 @@ class TestDispatchViaInbox:
         output_ref = _get_output_ref(db_path, uow_id)
         result_data = _read_result_json(output_ref)
         assert result_data.get("executor_id") == expected_run_id
+
+
+# ---------------------------------------------------------------------------
+# WOS context block tests
+# ---------------------------------------------------------------------------
+
+class TestWOSContextBlock:
+    def test_wos_context_block_includes_token_tracking(self) -> None:
+        """The WOS context block must include token tracking instructions."""
+        uow_id = "uow_test123"
+        result = _build_wos_context_block(uow_id)
+
+        assert "token_usage" in result
+        assert "write_wos_heartbeat" in result
+        assert "mcp__lobster-inbox__write_result" in result
