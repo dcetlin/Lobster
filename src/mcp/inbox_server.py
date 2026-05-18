@@ -849,6 +849,7 @@ from message_types import (  # noqa: E402 — placed after path-setup at top of 
     INBOX_MESSAGE_SOURCES,
     USER_FACING_TYPES,
 )
+from lobster_meta import build_lobster_meta  # noqa: E402 — same path-setup above
 
 # ---------------------------------------------------------------------------
 # Message type normalization (issue #635)
@@ -5844,9 +5845,13 @@ async def handle_mark_processing(args: dict) -> list[TextContent]:
     # Shared helper handles filtering, incrementing, and reminder injection.
     _tick_user_message_counter(msg_type, msg_source)
 
-    # Stamp _processing_started_at so stale detection uses actual claim time, not file mtime.
+    # Stamp _processing_started_at and _lobster_meta (issue #1023) so stale detection
+    # uses actual claim time and downstream consumers have pre-computed routing hints.
     try:
         msg_data["_processing_started_at"] = datetime.now(timezone.utc).isoformat()
+        # _lobster_meta: fast heuristic classification (<5ms, no LLM calls).
+        # Fields are hints only — dispatcher must never trust them blindly.
+        msg_data["_lobster_meta"] = build_lobster_meta(msg_data)
         atomic_write_json(dest, msg_data)
     except Exception:
         pass  # non-fatal; stale recovery falls back to mtime
