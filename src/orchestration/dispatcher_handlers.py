@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 from .registry import ApproveConfirmed, ApproveExpired, ApproveNotFound, ApproveSkipped
 from .paths import LOBSTER_WORKSPACE as _LOBSTER_WORKSPACE, WOS_CONFIG as _WOS_CONFIG_PATH_FROM_PATHS, WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG, JOBS_JSON as _JOBS_JSON_PATH
 from .steward import ReturnReasonClassification, MAX_RETRIES as _STEWARD_MAX_RETRIES, _HARD_CAP_CYCLES
+from .wos_issue_lifecycle import HUMAN_GATE_LABELS as _HUMAN_GATE_LABELS
 from src.utils.timezone import format_iso_for_user as _format_iso_for_user, get_owner_tz_name as _get_owner_tz_name
 
 
@@ -530,6 +531,23 @@ def handle_wos_execute(uow_id: str, instructions: str, output_ref: str) -> str:
         f"A return value of 0 (or {{\"rowcount\": 0}} from the MCP tool) means the Steward\n"
         f"has already re-queued this UoW — stop execution immediately and call write_result\n"
         f"with outcome=failed.\n\n"
+        f"## PR-close guard (REQUIRED)\n\n"
+        f"Before closing any PR via `gh pr close` or any equivalent operation:\n\n"
+        f"1. Fetch the PR's labels:\n"
+        f"   ```bash\n"
+        f"   gh pr view <PR_NUMBER> --repo <REPO> --json labels --jq '[.labels[].name]'\n"
+        f"   ```\n\n"
+        f"2. If the output contains any of these labels — "
+        f"{', '.join(f'**`{lbl}`**' for lbl in sorted(_HUMAN_GATE_LABELS))} — "
+        f"**do not close the PR**. Instead:\n"
+        f"   - Skip the close operation entirely.\n"
+        f"   - Include in your result file's `reason` field: "
+        f"\"PR #<N> skipped: carries human-gate label <LABEL> — human review required\"\n"
+        f"   - Set outcome to `blocked` only if this is the sole blocker; otherwise "
+        f"continue with remaining instructions and report the skipped PR in the reason.\n\n"
+        f"3. If the `gh pr view` call fails for any reason, treat the PR as gated and skip.\n\n"
+        f"This guard applies to every PR close operation in the instructions below, "
+        f"regardless of how the instruction is phrased.\n\n"
         f"## Instructions\n\n"
         f"{instructions}\n\n"
         f"## Result contract (REQUIRED)\n\n"
