@@ -254,7 +254,8 @@ def collect_completed_uows(db_path: Path, period_days: int) -> list[dict]:
             rows = conn.execute(
                 f"""
                 SELECT id, status, summary, register, close_reason, output_ref,
-                       started_at, closed_at, updated_at, created_at, steward_cycles
+                       started_at, closed_at, updated_at, created_at, steward_cycles,
+                       artifacts, outcome_category
                 FROM uow_registry
                 WHERE id IN ({id_ph})
                   AND status IN ({terminal_ph})
@@ -350,12 +351,33 @@ def compute_metabolic_counts(uows: list[dict]) -> dict[str, int]:
     """
     Classify all UoWs and return counts by outcome category.
 
-    Returns a dict with keys: pearl, seed, heat, shit, total.
+    Returns a dict with keys: pearl, seed, heat, shit, total, done_unverifiable.
+
+    done_unverifiable is the count of UoWs with status='done' that have no
+    artifact evidence — i.e. no artifacts column content and no outcome_category.
+    This is the precise signal for write_result back-propagation failure, as
+    opposed to the broader 'shit' count which also includes TTL-exceeded and
+    other execution failures unrelated to back-propagation.
     """
-    counts: dict[str, int] = {OUTCOME_PEARL: 0, OUTCOME_SEED: 0, OUTCOME_HEAT: 0, OUTCOME_SHIT: 0}
+    counts: dict[str, int] = {
+        OUTCOME_PEARL: 0, OUTCOME_SEED: 0, OUTCOME_HEAT: 0, OUTCOME_SHIT: 0,
+        "done_unverifiable": 0,
+    }
     for uow in uows:
         label = classify_uow(uow)
         counts[label] += 1
+        # Track done-but-unverifiable separately for the back-propagation smell.
+        # A UoW qualifies only when:
+        # - status is 'done' (not failed/expired/cancelled — those are execution failures)
+        # - artifacts column is empty/null (no artifact refs extracted from write_result)
+        # - outcome_category is null (write_result payload was never received)
+        # This combination strongly implies write_result was never called or its payload
+        # was not back-propagated to the registry.
+        if uow.get("status") == "done":
+            has_artifacts = bool(uow.get("artifacts"))
+            has_outcome = bool(uow.get("outcome_category"))
+            if not has_artifacts and not has_outcome:
+                counts["done_unverifiable"] += 1
     counts["total"] = len(uows)
     return counts
 
@@ -478,15 +500,37 @@ def _detect_write_result_not_back_propagated(
     """
     Detect Smell: write_result not back-propagated.
 
-    Heuristic: count UoWs classified as 'shit' (outcome_unverifiable proxy).
-    Threshold is the minimum shit count to trigger detection.
+    Heuristic: count UoWs with status='done' that have no artifact evidence in
+    the registry — i.e. no artifacts field and no outcome_category. These are
+    UoWs that completed (status=done) but whose write_result payload was never
+    received or back-propagated to the registry.
+
+    This is deliberately narrower than the previous 'shit count' heuristic, which
+    fired on any UoW classified as shit — including TTL-exceeded failures, quota
+    exhaustion crashes, and other execution failures unrelated to back-propagation.
+    Equating all shit UoWs with back-propagation failure produces false positives
+    during periods of high execution failure (e.g. a rough API quota window).
+
+    The correct signal is: done UoWs with no evidence trail. If write_result was
+    called and back-propagated, the registry will have either artifacts (extracted
+    from the result text) or outcome_category (set by maybe_complete_wos_uow).
+    A done UoW with neither field populated implies the subagent either did not
+    call write_result or write_result was not intercepted by wos_completion.py.
+
+    Threshold is the minimum done_unverifiable count to trigger detection.
     """
-    shit_count = uow_counts.get(OUTCOME_SHIT, 0)
+    done_unverifiable = uow_counts.get("done_unverifiable", 0)
+    total_done = sum(
+        uow_counts.get(k, 0)
+        for k in (OUTCOME_PEARL, OUTCOME_SEED, OUTCOME_HEAT, OUTCOME_SHIT)
+        if k == OUTCOME_SHIT or True  # all classified outcomes
+    )
+    # Use total as denominator for the evidence string context
     total = uow_counts.get("total", 0)
-    detected = shit_count > threshold
+    detected = done_unverifiable > threshold
     evidence = (
-        f"{shit_count}/{total} UoWs classified as 'shit' (unverifiable output); "
-        f"threshold={threshold}"
+        f"{done_unverifiable}/{total} done UoWs with no artifact evidence "
+        f"(no artifacts + no outcome_category in registry); threshold={threshold}"
     )
     return detected, evidence
 
