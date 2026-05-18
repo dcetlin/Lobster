@@ -27,6 +27,7 @@ Schema written to ``<output_ref>.result.json``:
         "success":    true | false,             # Steward-compatible convenience field
         "summary":    "<human-readable one-line summary>",
         "artifacts":  ["<path1>", "<path2>", ...],   # optional
+        "token_usage": <int>,                        # optional
         "written_at": "<ISO-8601 UTC timestamp>"
     }
 
@@ -56,6 +57,7 @@ def write_result(
     status: Literal["done", "complete", "failed"],
     summary: str,
     artifacts: list[str] | None = None,
+    token_usage: int | None = None,
 ) -> Path:
     """
     Write a result.json file at the path derived from ``output_ref``.
@@ -82,6 +84,8 @@ def write_result(
         artifacts: Optional list of absolute file paths produced during
             execution (e.g. PR URLs, generated report paths). The Steward
             reads this list when building its diagnosis context.
+        token_usage: Optional total token count (input + output tokens) consumed
+            across all API turns during execution. Used for per-UoW cost telemetry.
 
     Returns:
         The Path where the result file was written.
@@ -111,6 +115,8 @@ def write_result(
     }
     if artifacts:
         payload["artifacts"] = artifacts
+    if token_usage is not None:
+        payload["token_usage"] = token_usage
 
     _atomic_write(result_path, json.dumps(payload, indent=2))
     return result_path

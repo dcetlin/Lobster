@@ -1009,6 +1009,14 @@ def _build_wos_context_block(uow_id: str) -> str:
         f"(create the label if it does not exist)\n"
         f"  - Commit messages: optionally include WOS-UoW: {uow_id} in the footer\n"
         f"---\n"
+        f"Token tracking: report your total token usage on completion.\n"
+        f"  - In your final mcp__lobster-inbox__write_result call, pass token_usage=<N>\n"
+        f"    where N is the total input+output tokens consumed across all API turns.\n"
+        f"  - In each mcp__lobster-inbox__write_wos_heartbeat call, pass token_usage=<N>.\n"
+        f"  - If your Claude Code session does not expose token counts directly, omit\n"
+        f"    token_usage (pass None / leave it out) — the field is optional and the\n"
+        f"    Steward handles absent values gracefully.\n"
+        f"---\n"
     )
 
 
