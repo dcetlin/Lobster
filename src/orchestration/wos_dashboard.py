@@ -638,13 +638,8 @@ def _uow_id_cell(uow_id: str, drilldown_urls: dict[str, str]) -> str:
     """Return an HTML table cell for a UoW ID linked to its detail page.
 
     Always links to the stable /wos/uow/<uow_id> route served by the Bisque relay.
-    Falls back to a legacy drilldown_urls URL if present (e.g. pre-generated static pages).
     """
-    # Prefer the stable dynamic route; fall back to pre-generated static URL if provided.
     url = f"/wos/uow/{uow_id}"
-    legacy_url = drilldown_urls.get(uow_id)
-    if legacy_url and not url:
-        url = legacy_url
     return f'<td class="uid"><a href="{url}" target="_blank">{uow_id} &#x2197;</a></td>'
 
 
