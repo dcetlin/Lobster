@@ -69,7 +69,14 @@ Naming a pattern without stating its effect on your analysis is not a citation �
 
 Before reading any domain-specific content, check the WOS throughput steady-state pattern. Given that a throughput stall is a high-signal system-health indicator, it must surface at the top of every sweep, not buried in the pattern-match section.
 
-1. Count open WOS UoWs: `gh issue list --repo dcetlin/Lobster --state open --label "wos-uow" --json number,title,updatedAt --limit 100`
+**Deliberate-pause check (run first):** Read `~/lobster-workspace/data/wos-config.json`. If `execution_enabled` is `false`, WOS has been deliberately paused. In this case:
+- Skip throughput stall classification — low throughput is expected and correct.
+- Record at the top of the Detection Pass: "WOS deliberately paused (execution_enabled=false in wos-config.json) — throughput checks skipped. This is not a stall."
+- Proceed to domain-specific detection without flagging starvation.
+
+If `execution_enabled` is `true` (or wos-config.json is absent), proceed with the throughput checks below:
+
+1. Count open WOS UoWs: `gh issue list --repo dcetlin/Lobster --state open --label "wos:executing" --json number,title,updatedAt --limit 100`
 2. For each open UoW, check the `updatedAt` field. If no UoW has been updated in the past 3 days, flag as a potential stall.
 3. Check the executor heartbeat log for recent dispatch events: `tail -50 ~/lobster-workspace/scheduled-jobs/logs/executor-heartbeat.log` (or the most recent executor-heartbeat log file).
 4. If throughput appears stalled (no UoW updates in >3 days, or no dispatch events in executor log within 3 days), record a **WOS throughput stall** finding immediately — at the top of the Detection Pass section in your sweep output, before any domain-specific findings.
