@@ -8,13 +8,13 @@ version: 1
 patterns:
   - id: write_result_not_back_propagated
     name: "write_result not back-propagated to executor output"
-    description: "Subagents call write_result but the executor output file receives only a dispatch receipt, not the result payload. The executor cannot confirm completion at next sweep. Every steward spiral re-runs 'is this done?' against records with zero evidence content. Root cause: executor-heartbeat.py does not intercept write_result responses to back-propagate result text and status to the UoW output file."
+    description: "Subagents complete (status=done) but leave no artifact evidence in the registry — artifacts field is null and outcome_category is null. This implies write_result was either not called or its payload was not intercepted by wos_completion.py. The original gap (PR #867) was fixed by PR #891 (2026-04-23). Detection heuristic was updated 2026-05-18 to use done_unverifiable count (done UoWs with no artifacts+outcome_category) instead of the broader 'shit count', which produced false positives during periods of high TTL-exceeded failures unrelated to back-propagation."
     severity: high
     threshold: 1
-    recurrence_count: 1
+    recurrence_count: 0
     first_detected: "2026-04-23"
     last_detected: "2026-04-23"
-    issue_ref: "dcetlin/Lobster#867"
+    issue_ref: null
     status: open
 
   - id: bare_python3_in_migrations
