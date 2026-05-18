@@ -89,15 +89,19 @@ completed_at = extra_row["completed_at"] if extra_row else None
 ### Step 4: Format the detail message
 
 ```python
+import os
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 def fmt_ts(ts):
-    """Format ISO timestamp to concise UTC display."""
+    """Format ISO timestamp to concise local-time display using LOBSTER_USER_TZ."""
     if not ts:
         return "—"
     try:
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d %H:%M UTC")
+        tz_name = os.environ.get("LOBSTER_USER_TZ", "America/New_York")
+        local_dt = dt.astimezone(ZoneInfo(tz_name))
+        return local_dt.strftime("%Y-%m-%d %H:%M %Z")
     except Exception:
         return ts[:16]
 

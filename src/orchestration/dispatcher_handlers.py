@@ -869,11 +869,11 @@ def handle_wos_abort(uow_id: str, *, registry: "Registry") -> str:
 
 def handle_wos_uow(uow_id: str, *, registry: "Registry") -> str:
     """
-    Handle '/wos uow <uow_id>' — return a task file path for dispatcher subagent dispatch.
+    Handle '/wos uow <uow_id>' — validate the UoW and return a sentinel or error string.
 
     This function validates the UoW exists (or could exist via suffix match) and
-    returns the path to the task file that the dispatcher should use when spawning
-    the wos-uow-detail subagent.
+    returns the sentinel string "found" so the dispatcher knows it can proceed to
+    spawn the wos-uow-detail subagent.
 
     The dispatcher is responsible for:
       1. Reading the task file.
@@ -882,9 +882,9 @@ def handle_wos_uow(uow_id: str, *, registry: "Registry") -> str:
       3. Sending an ack reply ("Looking up UoW...").
 
     Returns:
-        A string describing the outcome — either the task file path (success) or an
-        inline not-found message. When the UoW is not found, the dispatcher should
-        send the returned string directly to the user without spawning a subagent.
+        The sentinel string "found" if the UoW exists, or an inline not-found message
+        string if no matching UoW was found. When the UoW is not found, the dispatcher
+        should send the returned string directly to the user without spawning a subagent.
 
     Note: Full detail formatting (timestamps, cycle counts, etc.) happens inside the
     subagent using the task file. This function only performs a lightweight existence
