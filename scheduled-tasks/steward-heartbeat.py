@@ -58,7 +58,7 @@ if str(_REPO_ROOT) not in sys.path:
 from src.orchestration.paths import REGISTRY_DB
 from src.orchestration.steward import is_bootup_candidate_gate_active, run_steward_cycle
 from src.orchestration.github_sync import run_post_completion_sync
-from src.orchestration.dispatcher_handlers import read_wos_config
+from src.orchestration.dispatcher_handlers import read_wos_config, _PAUSE_REASON_USER_COMMAND
 from src.utils.jobs import is_job_enabled
 
 # ---------------------------------------------------------------------------
@@ -883,7 +883,7 @@ def check_backlog_alerts(
 
         if (
             not _starvation_wos_config.get("execution_enabled", True)
-            and _starvation_wos_config.get("pause_reason") == "user_command"
+            and _starvation_wos_config.get("pause_reason") == _PAUSE_REASON_USER_COMMAND
         ):
             log.info(
                 "backlog_starvation suppressed: wos execution intentionally paused "

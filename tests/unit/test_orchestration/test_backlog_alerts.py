@@ -288,3 +288,42 @@ class TestCheckBacklogAlerts:
         msg = mock_obs.call_args[0][0]
         assert "current_depth=4" in msg
         assert "growth=+3" in msg
+
+
+# ---------------------------------------------------------------------------
+# Starvation suppression guard — pause_reason-aware behavior
+# ---------------------------------------------------------------------------
+
+class TestStarvationSuppression:
+    """Verify that the starvation alert respects the pause_reason suppression guard."""
+
+    def _run_starvation(self, wos_config: dict):
+        """Seed starvation condition and run check_backlog_alerts with a given wos_config."""
+        registry = _make_registry()
+        state = {"depths": [0, 0], "last_updated": _now_iso()}
+        registry.list.return_value = []  # current depth = 0
+
+        with patch.object(_MODULE, "_load_backlog_state", return_value=state), \
+             patch.object(_MODULE, "_save_backlog_state"), \
+             patch.object(_MODULE, "_append_observation") as mock_obs, \
+             patch.object(_MODULE, "read_wos_config", return_value=wos_config):
+            result = check_backlog_alerts(registry)
+
+        return result, mock_obs
+
+    def test_suppression_fires_when_user_commanded_pause(self) -> None:
+        """Starvation condition met + execution_enabled=False + pause_reason=user_command
+        → _append_observation NOT called; log message contains 'suppressed'."""
+        wos_config = {"execution_enabled": False, "pause_reason": "user_command"}
+        result, mock_obs = self._run_starvation(wos_config)
+        assert result.starvation_alert is True  # detection still fires
+        mock_obs.assert_not_called()  # but observation is suppressed
+
+    def test_no_suppression_when_pause_reason_absent(self) -> None:
+        """Starvation condition met + execution_enabled=False + no pause_reason
+        → _append_observation IS called (infrastructure-triggered pause, not user intent)."""
+        wos_config = {"execution_enabled": False}
+        result, mock_obs = self._run_starvation(wos_config)
+        assert result.starvation_alert is True
+        mock_obs.assert_called_once()
+        assert "backlog_starvation" in mock_obs.call_args[0][0]

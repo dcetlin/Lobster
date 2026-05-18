@@ -105,6 +105,12 @@ def _write_wos_config(config: dict) -> None:
     tmp.rename(_WOS_CONFIG_PATH)
 
 
+# Canonical pause_reason value written to wos-config.json when the operator
+# explicitly runs `wos stop`. Steward-heartbeat imports this constant to
+# identify intentional pauses and suppress false-positive starvation alerts.
+_PAUSE_REASON_USER_COMMAND: str = "user_command"
+
+
 # ---------------------------------------------------------------------------
 # WOS-core job list — canonical gate list for wos start / wos stop
 # ---------------------------------------------------------------------------
@@ -767,7 +773,7 @@ def handle_wos_stop(*, registry: "Registry | None" = None) -> str:
         )
 
     try:
-        result = toggle_wos_core_jobs(enabled=False, pause_reason="user_command")
+        result = toggle_wos_core_jobs(enabled=False, pause_reason=_PAUSE_REASON_USER_COMMAND)
     except OSError as exc:
         return (
             f"Failed to disable WOS-core jobs: {exc}\n"
