@@ -1251,6 +1251,72 @@ send_reply(chat_id=chat_id, text=text, source=source, message_id=message_id)
 
 ---
 
+## /config — User Config File Commands (issue #1018)
+
+These commands provide Telegram access to user bootup config files in `~/lobster-user-config/agents/`. System files in `.claude/` are protected and not accessible via these commands.
+
+Match trigger: `msg["text"].strip().lower().startswith("/config")` or `msg["text"].strip().lower().startswith("config ")`
+
+Parse the subcommand:
+```python
+parts = msg["text"].strip().lstrip("/").split(None, 2)
+# parts[0] == "config", parts[1] == subcommand, parts[2] == args (optional)
+subcommand = parts[1].lower() if len(parts) > 1 else ""
+args = parts[2] if len(parts) > 2 else ""
+```
+
+**`/config list`** — inline, no subagent needed:
+
+```python
+from src.orchestration.dispatcher_handlers import handle_config_list
+
+send_reply(chat_id=chat_id, text=handle_config_list(), source=source, message_id=message_id)
+```
+
+**`/config read <filename>`** — inline for short files; chunked reply for long files:
+
+```python
+from src.orchestration.dispatcher_handlers import handle_config_read
+
+filename = args.strip()
+if not filename:
+    send_reply(chat_id=chat_id, text="Usage: /config read <filename>", source=source, message_id=message_id)
+else:
+    content, needs_chunking = handle_config_read(filename)
+    if needs_chunking:
+        # Send first 4000 chars with a note
+        chunk = content[:4000]
+        note = f"\n\n... ({len(content)} chars total, showing first 4000)"
+        send_reply(chat_id=chat_id, text=chunk + note, source=source, message_id=message_id)
+    else:
+        send_reply(chat_id=chat_id, text=content, source=source, message_id=message_id)
+```
+
+**`/config search <query>`** — inline search across all user config files:
+
+```python
+from src.orchestration.dispatcher_handlers import handle_config_search
+
+query = args.strip()
+send_reply(chat_id=chat_id, text=handle_config_search(query), source=source, message_id=message_id)
+```
+
+**`/config append <filename> <text>`** — inline append to a user config file:
+
+```python
+from src.orchestration.dispatcher_handlers import handle_config_append
+
+# args format: "<filename> <text>"
+append_parts = args.split(None, 1)
+if len(append_parts) < 2:
+    send_reply(chat_id=chat_id, text="Usage: /config append <filename> <text>", source=source, message_id=message_id)
+else:
+    filename, text = append_parts[0], append_parts[1]
+    send_reply(chat_id=chat_id, text=handle_config_append(filename, text), source=source, message_id=message_id)
+```
+
+---
+
 ## Skill System
 
 At message processing start (when skills are enabled), call `get_skill_context` to load assembled context from all active skills. Apply returned instructions alongside base context.
