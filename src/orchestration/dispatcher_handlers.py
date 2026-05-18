@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 from .registry import ApproveConfirmed, ApproveExpired, ApproveNotFound, ApproveSkipped
 from .paths import LOBSTER_WORKSPACE as _LOBSTER_WORKSPACE, WOS_CONFIG as _WOS_CONFIG_PATH_FROM_PATHS, WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG, JOBS_JSON as _JOBS_JSON_PATH
 from .steward import ReturnReasonClassification, MAX_RETRIES as _STEWARD_MAX_RETRIES, _HARD_CAP_CYCLES
+from .wos_issue_lifecycle import HUMAN_GATE_LABELS as _HUMAN_GATE_LABELS
 from src.utils.timezone import format_iso_for_user as _format_iso_for_user, get_owner_tz_name as _get_owner_tz_name
 
 
@@ -536,8 +537,9 @@ def handle_wos_execute(uow_id: str, instructions: str, output_ref: str) -> str:
         f"   ```bash\n"
         f"   gh pr view <PR_NUMBER> --repo <REPO> --json labels --jq '[.labels[].name]'\n"
         f"   ```\n\n"
-        f"2. If the output contains any of these labels — **`awaiting-sign-off`**, "
-        f"`needs-decision`, `blocked-on-dan` — **do not close the PR**. Instead:\n"
+        f"2. If the output contains any of these labels — "
+        f"{', '.join(f'**`{lbl}`**' for lbl in sorted(_HUMAN_GATE_LABELS))} — "
+        f"**do not close the PR**. Instead:\n"
         f"   - Skip the close operation entirely.\n"
         f"   - Include in your result file's `reason` field: "
         f"\"PR #<N> skipped: carries human-gate label <LABEL> — human review required\"\n"

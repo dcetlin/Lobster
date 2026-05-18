@@ -224,8 +224,9 @@ def is_pr_human_gated(pr_number: int, repo: str, gh_bin: str = "gh") -> str | No
     Callers should skip automated close operations and surface to the dispatcher
     when this returns a non-None value.
 
-    Returns None on gh CLI failure — callers must treat an error as "unknown"
-    and surface rather than silently close.
+    Returns "unknown-check-failed" (a non-None string) on gh CLI failure —
+    callers must treat a non-None return value as gated and skip the close
+    operation rather than silently proceed.
     """
     try:
         result = _run_gh(
@@ -233,8 +234,7 @@ def is_pr_human_gated(pr_number: int, repo: str, gh_bin: str = "gh") -> str | No
              "--jq", "[.labels[].name]"],
             gh_bin=gh_bin,
         )
-        import json as _json
-        labels: list[str] = _json.loads(result.stdout.decode().strip())
+        labels: list[str] = json.loads(result.stdout.decode().strip())
         for label in labels:
             if label in HUMAN_GATE_LABELS:
                 return label
