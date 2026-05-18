@@ -899,6 +899,7 @@ wait_for_messages() returns with message
          │
          ▼
 mark_processing(message_id)  ← claim it first
+  (injects _lobster_meta hints — see below)
          │
          ▼
 Route by message type and source
@@ -918,6 +919,38 @@ wait_for_messages() ← loop back
 ```
 
 **State directories:** `inbox/` → `processing/` → `processed/` (or → `failed/` → retried back to `inbox/`)
+
+### `_lobster_meta` Pre-Classification Envelope (issue #1023)
+
+`inbox_server.py` populates a `_lobster_meta` field on every message at `mark_processing()` time. These are **hints only** — fast heuristics (<5ms, no LLM calls). Never trust them blindly; a message could trigger false matches.
+
+Available fields after `mark_processing()`:
+
+```json
+"_lobster_meta": {
+  "intent_class": "operational" | "emotional" | "code" | "question" | "reaction" | "system",
+  "urgency": "high" | "normal" | "low",
+  "is_user_facing": true | false,
+  "preprocessed_at": "2026-03-28T..."
+}
+```
+
+**`intent_class`** — keyword-matched message category:
+- `"system"` — message type is a system type (wos_execute, subagent_result, etc.)
+- `"reaction"` — Telegram emoji reaction
+- `"code"` — bug, PR, fix, error, import, test, deploy, etc.
+- `"question"` — ends with ?, or starts with what/how/why/can you/etc.
+- `"emotional"` — feel, anxious, stressed, excited, grateful, etc.
+- `"operational"` — schedule, task, config, wos, lobster, job, etc. (default fallback)
+
+**`urgency`** — keyword urgency signal:
+- `"high"` — urgent, asap, broken, down, critical, emergency, etc.
+- `"low"` — whenever, no rush, low priority, eventually, fyi, etc.
+- `"normal"` — no urgency keyword found
+
+**`is_user_facing`** — `true` when source is in the user-facing sources set, `chat_id != 0`, and type is not a system type.
+
+**Usage guidance:** Use `_lobster_meta` to help route messages — e.g., prioritize high-urgency replies, or skip context injection for system messages. The dispatcher must always verify routing decisions against the actual message content; `_lobster_meta` is a speed hint, not an authoritative classification.
 
 ---
 
