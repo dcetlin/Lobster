@@ -60,3 +60,72 @@ patterns:
     last_detected: "2026-04-23"
     issue_ref: null
     status: open
+
+  - id: legibility_failure/silent-contract-violation
+    name: "legibility failure: silent contract violation"
+    description: |
+      A monitoring or sweep instruction queries an external resource (GitHub label, file path, API endpoint)
+      without first verifying the resource exists. Empty results are treated as valid signal — the query
+      returns zero items and the sweep reads this as "nothing to report," when the real condition is
+      "the resource this sweep depends on does not exist." No error surfaces when the contract is broken.
+      The sweep reads confidently and misreads.
+
+      Concrete example: a sweep that counts open issues with label "wos:executing" will return zero if
+      the label has been renamed or deleted — indistinguishable from a genuine zero-count. The sweep
+      reported a throughput stall when the label had been renamed, not because throughput had stalled.
+
+      Note on classification completeness: the write_result_not_back_propagated smell (PR #891/#867)
+      is itself an instance of this class — the detection heuristic queried "shit count" without
+      verifying that TTL-exceeded failures would not produce the same reading as back-propagation
+      failures. The empty-contract and the empty-result were indistinguishable.
+    severity: high
+    detection_heuristic: |
+      Before any query to an external resource (gh issue list --label X, file read, API call),
+      verify the resource exists: label via `gh label list`, file via existence check, API endpoint
+      via a probe call. If the resource is absent, the instruction must fail loudly — not silently
+      proceed with empty results.
+    examples:
+      - "Sweep counts `gh issue list --label wos:executing` — label renamed → zero count → false stall report"
+      - "write_result_not_back_propagated detection used 'shit count' which TTL-exceeded failures could also produce — contract between metric and failure class was never verified"
+    fix_pattern: "contract-declarations harness pattern (see sweep-instruction.template.md: Dependencies section)"
+    threshold: 1
+    recurrence_count: 1
+    first_detected: "2026-05-18"
+    last_detected: "2026-05-18"
+    issue_ref: null
+    status: open
+
+  - id: coherence_failure/missing-state-registry-read
+    name: "coherence failure: missing state registry read"
+    description: |
+      A diagnostic or sweep agent classifies system state (stalled, healthy, failing, starved) without
+      first reading the canonical operational state registry (e.g. wos-config.json). Valid operational
+      states that exist only in the registry are invisible to the classifier — "deliberately paused"
+      did not exist in the sweep's conceptual space, so it misclassified a valid, intentional state
+      as a stall and generated an incorrect prescription.
+
+      This is a coherence failure: the classifier's state space does not match the system's actual
+      state space. Any binary classifier (stalled/healthy) that uses elimination logic ("no throughput
+      → stalled") will misclassify when a legitimate "no-throughput" state exists but is unknown to
+      the classifier. The classifier asserted a conclusion via absence-of-evidence without first
+      exhausting the alternative explanations that are knowable from the registry.
+
+      Concrete example: sweep reported WOS throughput stall and escalated. wos-config.json had
+      `execution_enabled: false` — a deliberate pause. The sweep had not read wos-config.json, so
+      "deliberately paused" was not in its state enumeration. The escalation was spurious.
+    severity: high
+    detection_heuristic: |
+      Any sweep or diagnostic instruction that uses elimination logic to classify system health
+      (no updates → stalled, no throughput → starved) must read wos-config.json (or equivalent
+      operational state registry) before the classification step. If execution_enabled=false,
+      all throughput/activity classifications must be suppressed and the posture recorded explicitly.
+    examples:
+      - "WOS throughput sweep classified zero-dispatch as stall without reading wos-config.json; execution_enabled=false was the actual state"
+      - "Any binary health classifier (stalled/running) that does not enumerate deliberate-pause as a third state will misclassify a paused system as failing"
+    fix_pattern: "shared-state-registry-read and classification-completeness-invariant harness patterns (see sweep-instruction.template.md: Operational Posture and Classification States sections)"
+    threshold: 1
+    recurrence_count: 1
+    first_detected: "2026-05-18"
+    last_detected: "2026-05-18"
+    issue_ref: null
+    status: open
