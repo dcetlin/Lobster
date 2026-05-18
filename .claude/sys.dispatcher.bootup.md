@@ -1103,6 +1103,115 @@ send_reply(chat_id=chat_id, text=handle_help(), source=source, message_id=messag
 
 ---
 
+## Inline Command Index (snag-reachable, no subagent)
+
+These prose commands execute directly on the main thread. Normalize before matching:
+```python
+cmd = msg["text"].strip().lstrip("/").lower()
+```
+
+**`status` / `health`** — inline system snapshot. `get_active_sessions()` is a fast MCP call allowed on the main thread.
+
+```python
+from src.orchestration.dispatcher_handlers import handle_status
+
+active_sessions = get_active_sessions()  # inline — fast read
+text = handle_status(active_sessions)
+send_reply(chat_id=chat_id, text=text, source=source, message_id=message_id)
+```
+
+**`usage`** — inline CC quota read. Pure file read, no MCP calls needed.
+
+```python
+from src.orchestration.dispatcher_handlers import handle_usage
+
+send_reply(chat_id=chat_id, text=handle_usage(), source=source, message_id=message_id)
+```
+
+**`usage full`** — spawns subagent for full usage report.
+
+```python
+from src.orchestration.dispatcher_handlers import handle_usage_full
+
+send_reply(chat_id=chat_id, text=handle_usage_full(), source=source, message_id=message_id)
+Task(
+    subagent_type="lobster-generalist",
+    run_in_background=True,
+    prompt=(
+        f"---\ntask_id: usage-full-report\nchat_id: {chat_id}\nsource: {source}\n---\n\n"
+        f"Run: ~/lobster/scripts/usage-report.sh --format full\n\n"
+        f"Send output to user via send_reply, then write_result(task_id=\"usage-full-report\", sent_reply_to_user=True).\n"
+        f"If usage-report.sh does not exist, reply with the raw contents of ~/.claude/cc-budget/state.json formatted readably."
+    ),
+)
+```
+
+**`agents`** — inline active agent list. `get_active_sessions()` is a fast MCP call allowed on the main thread.
+
+```python
+from src.orchestration.dispatcher_handlers import handle_agents
+
+active_sessions = get_active_sessions()  # inline — fast read
+text = handle_agents(active_sessions)
+send_reply(chat_id=chat_id, text=text, source=source, message_id=message_id)
+```
+
+**`inbox`** — inline queue depth. `check_inbox()` and `get_stats()` are allowed on the main thread.
+
+```python
+from src.orchestration.dispatcher_handlers import handle_inbox
+
+msgs = check_inbox(limit=5)
+stats = get_stats()
+total_count = stats.get("inbox_count") or stats.get("total") or len(msgs or [])
+text = handle_inbox(msgs or [], total_count)
+send_reply(chat_id=chat_id, text=text, source=source, message_id=message_id)
+```
+
+**`restart mcp`** — inline ack then subagent restart. The inline half writes the ack; the subagent handles the slow systemctl call.
+
+```python
+from src.orchestration.dispatcher_handlers import handle_restart_mcp
+
+send_reply(
+    chat_id=chat_id,
+    text=handle_restart_mcp(),
+    source=source,
+    message_id=message_id,
+)
+Task(
+    subagent_type="lobster-generalist",
+    run_in_background=True,
+    prompt=(
+        f"---\ntask_id: restart-mcp-exec\nchat_id: {chat_id}\nsource: {source}\n---\n\n"
+        f"Run: ~/lobster/scripts/restart-mcp.sh --no-wait\n\n"
+        f"Then call: write_result(task_id=\"restart-mcp-exec\", sent_reply_to_user=True)"
+    ),
+)
+```
+
+Note: `message_id` is passed to `send_reply` to atomically mark the message as processed.
+
+**`restart dispatcher`** — inline instructions. No code operation; returns a static message.
+
+```python
+from src.orchestration.dispatcher_handlers import handle_restart_dispatcher
+
+send_reply(chat_id=chat_id, text=handle_restart_dispatcher(), source=source, message_id=message_id)
+```
+
+**`debug on` / `debug off`** — inline flag file toggle.
+
+```python
+from src.orchestration.dispatcher_handlers import handle_debug
+
+on = cmd == "debug on"
+text = handle_debug(on=on)
+send_reply(chat_id=chat_id, text=text, source=source, message_id=message_id)
+```
+
+---
+
 ## Skill System
 
 At message processing start (when skills are enabled), call `get_skill_context` to load assembled context from all active skills. Apply returned instructions alongside base context.

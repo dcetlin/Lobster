@@ -2395,3 +2395,147 @@ def format_status_message(
     quota_line = "◉ " + format_quota_message(quota_state)
 
     return "\n".join([wos_line, agents_line, quota_line])
+
+
+# ---------------------------------------------------------------------------
+# Inline dispatcher command handlers (Phase 1 + 2)
+#
+# These handlers implement snag-reachable commands that execute directly on
+# the dispatcher main thread without spawning a subagent.  Each function is
+# pure with respect to MCP calls — any MCP data (active_sessions, inbox msgs)
+# must be gathered by the dispatcher before calling these functions.
+# ---------------------------------------------------------------------------
+
+# Path to the debug-enabled flag file.  Touch to enable; unlink to disable.
+_DEBUG_FLAG_PATH: Path = Path.home() / "lobster-workspace" / "data" / "debug-enabled"
+
+
+def handle_usage() -> str:
+    """Handle prose 'usage' command — inline CC quota read from state.json.
+
+    Pure file read: reads cc-budget/state.json via read_quota_state() and
+    formats the result using format_quota_message().  Adds session cost when
+    available.  Returns the unavailable message when the file is absent or stale.
+    """
+    state = read_quota_state()
+    quota_msg = format_quota_message(state)
+    if state:
+        cost = state.get("session_cost_usd")
+        if cost is not None:
+            quota_msg += f"\nSession cost: ${cost:.2f}"
+    return quota_msg
+
+
+def handle_status(active_sessions: list[dict]) -> str:
+    """Handle prose 'status' / 'health' command — inline system snapshot.
+
+    Reads wos-config.json and cc-budget/state.json directly (fast file reads).
+    active_sessions must be gathered by the dispatcher via get_active_sessions()
+    before calling this function.
+
+    Returns a 3-line status string covering WOS state, agent count, and CC usage.
+    """
+    wos_config = read_wos_config()
+    quota_state = read_quota_state()
+
+    execution_enabled = bool(wos_config.get("execution_enabled", False))
+    wos_label = "enabled" if execution_enabled else "stopped"
+
+    agent_count = len(active_sessions)
+    quota_msg = format_quota_message(quota_state)
+
+    return "\n".join([
+        f"WOS: {wos_label}",
+        f"Active agents: {agent_count}",
+        quota_msg,
+    ])
+
+
+def handle_agents(active_sessions: list[dict]) -> str:
+    """Handle prose 'agents' command — format active session list.
+
+    active_sessions must be gathered by the dispatcher via get_active_sessions()
+    before calling this function.
+    """
+    if not active_sessions:
+        return "No active agents."
+    lines = [f"Active agents ({len(active_sessions)}):"]
+    for s in active_sessions:
+        agent_id = s.get("task_id") or s.get("agent_id") or s.get("id") or "?"
+        desc = s.get("description", "")
+        lines.append(f"  • {agent_id}: {desc}")
+    return "\n".join(lines)
+
+
+def handle_inbox(msgs: list[dict], total_count: int) -> str:
+    """Handle prose 'inbox' command — format queue depth and recent messages.
+
+    msgs and total_count must be gathered by the dispatcher via check_inbox()
+    and get_stats() before calling this function.
+    """
+    lines = [f"Inbox: {total_count} pending"]
+    for m in (msgs or [])[:5]:
+        preview = (m.get("text") or "")[:60].replace("\n", " ")
+        if preview:
+            lines.append(f"  • {preview}")
+    return "\n".join(lines)
+
+
+def handle_debug(on: bool) -> str:
+    """Handle 'debug on' / 'debug off' — toggle the debug-enabled flag file.
+
+    Touches ~/lobster-workspace/data/debug-enabled to enable debug mode;
+    unlinks it to disable.  Returns a confirmation string.
+    """
+    try:
+        if on:
+            _DEBUG_FLAG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _DEBUG_FLAG_PATH.touch()
+            return f"Debug mode enabled. Flag: `{_DEBUG_FLAG_PATH}`"
+        else:
+            if _DEBUG_FLAG_PATH.exists():
+                _DEBUG_FLAG_PATH.unlink()
+            return "Debug mode disabled. Flag file removed."
+    except OSError as exc:
+        return f"Debug toggle failed: {exc}"
+
+
+def handle_restart_mcp() -> str:
+    """Handle 'restart mcp' — return the inline ACK message.
+
+    The dispatcher sends this text as an immediate reply, then spawns a subagent
+    to run ~/lobster/scripts/restart-mcp.sh --no-wait.  The subagent performs
+    the actual restart; the dispatcher reconnects automatically.
+
+    Returns the ACK text to send before the subagent is spawned.
+    """
+    return (
+        "MCP restart initiated. The service will restart in ~5 seconds. "
+        "Reconnection is automatic — you may see a brief gap in responsiveness."
+    )
+
+
+def handle_restart_dispatcher() -> str:
+    """Handle 'restart dispatcher' — return manual restart instructions.
+
+    The Claude Code process cannot restart itself.  This function returns
+    the instructions Dan must follow to restart the dispatcher manually.
+    """
+    return (
+        "The dispatcher (Claude Code process) cannot restart itself.\n\n"
+        "To restart:\n"
+        "1. Open a new terminal on the Lobster host\n"
+        "2. Run: ~/lobster/scripts/claude-persistent.sh\n"
+        "3. The new session will pick up from the inbox queue automatically."
+    )
+
+
+def handle_usage_full() -> str:
+    """Handle 'usage full' — return the spawning acknowledgement.
+
+    This command is NOT snag-reachable by design: it requires a subagent.
+    Returns the ack text to send before spawning the usage-report subagent.
+    The dispatcher is responsible for the actual Task spawn with the appropriate
+    prompt (run usage-report.sh --format full, or fall back to state.json).
+    """
+    return "Spawning usage report agent..."
