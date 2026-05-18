@@ -615,20 +615,19 @@ class TestRenderHtml:
         assert "uow_20260101_abc" in html
 
     def test_drilldown_link_rendered_when_url_provided(self):
-        """UoW ID cell becomes a link when a drilldown URL is available."""
+        """UoW ID cell always links to the stable /wos/uow/<uow_id> route."""
         from src.orchestration.wos_dashboard import render_html
         urls = {"uow_20260101_abc": "http://test:9101/files/abc.html"}
         html = render_html(self._base_data(), drilldown_urls=urls)
-        assert 'href="http://test:9101/files/abc.html"' in html
+        assert 'href="/wos/uow/uow_20260101_abc"' in html
         assert "uow_20260101_abc" in html
 
-    def test_no_link_when_no_drilldown_url(self):
-        """When drilldown_urls is empty, UoW ID appears as plain text (no href link for it)."""
+    def test_link_always_present_without_drilldown_urls(self):
+        """UoW ID cell always links to /wos/uow/<uow_id>, even when drilldown_urls is empty."""
         from src.orchestration.wos_dashboard import render_html
         html = render_html(self._base_data(), drilldown_urls={})
-        # The uow id appears but there should be no drilldown href for it
+        assert 'href="/wos/uow/uow_20260101_abc"' in html
         assert "uow_20260101_abc" in html
-        assert "http://test:9101/files/" not in html
 
     def test_dashboard_title_in_html(self):
         from src.orchestration.wos_dashboard import render_html
@@ -653,7 +652,7 @@ class TestRenderHtml:
         assert "uow_stalled" in html
 
     def test_drilldown_links_for_stalled_uow(self):
-        """Stalled UoWs also get drilldown links when URLs are available."""
+        """Stalled UoWs always link to /wos/uow/<uow_id>."""
         from src.orchestration.wos_dashboard import render_html
         data = self._base_data()
         data["stalled_uows"] = [{
@@ -663,7 +662,7 @@ class TestRenderHtml:
         }]
         urls = {"uow_stalled_x": "http://test:9101/files/stalled.html"}
         html = render_html(data, drilldown_urls=urls)
-        assert 'href="http://test:9101/files/stalled.html"' in html
+        assert 'href="/wos/uow/uow_stalled_x"' in html
 
     def test_issue_title_displayed_in_active_row(self):
         """When a UoW row has an issue_title, it appears prominently in the row HTML."""

@@ -635,11 +635,12 @@ def render_text(data: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 def _uow_id_cell(uow_id: str, drilldown_urls: dict[str, str]) -> str:
-    """Return an HTML table cell for a UoW ID, optionally linked to its drilldown page."""
-    url = drilldown_urls.get(uow_id)
-    if url:
-        return f'<td class="uid"><a href="{url}" target="_blank">{uow_id} &#x2197;</a></td>'
-    return f'<td class="uid">{uow_id}</td>'
+    """Return an HTML table cell for a UoW ID linked to its detail page.
+
+    Always links to the stable /wos/uow/<uow_id> route served by the Bisque relay.
+    """
+    url = f"/wos/uow/{uow_id}"
+    return f'<td class="uid"><a href="{url}" target="_blank">{uow_id} &#x2197;</a></td>'
 
 
 def _active_uow_row(u: dict, drilldown_urls: dict[str, str]) -> str:

@@ -27,7 +27,9 @@ import logging
 import logging.handlers
 import mimetypes
 import os
+import re
 import signal
+import sys
 import tempfile
 import time
 import uuid
@@ -727,6 +729,79 @@ class BisqueRelayServer:
             },
         )
 
+    # --- HTTP handler: GET /wos/uow/{uow_id} (WOS UoW detail page) ---
+
+    async def _http_wos_uow_detail(self, request: web.Request) -> web.Response:
+        """Serve a live per-UoW detail page queried from the WOS registry DB.
+
+        No auth required — the page contains observability data, not user data.
+        Returns 404 if the UoW is not found, 500 on DB error.
+
+        URL pattern: /wos/uow/{uow_id}
+        Example:     /wos/uow/uow_20260517_4827ef
+        """
+        uow_id = request.match_info.get("uow_id", "")
+        # Basic validation: UoW IDs follow the pattern uow_YYYYMMDD_XXXXXX
+        if not uow_id or not re.fullmatch(r"uow_\d{8}_[0-9a-f]+", uow_id):
+            return web.Response(
+                status=400,
+                text="Invalid UoW ID format. Expected: uow_YYYYMMDD_XXXXXX",
+                content_type="text/plain",
+            )
+
+        try:
+            _install = Path(os.environ.get("LOBSTER_INSTALL_DIR", str(Path.home() / "lobster")))
+            _src = _install / "src"
+            if str(_src) not in sys.path:
+                sys.path.insert(0, str(_src))
+            from orchestration import wos_uow_detail_gen  # type: ignore[import]
+
+            db_path = wos_uow_detail_gen._registry_path()
+            ledger_path = wos_uow_detail_gen._ledger_path()
+
+            conn = wos_uow_detail_gen._connect(db_path)
+            try:
+                uow_data = wos_uow_detail_gen._fetch_uow_data(conn, uow_id)
+                if uow_data is None:
+                    return web.Response(
+                        status=404,
+                        text=f"UoW {uow_id!r} not found in registry",
+                        content_type="text/plain",
+                    )
+                audit_trail = wos_uow_detail_gen._fetch_audit_trail(conn, uow_id)
+                traces = wos_uow_detail_gen._fetch_corrective_traces(conn, uow_id)
+                heartbeats = wos_uow_detail_gen._fetch_heartbeat_log(conn, uow_id)
+            finally:
+                conn.close()
+
+            ledger_entries = wos_uow_detail_gen._read_ledger(ledger_path)
+            token_data = wos_uow_detail_gen._fetch_token_data(ledger_entries, uow_id)
+
+            html = wos_uow_detail_gen.generate_html(
+                uow_data, audit_trail, traces, heartbeats, token_data
+            )
+
+            # Patch the back-link to point at the WOS dashboard stable URL
+            html = html.replace(
+                '<a class="back" href="javascript:history.back()">← Back</a>',
+                '<a class="back" href="/files/wos-dashboard-active.html">← WOS Dashboard</a>',
+            )
+
+            return web.Response(
+                body=html.encode("utf-8"),
+                content_type="text/html",
+                charset="utf-8",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+        except Exception as exc:
+            log.error("Error rendering WOS UoW detail for %s: %s", uow_id, exc)
+            return web.Response(
+                status=500,
+                text=f"Internal error: {exc}",
+                content_type="text/plain",
+            )
+
     # --- WebSocket handler ---
 
     async def _ws_handler(self, request: web.Request) -> web.WebSocketResponse:
@@ -1339,6 +1414,9 @@ class BisqueRelayServer:
         app.router.add_post("/bisque-relay/upload", self._http_upload)
         app.router.add_route("OPTIONS", "/bisque-relay/upload", self._http_upload_options)
         app.router.add_get("/bisque-relay/files/{filename}", self._http_serve_file)
+        # WOS UoW detail page — dynamic, live-queried from registry DB
+        app.router.add_get("/wos/uow/{uow_id}", self._http_wos_uow_detail)
+        app.router.add_get("/bisque-relay/wos/uow/{uow_id}", self._http_wos_uow_detail)
         app.router.add_get("/", self._ws_handler)
         # Catch-all for WS connections on any path
         app.router.add_get("/{path:.*}", self._ws_handler)
