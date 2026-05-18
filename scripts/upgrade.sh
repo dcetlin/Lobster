@@ -877,11 +877,15 @@ restart_services() {
     step "Restarting services"
 
     if $DRY_RUN; then
-        info "[dry-run] Would restart lobster-router and lobster-claude"
+        info "[dry-run] Would restart lobster-router (lobster-claude skipped — restarts itself)"
         return 0
     fi
 
-    local services=("lobster-router" "lobster-claude")
+    # lobster-claude is intentionally excluded from this list.
+    # Restarting it here would kill the active dispatcher session mid-upgrade,
+    # before migrations have run (step 9). The dispatcher restarts itself on the
+    # next message cycle after upgrade.sh completes. See issue #1107.
+    local services=("lobster-router")
 
     for svc in "${services[@]}"; do
         if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
@@ -906,6 +910,8 @@ restart_services() {
         substep "Restarting lobster-slack-router..."
         sudo systemctl restart "lobster-slack-router" 2>/dev/null || warn "Failed to restart slack router"
     fi
+
+    info "Note: lobster-claude restart skipped — the dispatcher restarts itself on the next message cycle."
 
     log_to_file "Services restarted"
 }
