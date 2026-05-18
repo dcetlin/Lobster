@@ -4172,6 +4172,68 @@ PYEOF
         fi
     fi
 
+    # Migration 119: Re-enable disabled systemd timers for WOS-core jobs (issue #1179).
+    # toggle_wos_core_jobs (wos start/stop) previously only toggled the jobs.json
+    # `enabled` flag without managing the corresponding systemd timers. After a
+    # `wos stop` + `wos start` cycle, the timers for issue-sweeper,
+    # github-issue-cultivator, pattern-candidate-sweep, uow-reflection,
+    # wos-overnight-loop, wos-hourly-observation, and wos-health-monitor were left
+    # disabled, preventing dispatch-job.sh from ever being called — and therefore
+    # no new UoWs were created. This migration re-enables the timers when
+    # execution_enabled=true in wos-config.json.
+    _m119_wos_config="${LOBSTER_WORKSPACE}/data/wos-config.json"
+    _m119_execution_enabled="false"
+    if [ -f "$_m119_wos_config" ]; then
+        _m119_execution_enabled=$(uv run - "$_m119_wos_config" << 'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    print("true" if data.get("execution_enabled") else "false")
+except Exception:
+    print("false")
+PYEOF
+        2>/dev/null || echo "false")
+    fi
+
+    _m119_timer_jobs="issue-sweeper github-issue-cultivator pattern-candidate-sweep uow-reflection wos-overnight-loop wos-hourly-observation wos-health-monitor"
+    _m119_enabled_count=0
+    _m119_skipped_count=0
+
+    if [ "$_m119_execution_enabled" = "true" ]; then
+        for _m119_job in $_m119_timer_jobs; do
+            _m119_timer="lobster-${_m119_job}.timer"
+            _m119_unit="/etc/systemd/system/${_m119_timer}"
+            if [ ! -f "$_m119_unit" ]; then
+                continue
+            fi
+            # Only touch LOBSTER-MANAGED timers (safety guard)
+            if ! grep -q '# LOBSTER-MANAGED' "$_m119_unit" 2>/dev/null; then
+                substep "Migration 119: $_m119_timer lacks LOBSTER-MANAGED — skipping"
+                _m119_skipped_count=$((_m119_skipped_count + 1))
+                continue
+            fi
+            if ! systemctl is-enabled --quiet "$_m119_timer" 2>/dev/null; then
+                sudo systemctl daemon-reload 2>/dev/null || true
+                sudo systemctl enable --now "$_m119_timer" 2>/dev/null \
+                    && substep "Migration 119: enabled $_m119_timer" \
+                    || warn "Migration 119: could not enable $_m119_timer — check sudo permissions"
+                _m119_enabled_count=$((_m119_enabled_count + 1))
+            else
+                substep "Migration 119: $_m119_timer already enabled — skipping"
+            fi
+        done
+        if [ "$_m119_enabled_count" -gt 0 ]; then
+            sudo systemctl daemon-reload 2>/dev/null || true
+            success "Migration 119: re-enabled $_m119_enabled_count WOS-core systemd timer(s)"
+            migrated=$((migrated + _m119_enabled_count))
+        else
+            substep "Migration 119: all WOS-core timers already enabled (or none found) — skipping"
+        fi
+    else
+        substep "Migration 119: execution_enabled=false — leaving timers disabled (pipeline is paused)"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
