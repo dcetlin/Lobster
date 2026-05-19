@@ -68,6 +68,12 @@ class UoWStatus(StrEnum):
     # Steward escalates to Dan rather than continuing to re-dispatch.
     # Treated as non-terminal (does not allow automatic re-proposal).
     NEEDS_HUMAN_REVIEW = "needs-human-review"
+    # AWAITING_OWNER: subagent surfaced a decision that only the owner can resolve.
+    # Entered from 'executing' when the subagent writes outcome=owner_decision_required.
+    # The UoW is paused — not failed — until Dan re-queues it (sets back to
+    # ready-for-steward with a decision note) or marks it done.
+    # Treated as non-terminal (does not allow automatic re-proposal).
+    AWAITING_OWNER = "awaiting-owner"
 
     def is_terminal(self) -> bool:
         """True for statuses that allow re-proposal (done, failed, expired, cancelled).
@@ -83,7 +89,7 @@ class UoWStatus(StrEnum):
         return self in {UoWStatus.DONE, UoWStatus.FAILED, UoWStatus.EXPIRED, UoWStatus.CANCELLED}
 
     def is_in_flight(self) -> bool:
-        """True for statuses that block re-proposal (active, executing, pending, ready-for-steward, ready-for-executor, diagnosing)."""
+        """True for statuses that block re-proposal (active, executing, pending, ready-for-steward, ready-for-executor, diagnosing, awaiting-owner)."""
         return self in {
             UoWStatus.ACTIVE,
             UoWStatus.EXECUTING,
@@ -91,6 +97,7 @@ class UoWStatus(StrEnum):
             UoWStatus.READY_FOR_STEWARD,
             UoWStatus.READY_FOR_EXECUTOR,
             UoWStatus.DIAGNOSING,
+            UoWStatus.AWAITING_OWNER,
         }
 
 
@@ -1006,6 +1013,137 @@ class Registry:
                 (new_status, now, uow_id),
             )
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def set_awaiting_owner(self, uow_id: str, decision_text: str) -> None:
+        """
+        Transition a UoW to 'awaiting-owner' status and record the decision context.
+
+        Called when a subagent writes outcome=owner_decision_required in its result
+        file, signalling that the UoW requires the owner's (Dan's) direct input to
+        proceed.  The UoW is paused — not failed — until the owner re-queues it
+        (transitions back to ready-for-steward with a decision note) or marks it done.
+
+        The decision_text is appended to steward_log so the owner can read what
+        decision is needed when reviewing the UoW.
+
+        Raises ValueError if uow_id is not found in the registry.
+        """
+        import json as _json
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, steward_log FROM uow_registry WHERE id = ?", (uow_id,)
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise ValueError(f"set_awaiting_owner: UoW {uow_id!r} not found in registry")
+            old_status = row["status"]
+            # Idempotency guard: if the UoW is already in awaiting-owner, return
+            # without writing duplicate steward_log entries or a spurious audit
+            # entry (awaiting-owner → awaiting-owner is meaningless).
+            if old_status == UoWStatus.AWAITING_OWNER:
+                conn.rollback()
+                return
+            now = _now_iso()
+            # Append decision context to steward_log so the history is legible.
+            existing_log = row["steward_log"] or "[]"
+            try:
+                log_entries = _json.loads(existing_log)
+            except (_json.JSONDecodeError, TypeError):
+                log_entries = []
+            log_entries.append({
+                "event": "awaiting_owner",
+                "actor": "steward",
+                "uow_id": uow_id,
+                "decision_text": decision_text,
+                "timestamp": now,
+            })
+            new_log = _json.dumps(log_entries)
+            self._write_audit(
+                conn,
+                uow_id=uow_id,
+                event="status_change",
+                from_status=old_status,
+                to_status=UoWStatus.AWAITING_OWNER,
+                note=f"awaiting owner decision: {decision_text[:200]}",
+            )
+            conn.execute(
+                "UPDATE uow_registry SET status = ?, updated_at = ?, steward_log = ? WHERE id = ?",
+                (UoWStatus.AWAITING_OWNER, now, new_log, uow_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def owner_decide(self, uow_id: str, decision_note: str) -> int:
+        """
+        Record an owner decision and re-queue a UoW from awaiting-owner to ready-for-steward.
+
+        Called when Dan provides a decision for a UoW that was paused with
+        outcome=owner_decision_required. The decision text is appended to
+        steward_log so the Steward can read what was decided when the UoW
+        re-enters the pipeline.
+
+        Transitions: awaiting-owner → ready-for-steward
+        Writes the decision note to steward_log and an audit entry in the same
+        transaction.  Does not reset steward_cycles — the cycle count reflects
+        how many Steward passes have already run and should be preserved.
+
+        Returns:
+            1 on success
+            0 if UoW is not in awaiting-owner status (optimistic-lock guard)
+
+        Raises ValueError if uow_id is not found in the registry.
+        """
+        import json as _json
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, steward_log FROM uow_registry WHERE id = ? AND status = ?",
+                (uow_id, UoWStatus.AWAITING_OWNER),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return 0
+            now = _now_iso()
+            existing_log = row["steward_log"] or "[]"
+            try:
+                log_entries = _json.loads(existing_log)
+            except (_json.JSONDecodeError, TypeError):
+                log_entries = []
+            log_entries.append({
+                "event": "owner_decided",
+                "actor": "user",
+                "uow_id": uow_id,
+                "decision_note": decision_note,
+                "timestamp": now,
+            })
+            new_log = _json.dumps(log_entries)
+            self._write_audit(
+                conn,
+                uow_id=uow_id,
+                event="status_change",
+                from_status=UoWStatus.AWAITING_OWNER,
+                to_status=UoWStatus.READY_FOR_STEWARD,
+                note=f"owner decided: {decision_note[:200]}",
+            )
+            cursor = conn.execute(
+                "UPDATE uow_registry SET status = ?, updated_at = ?, steward_log = ? WHERE id = ? AND status = ?",
+                (UoWStatus.READY_FOR_STEWARD, now, new_log, uow_id, UoWStatus.AWAITING_OWNER),
+            )
+            rows_affected = cursor.rowcount
+            conn.commit()
+            return rows_affected
         except Exception:
             conn.rollback()
             raise
@@ -2193,7 +2331,9 @@ class Registry:
     # 'blocked' covers the normal hard-cap / stuck-steward case.
     # 'ready-for-steward' covers UoWs that false-completed at executor dispatch
     # time (issue #669) and are looping in the steward queue without advancing.
-    RETRYABLE_STATUSES: frozenset[str] = frozenset({"blocked", "ready-for-steward"})
+    # 'awaiting-owner' allows the existing decide_retry path to transition a UoW
+    # back to ready-for-steward when Dan provides a decision via /wos reset.
+    RETRYABLE_STATUSES: frozenset[str] = frozenset({"blocked", "ready-for-steward", "awaiting-owner"})
 
     # Sentinel value returned by decide_retry when the UoW was cleaned up by
     # the hard-cap arc and a bare retry is rejected. Callers check for this
