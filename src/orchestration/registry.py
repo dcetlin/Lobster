@@ -2954,7 +2954,7 @@ class Registry:
         2. updated_at < now - min_age_seconds — UoW is older than the
            startup grace window (default 300s / 5 minutes)
         3. No rows exist in uow_heartbeat_log for this UoW with a
-           recorded_at > updated_at + 300s AND token_usage IS NOT NULL
+           recorded_at > updated_at + min_age_seconds AND token_usage IS NOT NULL
 
         Condition 3 is the discriminator: the absence of any agent-originated
         heartbeat log entry (token_usage IS NOT NULL) means the sidecar is the
@@ -2990,11 +2990,11 @@ class Registry:
                     FROM uow_heartbeat_log l
                     WHERE l.uow_id = r.id
                       AND l.token_usage IS NOT NULL
-                      AND l.recorded_at > datetime(r.updated_at, '+300 seconds')
+                      AND datetime(l.recorded_at) > datetime(r.updated_at, '+'||?||' seconds')
                   )
                 ORDER BY r.updated_at ASC
                 """,
-                (now, min_age_seconds),
+                (now, min_age_seconds, min_age_seconds),
             ).fetchall()
             return [self._row_to_uow(r) for r in rows]
         except Exception as exc:
@@ -3043,6 +3043,14 @@ class Registry:
         try:
             conn.execute("BEGIN IMMEDIATE")
 
+            # Capture actual current status before the UPDATE so the audit log
+            # records the real from_status (either 'active' or 'executing').
+            current_row = conn.execute(
+                "SELECT status FROM uow_registry WHERE id = ?",
+                (uow_id,),
+            ).fetchone()
+            current_status = current_row["status"] if current_row else None
+
             cursor = conn.execute(
                 """
                 UPDATE uow_registry
@@ -3058,10 +3066,10 @@ class Registry:
                     """
                     INSERT INTO audit_log
                         (ts, uow_id, event, from_status, to_status, agent, note)
-                    VALUES (?, ?, 'stall_detected', 'executing', 'ready-for-steward',
+                    VALUES (?, ?, 'stall_detected', ?, 'ready-for-steward',
                             'observation_loop', ?)
                     """,
-                    (now, uow_id, note_payload),
+                    (now, uow_id, current_status, note_payload),
                 )
 
             conn.commit()
