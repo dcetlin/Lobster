@@ -18,6 +18,32 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+
+# ---------------------------------------------------------------------------
+# jobs.json enabled gate — Type B/C cron-direct dispatch path
+# ---------------------------------------------------------------------------
+
+
+def _is_job_enabled(job_name: str) -> bool:
+    """
+    Return True if the job is enabled in jobs.json, False if explicitly disabled.
+
+    Defaults to True when:
+    - jobs.json is absent
+    - the job entry is missing
+    - the file is unreadable or malformed
+
+    This mirrors the gate logic in dispatch-job.sh so cron-direct jobs
+    respect the same runtime enable/disable toggle as LLM-dispatch jobs.
+    """
+    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+    jobs_file = workspace / "scheduled-jobs" / "jobs.json"
+    try:
+        data = json.loads(jobs_file.read_text())
+        return bool(data.get("jobs", {}).get(job_name, {}).get("enabled", True))
+    except Exception:
+        return True
+
 # ---------------------------------------------------------------------------
 # Path setup -- allow running as a script or via importlib (tests)
 # ---------------------------------------------------------------------------
@@ -307,6 +333,13 @@ def main() -> None:
         help="Scan and parse without writing anything",
     )
     args = parser.parse_args()
+
+    # jobs.json enabled gate — respect runtime enable/disable toggled via
+    # the dispatcher 'wos start/stop' commands or direct jobs.json edits.
+    if not _is_job_enabled(JOB_NAME):
+        print(f"{JOB_NAME}: skipped (disabled in jobs.json)")
+        sys.exit(0)
+
     sys.exit(run(dry_run=args.dry_run))
 
 
