@@ -2937,6 +2937,142 @@ class Registry:
         finally:
             conn.close()
 
+    def get_sidecar_masked_uows(
+        self,
+        min_age_seconds: int = 300,
+    ) -> list["UoW"]:
+        """
+        Return executing UoWs that appear live (fresh heartbeat_at) but have
+        never had an agent-originated heartbeat in uow_heartbeat_log.
+
+        This is the sidecar-masking detection query described in the
+        multi-posture spec §2.3. The sidecar writes heartbeat_at for all
+        active UoWs every 3 minutes, which can keep heartbeat_at fresh even
+        when the agent is dead. This method identifies UoWs where:
+
+        1. status IN ('active', 'executing') — UoW is in-flight
+        2. updated_at < now - min_age_seconds — UoW is older than the
+           startup grace window (default 300s / 5 minutes)
+        3. No rows exist in uow_heartbeat_log for this UoW with a
+           recorded_at > updated_at + 300s AND token_usage IS NOT NULL
+
+        Condition 3 is the discriminator: the absence of any agent-originated
+        heartbeat log entry (token_usage IS NOT NULL) means the sidecar is the
+        only source of the fresh heartbeat_at signal — the agent may be dead.
+
+        NOTE: heartbeat_at is intentionally NOT checked. A recently-updated
+        heartbeat_at is exactly the sidecar-masking signature we are detecting.
+        The liveness signal comes from uow_heartbeat_log, not heartbeat_at.
+
+        Args:
+            min_age_seconds: Minimum age (seconds since updated_at) for a UoW
+                to be included. UoWs newer than this are in the startup grace
+                window and must not be flagged. Default 300 (5 minutes),
+                matching the spec's "older than 5 minutes" threshold.
+
+        Returns:
+            List of UoW objects that are potentially sidecar-masked (may be
+            empty). Returns empty list if uow_heartbeat_log does not exist
+            (pre-0017 deploys).
+        """
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            rows = conn.execute(
+                """
+                SELECT r.*
+                FROM uow_registry r
+                WHERE r.status IN ('active', 'executing')
+                  AND CAST((julianday(?) - julianday(r.updated_at)) * 86400 AS INTEGER)
+                      > ?
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM uow_heartbeat_log l
+                    WHERE l.uow_id = r.id
+                      AND l.token_usage IS NOT NULL
+                      AND l.recorded_at > datetime(r.updated_at, '+300 seconds')
+                  )
+                ORDER BY r.updated_at ASC
+                """,
+                (now, min_age_seconds),
+            ).fetchall()
+            return [self._row_to_uow(r) for r in rows]
+        except Exception as exc:
+            log.debug(
+                "get_sidecar_masked_uows: query failed (pre-0017 deploy?) — %s: %s",
+                type(exc).__name__, exc,
+            )
+            return []
+        finally:
+            conn.close()
+
+    def record_sidecar_masked_stall(
+        self,
+        uow_id: str,
+        age_seconds: float,
+    ) -> int:
+        """
+        Atomically write a heartbeat_stall audit entry (stall_type='sidecar_masked')
+        and transition the UoW from ('active' or 'executing') to 'ready-for-steward'.
+
+        Used when the Observation Loop classifies a UoW as sidecar-masked:
+        heartbeat_at appears fresh (sidecar writes), but no agent-originated
+        heartbeat log rows exist — the agent never ran or died before its first
+        write_heartbeat call.
+
+        Follows the same optimistic-lock + audit pattern as record_heartbeat_stall.
+        Returns 1 if the transition succeeded; 0 on race (another component
+        already advanced this UoW).
+        """
+        now = _now_iso()
+        note_payload = json.dumps({
+            "event": "stall_detected",
+            "stall_type": "sidecar_masked",
+            "actor": "observation_loop",
+            "uow_id": uow_id,
+            "age_seconds": age_seconds,
+            "timestamp": now,
+            "reason": (
+                "No agent-originated heartbeat (token_usage IS NOT NULL) "
+                "found in uow_heartbeat_log after dispatch grace window. "
+                "heartbeat_at reflects sidecar writes only — agent may be dead."
+            ),
+        })
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            cursor = conn.execute(
+                """
+                UPDATE uow_registry
+                SET status = 'ready-for-steward', updated_at = ?
+                WHERE id = ? AND status IN ('active', 'executing')
+                """,
+                (now, uow_id),
+            )
+            rows_affected = cursor.rowcount
+
+            if rows_affected == 1:
+                conn.execute(
+                    """
+                    INSERT INTO audit_log
+                        (ts, uow_id, event, from_status, to_status, agent, note)
+                    VALUES (?, ?, 'stall_detected', 'executing', 'ready-for-steward',
+                            'observation_loop', ?)
+                    """,
+                    (now, uow_id, note_payload),
+                )
+
+            conn.commit()
+            return rows_affected
+
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def record_heartbeat_stall(
         self,
         uow_id: str,
