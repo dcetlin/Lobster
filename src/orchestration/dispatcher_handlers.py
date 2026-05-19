@@ -2879,3 +2879,111 @@ def handle_config_append(filename: str, text: str) -> str:
         return f"Appended to {p.name}.\n\nTail:\n{tail}"
     except OSError as exc:
         return f"Could not write to '{p.name}': {exc}"
+
+
+# ---------------------------------------------------------------------------
+# WOS PR coordinator routing (issue uow_20260516_71b777)
+#
+# Called from the dispatcher's ENGINEER → REVIEWER routing block when a
+# completed subagent result contains a GitHub PR URL.  Routes WOS-originated
+# PRs (task_id starts with "wos-") to the wos-pr-coordinator agent, which
+# owns the full oracle→fix→merge loop internally.  Non-WOS PRs fall through
+# to the existing review agent path unchanged.
+#
+# Dispatcher integration (add to ENGINEER → REVIEWER routing, before the
+# existing Task(subagent_type="review", ...) call):
+#
+#     from src.orchestration.dispatcher_handlers import route_wos_pr_result
+#
+#     pr_url_match = re.search(r"https://github\.com/.*/pull/\d+", msg["text"])
+#     if pr_url_match:
+#         routing = route_wos_pr_result(
+#             pr_url=pr_url_match.group(0),
+#             task_id=msg.get("task_id"),
+#             chat_id=msg["chat_id"],
+#             result_text=msg["text"],
+#         )
+#         if routing["action"] == "spawn_subagent":
+#             Task(subagent_type=routing["agent_type"],
+#                  run_in_background=True,
+#                  prompt=routing["prompt"])
+#             mark_processed(message_id)
+#             continue
+#         # else: fallthrough — let existing review agent path handle it
+# ---------------------------------------------------------------------------
+
+
+def route_wos_pr_result(
+    pr_url: str,
+    task_id: str | None,
+    chat_id: int | str,
+    result_text: str,
+) -> dict[str, Any]:
+    """Route a subagent result containing a GitHub PR URL.
+
+    If ``task_id`` starts with ``"wos-"``, builds a coordinator Task prompt
+    that owns the full oracle→fix→merge loop for the PR internally.  Returns
+    ``action="spawn_subagent"`` so the dispatcher can spawn the coordinator
+    without any further logic.
+
+    If ``task_id`` does NOT start with ``"wos-"`` (or is None), returns
+    ``action="fallthrough"`` so the dispatcher falls through to the existing
+    review agent path unchanged.
+
+    Pure function: no side effects, no I/O.
+
+    Args:
+        pr_url:      Full GitHub PR URL extracted from the subagent result text.
+        task_id:     task_id from the subagent result message (may be None).
+        chat_id:     Admin chat_id for Dan notifications (passed through to coordinator).
+        result_text: Full result text from the subagent (used as task_context).
+
+    Returns:
+        ``{"action": "spawn_subagent", "task_id": ..., "prompt": ..., "agent_type": ...}``
+        when routing to coordinator, or ``{"action": "fallthrough"}`` otherwise.
+    """
+    import re as _re
+
+    if not (task_id and task_id.startswith("wos-")):
+        return {"action": "fallthrough"}
+
+    # Extract pr_number and repo from the PR URL.
+    # Expected format: https://github.com/{owner}/{repo}/pull/{number}
+    parts = pr_url.rstrip("/").split("/")
+    try:
+        pr_number = int(parts[-1])
+        repo = f"{parts[-4]}/{parts[-3]}"
+    except (IndexError, ValueError):
+        _log.warning(
+            "route_wos_pr_result: could not parse PR URL %r — falling through",
+            pr_url,
+        )
+        return {"action": "fallthrough"}
+
+    coordinator_task_id = f"wos-pr-coord-{pr_number}"
+
+    prompt = (
+        f"---\n"
+        f"task_id: {coordinator_task_id}\n"
+        f"chat_id: {chat_id}\n"
+        f"source: wos/coordinator\n"
+        f"---\n\n"
+        f"You are the WOS PR pipeline coordinator for PR #{pr_number}.\n\n"
+        f"pr_url: {pr_url}\n"
+        f"pr_number: {pr_number}\n"
+        f"repo: {repo}\n"
+        f"task_id: {coordinator_task_id}\n"
+        f"chat_id: {chat_id}\n"
+        f"task_context: {result_text[:500]}\n\n"
+        f"Follow the wos-pr-coordinator agent definition at "
+        f".claude/agents/wos-pr-coordinator.md exactly.\n\n"
+        f"Minimum viable output: Single write_result call reporting PR merged or escalated.\n"
+        f"Boundary: do not send intermediate oracle/fix status to the dispatcher inbox."
+    )
+
+    return {
+        "action": "spawn_subagent",
+        "task_id": coordinator_task_id,
+        "prompt": prompt,
+        "agent_type": "lobster-generalist",
+    }
