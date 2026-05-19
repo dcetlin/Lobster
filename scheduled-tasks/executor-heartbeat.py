@@ -324,7 +324,13 @@ def run_ttl_recovery(registry, dry_run: bool = False) -> list[str]:
     In dry_run mode: queries but does NOT transition any UoW.
     Returns the list of recovered uow_ids (empty on dry_run or nothing to recover).
     """
-    from src.orchestration.executor import TTL_EXCEEDED_HOURS, recover_ttl_exceeded_uows
+    try:
+        from src.orchestration.executor import TTL_EXCEEDED_HOURS, recover_ttl_exceeded_uows
+    except ImportError:
+        log.warning(
+            "TTL recovery skipped — TTL_EXCEEDED_HOURS not available in executor.py (see #1216)"
+        )
+        return []
     import sqlite3
     from datetime import datetime, timezone, timedelta
 
@@ -658,8 +664,31 @@ def main() -> int:
 
     registry = Registry(db_path)
 
-    # Phase 1: TTL recovery — always runs regardless of execution_enabled so
+    # Phase 1: Stall recovery — always runs regardless of execution_enabled so
     # that stalled active UoWs are recovered even when dispatch is paused.
+    #
+    # Primary path: registry.reset_expired_claims() uses the visibility-timeout
+    # model (claimed_until) to reset expired claims back to 'ready-for-executor'.
+    # This is the designed replacement for the legacy recover_ttl_exceeded_uows()
+    # approach — see executor.py module docstring and registry.py:1354.
+    #
+    # Legacy fallback: run_ttl_recovery() wraps recover_ttl_exceeded_uows() with
+    # a try/except ImportError guard (TTL_EXCEEDED_HOURS was removed in #1216).
+    # Retained as a defensive fallback; silently returns [] if the symbol is absent.
+    if not dry_run:
+        try:
+            reset_ids = registry.reset_expired_claims()
+            if reset_ids:
+                log.info(
+                    "Stall recovery: reset %d expired claim(s) to ready-for-executor — %s",
+                    len(reset_ids), reset_ids,
+                )
+            else:
+                log.debug("Stall recovery: no expired claims found")
+        except Exception as e:
+            log.warning("Stall recovery (reset_expired_claims) failed — %s", e)
+    else:
+        log.info("Stall recovery (DRY RUN): skipping reset_expired_claims")
     run_ttl_recovery(registry, dry_run=dry_run)
 
     # Phase 1b: Heartbeat sidecar — write heartbeats for all in-flight UoWs.
