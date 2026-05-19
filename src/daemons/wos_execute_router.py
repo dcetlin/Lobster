@@ -326,6 +326,12 @@ _CLAUDE_BIN: str = "claude"
 #: Maximum turns for a dispatched claude -p agent.
 _MAX_TURNS: int = 40
 
+#: Directory for per-execution subprocess log files (stdout + stderr combined).
+#: Created on first use.  Each file is named ``<run_id>.log``.
+_SUBPROCESS_LOG_DIR: Path = (
+    Path.home() / "lobster-workspace" / "orchestration" / "logs"
+)
+
 
 def _dispatch_via_popen(
     instructions: str,
@@ -386,15 +392,23 @@ def _dispatch_via_popen(
     except Exception:
         env = None  # Fall back to inheriting the current environment
 
-    proc = subprocess.Popen(
-        command,
-        start_new_session=True,  # Insulates child from SIGTERM sent to daemon
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-        env=env,
-    )
+    # Redirect child stdout+stderr to a per-execution log file so that silent
+    # exits (OOM kills, unhandled exceptions, Claude binary crashes) leave
+    # forensic evidence.  Without this, DEVNULL swallows all exit context and
+    # post-mortem analysis is impossible.
+    _SUBPROCESS_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = _SUBPROCESS_LOG_DIR / f"{run_id}.log"
+
+    with open(log_path, "w") as log_fh:
+        proc = subprocess.Popen(
+            command,
+            start_new_session=True,  # Insulates child from SIGTERM sent to daemon
+            stdin=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=log_fh,
+            close_fds=True,
+            env=env,
+        )
 
     # Write PID to registry so `wos abort` can send SIGTERM to the process group.
     # Best-effort: any failure is logged but does not abort the dispatch.
@@ -413,8 +427,9 @@ def _dispatch_via_popen(
             )
 
     log.info(
-        "dispatch: spawned claude -p for uow_id=%s run_id=%s (non-blocking, new session)",
-        uow_id, run_id,
+        "dispatch: spawned claude -p for uow_id=%s run_id=%s (non-blocking, new session) "
+        "log=%s",
+        uow_id, run_id, log_path,
     )
     return run_id
 

@@ -638,9 +638,10 @@ class TestDispatchViaPopen:
             f"Got kwargs: {kwargs}"
         )
 
-    def test_stdin_stdout_stderr_devnull(self):
-        """Child process inherits no file descriptors from daemon (clean isolation)."""
+    def test_stdin_devnull_stdout_stderr_log_file(self):
+        """stdin is DEVNULL; stdout and stderr are redirected to a per-execution log file."""
         import importlib.util
+        import io
         repo_root = Path(__file__).resolve().parent.parent
         spec = importlib.util.spec_from_file_location(
             "wos_execute_router_fds",
@@ -665,8 +666,19 @@ class TestDispatchViaPopen:
 
         kwargs = mock_popen.call_args.kwargs
         assert kwargs.get("stdin") == subprocess.DEVNULL, "stdin must be DEVNULL"
-        assert kwargs.get("stdout") == subprocess.DEVNULL, "stdout must be DEVNULL"
-        assert kwargs.get("stderr") == subprocess.DEVNULL, "stderr must be DEVNULL"
+        # stdout and stderr must be redirected to a writable file object, not DEVNULL,
+        # so that subagent exits leave forensic evidence for post-mortem analysis.
+        stdout = kwargs.get("stdout")
+        stderr = kwargs.get("stderr")
+        assert stdout != subprocess.DEVNULL, (
+            "stdout must not be DEVNULL — redirect to a log file for observability"
+        )
+        assert stderr != subprocess.DEVNULL, (
+            "stderr must not be DEVNULL — redirect to a log file for observability"
+        )
+        assert hasattr(stdout, "write"), "stdout must be a writable file object"
+        assert hasattr(stderr, "write"), "stderr must be a writable file object"
+        assert stdout is stderr, "stdout and stderr must share the same log file handle"
 
     def test_command_includes_claude_p_flags(self):
         """Popen command includes -p, --dangerously-skip-permissions, --max-turns."""
