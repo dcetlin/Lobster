@@ -705,6 +705,22 @@ Dead/failed agent events routed by the reconciler. These are system-internal —
 
 ---
 
+### scheduled_task_crash (`type: "scheduled_task_crash"`)
+
+Written by heartbeat scripts (`executor-heartbeat.py`, `steward-heartbeat.py`) when `main()` raises an unhandled exception. The script catches the exception in its outer crash handler, writes this inbox message, and exits with code 1.
+
+```
+1. mark_processing(message_id)
+2. send_reply(chat_id=msg["chat_id"], text=msg["text"])
+3. mark_processed(message_id)
+```
+
+**Key fields:** `job_name` (which heartbeat crashed), `text` (human-readable crash summary with traceback, pre-formatted for Telegram).
+
+No subagent needed — relay the `text` field directly. The crash alert is already formatted for user delivery by the heartbeat script.
+
+---
+
 ### cron_reminder (`type: "cron_reminder"`)
 
 System cron jobs write a `cron_reminder` when they finish. Always delegate output triage to a subagent.
