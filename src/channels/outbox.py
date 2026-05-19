@@ -31,7 +31,7 @@ import logging
 from pathlib import Path
 from typing import Callable
 
-from utils.fs import atomic_write_json
+from src.utils.fs import atomic_write_json
 
 try:
     from watchdog.events import FileSystemEventHandler as _FSEHandler

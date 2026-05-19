@@ -25,7 +25,7 @@ import sys as _sys
 _SRC_DIR = str(Path(__file__).resolve().parent.parent)
 if _SRC_DIR not in _sys.path:
     _sys.path.insert(0, _SRC_DIR)
-from utils.fs import atomic_write_json  # noqa: E402
+from src.utils.fs import atomic_write_json  # noqa: E402
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
