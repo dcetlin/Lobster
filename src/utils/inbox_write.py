@@ -9,6 +9,8 @@ Public API
 write_inbox_message(job_name, chat_id, text, timestamp) -> str
     Write a subagent_result JSON to ~/messages/inbox/ using atomic
     tmp-then-rename.  Returns the message ID so callers can log it.
+    Non-urgent messages sent outside the morning window are queued in
+    pending-deliveries.jsonl instead of the inbox (circadian delivery).
 
 _inbox_dir() -> Path
 _task_outputs_dir() -> Path
@@ -52,6 +54,11 @@ def write_inbox_message(
     Uses atomic tmp-then-rename so the dispatcher never reads a partial file.
     The dispatcher picks up the file and routes it via send_reply.
 
+    Circadian routing: if the message is non-urgent and the current time is
+    outside the morning window (06:00–10:00 Pacific), the message is queued
+    in pending-deliveries.jsonl for batch morning delivery instead of being
+    written to the inbox immediately.
+
     Parameters
     ----------
     job_name:
@@ -70,7 +77,6 @@ def write_inbox_message(
     str
         The generated message ID (``"<job_name>_<uuid-hex>"``).
     """
-    inbox = _inbox_dir()
     msg_id = f"{job_name}_{uuid.uuid4().hex}"
     source = os.environ.get("LOBSTER_DEFAULT_SOURCE", "telegram")
     msg = {
@@ -84,6 +90,17 @@ def write_inbox_message(
         "sent_reply_to_user": False,
         "timestamp": timestamp,
     }
+
+    # Circadian gate: defer non-urgent messages to the morning delivery window.
+    try:
+        from src.delivery.circadian import is_morning_window, is_non_urgent, queue_message  # noqa: PLC0415
+        if is_non_urgent(msg) and not is_morning_window():
+            queue_message(chat_id, text, source=job_name)
+            return msg_id
+    except Exception:
+        pass  # circadian module unavailable — fall through to immediate delivery
+
+    inbox = _inbox_dir()
     out_path = inbox / f"{msg_id}.json"
     tmp_path = Path(str(out_path) + ".tmp")
     tmp_path.write_text(json.dumps(msg, ensure_ascii=False, indent=2), encoding="utf-8")

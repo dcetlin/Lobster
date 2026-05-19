@@ -13,6 +13,11 @@ from datetime import datetime
 
 VALENCE_VALUES = frozenset({"golden", "smell", "neutral"})
 
+VALID_SIGNAL_TYPES = frozenset({
+    "task_request", "design_question", "voice_note", "status_check",
+    "system_observation", "meta_reflection", "philosophy", "casual"
+})
+
 
 @dataclass
 class MemoryEvent:
@@ -26,6 +31,13 @@ class MemoryEvent:
     (something that works well and should be reinforced), a smell (something
     problematic that should be addressed), or neutral (no strong signal).
     Valid values: 'golden' | 'smell' | 'neutral' (default).
+
+    The ``subject`` field is a short noun-phrase label for what this event is about.
+
+    The ``signal_type_hint`` field is the caller's pre-classification of the event's
+    signal type. When provided, the slow-reclassifier will use this value and skip
+    content inference. Valid values: 'task_request' | 'design_question' | 'voice_note' |
+    'status_check' | 'system_observation' | 'meta_reflection' | 'philosophy' | 'casual'.
     """
     id: Optional[int]
     timestamp: datetime
@@ -36,6 +48,8 @@ class MemoryEvent:
     metadata: dict = field(default_factory=dict)
     consolidated: bool = False
     valence: str = "neutral"   # 'golden' | 'smell' | 'neutral'
+    subject: Optional[str] = None
+    signal_type_hint: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Serialize to a dictionary."""
@@ -49,6 +63,8 @@ class MemoryEvent:
             "metadata": self.metadata,
             "consolidated": self.consolidated,
             "valence": self.valence,
+            "subject": self.subject,
+            "signal_type_hint": self.signal_type_hint,
         }
 
     @classmethod
@@ -69,6 +85,8 @@ class MemoryEvent:
             metadata=data.get("metadata", {}),
             consolidated=data.get("consolidated", False),
             valence=data.get("valence", "neutral"),
+            subject=data.get("subject"),
+            signal_type_hint=data.get("signal_type_hint"),
         )
 
 

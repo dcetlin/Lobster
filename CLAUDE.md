@@ -53,9 +53,9 @@ User context files are private and not committed to git. They contain user-speci
 > **Dispatcher-only tools** (`wait_for_messages`, `mark_processing`, `mark_processed`, `mark_failed`) are documented in `.claude/sys.dispatcher.bootup.md`.
 
 ### Task Management
-- `list_tasks(status?)` - List all tasks
-- `create_task(subject, description?)` - Create task
-- `update_task(task_id, status?, ...)` - Update task
+- `list_tasks(status?)` - List all tasks (statuses: pending, in_progress, completed, blocked, all)
+- `create_task(subject, description?, status?)` - Create task; use `status="blocked"` when Lobster has made a commitment and asked clarifying questions it's waiting on the user to answer
+- `update_task(task_id, status?, ...)` - Update task; transition blocked→in_progress when user provides answers
 - `get_task(task_id)` - Get task details
 - `delete_task(task_id)` - Delete task
 
@@ -147,18 +147,55 @@ Before consulting any gate, classify the message as ACTION or DESIGN_OPEN. These
 - [ ] Message uses exploratory vocabulary: "think about", "consider", "what if", "how would we", "should we"
 - [ ] The output artifact cannot be stated in one sentence using only the words in the message
 
-**If no signal fires:** default to DESIGN_OPEN — ask for clarification before acting.
+**Step 3 — Middle-register tiebreaker (artifact determinability check):** fires when Step 1 and Step 2 both failed to produce a classification.
+- If the output artifact can be stated in one sentence using only words in the message → classify ACTION, proceed with the most defensible implementation reading, and surface that interpretation in your first response
+- If the output artifact itself cannot be stated (not just the implementation — the *what* is unclear, not just the *how*) → classify DESIGN_OPEN, ask exactly one precise question
+
+> **Test case (Case 2 analog):** "Can you improve the onboarding flow?" — names an artifact ("onboarding flow") but does not specify what the output is (a redesigned screen? a new copy document? a code change?). The output artifact cannot be stated in one sentence from the message alone → Step 3 fires DESIGN_OPEN, ask one precise question: "What should the output be — a copy revision, a UI change, or something else?"
+
+**If no signal fires after all three steps:** default to DESIGN_OPEN — ask for clarification before acting.
 
 | Gate | Trigger (one sentence) | Enforcement |
 |------|----------------------|-------------|
 | **7-Second Rule** | Any tool call that is not `wait_for_messages`, `check_inbox`, `mark_processing`, `mark_processed`, `mark_failed`, or `send_reply` must go to a background subagent. | Structural — if you reach for any other tool, stop and delegate. |
 | **Design Gate** | A message is DESIGN_OPEN when no concrete output artifact can be stated in one sentence from the message alone. | Advisory — classify before routing; fire the gate if DESIGN_OPEN. |
 | **Bias to Action** | Classifier returned ACTION. Proceed with implementation without asking for confirmation. | Advisory — classifier output is the entry condition; no secondary check needed. |
-| **Dispatch template** | Every subagent Task call must include `Minimum viable output: [deliverable]` and `Boundary: do not produce [X]` in its prompt. Every subagent prompt must include `Your task_id is: <slug>` as its first line. task_id must be a slug (not a UUID); the SessionStart hook rejects sessions without task_id. | Advisory — check before calling Task. |
+| **Dispatch template** | Every subagent Task call must include `Minimum viable output: [deliverable]` and `Boundary: do not produce [X]` in its prompt. Every subagent prompt must begin with a YAML frontmatter block (preferred): `task_id: <slug>`, `chat_id: <id>`, `source: <telegram|slack|system>`. task_id must be a slug (not a UUID); the SessionStart hook rejects sessions without it. Legacy inline format `Your task_id is: <slug>` is still accepted for backward compat. **Long-running gate:** If the Minimum viable output implies >15 min of work, prepend the workstream scaffolding preamble (see "Long-Running Dispatch Preamble" below) to the subagent prompt before any other content. | Advisory — check before calling Task. |
 | **No self-relay** | When `sent_reply_to_user == True` or message type is `subagent_notification`, mark_processed without calling send_reply. | Structural — the message type routes it; no discretion needed. |
 | **Relay filter** | If the key signal in a send_reply to Dan is buried past paragraph 2, move it to the lead. | Advisory — apply before every send_reply. |
-| **PR Merge Gate** | Every code PR must pass oracle review before merge. Flow: open PR → oracle agent → writes `oracle/verdicts/pr-{number}.md` → if first line is `VERDICT: APPROVED` dispatch merge agent; if `VERDICT: NEEDS_CHANGES` dispatch fix agent → re-oracle → repeat. Merge agent must read `oracle/verdicts/pr-{number}.md` and confirm first line is `VERDICT: APPROVED` before merging, then move file to `oracle/verdicts/archive/pr-{number}.md`. Oracle round cap: Rounds 1–2: auto-fix. Round 3: notify Dan before dispatching another fix. Round 4+: escalate to Dan before dispatching; include a summary of what gaps keep re-opening and why. | Advisory — never dispatch a merge agent without first confirming `VERDICT: APPROVED` in `oracle/verdicts/pr-{number}.md`. |
+| **PR Merge Gate** | Every code PR must pass oracle review before merge. Flow: open PR → oracle agent → writes `oracle/verdicts/pr-{number}.md` → if first line is `VERDICT: APPROVED` dispatch merge agent; if `VERDICT: NEEDS_CHANGES` dispatch fix agent → re-oracle → repeat. Merge agent must read `oracle/verdicts/pr-{number}.md` and confirm first line is `VERDICT: APPROVED` before merging, then move file to `oracle/verdicts/archive/pr-{number}.md`. Oracle round cap: Rounds 1–2: auto-fix. Round 3: notify Dan before dispatching another fix. Round 4+: escalate to Dan before dispatching; include a summary of what gaps keep re-opening and why. | Advisory — never dispatch a merge agent without first confirming `VERDICT: APPROVED` in `oracle/verdicts/pr-{number}.md`. Two enforcement paths: **Option A** — if `LOBSTER_REVIEW_TOKEN` is configured, the oracle posts a formal GitHub Approved review via the GitHub API (required for branch protection rules with non-author reviewer requirement); **Option B** (always active, Option A fallback) — dispatcher checks the verdict file directly. If Option A is configured but the `gh api` call fails, a warning is appended to the verdict file and Option B governs. |
 | **WOS Execute Gate** | A message with `type: "wos_execute"` must be routed by calling `route_wos_message(msg)` from `src/orchestration/dispatcher_handlers.py` — never by re-reading prose that may be absent after compaction. | Structural — if you receive a `wos_execute` message, call `route_wos_message` unconditionally; the import is always available. |
+
+### Long-Running Dispatch Preamble
+
+Any dispatch where the `Minimum viable output` implies >15 minutes of runtime **must** begin with the following preamble, substituting `<task-slug>` with the agent's task_id:
+
+```
+WORKSTREAM SETUP (do this first, before any other work):
+
+1. Create your workstream directory:
+   mkdir -p ~/lobster-workspace/workstreams/<task-slug>/
+
+2. Write an initial status file immediately after creating the directory:
+   ~/lobster-workspace/workstreams/<task-slug>/status.md
+   Content: task_id, start time, goal summary, current step ("started"), next planned step.
+
+3. Rewrite status.md every ~5 minutes as you work:
+   Update: current step, % complete estimate, last completed milestone, next step.
+   If you are blocked or failing, write that explicitly — stalled state is recoverable; silent state is not.
+
+4. Call write_result at completion:
+   write_result(task_id="<task-slug>", sent_reply_to_user=False, status="success", text="<one-sentence summary>")
+   If you sent a reply to the user directly: write_result(task_id="<task-slug>", sent_reply_to_user=True)
+
+Do not defer workstream creation. If you die without writing status.md, the reconciler has nothing to recover from.
+```
+
+Signals that a dispatch implies >15 min:
+- The Minimum viable output involves cloning a repo, running a migration, or merging many commits
+- The prompt includes words like "full", "complete", "all", "every", "rewrite", "port", "migrate"
+- The task requires reading many files before writing any output
+- The task_id is for a WOS UoW with estimated_cycles > 1
 
 ### Gate-Miss Logging (Proprioceptive Feedback)
 
@@ -228,14 +265,33 @@ Never use cron for user-space jobs. Never use systemd tools for system-level inf
 ### Job type distinction
 
 - **Type A (LLM subagent tasks):** Run a prompt, do work, return output. The cron + jobs.json `enabled` field is the correct dispatch gate. Systemd was intentionally excluded — job dispatch is not process management. Jobs are prompts, not processes. Runtime enable/disable lives in jobs.json without touching cron.
-- **Type B (long-running services):** The dispatcher, MCP servers, Telegram bot, health daemons. These are processes. Systemd is the right tool here when/if Lobster moves to fully-automated operation.
-- **Type C (cron-direct non-LLM scripts):** Pure Python scripts invoked directly by cron — no inbox message written, no LLM round-trip. The script reads jobs.json itself to check the `enabled` gate and logs to `scheduled-jobs/logs/` directly. `dispatch: "cron-direct"` in jobs.json identifies these entries. Examples: `executor-heartbeat.py`, `steward-heartbeat.py`.
+- **Type B (cron-direct scripts):** Pure Python scripts invoked directly by cron — no inbox message, no LLM round-trip. Use this type when: (a) the job is a deterministic polling/recovery loop rather than an LLM reasoning task, (b) the same result would be produced on every invocation regardless of model choice, and (c) latency or LLM cost matter (e.g. runs every 3 minutes). The script handles its own error recovery and logging.
+
+  **Cron entry pattern** (unique marker per job required):
+  ```
+  */N * * * * cd ~/lobster && uv run scheduled-tasks/my-script.py >> ~/lobster-workspace/scheduled-jobs/logs/my-script.log 2>&1 # LOBSTER-MY-SCRIPT
+  ```
+
+  **Required: jobs.json gate.** Add `_is_job_enabled(job_name)` at the top of `main()` before any DB work. This preserves runtime enable/disable via `wos start/stop` and direct jobs.json edits. See `scheduled-tasks/executor-heartbeat.py` and `scheduled-tasks/steward-heartbeat.py` for the reference implementation.
+
+  **jobs.json fields for Type B jobs:**
+  ```json
+  {
+    "type": "B",
+    "dispatch": "cron-direct",
+    "task_file": null
+  }
+  ```
+
+  **Decision rule:** If the job would run identically regardless of which LLM model responds, and it runs more frequently than every 15 minutes, prefer Type B.
+
+- **Long-running services** (dispatcher, MCP servers, Telegram bot, health daemons): These are processes, not jobs. Systemd is the right tool here when/if Lobster moves to fully-automated operation. Not part of the job type taxonomy.
 
 ## Key Directories
 
 - `~/lobster/` - Repository (code only, no personal data)
   - `scheduled-tasks/` - Job runner scripts (committed, no runtime data)
-  - `memory/canonical-templates/` - Seed templates (committed)
+  - `memory/canonical-templates/` - Seed templates (committed); sweep and diagnostic agents must follow `memory/canonical-templates/sweep-instruction.template.md` (encodes contract-declaration, state-registry-read, and classification-completeness harness patterns)
 - `~/lobster-user-config/` - User-specific config and memory (private, not in repo)
   - `memory/canonical/` - Handoff, priorities, people, projects
   - `memory/archive/digests/` - Archived daily digests
@@ -251,6 +307,7 @@ Never use cron for user-space jobs. Never use systemd tools for system-level inf
   - `assessments/` - Assessment documents (audits, retros, design reviews). Maintenance logs only → `hygiene/`.
   - `data/memory.db` - Vector memory SQLite DB
   - `data/memory-events.jsonl` - StaticMemory event log (JSONL fallback backend)
+  - `data/decisions-ledger.md` — Decision text from `decision:` footer blocks, routed by `hooks/decision-router.py`
   - `scheduled-jobs/jobs.json` - Job registry state
   - `scheduled-jobs/tasks/` - Task definition markdown files
   - `scheduled-jobs/logs/` - Execution logs

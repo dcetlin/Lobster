@@ -65,7 +65,98 @@ Then read both oracle files as vocabulary before the detection pass:
 
 Naming a pattern without stating its effect on your analysis is not a citation — it is a label. The bar is behavioral change: what did you weight differently, what did you flag that you would have passed over, what did you not include because of this pattern?
 
-### Step 1b: Memory Pre-Pass (Night 4 only)
+### Step 1b: WOS Throughput Pre-Check (all nights)
+
+Before reading any domain-specific content, check the WOS throughput steady-state pattern. Given that a throughput stall is a high-signal system-health indicator, it must surface at the top of every sweep, not buried in the pattern-match section.
+
+1. Count open WOS UoWs: `gh issue list --repo dcetlin/Lobster --state open --label "wos:executing" --json number,title,updatedAt --limit 100`
+
+   **Label self-validation (required before trusting empty results):** Before treating a zero result as meaningful, verify the label actually exists in the repo:
+   ```bash
+   gh label list --repo dcetlin/Lobster --limit 200 --json name --jq '.[].name' | grep -q '^wos:executing$' && echo "label found" || echo "label not found"
+   ```
+   If the label is not found, record "label not found — result unreliable" in your sweep output for this check and do not treat the count as meaningful. Do not fire a stall prescription based on a label-not-found result. Apply the same validation logic to any other label-based queries in this step before treating their results as zero.
+
+2. For each open UoW, check the `updatedAt` field. If no UoW has been updated in the past 3 days, flag as a potential stall.
+3. Check the executor heartbeat log for recent dispatch events: `tail -50 ~/lobster-workspace/scheduled-jobs/logs/executor-heartbeat.log` (or the most recent executor-heartbeat log file).
+4. **execution_enabled gate (check before firing any stall prescription):** Read `~/lobster-workspace/data/wos-config.json`. If the file exists and `execution_enabled` is `false`, do NOT fire the throughput stall prescription. Instead, record: "WOS execution is deliberately paused (execution_enabled=False) — throughput analysis skipped; this is not a stall." Skip steps 4a and 5 below when this gate fires.
+   4a. If throughput appears stalled (no UoW updates in >3 days, or no dispatch events in executor log within 3 days), record a **WOS throughput stall** finding immediately — at the top of the Detection Pass section in your sweep output, before any domain-specific findings.
+5. If stall duration appears to be >7 days (and execution_enabled is not false), add to escalation list with a prescription: "investigate executor starvation."
+
+This check runs every night so that stalls are visible as soon as they occur, regardless of which domain is active. The `steady-state` pattern in the Pattern Match section is now satisfied by the evidence gathered here — do not re-run the throughput check in the Pattern Match step.
+
+### Step 1c: Structural Pre-Scan (Night 5 only)
+
+Before the detection pass on Night 5 (Code layer), run a cron-vs-jobs.json consistency check as a first-pass structural scan. This is analogous to the Issue Pre-Scan on Night 4: it produces a structured view of the landscape before any detailed reading occurs.
+
+1. Read `~/lobster-workspace/scheduled-jobs/jobs.json`. Collect all jobs with `"type": "B"` (cron-direct) and `"enabled": true`.
+2. Read the active crontab: `crontab -l`. For each Type B job that is enabled in jobs.json, verify a corresponding entry exists in the crontab (match on job name or script path via the `# LOBSTER-<NAME>` marker).
+3. Read all scripts in `~/lobster/scheduled-tasks/` that are invoked directly by cron (look for `dispatch: "cron-direct"` entries in jobs.json or identify by the `# LOBSTER-` cron marker). For each such script, verify it calls `_is_job_enabled(<job_name>)` at the top of `main()` before any substantive work.
+4. Produce two lists:
+   - **Cron gaps:** Type B jobs enabled in jobs.json but absent from crontab
+   - **Gate gaps:** Cron-direct scripts that lack a `_is_job_enabled` gate at the top of `main()`
+5. If either list is non-empty, add the missing entries as escalation candidates (they are structural defects, not behavioral ones — do not attempt autonomous fixes unless the gap is clearly a stale entry).
+
+This pre-scan runs before any code-layer detection reading. Its output becomes the structural context for the rest of the Night 5 pass.
+
+### Step 1c-N4: Night 4 Pipeline Pre-flight (Night 4 only)
+
+**Gate: Run this step only on Night 4, before any other Night 4 steps.** Its purpose is to detect setup failures before they surface mid-sweep — a misconfigured pipeline discovered at step 1f is more costly than one found here.
+
+#### Pre-flight checks
+
+**1. Night agreement check**
+
+Read `~/lobster-workspace/hygiene/rotation-state.json` and note the `current_night` value. Independently assess which night this is based on the rotation schedule (count from the last known Night 1 start, or derive from the cycle position). If the two assessments disagree:
+- Log the disagreement in the sweep file: "Pre-flight: rotation-state.json reports Night N but independent assessment indicates Night M. Proceeding with rotation-state.json value as authoritative."
+- Do NOT abort — proceed using the rotation-state.json value. The disagreement is itself an entropy item to include in the Detection Pass.
+
+If the two agree, log: "Pre-flight: Night agreement confirmed (Night 4)."
+
+**2. decay-detector.py existence and runtime check**
+
+Check whether `~/lobster/scheduled-tasks/decay-detector.py` exists:
+- If the file does not exist: log "Pre-flight: decay-detector.py not found — skipping decay detection this run" and continue. Add to Detection Pass as a missing dependency.
+- If the file exists, run it: `uv run ~/lobster/scheduled-tasks/decay-detector.py --dry-run 2>&1 | head -20` (or the appropriate invocation if `--dry-run` is not supported — check the script's `--help` first).
+  - If it runs without error: log "Pre-flight: decay-detector.py ran cleanly."
+  - If it reports an internal state that disagrees with rotation-state.json (e.g., "not Night 4" while rotation-state.json says Night 4): log the disagreement — "Pre-flight: decay-detector.py internal state disagrees with rotation-state.json (script says: [X], state file says: Night 4)." Do NOT abort; log it as an entropy item for the Detection Pass.
+  - If it errors: log the error output and continue. Add to Detection Pass as a broken dependency.
+
+**3. Pipeline Mode B script existence check**
+
+Check whether the Pipeline Mode B script exists. The canonical location is `~/lobster/scheduled-tasks/pipeline-mode-b.py` (or equivalent — check `~/lobster-workspace/scheduled-jobs/jobs.json` for a job referencing "mode-b" or "pipeline" to find the actual path).
+
+- If the script does not exist: log "Pre-flight: Pipeline Mode B script not found. Falling back to inline ripeness classification (Step 1f protocol)." Continue with the inline 1f protocol as normal — the pre-flight makes this explicit rather than a silent gap.
+- If the script exists: log "Pre-flight: Pipeline Mode B script found at [path]." Proceed normally.
+
+**4. Other Night 4 dependency scan**
+
+Scan for any other files referenced in Night 4 steps (Steps 1d, 1e, 1f) before running them:
+- `~/lobster-workspace/hygiene/pipeline-ripeness-state.json` — if absent, note "will be created fresh this run" (not an error)
+- `~/lobster-workspace/hygiene/rotation-state.json` — already checked above
+- Verify `gh` CLI is available and authenticated: `gh auth status 2>&1 | head -5`
+
+If `gh` is not authenticated, log this as a blocking pre-flight failure: "Pre-flight BLOCKED: gh CLI not authenticated — Night 4 issue scan cannot proceed." In this case, write the pre-flight findings to the sweep file, send Ping 1 with "Night 4 aborted: gh authentication failure", and exit without running Steps 1d–1f.
+
+#### Pre-flight output
+
+Write a `## Night 4 Pre-flight` section at the top of the sweep file (before the Detection Pass), with a one-line result for each check:
+
+```markdown
+## Night 4 Pre-flight
+
+- Night agreement: [confirmed / disagreement: state file=N, assessment=M]
+- decay-detector.py: [not found / ran cleanly / internal state disagrees (details) / errored (details)]
+- Pipeline Mode B script: [found at path / not found — falling back to 1f inline protocol]
+- pipeline-ripeness-state.json: [exists / absent — will be created fresh]
+- gh CLI: [authenticated / NOT AUTHENTICATED — blocked]
+```
+
+Only after writing this section and confirming no blocking failures: proceed to Step 1d.
+
+---
+
+### Step 1d: Memory Pre-Pass (Night 4 only)
 
 Before reading memory entries for Night 4 (Issues + memory domain), run a signal-flood check:
 
@@ -76,7 +167,7 @@ Before reading memory entries for Night 4 (Issues + memory domain), run a signal
 
 This prevents a signal flood (e.g., 3500+ health-check-v3 entries) from drowning the ~10-20 substantive entries that are the real scan targets.
 
-### Step 1c: Issue Pre-Scan (Night 4 only)
+### Step 1e: Issue Pre-Scan (Night 4 only)
 
 Before linear issue reading for Night 4, run a structural pre-scan:
 
@@ -87,13 +178,13 @@ Before linear issue reading for Night 4, run a structural pre-scan:
 
 This replaces O(n) linear reading with a structural pass that improves signal-to-noise before any reading occurs.
 
-### Step 1d: Pipeline Layer — Mode B Ripeness Classifier (Night 4 only)
+### Step 1f: Pipeline Layer — Mode B Ripeness Classifier (Night 4 only)
 
 **Gate: Run this step only on Night 4.** Skip entirely on all other nights.
 
-After completing Step 1c (Issue Pre-Scan), run the ripeness classifier on the open issue set. This step classifies issues by advancement readiness and posts structured ripeness notes on classification changes.
+After completing Step 1e (Issue Pre-Scan), run the ripeness classifier on the open issue set. This step classifies issues by advancement readiness and posts structured ripeness notes on classification changes.
 
-#### 1d-0. Prerequisites
+#### 1f-0. Prerequisites
 
 Ensure the `pipeline-reviewed` label exists before the first classification pass:
 ```bash
@@ -103,11 +194,11 @@ gh label create "pipeline-reviewed" --color "0075ca" --description "Issue has be
 Read the state file: `~/lobster-workspace/hygiene/pipeline-ripeness-state.json`
 If the file does not exist, treat all issues as having no prior classification.
 
-#### 1d-1. Input: issue list
+#### 1f-1. Input: issue list
 
-Use the issue list from Step 1c. Exclude any issue carrying the `stale` label (Mode A output — if Mode A has not yet run, no issues will carry this label; proceed with the full list). Also exclude issues with the `on-hold` label.
+Use the issue list from Step 1e. Exclude any issue carrying the `stale` label (Mode A output — if Mode A has not yet run, no issues will carry this label; proceed with the full list). Also exclude issues with the `on-hold` label.
 
-#### 1d-2. For each remaining open issue, gather:
+#### 1f-2. For each remaining open issue, gather:
 
 1. Full issue body and all comments: `gh issue view <N> --repo dcetlin/Lobster --json body,comments`
 2. Design doc linkage check:
@@ -118,7 +209,7 @@ Use the issue list from Step 1c. Exclude any issue carrying the `stale` label (M
 3. Recent escalation list check: scan the most recent completed sweep file (`~/lobster-workspace/hygiene/YYYY-MM-DD-sweep.md` — the last one before today) for the issue number in any Escalation List section
 4. Oracle outputs check: scan `~/lobster/oracle/decisions.md` for the issue number
 
-#### 1d-3. Classification logic
+#### 1f-3. Classification logic
 
 Classify each issue into **exactly one** of:
 
@@ -133,7 +224,7 @@ Classify each issue into **exactly one** of:
 
 **Unclassifiable:** If an issue fits none of the four categories, classify it as `unclassifiable` and note why. Do not post a GitHub comment for unclassifiable issues.
 
-#### 1d-4. Post GitHub comments (on classification change only)
+#### 1f-4. Post GitHub comments (on classification change only)
 
 For each issue where the new classification differs from the stored classification in `pipeline-ripeness-state.json` (or no prior entry exists):
 
@@ -156,7 +247,7 @@ gh issue edit <N> --repo dcetlin/Lobster --add-label pipeline-reviewed
 
 Do not post comments or apply labels for `unclassifiable` issues.
 
-#### 1d-5. Write state
+#### 1f-5. Write state
 
 Update `~/lobster-workspace/hygiene/pipeline-ripeness-state.json` with all classified issues:
 ```json
@@ -172,7 +263,7 @@ Update `~/lobster-workspace/hygiene/pipeline-ripeness-state.json` with all class
 }
 ```
 
-#### 1d-6. Write ripeness report to sweep file
+#### 1f-6. Write ripeness report to sweep file
 
 Append a `## Pipeline Layer — Ripeness Report` section to today's sweep file (`~/lobster-workspace/hygiene/YYYY-MM-DD-sweep.md`):
 
@@ -189,13 +280,33 @@ Append a `## Pipeline Layer — Ripeness Report` section to today's sweep file (
 **Summary:** N issues classified. N classification changes (comments posted). N `pipeline-reviewed` labels applied.
 ```
 
+### Step 1g: Contradiction Matrix Dead-Entry Detection (Night 2 only)
+
+**Run this step only on Night 2, before the detection pass.** Its purpose is to validate the Contradiction Matrix entries themselves — a missing referenced file is itself an entropy signal.
+
+The Contradiction Matrix below references these specific files. Before running any matrix check, verify each file exists:
+
+- `~/lobster-workspace/.claude/sys.subagent.bootup.md`
+- `~/lobster-user-config/agents/user.base.bootup.md`
+- `~/lobster-workspace/.claude/agents/` (directory — check it exists and is non-empty)
+- `~/lobster-workspace/.claude/sys.dispatcher.bootup.md`
+- `~/lobster-workspace/.claude/compact-ack-messages.json`
+- `~/lobster/CLAUDE.md`
+- `~/lobster-user-config/agents/subagents/` (directory — check it exists)
+
+For each file or directory that does not exist, add it to the Detection Pass as an entropy item:
+
+> "Contradiction Matrix references non-existent file: `<path>` — this matrix entry cannot be checked and the reference is dead. Check how many consecutive sweeps this file has been missing (look at recent sweep files in `~/lobster-workspace/hygiene/`) and surface: 'dead for N sweeps; remove or update the reference.'"
+
+Do not silently skip matrix checks for missing files — a missing file means the check produced no signal, and that is itself a signal worth recording.
+
 ### Step 2: Detection pass
 
 **Cross-file contradiction check (Night 2 only):** Cross-reference behavioral rules, gates, and heuristics that appear in more than one document — flag divergences. Scope this to concepts with behavioral consequence (gates, rules, heuristics) — not all concepts.
 
 **Contradiction Matrix (Night 2) — pre-specified file pairs:**
 
-Do not discover these pairs during scanning. Read each pair explicitly and check for divergence on the named concern.
+Do not discover these pairs during scanning. Read each pair explicitly and check for divergence on the named concern. (Files validated to exist in Step 1g — skip any pair where a file was flagged as missing.)
 
 | File A | File B | Check for |
 |--------|--------|-----------|
@@ -227,6 +338,20 @@ When a finding is notable enough to store as a memory observation, use the `memo
 
 Example: a finding that matches the "coherence-narrative basin" failure pattern would be stored with `valence="smell"`. A finding that identifies a new instance of the "table-as-compaction-resistant encoding" pattern would be stored with `valence="golden"`. Only store observations that are specific and evidence-grounded — not summaries of the sweep.
 
+### Recurrence Pre-Check
+
+Before running the detection pass, check for recurring smells from prior sweep files. This runs on every night.
+
+1. Read the two most recent sweep files in `~/lobster-workspace/hygiene/` (excluding today's, which has not been written yet): the files named `YYYY-MM-DD-sweep.md` with the two most recent dates.
+2. Extract all smell/dissonance items from both files. A smell is "recurring" if the same item (identified by component name, file path, or smell description) appears in both files — regardless of which domain night each was.
+3. For each recurring smell found:
+   - Check whether a GitHub issue exists for it: `gh issue list --repo dcetlin/Lobster --state open --search "<smell keywords>"`
+   - If no issue exists or the existing issue lacks the `recurring-smell` label, it is a recurrence escalation candidate.
+4. Record recurring smells at the top of your Detection Pass section, before any new findings from today's domain scan. Label them explicitly as **recurring-smell** items.
+5. When filing or updating a GitHub issue for a recurring smell, add the `recurring-smell` label (create it first if absent: `gh label create "recurring-smell" --color "b60205" --description "Smell that appeared in 2+ consecutive sweep files" --repo dcetlin/Lobster 2>/dev/null || true`).
+
+Checking for recurrences before running detection ensures that patterns that survived one sweep are not buried by new findings in the next.
+
 ### Pattern Match
 
 Read `~/lobster/oracle/patterns.md`. For each pattern:
@@ -234,7 +359,7 @@ Read `~/lobster/oracle/patterns.md`. For each pattern:
 - **dead-end**: count UoWs that hit failed/blocked ≥2 times. If >3, add prescription: "executor needs better blocker detection"
 - **burst**: note if any sweep generated ≥5 UoWs. If burst UoWs had >50% failure rate, add prescription: "scope UoWs more narrowly"
 - **cascade**: count cascade chains. If chain depth >3 anywhere, add prescription: "spec full chain before starting"
-- **steady-state**: if throughput <1 UoW/day for >3 days, add prescription: "investigate executor starvation"
+- **steady-state**: throughput stall check is run in Step 1b (WOS Throughput Pre-Check) before the detection pass — do not re-run here. If a stall was flagged in Step 1b and stall duration exceeds 7 days, confirm the prescription "investigate executor starvation" is in the escalation list
 
 ### Step 3: Refactor pass
 
@@ -246,6 +371,20 @@ Act autonomously on items that meet the autonomy criteria below. For each action
 ### Step 4: Escalation list
 
 Items requiring user judgment. For each: what it is, why it requires escalation rather than autonomous action, and a proposed action for Dan to approve or redirect.
+
+**OODA Act-layer gap (check on every sweep — add as a priority item when condition is met):**
+
+After assembling the escalation list, check for the following compound condition:
+
+1. Read `~/lobster-workspace/data/wos-config.json`. Is `execution_enabled` false?
+2. Are there escalation items (open GitHub issues) that are 7 or more days old with no recent action (no comment, no label change, no PR linked)?
+   - Check age using: `gh issue list --repo dcetlin/Lobster --state open --label "needs-decision" --json number,title,createdAt,updatedAt` (or query the escalation list items directly by issue number)
+
+If both conditions are true — execution is paused AND old escalation items have no action taken — add this as a **priority item** at the top of the Escalation List section (not buried in the findings list):
+
+> "OODA Act-layer gap: Hygiene backlog cannot drain because the Act layer requires execution_enabled=True. [N] escalation items have been open for [X] days with no action taken. The loop closes only when execution restarts. These items are blocked, not forgotten — but the system cannot self-correct until execution is re-enabled."
+
+State the specific issue numbers, their age in days, and the count. This item surfaces the dependency chain explicitly so the cost of leaving execution paused is visible.
 
 ---
 
@@ -395,9 +534,20 @@ Scan scope by domain:
 
 ---
 
+## Post-run cleanup
+
+After both pings are sent, archive sweep files older than 14 days:
+
+```bash
+mkdir -p ~/lobster-workspace/hygiene/archive/
+find ~/lobster-workspace/hygiene/ -maxdepth 1 -name "*-sweep.md" -mtime +14 -exec mv {} ~/lobster-workspace/hygiene/archive/ \;
+```
+
+Run this step unconditionally at the end of every sweep run.
+
 ## Final Step
 
-After both pings are sent, call `write_task_output` with:
+After the post-run cleanup, call `write_task_output` with:
 - job_name: `negentropic-sweep`
 - output: brief summary (domain covered, items found/acted/escalated, golden patterns named)
 - status: `success` (or `failed` if the run errored)

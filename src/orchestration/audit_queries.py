@@ -400,7 +400,7 @@ def completed_uow_durations(
     Returns
     -------
     list of dicts with keys:
-        uow_id, created_at, completed_at, steward_cycles,
+        uow_id, created_at, completed_at, steward_cycles, lifetime_cycles,
         wall_clock_hours, register, type
     """
     path = registry_path if registry_path is not None else _default_registry_path()
@@ -411,7 +411,7 @@ def completed_uow_durations(
     try:
         rows = conn.execute(
             """
-            SELECT id, created_at, completed_at, steward_cycles, register, type
+            SELECT id, created_at, completed_at, steward_cycles, lifetime_cycles, register, type
             FROM uow_registry
             WHERE status = 'done'
               AND completed_at IS NOT NULL
@@ -448,6 +448,7 @@ def completed_uow_durations(
             "created_at": created,
             "completed_at": completed,
             "steward_cycles": row["steward_cycles"],
+            "lifetime_cycles": row["lifetime_cycles"],
             "wall_clock_hours": wall_clock_hours,
             "register": row["register"] or "operational",
             "type": row["type"] or "executable",

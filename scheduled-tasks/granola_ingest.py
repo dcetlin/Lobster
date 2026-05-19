@@ -34,8 +34,20 @@ from typing import Iterator
 # Bootstrap: ensure we can import sibling modules regardless of cwd
 # ---------------------------------------------------------------------------
 _THIS_DIR = Path(__file__).parent.resolve()
+_REPO_ROOT = _THIS_DIR.parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+
+# ---------------------------------------------------------------------------
+# jobs.json enabled gate — Type C dispatch path
+# ---------------------------------------------------------------------------
+
+JOB_NAME = "granola-ingest"
+
+from src.utils.jobs import is_job_enabled  # noqa: E402
 
 from granola_client import GranolaClient, GranolaAPIError  # noqa: E402
 from granola_state import IncrementalFetcher, StateManager  # noqa: E402
@@ -144,6 +156,9 @@ def _fetch_notes_for_account(
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    if not is_job_enabled(JOB_NAME):
+        return 0
+
     log = _setup_logging()
     log.info("=== Granola ingest started ===")
 

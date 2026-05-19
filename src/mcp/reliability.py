@@ -39,7 +39,7 @@ _SRC_DIR = str(Path(__file__).resolve().parent.parent)
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from utils.fs import atomic_write_json, safe_move  # noqa: E402, F401
+from src.utils.fs import atomic_write_json, safe_move  # noqa: E402, F401
 
 
 # =============================================================================

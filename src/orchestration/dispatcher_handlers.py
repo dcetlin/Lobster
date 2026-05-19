@@ -7,14 +7,17 @@ Telegram. No MCP tools, no network calls — those belong in the dispatcher.
 
 The dispatcher calls these handlers when it recognizes:
   /approve <uow-id>                    → handle_approve(uow_id, registry)
-  /decide <uow-id> <proceed|abandon|retry> → handle_decide(uow_id, action, registry)
+  /decide <uow-id> <proceed|abandon|retry|owner <decision>> → handle_decide(uow_id, action, registry)
   /wos status [status]                 → handle_wos_status(status, registry)
+  /wos uow <uow-id>                    → handle_wos_uow(uow_id, registry) → dispatcher spawns subagent
   /wos unblock                         → handle_wos_unblock()
   /wos start                           → handle_wos_start()
   /wos stop                            → handle_wos_stop()
+  wos abort <uow-id>                   → handle_wos_abort(uow_id, registry)
   decide retry <uow-id>                → handle_decide_retry(uow_id, registry)
   decide close <uow-id>                → handle_decide_close(uow_id, registry)
   type: "wos_execute"                  → handle_wos_execute(uow_id, instructions, output_ref)
+  type: "wos_owner_required"           → handle_wos_owner_required(msg)
   type: "callback" (decide_retry/close)→ route_callback_message(msg)
 
 ## Compaction-resilient dispatch
@@ -28,16 +31,35 @@ Import and call this table unconditionally — Python imports survive compaction
 from __future__ import annotations
 
 import json
+import logging
 import os
+import subprocess
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .registry import Registry
 
 from .registry import ApproveConfirmed, ApproveExpired, ApproveNotFound, ApproveSkipped
-from .paths import LOBSTER_WORKSPACE as _LOBSTER_WORKSPACE, WOS_CONFIG as _WOS_CONFIG_PATH_FROM_PATHS, WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG
+from .paths import LOBSTER_WORKSPACE as _LOBSTER_WORKSPACE, WOS_CONFIG as _WOS_CONFIG_PATH_FROM_PATHS, WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG, JOBS_JSON as _JOBS_JSON_PATH
 from .steward import ReturnReasonClassification, MAX_RETRIES as _STEWARD_MAX_RETRIES, _HARD_CAP_CYCLES
+from .wos_issue_lifecycle import HUMAN_GATE_LABELS as _HUMAN_GATE_LABELS
+from src.utils.timezone import format_iso_for_user as _format_iso_for_user, get_owner_tz_name as _get_owner_tz_name
+
+
+# ---------------------------------------------------------------------------
+# Control event type constants
+# ---------------------------------------------------------------------------
+
+class ControlEventType(StrEnum):
+    """Named constants for dispatcher control event types written to control_events."""
+
+    WOS_START = "wos_start"
+    WOS_STOP = "wos_stop"
+    WOS_ABORT = "wos_abort"
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +109,250 @@ def _write_wos_config(config: dict) -> None:
     with tmp.open("w") as fh:
         json.dump(config, fh)
     tmp.rename(_WOS_CONFIG_PATH)
+
+
+# Canonical pause_reason value written to wos-config.json when the operator
+# explicitly runs `wos stop`. Steward-heartbeat imports this constant to
+# identify intentional pauses and suppress false-positive starvation alerts.
+_PAUSE_REASON_USER_COMMAND: str = "user_command"
+
+
+# ---------------------------------------------------------------------------
+# WOS-core job list — canonical gate list for wos start / wos stop
+# ---------------------------------------------------------------------------
+#
+# These are the jobs that constitute the WOS pipeline. All 14 are toggled
+# atomically when the operator runs `wos start` or `wos stop`. The source of
+# truth for which jobs are WOS-core is the `wos_core: true` field in
+# jobs.json (instance config). This constant mirrors that list so that the
+# toggle function can be tested independently of a live jobs.json, and so
+# that missing entries are detectable at toggle time.
+#
+# wos-health-monitor is listed here but may not be present in jobs.json on
+# all instances (it was previously managed via systemd only). The toggle
+# function skips entries not found in jobs.json and surfaces them in its
+# return value.
+#
+_WOS_CORE_JOBS: frozenset[str] = frozenset({
+    "executor-heartbeat",
+    "steward-heartbeat",
+    "issue-sweeper",
+    "uow-reflection",
+    "pattern-candidate-sweep",
+    "github-issue-cultivator",
+    "proposals-authorship",
+    "wos-overnight-loop",
+    "wos-hourly-observation",
+    "wos-queue-monitor",
+    "wos-health-check",
+    "wos-metabolic-digest",
+    "wos-pr-sweeper",
+    "wos-health-monitor",
+})
+
+# ---------------------------------------------------------------------------
+# Systemd timer management for WOS-core jobs
+# ---------------------------------------------------------------------------
+#
+# A subset of WOS-core jobs are dispatched via systemd timers (not cron).
+# These timers call dispatch-job.sh, which reads the jobs.json `enabled` flag
+# as a second gate. When the timer is disabled, the job never fires regardless
+# of the jobs.json state — so wos start/stop must manage both layers.
+#
+# Jobs in this set have unit files at /etc/systemd/system/lobster-{job}.timer
+# and are managed only when the file exists AND contains the LOBSTER-MANAGED
+# comment (safety guard against touching unrelated timers).
+#
+_SYSTEMD_UNIT_DIR: Path = Path("/etc/systemd/system")
+
+_WOS_CORE_TIMER_JOBS: frozenset[str] = frozenset({
+    "issue-sweeper",
+    "github-issue-cultivator",
+    "pattern-candidate-sweep",
+    "uow-reflection",
+    "wos-overnight-loop",
+    "wos-hourly-observation",
+    "wos-health-monitor",
+})
+
+_LOBSTER_MANAGED_MARKER = "# LOBSTER-MANAGED"
+
+
+def _toggle_systemd_timers(enabled: bool) -> list[str]:
+    """Enable or disable systemd timers for WOS-core jobs that use them.
+
+    For each job in ``_WOS_CORE_TIMER_JOBS``:
+    - Checks whether ``/etc/systemd/system/lobster-{job}.timer`` exists.
+    - Reads the unit file and verifies it contains ``# LOBSTER-MANAGED`` (safety
+      guard: we never touch timers we did not install).
+    - Calls ``sudo systemctl enable --now`` or ``sudo systemctl disable --now``
+      depending on ``enabled``.
+    - Failures (non-zero exit, subprocess error, permission error) are logged
+      and skipped — this function never raises.
+
+    Returns a list of timer names that were successfully toggled.
+    """
+    action = "enable" if enabled else "disable"
+    toggled: list[str] = []
+
+    for job_name in sorted(_WOS_CORE_TIMER_JOBS):
+        timer_name = f"lobster-{job_name}.timer"
+        unit_path = _SYSTEMD_UNIT_DIR / timer_name
+
+        if not unit_path.exists():
+            continue
+
+        try:
+            unit_text = unit_path.read_text()
+        except OSError:
+            _log.debug("_toggle_systemd_timers: cannot read %s — skipping", unit_path)
+            continue
+
+        if _LOBSTER_MANAGED_MARKER not in unit_text:
+            _log.debug(
+                "_toggle_systemd_timers: %s lacks LOBSTER-MANAGED marker — skipping",
+                timer_name,
+            )
+            continue
+
+        try:
+            proc = subprocess.run(
+                ["sudo", "systemctl", f"{action}", "--now", timer_name],
+                capture_output=True,
+                timeout=15,
+            )
+            if proc.returncode == 0:
+                toggled.append(timer_name)
+                _log.info("_toggle_systemd_timers: %s %sd successfully", timer_name, action)
+            else:
+                _log.warning(
+                    "_toggle_systemd_timers: systemctl %s %s returned %d: %s",
+                    action,
+                    timer_name,
+                    proc.returncode,
+                    proc.stderr.decode(errors="replace").strip(),
+                )
+        except (OSError, subprocess.SubprocessError) as exc:
+            _log.warning(
+                "_toggle_systemd_timers: could not %s %s: %s",
+                action,
+                timer_name,
+                exc,
+            )
+
+    return toggled
+
+
+def _read_jobs_json() -> dict:
+    """Read jobs.json and return its contents. Returns empty jobs dict on error."""
+    try:
+        with _JOBS_JSON_PATH.open() as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {"jobs": {}}
+
+
+def _write_jobs_json(data: dict) -> None:
+    """Write jobs.json atomically (write-then-rename)."""
+    tmp = _JOBS_JSON_PATH.with_suffix(".json.tmp")
+    with tmp.open("w") as fh:
+        json.dump(data, fh, indent=2)
+    tmp.rename(_JOBS_JSON_PATH)
+
+
+def get_disabled_wos_core_jobs() -> list[str]:
+    """Return a sorted list of wos_core job names that are currently disabled.
+
+    Reads jobs.json and returns the names of all jobs where both:
+    - ``wos_core`` is truthy
+    - ``enabled`` is falsy (False, missing, or None)
+
+    Used by handle_wos_start to detect partially-enabled state: when
+    execution_enabled=True in wos-config.json but one or more wos_core jobs
+    are still disabled (e.g. due to a manual edit that bypassed toggle_wos_core_jobs).
+
+    Returns an empty list when all wos_core jobs are enabled or when jobs.json
+    is absent/unreadable.
+    """
+    jobs = _read_jobs_json().get("jobs", {})
+    return sorted(
+        name
+        for name, entry in jobs.items()
+        if entry.get("wos_core") and not entry.get("enabled", False)
+    )
+
+
+def toggle_wos_core_jobs(enabled: bool, pause_reason: str | None = None) -> dict:
+    """Enable or disable all WOS-core jobs atomically.
+
+    Reads jobs.json, sets the `enabled` field on every job where
+    `wos_core == True`, and writes both jobs.json and wos-config.json
+    atomically. The `execution_enabled` flag in wos-config.json is also
+    updated to match.
+
+    Jobs listed in _WOS_CORE_JOBS but absent from jobs.json are silently
+    skipped and reported in the `not_found` list of the return value.
+
+    Args:
+        enabled: True to enable WOS execution; False to disable.
+        pause_reason: Optional reason string written to wos-config.json when
+            disabling (``enabled=False``). Pass ``"user_command"`` when the
+            pause was explicitly requested by the user (via ``/wos stop``).
+            When ``enabled=True``, ``pause_reason`` is removed from the config
+            regardless of this argument. When ``enabled=False`` and
+            ``pause_reason`` is None, the field is left unchanged if already
+            present (preserves any prior reason written by an earlier call).
+
+    Returns a summary dict:
+        {
+            "toggled": [list of job names that were updated],
+            "not_found": [list of job names absent from jobs.json],
+            "new_state": "enabled" | "disabled",
+        }
+
+    This function is pure with respect to side effects: all I/O is
+    isolated to two atomic file writes at the end, after all mutations
+    are computed in memory.
+    """
+    jobs_data = _read_jobs_json()
+    jobs = jobs_data.get("jobs", {})
+
+    toggled: list[str] = []
+    not_found: list[str] = []
+
+    # Compute the updated jobs dict without mutating the original.
+    updated_jobs = {
+        name: ({**entry, "enabled": enabled} if entry.get("wos_core") else entry)
+        for name, entry in jobs.items()
+    }
+
+    # Identify which WOS-core jobs were toggled vs. not found.
+    for job_name in sorted(_WOS_CORE_JOBS):
+        if job_name in jobs and jobs[job_name].get("wos_core"):
+            toggled.append(job_name)
+        else:
+            not_found.append(job_name)
+
+    # Write both files atomically. If either write fails, raise — the caller
+    # (handle_wos_start / handle_wos_stop) catches OSError and reports it.
+    _write_jobs_json({**jobs_data, "jobs": updated_jobs})
+    config = read_wos_config()
+    new_config = {**config, "execution_enabled": enabled}
+    if enabled:
+        # Starting: clear pause_reason so monitoring knows execution is intentionally on.
+        new_config.pop("pause_reason", None)
+    elif pause_reason is not None:
+        # Stopping with an explicit reason: record it so monitors can suppress
+        # starvation alerts when the pause is intentional (user_command).
+        new_config["pause_reason"] = pause_reason
+    # else: stopping without a reason — leave any existing pause_reason unchanged.
+    _write_wos_config(new_config)
+
+    return {
+        "toggled": toggled,
+        "not_found": not_found,
+        "new_state": "enabled" if enabled else "disabled",
+    }
 
 
 def handle_approve(uow_id: str, *, registry: "Registry") -> str:
@@ -166,12 +432,14 @@ def handle_decide_close(uow_id: str, *, registry: "Registry") -> str:
     Handle a decide_close action for a UoW.
 
     Called when Dan selects "Close" after the Steward surfaces a stuck UoW,
-    or sends a message matching "decide close <uow-id>".
+    or sends a message matching "decide close <uow-id>" / "wos abort <uow-id>".
 
-    Transitions blocked → failed with reason=user_closed.
+    Transitions blocked → failed with reason=user_closed. Writes a 'wos_abort'
+    control event to the registry log when the close succeeds.
     """
     rows = registry.decide_close(uow_id)
     if rows == 1:
+        registry.log_control_event(ControlEventType.WOS_ABORT, {"uow_id": uow_id, "result": "closed"})
         return (
             f"UoW `{uow_id}` closed.\n"
             f"Status: `blocked \u2192 failed` (reason: user_closed)"
@@ -182,7 +450,7 @@ def handle_decide_close(uow_id: str, *, registry: "Registry") -> str:
     )
 
 
-_VALID_DECIDE_ACTIONS = frozenset({"proceed", "abandon", "retry", "defer"})
+_VALID_DECIDE_ACTIONS = frozenset({"proceed", "abandon", "retry", "defer", "owner"})
 
 
 def handle_decide_defer(uow_id: str, note: str = "", *, registry: "Registry") -> str:
@@ -211,28 +479,63 @@ def handle_decide_defer(uow_id: str, note: str = "", *, registry: "Registry") ->
     )
 
 
+def handle_owner_decide(uow_id: str, decision_note: str, *, registry: "Registry") -> str:
+    """
+    Handle `/decide <uow-id> owner <decision>` — provide an owner decision to a paused UoW.
+
+    Called when Dan provides a decision for a UoW that was paused in
+    `awaiting-owner` status (i.e., a subagent wrote outcome=owner_decision_required).
+
+    The decision text is recorded in the UoW's steward_log and the UoW is
+    transitioned back to ready-for-steward so the Steward can read the decision
+    and prescribe the next execution step accordingly.
+
+    Returns a human-readable Telegram message describing the outcome.
+    """
+    if not decision_note.strip():
+        return (
+            f"Decision text is required for owner action.\n"
+            f"Usage: `/decide {uow_id} owner <your decision text>`"
+        )
+    rows = registry.owner_decide(uow_id, decision_note.strip())
+    if rows == 1:
+        return (
+            f"UoW `{uow_id}` re-queued with owner decision.\n"
+            f"Status: `awaiting-owner → ready-for-steward`\n"
+            f"Decision recorded: {decision_note.strip()}"
+        )
+    return (
+        f"UoW `{uow_id}` could not be re-queued — it is not currently in `awaiting-owner` status.\n"
+        f"Run `/wos status awaiting-owner` to see UoWs awaiting a decision."
+    )
+
+
 def handle_decide(uow_id: str, action: str, *, registry: "Registry") -> str:
     """
-    Handle /decide <uow-id> <proceed|abandon|retry[force]|defer[note]>.
+    Handle /decide <uow-id> <proceed|abandon|retry[force]|defer[note]|owner <decision>>.
 
     Provides a single unified command for resolving blocked UoWs from Telegram.
     Action semantics:
-      proceed          — unblock and re-queue to ready-for-steward (preserves steward_cycles)
-      retry            — reset steward_cycles to 0 and re-queue to ready-for-steward (full retry)
-      retry force      — override the hard-cap commitment gate (explicit operator intent required)
+      proceed              — unblock and re-queue to ready-for-steward (preserves steward_cycles)
+      retry                — reset steward_cycles to 0 and re-queue to ready-for-steward (full retry)
+      retry force          — override the hard-cap commitment gate (explicit operator intent required)
       abandon          — close the UoW as user-requested failure (blocked → failed)
       defer [note]     — leave in blocked, write a dated audit entry with optional note
+      owner <decision> — record owner decision and re-queue awaiting-owner → ready-for-steward
 
-    All actions operate only on UoWs in `blocked` status — optimistic lock
-    prevents accidental double-writes if the UoW has already been advanced.
+    Most actions operate only on UoWs in `blocked` status. The `owner` action
+    operates only on UoWs in `awaiting-owner` status. Optimistic lock prevents
+    accidental double-writes if the UoW has already been advanced.
 
     Returns a human-readable Telegram message describing the outcome.
     """
     # Support "retry force" as a two-word action token.
     # Support "defer <note>" where any trailing text after "defer" is the note.
+    # Support "owner <decision>" where trailing text is the owner decision note.
     action_normalized = action.lower().strip()
     force_retry = False
     defer_note = ""
+    owner_decision = ""
 
     if action_normalized in ("retry force", "force retry"):
         action_normalized = "retry"
@@ -241,6 +544,10 @@ def handle_decide(uow_id: str, action: str, *, registry: "Registry") -> str:
         # "defer waiting on external review" → action=defer, note="waiting on external review"
         defer_note = action.strip()[len("defer "):].strip()
         action_normalized = "defer"
+    elif action_normalized.startswith("owner "):
+        # "owner proceed with option A" → action=owner, decision="proceed with option A"
+        owner_decision = action.strip()[len("owner "):].strip()
+        action_normalized = "owner"
 
     if action_normalized not in _VALID_DECIDE_ACTIONS:
         valid = ", ".join(sorted(_VALID_DECIDE_ACTIONS))
@@ -268,6 +575,8 @@ def handle_decide(uow_id: str, action: str, *, registry: "Registry") -> str:
             return handle_decide_close(uow_id, registry=registry)
         case "defer":
             return handle_decide_defer(uow_id, defer_note, registry=registry)
+        case "owner":
+            return handle_owner_decide(uow_id, owner_decision, registry=registry)
         case _:
             # Unreachable — guarded by frozenset check above — but satisfies mypy exhaustiveness
             return f"Unhandled action `{action}`."
@@ -356,6 +665,7 @@ def handle_wos_execute(uow_id: str, instructions: str, output_ref: str) -> str:
     return (
         f"---\n"
         f"task_id: wos-{uow_id}\n"
+        f"uow_id: {uow_id}\n"
         f"chat_id: 0\n"
         f"source: system\n"
         f"---\n\n"
@@ -385,6 +695,23 @@ def handle_wos_execute(uow_id: str, instructions: str, output_ref: str) -> str:
         f"A return value of 0 (or {{\"rowcount\": 0}} from the MCP tool) means the Steward\n"
         f"has already re-queued this UoW — stop execution immediately and call write_result\n"
         f"with outcome=failed.\n\n"
+        f"## PR-close guard (REQUIRED)\n\n"
+        f"Before closing any PR via `gh pr close` or any equivalent operation:\n\n"
+        f"1. Fetch the PR's labels:\n"
+        f"   ```bash\n"
+        f"   gh pr view <PR_NUMBER> --repo <REPO> --json labels --jq '[.labels[].name]'\n"
+        f"   ```\n\n"
+        f"2. If the output contains any of these labels — "
+        f"{', '.join(f'**`{lbl}`**' for lbl in sorted(_HUMAN_GATE_LABELS))} — "
+        f"**do not close the PR**. Instead:\n"
+        f"   - Skip the close operation entirely.\n"
+        f"   - Include in your result file's `reason` field: "
+        f"\"PR #<N> skipped: carries human-gate label <LABEL> — human review required\"\n"
+        f"   - Set outcome to `blocked` only if this is the sole blocker; otherwise "
+        f"continue with remaining instructions and report the skipped PR in the reason.\n\n"
+        f"3. If the `gh pr view` call fails for any reason, treat the PR as gated and skip.\n\n"
+        f"This guard applies to every PR close operation in the instructions below, "
+        f"regardless of how the instruction is phrased.\n\n"
         f"## Instructions\n\n"
         f"{instructions}\n\n"
         f"## Result contract (REQUIRED)\n\n"
@@ -394,9 +721,14 @@ def handle_wos_execute(uow_id: str, instructions: str, output_ref: str) -> str:
         f'  {{"uow_id": "{uow_id}", "outcome": "complete", "success": true}}\n'
         f'  {{"uow_id": "{uow_id}", "outcome": "failed", "success": false, "reason": "<why>"}}\n'
         f'  {{"uow_id": "{uow_id}", "outcome": "partial", "success": false, "reason": "<what was done and what was not>"}}\n'
-        f'  {{"uow_id": "{uow_id}", "outcome": "blocked", "success": false, "reason": "<what is blocking and why>"}}\n\n'
-        f"Outcome values: \"complete\" | \"partial\" | \"failed\" | \"blocked\"\n"
+        f'  {{"uow_id": "{uow_id}", "outcome": "blocked", "success": false, "reason": "<what is blocking and why>"}}\n'
+        f'  {{"uow_id": "{uow_id}", "outcome": "owner_decision_required", "success": false, "reason": "<what decision is needed and why only the owner can resolve it>"}}\n\n'
+        f"Outcome values: \"complete\" | \"partial\" | \"failed\" | \"blocked\" | \"owner_decision_required\"\n"
         f"\"success\" must be true if and only if outcome == \"complete\".\n\n"
+        f"Use \"owner_decision_required\" only when you have reached a genuine decision point\n"
+        f"that only the owner (Dan) can resolve and you cannot proceed without the answer.\n"
+        f"Do not use it for transient errors or blockers that a retry might resolve — use\n"
+        f"\"blocked\" or \"failed\" for those instead.\n\n"
         f"Steps to write the file:\n"
         f"  1. mkdir -p {'/'.join(output_ref.split('/')[:-1])}\n"
         f"  2. Write JSON to {output_ref}.tmp, then rename to {output_ref}\n\n"
@@ -408,7 +740,6 @@ def handle_wos_execute(uow_id: str, instructions: str, output_ref: str) -> str:
         f"response across all turns and report the total. This enables per-UoW cost telemetry.\n"
         f"Omit token_usage if you did not track it.\n\n"
         f"Minimum viable output: {output_ref} with uow_id, outcome, and success fields.\n"
-        f"Boundary: do not modify executor.py, registry.py, or any WOS source files.\n"
     )
 
 
@@ -451,73 +782,311 @@ def handle_wos_unblock() -> str:
     )
 
 
-def handle_wos_start() -> str:
+def handle_wos_start(*, registry: "Registry | None" = None) -> str:
     """
     Handle /wos start (or "wos start").
 
-    Sets execution_enabled: true in wos-config.json so that executor-heartbeat
-    dispatches UoWs on its next cycle (within ~90 seconds).
+    Enables all WOS-core jobs atomically: sets `enabled: true` on every job
+    tagged `wos_core: true` in jobs.json, and sets `execution_enabled: true`
+    in wos-config.json so that executor-heartbeat dispatches UoWs on its next
+    cycle (within ~90 seconds).
 
-    Idempotent: calling /wos start when already started returns a notice.
+    Partial-recovery path: if execution_enabled is already True but some wos_core
+    jobs are disabled (e.g. due to a manual jobs.json edit that bypassed the toggle),
+    re-enables those jobs and reports the recovered names rather than silently
+    declaring "already running". This prevents a class of stall where a partial
+    enable leaves the steward (or other core jobs) disabled while the system
+    believes the pipeline is running.
+
+    Idempotent: calling /wos start when already fully started (all wos_core jobs
+    enabled) returns a notice without calling toggle_wos_core_jobs.
+
+    Args:
+        registry: Optional Registry instance. When omitted (the default), a new
+            Registry() is created for the control event write. Callers may pass
+            an existing instance to avoid opening a second connection (useful in
+            tests that need to inspect the written rows).
 
     Returns a human-readable Telegram message describing the outcome.
     """
+    from .registry import Registry as _Registry  # local import — keeps module importable without DB
+
     config = read_wos_config()
     if config.get("execution_enabled"):
-        return (
-            "WOS execution is already enabled.\n"
-            "executor-heartbeat is dispatching UoWs normally."
+        # Detect partial-enable: execution is on but some wos_core jobs are still disabled.
+        disabled_core_jobs = get_disabled_wos_core_jobs()
+        if not disabled_core_jobs:
+            # Fully started — nothing to do.
+            return (
+                "WOS pipeline is already running.\n"
+                "executor-heartbeat is dispatching UoWs normally."
+            )
+
+        # Partial recovery: re-enable the disabled wos_core jobs via toggle.
+        try:
+            result = toggle_wos_core_jobs(enabled=True)
+        except OSError as exc:
+            return (
+                f"Failed to re-enable disabled WOS-core jobs: {exc}\n"
+                f"Config: `{_WOS_CONFIG_PATH}`"
+            )
+
+        timer_toggled = _toggle_systemd_timers(True)
+
+        lines = [
+            f"WOS partial recovery: {len(disabled_core_jobs)} wos_core job(s) were "
+            f"disabled while execution_enabled=true — re-enabled: "
+            f"{', '.join(disabled_core_jobs)}.",
+            "executor-heartbeat will dispatch ready-for-executor UoWs on its next "
+            "cycle (within ~90 seconds).",
+        ]
+        if timer_toggled:
+            lines.append(
+                f"Systemd timers re-enabled ({len(timer_toggled)}): "
+                f"{', '.join(sorted(timer_toggled))}"
+            )
+        if result["not_found"]:
+            lines.append(
+                f"Note: {len(result['not_found'])} WOS-core job(s) not in jobs.json "
+                f"(may be systemd-only): {', '.join(sorted(result['not_found']))}"
+            )
+
+        reg = registry if registry is not None else _Registry()
+        reg.log_control_event(
+            ControlEventType.WOS_START,
+            {
+                "partial_recovery": True,
+                "recovered": sorted(disabled_core_jobs),
+                "toggled": sorted(result["toggled"]),
+                "not_found": sorted(result["not_found"]),
+                "timers_toggled": sorted(timer_toggled),
+            },
         )
+
+        return "\n".join(lines)
 
     try:
-        _write_wos_config({**config, "execution_enabled": True})
+        result = toggle_wos_core_jobs(enabled=True)
     except OSError as exc:
         return (
-            f"Failed to write wos-config.json: {exc}\n"
-            f"Path: `{_WOS_CONFIG_PATH}`"
+            f"Failed to enable WOS-core jobs: {exc}\n"
+            f"Config: `{_WOS_CONFIG_PATH}`"
         )
 
-    return (
-        "WOS execution enabled.\n"
-        "executor-heartbeat will dispatch ready-for-executor UoWs on its next cycle "
-        "(within ~90 seconds).\n"
-        f"Config: `{_WOS_CONFIG_PATH}`"
+    timer_toggled = _toggle_systemd_timers(True)
+
+    toggled_count = len(result["toggled"])
+    lines = [
+        f"WOS pipeline started. {toggled_count} WOS-core jobs enabled.",
+        "executor-heartbeat will dispatch ready-for-executor UoWs on its next "
+        "cycle (within ~90 seconds).",
+    ]
+    if timer_toggled:
+        lines.append(
+            f"Systemd timers re-enabled ({len(timer_toggled)}): "
+            f"{', '.join(sorted(timer_toggled))}"
+        )
+    if result["not_found"]:
+        lines.append(
+            f"Note: {len(result['not_found'])} WOS-core job(s) not in jobs.json "
+            f"(may be systemd-only): {', '.join(sorted(result['not_found']))}"
+        )
+
+    reg = registry if registry is not None else _Registry()
+    reg.log_control_event(
+        ControlEventType.WOS_START,
+        {
+            "toggled": sorted(result["toggled"]),
+            "not_found": sorted(result["not_found"]),
+            "timers_toggled": sorted(timer_toggled),
+        },
     )
 
+    return "\n".join(lines)
 
-def handle_wos_stop() -> str:
+
+def handle_wos_stop(*, registry: "Registry | None" = None) -> str:
     """
     Handle /wos stop (or "wos stop").
 
-    Sets execution_enabled: false in wos-config.json so that executor-heartbeat
-    skips dispatch on its next cycle. UoWs already active are not affected —
-    TTL recovery will handle any that stall.
+    Pauses all WOS-core jobs atomically: sets `enabled: false` on every job
+    tagged `wos_core: true` in jobs.json, and sets `execution_enabled: false`
+    in wos-config.json so that executor-heartbeat skips dispatch on its next
+    cycle. UoWs already active are not affected — TTL recovery will handle
+    any that stall.
 
     Idempotent: calling /wos stop when already stopped returns a notice.
 
+    Args:
+        registry: Optional Registry instance. When omitted (the default), a new
+            Registry() is created for the control event write. Callers may pass
+            an existing instance to avoid opening a second connection (useful in
+            tests that need to inspect the written rows).
+
     Returns a human-readable Telegram message describing the outcome.
     """
+    from .registry import Registry as _Registry  # local import — keeps module importable without DB
+
     config = read_wos_config()
     if not config.get("execution_enabled"):
         return (
-            "WOS execution is already disabled.\n"
+            "WOS pipeline is already paused.\n"
             "executor-heartbeat is skipping dispatch."
         )
 
     try:
-        _write_wos_config({**config, "execution_enabled": False})
+        result = toggle_wos_core_jobs(enabled=False, pause_reason=_PAUSE_REASON_USER_COMMAND)
     except OSError as exc:
         return (
-            f"Failed to write wos-config.json: {exc}\n"
-            f"Path: `{_WOS_CONFIG_PATH}`"
+            f"Failed to disable WOS-core jobs: {exc}\n"
+            f"Config: `{_WOS_CONFIG_PATH}`"
         )
 
-    return (
-        "WOS execution disabled.\n"
-        "executor-heartbeat will skip dispatch on its next cycle (within ~90 seconds).\n"
-        "UoWs already active will continue running; TTL recovery handles any that stall.\n"
-        f"Config: `{_WOS_CONFIG_PATH}`"
+    timer_toggled = _toggle_systemd_timers(False)
+
+    toggled_count = len(result["toggled"])
+    lines = [
+        f"WOS pipeline paused. {toggled_count} WOS-core jobs disabled.",
+        "UoWs already active will continue running; TTL recovery handles any that stall.",
+    ]
+    if timer_toggled:
+        lines.append(
+            f"Systemd timers disabled ({len(timer_toggled)}): "
+            f"{', '.join(sorted(timer_toggled))}"
+        )
+    if result["not_found"]:
+        lines.append(
+            f"Note: {len(result['not_found'])} WOS-core job(s) not in jobs.json "
+            f"(may be systemd-only): {', '.join(sorted(result['not_found']))}"
+        )
+
+    reg = registry if registry is not None else _Registry()
+    reg.log_control_event(
+        ControlEventType.WOS_STOP,
+        {
+            "toggled": sorted(result["toggled"]),
+            "not_found": sorted(result["not_found"]),
+            "timers_toggled": sorted(timer_toggled),
+        },
     )
+
+    return "\n".join(lines)
+
+
+def handle_wos_abort(uow_id: str, *, registry: "Registry") -> str:
+    """
+    Handle 'wos abort <uow_id>'.
+
+    Sends SIGTERM to the process group of the subprocess dispatched for the
+    given UoW. This kills the running worker explicitly without waiting for
+    TTL recovery (which takes up to 24 hours).
+
+    The kill targets the entire process group (os.killpg) so that any child
+    processes spawned by the subagent (e.g. claude -p spawning shell commands)
+    are also terminated.
+
+    Flow:
+      1. Look up executor_pid via registry.get_executor_pid(uow_id).
+      2. If None (no running process): report not found — nothing to kill.
+      3. If found: call registry.kill_executor(uow_id) which sends SIGTERM
+         and clears executor_pid on success or ProcessLookupError.
+
+    Returns a human-readable Telegram message describing the outcome.
+
+    Note: The registry transition from executing/active to failed/ready-for-steward
+    is NOT performed here — the killed subprocess will fail to write its result
+    file, and TTL/heartbeat recovery will detect the missing result and re-queue
+    the UoW on the next observation cycle. This preserves the existing recovery
+    path and avoids a conflicting state transition race.
+
+    Args:
+        uow_id: The UoW identifier to abort.
+        registry: The Registry instance to query and update.
+    """
+    pid = registry.get_executor_pid(uow_id)
+    if pid is None:
+        return (
+            f"UoW `{uow_id}`: no running process found (executor_pid is not set).\n"
+            "The UoW may not have been dispatched via subprocess, or it already completed.\n"
+            "Run `/wos status active` or `/wos status executing` to check current state."
+        )
+
+    killed = registry.kill_executor(uow_id)
+    if killed:
+        return (
+            f"UoW `{uow_id}` aborted: sent SIGTERM to process group of PID {pid}.\n"
+            "The subprocess and its children have been signaled for termination.\n"
+            "TTL/heartbeat recovery will re-queue the UoW on the next observation cycle."
+        )
+
+    # kill_executor returned False — two distinct cases depending on whether the PID was retained.
+    # PermissionError: process still running but unowned → PID retained.
+    # ProcessLookupError: process already gone → PID cleared.
+    retained_pid = registry.get_executor_pid(uow_id)
+    if retained_pid is not None:
+        # PermissionError path: process alive but we cannot signal it.
+        return (
+            f"UoW `{uow_id}`: cannot kill PID {pid} — permission denied.\n"
+            "The process may still be running (owned by a different user).\n"
+            "executor_pid has been retained for future abort attempts."
+        )
+    else:
+        # ProcessLookupError path: process already exited, stale PID cleared.
+        return (
+            f"UoW `{uow_id}`: process PID {pid} was already gone (ProcessLookupError).\n"
+            "The subprocess may have exited before the abort command reached it.\n"
+            "executor_pid has been cleared. The UoW will be re-queued by heartbeat recovery."
+        )
+
+
+def handle_wos_uow(uow_id: str, *, registry: "Registry") -> str:
+    """
+    Handle '/wos uow <uow_id>' — validate the UoW and return a sentinel or error string.
+
+    This function validates the UoW exists (or could exist via suffix match) and
+    returns the sentinel string "found" so the dispatcher knows it can proceed to
+    spawn the wos-uow-detail subagent.
+
+    The dispatcher is responsible for:
+      1. Reading the task file.
+      2. Spawning a lobster-generalist subagent with the task file content, injecting
+         `uow_id` into the prompt header.
+      3. Sending an ack reply ("Looking up UoW...").
+
+    Returns:
+        The sentinel string "found" if the UoW exists, or an inline not-found message
+        string if no matching UoW was found. When the UoW is not found, the dispatcher
+        should send the returned string directly to the user without spawning a subagent.
+
+    Note: Full detail formatting (timestamps, cycle counts, etc.) happens inside the
+    subagent using the task file. This function only performs a lightweight existence
+    check so the dispatcher can give an immediate "not found" response instead of
+    spawning a subagent that immediately fails.
+    """
+    # Quick existence check — if the exact ID is not found, try suffix match.
+    uow = registry.get(uow_id)
+    if uow is not None:
+        return "found"
+
+    # Try suffix match (user may have typed the trailing hex only, e.g. "abc123").
+    import sqlite3
+    conn = registry._connect()
+    try:
+        rows = conn.execute(
+            "SELECT id FROM uow_registry WHERE id LIKE ? ORDER BY created_at DESC",
+            (f"%{uow_id}",),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if len(rows) == 0:
+        return f"UoW `{uow_id}` not found in registry."
+    if len(rows) > 1:
+        ids = ", ".join(f"`{r['id']}`" for r in rows[:5])
+        suffix = f" (and {len(rows) - 5} more)" if len(rows) > 5 else ""
+        return f"Ambiguous ID — {len(rows)} UoWs end with `{uow_id}`: {ids}{suffix}"
+    # Exactly one suffix match.
+    return "found"
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +1134,22 @@ WOS_MESSAGE_TYPE_DISPATCH: dict[str, str] = {
     # and returns a structured forensic report. Always returns action="spawn_subagent";
     # runs inside the spawn-gate block where the enforcement check is always satisfied.
     "wos_diagnose": "handle_wos_diagnose",
+    # PR sweep result handler: written by wos-pr-sweeper.py (Type C cron script) when
+    # stale open PRs or merged PRs with non-done UoWs are detected. Fast-path — dispatched
+    # before the spawn-gate because this handler legitimately returns action="send_reply"
+    # (surface PR attention items to Dan). No subagent spawn required.
+    "wos_pr_sweep_result": "handle_wos_pr_sweep_result",
+    # Per-cycle completion ping: written by wos_completion_notifier.py when a UoW
+    # transitions to Done or Failed in _process_uow(). Fast-path — dispatched before the
+    # spawn-gate; returns action="send_reply" to deliver the pre-formatted ping to Dan.
+    # Non-fatal write: steward.py swallows inbox write errors so the Done/Failed
+    # registry transition is never blocked.
+    "wos_done": "handle_wos_done",
+    # Owner escalation: written by steward._write_owner_required_message when a subagent
+    # writes outcome=owner_decision_required in its result file. Fast-path — dispatched
+    # before the spawn-gate; returns action="send_reply" to notify Dan directly.
+    # No subagent spawn required.
+    "wos_owner_required": "handle_wos_owner_required",
 }
 
 
@@ -1304,6 +1889,43 @@ def parse_diagnose_command(text: str) -> str | None:
     return None
 
 
+def parse_wos_abort_command(text: str) -> str | None:
+    """
+    Parse a ``wos abort <uow_id>`` Telegram command and return the UoW ID.
+
+    Matches ``wos abort <uow_id>`` (case-insensitive, leading/trailing whitespace
+    ignored). Returns the uow_id token if the command matches; None otherwise.
+
+    The dispatcher calls this alongside other 'wos ...' command parsers before
+    routing the command to handle_wos_abort().
+
+    Args:
+        text: The raw Telegram message text.
+
+    Returns:
+        The ``uow_id`` token if the command matches; ``None`` otherwise.
+
+    Examples::
+
+        parse_wos_abort_command("wos abort uow_20260426_abc123")
+        # → "uow_20260426_abc123"
+
+        parse_wos_abort_command("WOS ABORT uow_20260426_abc123")
+        # → "uow_20260426_abc123"
+
+        parse_wos_abort_command("wos start")
+        # → None
+    """
+    stripped = text.strip()
+    lower = stripped.lower()
+    if lower.startswith("wos abort "):
+        remainder = stripped[len("wos abort "):].strip()
+        tokens = remainder.split()
+        if tokens:
+            return tokens[0]
+    return None
+
+
 def _load_instructions_from_artifact(uow_id: str) -> str:
     """
     Load prescribed instructions from the WorkflowArtifact file for uow_id.
@@ -1324,6 +1946,143 @@ def _load_instructions_from_artifact(uow_id: str) -> str:
     text = path.read_text(encoding="utf-8")
     artifact = from_frontmatter(text)
     return artifact["instructions"]
+
+
+def handle_wos_pr_sweep_result(msg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Handle a ``wos_pr_sweep_result`` inbox message from the PR sweeper cron script.
+
+    Called by route_wos_message when the dispatcher receives a message written by
+    wos-pr-sweeper.py.  The sweeper produces these messages when stale open PRs
+    (open >7 days) or merged PRs with non-done UoWs are detected.
+
+    This handler is a fast-path: it returns action="send_reply" so the dispatcher
+    surfaces the sweep results directly to Dan without spawning a subagent.  It is
+    dispatched before the spawn-gate (which only applies to execution message types
+    that must always spawn a subagent).
+
+    Pure function — no side effects, no I/O.
+
+    Args:
+        msg: The raw wos_pr_sweep_result inbox message dict.  Expected fields:
+            - ``text`` (str): Pre-formatted notification text from the sweeper.
+            - ``chat_id`` (int): Admin chat ID to deliver the message to.
+            - ``data`` (dict, optional): Structured counts (stale_open_count, etc.).
+
+    Returns:
+        A dict with action="send_reply" and the notification text.
+    """
+    text: str = msg.get("text", "WOS PR sweep results (no detail available)")
+    chat_id: int = int(msg.get("chat_id", os.environ.get("LOBSTER_ADMIN_CHAT_ID", "0")))
+    return {
+        "action": "send_reply",
+        "text": text,
+        "chat_id": chat_id,
+        "message_type": "wos_pr_sweep_result",
+    }
+
+
+def handle_wos_done(msg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Handle a ``wos_done`` inbox message — per-cycle ping for a UoW Done/Failed transition.
+
+    Called by route_wos_message when the dispatcher receives a message written by
+    wos_completion_notifier.py at the end of the Done() or fail_uow() branch.
+
+    This handler is a fast-path: it returns action="send_reply" so the dispatcher
+    delivers the pre-formatted Telegram ping to Dan directly, without spawning a
+    subagent. It is dispatched before the spawn-gate (which applies only to execution
+    message types that must always spawn a subagent).
+
+    The ping text is pre-formatted by wos_completion_notifier._select_format_and_build
+    in one of three variants:
+    - Short-form: pearl outcome with ≤1 execution attempt (two-line terse format)
+    - Rich-form: non-pearl outcome or >1 execution attempt (labelled multi-field format)
+    - Failed-form: UoW that failed (failed prefix, topology, tokens, failure summary)
+
+    After assembling the ping text, this handler generates a per-UoW HTML drilldown
+    page via wos_uow_detail_gen.generate_and_upload and appends the public URL to the
+    message so Dan can tap through to token breakdown, audit trail, and corrective
+    traces. The HTML generation step is non-fatal: if the registry is absent (e.g. test
+    env), the UoW is not found, or the upload fails, the original text is sent unchanged.
+
+    Args:
+        msg: The raw wos_done inbox message dict.  Expected fields:
+            - ``text`` (str): Pre-formatted ping text from wos_completion_notifier.
+            - ``chat_id`` (str): Admin chat_id to deliver the ping to.
+            - ``uow_id`` (str): The UoW ID — used to generate the HTML detail URL.
+
+    Returns:
+        A dict with action="send_reply" and the ping text (with HTML detail URL when
+        generation succeeds).
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    _default_chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
+    text: str = msg.get("text", "WOS UoW completion notification (no detail available)")
+    chat_id: str = str(msg.get("chat_id", _default_chat_id))
+    uow_id: str = msg.get("uow_id", "")
+
+    # Append the HTML drilldown URL when the UoW id is known and the detail page
+    # can be generated successfully.  Non-fatal: failures are logged and the
+    # original text is sent unchanged so the completion notification always fires.
+    if uow_id:
+        try:
+            from .wos_uow_detail_gen import generate_and_upload
+            detail_url = generate_and_upload(uow_id=uow_id)
+            text = f"{text}\n{detail_url}"
+        except Exception as exc:
+            _log.debug(
+                "handle_wos_done: could not generate HTML detail for UoW %r — %s: %s",
+                uow_id, type(exc).__name__, exc,
+            )
+
+    return {
+        "action": "send_reply",
+        "text": text,
+        "chat_id": chat_id,
+        "message_type": "wos_done",
+    }
+
+
+def handle_wos_owner_required(msg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Handle a ``wos_owner_required`` inbox message — owner escalation from a subagent.
+
+    Called by route_wos_message when the dispatcher receives a message written by
+    steward._write_owner_required_message when a subagent writes
+    outcome=owner_decision_required in its result file.
+
+    This handler is a fast-path: it returns action="send_reply" so the dispatcher
+    delivers the pre-formatted owner decision request to Dan directly, without
+    spawning a subagent.
+
+    The UoW has already been transitioned to 'awaiting-owner' status by the steward
+    before this message was written to the inbox. Dan's reply in the primary thread
+    constitutes the decision; the dispatcher can then re-queue the UoW to
+    ready-for-steward with the decision as a note.
+
+    Args:
+        msg: The raw wos_owner_required inbox message dict. Expected fields:
+            - ``text`` (str): Pre-formatted notification text from the steward.
+            - ``chat_id`` (str|int): Admin chat_id to deliver the notification to.
+            - ``uow_id`` (str): The UoW ID — carried for dispatcher reference.
+            - ``uow_title`` (str): UoW summary — carried for dispatcher reference.
+
+    Returns:
+        A dict with action="send_reply" and the notification text.
+    """
+    _default_chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
+    text: str = msg.get("text", "WOS UoW awaiting your decision (no detail available)")
+    chat_id: str = str(msg.get("chat_id", _default_chat_id))
+
+    return {
+        "action": "send_reply",
+        "text": text,
+        "chat_id": chat_id,
+        "message_type": "wos_owner_required",
+    }
 
 
 def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
@@ -1446,6 +2205,89 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
                     f"({type(exc).__name__}: {exc}). "
                     f"Kill wave was NOT processed. "
                     "Check logs and re-queue manually if needed."
+                ),
+                "message_type": msg_type,
+            }
+
+    # ---------------------------------------------------------------------------
+    # wos_pr_sweep_result fast-path: dispatched before the spawn-gate.  The PR sweeper
+    # cron script writes these messages when stale open PRs or merged PRs with non-done
+    # UoWs are found.  This handler always returns action="send_reply" — no subagent
+    # spawn is needed, just surface the pre-formatted text to Dan.
+    # ---------------------------------------------------------------------------
+    if msg_type == "wos_pr_sweep_result":
+        try:
+            sweep_result = handle_wos_pr_sweep_result(msg)
+            sweep_result["message_type"] = msg_type
+            return sweep_result
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).error(
+                "route_wos_message: handle_wos_pr_sweep_result raised %s: %s — "
+                "returning send_reply alert",
+                type(exc).__name__, exc,
+            )
+            return {
+                "action": "send_reply",
+                "text": (
+                    f"WOS PR sweep handler raised an error "
+                    f"({type(exc).__name__}: {exc}). "
+                    "PR sweep results were NOT delivered. Check logs."
+                ),
+                "message_type": msg_type,
+            }
+
+    # ---------------------------------------------------------------------------
+    # wos_done fast-path: per-cycle completion ping written by wos_completion_notifier.py
+    # at the end of the Done() or fail_uow() branch in steward._process_uow().
+    # Always returns action="send_reply" — no subagent spawn required.
+    # ---------------------------------------------------------------------------
+    if msg_type == "wos_done":
+        try:
+            done_result = handle_wos_done(msg)
+            done_result["message_type"] = msg_type
+            return done_result
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).error(
+                "route_wos_message: handle_wos_done raised %s: %s — "
+                "returning send_reply alert",
+                type(exc).__name__, exc,
+            )
+            return {
+                "action": "send_reply",
+                "text": (
+                    f"WOS completion ping handler raised an error "
+                    f"({type(exc).__name__}: {exc}). "
+                    "Completion ping was NOT delivered. Check logs."
+                ),
+                "message_type": msg_type,
+            }
+
+    # ---------------------------------------------------------------------------
+    # wos_owner_required fast-path: written by steward._write_owner_required_message
+    # when a subagent writes outcome=owner_decision_required. The UoW is already
+    # transitioned to awaiting-owner by the steward before this message is written.
+    # Always returns action="send_reply" — no subagent spawn required.
+    # ---------------------------------------------------------------------------
+    if msg_type == "wos_owner_required":
+        try:
+            owner_result = handle_wos_owner_required(msg)
+            owner_result["message_type"] = msg_type
+            return owner_result
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).error(
+                "route_wos_message: handle_wos_owner_required raised %s: %s — "
+                "returning send_reply alert",
+                type(exc).__name__, exc,
+            )
+            return {
+                "action": "send_reply",
+                "text": (
+                    f"WOS owner-required handler raised an error "
+                    f"({type(exc).__name__}: {exc}). "
+                    "Owner notification was NOT delivered. Check logs."
                 ),
                 "message_type": msg_type,
             }
@@ -1634,3 +2476,635 @@ def route_callback_message(msg: dict[str, Any], *, registry: "Registry | None" =
 
     # Not a WOS callback — signal the dispatcher to use its own handling
     return {"action": "send_reply", "text": f"Unknown callback: {data}", "chat_id": chat_id, "handled": False}
+
+
+# ---------------------------------------------------------------------------
+# Help text — update when new commands are added
+# ---------------------------------------------------------------------------
+
+COMMAND_HELP: str = """Lobster command index
+
+System status:
+  /status             — running agents, WOS state, CC usage snapshot
+  /quota              — CC quota windows and reset times (5h and 7d)
+  status / health     — usage %, WOS state, active agents (prose command)
+  usage               — Claude quota windows and reset times (prose command)
+  usage full          — full usage report (spawns subagent)
+  agents              — list active subagent sessions
+  inbox               — queue depth and processing state
+
+LOS (action items):
+  /todos              — show open action items with Done/Snooze buttons
+  /todo add <text>    — add a new action item
+  /todo done <text>   — mark an item done by partial text or ID
+  /todo snooze <text> [days] — snooze an item (default: 3 days)
+
+WOS control:
+  /wos                — active UoW count, pipeline status breakdown, Bisque link
+  wos start  — enable WOS pipeline (all 14 WOS-core jobs + execution_enabled)
+  wos stop   — pause WOS pipeline (all 14 WOS-core jobs + execution_enabled)
+  wos status [status] — show active + queued UoWs
+  wos uow <uow-id>    — show detail for a specific UoW
+  wos unblock         — clear BOOTUP_CANDIDATE_GATE flag
+  wos abort <uow-id>  — send SIGTERM to running subprocess for a UoW
+
+Decision:
+  /approve <uow-id>   — approve a proposed UoW
+  /decide <uow-id> <action> — resolve a blocked UoW
+    actions: proceed, retry, retry force, abandon, defer [note], owner <decision>
+    owner action: re-queues an awaiting-owner UoW with the given decision note
+
+Config (user bootup files):
+  /config list                  — list all user config files with line counts
+  /config read <filename>       — show file contents (chunked if long)
+  /config search <query>        — search for text across all user config files
+  /config append <filename> <text> — append text to a user config file
+
+Skills:
+  /shop               — list available skills
+  /shop install <name> — install and activate a skill
+  /skill activate/deactivate <name> — toggle a skill
+
+Review:
+  /re-review <PR URL or number> — re-run oracle review on a PR
+
+Restart:
+  restart mcp         — restart MCP server (auto-reconnects)
+  restart dispatcher  — instructions to restart dispatcher process
+
+Debug:
+  debug on / debug off — toggle debug flag file
+
+Help:
+  /help / help        — this index
+"""
+
+
+def handle_help() -> str:
+    """Handle 'help' / '/help' command — return command index."""
+    return COMMAND_HELP
+
+
+# ---------------------------------------------------------------------------
+# CC quota state — path and stale threshold
+# ---------------------------------------------------------------------------
+
+# Default path for the cc-budget state file written by cc-usage-poller.py.
+# Overridable via LOBSTER_CC_BUDGET_STATE env var or the state_path argument.
+_CC_BUDGET_STATE_PATH: Path = Path.home() / ".claude" / "cc-budget" / "state.json"
+
+# Data older than this many hours is treated as unavailable (poller may be down).
+QUOTA_STALE_THRESHOLD_HOURS: int = 2
+
+
+def read_quota_state(state_path: Path | None = None) -> dict | None:
+    """Read the CC budget state written by cc-usage-poller.
+
+    Pure read: no side effects beyond file I/O. Returns the parsed dict, or None
+    when the file is absent, unreadable, malformed, or missing ``rate_limits``.
+
+    Path resolution order:
+    1. ``state_path`` argument (if provided)
+    2. ``LOBSTER_CC_BUDGET_STATE`` env var
+    3. ``~/.claude/cc-budget/state.json`` (default)
+    """
+    resolved: Path
+    if state_path is not None:
+        resolved = state_path
+    else:
+        env_override = os.environ.get("LOBSTER_CC_BUDGET_STATE")
+        resolved = Path(env_override) if env_override else _CC_BUDGET_STATE_PATH
+
+    try:
+        text = resolved.read_text(encoding="utf-8")
+        data = json.loads(text)
+        # Require the rate_limits key written by cc-usage-poller (v2 schema).
+        if "rate_limits" not in data:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _is_quota_state_stale(state: dict) -> bool:
+    """Return True if the state's last_updated timestamp exceeds QUOTA_STALE_THRESHOLD_HOURS.
+
+    Falls back to False (fresh) when last_updated is absent or unparseable so that
+    partial state data is still surfaced rather than silently suppressed.
+    """
+    from datetime import datetime as _datetime, timezone as _timezone, timedelta as _timedelta
+
+    last_updated = state.get("last_updated")
+    if not last_updated:
+        return False  # no timestamp — assume fresh rather than suppress
+    try:
+        ts_str = last_updated.replace("Z", "+00:00")
+        ts = _datetime.fromisoformat(ts_str)
+        age = _datetime.now(_timezone.utc) - ts
+        return age > _timedelta(hours=QUOTA_STALE_THRESHOLD_HOURS)
+    except Exception:
+        return False
+
+
+def format_quota_message(state: dict | None) -> str:
+    """Format a CC usage string from the cc-budget state dict.
+
+    Returns the unavailable message when:
+    - ``state`` is None (file missing/unreadable)
+    - ``state`` is stale (older than QUOTA_STALE_THRESHOLD_HOURS)
+    - ``rate_limits`` keys are missing or malformed
+
+    Format when data is available:
+        CC usage: 5h 42% | 7d 15%. Resets 5h: May 15 4:10 PM ET / 7d: May 22 11:00 AM ET.
+
+    Pure function: no side effects. All inputs are arguments.
+    """
+    _UNAVAILABLE = "CC usage data unavailable — poller may not have run yet."
+
+    if state is None:
+        return _UNAVAILABLE
+
+    if _is_quota_state_stale(state):
+        return _UNAVAILABLE
+
+    try:
+        rl = state["rate_limits"]
+        five_pct = rl["five_hour"]["pct"]
+        seven_pct = rl["seven_day"]["pct"]
+        five_resets_at = rl["five_hour"]["resets_at"]
+        seven_resets_at = rl["seven_day"]["resets_at"]
+    except (KeyError, TypeError):
+        return _UNAVAILABLE
+
+    def _fmt_reset(iso: str) -> str:
+        """Format an ISO reset timestamp in the owner's configured timezone."""
+        try:
+            return _format_iso_for_user(iso, fmt="%b %-d %-I:%M %p %Z")
+        except Exception:
+            return iso[:16]  # fallback: truncated ISO
+
+    five_reset_str = _fmt_reset(five_resets_at)
+    seven_reset_str = _fmt_reset(seven_resets_at)
+
+    return (
+        f"CC usage: 5h {five_pct:.0f}% | 7d {seven_pct:.0f}%. "
+        f"Resets — 5h: {five_reset_str} / 7d: {seven_reset_str}."
+    )
+
+
+def format_status_message(
+    active_sessions: list[dict],
+    wos_config: dict,
+    status_counts: dict,
+    quota_state: dict | None,
+) -> str:
+    """Format a system status snapshot for Telegram display.
+
+    Assembles three lines from independently-sourced data:
+    - WOS execution state and queue depth from wos_config + status_counts
+    - Active agent count and IDs from active_sessions
+    - CC usage percentage from quota_state (or unavailable)
+
+    Pure function: all inputs are arguments; no file reads or MCP calls.
+
+    Example output:
+        ◉ WOS: enabled | 179 ready-for-steward | 1 executing
+        ◉ Agents: 2 running (task-a, task-b)
+        ◉ CC usage: 5h 42% | 7d 15%. Resets — 5h: May 15 4:10 PM ET / 7d: May 22 11:00 AM ET.
+    """
+    execution_enabled = bool(wos_config.get("execution_enabled", False))
+    wos_label = "enabled" if execution_enabled else "stopped"
+
+    # Build queue-depth string from status_counts
+    queue_parts: list[str] = []
+    for status, count in sorted(status_counts.items()):
+        if count > 0:
+            queue_parts.append(f"{count} {status}")
+    queue_str = " | ".join(queue_parts) if queue_parts else "0 UoWs"
+
+    wos_line = f"◉ WOS: {wos_label} | {queue_str}"
+
+    # Active agents line
+    agent_count = len(active_sessions)
+    if agent_count == 0:
+        agents_line = "◉ Agents: 0 running"
+    else:
+        agent_ids = [
+            s.get("task_id") or s.get("id") or "?"
+            for s in active_sessions
+        ]
+        agents_line = f"◉ Agents: {agent_count} running ({', '.join(agent_ids)})"
+
+    # CC usage line
+    quota_line = "◉ " + format_quota_message(quota_state)
+
+    return "\n".join([wos_line, agents_line, quota_line])
+
+
+# ---------------------------------------------------------------------------
+# Inline dispatcher command handlers (Phase 1 + 2)
+#
+# These handlers implement snag-reachable commands that execute directly on
+# the dispatcher main thread without spawning a subagent.  Each function is
+# pure with respect to MCP calls — any MCP data (active_sessions, inbox msgs)
+# must be gathered by the dispatcher before calling these functions.
+# ---------------------------------------------------------------------------
+
+# Path to the debug-enabled flag file.  Touch to enable; unlink to disable.
+_DEBUG_FLAG_PATH: Path = Path.home() / "lobster-workspace" / "data" / "debug-enabled"
+
+
+def handle_usage() -> str:
+    """Handle prose 'usage' command — inline CC quota read from state.json.
+
+    Pure file read: reads cc-budget/state.json via read_quota_state() and
+    formats the result using format_quota_message().  Adds session cost when
+    available.  Returns the unavailable message when the file is absent or stale.
+    """
+    state = read_quota_state()
+    quota_msg = format_quota_message(state)
+    if state:
+        cost = state.get("session_cost_usd")
+        if cost is not None:
+            quota_msg += f"\nSession cost: ${cost:.2f}"
+    return quota_msg
+
+
+def handle_status(active_sessions: list[dict]) -> str:
+    """Handle prose 'status' / 'health' command — inline system snapshot.
+
+    Reads wos-config.json and cc-budget/state.json directly (fast file reads).
+    active_sessions must be gathered by the dispatcher via get_active_sessions()
+    before calling this function.
+
+    Returns a 3-line status string covering WOS state, agent count, and CC usage.
+    """
+    wos_config = read_wos_config()
+    quota_state = read_quota_state()
+
+    execution_enabled = bool(wos_config.get("execution_enabled", False))
+    wos_label = "enabled" if execution_enabled else "stopped"
+
+    agent_count = len(active_sessions)
+    quota_msg = format_quota_message(quota_state)
+
+    return "\n".join([
+        f"WOS: {wos_label}",
+        f"Active agents: {agent_count}",
+        quota_msg,
+    ])
+
+
+def handle_agents(active_sessions: list[dict]) -> str:
+    """Handle prose 'agents' command — format active session list.
+
+    active_sessions must be gathered by the dispatcher via get_active_sessions()
+    before calling this function.
+    """
+    if not active_sessions:
+        return "No active agents."
+    lines = [f"Active agents ({len(active_sessions)}):"]
+    for s in active_sessions:
+        agent_id = s.get("task_id") or s.get("agent_id") or s.get("id") or "?"
+        desc = s.get("description", "")
+        lines.append(f"  • {agent_id}: {desc}")
+    return "\n".join(lines)
+
+
+def handle_inbox(msgs: list[dict], total_count: int) -> str:
+    """Handle prose 'inbox' command — format queue depth and recent messages.
+
+    msgs and total_count must be gathered by the dispatcher via check_inbox()
+    and get_stats() before calling this function.
+    """
+    lines = [f"Inbox: {total_count} pending"]
+    for m in (msgs or [])[:5]:
+        preview = (m.get("text") or "")[:60].replace("\n", " ")
+        if preview:
+            lines.append(f"  • {preview}")
+    return "\n".join(lines)
+
+
+def handle_debug(on: bool) -> str:
+    """Handle 'debug on' / 'debug off' — toggle the debug-enabled flag file.
+
+    Touches ~/lobster-workspace/data/debug-enabled to enable debug mode;
+    unlinks it to disable.  Returns a confirmation string.
+    """
+    try:
+        if on:
+            _DEBUG_FLAG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _DEBUG_FLAG_PATH.touch()
+            return f"Debug mode enabled. Flag: `{_DEBUG_FLAG_PATH}`"
+        else:
+            if _DEBUG_FLAG_PATH.exists():
+                _DEBUG_FLAG_PATH.unlink()
+            return "Debug mode disabled. Flag file removed."
+    except OSError as exc:
+        return f"Debug toggle failed: {exc}"
+
+
+def handle_restart_mcp() -> str:
+    """Handle 'restart mcp' — return the inline ACK message.
+
+    The dispatcher sends this text as an immediate reply, then spawns a subagent
+    to run ~/lobster/scripts/restart-mcp.sh --no-wait.  The subagent performs
+    the actual restart; the dispatcher reconnects automatically.
+
+    Returns the ACK text to send before the subagent is spawned.
+    """
+    return (
+        "MCP restart initiated. The service will restart in ~5 seconds. "
+        "Reconnection is automatic — you may see a brief gap in responsiveness."
+    )
+
+
+def handle_restart_dispatcher() -> str:
+    """Handle 'restart dispatcher' — return manual restart instructions.
+
+    The Claude Code process cannot restart itself.  This function returns
+    the instructions Dan must follow to restart the dispatcher manually.
+    """
+    return (
+        "The dispatcher (Claude Code process) cannot restart itself.\n\n"
+        "To restart:\n"
+        "1. Open a new terminal on the Lobster host\n"
+        "2. Run: ~/lobster/scripts/claude-persistent.sh\n"
+        "3. The new session will pick up from the inbox queue automatically."
+    )
+
+
+def handle_usage_full() -> str:
+    """Handle 'usage full' — return the spawning acknowledgement.
+
+    This command is NOT snag-reachable by design: it requires a subagent.
+    Returns the ack text to send before spawning the usage-report subagent.
+    The dispatcher is responsible for the actual Task spawn with the appropriate
+    prompt (run usage-report.sh --format full, or fall back to state.json).
+    """
+    return "Spawning usage report agent..."
+
+
+# ---------------------------------------------------------------------------
+# /config — user bootup file access from Telegram (issue #1018)
+# ---------------------------------------------------------------------------
+
+# Allowlist of user config files accessible via /config commands.
+# System files in .claude/ are not included — those are protected.
+_USER_CONFIG_DIR: Path = Path.home() / "lobster-user-config" / "agents"
+_USER_CONFIG_FILENAMES: tuple[str, ...] = (
+    "user.base.bootup.md",
+    "user.base.context.md",
+    "user.dispatcher.bootup.md",
+    "user.subagent.bootup.md",
+    "system-audit.context.md",
+    "user.development.md",
+    "user.epistemic.md",
+)
+
+# Telegram message size limit (chars). Content beyond this is chunked.
+_TELEGRAM_CHAR_LIMIT: int = 4000
+
+
+def _config_file_path(filename: str) -> Path | None:
+    """Return the resolved path for a user config file, or None if not allowed."""
+    # Strip leading path components — accept bare filename or agents/filename
+    name = Path(filename).name
+    if name not in _USER_CONFIG_FILENAMES:
+        return None
+    p = _USER_CONFIG_DIR / name
+    return p if p.exists() else None
+
+
+def handle_config_list() -> str:
+    """Return a formatted list of user config files with line counts."""
+    lines: list[str] = ["User config files in ~/lobster-user-config/agents/:", ""]
+    found = False
+    for name in _USER_CONFIG_FILENAMES:
+        p = _USER_CONFIG_DIR / name
+        if p.exists():
+            try:
+                line_count = len(p.read_text(encoding="utf-8").splitlines())
+            except OSError:
+                line_count = 0
+            lines.append(f"  {name} ({line_count} lines)")
+            found = True
+    if not found:
+        lines.append("  (no user config files found)")
+    return "\n".join(lines)
+
+
+def handle_config_read(filename: str) -> tuple[str, bool]:
+    """Read a user config file and return (text, needs_chunking).
+
+    Returns (error_message, False) if the file is not found or not allowed.
+    Returns (content, True) if content exceeds _TELEGRAM_CHAR_LIMIT.
+    Returns (content, False) otherwise.
+    """
+    p = _config_file_path(filename)
+    if p is None:
+        name = Path(filename).name
+        if name not in _USER_CONFIG_FILENAMES:
+            return (
+                f"Not allowed: '{name}' is not in the user config allowlist.\n"
+                "Use /config list to see available files.",
+                False,
+            )
+        return (f"File not found: '{name}' (may not exist yet).", False)
+
+    try:
+        content = p.read_text(encoding="utf-8")
+    except OSError as exc:
+        return (f"Could not read '{p.name}': {exc}", False)
+
+    needs_chunking = len(content) > _TELEGRAM_CHAR_LIMIT
+    return (content, needs_chunking)
+
+
+def handle_config_search(query: str) -> str:
+    """Search for a term across all user config files.
+
+    Returns matching lines with filename and line number, formatted for Telegram.
+    """
+    if not query or not query.strip():
+        return "Usage: /config search <query>"
+
+    query = query.strip()
+    results: list[str] = []
+    matched_files = 0
+
+    for name in _USER_CONFIG_FILENAMES:
+        p = _USER_CONFIG_DIR / name
+        if not p.exists():
+            continue
+        try:
+            file_results: list[str] = []
+            for lineno, line in enumerate(
+                p.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                if query.lower() in line.lower():
+                    # Truncate long lines for Telegram readability
+                    display = line.rstrip()
+                    if len(display) > 120:
+                        display = display[:117] + "..."
+                    file_results.append(f"  L{lineno}: {display}")
+            if file_results:
+                results.append(f"{name}:")
+                results.extend(file_results)
+                matched_files += 1
+        except OSError:
+            continue
+
+    if not results:
+        return f"No matches for '{query}' in user config files."
+
+    header = f"Search results for '{query}' ({matched_files} file(s)):"
+    body = "\n".join(results)
+    full = f"{header}\n\n{body}"
+
+    # Truncate if over limit, with a note
+    if len(full) > _TELEGRAM_CHAR_LIMIT:
+        truncated = full[: _TELEGRAM_CHAR_LIMIT - 60]
+        full = truncated + f"\n\n... (truncated, {len(full)} chars total)"
+
+    return full
+
+
+def handle_config_append(filename: str, text: str) -> str:
+    """Append text to a user config file.
+
+    Returns a confirmation string or an error message.
+    """
+    if not text or not text.strip():
+        return "Usage: /config append <filename> <text>"
+
+    p = _config_file_path(filename)
+    if p is None:
+        name = Path(filename).name
+        if name not in _USER_CONFIG_FILENAMES:
+            return (
+                f"Not allowed: '{name}' is not in the user config allowlist.\n"
+                "Use /config list to see available files."
+            )
+        # File doesn't exist yet — create it
+        p = _USER_CONFIG_DIR / name
+
+    try:
+        _USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            # Ensure we start on a new line
+            f.write(f"\n{text.strip()}\n")
+        # Return a confirmation with the last 200 chars of the file for verification
+        content = p.read_text(encoding="utf-8")
+        tail = content[-200:].strip()
+        return f"Appended to {p.name}.\n\nTail:\n{tail}"
+    except OSError as exc:
+        return f"Could not write to '{p.name}': {exc}"
+
+
+# ---------------------------------------------------------------------------
+# WOS PR coordinator routing (issue uow_20260516_71b777)
+#
+# Called from the dispatcher's ENGINEER → REVIEWER routing block when a
+# completed subagent result contains a GitHub PR URL.  Routes WOS-originated
+# PRs (task_id starts with "wos-") to the wos-pr-coordinator agent, which
+# owns the full oracle→fix→merge loop internally.  Non-WOS PRs fall through
+# to the existing review agent path unchanged.
+#
+# Dispatcher integration (add to ENGINEER → REVIEWER routing, before the
+# existing Task(subagent_type="review", ...) call):
+#
+#     from src.orchestration.dispatcher_handlers import route_wos_pr_result
+#
+#     pr_url_match = re.search(r"https://github\.com/.*/pull/\d+", msg["text"])
+#     if pr_url_match:
+#         routing = route_wos_pr_result(
+#             pr_url=pr_url_match.group(0),
+#             task_id=msg.get("task_id"),
+#             chat_id=msg["chat_id"],
+#             result_text=msg["text"],
+#         )
+#         if routing["action"] == "spawn_subagent":
+#             Task(subagent_type=routing["agent_type"],
+#                  run_in_background=True,
+#                  prompt=routing["prompt"])
+#             mark_processed(message_id)
+#             continue
+#         # else: fallthrough — let existing review agent path handle it
+# ---------------------------------------------------------------------------
+
+
+def route_wos_pr_result(
+    pr_url: str,
+    task_id: str | None,
+    chat_id: int | str,
+    result_text: str,
+) -> dict[str, Any]:
+    """Route a subagent result containing a GitHub PR URL.
+
+    If ``task_id`` starts with ``"wos-"``, builds a coordinator Task prompt
+    that owns the full oracle→fix→merge loop for the PR internally.  Returns
+    ``action="spawn_subagent"`` so the dispatcher can spawn the coordinator
+    without any further logic.
+
+    If ``task_id`` does NOT start with ``"wos-"`` (or is None), returns
+    ``action="fallthrough"`` so the dispatcher falls through to the existing
+    review agent path unchanged.
+
+    Pure function: no side effects, no I/O.
+
+    Args:
+        pr_url:      Full GitHub PR URL extracted from the subagent result text.
+        task_id:     task_id from the subagent result message (may be None).
+        chat_id:     Admin chat_id for Dan notifications (passed through to coordinator).
+        result_text: Full result text from the subagent (used as task_context).
+
+    Returns:
+        ``{"action": "spawn_subagent", "task_id": ..., "prompt": ..., "agent_type": ...}``
+        when routing to coordinator, or ``{"action": "fallthrough"}`` otherwise.
+    """
+    import re as _re
+
+    if not (task_id and task_id.startswith("wos-")):
+        return {"action": "fallthrough"}
+
+    # Extract pr_number and repo from the PR URL.
+    # Expected format: https://github.com/{owner}/{repo}/pull/{number}
+    parts = pr_url.rstrip("/").split("/")
+    try:
+        pr_number = int(parts[-1])
+        repo = f"{parts[-4]}/{parts[-3]}"
+    except (IndexError, ValueError):
+        _log.warning(
+            "route_wos_pr_result: could not parse PR URL %r — falling through",
+            pr_url,
+        )
+        return {"action": "fallthrough"}
+
+    coordinator_task_id = f"wos-pr-coord-{pr_number}"
+
+    prompt = (
+        f"---\n"
+        f"task_id: {coordinator_task_id}\n"
+        f"chat_id: {chat_id}\n"
+        f"source: wos/coordinator\n"
+        f"---\n\n"
+        f"You are the WOS PR pipeline coordinator for PR #{pr_number}.\n\n"
+        f"pr_url: {pr_url}\n"
+        f"pr_number: {pr_number}\n"
+        f"repo: {repo}\n"
+        f"task_id: {coordinator_task_id}\n"
+        f"chat_id: {chat_id}\n"
+        f"task_context: {result_text[:500]}\n\n"
+        f"Follow the wos-pr-coordinator agent definition at "
+        f".claude/agents/wos-pr-coordinator.md exactly.\n\n"
+        f"Minimum viable output: Single write_result call reporting PR merged or escalated.\n"
+        f"Boundary: do not send intermediate oracle/fix status to the dispatcher inbox."
+    )
+
+    return {
+        "action": "spawn_subagent",
+        "task_id": coordinator_task_id,
+        "prompt": prompt,
+        "agent_type": "lobster-generalist",
+    }

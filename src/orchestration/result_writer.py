@@ -27,6 +27,7 @@ Schema written to ``<output_ref>.result.json``:
         "success":    true | false,             # Steward-compatible convenience field
         "summary":    "<human-readable one-line summary>",
         "artifacts":  ["<path1>", "<path2>", ...],   # optional
+        "token_usage": <int>,                        # optional
         "written_at": "<ISO-8601 UTC timestamp>"
     }
 
@@ -35,6 +36,17 @@ Both ``status`` and ``outcome`` use identical vocabulary (``"complete"`` /
 consistent value. The Steward's primary routing signal remains ``outcome``
 (executor-contract.md §Schema). ``status="done"`` is still accepted as a
 convenience alias for ``"complete"`` and is normalized before writing.
+
+To escalate to the owner (outcome=owner_decision_required), call:
+
+    from orchestration.result_writer import write_owner_decision_required
+    write_owner_decision_required(
+        output_ref, decision_text="Which database should we use: Postgres or SQLite?"
+    )
+
+This transitions the UoW to 'awaiting-owner' status and notifies Dan via
+Telegram. Use only for genuine owner-level decisions — not for blockers that
+a retry might resolve.
 """
 
 from __future__ import annotations
@@ -56,6 +68,7 @@ def write_result(
     status: Literal["done", "complete", "failed"],
     summary: str,
     artifacts: list[str] | None = None,
+    token_usage: int | None = None,
 ) -> Path:
     """
     Write a result.json file at the path derived from ``output_ref``.
@@ -82,6 +95,8 @@ def write_result(
         artifacts: Optional list of absolute file paths produced during
             execution (e.g. PR URLs, generated report paths). The Steward
             reads this list when building its diagnosis context.
+        token_usage: Optional total token count (input + output tokens) consumed
+            across all API turns during execution. Used for per-UoW cost telemetry.
 
     Returns:
         The Path where the result file was written.
@@ -111,6 +126,58 @@ def write_result(
     }
     if artifacts:
         payload["artifacts"] = artifacts
+    if token_usage is not None:
+        payload["token_usage"] = token_usage
+
+    _atomic_write(result_path, json.dumps(payload, indent=2))
+    return result_path
+
+
+def write_owner_decision_required(
+    output_ref: str,
+    decision_text: str,
+    uow_id: str | None = None,
+) -> Path:
+    """
+    Write a result.json file with outcome=owner_decision_required.
+
+    Call this when the subagent reaches a genuine decision point that only the
+    owner (Dan) can resolve and cannot proceed without the answer. The Steward
+    will transition the UoW to 'awaiting-owner' status and notify Dan via
+    Telegram. The UoW is paused — not failed — until Dan re-queues it with the
+    decision as a note.
+
+    Use only for genuine owner-level decisions. Do not use for transient
+    blockers, missing dependencies, or errors that a retry might resolve —
+    those should use ``outcome="blocked"`` or ``outcome="failed"``.
+
+    Args:
+        output_ref: The output reference path provided in the WOS task prompt.
+        decision_text: A clear, concise statement of the decision needed.
+            Example: "The API returned conflicting schemas for endpoint /v2/users.
+            Should we use the documented schema or the live response schema?"
+        uow_id: Optional UoW ID for the result file's ``uow_id`` field.
+            If omitted, the field is absent (Steward still routes correctly,
+            but audit correlation is weaker).
+
+    Returns:
+        The Path where the result file was written.
+
+    Raises:
+        OSError: If the parent directory cannot be created or the file cannot
+            be written.
+    """
+    result_path = _result_json_path(output_ref)
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload: dict = {
+        "outcome": "owner_decision_required",
+        "success": False,
+        "reason": decision_text,
+        "written_at": _now_iso(),
+    }
+    if uow_id is not None:
+        payload["uow_id"] = uow_id
 
     _atomic_write(result_path, json.dumps(payload, indent=2))
     return result_path

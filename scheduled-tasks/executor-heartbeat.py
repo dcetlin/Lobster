@@ -22,7 +22,7 @@ continues for remaining UoWs.
 Cron schedule (every 3 minutes, offset by 90s from steward-heartbeat):
     */3 * * * * sleep 90 && cd ~/lobster && uv run scheduled-tasks/executor-heartbeat.py >> ~/lobster-workspace/scheduled-jobs/logs/executor-heartbeat.log 2>&1
 
-Type B dispatch: cron calls this script directly (no inbox/ message, no dispatcher
+Type C dispatch: cron calls this script directly (no inbox/ message, no dispatcher
 involvement). The jobs.json enabled gate is checked at the top of main() so that
 runtime enable/disable (wos start/stop) is respected without touching cron.
 
@@ -40,6 +40,8 @@ import logging
 import os
 import subprocess
 import sys
+import traceback
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -56,6 +58,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 from src.orchestration.paths import REGISTRY_DB
+from src.utils.jobs import is_job_enabled
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -68,30 +71,70 @@ logging.basicConfig(
 )
 log = logging.getLogger("executor-heartbeat")
 
+# Admin chat_id for crash alerts (env-injected, falls back to hardcoded)
+_ADMIN_CHAT_ID: str = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
+
 
 # ---------------------------------------------------------------------------
-# jobs.json enabled gate — Type B dispatch path
+# Crash alert — write a system inbox message so the dispatcher relays it to Dan
 # ---------------------------------------------------------------------------
 
-def _is_job_enabled(job_name: str) -> bool:
-    """
-    Return True if the job is enabled in jobs.json, False if explicitly disabled.
+def _write_crash_alert(job_name: str, exc: BaseException, extra: str = "") -> None:
+    """Write a scheduled_task_crash inbox message so the dispatcher alerts Dan.
 
-    Defaults to True when:
-    - jobs.json is absent
-    - the job entry is missing
-    - the file is unreadable or malformed
+    This is a best-effort fire-and-forget write. Failures here are logged but
+    do not mask the original exception — the caller must re-raise or sys.exit
+    after calling this function.
 
-    This mirrors the gate logic in dispatch-job.sh so Type B (cron → script)
-    jobs respect the same runtime enable/disable toggle as Type A jobs.
+    The inbox message shape is intentionally simple: source=system,
+    type=scheduled_task_crash, text=human-readable alert. The dispatcher's
+    LLM loop reads the message and relays it to Dan as a Telegram notification.
     """
-    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-    jobs_file = workspace / "scheduled-jobs" / "jobs.json"
+    tb_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    tb_str = "".join(tb_lines).strip()
+    # Truncate traceback to avoid oversized messages (keep last 2000 chars)
+    if len(tb_str) > 2000:
+        tb_str = "...(truncated)...\n" + tb_str[-2000:]
+
+    text = (
+        f"[CRASH] {job_name} crashed with {type(exc).__name__}: {exc}\n\n"
+        f"```\n{tb_str}\n```"
+    )
+    if extra:
+        text += f"\n\n{extra}"
+
+    from datetime import datetime as _datetime, timezone as _timezone
+
+    msg_id = str(uuid.uuid4())
+    msg = {
+        "id": msg_id,
+        "source": "system",
+        "type": "scheduled_task_crash",
+        "chat_id": _ADMIN_CHAT_ID,
+        "job_name": job_name,
+        "timestamp": _datetime.now(_timezone.utc).isoformat(),
+        "text": text,
+    }
+
     try:
-        data = json.loads(jobs_file.read_text())
-        return bool(data.get("jobs", {}).get(job_name, {}).get("enabled", True))
-    except Exception:
-        return True
+        messages_base = Path(os.environ.get("LOBSTER_MESSAGES", Path.home() / "messages"))
+        inbox_dir = messages_base / "inbox"
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = inbox_dir / f"{msg_id}.json.tmp"
+        dest_path = inbox_dir / f"{msg_id}.json"
+        tmp_path.write_text(json.dumps(msg, indent=2), encoding="utf-8")
+        tmp_path.rename(dest_path)
+        log.info("Crash alert written to inbox (%s)", msg_id)
+    except Exception as write_exc:
+        log.error("Failed to write crash alert to inbox: %s", write_exc)
+
+
+# ---------------------------------------------------------------------------
+# Sentinel file written to /tmp/ after the first stale-registry warning fires
+# within a given boot session. Because /tmp/ is cleared on reboot, the warning
+# resurfaces once per boot — sufficient signal without flooding the log on every
+# 3-minute cron invocation.
+_REGISTRY_WARN_SENTINEL = "/tmp/lobster-wos-registry-warned"
 
 
 def _warn_if_legacy_registry_exists() -> None:
@@ -101,6 +144,10 @@ def _warn_if_legacy_registry_exists() -> None:
     The legacy path (data/wos-registry.db) is removed by upgrade.sh Migration 86
     when its uow_registry table is empty. This function fires only if the file
     survived migration (non-empty or migration not yet run).
+
+    The warning is suppressed after the first detection per boot session via a
+    /tmp/ sentinel file, preventing the log from being flooded on every cron
+    invocation (~480 lines/day if left unchecked).
     """
     workspace = Path(os.environ.get(
         "LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"
@@ -121,18 +168,30 @@ def _warn_if_legacy_registry_exists() -> None:
     except Exception:
         uow_count = -1
     if uow_count == 0:
-        log.info(
+        log.debug(
             "Legacy registry DB at %s exists (%d bytes) but has 0 UoWs — "
             "run upgrade.sh to apply Migration 86 and remove it.",
             legacy_path, size,
         )
     else:
-        log.warning(
-            "Legacy registry DB at %s exists and is non-empty (%d bytes, %d UoWs). "
-            "Canonical path is %s. Run upgrade.sh (Migration 86) to safely relocate.",
-            legacy_path, size, uow_count,
-            workspace / "orchestration" / "registry.db",
-        )
+        if not os.path.exists(_REGISTRY_WARN_SENTINEL):
+            log.warning(
+                "Legacy registry DB at %s exists and is non-empty (%d bytes, %d UoWs). "
+                "Canonical path is %s. Run upgrade.sh (Migration 86) to safely relocate.",
+                legacy_path, size, uow_count,
+                workspace / "orchestration" / "registry.db",
+            )
+            # Touch sentinel so subsequent invocations within this boot session are silent.
+            try:
+                open(_REGISTRY_WARN_SENTINEL, "w").close()
+            except OSError:
+                pass  # /tmp/ write failure is non-fatal; warning will re-fire next cycle
+        else:
+            log.debug(
+                "Legacy registry DB still present (suppressed after first warning this "
+                "boot session): %s",
+                legacy_path,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +205,82 @@ def _warn_if_legacy_registry_exists() -> None:
 # ---------------------------------------------------------------------------
 
 RECOVERY_STALE_MINUTES: int = 5
+
+# ---------------------------------------------------------------------------
+# CC quota gate — skip UoW dispatch when the 5-hour Claude Code quota is
+# critically low (>= 90%). Subagents are expensive; dispatching when quota
+# is nearly exhausted wastes the remaining headroom and can cause subagents
+# to fail partway through with quota errors.
+#
+# Fail-open: if the state file is absent or stale (> 60 min old), proceed
+# normally. Absent/stale data must never block dispatch.
+# ---------------------------------------------------------------------------
+
+#: Percentage threshold above which dispatch is skipped for the cycle.
+CC_QUOTA_SKIP_THRESHOLD: float = 90.0
+
+#: State file is considered stale if last_updated is older than this many seconds.
+_CC_QUOTA_FRESHNESS_SECONDS: int = 60 * 60  # 60 minutes
+
+
+def _read_cc_quota() -> float | None:
+    """Return five_hour_pct from the CC budget state file, or None if unavailable.
+
+    Reads the state.json written by cc-usage-poller.py.  The file shape is:
+
+        {
+          "rate_limits": {
+            "five_hour": {"pct": <float>, "resets_at": "<ISO8601>"},
+            "seven_day":  {"pct": <float>, "resets_at": "<ISO8601>"}
+          },
+          "last_updated": "<ISO8601>",
+          "ts": <unix-int>,
+          "source": "cc-usage-poller"
+        }
+
+    Returns the float value when the file exists AND last_updated is within the
+    last 60 minutes. Returns None when:
+    - The file does not exist (LOBSTER_CC_BUDGET_STATE or ~/.claude/cc-budget/state.json)
+    - The file is stale (last_updated older than 60 minutes)
+    - The file is unreadable or malformed
+
+    None signals "no usable data" — callers must treat None as "proceed normally"
+    (fail-open). Only a fresh float >= CC_QUOTA_SKIP_THRESHOLD should cause a skip.
+
+    Pure function: reads the filesystem, parses JSON, computes staleness. No
+    side effects — the caller owns all logging and the skip decision.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    state_path = Path(
+        os.environ.get(
+            "LOBSTER_CC_BUDGET_STATE",
+            Path.home() / ".claude" / "cc-budget" / "state.json",
+        )
+    )
+
+    try:
+        raw = state_path.read_text()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+    try:
+        data = json.loads(raw)
+        pct = float(data["rate_limits"]["five_hour"]["pct"])
+        last_updated_str = data["last_updated"]
+        last_updated = datetime.fromisoformat(last_updated_str.replace("Z", "+00:00"))
+        if last_updated.tzinfo is None:
+            last_updated = last_updated.replace(tzinfo=timezone.utc)
+    except (KeyError, ValueError, TypeError):
+        return None
+
+    age = datetime.now(timezone.utc) - last_updated
+    if age > timedelta(seconds=_CC_QUOTA_FRESHNESS_SECONDS):
+        return None
+
+    return pct
 
 # ---------------------------------------------------------------------------
 # GitHub API rate limit pre-dispatch check
@@ -240,62 +375,6 @@ def check_github_rate_limit(
 # ---------------------------------------------------------------------------
 # Executor cycle — claim and dispatch all ready-for-executor UoWs
 # ---------------------------------------------------------------------------
-
-def run_ttl_recovery(registry, dry_run: bool = False) -> list[str]:
-    """
-    Recover UoWs stuck in 'active' state for more than TTL_EXCEEDED_HOURS.
-
-    In dry_run mode: queries but does NOT transition any UoW.
-    Returns the list of recovered uow_ids (empty on dry_run or nothing to recover).
-    """
-    from src.orchestration.executor import TTL_EXCEEDED_HOURS, recover_ttl_exceeded_uows
-    import sqlite3
-    from datetime import datetime, timezone, timedelta
-
-    if dry_run:
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=TTL_EXCEEDED_HOURS)
-        cutoff_iso = cutoff.isoformat()
-        try:
-            conn = sqlite3.connect(str(registry.db_path), timeout=10.0)
-            conn.row_factory = sqlite3.Row
-            try:
-                rows = conn.execute(
-                    """
-                    SELECT id FROM uow_registry
-                    WHERE status IN ('active', 'executing')
-                      AND started_at IS NOT NULL
-                      AND started_at < ?
-                    """,
-                    (cutoff_iso,),
-                ).fetchall()
-                stalled = [r["id"] for r in rows]
-            finally:
-                conn.close()
-        except Exception as e:
-            log.warning("TTL recovery (DRY RUN): query failed — %s", e)
-            return []
-        if stalled:
-            log.info(
-                "TTL recovery (DRY RUN): %d stalled UoWs would be recovered — %s",
-                len(stalled), stalled,
-            )
-        else:
-            log.info("TTL recovery (DRY RUN): no stalled UoWs found")
-        return []
-
-    try:
-        recovered = recover_ttl_exceeded_uows(registry)
-    except Exception as e:
-        log.warning("TTL recovery: unexpected error — %s", e)
-        return []
-
-    if recovered:
-        log.info("TTL recovery: marked %d stalled UoW(s) as failed — %s", len(recovered), recovered)
-    else:
-        log.debug("TTL recovery: no stalled UoWs found")
-
-    return recovered
-
 
 def _filter_stale_uows(
     ready_uows: list,
@@ -544,6 +623,16 @@ def main() -> int:
 
     Returns exit code: 0 on success, 1 on unhandled error.
     """
+    try:
+        return _main_inner()
+    except Exception as exc:
+        log.error("executor-heartbeat crashed with unhandled exception: %s", exc, exc_info=True)
+        _write_crash_alert(job_name="executor-heartbeat", exc=exc)
+        return 1
+
+
+def _main_inner() -> int:
+    """Inner implementation of main() — wrapped by main() for crash alerting."""
     parser = argparse.ArgumentParser(description="Executor Heartbeat — WOS Phase 2")
     parser.add_argument(
         "--dry-run",
@@ -560,7 +649,7 @@ def main() -> int:
 
     # jobs.json enabled gate — respect runtime enable/disable toggled via
     # the dispatcher 'wos start/stop' commands or direct jobs.json edits.
-    if not _is_job_enabled("executor-heartbeat"):
+    if not is_job_enabled("executor-heartbeat"):
         log.info("Executor heartbeat: skipped (disabled in jobs.json)")
         return 0
 
@@ -582,9 +671,26 @@ def main() -> int:
 
     registry = Registry(db_path)
 
-    # Phase 1: TTL recovery — always runs regardless of execution_enabled so
+    # Phase 1: Stall recovery — always runs regardless of execution_enabled so
     # that stalled active UoWs are recovered even when dispatch is paused.
-    run_ttl_recovery(registry, dry_run=dry_run)
+    #
+    # Uses the visibility-timeout model (claimed_until) via reset_expired_claims()
+    # to reset expired claims back to 'ready-for-executor'.
+    # See executor.py module docstring and registry.py for implementation details.
+    if not dry_run:
+        try:
+            reset_ids = registry.reset_expired_claims()
+            if reset_ids:
+                log.info(
+                    "Stall recovery: reset %d expired claim(s) to ready-for-executor — %s",
+                    len(reset_ids), reset_ids,
+                )
+            else:
+                log.debug("Stall recovery: no expired claims found")
+        except Exception as e:
+            log.warning("Stall recovery (reset_expired_claims) failed — %s", e)
+    else:
+        log.info("Stall recovery (DRY RUN): skipping reset_expired_claims")
 
     # Phase 1b: Heartbeat sidecar — write heartbeats for all in-flight UoWs.
     # Structural enforcement: heartbeats are written by the cron-driven executor
@@ -620,9 +726,23 @@ def main() -> int:
     # reliable proxy for context pressure and a contributing cause of the
     # 2026-04 restart storm (WOS running at full speed → faster compaction cycles).
     #
+    # get_active_sessions() reads agent_sessions (Claude session store), not
+    # uow_registry executing status — these are separate tracking systems.
+    # Real throttles: CC quota gate (90%) and GitHub rate limit gate. This
+    # threshold is a safety backstop against session accumulation (e.g. orphaned
+    # agent_sessions rows from subagents that died without writing results).
+    #
+    # Raised from 5 → 20 (2026-05-19): the old threshold of 5 caused the pipeline
+    # to stall when 5 long-running "executing" UoWs occupied session slots but had
+    # no live subagents — the heartbeat sidecar kept their heartbeat_at fresh,
+    # preventing TTL recovery. With 168 UoWs ready-for-steward and only 1 real
+    # session active, the effective cap was 5, blocking all new dispatch.
+    # The quota gate (CC quota, GitHub rate limit) remains the real throttle;
+    # this threshold is now a safety backstop rather than an active dispatch cap.
+    #
     # TTL recovery (Phase 1) and heartbeat sidecar (Phase 1b) always run above —
     # only new dispatch is throttled here.
-    CONTEXT_PRESSURE_AGENT_THRESHOLD: int = 5
+    CONTEXT_PRESSURE_AGENT_THRESHOLD: int = 20
     try:
         from src.agents.session_store import get_active_sessions
         active_session_count = len(get_active_sessions())
@@ -662,6 +782,21 @@ def main() -> int:
                 rate_status.remaining,
                 GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD,
             )
+
+    # CC quota gate — skip dispatch when the 5-hour Claude Code quota is
+    # critically low. Fail-open: absent or stale data (> 60 min old) does
+    # not block dispatch — only fresh data at or above the threshold does.
+    cc_pct = _read_cc_quota()
+    if cc_pct is not None and cc_pct >= CC_QUOTA_SKIP_THRESHOLD:
+        log.info(
+            "cc_quota=%.1f%% — skipping dispatch cycle (threshold=%.1f%%)",
+            cc_pct,
+            CC_QUOTA_SKIP_THRESHOLD,
+        )
+        log.info("Executor heartbeat complete")
+        return 0
+    if cc_pct is not None:
+        log.debug("CC quota ok: %.1f%% (threshold=%.1f%%)", cc_pct, CC_QUOTA_SKIP_THRESHOLD)
 
     try:
         result = run_executor_cycle(registry, dry_run=dry_run)

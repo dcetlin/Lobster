@@ -1,0 +1,1384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LOS — Active Todos UX Enumeration v1.1</title>
+<style>
+:root {
+  --bg: #0b0d14;
+  --surface: #141720;
+  --surface2: #1c2030;
+  --surface3: #232840;
+  --border: #2a2f45;
+  --border2: #363d5a;
+  --text: #e4e6f0;
+  --text2: #9aa0bb;
+  --text3: #5c6480;
+  --accent: #6ea8fe;
+  --accent2: #a78bfa;
+  --accent3: #34d399;
+  --accent4: #fb923c;
+  --accent5: #f472b6;
+  --live-color: #34d399;
+  --live-bg: #0a2e1a;
+  --live-border: rgba(52,211,153,.35);
+  --scaffolded-color: #f59e0b;
+  --scaffolded-bg: #2a1a00;
+  --scaffolded-border: rgba(245,158,11,.35);
+  --planned-color: #5c6480;
+  --planned-bg: #141720;
+  --planned-border: #2a2f45;
+  --comment-bg: rgba(110,168,254,.06);
+  --comment-border: rgba(110,168,254,.25);
+}
+
+/* ── Light mode ── */
+body.light-mode {
+  --bg: #f8f9fb;
+  --surface: #ffffff;
+  --surface2: #f0f2f7;
+  --surface3: #e8ecf4;
+  --border: #dde1ee;
+  --border2: #c8cedf;
+  --text: #1a1d2e;
+  --text2: #4a5068;
+  --text3: #8890a8;
+  --live-bg: #e6faf3;
+  --live-border: rgba(52,211,153,.4);
+  --scaffolded-bg: #fff8e6;
+  --scaffolded-border: rgba(245,158,11,.4);
+  --planned-bg: #f0f2f7;
+  --planned-border: #dde1ee;
+  --comment-bg: rgba(110,168,254,.06);
+  --comment-border: rgba(110,168,254,.3);
+}
+
+/* ── Theme toggle ── */
+#theme-toggle {
+  position: fixed;
+  top: 14px;
+  right: 18px;
+  z-index: 1000;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text2);
+  cursor: pointer;
+  transition: background .15s, color .15s;
+}
+#theme-toggle:hover { background: var(--surface3); color: var(--text); }
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', sans-serif;
+  background: var(--bg); color: var(--text); line-height: 1.6; font-size: 14px;
+}
+.wrap { max-width: 960px; margin: 0 auto; padding: 40px 24px 100px; }
+
+.header { margin-bottom: 40px; padding-bottom: 24px; border-bottom: 1px solid var(--border); }
+.eyebrow { font-size: 11px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); margin-bottom: 10px; }
+h1 {
+  font-size: 1.8rem; font-weight: 700; letter-spacing: -.02em;
+  background: linear-gradient(135deg, var(--text) 0%, var(--accent) 60%, var(--accent2) 100%);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+  line-height: 1.2; margin-bottom: 10px;
+}
+.header-sub { font-size: 13px; color: var(--text2); max-width: 680px; }
+.header-meta { margin-top: 12px; display: flex; gap: 18px; flex-wrap: wrap; align-items: center; }
+.meta-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text3); }
+
+/* Symbol legend */
+.legend { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 10px; }
+.legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.sym-live { color: var(--live-color); font-weight: 700; }
+.sym-scaffolded { color: var(--scaffolded-color); font-weight: 700; }
+.sym-planned { color: var(--planned-color); font-weight: 700; }
+
+/* Nav tabs */
+.nav { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 32px; }
+.nav a {
+  padding: 6px 14px; border-radius: 6px; font-size: 12px; font-weight: 600;
+  color: var(--text3); text-decoration: none; border: 1px solid var(--border);
+  transition: color .15s, border-color .15s;
+}
+.nav a:hover { color: var(--text); border-color: var(--border2); }
+.nav a.active { color: var(--accent); border-color: var(--accent); background: rgba(110,168,254,.07); }
+
+/* Section */
+.section { margin-bottom: 40px; }
+.section-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--accent2); margin-bottom: 16px; padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.section-header-text { flex: 1; }
+.section-id {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text3);
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  margin-right: 4px;
+  letter-spacing: 0;
+  user-select: none;
+}
+
+/* Section comment toggle button */
+.section-comment-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 4px 8px;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 16px;
+  color: var(--text3);
+  transition: background .15s, border-color .15s, color .15s;
+  flex-shrink: 0;
+}
+.section-comment-btn:hover { background: var(--surface2); border-color: var(--border); color: var(--text2); }
+.section-comment-btn.active { color: var(--accent); border-color: var(--comment-border); background: var(--comment-bg); }
+
+/* Inline comment area (sections and items) */
+.inline-comment-area {
+  display: none;
+  margin-top: 8px;
+  margin-bottom: 4px;
+  padding: 10px 12px;
+  background: var(--comment-bg);
+  border: 1px solid var(--comment-border);
+  border-radius: 8px;
+}
+.inline-comment-area.open { display: block; }
+.inline-comment-label {
+  font-size: 10px;
+  font-weight: 700;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  color: var(--accent);
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+.inline-comment-input {
+  width: 100%;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 13px;
+  color: var(--text);
+  outline: none;
+  transition: border-color .15s;
+  font-family: inherit;
+  resize: vertical;
+  min-height: 44px;
+}
+.inline-comment-input:focus { border-color: var(--accent); }
+
+/* Action card */
+.action-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 18px 20px; margin-bottom: 10px;
+  cursor: pointer;
+  transition: border-color .15s;
+}
+.action-card:hover { border-color: var(--border2); }
+.action-card.comment-open { border-color: var(--comment-border); }
+.action-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 8px; flex-wrap: wrap; }
+.action-name-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.action-name { font-size: 14px; font-weight: 700; color: var(--text); font-family: monospace; }
+.item-id {
+  font-size: 10px;
+  font-weight: 700;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  color: var(--text3);
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  user-select: none;
+  white-space: nowrap;
+}
+.badge {
+  display: inline-flex; align-items: center;
+  padding: 2px 9px; border-radius: 20px; font-size: 11px; font-weight: 600; white-space: nowrap;
+}
+.badge-live { color: var(--live-color); background: var(--live-bg); border: 1px solid var(--live-border); }
+.badge-scaffolded { color: var(--scaffolded-color); background: var(--scaffolded-bg); border: 1px solid var(--scaffolded-border); }
+.badge-planned { color: var(--planned-color); background: var(--planned-bg); border: 1px solid var(--planned-border); }
+
+.action-trigger { font-size: 12px; color: var(--text3); margin-bottom: 10px; }
+.action-trigger strong { color: var(--text2); }
+
+.lifecycle { margin: 10px 0; }
+.lifecycle-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .07em; color: var(--text3); margin-bottom: 6px; }
+.lifecycle ol { margin: 0; padding-left: 18px; }
+.lifecycle li { font-size: 12px; color: var(--text2); margin-bottom: 3px; line-height: 1.55; }
+
+.note {
+  background: var(--surface2); border: 1px solid var(--border); border-left: 3px solid var(--accent4);
+  border-radius: 0 8px 8px 0; padding: 8px 12px; margin-top: 10px;
+  font-size: 12px; color: var(--text2); line-height: 1.5;
+}
+.note strong { color: var(--accent4); }
+.note-warn {
+  background: rgba(42,26,0,.5); border: 1px solid var(--scaffolded-border); border-left: 3px solid var(--scaffolded-color);
+  border-radius: 0 8px 8px 0; padding: 8px 12px; margin-top: 10px;
+  font-size: 12px; color: var(--text2); line-height: 1.5;
+}
+body.light-mode .note-warn { background: rgba(245,158,11,.08); }
+.note-warn strong { color: var(--scaffolded-color); }
+.note-ok {
+  background: var(--live-bg); border: 1px solid var(--live-border); border-left: 3px solid var(--live-color);
+  border-radius: 0 8px 8px 0; padding: 8px 12px; margin-top: 10px;
+  font-size: 12px; color: var(--text2); line-height: 1.5;
+}
+.note-ok strong { color: var(--live-color); }
+
+/* Failure table */
+.failure-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }
+.failure-table th { text-align: left; color: var(--text3); font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+.failure-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); color: var(--text2); vertical-align: top; }
+.failure-table tr:last-child td { border-bottom: none; }
+.failure-table code { color: var(--accent); font-size: 11px; }
+
+/* Pipeline diagram */
+.pipeline {
+  background: var(--surface2); border: 1px solid var(--border); border-radius: 8px;
+  padding: 18px 20px; margin: 16px 0;
+  font-family: 'SF Mono', 'Fira Code', monospace; font-size: 11px; color: var(--text2);
+  white-space: pre; overflow-x: auto; line-height: 1.7;
+}
+
+/* Global comment widget */
+.comment-widget {
+  margin-top: 48px;
+  padding: 20px 24px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.comment-widget-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .09em;
+  color: var(--text3);
+  margin-bottom: 14px;
+}
+.global-comment-label {
+  font-size: 11px;
+  font-weight: 700;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  color: var(--text3);
+  margin-bottom: 6px;
+}
+#global-comment {
+  width: 100%;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 13px;
+  color: var(--text);
+  outline: none;
+  transition: border-color .15s;
+  font-family: inherit;
+  resize: vertical;
+  min-height: 72px;
+}
+#global-comment:focus { border-color: var(--accent); }
+.copy-comments-btn {
+  margin-top: 14px;
+  padding: 10px 22px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: opacity .15s;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+}
+.copy-comments-btn:hover { opacity: .85; }
+.copy-feedback {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--accent3);
+  min-height: 16px;
+}
+
+/* Footer */
+.footer { margin-top: 64px; padding-top: 20px; border-top: 1px solid var(--border); font-size: 11px; color: var(--text3); }
+.footer a { color: var(--accent); text-decoration: none; }
+
+/* Design note (exploratory) */
+.design-note {
+  background: rgba(167,139,250,.06); border: 1px solid rgba(167,139,250,.25); border-left: 3px solid var(--accent2);
+  border-radius: 0 8px 8px 0; padding: 10px 14px; margin-top: 12px;
+  font-size: 12px; color: var(--text2); line-height: 1.6;
+}
+.design-note strong { color: var(--accent2); }
+.design-note .decision { color: var(--accent4); font-weight: 700; }
+body.light-mode .design-note { background: rgba(167,139,250,.06); }
+
+/* Future-work taxonomy tags */
+.tag {
+  display: inline-block;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-right: 6px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+/* Dark mode tag colors */
+.tag-DECISION { background: rgba(245,158,11,.18); color: #f59e0b; border: 1px solid rgba(245,158,11,.35); }
+.tag-BUILD    { background: rgba(52,211,153,.15);  color: #34d399; border: 1px solid rgba(52,211,153,.3); }
+.tag-REMOVE   { background: rgba(251,146,60,.15);  color: #fb923c; border: 1px solid rgba(251,146,60,.3); }
+.tag-DEFER    { background: rgba(92,100,128,.18);  color: #9aa0bb; border: 1px solid rgba(92,100,128,.35); }
+.tag-TRACK    { background: rgba(110,168,254,.13); color: #6ea8fe; border: 1px solid rgba(110,168,254,.3); }
+/* Light mode overrides */
+body.light-mode .tag-DECISION { background: rgba(245,158,11,.12); color: #b45309; border-color: rgba(245,158,11,.4); }
+body.light-mode .tag-BUILD    { background: rgba(52,211,153,.12);  color: #059669; border-color: rgba(52,211,153,.4); }
+body.light-mode .tag-REMOVE   { background: rgba(251,146,60,.12);  color: #c2410c; border-color: rgba(251,146,60,.4); }
+body.light-mode .tag-DEFER    { background: rgba(92,100,128,.12);  color: #4a5068; border-color: rgba(92,100,128,.4); }
+body.light-mode .tag-TRACK    { background: rgba(110,168,254,.10); color: #2563eb; border-color: rgba(110,168,254,.4); }
+
+/* State system table */
+.state-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 12px; margin-bottom: 8px; }
+.state-table th { text-align: left; color: var(--text3); font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+.state-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); color: var(--text2); vertical-align: top; }
+.state-table tr:last-child td { border-bottom: none; }
+.state-table td:first-child { font-family: 'SF Mono', 'Fira Code', monospace; color: var(--accent); font-weight: 700; white-space: nowrap; }
+.state-table td:nth-child(2) { color: var(--text); }
+
+/* Vision section */
+.vision-card {
+  background: var(--surface); border: 1px solid var(--border2);
+  border-radius: 10px; padding: 18px 20px; margin-bottom: 12px;
+}
+.vision-card-title { font-size: 13px; font-weight: 700; color: var(--accent); margin-bottom: 6px; }
+.vision-card-body { font-size: 12px; color: var(--text2); line-height: 1.6; }
+.vision-card-body ul { margin: 6px 0 0 16px; }
+.vision-card-body li { margin-bottom: 4px; }
+
+code { color: var(--accent); font-family: 'SF Mono', 'Fira Code', monospace; font-size: 11px; }
+
+@media (max-width: 640px) { h1 { font-size: 1.4rem; } }
+</style>
+</head>
+<body>
+<button id="theme-toggle" onclick="toggleTheme()">&#9788; Light</button>
+<div class="wrap">
+
+<!-- HEADER -->
+<div class="header">
+  <div class="eyebrow">LOS — Life Orchestration System</div>
+  <h1>Active Todos UX Enumeration</h1>
+  <div class="header-sub">
+    Canonical enumeration of all actions Dan can take on <code>✅ ACTIVE TODOS.md</code>,
+    including failure modes, @lobster annotation lifecycle, and current vs. future status.
+    Vault-watcher Tier 1 is LIVE as of 2026-05-11.
+  </div>
+  <div class="header-meta">
+    <div class="meta-item">Version 1.1 &nbsp;&bull;&nbsp; Updated 2026-05-11 (PDT)</div>
+    <div class="legend">
+      <div class="legend-item"><span class="sym-live">&#10003; LIVE</span> — fully implemented</div>
+      <div class="legend-item"><span class="sym-scaffolded">&#9685; SCAFFOLDED</span> — wired, validation pending</div>
+      <div class="legend-item"><span class="sym-planned">&#9675; PLANNED</span> — designed, not implemented</div>
+    </div>
+  </div>
+</div>
+
+<!-- NAV -->
+<div class="nav">
+  <a href="#s1" class="active">Status Changes</a>
+  <a href="#s2">Content Changes</a>
+  <a href="#s3">@lobster Annotations</a>
+  <a href="#s4">Structural / System</a>
+  <a href="#s5">Gaps &amp; Future</a>
+  <a href="#failures">Failure Modes</a>
+  <a href="#pipeline">Pipeline Diagram</a>
+  <a href="#s6">Vision &amp; Bets</a>
+</div>
+
+<!-- ─── §1 STATUS CHANGES ─── -->
+<div class="section" id="s1">
+  <div class="section-header">
+    <div class="section-header-text"><span class="section-id">§1</span> Status Changes</div>
+    <button class="section-comment-btn" data-section="s1" title="Add comment for §1" onclick="toggleSectionComment('s1', this)">💬</button>
+  </div>
+  <div class="inline-comment-area" id="sec-comment-s1">
+    <div class="inline-comment-label">§1 — section comment</div>
+    <textarea class="inline-comment-input" id="sci-s1" placeholder="Comment on §1 Status Changes…" rows="2"></textarea>
+  </div>
+
+  <!-- STATE SYSTEM -->
+  <div class="note" style="margin-bottom: 18px;">
+    <strong>State System</strong><br>
+    Every todo item in LOS has exactly one state. The state machine is <em>source-agnostic</em> — where an item came from (Obsidian vs. Telegram vs. Lobster) does not change how states work or transition. Source is provenance metadata only.
+    <table class="state-table" style="margin-top: 10px;">
+      <thead>
+        <tr>
+          <th>State</th>
+          <th>Meaning</th>
+          <th>How to enter</th>
+          <th>Exits to</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>open</td>
+          <td>Active, unfinished. Appears in Obsidian and surfaces in triage/nudges.</td>
+          <td>Created (any source). Snooze expires.</td>
+          <td>done, snoozed, dismissed, deleted</td>
+        </tr>
+        <tr>
+          <td>done</td>
+          <td>Completed. Retained in DB for weekly review. DB is authoritative — Obsidian checkbox reverts if unchecked.</td>
+          <td>Dan checks the box in Obsidian, or <code>/todo done</code> via Telegram.</td>
+          <td>open (<span class="tag tag-BUILD">BUILD</span> not yet implemented — reopen is planned)</td>
+        </tr>
+        <tr>
+          <td>snoozed</td>
+          <td>Deferred until a date. Hidden from active view during snooze window; auto-resurfaces when <code>snoozed_until</code> passes.</td>
+          <td><code>/todo snooze</code> via Telegram, or inline button.</td>
+          <td>open (automatic on date expiry)</td>
+        </tr>
+        <tr>
+          <td>dismissed</td>
+          <td>Intentionally dropped — not done, not snoozed, just not worth doing. Retained in DB. Does not reappear.</td>
+          <td>Telegram inline dismiss button.</td>
+          <td>(terminal — no automatic exit)</td>
+        </tr>
+        <tr>
+          <td>deleted</td>
+          <td>Line removed from Obsidian file without checking it. System infers intent and marks deleted. Does not reappear.</td>
+          <td>Dan deletes the line in Obsidian (Obsidian-sourced items only — see §1.4).</td>
+          <td>(terminal)</td>
+        </tr>
+      </tbody>
+    </table>
+    <div style="margin-top: 8px; font-size: 11px; color: var(--text3);">Valid transitions: open ↔ snoozed &nbsp;|&nbsp; open → done &nbsp;|&nbsp; open → dismissed &nbsp;|&nbsp; open → deleted (Obsidian-sourced) &nbsp;|&nbsp; <span class="tag tag-BUILD">BUILD</span> reopen (done → open) &#9675; PLANNED.</div>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s1-1', this)" title="Tap to comment on §1.1">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§1.1</span>
+        <div class="action-name">CHECK A TODO ITEM (mark done)</div>
+      </div>
+      <span class="badge badge-live">&#10003; LIVE</span>
+    </div>
+    <div class="action-trigger"><strong>Trigger:</strong> Dan toggles <code>[ ]</code> → <code>[x]</code> in Obsidian</div>
+    <div class="lifecycle">
+      <div class="lifecycle-title">Lifecycle</div>
+      <ol>
+        <li>Dan checks the box; Obsidian git plugin pushes to remote</li>
+        <li>vault-watcher detects new remote HEAD (~30s polling interval)</li>
+        <li>After debounce (~60s), vault-processor fires</li>
+        <li><code>git pull --rebase --autostash</code> merges latest</li>
+        <li><code>sync_obsidian_to_db()</code>: <code>[x]</code> line → <code>mark_done()</code> in DB</li>
+        <li><code>apply_status_delta()</code>: DB says done, file already shows <code>[x]</code> — no change</li>
+        <li>git commit + push (if any other changes)</li>
+      </ol>
+    </div>
+    <div class="note-warn"><strong>Failure:</strong> If Obsidian git plugin doesn't push, no sync fires and item stays open in DB. Recovery: <code>/todo done &lt;id&gt;</code> via Telegram.</div>
+    <div class="inline-comment-area" id="item-comment-s1-1">
+      <div class="inline-comment-label">§1.1 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s1-1" placeholder="Comment on §1.1…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s1-2', this)" title="Tap to comment on §1.2">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§1.2</span>
+        <div class="action-name">UNCHECK A TODO ITEM (attempt reopen)</div>
+      </div>
+      <span class="badge badge-live">&#10003; LIVE</span>
+    </div>
+    <div class="action-trigger"><strong>Trigger:</strong> Dan toggles <code>[x]</code> → <code>[ ]</code> in Obsidian</div>
+    <div class="lifecycle">
+      <div class="lifecycle-title">Lifecycle</div>
+      <ol>
+        <li>Push detected; vault-processor fires</li>
+        <li><code>sync_obsidian_to_db()</code>: item appears open; if DB status is done → skipped (DB is authoritative)</li>
+        <li><code>apply_status_delta()</code>: DB says done, file shows <code>[ ]</code> → flips back to <code>[x]</code></li>
+      </ol>
+    </div>
+    <div class="note-warn"><strong>Note:</strong> DB is authoritative for done status. Once done, unchecking in Obsidian reverts on next sync. <span class="tag tag-BUILD">BUILD</span> Reopening a done item: &#9675; PLANNED — no Telegram command today.</div>
+    <div class="inline-comment-area" id="item-comment-s1-2">
+      <div class="inline-comment-label">§1.2 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s1-2" placeholder="Comment on §1.2…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s1-3', this)" title="Tap to comment on §1.3">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§1.3</span>
+        <div class="action-name">SNOOZE A TODO ITEM</div>
+      </div>
+      <span class="badge badge-live">&#10003; LIVE</span>
+    </div>
+    <div class="action-trigger"><strong>Trigger:</strong> <code>/todo snooze &lt;query&gt; [days]</code> via Telegram, or inline button <code>todo-snooze-{id}-{date}</code></div>
+    <div class="lifecycle">
+      <div class="lifecycle-title">Lifecycle</div>
+      <ol>
+        <li><code>mark_snoozed(conn, item_id, until_date)</code> sets <code>status='snoozed'</code>, <code>snoozed_until=YYYY-MM-DD</code></li>
+        <li>On next <code>apply_status_delta()</code>: snoozed items with future <code>snoozed_until</code> treated as open for file rendering</li>
+        <li>After <code>snoozed_until</code> passes: <code>get_open_items()</code> treats item as open again</li>
+      </ol>
+    </div>
+    <div class="note">No snooze mechanism in Obsidian directly — Telegram-only today.</div>
+    <div class="design-note">
+      <strong>Design: Snooze Archetypes</strong><br>
+      Snooze is not a single concept. Before expanding it, we need to decide which archetypes we're building:
+      <ul style="margin: 8px 0 0 16px; line-height: 1.7;">
+        <li><strong>① Temporal deferral</strong> — "I'll deal with this on date X." Item is hidden until that date, then resurfaces as open. <em>This is what snooze does today.</em> The item's state changes to <code>snoozed</code> and auto-transitions to <code>open</code> on expiry.</li>
+        <li><strong>② Notification trigger</strong> — "Remind me about this at time/event T." The item stays open; Lobster pings Dan at the specified moment. This is a different behavior: the item is not hidden, a notification is added. <em>This does not exist yet.</em> It requires a scheduled alert mechanism, not a state change.</li>
+        <li><strong>③ Visual declutter</strong> — "I know it's there; hide it from view until I ask." No date, no reminder — just suppressed from the active view. Closer to a soft-dismiss than a deferral. <em>Partially overlaps ① today</em> (a long snooze achieves this), but the intent is different: the user is not setting a return date, just reducing clutter.</li>
+      </ul>
+      <div style="margin-top: 8px;"><span class="tag tag-DECISION">DECISION</span> Current snooze = ① + ③ (temporal deferral that also visually hides). Should we also build ②? Archetype ② is the higher-leverage bet for a personal assistant — the user shouldn't have to initiate recall; Lobster should push. These three could be separate commands or a unified "snooze with optional remind" model.</div>
+    </div>
+    <div class="inline-comment-area" id="item-comment-s1-3">
+      <div class="inline-comment-label">§1.3 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s1-3" placeholder="Comment on §1.3…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s1-4', this)" title="Tap to comment on §1.4">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§1.4</span>
+        <div class="action-name">DISMISS A TODO ITEM</div>
+      </div>
+      <span class="badge badge-live">&#10003; LIVE</span>
+    </div>
+    <div class="action-trigger"><strong>Trigger:</strong> Telegram inline button <code>todo-dismiss-{id}</code></div>
+    <div class="lifecycle">
+      <div class="lifecycle-title">Lifecycle</div>
+      <ol>
+        <li><code>mark_dismissed()</code> sets <code>status='dismissed'</code>, records <code>dismissed_at</code></li>
+        <li>Dismissed items retained in DB (reviewable in weekly review)</li>
+        <li>On next vault sync: absent from <code>apply_status_delta()</code> output</li>
+      </ol>
+    </div>
+    <div class="note">
+      <strong>Dismissed vs. Done — they are different terminal states:</strong><br>
+      <ul style="margin: 6px 0 0 16px; line-height: 1.7;">
+        <li><strong>Done (<code>status='done'</code>)</strong> — the task was completed. Dan toggled <code>[x]</code> in Obsidian, or sent <code>/todo done</code>. The item carries a completion timestamp. It appears in weekly review as an accomplishment.</li>
+        <li><strong>Dismissed (<code>status='dismissed'</code>)</strong> — the task was intentionally dropped. Dan decided it isn't worth doing. No checkbox involved. Triggered only via Telegram inline button. Retained in DB for review but does not resurface.</li>
+      </ul>
+      The key distinction: <em>done means finished; dismissed means abandoned</em>. Both are retained in the DB. Neither resurfaces automatically.
+    </div>
+    <div class="note-warn">
+      <strong>Why does origin affect the deletion scan?</strong><br>
+      Today, the deletion scan (<code>sync_obsidian_to_db()</code>) only marks items as <code>deleted</code> if their <code>source='obsidian:ACTIVE TODOS.md'</code>. The rationale was: Obsidian items were explicitly added to the file by Dan; if they're gone from the file, Dan removed them, so deletion is the correct inference. Telegram-sourced items were <em>written to the file by Lobster</em> (in the additions block); their absence from the file could mean the block wasn't rendered yet, not that Dan deleted them — so deletion was unsafe to infer.<br><br>
+      <strong>Position going forward:</strong> <span class="tag tag-REMOVE">REMOVE</span> This origin-branching in the state machine is a pragmatic holdover, not a design principle. Source should be provenance metadata only — it should describe <em>where the item came from</em>, not <em>how the state machine behaves</em>. The right long-term fix is smarter deletion inference (e.g., a deletion confirmation flow, or tracking render vs. user-removal separately). See §2.5–§2.7 for the broader Source Parity principle.
+    </div>
+    <div class="inline-comment-area" id="item-comment-s1-4">
+      <div class="inline-comment-label">§1.4 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s1-4" placeholder="Comment on §1.4…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+</div>
+
+<!-- ─── §2 CONTENT CHANGES ─── -->
+<div class="section" id="s2">
+  <div class="section-header">
+    <div class="section-header-text"><span class="section-id">§2</span> Content Changes</div>
+    <button class="section-comment-btn" data-section="s2" title="Add comment for §2" onclick="toggleSectionComment('s2', this)">💬</button>
+  </div>
+  <div class="inline-comment-area" id="sec-comment-s2">
+    <div class="inline-comment-label">§2 — section comment</div>
+    <textarea class="inline-comment-input" id="sci-s2" placeholder="Comment on §2 Content Changes…" rows="2"></textarea>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s2-1', this)" title="Tap to comment on §2.1">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§2.1</span>
+        <div class="action-name">ADD A NEW ITEM (inline in Obsidian)</div>
+      </div>
+      <span class="badge badge-live">&#10003; LIVE</span>
+    </div>
+    <div class="action-trigger"><strong>Trigger:</strong> Dan types a new <code>- [ ] &lt;text&gt;</code> line anywhere in the file</div>
+    <div class="lifecycle">
+      <div class="lifecycle-title">Lifecycle</div>
+      <ol>
+        <li>Push detected; vault-processor fires</li>
+        <li><code>sync_obsidian_to_db()</code>: no matching <code>dedup_key</code> → <code>insert_action_item()</code> with <code>source='obsidian:ACTIVE TODOS.md'</code> and priority from section</li>
+        <li><code>apply_status_delta()</code>: item is open in DB and in file → no change to line</li>
+      </ol>
+    </div>
+    <div class="note">Priority is determined by which section header (Urgent P3, Active P5, Someday P8) the item falls under. Workstream tag comes from the <code>### &lt;name&gt;</code> subsection above.</div>
+    <div class="design-note">
+      <strong>Design: Category Grouping Within Priority</strong><br>
+      Items under a priority section (e.g., Active) are further grouped by workstream subsection (<code>### LOS</code>, <code>### Site</code>, etc.). This grouping currently serves two functions simultaneously: <em>spatial organization</em> (items cluster visually) and <em>tagging</em> (DB <code>workstream</code> field is set from the subsection header).<br><br>
+      The coupling is convenient but creates questions: What if an item belongs to a workstream but shouldn't be grouped with others from that workstream? What if the best spatial grouping doesn't align with the workstream taxonomy? The current model treats "where it appears" and "what it belongs to" as the same signal. <span class="tag tag-TRACK">TRACK</span> This is fine for now but may eventually need to be two separate fields — a display section and a workstream tag — especially as the todo file grows in density.
+    </div>
+    <div class="inline-comment-area" id="item-comment-s2-1">
+      <div class="inline-comment-label">§2.1 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s2-1" placeholder="Comment on §2.1…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s2-2', this)" title="Tap to comment on §2.2">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§2.2</span>
+        <div class="action-name">ADD A SUBTASK (in Obsidian)</div>
+      </div>
+      <span class="badge badge-live">&#10003; LIVE</span>
+    </div>
+    <div class="action-trigger"><strong>Trigger:</strong> Dan adds <code>  - [ ] &lt;text&gt;</code> (exactly 2-space indent) under a parent item</div>
+    <div class="lifecycle">
+      <div class="lifecycle-title">Lifecycle</div>
+      <ol>
+        <li><code>parse_active_todos()</code> uses <code>SUBTASK_CHECKBOX_RE</code>; inherits <code>parent_id</code> from most recent <code>&lt;!-- id:N --&gt;</code> above</li>
+        <li><code>insert_action_item()</code> with <code>parent_id</code> set</li>
+        <li><code>apply_status_delta()</code> handles subtask lines by dedup_key lookup</li>
+      </ol>
+    </div>
+    <div class="note-warn"><strong>Edge case:</strong> If parent item has no <code>&lt;!-- id:N --&gt;</code> comment yet (new parent not yet synced), <code>parent_id</code> may be None on first pass. Resolved on subsequent sync once parent is in DB. Depth cap: 2 levels.</div>
+    <div class="inline-comment-area" id="item-comment-s2-2">
+      <div class="inline-comment-label">§2.2 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s2-2" placeholder="Comment on §2.2…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s2-3', this)" title="Tap to comment on §2.3">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§2.3</span>
+        <div class="action-name">ADD AN ITEM VIA TELEGRAM → APPEARS IN VAULT</div>
+      </div>
+      <span class="badge badge-live">&#10003; LIVE</span>
+    </div>
+    <div class="action-trigger"><strong>Trigger:</strong> <code>/todo add &lt;text&gt;</code> via Telegram</div>
+    <div class="lifecycle">
+      <div class="lifecycle-title">Lifecycle</div>
+      <ol>
+        <li><code>handle_todo_add()</code> → <code>insert_action_item()</code> with <code>source='telegram'</code></li>
+        <li>On next vault sync, <code>apply_status_delta()</code> Pass 3: item open in DB but not in file → appended to <code>&lt;!-- lobster-additions --&gt;</code> block as <code>- [ ] &lt;text&gt; &lt;!-- id:N --&gt;</code></li>
+        <li>Vault-processor commits and pushes; Obsidian pulls on next sync</li>
+      </ol>
+    </div>
+    <div class="note">Item appears in the additions block, not priority sections. Dan can move it manually; priority is updated on next sync by section position.</div>
+    <div class="design-note">
+      <strong>Design: New Item Surfacing (Lobster-Generated Items)</strong><br>
+      When Lobster adds items to the vault (via <code>/todo add</code> or autonomous capture), they land in the <code>&lt;!-- lobster-additions --&gt;</code> block at the bottom of the file — unplaced, unranked, awaiting Dan's triage. This is correct behavior but the surfacing is passive. Dan may not notice new items have been added until the next time he scrolls to the bottom.<br><br>
+      The higher-leverage pattern: <em>new Lobster-generated items should be visibly flagged as awaiting triage</em>. Options under consideration:
+      <ul style="margin: 8px 0 0 16px; line-height: 1.7;">
+        <li><strong>(a) Insert at top of Someday</strong> — Lobster-added items default to Someday/P8 and appear at the top of that section. Dan sees them on next open. Requires Lobster to make a placement decision (which section to default to).</li>
+        <li><strong>(b) Insert in most appropriate section + [NEW] flag</strong> — Lobster infers priority and places the item, but decorates it with a <code>[NEW]</code> inline comment. The flag disappears once Dan moves or touches the item. Requires inference + decoration tracking.</li>
+        <li><strong>(c) Separate "Inbox" section</strong> — All Lobster-generated items land in a dedicated <code>## Inbox</code> section at the top of the file. Dan triages from Inbox into priority sections. Clean separation, maximum visibility. Adds a triage step Dan currently doesn't have.</li>
+      </ul>
+      <div style="margin-top: 8px;"><span class="tag tag-DECISION">DECISION</span> Option (c) is most structurally clean and is consistent with the "extension of mind" framing — the Inbox is the cognitive buffer. Option (a) is easiest to implement today. Option (b) requires tracking that doesn't exist yet.</div>
+    </div>
+    <div class="inline-comment-area" id="item-comment-s2-3">
+      <div class="inline-comment-label">§2.3 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s2-3" placeholder="Comment on §2.3…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s2-4', this)" title="Tap to comment on §2.4">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§2.4</span>
+        <div class="action-name">MOVE OR REORDER AN ITEM</div>
+      </div>
+      <span class="badge badge-live">&#10003; LIVE</span>
+    </div>
+    <div class="action-trigger"><strong>Trigger:</strong> Dan cuts/pastes or drags an item to a different position or section</div>
+    <div class="lifecycle">
+      <div class="lifecycle-title">Lifecycle</div>
+      <ol>
+        <li>If item moves to a different section: <code>sync_obsidian_to_db()</code> detects priority band change → <code>_update_priority()</code></li>
+        <li>If item moves within the same section: no DB change; file order preserved</li>
+        <li><code>apply_status_delta()</code> preserves the new order (only checkbox prefixes touched)</li>
+      </ol>
+    </div>
+    <div class="design-note">
+      <strong>Design: Priority–Section Coupling</strong><br>
+      The Obsidian file structure encodes priority as spatial position: items under <code>## Urgent</code> are P1–P3, <code>## Active</code> is P4–P6, <code>## Someday</code> is P7–P9. This is elegant because the file is readable without any metadata — the structure is the priority system. Dan's intuition ("tool for my mind") aligns naturally with spatial layout.<br><br>
+      The tension: priority (urgency/importance) and spatial section (grouping/organization) are currently the same concept. That means you cannot mark something as urgent-priority without moving it to the top section, and you cannot organize the Someday section into subsections without implying it's all P7–P9. As the system grows, these two concerns may want to diverge — for example, an item that is <em>strategically important</em> but genuinely long-horizon might benefit from a separate priority signal independent of section placement.<br><br>
+      <span class="tag tag-DEFER">DEFER</span> The markdown/hierarchical model is expressive enough for the current scale. The coupling is a limitation of the format, not a design mistake. If this ever becomes a pain point, the right move is an explicit <code>priority:</code> tag in the item text (e.g., <code>- [ ] Fix login flow &lt;!-- priority:urgent --&gt;</code>), but that introduces complexity that isn't justified today.
+    </div>
+    <div class="inline-comment-area" id="item-comment-s2-4">
+      <div class="inline-comment-label">§2.4 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s2-4" placeholder="Comment on §2.4…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s2-5', this)" title="Tap to comment on §2.5">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§2.5</span>
+        <div class="action-name">EDIT AN ITEM'S TEXT</div>
+      </div>
+      <span class="badge badge-scaffolded">&#9685; SCAFFOLDED</span>
+    </div>
+    <div class="action-trigger"><strong>Trigger:</strong> Dan edits the text of an existing checkbox line</div>
+    <div class="lifecycle">
+      <div class="lifecycle-title">Lifecycle</div>
+      <ol>
+        <li><code>sync_obsidian_to_db()</code>: new text has no matching <code>dedup_key</code> → inserted as new item</li>
+        <li>Old text is absent from file → deletion scan: <code>mark_deleted()</code> if <code>source='obsidian:ACTIVE TODOS.md'</code></li>
+      </ol>
+    </div>
+    <div class="note-warn"><strong>Gap:</strong> If item was Telegram-sourced, the deletion scan skips it — DB has two open rows (old + new text). <span class="tag tag-BUILD">BUILD</span> No automated dedup — &#9675; PLANNED.</div>
+    <div class="design-note">
+      <strong>Architectural Principle: Source Parity</strong><br>
+      The fact that this gap is <em>source-dependent</em> points to a deeper structural issue worth naming explicitly. The current system branches on <code>source</code> in multiple places: deletion scan, additions block rendering, file-presence inference. Each branch was added for a pragmatic reason, but together they make the state machine source-aware in ways that should not be necessary.<br><br>
+      <strong>The Source Parity principle:</strong> Source is provenance metadata. It tells you <em>where an item came from</em> for audit, attribution, and triage purposes. It should not determine <em>how the state machine behaves</em>. All items — regardless of origin — should compete on the same footing, transition through the same states, and be subject to the same sync logic.<br><br>
+      The current branching-on-origin is a pragmatic holdover from the incremental build. Each origin-specific branch is a candidate for removal once the underlying uncertainty it was handling (e.g., "we don't know if the user deleted this or if the block wasn't rendered") is resolved by better mechanism design. See §2.6 and §2.7 for related instances.
+    </div>
+    <div class="inline-comment-area" id="item-comment-s2-5">
+      <div class="inline-comment-label">§2.5 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s2-5" placeholder="Comment on §2.5…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s2-6', this)" title="Tap to comment on §2.6">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§2.6</span>
+        <div class="action-name">DELETE AN ITEM (remove line)</div>
+      </div>
+      <span class="badge badge-live">&#10003; LIVE</span>
+    </div>
+    <div class="action-trigger"><strong>Trigger:</strong> Dan removes the <code>- [ ] &lt;text&gt;</code> line entirely (without checking it)</div>
+    <div class="lifecycle">
+      <div class="lifecycle-title">Lifecycle</div>
+      <ol>
+        <li>Deletion scan in <code>sync_obsidian_to_db()</code>: DB open items with <code>source='obsidian:ACTIVE TODOS.md'</code> whose <code>dedup_key</code> was not seen → <code>mark_deleted()</code></li>
+        <li>Deleted items do not reappear in <code>apply_status_delta()</code></li>
+      </ol>
+    </div>
+    <div class="note-warn"><strong>Important:</strong> Only <code>obsidian</code>-sourced items get deletion-detected. Telegram-sourced items removed from the file will reappear in the additions block on next render.</div>
+    <div class="design-note">
+      <strong>Design note:</strong> Why shouldn't all sourced items get the same deletion treatment? The current asymmetry exists because the system can't distinguish "Dan deleted this Telegram-sourced line" from "Lobster just hasn't written it to the file yet." Obsidian-sourced items don't have this ambiguity — if they're in the DB and not in the file, Dan removed them.<br><br>
+      The Source Parity goal would remove this distinction. <span class="tag tag-BUILD">BUILD</span> One path: track whether a Lobster-added item has been successfully rendered to the file (a <code>rendered_at</code> timestamp or <code>rendered=true</code> flag). Once rendered, its absence from the file can be confidently attributed to Dan's intent, and the deletion scan can treat it the same as Obsidian-sourced items. The system should trust and defer to Dan regardless of origin — the current asymmetry is a workaround for a gap in render tracking, not an intended feature.
+    </div>
+    <div class="inline-comment-area" id="item-comment-s2-6">
+      <div class="inline-comment-label">§2.6 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s2-6" placeholder="Comment on §2.6…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s2-7', this)" title="Tap to comment on §2.7">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§2.7</span>
+        <div class="action-name">ADD SUBBULLETS OR NOTES (non-checkbox content)</div>
+      </div>
+      <span class="badge badge-live">&#10003; LIVE</span>
+    </div>
+    <div class="action-trigger"><strong>Trigger:</strong> Dan adds plain text lines, dash bullets without <code>[ ]</code>, or any non-checkbox content under a todo</div>
+    <div class="lifecycle">
+      <div class="lifecycle-title">Lifecycle</div>
+      <ol>
+        <li><code>apply_status_delta()</code> passes non-checkbox lines through unchanged</li>
+        <li><code>parse_active_todos()</code> ignores non-checkbox lines</li>
+        <li>Subbullets are never synced to DB — they exist only in the file</li>
+      </ol>
+    </div>
+    <div class="note-ok"><strong>Fully preserved:</strong> Non-checkbox content survives all sync cycles without modification. This is a core design guarantee of the delta approach.</div>
+    <div class="design-note">
+      <strong>Design note — subbullets and origin:</strong> Subbullets (non-checkbox lines) are file-only constructs. They have no DB representation and no source attribution. This is a deliberate simplicity choice — the delta approach passes them through unchanged, which is the safest and most predictable behavior. The question "why does origin matter here?" doesn't apply to subbullets because they aren't tracked at all. <span class="tag tag-DEFER">DEFER</span> If rich note-taking on todos becomes a priority (e.g., linking notes to items in the DB), subbullets would need promotion to a tracked concept — but that's a significant scope increase not justified today.
+    </div>
+    <div class="inline-comment-area" id="item-comment-s2-7">
+      <div class="inline-comment-label">§2.7 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s2-7" placeholder="Comment on §2.7…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+</div>
+
+<!-- ─── §3 ANNOTATIONS ─── -->
+<div class="section" id="s3">
+  <div class="section-header">
+    <div class="section-header-text"><span class="section-id">§3</span> @lobster Annotation Protocol</div>
+    <button class="section-comment-btn" data-section="s3" title="Add comment for §3" onclick="toggleSectionComment('s3', this)">💬</button>
+  </div>
+  <div class="inline-comment-area" id="sec-comment-s3">
+    <div class="inline-comment-label">§3 — section comment</div>
+    <textarea class="inline-comment-input" id="sci-s3" placeholder="Comment on §3 @lobster Annotation Protocol…" rows="2"></textarea>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s3-1', this)" title="Tap to comment on §3.1">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§3.1</span>
+        <div class="action-name">ADD AN @LOBSTER ANNOTATION</div>
+      </div>
+      <span class="badge badge-live">&#10003; LIVE</span>
+    </div>
+    <div class="action-trigger"><strong>Trigger:</strong> Dan types <code>@lobster &lt;command text&gt;</code> anywhere in any vault <code>.md</code> file</div>
+    <div class="lifecycle">
+      <div class="lifecycle-title">Full Lifecycle</div>
+      <ol>
+        <li>vault-watcher detects push; vault-processor fires after debounce</li>
+        <li>Step 5: <code>_collect_files_to_scan()</code> returns files per <code>annotation_scope</code> config (<code>all</code> = all vault .md files; <code>watched_only</code> = watched list only)</li>
+        <li><code>parse_lobster_annotations()</code> finds all lines with <code>@lobster &lt;text&gt;</code> without a <code>dispatched_at:</code> marker</li>
+        <li>For each annotation:<br>
+          &nbsp;&nbsp;a. Line is marked in-place: <code>@lobster X &lt;!-- dispatched_at: 2026-… --&gt;</code><br>
+          &nbsp;&nbsp;b. Inbox JSON written to <code>~/messages/inbox/vault-lobster-annotation-*.json</code><br>
+          &nbsp;&nbsp;&nbsp;&nbsp; <code>{ type: "user_message", source: "telegram", chat_id: 8075091586, text: "X", ... }</code><br>
+          &nbsp;&nbsp;c. Annotation removed from line (or line deleted if annotation-only)
+        </li>
+        <li>Modified files <code>git add</code>ed; committed and pushed</li>
+        <li>Dispatcher picks up inbox JSON and processes as a normal user message</li>
+      </ol>
+    </div>
+    <div class="note-warn"><strong>Gap — No acknowledgement ping:</strong> After dispatch, Dan receives no "received your annotation" Telegram message. The annotation is silently consumed. The <code>dispatched_at:</code> comment is written and immediately removed — no trace remains in the file. Dan must infer dispatch from the annotation line disappearing on next pull.<br><br><span class="tag tag-BUILD">BUILD</span> Planned mitigation (&#9675; PLANNED, Tier 2a): Obsidian plugin will show inline status decorations (<em>dispatched / open / done</em>) on <code>@lobster</code> lines.</div>
+    <div class="note">Deduplication: each annotation gets a SHA-256 content-hash <code>message_id</code>. If the same annotation fires twice (retry scenario), the dispatcher's dedup gate prevents double-processing.</div>
+    <div class="inline-comment-area" id="item-comment-s3-1">
+      <div class="inline-comment-label">§3.1 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s3-1" placeholder="Comment on §3.1…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s3-2', this)" title="Tap to comment on §3.2">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§3.2</span>
+        <div class="action-name">@LOBSTER WITH SPECIFIC COMMANDS</div>
+      </div>
+      <span class="badge badge-live">&#10003; LIVE</span>
+    </div>
+    <div class="action-trigger"><strong>Trigger:</strong> <code>@lobster /todo add Fix the login flow</code>, <code>@lobster remind me about X</code>, etc.</div>
+    <div class="lifecycle">
+      <div class="lifecycle-title">Lifecycle</div>
+      <ol>
+        <li>Annotation text becomes the message <code>text</code> field verbatim</li>
+        <li>Processed identically to a Telegram message — all commands and natural-language routing apply</li>
+        <li>Any reply produced by the command goes to Telegram (chat_id from config)</li>
+      </ol>
+    </div>
+    <div class="note">No special @lobster command vocabulary beyond what Telegram accepts. <span class="tag tag-BUILD">BUILD</span> Vault-specific semantics (link to issue, snooze annotation) are &#9675; PLANNED for Tier 2 extensions.</div>
+    <div class="design-note">
+      <strong>§3.2 vs. §3.1 — what's the difference?</strong><br>
+      <strong>§3.1</strong> covers the <em>infrastructure</em> of @lobster annotations: how they're detected, marked, dispatched to the inbox, and removed from the file. It describes the wiring regardless of what you write after <code>@lobster</code>.<br><br>
+      <strong>§3.2</strong> covers the <em>content</em> of @lobster annotations when they include a specific command or structured text — e.g., <code>@lobster /todo add Fix the login flow</code>. The distinction matters because §3.1 explains "this annotation was seen and dispatched" while §3.2 explains "once dispatched, what happens to the text." The answer for §3.2 is: the annotation text is handed to the Lobster dispatcher as if Dan had typed it in Telegram. All Telegram commands, natural-language routing, and NLP apply. There is no vault-specific command vocabulary today — writing <code>@lobster /todo add X</code> in the vault is functionally identical to sending <code>/todo add X</code> in Telegram.
+    </div>
+    <div class="inline-comment-area" id="item-comment-s3-2">
+      <div class="inline-comment-label">§3.2 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s3-2" placeholder="Comment on §3.2…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+</div>
+
+<!-- ─── §4 STRUCTURAL / SYSTEM ─── -->
+<div class="section" id="s4">
+  <div class="section-header">
+    <div class="section-header-text"><span class="section-id">§4</span> Structural / System Actions</div>
+    <button class="section-comment-btn" data-section="s4" title="Add comment for §4" onclick="toggleSectionComment('s4', this)">💬</button>
+  </div>
+  <div class="inline-comment-area" id="sec-comment-s4">
+    <div class="inline-comment-label">§4 — section comment</div>
+    <textarea class="inline-comment-input" id="sci-s4" placeholder="Comment on §4 Structural / System Actions…" rows="2"></textarea>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s4-1', this)" title="Tap to comment on §4.1">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§4.1</span>
+        <div class="action-name">CHECK THE DISABLE PROCESSING GUARD (pause sync)</div>
+      </div>
+      <span class="badge badge-live">&#10003; LIVE</span>
+    </div>
+    <div class="action-trigger"><strong>Trigger:</strong> Dan checks <code>- [ ] 🔒 DISABLE PROCESSING</code> → <code>- [x] 🔒 DISABLE PROCESSING</code></div>
+    <div class="lifecycle">
+      <div class="lifecycle-title">Lifecycle</div>
+      <ol>
+        <li>Push detected; vault-processor fires</li>
+        <li>Step 4: <code>check_disable_processing_guard()</code> scans first 10 lines → State 2 (checked)</li>
+        <li>Processor skips all sync steps; writes Telegram alert: "DISABLE PROCESSING is active — skipping this sync cycle."</li>
+        <li><code>last_processed_head</code> is advanced (no infinite retry)</li>
+      </ol>
+    </div>
+    <div class="note">Use case: Dan wants to make extensive edits without triggering mid-edit syncs. Uncheck to resume.</div>
+    <div class="inline-comment-area" id="item-comment-s4-1">
+      <div class="inline-comment-label">§4.1 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s4-1" placeholder="Comment on §4.1…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s4-2', this)" title="Tap to comment on §4.2">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§4.2</span>
+        <div class="action-name">DELETE OR CORRUPT THE DISABLE PROCESSING GUARD</div>
+      </div>
+      <span class="badge badge-live">&#10003; LIVE</span>
+    </div>
+    <div class="action-trigger"><strong>Trigger:</strong> Dan accidentally removes or garbles the guard line</div>
+    <div class="lifecycle">
+      <div class="lifecycle-title">Lifecycle</div>
+      <ol>
+        <li><code>check_disable_processing_guard()</code>: no match in first 10 lines → State 3 (guard absent)</li>
+        <li>Processor skips all sync steps; Telegram alert: "DISABLE PROCESSING guard not found — processing paused. Restore the guard line within the first 10 lines to resume."</li>
+        <li><code>last_processed_head</code> IS advanced (avoids infinite alert loop on the same commit)</li>
+      </ol>
+    </div>
+    <div class="note-warn"><strong>Recovery:</strong> Dan restores the guard line manually in Obsidian and pushes. The guard must be in the first 10 lines of the file. Exact text: <code>- [ ] 🔒 DISABLE PROCESSING</code></div>
+    <div class="inline-comment-area" id="item-comment-s4-2">
+      <div class="inline-comment-label">§4.2 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s4-2" placeholder="Comment on §4.2…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s4-3', this)" title="Tap to comment on §4.3">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§4.3</span>
+        <div class="action-name">DELETE OR CORRUPT THE LOBSTER-ADDITIONS TAGS</div>
+      </div>
+      <span class="badge badge-live">&#10003; LIVE</span>
+    </div>
+    <div class="action-trigger"><strong>Trigger:</strong> Dan removes <code>&lt;!-- lobster-additions --&gt;</code> or <code>&lt;!-- /lobster-additions --&gt;</code> markers</div>
+    <div class="lifecycle">
+      <div class="lifecycle-title">Lifecycle</div>
+      <ol>
+        <li><code>apply_status_delta()</code> scans <code>out_lines</code> for the marker; if not found, <code>tail_start</code> is None</li>
+        <li>Additions block is freshly appended at the end of the file</li>
+        <li>Automatic recovery on next sync — no alert sent</li>
+      </ol>
+    </div>
+    <div class="note-ok"><strong>Self-healing:</strong> Additions block is always rebuilt from DB state. Deleting these markers has no lasting effect.</div>
+    <div class="note" style="font-size:11px; opacity:.7;"><strong>Doc note:</strong> §4.3 received a "Test" comment during review — this was a test of the comment widget, not a substantive question. No design issue in this section.</div>
+    <div class="inline-comment-area" id="item-comment-s4-3">
+      <div class="inline-comment-label">§4.3 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s4-3" placeholder="Comment on §4.3…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s4-4', this)" title="Tap to comment on §4.4">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§4.4</span>
+        <div class="action-name">EDIT SECTION HEADERS OR STRUCTURE</div>
+      </div>
+      <span class="badge badge-live">&#10003; LIVE (partial)</span>
+    </div>
+    <div class="action-trigger"><strong>Trigger:</strong> Dan renames, adds, or removes <code>## Urgent</code>, <code>## Active</code>, <code>## Someday</code>, or <code>### &lt;workstream&gt;</code> headers</div>
+    <div class="lifecycle">
+      <div class="lifecycle-title">Lifecycle</div>
+      <ol>
+        <li><code>parse_active_todos()</code> uses regex matching for section headers</li>
+        <li>If a header is renamed to non-matching text: items under it lose section assignment → default to <code>active</code> priority band (P5)</li>
+        <li>Workstream subsection renaming: DB <code>workstream</code> tag updated on next sync</li>
+      </ol>
+    </div>
+    <div class="note-warn"><strong>Failure mode:</strong> Renaming headers to non-matching strings silently degrades priority assignment. No alert is sent. Canonical headers: <code>## Urgent / This Week (P1–P3)</code>, <code>## Active (P4–P6)</code>, <code>## Someday / Aspirational (P7–P9)</code>.</div>
+    <div class="design-note">
+      <strong>Design note — structure, views, and flexibility</strong><br>
+      The current section structure is a good default but it should be treated as <em>convention, not law</em>. The system works best when it bends to how Dan's mind works, not the other way around. A few directions worth noting:<br><br>
+      <span class="tag tag-DEFER">DEFER</span> <strong>Views:</strong> The Obsidian file is one view — a flat, spatially-organized list. As the item count grows, other views become useful: by workstream, by staleness (items untouched for 7+ days), by snooze expiry, by a custom filter. These don't require changing the file structure; they're computed views over the DB. This is where Lobster can add leverage without touching the vault format.<br><br>
+      <span class="tag tag-BUILD">BUILD</span> <strong>Antifragility:</strong> The system should be robust to structural experiments. Dan reshuffling headers, adding new subsections, or trying different organizational schemes should produce graceful degradation (items default to Active priority) rather than silent data corruption. The current failure mode (silent priority misassignment) is suboptimal — the system should alert when it can't parse a header, not silently fall back.<br><br>
+      <span class="tag tag-TRACK">TRACK</span> <strong>Extension of mind:</strong> The most important structural property is that the file remains a <em>direct cognitive interface</em>. Every affordance Lobster adds — auto-placement, [NEW] flags, inline decorations — must earn its place by reducing cognitive friction, not adding to it. When in doubt, prefer invisible infrastructure over visible UI chrome.
+    </div>
+    <div class="inline-comment-area" id="item-comment-s4-4">
+      <div class="inline-comment-label">§4.4 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s4-4" placeholder="Comment on §4.4…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+</div>
+
+<!-- ─── §5 GAPS / FUTURE ─── -->
+<div class="section" id="s5">
+  <div class="section-header">
+    <div class="section-header-text"><span class="section-id">§5</span> Open / Future</div>
+    <button class="section-comment-btn" data-section="s5" title="Add comment for §5" onclick="toggleSectionComment('s5', this)">💬</button>
+  </div>
+  <div class="inline-comment-area" id="sec-comment-s5">
+    <div class="inline-comment-label">§5 — section comment</div>
+    <textarea class="inline-comment-input" id="sci-s5" placeholder="Comment on §5 Open / Future…" rows="2"></textarea>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s5-1', this)" title="Tap to comment on §5.1">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§5.1</span>
+        <div class="action-name">Currently Open (&#9675; PLANNED)</div>
+      </div>
+    </div>
+    <div class="lifecycle">
+      <ol>
+        <li><span class="tag tag-BUILD">BUILD</span> No acknowledgement ping for @lobster annotation dispatch — Tier 2a plugin will provide inline decorations</li>
+        <li><span class="tag tag-BUILD">BUILD</span> Reopen a done item: no Telegram command today; requires direct DB action</li>
+        <li><span class="tag tag-BUILD">BUILD</span> Edit text of an existing item: creates duplicate; no merge/reconcile UI</li>
+        <li><span class="tag tag-REMOVE">REMOVE</span> Retire <code>todo_obsidian_sync.py</code> cron: scheduled 2026-05-13 after 48h validation</li>
+        <li><span class="tag tag-BUILD">BUILD</span> Tier 2a Obsidian plugin (Mac): hotkey capture, quick-add modal, @lobster inline decorations, DISABLE PROCESSING ribbon toggle, status bar</li>
+        <li><span class="tag tag-BUILD">BUILD</span> Tier 2b surfacing: idle nudges for items open &gt;72h, today-view panel</li>
+        <li><span class="tag tag-BUILD">BUILD</span> GitHub webhook mode: replace git-fetch polling with push webhook (~1s vs. ~30s detection)</li>
+      </ol>
+    </div>
+    <div class="inline-comment-area" id="item-comment-s5-1">
+      <div class="inline-comment-label">§5.1 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s5-1" placeholder="Comment on §5.1…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+
+  <div class="action-card" onclick="toggleItemComment('s5-2', this)" title="Tap to comment on §5.2">
+    <div class="action-header">
+      <div class="action-name-row">
+        <span class="item-id">§5.2</span>
+        <div class="action-name">Explicitly Excluded</div>
+      </div>
+    </div>
+    <div class="action-trigger">These are design decisions, not gaps.</div>
+    <div class="lifecycle">
+      <ol>
+        <li><strong>Signal channel (behavioral metadata)</strong> — implicit observation (dwell time, scroll depth, editing intensity) is excluded by design, not deferred</li>
+        <li><strong>Full file rewrite on every sync</strong> — <code>apply_status_delta()</code> is the architecture; <code>render_active_todos()</code> is bootstrap-only</li>
+      </ol>
+    </div>
+    <div class="inline-comment-area" id="item-comment-s5-2">
+      <div class="inline-comment-label">§5.2 — item comment</div>
+      <textarea class="inline-comment-input" id="ici-s5-2" placeholder="Comment on §5.2…" rows="2" onclick="event.stopPropagation()"></textarea>
+    </div>
+  </div>
+</div>
+
+<!-- ─── FAILURE MODES ─── -->
+<div class="section" id="failures">
+  <div class="section-header"><div class="section-header-text">Failure Modes and Recovery Paths</div></div>
+  <table class="failure-table">
+    <thead>
+      <tr>
+        <th>Failure</th>
+        <th>Detection</th>
+        <th>Recovery</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Git conflict markers in file</td>
+        <td><code>has_conflict_markers()</code> checks first 50 lines; processor halts + Telegram alert</td>
+        <td>Dan resolves conflict in Obsidian; pushes; processor resumes</td>
+      </tr>
+      <tr>
+        <td>DISABLE PROCESSING guard missing</td>
+        <td>State 3: Telegram alert sent, processor skips</td>
+        <td>Dan restores guard line in first 10 lines; pushes</td>
+      </tr>
+      <tr>
+        <td>DISABLE PROCESSING guard checked</td>
+        <td>State 2: Telegram alert sent, processor skips</td>
+        <td>Dan unchecks the guard; pushes</td>
+      </tr>
+      <tr>
+        <td>Git pull fails (rebase failure)</td>
+        <td><code>git_pull()</code> returns False; processor aborts; <code>last_processed_head</code> NOT advanced</td>
+        <td>vault-watcher retries on next debounce; Dan may need to resolve conflict manually</td>
+      </tr>
+      <tr>
+        <td>Obsidian git plugin not pushing</td>
+        <td>vault-watcher never detects new HEAD; no sync fires</td>
+        <td>Tier 0 cron (<code>todo_obsidian_sync.py</code>) fires every 30 min as fallback (during validation window)</td>
+      </tr>
+      <tr>
+        <td>Annotation dispatch fails (OSError)</td>
+        <td><code>_dispatch_annotation()</code> returns False; line reverts to unprocessed state</td>
+        <td>Retried on next processor run (annotation still in file without <code>dispatched_at:</code> marker)</td>
+      </tr>
+      <tr>
+        <td>Item text edited in Obsidian</td>
+        <td>Old item becomes <code>status='deleted'</code>; new text inserted as new row</td>
+        <td>If Telegram-sourced: DB has two rows. <span class="tag tag-BUILD">BUILD</span> No automated dedup — &#9675; PLANNED.</td>
+      </tr>
+      <tr>
+        <td>lobster-additions block corrupted</td>
+        <td><code>apply_status_delta()</code> rebuilds block from scratch</td>
+        <td>Automatic</td>
+      </tr>
+      <tr>
+        <td>vault-processor crashes mid-run</td>
+        <td>Lock released on process exit; next watcher cycle fires fresh run</td>
+        <td>Idempotent: all steps safe to repeat from the top</td>
+      </tr>
+      <tr>
+        <td>DB unreachable</td>
+        <td><code>connect()</code> raises; vault-processor exits with error; no Telegram alert sent</td>
+        <td>VPS admin action required</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ─── PIPELINE DIAGRAM ─── -->
+<div class="section" id="pipeline">
+  <div class="section-header"><div class="section-header-text">Full Pipeline Lifecycle Diagram</div></div>
+  <div class="pipeline">Dan edits ACTIVE TODOS.md in Obsidian
+         |
+         | (Obsidian git plugin auto-commit + push)
+         v
+ obsidian-vault GitHub remote (origin)
+         |
+         | (~30s polling: git fetch + rev-parse origin/HEAD)
+         v
+  vault-watcher.py (Type B cron, every 30s)
+    - Compares remote HEAD to last_known_head
+    - If changed: records last_push_at, starts debounce timer
+    - If debounce expired (~60s) OR max_debounce exceeded (~300s):
+         |
+         v
+  vault-processor.py (invoked synchronously by watcher)
+    1. git pull --rebase --autostash
+    2. Read ACTIVE TODOS.md
+    3. Check conflict markers (first 50 lines)       ← HALT if found; Telegram alert
+    4. Check DISABLE PROCESSING guard (first 10)     ← SKIP if checked/missing; Telegram alert
+    5. Scan vault .md files for @lobster annotations ← dispatch to inbox + remove from file
+    6. git add annotation-modified files
+    7. sync_obsidian_to_db(): parse + mark done/inserted/deleted
+    8. apply_status_delta(): rewrite checkbox prefixes + append new items
+    9. git add ACTIVE TODOS.md
+   10. git commit + push ("vault-watcher: sync [timestamp]")
+         |
+         v
+  self_action_items.db (updated)
+         |
+         +---> ~/messages/inbox/ (if @lobster annotations dispatched)
+         |          |
+         |          v
+         |     Lobster dispatcher processes annotation as user_message
+         |     → routes to commands / subagents
+         |     → any reply sent to Telegram (chat_id from config)
+         |
+         v
+  obsidian-vault GitHub remote (new commit pushed)
+         |
+         | (Obsidian git plugin auto-pull)
+         v
+  Dan's Obsidian shows updated ACTIVE TODOS.md</div>
+</div>
+
+<!-- ─── §6 VISION & HIGH-LEVERAGE BETS ─── -->
+<div class="section" id="s6">
+  <div class="section-header">
+    <div class="section-header-text"><span class="section-id">§6</span> Vision and High-Leverage Bets</div>
+    <button class="section-comment-btn" data-section="s6" title="Add comment for §6" onclick="toggleSectionComment('s6', this)">💬</button>
+  </div>
+  <div class="inline-comment-area" id="sec-comment-s6">
+    <div class="inline-comment-label">§6 — section comment</div>
+    <textarea class="inline-comment-input" id="sci-s6" placeholder="Comment on §6 Vision…" rows="2"></textarea>
+  </div>
+
+  <p style="font-size:13px; color:var(--text2); margin-bottom:20px; line-height:1.7;">
+    LOS is an extension of mind, not a productivity app. The goal is not to help Dan track more things — it is to reduce the cognitive load of the tracking itself to near zero, so his attention is free for the actual work. What follows is Lobster's first-principles read on what would make a 10x version of this system.
+  </p>
+
+  <div class="vision-card">
+    <div class="vision-card-title">Bet 1 — Capture Fidelity: Zero Friction from Intent to Record</div>
+    <div class="vision-card-body">
+      The highest-leverage primitive is making capture so fast and natural that the cost of not capturing an item exceeds the cost of capturing it. Today there are still too many capture paths with different friction levels: typing in Obsidian (high trust, medium friction), <code>/todo add</code> in Telegram (medium friction), <code>@lobster</code> in any .md file (low friction but vault-scoped). The 10x version has one pattern that works everywhere and costs under 5 seconds. The Obsidian Tier 2a plugin (hotkey capture, quick-add modal) is the right direction. The bet: every unrecorded item that gets lost costs more than any amount of infrastructure to prevent it.
+    </div>
+  </div>
+
+  <div class="vision-card">
+    <div class="vision-card-title">Bet 2 — Triage Surfacing: Lobster-Added Items Are Never Invisible</div>
+    <div class="vision-card-body">
+      When Lobster adds an item to the vault, Dan should know about it within the next time he opens Obsidian — not by scrolling to the bottom of the file. This is the highest-leverage UX fix in the current system. An Inbox section (see §2.3 option c) or a Telegram ping ("I added 2 items to your vault — want to place them?") would close this gap. The deeper principle: Lobster is a collaborator, not a silent scribe. When it makes a decision (adding an item, inferring a priority), it should surface that decision to Dan so he can accept, reject, or redirect it. Silent adds are a trust gap.
+    </div>
+  </div>
+
+  <div class="vision-card">
+    <div class="vision-card-title">Bet 3 — Proactive Push: The System Initiates, Dan Doesn't Have to Remember</div>
+    <div class="vision-card-body">
+      The gap between "I snoozed this" and "it resurfaced when I needed it" is where most productivity systems fail. The current snooze (archetype ①) resurfaces items on date expiry but doesn't push — Dan still has to open Obsidian. The 10x version closes this gap with archetype ②: Lobster pings Dan at the right moment, on the right channel. This is especially high-leverage for items that are context-dependent ("remind me when I'm near X", "resurface when PR #N merges") rather than date-dependent. The bet: proactive delivery of the right item at the right time is worth more than any organizational scheme.
+    </div>
+  </div>
+
+  <div class="vision-card">
+    <div class="vision-card-title">Bet 4 — Staleness Detection: Items That Don't Move Should Prompt Action</div>
+    <div class="vision-card-body">
+      An item that stays in Active for 14 days without any status change is a signal — either it's blocked, no longer relevant, or the friction to close it is too high. Today the system doesn't react to staleness. The 10x version tracks item age and uses it as a triage signal: items open beyond a threshold surface in a weekly nudge ("3 items have been open for 2+ weeks — snooze, dismiss, or commit?"). This doesn't require Dan to maintain the list; it requires Lobster to surface the list's own drift. The nudge is the leverage, not the tracking.
+    </div>
+  </div>
+
+  <div class="vision-card">
+    <div class="vision-card-title">Bet 5 — Source Parity and Structural Simplicity</div>
+    <div class="vision-card-body">
+      Every place the current codebase branches on <code>source</code> in the state machine is a candidate for removal. The architectural goal is a source-agnostic state machine where all items compete on the same footing: same states, same transitions, same sync logic. The payoff is not just cleaner code — it's that the system becomes <em>predictable</em>. Dan should be able to reason about what will happen to an item without knowing or caring where it came from. Source should be an audit field, not a routing field. This is structural debt with a clear payoff trajectory.
+    </div>
+  </div>
+
+  <div class="vision-card">
+    <div class="vision-card-title">Bet 6 — Views Without File Complexity</div>
+    <div class="vision-card-body">
+      As the item count grows, a single flat file organized by priority/workstream becomes harder to navigate. The high-leverage answer is not to make the file more complex — it's to provide computed views over the DB that can be rendered on demand: "show me everything tagged #lobster that's been open 7+ days," "show me today's Urgent items only," "show me what I snoozed this week that's coming due." These views require no changes to the Obsidian file format; they're just queries. A Telegram command (<code>/todo view today</code>) or a secondary Bisque dashboard would surface them without adding any structure to Dan's vault. The principle: the file stays simple; the views add richness.
+    </div>
+  </div>
+</div>
+
+<!-- GLOBAL COMMENT WIDGET -->
+<div class="comment-widget" id="comment-widget">
+  <div class="comment-widget-title">Annotate &amp; Copy</div>
+  <p style="font-size:12px; color:var(--text3); margin-bottom:14px;">Tap any section header 💬 or any card to leave an inline note. Use the box below for general observations. Hit Copy to assemble everything into a pasteable message.</p>
+  <div class="global-comment-label">general</div>
+  <textarea id="global-comment" placeholder="General observations not tied to a specific section or item…"></textarea>
+  <br>
+  <button class="copy-comments-btn" onclick="copyComments()">Copy comments to clipboard</button>
+  <div class="copy-feedback" id="copy-feedback"></div>
+</div>
+
+<!-- FOOTER -->
+<div class="footer">
+  <div>LOS workstream &mdash; <code>~/lobster-workspace/workstreams/los/</code></div>
+  <div style="margin-top:6px">
+    <a href="status.html">Work Item Sequencing</a> &nbsp;&bull;&nbsp;
+    <a href="obsidian-active-todos-ux.md">Canonical doc (markdown)</a> &nbsp;&bull;&nbsp;
+    Tier 2a design: <code>personal-todo-system/obsidian-plugin/tier2a-design.md</code>
+  </div>
+</div>
+
+</div><!-- /wrap -->
+<script>
+// ── Theme toggle ──
+function toggleTheme() {
+  var isLight = document.body.classList.toggle('light-mode');
+  localStorage.setItem('theme', isLight ? 'light' : 'dark');
+  document.getElementById('theme-toggle').textContent = isLight ? '☾ Dark' : '☀ Light';
+}
+(function() {
+  if (localStorage.getItem('theme') === 'light') {
+    document.body.classList.add('light-mode');
+    var btn = document.getElementById('theme-toggle');
+    if (btn) btn.textContent = '☾ Dark';
+  }
+})();
+
+// ── Section comment toggle ──
+function toggleSectionComment(sectionId, btn) {
+  event.stopPropagation();
+  var area = document.getElementById('sec-comment-' + sectionId);
+  if (!area) return;
+  var isOpen = area.classList.toggle('open');
+  btn.classList.toggle('active', isOpen);
+  if (isOpen) {
+    var input = document.getElementById('sci-' + sectionId);
+    if (input) setTimeout(function() { input.focus(); }, 50);
+  }
+}
+
+// ── Item comment toggle ──
+function toggleItemComment(itemId, card) {
+  var area = document.getElementById('item-comment-' + itemId);
+  if (!area) return;
+  var isOpen = area.classList.toggle('open');
+  card.classList.toggle('comment-open', isOpen);
+  if (isOpen) {
+    var input = document.getElementById('ici-' + itemId);
+    if (input) setTimeout(function() { input.focus(); }, 50);
+  }
+}
+
+// ── Copy all comments ──
+// Registry: section IDs and item IDs in document order
+var SECTION_IDS = ['s1', 's2', 's3', 's4', 's5', 's6'];
+var ITEM_IDS = [
+  's1-1', 's1-2', 's1-3', 's1-4',
+  's2-1', 's2-2', 's2-3', 's2-4', 's2-5', 's2-6', 's2-7',
+  's3-1', 's3-2',
+  's4-1', 's4-2', 's4-3', 's4-4',
+  's5-1', 's5-2'
+];
+
+// Map item IDs to display labels
+var ITEM_LABELS = {
+  's1-1': '§1.1', 's1-2': '§1.2', 's1-3': '§1.3', 's1-4': '§1.4',
+  's2-1': '§2.1', 's2-2': '§2.2', 's2-3': '§2.3', 's2-4': '§2.4',
+  's2-5': '§2.5', 's2-6': '§2.6', 's2-7': '§2.7',
+  's3-1': '§3.1', 's3-2': '§3.2',
+  's4-1': '§4.1', 's4-2': '§4.2', 's4-3': '§4.3', 's4-4': '§4.4',
+  's5-1': '§5.1', 's5-2': '§5.2'
+};
+
+var SECTION_LABELS = {
+  's1': '§1', 's2': '§2', 's3': '§3', 's4': '§4', 's5': '§5', 's6': '§6'
+};
+
+function copyComments() {
+  var parts = [];
+
+  // Section-level comments
+  SECTION_IDS.forEach(function(sid) {
+    var el = document.getElementById('sci-' + sid);
+    var val = el ? el.value.trim() : '';
+    if (val) parts.push('[' + SECTION_LABELS[sid] + '] ' + val);
+  });
+
+  // Item-level comments
+  ITEM_IDS.forEach(function(iid) {
+    var el = document.getElementById('ici-' + iid);
+    var val = el ? el.value.trim() : '';
+    if (val) parts.push('[' + ITEM_LABELS[iid] + '] ' + val);
+  });
+
+  // Global comment
+  var globalEl = document.getElementById('global-comment');
+  var globalVal = globalEl ? globalEl.value.trim() : '';
+  if (globalVal) parts.push('[general] ' + globalVal);
+
+  var feedback = document.getElementById('copy-feedback');
+  if (!parts.length) {
+    feedback.textContent = 'Nothing to copy — add a comment first.';
+    setTimeout(function() { feedback.textContent = ''; }, 2500);
+    return;
+  }
+
+  var text = parts.join('\n');
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function() {
+      feedback.textContent = 'Copied! (' + parts.length + ' comment' + (parts.length === 1 ? '' : 's') + ')';
+      setTimeout(function() { feedback.textContent = ''; }, 2500);
+    }).catch(function() {
+      fallbackCopy(text, feedback);
+    });
+  } else {
+    fallbackCopy(text, feedback);
+  }
+}
+
+function fallbackCopy(text, feedback) {
+  var ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  try {
+    document.execCommand('copy');
+    feedback.textContent = 'Copied!';
+  } catch(e) {
+    feedback.textContent = 'Copy failed — select and copy manually.';
+  }
+  document.body.removeChild(ta);
+  setTimeout(function() { feedback.textContent = ''; }, 2500);
+}
+</script>
+</body>
+</html>

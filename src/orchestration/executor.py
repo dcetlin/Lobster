@@ -20,10 +20,9 @@ Dispatch protocol:
   subagent via `claude -p` (subprocess, synchronous). Retained for CI/dev environments
   without a live Lobster dispatcher. Activate by passing dispatcher=_dispatch_via_claude_p
   to Executor.__init__ explicitly.
-- TTL recovery: UoWs stuck in 'active' state for more than TTL_EXCEEDED_HOURS are
-  transitioned to 'failed' with return_reason='ttl_exceeded'. Call
-  recover_ttl_exceeded_uows(registry) at heartbeat startup before the dispatch
-  cycle so the Steward can re-diagnose stalled UoWs on its next pass.
+- Stall recovery: UoWs with an expired claimed_until timestamp are reset to
+  'ready-for-executor' by registry.reset_expired_claims() at heartbeat startup.
+  No separate TTL recovery job is needed — the visibility-timeout model handles it.
 - Default: Executor(...) with dispatcher=None activates the dispatch table
   (_EXECUTOR_TYPE_TO_DISPATCHER). The heartbeat passes dispatcher=None so
   register-appropriate routing activates in production. Tests inject
@@ -31,7 +30,6 @@ Dispatch protocol:
 
 Imports:
     from orchestration.executor import Executor, ExecutorOutcome, ExecutorResult
-    from orchestration.executor import recover_ttl_exceeded_uows
 
 Canonical output path convention (from executor-contract.md):
     {output_ref}.result.json  (replace extension)
@@ -56,7 +54,7 @@ from orchestration.config import TimeoutConfig
 
 log = logging.getLogger("executor")
 
-from orchestration.registry import Registry, UoW, UoWStatus
+from orchestration.registry import Registry, UoW, UoWStatus, UoWRegister
 from orchestration.result_writer import write_result as _write_subagent_result
 from orchestration.workflow_artifact import WorkflowArtifact, from_json, from_frontmatter
 from orchestration.error_capture import (
@@ -80,17 +78,6 @@ LOBSTER_ADMIN_CHAT_ID: str = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586
 _OUTPUT_DIR_TEMPLATE: str = os.environ.get(
     "WOS_OUTPUTS_DIR", "~/lobster-workspace/orchestration/outputs"
 )
-
-# UoWs stuck in 'active' state longer than this are considered TTL-exceeded
-# and marked 'failed' by recover_ttl_exceeded_uows() at heartbeat startup.
-#
-# This is the orphan safety net — the hard ceiling for UoWs that somehow
-# evaded heartbeat-based recovery. Increased from 4h to 24h because
-# heartbeat locking (migration 0009) now detects stalls within heartbeat_ttl
-# + 3min poll (~8min), making the old 4h window redundant and overly aggressive.
-# The 24h threshold catches definitively orphaned UoWs only.
-TTL_EXCEEDED_HOURS: int = 24
-
 
 # ---------------------------------------------------------------------------
 # ExecutorOutcome StrEnum — per executor-contract.md
@@ -148,7 +135,7 @@ class ClaimSucceeded:
     uow_id: str
     output_ref: str
     artifact: WorkflowArtifact
-    register: str = "operational"
+    register: UoWRegister = UoWRegister.OPERATIONAL
 
 
 @dataclass(frozen=True)
@@ -339,7 +326,7 @@ def _validate_result_json_written(uow_id: str, output_ref: str) -> None:
         log.warning(
             "Executor contract violation: result.json not found after write for UoW %s "
             "(expected: %s). Steward will be unable to assess completion deterministically. "
-            "See docs/executor-contract.md.",
+            "See docs/wos/current/executor-contract.md.",
             uow_id,
             result_path,
         )
@@ -568,7 +555,7 @@ class Executor:
                 _write_result_json(output_ref, null_result)
                 null_trace = _build_trace(
                     uow_id=uow_id,
-                    register=row["register"] if row["register"] else "operational",
+                    register=UoWRegister(row["register"] or "operational"),
                     outcome=ExecutorOutcome.FAILED,
                     execution_summary=null_reason,
                     surprises=[null_reason],
@@ -602,7 +589,7 @@ class Executor:
                     _write_result_json(output_ref, missing_result)
                     missing_trace = _build_trace(
                         uow_id=uow_id,
-                        register=row["register"] if row["register"] else "operational",
+                        register=UoWRegister(row["register"] or "operational"),
                         outcome=ExecutorOutcome.FAILED,
                         execution_summary=missing_reason,
                         surprises=[missing_reason],
@@ -643,7 +630,7 @@ class Executor:
                 _write_result_json(output_ref, deser_result)
                 deser_trace = _build_trace(
                     uow_id=uow_id,
-                    register=row["register"] if row["register"] else "operational",
+                    register=UoWRegister(row["register"] or "operational"),
                     outcome=ExecutorOutcome.FAILED,
                     execution_summary=deser_reason,
                     surprises=[str(e)],
@@ -657,7 +644,7 @@ class Executor:
                     reason=f"workflow_artifact deserialization failed: {e}",
                 )
 
-            register = row["register"] if row["register"] else "operational"
+            register = UoWRegister(row["register"] or "operational")
             return ClaimSucceeded(uow_id=uow_id, output_ref=output_ref, artifact=artifact, register=register)
 
         except Exception:
@@ -1009,6 +996,14 @@ def _build_wos_context_block(uow_id: str) -> str:
         f"(create the label if it does not exist)\n"
         f"  - Commit messages: optionally include WOS-UoW: {uow_id} in the footer\n"
         f"---\n"
+        f"Token tracking: report your total token usage on completion.\n"
+        f"  - In your final mcp__lobster-inbox__write_result call, pass token_usage=<N>\n"
+        f"    where N is the total input+output tokens consumed across all API turns.\n"
+        f"  - In each mcp__lobster-inbox__write_wos_heartbeat call, pass token_usage=<N>.\n"
+        f"  - If your Claude Code session does not expose token counts directly, omit\n"
+        f"    token_usage (pass None / leave it out) — the field is optional and the\n"
+        f"    Steward handles absent values gracefully.\n"
+        f"---\n"
     )
 
 
@@ -1352,7 +1347,8 @@ def _log_dispatch_boundary(
     Args:
         uow_id: The UoW being dispatched.
         dispatch_attempt: Attempt number (1 for first attempt, 2+ for retries).
-        outcome: One of "success", "retry", "failure".
+        outcome: One of "success", "failure". (`retry` is reserved for a future
+            retry loop and is not currently emitted.)
         msg_id: The inbox message ID (on success).
         failure_reason: Reason for failure or retry (on non-success).
     """
@@ -1441,7 +1437,8 @@ def _dispatch_via_inbox(instructions: str, uow_id: str, agent_type: str = "funct
 
     Observability: All dispatch attempts, retries, and failures are logged to
     ~/lobster-workspace/logs/dispatch-boundary.jsonl with structured records:
-    {uow_id, dispatch_attempt, timestamp, outcome: success|retry|failure, failure_reason?}
+    {uow_id, dispatch_attempt, timestamp, outcome: success|failure, failure_reason?}
+    (`retry` is reserved for a future retry loop; `dispatch_attempt` is always 1.)
 
     Raises OSError if the inbox directory cannot be created or the message
     file cannot be written.
@@ -1560,76 +1557,6 @@ def _stamp_failed_if_github(registry: "Registry", uow_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# TTL recovery — mark stuck 'active' and 'executing' UoWs as failed
-# ---------------------------------------------------------------------------
-# TTL recovery catches UoWs that transition to 'active' or 'executing' but
-# never complete — e.g. if the subagent crashes before writing its result file,
-# or the inbox message was lost. With inbox dispatch, UoWs have natural heartbeat
-# presence via the dispatcher cycle, but TTL recovery remains as a safety net for
-# any subagent that stalls beyond TTL_EXCEEDED_HOURS without writing a result.
-#
-# 'executing' UoWs are included alongside 'active': an 'executing' UoW whose
-# subagent never calls write_result (orphan, crash, context loss) must be
-# recovered so the Steward can re-diagnose it. Without this, orphaned 'executing'
-# UoWs would be invisible to standard recovery paths (issue #669).
-
-def recover_ttl_exceeded_uows(registry: "Registry") -> list[str]:
-    """
-    Scan for UoWs in 'active' or 'executing' state that have exceeded
-    TTL_EXCEEDED_HOURS and transition them to 'failed'.
-
-    Call this at executor-heartbeat startup, before the dispatch cycle, so
-    the Steward can re-diagnose stalled UoWs on its next pass.
-
-    Returns the list of uow_ids that were recovered (may be empty).
-
-    Design: uses optimistic lock on fail_uow — if another process already
-    transitioned the UoW, the update silently skips (rowcount=0 path in
-    fail_uow's WHERE clause). This is safe for concurrent heartbeat runs.
-    """
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=TTL_EXCEEDED_HOURS)
-    cutoff_iso = cutoff.isoformat()
-
-    conn = sqlite3.connect(str(registry.db_path), timeout=10.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-
-    try:
-        rows = conn.execute(
-            """
-            SELECT id FROM uow_registry
-            WHERE status IN ('active', 'executing')
-              AND started_at IS NOT NULL
-              AND started_at < ?
-            """,
-            (cutoff_iso,),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    recovered: list[str] = []
-    for row in rows:
-        uow_id = row["id"]
-        try:
-            registry.fail_uow(
-                uow_id,
-                f"ttl_exceeded: UoW was in active state for more than {TTL_EXCEEDED_HOURS}h",
-            )
-            recovered.append(uow_id)
-        except Exception as e:
-            log.debug(
-                "TTL recovery failed for UoW %s: %s: %s",
-                uow_id,
-                type(e).__name__,
-                e,
-                exc_info=True,
-            )
-            # Non-fatal: the UoW remains active and will be caught on the next heartbeat cycle.
-
-    return recovered
-
-
 # ---------------------------------------------------------------------------
 # No-op implementations — for tests and environments without a live inbox
 # ---------------------------------------------------------------------------

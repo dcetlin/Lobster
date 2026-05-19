@@ -215,3 +215,219 @@ must use `UoWStatus.DONE` (or another enum value as appropriate). The 'closed'
 treatment as terminal is for legacy-row compatibility only. The production
 migration to reclassify existing 'closed' rows as 'done' is out of scope for
 this PR and tracked as a follow-on.
+
+---
+
+## ADR-005: Fast-Path Classification Bypass for Writer-Provided signal_type_hint — Encoded Orientation
+
+**Date:** 2026-05-01
+**Status:** Accepted
+**PR:** #1032 (mem-event-subject-tagging)
+**WOS Reference:** uow_20260501_8de2bc
+
+### Context
+
+PR #1032 adds `subject` and `signal_type_hint` columns to the memory events table. The `signal_type_hint` field allows a producer (harvester, scheduled job, dispatcher) to pre-classify an event at write time. The slow-reclassifier's `run_pass` function uses this hint via a fast path: events with `signal_type_hint` set bypass all content-inference pattern detection and receive a `confidence="high"` slow-v1 tag using the caller's self-declared type.
+
+This is an Encoded Orientation decision under vision.yaml `core.inviolable_constraints.constraint-3` because it changes a durable behavioral default in the classification pipeline without requiring Dan's real-time input on each invocation.
+
+### What Changed
+
+Before this PR, every event processed by the slow-reclassifier went through cluster-based pattern detection (design_session, brainstorm_mode, complex_request, meta_thread, philosophy_thread). The classification result depended on the event's content and its neighbors in time.
+
+After this PR, events with `signal_type_hint` set are classified directly by the hint value with `confidence="high"` and are excluded from cluster-based pattern detection entirely. Events without `signal_type_hint` continue through pattern detection unchanged.
+
+This creates a two-tier classification contract: structured producers (harvesters, scheduled jobs) self-classify at write time; ad-hoc writers go through content inference. The fast path is the operative change — it is not constrained, not temporary, and not reversible per-run.
+
+### Why This Is an Encoded Orientation Decision
+
+The fast-path decision is structural: every event carrying a `signal_type_hint` value will be classified with `confidence="high"` on the hint, regardless of content, without a human deciding this on a per-event basis. This satisfies all three of constraint-3's conditions: (a) the system acts without Dan's explicit input, (b) it changes a durable default in the classification pipeline, and (c) the behavioral change is encoded in code, not in a retrievable prompt or conversation.
+
+The oracle PR #1032 verdict Round 1 confirms this is a constraint-3 gap and requires this ADR as the resolution.
+
+### Vision Anchor
+
+**Primary:** `core.inviolable_constraints.constraint-3` — "Every system decision traverses the full OODA loop at the appropriate register. Encoded Orientation decisions require a prior logged decision of the same class and a traceable vision.yaml anchor."
+
+This ADR is the logged decision. It satisfies constraint-3 for the fast-path classification bypass.
+
+**Secondary:** `core.operating_principles.principle-3` — "Determinism over judgment for conditionals. If-then logic and field checks are code, not LLM instructions. Use LLMs where genuine interpretation is required."
+
+The fast path encodes the rule "if signal_type_hint is present, trust it" as code. This is correct — a producer writing a hint at event time has more context than the slow-reclassifier can recover from content alone. The deterministic path (trust hint) is preferable to re-running inference on content the producer already interpreted.
+
+**Tertiary:** `current_focus.what_not_to_touch` — "New detection or classification rules — improve Orient routing before adding more detection."
+
+The fast path does not add detection rules. It reduces detection: events with hints skip pattern detection entirely. This is complementary to the constraint's intent — it prevents over-detection on events where classification is already known.
+
+### Authorization
+
+Authorized by WOS UoW uow_20260501_8de2bc (mem-event-type-subject-tagging). The UoW is a dispatch record, not a decision record per learnings.md PR #913; this ADR is the decision record. The behavioral change is technically sound; the oracle Round 1 verdict (Alignment: Questioned, not Rejected) confirms the underlying logic is coherent while requiring this log entry as the structural anchor.
+
+### Known Correction Gap
+
+Events classified via the fast path (confidence="high") have no correction path if the producer's hint is wrong. The slow-reclassifier's `total_revised` counter conflates hinted events with pattern-revised events, making true reclassification rates harder to audit. These are accepted trade-offs at current scale given that structured producers (harvesters, scheduled jobs) have reliable self-knowledge of their signal type. If producer accuracy degrades, the correct response is to add a monitoring gap to the daily digest, not to remove the fast path.
+
+---
+
+## ADR-006: Circadian Gate Wired into inbox_write.py as a Shared Behavioral Default — Encoded Orientation
+
+**Date:** 2026-05-02
+**Status:** Accepted
+**PR:** #1036 (feat/circadian-delivery_uow_20260427_7ffcb3)
+
+### Context
+
+PR #1036 introduces circadian-aware message delivery: non-urgent scheduled-job outputs are held in a local queue and batched for delivery during Dan's morning window (06:00–10:00 America/Los_Angeles). The circadian gate logic lives in `src/delivery/circadian.py`.
+
+Before this PR, `src/utils/inbox_write.py` wrote every subagent_result directly to the inbox, regardless of time-of-day. The circadian module was self-contained with no call site in the shared delivery path.
+
+### Decision
+
+The circadian gate is wired into `write_inbox_message()` in `src/utils/inbox_write.py` as a durable behavioral default for all callers. When `is_non_urgent(msg)` returns True and `is_morning_window()` returns False, the message is routed to `queue_message()` instead of being written to the inbox. This applies to every caller of `write_inbox_message()` — no opt-in is required.
+
+The gate is wrapped in a `try/except` so that unavailability of the circadian module falls through to immediate delivery without disrupting existing callers.
+
+### Why This Is an Encoded Orientation Decision
+
+The system now acts without Dan's real-time input when circadian deferral conditions are met: every non-urgent job output sent outside the morning window is silently queued rather than immediately delivered. This satisfies all three conditions under constraint-3: (a) the system acts without Dan's explicit per-message input, (b) it changes a durable behavioral default in the delivery path, and (c) the change is encoded in `inbox_write.py`, not in a retrievable prompt.
+
+### Rationale
+
+Wiring the gate into `inbox_write.py` rather than into each caller individually serves the "integration rate before new feature rate" principle: the shared utility is the correct seam for a delivery-layer concern. Callers that produce non-urgent output do not need to know about circadian delivery — they call `write_inbox_message()` and the gate is applied transparently.
+
+This directly addresses constraint-4: overnight job outputs that would otherwise interrupt Dan's sleep or early-morning focus are held and batched for the morning window, reducing friction and screen-time without reducing information completeness.
+
+### Vision Anchor
+
+**Primary:** `core.inviolable_constraints.constraint-4` — "Minimize metabolic cost of cybernetic engagement. The system should reduce friction and screen time, not maximize output volume or feature density."
+
+Deferring non-urgent job outputs to the morning window is a structural implementation of constraint-4: it removes overnight interruptions at the delivery layer rather than relying on Dan to manage notification volume manually.
+
+**Secondary:** `core.operating_principles.principle-4` — "Integration rate before new feature rate. Wire what exists before building more. The missing arrows between existing systems are the velocity multiplier."
+
+The circadian module existed before this PR. Wiring it into the shared write path is the missing arrow — it makes the feature operative for all callers without requiring per-caller changes.
+
+### Constraint
+
+The circadian gate applies only to messages where `is_non_urgent()` returns True (type is `subagent_result`, no `reply_to_message_id`, no urgent-signal keywords). Urgent messages, user replies, and incident alerts always deliver immediately via the existing path. The gate cannot defer a message the user is waiting for a reply to.
+
+---
+
+## ADR-007: Developmental Register Injection into _llm_prescribe — Encoded Orientation Behavioral Default
+
+**Date:** 2026-05-02
+**Status:** Accepted
+**PR:** #1049 (feature/steward-dev-register)
+
+### Context
+
+The WOS Steward prescriber generates execution instructions for Units of Work but had no awareness of Dan's developmental arc — the current attunement stage, active capability clusters, and the Goldilocks window for expanding vs. consolidating work. Prescriptions could land correctly for the task surface while missing what the arc requires (e.g. prioritising observation-loop work over new capability surface, or flagging when a UoW would push the active cluster beyond the consolidation threshold).
+
+The oracle PR #1049 verdict (Round 1) identified this change as an Encoded Orientation decision under constraint-3: it modifies a durable behavioral default in `_llm_prescribe` that fires on every steward prescription cycle without Dan's real-time input. No logged prior existed before this ADR was written.
+
+### What Changed
+
+`_llm_prescribe` in `src/orchestration/steward.py` now calls `_load_dan_register_excerpt()` and — when the excerpt is non-empty — injects it as a `## Dan's current orientation` block positioned after the UoW context and before the dispatch conventions in the user prompt. The model sees both "what does this UoW need" and "what does Dan's arc require of how this work lands" before generating the prescription.
+
+When the excerpt is empty (file absent or anchor section missing) the prompt is unchanged. This makes the injection safe in upstream and CI environments without a user config.
+
+### Why This Is an Encoded Orientation Decision
+
+The injection fires on every `_llm_prescribe` call — a durable behavioral default change that operates without Dan's explicit per-prescription input. Per constraint-3 (`core.inviolable_constraints.constraint-3`): Encoded Orientation decisions require a prior logged decision of the same class and a traceable vision.yaml anchor. This ADR is the logged decision.
+
+### Vision Anchor
+
+**Primary:** `core.fundamental_intent` — "The system should be able to answer 'is this aligned with Dan's intent?' without asking me — because it has structural access to my intent, not just a prose reconstruction of it."
+
+The developmental register excerpt is a proxy toward this intent: it surfaces Dan's current arc to the prescriber so prescriptions can be evaluated against more than task-surface correctness. This is a stepping-stone toward the structural Orient seam (#733), not a substitute for it.
+
+**Secondary:** `core.inviolable_constraints.constraint-3` — "Every system decision traverses the full OODA loop at the appropriate register. Encoded Orientation decisions require a prior logged decision of the same class and a traceable vision.yaml anchor."
+
+This ADR satisfies constraint-3 for the `_llm_prescribe` behavioral default change.
+
+### Dual-Source Drift Risk
+
+`user.base.context.md` (the source of the developmental register excerpt) and `vision.yaml` (the structural intent anchor) have different update disciplines:
+
+- `user.base.context.md` is updated by agents and Dan's session work — higher frequency, lower ceremony
+- `vision.yaml` structural fields are Dan-authored — lower frequency, higher ceremony
+
+When the two sources diverge — a `current_focus` or developmental stage description in `user.base.context.md` that no longer aligns with `vision.yaml.current_focus` — the prescriber has no mechanism to detect the conflict or prefer one over the other. The injection silently uses whichever text is in `user.base.context.md` at call time.
+
+This is an accepted risk at current scale given: (a) the developmental map section of `user.base.context.md` is updated intentionally (not auto-generated), (b) the injection is advisory context rather than a routing decision — it enriches the prompt but does not gate prescription generation, and (c) graceful degradation (empty-string return) fires if the file or section is absent, leaving the prompt unchanged.
+
+The correct mitigation when Orient (#733) is implemented: replace the prose excerpt injection with a structured query against a vision.yaml-native orient seam, eliminating the dual-source problem structurally.
+
+### Deliberate Proxy Approach
+
+This implementation uses `user.base.context.md` as a proxy for the structural orient substrate that `current_focus.horizon.after_that` names as the next investment: "Orient implementation (#733) — the guardrail names the next structural investment once feedback loop is verifiably closed end-to-end."
+
+This ADR explicitly records that this is a proxy approach chosen for ergonomic benefit while the structural seam is not yet built. It does not foreclose the structural implementation — `_load_dan_register_excerpt` is a pure I/O boundary function that can be replaced with a vision.yaml query when Orient is ready. The behavioral default (inject orientation into prescriptions) is the durable change; the source (prose excerpt vs. structured field) is a replaceable implementation detail.
+
+---
+
+## ADR-008: Sweep-Filed GitHub Issues Automatically Promoted to Proposed WOS UoWs — Encoded Orientation
+
+**Date:** 2026-05-14
+**Status:** Accepted
+**PR:** #1153 (feat/sweep-uow-wiring)
+**Authorizing party:** Dan Cetlin — authorized in deep work session 2026-05-14
+
+### Context
+
+Before this PR, the negentropic sweep detected structural smells and filed GitHub issues, but those issues entered the WOS queue only when the cultivator ran its next cycle (typically the following morning at ~6 AM). The sweep had no direct actuator: the sensor-to-queue path had a 4–8 hour latency gap that operated as a de facto human-review window.
+
+The oracle PR #1153 verdict (Round 1) identified the PR's claim of "Decision from 2026-05-14 deep work digest: Lobster has delegated authority to promote sweep observations into the WOS queue" as an unverified Encoded Orientation authorization under constraint-3. No entry in `oracle/verdicts/`, `oracle/decisions.md`, or `vision.yaml open_decisions` reflected this decision. This ADR is the required logged prior.
+
+### Authorization
+
+Dan Cetlin authorized this behavioral default in the 2026-05-14 deep work session. The authorization: Lobster has delegated authority to promote sweep observations into the WOS queue as proposed UoWs immediately after the sweep files a GitHub issue, without waiting for the cultivator's next cycle.
+
+The oracle identified the 4-hour cultivator delay as a potentially intentional human-review window. Dan's explicit delegation of this authority to Lobster resolves that ambiguity: the delay was a structural gap, not a deliberate gate. Sweep-filed issues are categorically appropriate proposed work — they enter as `proposed` (same state the cultivator uses), not as auto-executed UoWs. The Steward remains the downstream quality filter.
+
+### What Changed
+
+After the sweep calls `gh issue create` for a new escalation item, it immediately calls `sweep-uow-promote.py`, which invokes `promote_sweep_issue()` in `src/orchestration/sweep_uow_promoter.py`. This creates a proposed UoW in the registry with:
+
+- `source = SWEEP_SOURCE` ("sweep") — distinguishes from cultivator-promoted UoWs
+- `source_issue_number` = the newly filed issue number
+- `status = "proposed"` — same entry state as cultivator-promoted UoWs
+- A default `success_criteria` string (refined by the Steward at germination)
+
+The promoter is gated by the `negentropic-sweep` job-enabled flag in `jobs.json`, co-locating sweep promotion with sweep execution. Dedup is enforced by `registry.upsert()`: if a non-terminal UoW already exists for the same `source_issue_number`, the call returns `SKIPPED_DEDUP` without writing a duplicate.
+
+### Why This Is an Encoded Orientation Decision
+
+The system now acts without Dan's real-time input after each sweep: every new sweep-filed issue enters the WOS pipeline as a proposed UoW without human review of that specific entry. This satisfies all three conditions under constraint-3: (a) the system acts without Dan's explicit per-issue input, (b) it establishes a durable behavioral default in the sweep-to-WOS path, and (c) the behavior is encoded in `sweep-uow-promote.py` and the updated `negentropic-sweep.md` task file.
+
+### Vision Anchor
+
+**Primary:** `core.operating_principles.principle-4` — "Integration rate before new feature rate. Wire what exists before building more. The missing arrows between existing systems are the velocity multiplier."
+
+The sweep and the WOS registry both existed before this PR. The sweep-to-WOS arrow was the missing integration. Wiring it directly (rather than continuing to route through the cultivator's daily cycle) is the minimum path from observation to queue entry.
+
+**Secondary:** `active_project.phase_intent` — "Registry populated by the issue sweeper, steward picks up." The phase intent explicitly names the sweeper as a population source for the registry. This PR makes that intent operative.
+
+### Constraint: Steward as the Downstream Filter
+
+The cultivator's pre-queue filtering is bypassed for sweep-originated items. Items enter at `proposed` status — the Steward evaluates readiness before advancing to `ready-for-steward`. The trade-off: sweep-filed items may be lower signal than cultivator-evaluated items, and the Steward bears the downstream quality responsibility. This is the accepted design: sweep items are directionally correct (they represent observed structural smells) even if not uniformly execution-ready.
+
+If sweep quality degrades, the correct response is to add a signal-quality check in `promote_sweep_issue()` before `registry.upsert()`, or to re-route sweep items through the cultivator's evaluation step. Neither change requires modifying this ADR — both are reversible at the call site.
+
+### Interaction with Cultivator Dedup
+
+On its next cycle, the cultivator's `promote_to_wos()` will encounter sweep-promoted UoWs via `registry.upsert()`'s non-terminal pre-check. These will be returned as `SKIPPED_DEDUP`. No duplicate UoWs will be created. The cultivator and sweep promoter are independent and dedup correctly.
+
+---
+
+## Reference: WOS PR Results Route to wos-pr-coordinator Agent
+
+**Date:** 2026-05-19
+**PR:** #1223 (feat/wos: WOS PR pipeline coordinator)
+**Full decision:** `oracle/decisions/decision-wos-pr-coordinator.md`
+
+WOS PR results (`task_id.startswith("wos-")`) now route to the `wos-pr-coordinator`
+agent instead of spawning an oracle review agent directly. Non-WOS PRs fall through
+to the existing review agent path unchanged. This is a durable behavioral default
+change anchored to vision.yaml principle-3 and principle-4. See the full decision
+file for constraint-3 authorization and vision anchors.

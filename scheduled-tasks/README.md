@@ -104,7 +104,7 @@ Cron → script → done  (no inbox write, no subagent)
 |---|---|---|
 | `dispatch-job.sh` | — | Core dispatcher: writes `scheduled_reminder` to inbox; used by Layer 1 scripts and called directly by cron for non-polling jobs |
 | `bot-talk-check-dispatch.sh` | Layer 1 poll-with-state | Polls bot-talk API; skips dispatch if no new messages since last cursor |
-| `lobstertalk-incoming-check.sh` | Layer 1 API poll | Polls bot-talk API for messages addressed to SaharLobster; skips dispatch if none |
+| `lobstertalk-incoming-check.sh` | Layer 1 API poll | Polls bot-talk API for messages addressed to this Lobster instance; skips dispatch if none |
 | `sync-crontab.sh` | Mode C (local-code) | Syncs crontab from config; no LLM, no inbox write |
 | `export-logs.py` | Mode C (local-code) | Exports log data; no LLM, no inbox write |
 | `file-size-monitor.py` | Mode C (local-code) | Checks bootup/config file line counts; files GitHub issue if threshold exceeded; no LLM, no inbox write |

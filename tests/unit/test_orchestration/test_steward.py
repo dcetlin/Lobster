@@ -4640,3 +4640,205 @@ class TestExecutingOrphanShortCircuit:
             "executing_orphan_failed audit event must be written when short-circuit fires; "
             f"audit entries: {entries}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for _load_dan_register_excerpt
+# ---------------------------------------------------------------------------
+
+class TestLoadDanRegisterExcerpt:
+    """Behavioural tests for _load_dan_register_excerpt."""
+
+    def test_returns_empty_string_when_file_absent(self, tmp_path, monkeypatch):
+        """Returns '' gracefully when user.base.context.md does not exist."""
+        steward = _import_steward()
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        result = steward._load_dan_register_excerpt()
+        assert result == ""
+
+    def test_returns_empty_string_when_anchor_missing(self, tmp_path, monkeypatch):
+        """Returns '' when file exists but lacks the developmental-map anchor section."""
+        steward = _import_steward()
+        agents_dir = tmp_path / "lobster-user-config" / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "user.base.context.md").write_text(
+            "# Dan's Context\n\n## Identity\nSoftware engineer.\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        result = steward._load_dan_register_excerpt()
+        assert result == ""
+
+    def test_returns_excerpt_starting_at_anchor(self, tmp_path, monkeypatch):
+        """Returns content starting from the 'Lobster Developmental Map' heading."""
+        steward = _import_steward()
+        agents_dir = tmp_path / "lobster-user-config" / "agents"
+        agents_dir.mkdir(parents=True)
+        context = (
+            "# Dan's Context\n\n"
+            "## Identity\nSoftware engineer.\n\n"
+            "## Lobster Developmental Map (Theory of Learning)\n\n"
+            "Capability stages: dispatcher routing is near Embodiment.\n\n"
+            "## Other Section\nMore content here.\n"
+        )
+        (agents_dir / "user.base.context.md").write_text(context, encoding="utf-8")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        result = steward._load_dan_register_excerpt()
+        assert result.startswith("## Lobster Developmental Map")
+        assert "Identity" not in result
+        assert "dispatcher routing" in result
+
+    def test_truncates_at_max_chars_with_marker(self, tmp_path, monkeypatch):
+        """Excerpt is capped at max_chars with a '[...truncated]' suffix."""
+        steward = _import_steward()
+        agents_dir = tmp_path / "lobster-user-config" / "agents"
+        agents_dir.mkdir(parents=True)
+        long_content = "## Lobster Developmental Map\n\n" + ("x" * 5000)
+        (agents_dir / "user.base.context.md").write_text(long_content, encoding="utf-8")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        result = steward._load_dan_register_excerpt(max_chars=200)
+        assert result.endswith("[...truncated]")
+        # The excerpt proper (before marker) must be <= max_chars chars
+        assert len(result) <= 200 + len("\n[...truncated]")
+
+    def test_no_truncation_marker_when_content_fits(self, tmp_path, monkeypatch):
+        """No truncation marker is appended when content fits within max_chars."""
+        steward = _import_steward()
+        agents_dir = tmp_path / "lobster-user-config" / "agents"
+        agents_dir.mkdir(parents=True)
+        short_content = "## Lobster Developmental Map\n\nShort excerpt.\n"
+        (agents_dir / "user.base.context.md").write_text(short_content, encoding="utf-8")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        result = steward._load_dan_register_excerpt()
+        assert "[...truncated]" not in result
+        assert "Short excerpt." in result
+
+    def test_matches_production_heading_format(self, tmp_path, monkeypatch):
+        """Anchor prefix matches the exact production heading format.
+
+        Production heading in user.base.context.md is:
+            ## Lobster Developmental Map (Theory of Learning, YYYY-MM-DD)
+
+        The anchor "## Lobster Developmental Map" is a prefix match via str.find().
+        This test verifies that the prefix correctly locates a heading in the
+        production format, so a heading with a date suffix is found — not silently
+        treated as absent.
+        """
+        steward = _import_steward()
+        agents_dir = tmp_path / "lobster-user-config" / "agents"
+        agents_dir.mkdir(parents=True)
+        # Use the exact production heading format (prefix + date suffix)
+        production_heading = "## Lobster Developmental Map (Theory of Learning, 2026-03-26)"
+        context = (
+            "# Dan's Context\n\n"
+            "## Identity\nSoftware engineer.\n\n"
+            f"{production_heading}\n\n"
+            "Capability stages: dispatcher routing near Embodiment.\n"
+        )
+        (agents_dir / "user.base.context.md").write_text(context, encoding="utf-8")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        result = steward._load_dan_register_excerpt()
+        # Anchor must find the production-format heading
+        assert result.startswith("## Lobster Developmental Map (Theory of Learning")
+        assert "dispatcher routing near Embodiment" in result
+        assert "Identity" not in result
+
+
+class TestLLMPrescribeIncludesOrientationBlock:
+    """Verify that _llm_prescribe injects Dan's register into the prompt."""
+
+    def _make_uow(self):
+        from src.orchestration.registry import UoW, UoWStatus
+        return UoW(
+            id="uow_orientation_test",
+            status=UoWStatus.READY_FOR_STEWARD,
+            summary="Test UoW for orientation injection",
+            source="github:issue/1",
+            source_issue_number=1,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+            type="executable",
+            success_criteria="Widget works.",
+            steward_cycles=0,
+            steward_log=None,
+        )
+
+    def test_orientation_block_present_in_prompt_when_register_exists(
+        self, tmp_path, monkeypatch
+    ):
+        """When _load_dan_register_excerpt returns content the prompt contains
+        a '## Dan's current orientation' block positioned after the UoW context."""
+        import subprocess as _subprocess
+        steward = _import_steward()
+
+        # Patch the register loader to return predictable content
+        monkeypatch.setattr(
+            "src.orchestration.steward._load_dan_register_excerpt",
+            lambda **kw: "Capability stages: dispatcher routing near Embodiment.",
+        )
+
+        captured_prompts: list[str] = []
+
+        front_matter_output = (
+            "---\n"
+            "executor_type: functional-engineer\n"
+            "estimated_cycles: 1\n"
+            "success_criteria_check: Widget works.\n"
+            "---\n\n"
+            "Do the work."
+        )
+
+        def mock_run(cmd, **kwargs):
+            # The full prompt is the last positional arg passed to claude -p
+            if "-p" in cmd:
+                idx = cmd.index("-p")
+                captured_prompts.append(cmd[idx + 1])
+            return _subprocess.CompletedProcess(cmd, returncode=0, stdout=front_matter_output, stderr="")
+
+        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
+
+        uow = self._make_uow()
+        steward._llm_prescribe(uow, "diagnosing_orphan", "no prior output")
+
+        assert captured_prompts, "subprocess.run was not called"
+        prompt_text = captured_prompts[0]
+        assert "## Dan's current orientation" in prompt_text
+        assert "dispatcher routing near Embodiment" in prompt_text
+
+    def test_orientation_block_absent_when_register_empty(
+        self, tmp_path, monkeypatch
+    ):
+        """When _load_dan_register_excerpt returns '' (file absent or anchor missing)
+        the prompt does NOT contain '## Dan's current orientation'."""
+        import subprocess as _subprocess
+        steward = _import_steward()
+
+        monkeypatch.setattr(
+            "src.orchestration.steward._load_dan_register_excerpt",
+            lambda **kw: "",
+        )
+
+        captured_prompts: list[str] = []
+
+        front_matter_output = (
+            "---\n"
+            "executor_type: functional-engineer\n"
+            "estimated_cycles: 1\n"
+            "success_criteria_check: Widget works.\n"
+            "---\n\n"
+            "Do the work."
+        )
+
+        def mock_run(cmd, **kwargs):
+            if "-p" in cmd:
+                idx = cmd.index("-p")
+                captured_prompts.append(cmd[idx + 1])
+            return _subprocess.CompletedProcess(cmd, returncode=0, stdout=front_matter_output, stderr="")
+
+        monkeypatch.setattr("src.orchestration.steward.subprocess.run", mock_run)
+
+        uow = self._make_uow()
+        steward._llm_prescribe(uow, "diagnosing_orphan", "no prior output")
+
+        assert captured_prompts, "subprocess.run was not called"
+        assert "## Dan's current orientation" not in captured_prompts[0]

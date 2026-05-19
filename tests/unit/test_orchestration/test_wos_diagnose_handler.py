@@ -48,7 +48,6 @@ PATTERN_UNRECOGNISED = "unrecognised"
 
 # Algorithm constants — imported from production modules so tests stay in sync
 # when the production values change.
-MAX_RETRIES = _STEWARD_MAX_RETRIES
 HARD_CAP = _HARD_CAP_CYCLES
 
 
@@ -202,8 +201,8 @@ class TestHandleWosDiagnosePromptContent:
         """Prompt must embed MAX_RETRIES constant for the execution cap branch."""
         msg = _make_diagnose_msg()
         result = handle_wos_diagnose(msg)
-        assert str(MAX_RETRIES) in result["prompt"], (
-            f"Subagent prompt must include MAX_RETRIES={MAX_RETRIES} "
+        assert str(_STEWARD_MAX_RETRIES) in result["prompt"], (
+            f"Subagent prompt must include MAX_RETRIES={_STEWARD_MAX_RETRIES} "
             "so the subagent knows when execution_attempts triggers surface-to-human"
         )
 

@@ -9,7 +9,7 @@ orphans back to the Steward via 'ready-for-steward' transitions with
 Runs as Phase 1 of the steward-heartbeat.py cron script (every 3 minutes).
 Can also be invoked standalone for testing:
 
-    uv run ~/lobster/scheduled-tasks/startup-sweep.py [--dry-run]
+    uv run ~/lobster/scheduled-tasks/startup_sweep.py [--dry-run]
 
 Full implementation spec: #307.
 

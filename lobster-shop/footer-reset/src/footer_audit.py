@@ -37,9 +37,9 @@ ACTION_PATTERNS = [
     ]
 ]
 
-# Valid forms: fenced code block with exactly "side-effects:" label, or bare null line
+# Valid form: fenced code block with exactly "side-effects:" label.
+# NOTE: bare "side-effects: none" is BANNED per PR #480 — omit the footer entirely instead.
 SIDE_EFFECTS_BLOCK_RE = re.compile(r"```side-effects:[^`]*```", re.DOTALL)
-SIDE_EFFECTS_NONE_RE = re.compile(r"^side-effects:\s*none\s*$", re.MULTILINE | re.IGNORECASE)
 
 # Wrong-label patterns — drift signatures that look footer-like but use the wrong label
 WRONG_LABEL_PATTERNS = [
@@ -47,6 +47,9 @@ WRONG_LABEL_PATTERNS = [
     (re.compile(r"```effects:[^`]*```", re.DOTALL), "wrong label: `effects:` instead of `side-effects:`"),
     (re.compile(r"```side-effects[^:\n][^`]*```", re.DOTALL), "malformed: `side-effects` missing colon"),
     (re.compile(r"^signals:\s*none\s*$", re.MULTILINE | re.IGNORECASE), "wrong label: `signals: none` instead of `side-effects: none`"),
+    # Banned null forms — per PR #480, omit the footer entirely when there are no side effects
+    (re.compile(r"^side-effects:\s*none\s*$", re.MULTILINE | re.IGNORECASE), "side-effects: none is not a valid declaration — omit the footer entirely when there are no side effects"),
+    (re.compile(r"```side-effects:\s*\nnone\s*\n```", re.DOTALL | re.IGNORECASE), "side-effects: none is not a valid declaration — omit the footer entirely when there are no side effects"),
 ]
 
 
@@ -55,7 +58,7 @@ def has_action_keywords(text: str) -> bool:
 
 
 def has_valid_footer(text: str) -> bool:
-    return bool(SIDE_EFFECTS_BLOCK_RE.search(text)) or bool(SIDE_EFFECTS_NONE_RE.search(text))
+    return bool(SIDE_EFFECTS_BLOCK_RE.search(text))
 
 
 def detect_wrong_labels(text: str) -> list[str]:
@@ -143,7 +146,7 @@ def format_report(messages: list[dict], missing: list[dict], wrong: list[dict]) 
 
     lines.append("\nCanonical forms:")
     lines.append("  With effects: ` ```side-effects:\\n✅ 🐙\\n``` `")
-    lines.append("  No effects: `side-effects: none` (bare line)")
+    lines.append("  No effects: omit the footer entirely (`side-effects: none` is banned)")
 
     return "\n".join(lines)
 

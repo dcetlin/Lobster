@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from src.orchestration.registry import UoW
+from src.orchestration.registry import UoW, UoWStatus, UoWRegister
 from src.orchestration.paths import WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG
 from src.orchestration.error_capture import (
     run_subprocess_with_error_capture,
@@ -47,6 +47,8 @@ from src.orchestration.error_capture import (
 from src.orchestration.config import TimeoutConfig
 from src.orchestration.vision_routing import resolve_vision_route
 from src.ooda.fast_thorough_selector import select_path as _ooda_select_path, cite_basis as _ooda_cite_basis
+from src.orchestration.gate_fired import translate_eligibility_to_gate
+from src.orchestration.wos_completion_notifier import notify_uow_done, notify_uow_failed
 
 log = logging.getLogger("steward")
 
@@ -435,29 +437,8 @@ def _build_claude_env() -> dict[str, str]:
     return env
 
 
-# ---------------------------------------------------------------------------
-# Status enum (golden pattern: StrEnum so values serialize as plain strings)
-# ---------------------------------------------------------------------------
-
-class UoWStatus(StrEnum):
-    PROPOSED = "proposed"
-    PENDING = "pending"
-    READY_FOR_STEWARD = "ready-for-steward"
-    DIAGNOSING = "diagnosing"
-    READY_FOR_EXECUTOR = "ready-for-executor"
-    ACTIVE = "active"
-    DONE = "done"
-    BLOCKED = "blocked"
-    FAILED = "failed"
-    EXPIRED = "expired"
-    # NEEDS_HUMAN_REVIEW: retry cap exceeded; UoW awaits human decision.
-    NEEDS_HUMAN_REVIEW = "needs-human-review"
-
-    def is_terminal(self) -> bool:
-        return self in {UoWStatus.DONE, UoWStatus.FAILED, UoWStatus.EXPIRED}
-
-    def is_in_flight(self) -> bool:
-        return self in {UoWStatus.ACTIVE, UoWStatus.READY_FOR_EXECUTOR, UoWStatus.DIAGNOSING}
+# UoWStatus and UoWRegister are imported from registry — see top of file.
+# The local definition was removed to eliminate the duplicate.
 
 
 # ---------------------------------------------------------------------------
@@ -1216,6 +1197,11 @@ def _assess_completion(
                         # Return is_complete=False so the normal prescription path
                         # is skipped; the caller must check executor_outcome for routing.
                         return False, f"outcome=blocked: {reason}", "blocked"
+                    elif outcome == "owner_decision_required":
+                        # Subagent reached a genuine decision point that only the owner
+                        # can resolve.  Return is_complete=False so _process_uow can
+                        # transition the UoW to awaiting-owner instead of re-prescribing.
+                        return False, f"outcome=owner_decision_required: {reason}", "owner_decision_required"
                     elif outcome in ("partial", "failed"):
                         return False, f"outcome={outcome}: {reason}", outcome
                     elif outcome is not None:
@@ -1845,6 +1831,52 @@ def _parse_workflow_artifact(raw_text: str) -> dict:
     }
 
 
+def _load_dan_register_excerpt(max_chars: int = 8000) -> str:
+    """Return a focused excerpt of Dan's developmental register from user.base.context.md.
+
+    Extracts the section from "Lobster Developmental Map" through the capability
+    coupling / attentional budget sections — the part of the file that captures
+    Dan's current arc, active focus areas, and developmental posture.  Returns an
+    empty string if the file is absent or the section cannot be found, so callers
+    can treat it as optional enrichment.
+
+    The excerpt is capped at ``max_chars`` to keep the injected context tight.
+    A trailing "[...truncated]" marker is appended when the cap is applied.
+
+    Anchor string: "## Lobster Developmental Map"
+    This is a prefix match against the production heading, which reads:
+    "## Lobster Developmental Map (Theory of Learning, <date>)".
+    If the heading is ever renamed, find() returns -1 and the excerpt is silently
+    absent — callers treat an empty return as optional enrichment, so no error
+    is raised. Any rename of this section heading must update this anchor.
+
+    Cap rationale: the production "Lobster Developmental Map" section is ~6,888
+    chars (as of 2026-05-02). 8000 chars safely covers the full section including
+    the "Capability ceiling and Embodiment distinction" subsection and the
+    "Attentional Budget Constraint" and "Capability Coupling Structure" subsections
+    that carry the most prescription-relevant orientation signals. The previous
+    1500-char cap truncated the section at ~22% and never reached these subsections.
+    """
+    register_path = Path.home() / "lobster-user-config" / "agents" / "user.base.context.md"
+    try:
+        text = register_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+    # Find the anchor section that starts the developmental register.
+    # Exact anchor string: "## Lobster Developmental Map"
+    # Production heading: "## Lobster Developmental Map (Theory of Learning, YYYY-MM-DD)"
+    anchor = "## Lobster Developmental Map"
+    start = text.find(anchor)
+    if start == -1:
+        return ""
+
+    excerpt = text[start:]
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[:max_chars] + "\n[...truncated]"
+    return excerpt.strip()
+
+
 def _llm_prescribe(
     uow: UoW,
     reentry_posture: str,
@@ -1963,10 +1995,21 @@ Every prompt must include:
 For internal tasks (no user reply): write_result only with sent_reply_to_user=False
 """
 
+    # Load Dan's developmental register and build an optional orientation block.
+    # Placed after the UoW context so the model sees both "what this UoW needs"
+    # and "what Dan's current arc requires of how this work lands" before generating
+    # the prescription.
+    _register_excerpt = _load_dan_register_excerpt()
+    _orientation_block = (
+        f"\n## Dan's current orientation\n\n{_register_excerpt}\n"
+        if _register_excerpt
+        else ""
+    )
+
     user_prompt = f"""Given this Unit of Work, write a precise prescription for the Executor.
 
 {uow_context}
-
+{_orientation_block}
 {_DISPATCH_CONVENTIONS}
 Respond using front-matter + prose format. Output ONLY the prescription — no preamble, no explanation outside this structure:
 
@@ -2551,17 +2594,74 @@ def _count_oracle_passes(audit_entries: list[dict]) -> int:
     return sum(1 for e in audit_entries if e.get("event") == "oracle_approved")
 
 
-def _count_failed_or_blocked_transitions(audit_entries: list[dict]) -> int:
-    """Count audit entries where the UoW transitioned to failed or blocked.
+# Infrastructure kill reason codes that must NOT count toward the dead-end
+# threshold.  These represent session kills or platform-level dispatch failures
+# where no execution outcome was produced — the agent never confirmed work.
+#
+# Mapping to audit note["reason"] prefixes written by Registry.fail_uow:
+#   executing_orphan          → steward-detected: dispatched, write_result never received
+#   orphan_kill_before_start  → heartbeat-classified: session killed before work began
+#   orphan_kill_during_execution → heartbeat-classified: session killed mid-execution
+#   ttl_exceeded              → executor-heartbeat: active/executing state exceeded 4h TTL
+#
+# CalledProcessError and all other reasons are genuine execution failures and
+# DO count toward the threshold.
+DEAD_END_INFRA_KILL_REASONS: frozenset[str] = frozenset({
+    "executing_orphan",
+    "orphan_kill_before_start",
+    "orphan_kill_during_execution",
+    "ttl_exceeded",
+})
 
-    Includes both executor-driven failures (to_status='failed') and
-    Steward-driven surface/block transitions (to_status='blocked').
-    Used by the Dead-end pattern detector.
+
+def _is_infra_kill_audit_entry(entry: dict) -> bool:
+    """Return True when an audit entry records an infrastructure kill, not a genuine failure.
+
+    Parses the entry's note JSON and checks whether the ``reason`` field starts
+    with one of the DEAD_END_INFRA_KILL_REASONS codes.  Infrastructure kills are
+    session terminations by the platform (TTL eviction, orphan recovery) where
+    the agent never confirmed an execution outcome.
+
+    The ``reason`` values written by Registry.fail_uow follow the pattern
+    ``"<code>: <human-readable detail>"``, so a ``startswith`` check on each
+    code is the correct discriminant.
+
+    Pure function — no side effects, no I/O.
+    """
+    note = entry.get("note")
+    if not note:
+        return False
+    try:
+        note_data = json.loads(note)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    reason: str | None = note_data.get("reason") if isinstance(note_data, dict) else None
+    if not reason:
+        return False
+    return any(reason.startswith(code) for code in DEAD_END_INFRA_KILL_REASONS)
+
+
+def _count_failed_or_blocked_transitions(audit_entries: list[dict]) -> int:
+    """Count genuine failure/block transitions, excluding infrastructure kills.
+
+    Counts audit entries where the UoW transitioned to failed or blocked,
+    but skips entries where the failure reason is an infrastructure kill
+    (executing_orphan, orphan_kill_before_start, orphan_kill_during_execution,
+    ttl_exceeded).  Infrastructure kills are platform-level session terminations
+    where no execution outcome was produced — they must not consume the dead-end
+    budget.
+
+    Genuine failures (CalledProcessError, agent-reported failure, etc.) still
+    count.  Used by the Dead-end pattern detector.
 
     Pure function — reads only audit_entries; no side effects.
     """
     terminal = {"failed", "blocked"}
-    return sum(1 for e in audit_entries if e.get("to_status") in terminal)
+    return sum(
+        1
+        for e in audit_entries
+        if e.get("to_status") in terminal and not _is_infra_kill_audit_entry(e)
+    )
 
 
 def _check_dispatch_eligibility(
@@ -3327,6 +3427,12 @@ def _diagnose_uow(
     if executor_outcome == "blocked" and stuck_condition is None:
         stuck_condition = "executor_blocked"
 
+    # owner_decision_required: subagent escalates to the owner.
+    # Use a dedicated stuck_condition so _process_uow can write the awaiting-owner
+    # inbox message and transition the UoW without consuming the retry budget.
+    if executor_outcome == "owner_decision_required" and stuck_condition is None:
+        stuck_condition = "owner_decision_required"
+
     # Hard cap overrides completion
     if stuck_condition == "hard_cap":
         is_complete = False
@@ -4084,6 +4190,57 @@ def _send_escalation_notification(uow: UoW) -> None:
         log.error("Failed to write WOS escalation message to inbox: %s", e)
 
 
+def _write_owner_required_message(uow: UoW, decision_text: str) -> None:
+    """
+    Write a wos_owner_required inbox message when a subagent escalates with
+    outcome=owner_decision_required.
+
+    The dispatcher handles wos_owner_required as a fast-path send_reply — no
+    subagent spawn needed. The pre-formatted text is delivered directly to Dan
+    via Telegram so he can provide the decision in the primary thread.
+
+    Non-fatal: write errors are logged but do not block the awaiting-owner
+    transition that was already committed before this function is called.
+    """
+    uow_id = uow.id
+    chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", _DAN_CHAT_ID)
+    uow_title = (uow.summary or uow_id)[:200]
+
+    text = (
+        f"UoW awaiting your decision: {uow_title}\n\n"
+        f"{decision_text}\n\n"
+        f"To re-queue: `/decide {uow_id} owner <your decision>`"
+    )
+
+    msg_id = str(uuid.uuid4())
+    msg: dict[str, Any] = {
+        "id": msg_id,
+        "type": "wos_owner_required",
+        "source": "system",
+        "chat_id": chat_id,
+        "timestamp": time.time(),
+        "uow_id": uow_id,
+        "uow_title": uow_title,
+        "text": text,
+    }
+
+    inbox_dir = _INBOX_DIR_PATH
+    try:
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        (inbox_dir / f"{msg_id}.json").write_text(
+            json.dumps(msg, indent=2), encoding="utf-8"
+        )
+        log.info(
+            "wos_owner_required message written to inbox: %s (uow_id=%s)",
+            msg_id, uow_id,
+        )
+    except Exception as e:
+        log.error(
+            "Failed to write wos_owner_required message for UoW %s: %s",
+            uow_id, e,
+        )
+
+
 # ---------------------------------------------------------------------------
 # DB fetch helpers
 # ---------------------------------------------------------------------------
@@ -4249,6 +4406,42 @@ def _process_uow(
 
     # Step 4: Convergence or prescription
 
+    # 4a-pre: owner_decision_required fast-path — handled before the generic stuck
+    # branch because it uses a dedicated awaiting-owner transition rather than the
+    # normal blocked transition and avoids consuming the retry budget.
+    if stuck_condition == "owner_decision_required" and not dry_run:
+        decision_text = diagnosis.completion_rationale or "no decision detail provided"
+        # Record the escalation event in the audit log.
+        registry.append_audit_log(uow_id, {
+            "event": "owner_decision_required",
+            "actor": _ACTOR_STEWARD,
+            "uow_id": uow_id,
+            "decision_text": decision_text,
+            "timestamp": _now_iso(),
+        })
+        # Transition UoW to awaiting-owner via the dedicated registry method.
+        try:
+            registry.set_awaiting_owner(uow_id, decision_text)
+        except Exception as _exc:
+            log.error(
+                "steward: set_awaiting_owner failed for UoW %s — %s: %s; "
+                "falling back to blocked",
+                uow_id, type(_exc).__name__, _exc,
+            )
+            registry.transition(uow_id, _STATUS_BLOCKED, _STATUS_DIAGNOSING)
+        # Write the wos_owner_required inbox message so the dispatcher can
+        # forward it to Dan without spawning a subagent.
+        _write_owner_required_message(uow, decision_text)
+        _append_cycle_trace(
+            uow_id=uow_id,
+            cycle_num=cycles,
+            subagent_excerpt=_read_output_ref(uow.output_ref),
+            return_reason=return_reason or "",
+            next_action="awaiting_owner",
+            artifact_dir=artifact_dir,
+        )
+        return Surfaced(uow_id=uow_id, condition="owner_decision_required")
+
     # 4a: Stuck condition check (fires before completion/prescription)
     if stuck_condition:
         surface_log = current_log_str
@@ -4380,6 +4573,24 @@ def _process_uow(
             next_action="done",
             artifact_dir=artifact_dir,
         )
+
+        # Per-cycle completion ping (spec: wos-completion-report-spec.md §Per-Cycle Ping).
+        # Non-fatal: inbox write failure must not block the Done registry transition.
+        # outcome_category is not mapped to UoW dataclass; pass None (degrades gracefully).
+        # current_log_str contains the updated steward_log including steward_closure event.
+        if not dry_run:
+            notify_uow_done(
+                uow_id=uow_id,
+                uow_title=uow.summary,
+                primary_outcome=None,  # not yet mapped to UoW dataclass; notifier falls back to 'seed'
+                steward_cycles=cycles,
+                execution_attempts=uow.execution_attempts,
+                token_usage=None,      # not yet mapped to UoW dataclass; notifier shows 'unknown'
+                artifacts=uow.artifacts,
+                steward_log=current_log_str,
+                gate_fired="none",     # not yet in schema; populated after migration 0019
+            )
+
         return Done(uow_id=uow_id)
 
     # 4b-orphan: executing_orphan short-circuit.
@@ -4429,6 +4640,20 @@ def _process_uow(
             next_action="failed",
             artifact_dir=artifact_dir,
         )
+
+        # Per-cycle failure ping (spec: wos-completion-report-spec.md §Per-Cycle Ping).
+        # Non-fatal: inbox write failure must not block the Surfaced return.
+        if not dry_run:
+            notify_uow_failed(
+                uow_id=uow_id,
+                uow_title=uow.summary,
+                gate_fired="none",         # not yet in schema; populated after migration 0019
+                steward_cycles=cycles,
+                execution_attempts=uow.execution_attempts,
+                token_usage=None,          # not yet mapped to UoW dataclass; shows 'unknown'
+                failure_summary=orphan_reason,
+            )
+
         return Surfaced(uow_id=uow_id, condition=surface_condition)
 
     # 4c: Prescribe another Executor pass
@@ -4457,7 +4682,7 @@ def _process_uow(
         is_infra_event = _is_infrastructure_event(return_reason)
         new_execution_attempts = uow.execution_attempts + (0 if is_infra_event else 1)
 
-        if new_execution_attempts > MAX_RETRIES:
+        if new_execution_attempts >= MAX_RETRIES:
             # Execution retry cap exceeded — escalate to needs-human-review.
             escalation_entry = {
                 "event": "retry_cap_exceeded",
@@ -5281,14 +5506,18 @@ def run_steward_cycle(
                     uow_id, throttle_count, _effective_burst_batch_size,
                 )
                 if not dry_run:
-                    registry.append_audit_log(uow_id, {
-                        "event": "dispatch_eligibility_skip",
+                    registry.write_dispatch_skip(uow_id, {
                         "actor": _ACTOR_STEWARD,
                         "uow_id": uow_id,
                         "steward_cycles": uow.steward_cycles,
                         "eligibility": _eligibility,
                         "timestamp": _now_iso(),
                     })
+                    try:
+                        _gate = translate_eligibility_to_gate(_eligibility)
+                        registry.write_gate_fired(uow_id, _gate)
+                    except Exception as _gate_exc:
+                        log.warning("write_gate_fired failed for %s: %s", uow_id, _gate_exc)
                 skipped += 1
                 continue
         elif _eligibility != "dispatch":
@@ -5297,14 +5526,18 @@ def run_steward_cycle(
                 uow_id, _eligibility,
             )
             if not dry_run:
-                registry.append_audit_log(uow_id, {
-                    "event": "dispatch_eligibility_skip",
+                registry.write_dispatch_skip(uow_id, {
                     "actor": _ACTOR_STEWARD,
                     "uow_id": uow_id,
                     "steward_cycles": uow.steward_cycles,
                     "eligibility": _eligibility,
                     "timestamp": _now_iso(),
                 })
+                try:
+                    _gate = translate_eligibility_to_gate(_eligibility)
+                    registry.write_gate_fired(uow_id, _gate)
+                except Exception as _gate_exc:
+                    log.warning("write_gate_fired failed for %s: %s", uow_id, _gate_exc)
             skipped += 1
             continue
 

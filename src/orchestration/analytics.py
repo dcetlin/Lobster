@@ -6,7 +6,7 @@ Steward decision point. Prescription events carry a ``prescription_path``
 field that records whether the LLM or deterministic fallback path was used.
 Trace injection events carry a ``gate_score`` dict with a convergence score.
 
-This module exposes seven public functions:
+This module exposes eight public functions:
 
     prescription_quality_summary(registry_path?) -> dict
     convergence_metrics(registry_path?) -> dict
@@ -15,9 +15,10 @@ This module exposes seven public functions:
     diagnostic_accuracy_summary(registry_path?) -> dict
     convergence_summary(registry_path?) -> dict
     complexity_appropriateness_summary(registry_path?) -> dict
+    outcome_cost_correlation(registry_path?) -> dict
 
 And a CLI entry point (``main()``) that accepts subcommands:
-    quality, convergence, diagnostic, all
+    quality, convergence, diagnostic, outcome_cost, all
 
 Design notes:
 - Pure function composition: each concern (connect, query, parse, aggregate)
@@ -1118,6 +1119,166 @@ def complexity_appropriateness_summary(
 
 
 # ---------------------------------------------------------------------------
+# outcome_cost_correlation — internal helpers
+# ---------------------------------------------------------------------------
+
+_BAD_OUTCOME_CATEGORIES = {"heat", "shit"}
+
+
+def _fetch_outcome_cost_rows(conn: sqlite3.Connection) -> list[dict]:
+    """Return UoW rows with outcome_category and token_usage both populated."""
+    rows = conn.execute(
+        """
+        SELECT id, summary, status, outcome_category, token_usage, steward_cycles
+        FROM uow_registry
+        WHERE outcome_category IS NOT NULL
+          AND token_usage IS NOT NULL
+        ORDER BY token_usage DESC
+        """
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _build_outcome_cost_per_category(rows: list[dict]) -> dict[str, dict[str, Any]]:
+    """Group rows by outcome_category and compute token cost stats per group."""
+    by_category: dict[str, list[int]] = {}
+    for row in rows:
+        cat = row["outcome_category"]
+        tokens = row["token_usage"]
+        by_category.setdefault(cat, []).append(tokens)
+
+    result: dict[str, dict[str, Any]] = {}
+    for cat, token_list in by_category.items():
+        count = len(token_list)
+        total = sum(token_list)
+        avg = round(total / count) if count > 0 else 0
+        max_t = max(token_list) if token_list else 0
+        result[cat] = {
+            "count": count,
+            "total_tokens": total,
+            "avg_tokens": avg,
+            "max_tokens": max_t,
+        }
+    return result
+
+
+def _build_bloat_candidates(rows: list[dict]) -> list[dict[str, Any]]:
+    """
+    Filter to bad-outcome rows (heat/shit), compute median token_usage within
+    that set, and return rows above the median sorted by token_usage DESC.
+    """
+    bad_rows = [r for r in rows if r["outcome_category"] in _BAD_OUTCOME_CATEGORIES]
+    if not bad_rows:
+        return []
+
+    token_values = [r["token_usage"] for r in bad_rows]
+    median_tokens = statistics.median(token_values)
+
+    above_median = [r for r in bad_rows if r["token_usage"] > median_tokens]
+    above_median.sort(key=lambda r: r["token_usage"], reverse=True)
+
+    return [
+        {
+            "id": r["id"],
+            "summary": r.get("summary") or "",
+            "outcome_category": r["outcome_category"],
+            "token_usage": r["token_usage"],
+            "steward_cycles": r.get("steward_cycles"),
+        }
+        for r in above_median
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Public API — outcome_cost_correlation
+# ---------------------------------------------------------------------------
+
+def outcome_cost_correlation(
+    registry_path: Path | None = None,
+) -> dict[str, Any]:
+    """
+    Join outcome_category x token_usage to surface the bloat detector signal.
+
+    Parameters
+    ----------
+    registry_path:
+        Path to the registry SQLite DB. Defaults to the canonical path
+        resolved from REGISTRY_DB_PATH or LOBSTER_WORKSPACE env vars.
+
+    Returns
+    -------
+    dict with keys:
+        per_outcome_category — token cost breakdown per metabolic label
+        top_20_by_token_cost — top-20 UoWs by token_usage with outcome_category
+        bloat_candidates     — bad-outcome UoWs (heat/shit) above median token cost
+        data_gap             — human-readable note when data is sparse, else None
+    """
+    path = registry_path if registry_path is not None else _default_registry_path()
+
+    if not path.exists():
+        return {
+            "per_outcome_category": {},
+            "top_20_by_token_cost": [],
+            "bloat_candidates": [],
+            "data_gap": (
+                f"Registry DB not found at {path}. "
+                "Run the WOS steward at least once to create the database."
+            ),
+        }
+
+    try:
+        conn = _connect_ro(path)
+    except sqlite3.OperationalError as exc:
+        return {
+            "per_outcome_category": {},
+            "top_20_by_token_cost": [],
+            "bloat_candidates": [],
+            "data_gap": f"Could not open registry DB: {exc}",
+        }
+
+    try:
+        rows = _fetch_outcome_cost_rows(conn)
+    except sqlite3.OperationalError as exc:
+        conn.close()
+        return {
+            "per_outcome_category": {},
+            "top_20_by_token_cost": [],
+            "bloat_candidates": [],
+            "data_gap": f"Could not query uow_registry: {exc}",
+        }
+    finally:
+        conn.close()
+
+    data_gap: str | None = None
+    if len(rows) < 3:
+        data_gap = (
+            f"Only {len(rows)} UoW(s) have both outcome_category and token_usage "
+            "populated. Metrics will be more meaningful once more UoWs complete with "
+            "both fields set."
+        )
+
+    per_outcome_category = _build_outcome_cost_per_category(rows)
+    top_20 = [
+        {
+            "id": r["id"],
+            "summary": r.get("summary") or "",
+            "outcome_category": r["outcome_category"],
+            "token_usage": r["token_usage"],
+            "steward_cycles": r.get("steward_cycles"),
+        }
+        for r in rows[:20]
+    ]
+    bloat_candidates = _build_bloat_candidates(rows)
+
+    return {
+        "per_outcome_category": per_outcome_category,
+        "top_20_by_token_cost": top_20,
+        "bloat_candidates": bloat_candidates,
+        "data_gap": data_gap,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -1126,10 +1287,11 @@ def main() -> None:
     analytics_report CLI — print WOS analytics as JSON to stdout.
 
     Subcommands:
-        quality      prescription_quality_summary()
-        convergence  convergence_metrics()
-        diagnostic   diagnostic_accuracy()
-        all          all three metrics under their respective keys (default)
+        quality       prescription_quality_summary()
+        convergence   convergence_metrics()
+        diagnostic    diagnostic_accuracy()
+        outcome_cost  outcome_cost_correlation()
+        all           all metrics under their respective keys (default)
 
     Options:
         --db PATH    override the default registry DB path
@@ -1141,7 +1303,7 @@ def main() -> None:
     parser.add_argument(
         "subcommand",
         nargs="?",
-        choices=["quality", "convergence", "diagnostic", "all"],
+        choices=["quality", "convergence", "diagnostic", "outcome_cost", "all"],
         default="all",
         help="Which metrics to report (default: all)",
     )
@@ -1160,11 +1322,14 @@ def main() -> None:
         result = convergence_metrics(db_path)
     elif args.subcommand == "diagnostic":
         result = diagnostic_accuracy(db_path)
+    elif args.subcommand == "outcome_cost":
+        result = outcome_cost_correlation(db_path)
     else:  # "all"
         result = {
             "quality": prescription_quality_summary(db_path),
             "convergence": convergence_metrics(db_path),
             "diagnostic": diagnostic_accuracy(db_path),
+            "outcome_cost": outcome_cost_correlation(db_path),
         }
 
     print(json.dumps(result, indent=2))

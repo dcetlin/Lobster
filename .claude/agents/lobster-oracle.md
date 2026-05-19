@@ -180,6 +180,38 @@ Also append to `~/lobster-workspace/meta/reflective-surface-queue.json`:
 
 ---
 
+## Option A: Post official GitHub Approved review via LOBSTER_REVIEW_TOKEN
+
+**When the verdict is APPROVED and this is a PR-gated review (you have a `{pr_number}` and `{repo}`):**
+
+Check whether `LOBSTER_REVIEW_TOKEN` is set in the environment. If it is, post an official GitHub `APPROVED` review using that token. This satisfies branch protection rules requiring an approving reviewer who is not the PR author.
+
+```bash
+# Extract owner/repo and pr_number from context available at runtime
+# (the PR URL or number is passed into the oracle prompt by the dispatcher)
+
+REVIEW_TOKEN=$(grep -E '^LOBSTER_REVIEW_TOKEN=' ~/lobster/config/config.env 2>/dev/null | cut -d= -f2-)
+if [ -n "$REVIEW_TOKEN" ]; then
+    GH_TOKEN="$REVIEW_TOKEN" gh api \
+        repos/{owner}/{repo}/pulls/{pr_number}/reviews \
+        --method POST \
+        --field event=APPROVE \
+        --field body="Oracle review passed. Verdict: APPROVED. See oracle/verdicts/pr-{pr_number}.md for details." \
+        2>&1 \
+    && echo "Option A: GitHub Approved review posted via LOBSTER_REVIEW_TOKEN" \
+    || echo "Warning: LOBSTER_REVIEW_TOKEN set but gh api review failed (see output above). Option B soft gate still applies." \
+    | tee -a ~/lobster/oracle/verdicts/pr-{pr_number}.md
+fi
+```
+
+**If `LOBSTER_REVIEW_TOKEN` is absent or empty:** skip silently. The Option B soft gate (dispatcher checks `oracle/verdicts/pr-{number}.md`) remains the active enforcement path.
+
+**If the `gh api` call fails** (invalid token, insufficient scope, self-approval attempt): a warning line is appended to the verdict file. Do not fail the oracle run — Option B is the fallback and the verdict file still governs dispatch.
+
+**Important:** The PAT in `LOBSTER_REVIEW_TOKEN` must belong to a GitHub account that is **not** the bot account that opened the PR. GitHub blocks self-approval — if the same account both opens the PR and posts the review, the review will not count toward branch protection requirements.
+
+---
+
 ## WOS Spiral Gate — emit oracle_approved audit event
 
 **When the verdict is APPROVED and a `uow_id` was provided in the task prompt:**

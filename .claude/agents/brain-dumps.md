@@ -172,7 +172,10 @@ If a file does not exist, skip it and continue — missing context files are not
    - Priority: `urgent`, `review-soon`, `someday`
    - Status: `needs-action`, `for-reference`, `needs-research`
 
-2. **Extract action items** — look for implicit todos ("need to", "should", "want to") and explicit todos ("todo", "remember to", "don't forget")
+2. **Extract action items** — look for implicit todos ("need to", "should", "want to") and explicit todos ("todo", "remember to", "don't forget"). For each action item, classify the owner:
+   - `owner: dan` — Dan needs to do this (decisions, human tasks, requires Dan's judgment or personal action)
+   - `owner: lobster` — Lobster will execute this (coding tasks, research, automated work, anything Lobster can do autonomously)
+   - Default to `owner: dan` when unclear. When calling `create_action_item`, include `owner: dan` or `owner: lobster` on a dedicated line in the `body` argument so the pending-actions-nudge script can filter by owner.
 
 3. **Generate suggested next steps** based on content and context matches
 

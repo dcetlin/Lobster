@@ -50,7 +50,6 @@ def _load_heartbeat():
 
 _hb = _load_heartbeat()
 check_github_rate_limit = _hb.check_github_rate_limit
-GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD = _hb.GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD
 
 
 # ---------------------------------------------------------------------------
@@ -58,8 +57,8 @@ GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD = _hb.GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD
 # ---------------------------------------------------------------------------
 
 def test_threshold_is_positive_integer():
-    assert isinstance(GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD, int)
-    assert GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD > 0
+    assert isinstance(_hb.GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD, int)
+    assert _hb.GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD > 0
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +98,7 @@ def test_rate_limit_not_ok_when_remaining_below_threshold():
 
 def test_rate_limit_ok_at_exact_threshold():
     """ok=True when remaining == threshold (boundary: threshold is the minimum allowed)."""
-    threshold = GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD
+    threshold = _hb.GITHUB_RATE_LIMIT_DISPATCH_THRESHOLD
     with patch("subprocess.run", return_value=_mock_subprocess_result(_rate_json(threshold))):
         result = check_github_rate_limit()
     assert result.ok is True
@@ -173,7 +172,7 @@ def test_dispatch_skipped_when_rate_limit_low(tmp_path):
 
     with (
         patch("sys.argv", ["executor-heartbeat.py"]),
-        patch.object(_hb_fresh, "_is_job_enabled", return_value=True),
+        patch.object(_hb_fresh, "is_job_enabled", return_value=True),
         patch.object(_hb_fresh, "check_github_rate_limit", return_value=low_limit_result),
         patch.object(_hb_fresh, "run_executor_cycle", mock_cycle),
         patch.object(_hb_fresh, "run_ttl_recovery"),
@@ -210,7 +209,7 @@ def test_dispatch_proceeds_when_rate_limit_ok(tmp_path):
 
     with (
         patch("sys.argv", ["executor-heartbeat.py"]),
-        patch.object(_hb_fresh, "_is_job_enabled", return_value=True),
+        patch.object(_hb_fresh, "is_job_enabled", return_value=True),
         patch.object(_hb_fresh, "check_github_rate_limit", return_value=ok_limit_result),
         patch.object(_hb_fresh, "run_executor_cycle", mock_cycle),
         patch.object(_hb_fresh, "run_ttl_recovery"),
@@ -248,7 +247,7 @@ def test_rate_limit_check_called_once_per_cycle(tmp_path):
 
     with (
         patch("sys.argv", ["executor-heartbeat.py"]),
-        patch.object(_hb_fresh, "_is_job_enabled", return_value=True),
+        patch.object(_hb_fresh, "is_job_enabled", return_value=True),
         patch.object(_hb_fresh, "check_github_rate_limit", mock_check),
         patch.object(_hb_fresh, "run_executor_cycle", return_value=cycle_result),
         patch.object(_hb_fresh, "run_ttl_recovery"),

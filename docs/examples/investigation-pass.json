@@ -1,0 +1,59 @@
+{
+  "diagnosis": {
+    "signal": "UoW uow_20260501_a1b2c3 entered ready-for-steward on first execution; source is a GitHub issue requesting an audit of the WOS throttle configuration.",
+    "reentry_posture": "first_execution",
+    "completion_gap": "",
+    "executor_outcome": null,
+    "prior_cycle_count": 0
+  },
+  "prescription": {
+    "summary": "Audit the current WOS throttle configuration and report findings against the documented defaults in wos-throttle-design.md.",
+    "instructions": "Read ~/lobster-workspace/data/wos-config.json and ~/lobster/src/orchestration/wos_throttle.py. Compare all throttle parameters against the defaults documented in docs/wos-throttle-design.md. Write findings to ~/lobster-workspace/workstreams/uow_20260501_a1b2c3/audit-report.md. Include: current values, documented defaults, any discrepancies, and a one-sentence recommendation for each discrepancy.\n\nMinimum viable output: ~/lobster-workspace/workstreams/uow_20260501_a1b2c3/audit-report.md with all findings documented.\nBoundary: do not modify wos-config.json, wos_throttle.py, or any production configuration.",
+    "estimated_cycles": 1,
+    "minimum_viable_output": "~/lobster-workspace/workstreams/uow_20260501_a1b2c3/audit-report.md with all findings documented",
+    "boundary": "do not modify wos-config.json, wos_throttle.py, or any production configuration"
+  },
+  "workflow": {
+    "agent_type": "lobster-generalist",
+    "steps": [
+      "Read wos-config.json and wos_throttle.py",
+      "Read docs/wos-throttle-design.md for documented defaults",
+      "Compare current values against defaults and note discrepancies",
+      "Write audit-report.md with findings and recommendations"
+    ],
+    "fan_out": null
+  },
+  "constraints": {
+    "boundary": "do not modify wos-config.json, wos_throttle.py, or any production configuration",
+    "no_modify": [
+      "~/lobster-workspace/data/wos-config.json",
+      "~/lobster/src/orchestration/wos_throttle.py"
+    ],
+    "no_deploy": true,
+    "max_cycles": 2
+  },
+  "success_criteria": {
+    "check": "audit-report.md exists at the specified path, is non-empty, and contains sections for current values, documented defaults, and recommendations.",
+    "artifacts": [
+      "~/lobster-workspace/workstreams/uow_20260501_a1b2c3/audit-report.md"
+    ],
+    "commands": [],
+    "gate_command": null
+  },
+  "dan_context": {
+    "orientation": "Part of the WOS throttle calibration initiative; this audit provides the baseline before any parameter changes.",
+    "priority_signal": "WOS was running at 100% dispatch rate during the April sprint and showed no backpressure — audit will confirm whether defaults need adjustment.",
+    "open_questions": [
+      "Is the current max_concurrent_uows setting intentional or a migration oversight?"
+    ],
+    "load_bearing_assumption": "wos-config.json reflects the currently active throttle state (not a cached copy)."
+  },
+  "audit_metadata": {
+    "uow_id": "uow_20260501_a1b2c3",
+    "cycle": 0,
+    "executor_posture": "first_execution",
+    "schema_version": "1.0.0",
+    "prescribed_at": "2026-05-01T14:32:00Z",
+    "prescribed_skills": []
+  }
+}

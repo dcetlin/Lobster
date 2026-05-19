@@ -68,6 +68,12 @@ class UoWStatus(StrEnum):
     # Steward escalates to Dan rather than continuing to re-dispatch.
     # Treated as non-terminal (does not allow automatic re-proposal).
     NEEDS_HUMAN_REVIEW = "needs-human-review"
+    # AWAITING_OWNER: subagent surfaced a decision that only the owner can resolve.
+    # Entered from 'executing' when the subagent writes outcome=owner_decision_required.
+    # The UoW is paused — not failed — until Dan re-queues it (sets back to
+    # ready-for-steward with a decision note) or marks it done.
+    # Treated as non-terminal (does not allow automatic re-proposal).
+    AWAITING_OWNER = "awaiting-owner"
 
     def is_terminal(self) -> bool:
         """True for statuses that allow re-proposal (done, failed, expired, cancelled).
@@ -83,7 +89,7 @@ class UoWStatus(StrEnum):
         return self in {UoWStatus.DONE, UoWStatus.FAILED, UoWStatus.EXPIRED, UoWStatus.CANCELLED}
 
     def is_in_flight(self) -> bool:
-        """True for statuses that block re-proposal (active, executing, pending, ready-for-steward, ready-for-executor, diagnosing)."""
+        """True for statuses that block re-proposal (active, executing, pending, ready-for-steward, ready-for-executor, diagnosing, awaiting-owner)."""
         return self in {
             UoWStatus.ACTIVE,
             UoWStatus.EXECUTING,
@@ -91,7 +97,32 @@ class UoWStatus(StrEnum):
             UoWStatus.READY_FOR_STEWARD,
             UoWStatus.READY_FOR_EXECUTOR,
             UoWStatus.DIAGNOSING,
+            UoWStatus.AWAITING_OWNER,
         }
+
+
+class UoWType(StrEnum):
+    """UoW type tag — determines whether a UoW is dispatched for execution or routing."""
+    EXECUTABLE = "executable"
+    SEED = "seed"
+    ROUTING = "routing"
+    CLASSIFICATION = "classification"
+
+
+class UoWPosture(StrEnum):
+    """Dispatch posture — controls how the UoW is scheduled relative to other UoWs."""
+    SOLO = "solo"
+    SEQUENTIAL = "sequential"
+    REVIEW_LOOP = "review-loop"
+    FAN_OUT = "fan-out"
+
+
+class UoWRegister(StrEnum):
+    """Attentional register — determines executor type and completion evaluation policy."""
+    OPERATIONAL = "operational"
+    ITERATIVE_CONVERGENT = "iterative-convergent"
+    PHILOSOPHICAL = "philosophical"
+    HUMAN_JUDGMENT = "human-judgment"
 
 
 # ---------------------------------------------------------------------------
@@ -169,8 +200,8 @@ class UoW:
     created_at: str
     updated_at: str
     sweep_date: str | None = None
-    type: str = "executable"
-    posture: str = "solo"
+    type: UoWType = UoWType.EXECUTABLE
+    posture: UoWPosture = UoWPosture.SOLO
     route_reason: str | None = None
     steward_notes: str = ""
     success_criteria: str = ""
@@ -209,7 +240,7 @@ class UoW:
     #   than reclassifying autonomously.
     # uow_mode: mirrors register; used for execution context selection by Executor.
     #   Kept separate to allow future divergence without a schema change.
-    register: str = "operational"
+    register: UoWRegister = UoWRegister.OPERATIONAL
     uow_mode: str | None = None
     # Delivery≠closure fields (populated after migration 0007)
     # closed_at: ISO timestamp written by Steward when it declares the loop done.
@@ -275,6 +306,13 @@ class UoW:
     #   Computed deterministically by _compute_prescription_confidence() in steward.py.
     #   Steward-private (excluded from executor_uow_view). Data collection only.
     prescription_confidence: float | None = None
+    # trigger_message_id: inbox message_id of the Telegram conversation that caused
+    #   this UoW to be created (populated after migration 0022).
+    #   NULL for UoWs created by the automated cultivator (GitHub-sweep path) or
+    #   registry_cli commands — those have no associated Telegram message.
+    #   TEXT matches inbox message_id format: "{ts}_{telegram_msg_id}", e.g.
+    #   "1778365681821_8563". No foreign key — inbox messages live in a separate DB.
+    trigger_message_id: str | None = None
 
 
 def _now_iso() -> str:
@@ -442,8 +480,8 @@ class Registry:
             created_at=d.get("created_at") or "",
             updated_at=d.get("updated_at") or "",
             sweep_date=d.get("sweep_date"),
-            type=d.get("type") or "executable",
-            posture=d.get("posture") or "solo",
+            type=UoWType(d.get("type") or "executable"),
+            posture=UoWPosture(d.get("posture") or "solo"),
             route_reason=d.get("route_reason"),
             steward_notes=d.get("steward_notes") or "",
             success_criteria=d.get("success_criteria") or "",
@@ -462,7 +500,7 @@ class Registry:
             source_last_seen_at=d.get("source_last_seen_at"),
             source_state=d.get("source_state"),
             issue_url=d.get("issue_url"),
-            register=d.get("register") or "operational",
+            register=UoWRegister(d.get("register") or "operational"),
             uow_mode=d.get("uow_mode"),
             closed_at=d.get("closed_at"),
             close_reason=d.get("close_reason"),
@@ -477,6 +515,7 @@ class Registry:
             juice_quality=d.get("juice_quality"),
             juice_rationale=d.get("juice_rationale"),
             prescription_confidence=d.get("prescription_confidence"),
+            trigger_message_id=d.get("trigger_message_id"),
         )
 
     def _write_audit(
@@ -514,6 +553,7 @@ class Registry:
         register: str = "operational",
         source_ref: str | None = None,
         file_scope: list[str] | None = None,
+        trigger_message_id: str | None = None,
     ) -> UpsertResult:
         """
         Propose a UoW for a GitHub issue.
@@ -553,6 +593,10 @@ class Registry:
             file_scope: List of file/directory paths touched by this issue (extracted from
                 issue body). Used by shard_dispatch to detect overlap between concurrent UoWs.
                 None means the UoW is treated as independent (serial execution is safe default).
+            trigger_message_id: Inbox message_id of the Telegram conversation that initiated
+                this UoW (e.g. "1778365681821_8563"). NULL for cultivator-driven UoWs (no
+                associated Telegram message). Stored for dashboard join queries linking
+                Telegram conversations to execution outcomes.
         """
         if not success_criteria or not success_criteria.strip():
             raise ValueError(
@@ -564,6 +608,7 @@ class Registry:
             source_repo=source_repo, issue_url=issue_url,
             register=register, source_ref=source_ref,
             file_scope=file_scope,
+            trigger_message_id=trigger_message_id,
         )
 
     def _upsert_typed(
@@ -578,6 +623,7 @@ class Registry:
         register: str = "operational",
         source_ref: str | None = None,
         file_scope: list[str] | None = None,
+        trigger_message_id: str | None = None,
     ) -> UpsertResult:
         """Core upsert logic returning typed UpsertResult."""
         if sweep_date is None:
@@ -594,30 +640,24 @@ class Registry:
             conn.execute("BEGIN IMMEDIATE")
 
             # Cross-sweep-date pre-check: any non-terminal record for this issue?
-            # 'cancelled' is a terminal status (UoWStatus.CANCELLED) that allows
-            # re-proposal after a cancellation.
-            # 'closed' is a legacy DB status predating the UoWStatus enum; treat it
-            # as terminal so that legacy rows do not permanently block re-proposal.
+            # Uses _TERMINAL_STATUSES_FOR_ISSUE_CHECK — single source of truth
+            # shared with has_active_uow_for_issue() — so both dedup paths
+            # stay in sync when terminal statuses are added or removed.
+            _terminal = self._TERMINAL_STATUSES_FOR_ISSUE_CHECK
+            _placeholders = ", ".join("?" * len(_terminal))
             existing = conn.execute(
-                """
+                f"""
                 SELECT id, status FROM uow_registry
                 WHERE source_issue_number = ?
-                  AND status NOT IN ('done', 'failed', 'expired', 'cancelled', 'closed')
+                  AND status NOT IN ({_placeholders})
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
-                (issue_number,),
+                (issue_number, *_terminal),
             ).fetchone()
 
             if existing:
                 skip_reason = f"existing record {existing['id']} is in '{existing['status']}' status"
-                self._write_audit(
-                    conn,
-                    uow_id=existing["id"],
-                    event="skipped",
-                    note=f"upsert skipped: {skip_reason}",
-                )
-                conn.commit()
                 return UpsertSkipped(id=existing["id"], reason=skip_reason)
 
             # Check for same-date UNIQUE conflict (terminal record from a prior run today).
@@ -638,13 +678,6 @@ class Registry:
                     f"terminal record {same_date_row['id']} (status={same_date_row['status']}) "
                     f"already exists for sweep_date={sweep_date}; will re-propose on next sweep date"
                 )
-                self._write_audit(
-                    conn,
-                    uow_id=same_date_row["id"],
-                    event="skipped",
-                    note=f"upsert skipped: {skip_reason}",
-                )
-                conn.commit()
                 return UpsertSkipped(id=same_date_row["id"], reason=skip_reason)
 
             uow_id = _generate_uow_id()
@@ -658,7 +691,7 @@ class Registry:
             # other fields callers choose to provide in the future).
             # Falls back to solo/classifier-unavailable if the YAML is absent.
             try:
-                from orchestration.routing_classifier import classify_posture
+                from .routing_classifier import classify_posture
                 classifier_result = classify_posture({"type": uow_type})
                 germination_posture = classifier_result.posture
                 germination_route_reason = classifier_result.route_reason
@@ -685,8 +718,9 @@ class Registry:
                     id, type, source, source_issue_number, sweep_date,
                     status, posture, created_at, updated_at, summary,
                     success_criteria, route_reason, route_evidence, trigger,
-                    issue_url, register, uow_mode, source_ref, file_scope
-                ) VALUES (?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}', ?, ?, ?, ?, ?)
+                    issue_url, register, uow_mode, source_ref, file_scope,
+                    trigger_message_id
+                ) VALUES (?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?, '{}', '{"type": "immediate"}', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     uow_id,
@@ -705,6 +739,7 @@ class Registry:
                     register,  # uow_mode mirrors register at germination time
                     source_ref,
                     file_scope_json,
+                    trigger_message_id,
                 ),
             )
             conn.commit()
@@ -984,6 +1019,137 @@ class Registry:
         finally:
             conn.close()
 
+    def set_awaiting_owner(self, uow_id: str, decision_text: str) -> None:
+        """
+        Transition a UoW to 'awaiting-owner' status and record the decision context.
+
+        Called when a subagent writes outcome=owner_decision_required in its result
+        file, signalling that the UoW requires the owner's (Dan's) direct input to
+        proceed.  The UoW is paused — not failed — until the owner re-queues it
+        (transitions back to ready-for-steward with a decision note) or marks it done.
+
+        The decision_text is appended to steward_log so the owner can read what
+        decision is needed when reviewing the UoW.
+
+        Raises ValueError if uow_id is not found in the registry.
+        """
+        import json as _json
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, steward_log FROM uow_registry WHERE id = ?", (uow_id,)
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise ValueError(f"set_awaiting_owner: UoW {uow_id!r} not found in registry")
+            old_status = row["status"]
+            # Idempotency guard: if the UoW is already in awaiting-owner, return
+            # without writing duplicate steward_log entries or a spurious audit
+            # entry (awaiting-owner → awaiting-owner is meaningless).
+            if old_status == UoWStatus.AWAITING_OWNER:
+                conn.rollback()
+                return
+            now = _now_iso()
+            # Append decision context to steward_log so the history is legible.
+            existing_log = row["steward_log"] or "[]"
+            try:
+                log_entries = _json.loads(existing_log)
+            except (_json.JSONDecodeError, TypeError):
+                log_entries = []
+            log_entries.append({
+                "event": "awaiting_owner",
+                "actor": "steward",
+                "uow_id": uow_id,
+                "decision_text": decision_text,
+                "timestamp": now,
+            })
+            new_log = _json.dumps(log_entries)
+            self._write_audit(
+                conn,
+                uow_id=uow_id,
+                event="status_change",
+                from_status=old_status,
+                to_status=UoWStatus.AWAITING_OWNER,
+                note=f"awaiting owner decision: {decision_text[:200]}",
+            )
+            conn.execute(
+                "UPDATE uow_registry SET status = ?, updated_at = ?, steward_log = ? WHERE id = ?",
+                (UoWStatus.AWAITING_OWNER, now, new_log, uow_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def owner_decide(self, uow_id: str, decision_note: str) -> int:
+        """
+        Record an owner decision and re-queue a UoW from awaiting-owner to ready-for-steward.
+
+        Called when Dan provides a decision for a UoW that was paused with
+        outcome=owner_decision_required. The decision text is appended to
+        steward_log so the Steward can read what was decided when the UoW
+        re-enters the pipeline.
+
+        Transitions: awaiting-owner → ready-for-steward
+        Writes the decision note to steward_log and an audit entry in the same
+        transaction.  Does not reset steward_cycles — the cycle count reflects
+        how many Steward passes have already run and should be preserved.
+
+        Returns:
+            1 on success
+            0 if UoW is not in awaiting-owner status (optimistic-lock guard)
+
+        Raises ValueError if uow_id is not found in the registry.
+        """
+        import json as _json
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, steward_log FROM uow_registry WHERE id = ? AND status = ?",
+                (uow_id, UoWStatus.AWAITING_OWNER),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return 0
+            now = _now_iso()
+            existing_log = row["steward_log"] or "[]"
+            try:
+                log_entries = _json.loads(existing_log)
+            except (_json.JSONDecodeError, TypeError):
+                log_entries = []
+            log_entries.append({
+                "event": "owner_decided",
+                "actor": "user",
+                "uow_id": uow_id,
+                "decision_note": decision_note,
+                "timestamp": now,
+            })
+            new_log = _json.dumps(log_entries)
+            self._write_audit(
+                conn,
+                uow_id=uow_id,
+                event="status_change",
+                from_status=UoWStatus.AWAITING_OWNER,
+                to_status=UoWStatus.READY_FOR_STEWARD,
+                note=f"owner decided: {decision_note[:200]}",
+            )
+            cursor = conn.execute(
+                "UPDATE uow_registry SET status = ?, updated_at = ?, steward_log = ? WHERE id = ? AND status = ?",
+                (UoWStatus.READY_FOR_STEWARD, now, new_log, uow_id, UoWStatus.AWAITING_OWNER),
+            )
+            rows_affected = cursor.rowcount
+            conn.commit()
+            return rows_affected
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def query(self, status: str) -> list[UoW]:
         """
         Return all UoW records with the given status.
@@ -1023,6 +1189,65 @@ class Registry:
                 (issue_number, *self._TERMINAL_STATUSES_FOR_ISSUE_CHECK),
             ).fetchone()
             return row is not None
+        finally:
+            conn.close()
+
+    def reactivate_if_no_active(self, uow_id: str, issue_number: int) -> bool:
+        """Atomically reactivate a terminal UoW to proposed IFF no non-terminal row exists.
+
+        Combines the has_active_uow_for_issue check and the status update in a
+        single BEGIN IMMEDIATE transaction to eliminate the TOCTOU race between
+        the check and the write.
+
+        Returns True if the UoW was reactivated, False if skipped (because a
+        non-terminal row already exists for this issue).
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            _terminal = self._TERMINAL_STATUSES_FOR_ISSUE_CHECK
+            _placeholders = ", ".join("?" * len(_terminal))
+            conflict = conn.execute(
+                f"""
+                SELECT id FROM uow_registry
+                WHERE source_issue_number = ?
+                  AND status NOT IN ({_placeholders})
+                LIMIT 1
+                """,
+                (issue_number, *_terminal),
+            ).fetchone()
+
+            if conflict:
+                conn.commit()
+                return False
+
+            row = conn.execute(
+                "SELECT status FROM uow_registry WHERE id = ?", (uow_id,)
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return False
+
+            old_status = row["status"]
+            now = _now_iso()
+            self._write_audit(
+                conn,
+                uow_id=uow_id,
+                event="status_change",
+                from_status=old_status,
+                to_status=UoWStatus.PROPOSED,
+                note="reactivation (atomic dedup guard)",
+            )
+            conn.execute(
+                "UPDATE uow_registry SET status = ?, updated_at = ? WHERE id = ?",
+                (UoWStatus.PROPOSED, now, uow_id),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -1093,6 +1318,36 @@ class Registry:
                 VALUES (?, ?, ?, ?)
                 """,
                 (_now_iso(), uow_id, event, note_json),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def write_dispatch_skip(self, uow_id: str, entry: dict[str, Any]) -> None:
+        """Write a dispatch_eligibility_skip record to dispatch_skip_log.
+
+        Kept out of audit_log to prevent noise from drowning forensic events.
+        The entry dict must contain 'eligibility'; other keys are optional.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO dispatch_skip_log (ts, uow_id, eligibility, steward_cycles, actor, note)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _now_iso(),
+                    uow_id,
+                    entry.get("eligibility", "unknown"),
+                    entry.get("steward_cycles"),
+                    entry.get("actor"),
+                    json.dumps(entry),
+                ),
             )
             conn.commit()
         except Exception:
@@ -1234,6 +1489,69 @@ class Registry:
         finally:
             conn.close()
 
+    def reset_expired_claims(self) -> list[str]:
+        """
+        Reset UoWs whose visibility-timeout (claimed_until) has expired back to
+        'ready-for-executor' so the next executor-heartbeat cycle can re-dispatch them.
+
+        A UoW claim expires when:
+          status IN ('active', 'executing')
+          AND claimed_until IS NOT NULL
+          AND claimed_until < datetime('now')
+
+        Supersedes the started_at-based recover_ttl_exceeded_uows() approach:
+        claimed_until is set to 2× estimated_runtime at dispatch time, so expiry
+        means the agent had enough headroom and genuinely stalled or crashed.
+
+        Returns the list of uow_ids that were reset (may be empty).
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT id FROM uow_registry
+                WHERE status IN ('active', 'executing')
+                  AND claimed_until IS NOT NULL
+                  AND claimed_until < datetime('now')
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+
+        reset_ids: list[str] = []
+        for row in rows:
+            uow_id = row["id"]
+            conn2 = self._connect()
+            try:
+                now = _now_iso()
+                conn2.execute("BEGIN IMMEDIATE")
+                conn2.execute(
+                    """
+                    INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                    VALUES (?, ?, 'claim_expired', NULL, 'ready-for-executor', 'executor', ?)
+                    """,
+                    (now, uow_id, json.dumps({"actor": "executor", "reason": "claimed_until expired", "timestamp": now})),
+                )
+                cursor = conn2.execute(
+                    """
+                    UPDATE uow_registry
+                    SET status = 'ready-for-executor', claimed_until = NULL, updated_at = ?
+                    WHERE id = ? AND status IN ('active', 'executing') AND claimed_until < datetime('now')
+                    """,
+                    (now, uow_id),
+                )
+                if cursor.rowcount == 1:
+                    conn2.commit()
+                    reset_ids.append(uow_id)
+                else:
+                    conn2.rollback()
+            except Exception:
+                conn2.rollback()
+            finally:
+                conn2.close()
+
+        return reset_ids
+
     def get_started_at(self, uow_id: str) -> str | None:
         """
         Return the started_at timestamp string for a UoW, or None if the UoW
@@ -1252,6 +1570,30 @@ class Registry:
             if row is None:
                 return None
             return row["started_at"]
+        finally:
+            conn.close()
+
+    def get_uow_trigger(self, uow_id: str) -> str | None:
+        """
+        Return the trigger_message_id for a UoW, or None if absent.
+
+        trigger_message_id is the inbox message_id of the Telegram conversation
+        that caused this UoW to be created (migration 0022). Returns None for
+        UoWs created by the automated cultivator (no associated Telegram message)
+        or for UoWs created before migration 0022 was applied.
+
+        Useful for dashboard join queries: registry.get_uow_trigger(uow_id)
+        → message_id → fetch_message(message_id) → full conversation context.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT trigger_message_id FROM uow_registry WHERE id = ?",
+                (uow_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return row["trigger_message_id"]
         finally:
             conn.close()
 
@@ -1684,6 +2026,13 @@ class Registry:
         conn = self._connect()
         try:
             now = _now_iso()
+            # claimed_until = 2× estimated_runtime from the UoW, fallback 3600s.
+            row = conn.execute(
+                "SELECT estimated_runtime FROM uow_registry WHERE id = ?", (uow_id,)
+            ).fetchone()
+            estimated_runtime = (row["estimated_runtime"] if row else None) or 3600
+            dispatch_ttl = int(estimated_runtime) * 2
+            claimed_until = (datetime.now(timezone.utc) + timedelta(seconds=dispatch_ttl)).isoformat()
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
@@ -1693,8 +2042,8 @@ class Registry:
                 (now, uow_id, json.dumps({"actor": "executor", "executor_id": executor_id, "timestamp": now})),
             )
             conn.execute(
-                "UPDATE uow_registry SET status = 'executing', updated_at = ? WHERE id = ?",
-                (now, uow_id),
+                "UPDATE uow_registry SET status = 'executing', claimed_until = ?, updated_at = ? WHERE id = ?",
+                (claimed_until, now, uow_id),
             )
             conn.commit()
         except Exception:
@@ -1765,7 +2114,8 @@ class Registry:
                 UPDATE uow_registry
                 SET status = 'ready-for-steward', updated_at = ?, completed_at = ?,
                     token_usage = COALESCE(?, token_usage),
-                    outcome_category = COALESCE(?, outcome_category)
+                    outcome_category = COALESCE(?, outcome_category),
+                    claimed_until = NULL
                 WHERE id = ?
                 """,
                 (now, now, token_usage, outcome_category, uow_id),
@@ -1814,6 +2164,132 @@ class Registry:
         finally:
             conn.close()
 
+    def write_gate_fired(self, uow_id: str, gate_value: str) -> None:
+        """
+        Write gate_fired to the registry with upgrade-only semantics.
+
+        Called by run_steward_cycle when _check_dispatch_eligibility returns a
+        non-dispatch verdict. The gate_fired column records the most severe
+        dispatch topology gate seen across all dispatch attempts for a UoW.
+
+        Upgrade-only: only writes when gate_value has strictly higher severity
+        than the current stored value. Uses CASE expression to enforce this in
+        SQL atomically.
+
+        Severity order (spec §Schema Additions §1):
+            spiral=3 > dead_end=2 > burst=1 > none=0
+
+        No-op when:
+        - uow_id does not exist in the registry
+        - gate_value has equal or lower severity than the current stored value
+
+        The column is added by migration 0019. On installations before the
+        migration runs, this method will raise sqlite3.OperationalError (no such
+        column). Callers should guard with try/except or ensure migration runs first.
+
+        Args:
+            uow_id: The WOS unit-of-work ID.
+            gate_value: One of 'spiral', 'dead_end', 'burst', or 'none'.
+        """
+        from .gate_fired import _GATE_SEVERITY
+
+        new_severity = _GATE_SEVERITY.get(gate_value, 0)
+
+        # Map each gate_value to its severity in SQL via CASE.
+        # Use CASE to implement: only write if new severity > current severity.
+        # NULL gate_fired is treated as severity 0 (same as 'none').
+        severity_case = " ".join([
+            "CASE gate_fired",
+            "WHEN 'spiral' THEN 3",
+            "WHEN 'dead_end' THEN 2",
+            "WHEN 'burst' THEN 1",
+            "ELSE 0",
+            "END",
+        ])
+
+        conn = self._connect()
+        try:
+            conn.execute(
+                f"""
+                UPDATE uow_registry
+                SET gate_fired = ?, updated_at = ?
+                WHERE id = ?
+                  AND {new_severity} > COALESCE({severity_case}, 0)
+                """,
+                (gate_value, _now_iso(), uow_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def log_control_event(
+        self,
+        event_type: str,
+        payload: dict | None = None,
+    ) -> None:
+        """
+        Append one row to the control_events table.
+
+        This is an append-only write — it never updates or deletes rows. Each row
+        records a single dispatcher control action (e.g. 'wos_start', 'wos_stop',
+        'wos_abort') with an optional JSON payload for contextual data such as
+        uow_id or pr_number.
+
+        Non-fatal: if the control_events table has not yet been created (pre-migration
+        install) or any other error occurs, the failure is logged to stderr and
+        swallowed. The calling handler continues normally — a missing control log
+        entry is never worth crashing a dispatcher command.
+
+        Args:
+            event_type: Short string identifying the event, e.g. 'wos_start',
+                'wos_stop', 'wos_abort', 'oracle_dispatched', 'merge_dispatched'.
+            payload: Optional dict of contextual data (uow_id, pr_number, etc.).
+                Serialized to JSON text in the payload column.
+
+        Table:
+            control_events(id, ts, event_type, payload)
+            Created by migration 0021.
+        """
+        import sys
+
+        payload_json: str | None = None
+        if payload is not None:
+            try:
+                payload_json = json.dumps(payload)
+            except (TypeError, ValueError) as exc:
+                print(
+                    f"[Registry.log_control_event] payload serialization failed "
+                    f"for event_type={event_type!r}: {exc}",
+                    file=sys.stderr,
+                )
+                payload_json = None
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO control_events (event_type, payload)
+                VALUES (?, ?)
+                """,
+                (event_type, payload_json),
+            )
+            conn.commit()
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            print(
+                f"[Registry.log_control_event] failed to write event_type={event_type!r}: {exc}",
+                file=sys.stderr,
+            )
+        finally:
+            conn.close()
+
     def fail_uow(self, uow_id: str, reason: str) -> None:
         """
         Transition a UoW to 'failed'.
@@ -1841,7 +2317,7 @@ class Registry:
                 (now, uow_id, current_status, json.dumps({"actor": "executor", "reason": reason, "timestamp": now})),
             )
             conn.execute(
-                "UPDATE uow_registry SET status = 'failed', updated_at = ? WHERE id = ?",
+                "UPDATE uow_registry SET status = 'failed', updated_at = ?, claimed_until = NULL WHERE id = ?",
                 (now, uow_id),
             )
             conn.commit()
@@ -1855,7 +2331,9 @@ class Registry:
     # 'blocked' covers the normal hard-cap / stuck-steward case.
     # 'ready-for-steward' covers UoWs that false-completed at executor dispatch
     # time (issue #669) and are looping in the steward queue without advancing.
-    RETRYABLE_STATUSES: frozenset[str] = frozenset({"blocked", "ready-for-steward"})
+    # 'awaiting-owner' allows the existing decide_retry path to transition a UoW
+    # back to ready-for-steward when Dan provides a decision via /wos reset.
+    RETRYABLE_STATUSES: frozenset[str] = frozenset({"blocked", "ready-for-steward", "awaiting-owner"})
 
     # Sentinel value returned by decide_retry when the UoW was cleaned up by
     # the hard-cap arc and a bare retry is rejected. Callers check for this
@@ -2563,6 +3041,49 @@ class Registry:
             conn.close()
 
     # -----------------------------------------------------------------------
+    # Latency query (used by registry_cli queue-latency command)
+    # -----------------------------------------------------------------------
+
+    def fetch_for_latency(self, since_iso: str, status: str | None = None) -> list[dict]:
+        """
+        Return UoW rows needed to compute queue-wait and execution-time latency.
+
+        Selects only the columns required for latency computation:
+          created_at, started_at, completed_at, status.
+
+        Filters to rows where started_at is not NULL and falls at or after
+        since_iso (the window start). An optional status filter narrows further.
+
+        Read-only. Never modifies registry state.
+        """
+        conn = self._connect()
+        try:
+            if status is not None:
+                rows = conn.execute(
+                    """
+                    SELECT id, created_at, started_at, completed_at, status
+                    FROM uow_registry
+                    WHERE started_at >= ?
+                      AND status = ?
+                    ORDER BY started_at ASC
+                    """,
+                    (since_iso, status),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, created_at, started_at, completed_at, status
+                    FROM uow_registry
+                    WHERE started_at >= ?
+                    ORDER BY started_at ASC
+                    """,
+                    (since_iso,),
+                ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    # -----------------------------------------------------------------------
     # Juice dispatch priority methods (migration 0013)
     # -----------------------------------------------------------------------
 
@@ -2620,6 +3141,167 @@ class Registry:
             raise
         finally:
             conn.close()
+
+    # -----------------------------------------------------------------------
+    # Executor PID tracking methods (migration 0020)
+    # -----------------------------------------------------------------------
+
+    def set_executor_pid(self, uow_id: str, pid: int) -> None:
+        """
+        Store the OS process ID of the dispatched subprocess for a UoW.
+
+        Called by the executor immediately after Popen(...) succeeds so that
+        the process group can be killed later via kill_executor(). Stored in
+        the executor_pid column (nullable INTEGER, migration 0020).
+
+        Args:
+            uow_id: The UoW identifier.
+            pid: The OS PID returned by Popen.pid.
+        """
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE uow_registry
+                SET executor_pid = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (pid, now, uow_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_executor_pid(self, uow_id: str) -> int | None:
+        """
+        Return the stored executor PID for a UoW, or None if absent.
+
+        Returns None when:
+        - The UoW has no stored PID (executor_pid IS NULL).
+        - The UoW does not exist.
+        - The executor_pid column has not yet been migrated (migration 0020).
+
+        Args:
+            uow_id: The UoW identifier.
+
+        Returns:
+            Integer PID if stored, None otherwise.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT executor_pid FROM uow_registry WHERE id = ?",
+                (uow_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return row["executor_pid"]
+        except Exception as exc:
+            log.debug(
+                "get_executor_pid: failed for uow_id=%s — %s: %s",
+                uow_id, type(exc).__name__, exc,
+            )
+            return None
+        finally:
+            conn.close()
+
+    def clear_executor_pid(self, uow_id: str) -> None:
+        """
+        Clear the stored executor PID for a UoW (set to NULL).
+
+        Called when:
+        - The UoW completes normally (wos_completion.py).
+        - The UoW is killed via kill_executor().
+        - The UoW is re-queued by orphan recovery.
+
+        Idempotent: no-op if executor_pid is already NULL or the UoW is not found.
+
+        Args:
+            uow_id: The UoW identifier.
+        """
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE uow_registry
+                SET executor_pid = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, uow_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def kill_executor(self, uow_id: str) -> bool:
+        """
+        Kill the subprocess associated with a UoW by sending SIGTERM to its process group.
+
+        Looks up the stored executor_pid and sends SIGTERM to the entire process group
+        via os.killpg(os.getpgid(pid), signal.SIGTERM). This reaches subprocesses that
+        spawn children (e.g. claude -p spawning shell commands).
+
+        Clears executor_pid after a successful kill or if the process is already gone
+        (ProcessLookupError — process exited between PID read and kill call).
+
+        Args:
+            uow_id: The UoW identifier.
+
+        Returns:
+            True if the process was found and SIGTERM was sent successfully.
+            False in three cases:
+              - executor_pid IS NULL (no PID stored, or UoW not found): no action taken.
+              - ProcessLookupError: process already exited; executor_pid is cleared.
+              - PermissionError: process is still running but owned by another user;
+                executor_pid is RETAINED (not cleared) so future abort attempts can
+                still see the PID. Callers that need to distinguish these two False
+                cases should call get_executor_pid() after a False return:
+                  - PID still present → PermissionError (process alive, unowned)
+                  - PID is None       → ProcessLookupError (process already gone)
+
+        Note:
+            ProcessLookupError is handled gracefully — the process already exited.
+            In that case, executor_pid is cleared and False is returned, because no
+            kill signal was actually delivered.
+
+            PermissionError is also handled gracefully — the process is running but
+            unowned. executor_pid is retained so the caller can report accurately and
+            a subsequent abort attempt is still possible (e.g., after privilege change).
+        """
+        import os
+        import signal
+
+        pid = self.get_executor_pid(uow_id)
+        if pid is None:
+            return False
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            self.clear_executor_pid(uow_id)
+            return True
+        except PermissionError:
+            # Process is still running but we lack permission to signal it.
+            # Do NOT clear the PID — the process is alive; clearing would make
+            # a future abort attempt silently do nothing (False rather than error).
+            log.warning(
+                "kill_executor: PermissionError sending SIGTERM to pid=%d "
+                "(uow_id=%s) — process is still running but unowned",
+                pid, uow_id,
+            )
+            return False
+        except ProcessLookupError:
+            # Process already exited — clean up stale PID.
+            self.clear_executor_pid(uow_id)
+            return False
 
 
 # ---------------------------------------------------------------------------

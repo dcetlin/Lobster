@@ -212,6 +212,23 @@ Include the GitHub activity summary in the synthesis for rolling-summary.md and 
    Read `~/lobster-user-config/memory/canonical/handoff.md`.
    Update the "Current state" section to reflect the synthesized current state. This is the first file the next session reads — keep it accurate and current.
 
+   **9a. Update the Metabolic Snapshot section.**
+   The Metabolic Snapshot section sits between the Stable Facts/Repo Mapping block and the Current State section. Update it based on what emerged in today's session activity. The goal is to keep this section tracking metabolic meaning, not just event log.
+
+   For each subsection, apply the following update rules:
+
+   - **Pearls**: Add any new well-crystallized insights that completed today — impeccable formulations, breakthrough vocabulary, closed design questions, or captured learnings that belong in long-term memory. Do NOT add incremental findings; only add items that are genuinely complete and worth preserving. Drop pearls that are more than 30 days old if they have been encoded elsewhere (linked issue, committed doc, IFTTT rule). Keep the list to 5-7 items max.
+
+   - **Active Seeds**: Add any new design seeds, unresolved generative threads, or investments-for-future-capability that surfaced today. Remove seeds that have since crystallized (issue filed + implementation started) or rotted (>60 days without germination — these are now shit). Keep the list to 7-10 items max.
+
+   - **Juice-Rich Sessions**: Replace with the 2-3 most recent sessions where juice was high — high-quality generative output, real vocabulary sharpening, momentum that carried into the next session. Only list sessions from the past 14 days. Drop older entries.
+
+   - **Shit Being Processed**: Add any new friction patterns, epistemic drift, lost subagents, structural dissonances, or anti-patterns that surfaced today and are being actively tracked. Remove items that were resolved this session (e.g., a stuck subagent that completed, a bug that was fixed). Keep the list to 5-8 items — long shit lists are themselves a smell.
+
+   - **Heat Dissipated**: Replace with 3-5 notable heat events from the past 24 hours only — cron runs that found nothing, clean oracle passes, resolved urgencies that left no residue. This is a rolling window, not a cumulative list. Older heat events are already dissipated — recording them past 24h is itself heat.
+
+   Update the `*Last updated:*` datestamp to today's date.
+
    **9b. Reconcile the handoff.md PR table against live GitHub state.**
    After updating the Current state section, reconcile any PR table present in handoff.md:
 

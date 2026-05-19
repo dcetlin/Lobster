@@ -29,7 +29,7 @@ def _stub_ooda_if_missing() -> None:
     """
     Insert a minimal stub for src.ooda into sys.modules if the real module is absent.
 
-    startup-sweep.py imports from src.orchestration.steward, which imports
+    startup_sweep.py imports from src.orchestration.steward, which imports
     src.ooda at module level. src.ooda is not present in the CI/test environment
     (it is a vendor package that is not committed to the repo). Without this stub,
     any test that transitively loads steward.py fails with ModuleNotFoundError.
@@ -55,9 +55,9 @@ def _stub_ooda_if_missing() -> None:
 
 
 def _load_startup_sweep():
-    """Load startup-sweep.py via importlib (hyphen in name prevents direct import)."""
+    """Load startup_sweep.py via importlib."""
     _stub_ooda_if_missing()
-    sweep_path = _REPO_ROOT / "scheduled-tasks" / "startup-sweep.py"
+    sweep_path = _REPO_ROOT / "scheduled-tasks" / "startup_sweep.py"
     spec = importlib.util.spec_from_file_location("startup_sweep", sweep_path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["startup_sweep"] = mod

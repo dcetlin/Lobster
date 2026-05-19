@@ -62,7 +62,6 @@ def _load_heartbeat():
 
 _hb = _load_heartbeat()
 _filter_stale_uows = _hb._filter_stale_uows
-RECOVERY_STALE_MINUTES = _hb.RECOVERY_STALE_MINUTES
 
 
 # ---------------------------------------------------------------------------
@@ -92,12 +91,12 @@ _never_orphaned = lambda uow_id: False
 
 class TestRecoveryStaleMintuesConstant:
     def test_is_positive_integer(self) -> None:
-        assert isinstance(RECOVERY_STALE_MINUTES, int)
-        assert RECOVERY_STALE_MINUTES > 0
+        assert isinstance(_hb.RECOVERY_STALE_MINUTES, int)
+        assert _hb.RECOVERY_STALE_MINUTES > 0
 
     def test_is_at_least_one_minute(self) -> None:
         """Must be long enough that a freshly-written UoW is not immediately eligible."""
-        assert RECOVERY_STALE_MINUTES >= 1
+        assert _hb.RECOVERY_STALE_MINUTES >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +401,7 @@ class TestRunExecutorCycleDispatchEligibility:
         A UoW with prior executor_orphan history that has aged past RECOVERY_STALE_MINUTES
         must be dispatched by the heartbeat (recovery path).
         """
-        stale_minutes = RECOVERY_STALE_MINUTES + 10
+        stale_minutes = _hb.RECOVERY_STALE_MINUTES + 10
         self._insert_uow(db_path, "orphan-stale-001", age_minutes=stale_minutes)
         self._insert_executor_orphan_audit(db_path, "orphan-stale-001")
 
@@ -437,7 +436,7 @@ class TestRunExecutorCycleDispatchEligibility:
         - fresh UoW: dispatched immediately
         - stale orphaned UoW: dispatched (staleness gate cleared)
         """
-        stale_minutes = RECOVERY_STALE_MINUTES + 10
+        stale_minutes = _hb.RECOVERY_STALE_MINUTES + 10
         self._insert_uow(db_path, "fresh-mix-001", age_minutes=0.1)
         self._insert_uow(db_path, "orphan-stale-mix-001", age_minutes=stale_minutes)
         self._insert_executor_orphan_audit(db_path, "orphan-stale-mix-001")

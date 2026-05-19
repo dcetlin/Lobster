@@ -115,6 +115,66 @@ class TestMemoryEvent:
         assert restored.project == original.project
         assert restored.metadata == original.metadata
 
+    def test_subject_and_signal_type_hint_in_to_dict(self):
+        """subject and signal_type_hint are present in to_dict output."""
+        from src.mcp.memory.provider import MemoryEvent
+        now = datetime.now(timezone.utc)
+        event = MemoryEvent(
+            id=10,
+            timestamp=now,
+            type="note",
+            source="internal",
+            project=None,
+            content="A classified note",
+            subject="OAuth implementation",
+            signal_type_hint="design_question",
+        )
+        d = event.to_dict()
+        assert d["subject"] == "OAuth implementation"
+        assert d["signal_type_hint"] == "design_question"
+
+    def test_subject_and_signal_type_hint_roundtrip(self):
+        """subject and signal_type_hint survive a to_dict / from_dict round-trip."""
+        from src.mcp.memory.provider import MemoryEvent
+        now = datetime.now(timezone.utc)
+        original = MemoryEvent(
+            id=11,
+            timestamp=now,
+            type="note",
+            source="internal",
+            project=None,
+            content="Discussed the system architecture",
+            subject="hiking trip planning",
+            signal_type_hint="voice_note",
+        )
+        restored = MemoryEvent.from_dict(original.to_dict())
+        assert restored.subject == "hiking trip planning"
+        assert restored.signal_type_hint == "voice_note"
+
+    def test_subject_and_signal_type_hint_default_none(self):
+        """subject and signal_type_hint default to None when absent from dict."""
+        from src.mcp.memory.provider import MemoryEvent
+        event = MemoryEvent.from_dict({"content": "Minimal"})
+        assert event.subject is None
+        assert event.signal_type_hint is None
+
+    def test_signal_type_hint_none_survives_roundtrip(self):
+        """An event with no signal_type_hint serializes and restores None correctly."""
+        from src.mcp.memory.provider import MemoryEvent
+        now = datetime.now(timezone.utc)
+        original = MemoryEvent(
+            id=12,
+            timestamp=now,
+            type="note",
+            source="internal",
+            project=None,
+            content="No hint here",
+        )
+        d = original.to_dict()
+        assert d["signal_type_hint"] is None
+        restored = MemoryEvent.from_dict(d)
+        assert restored.signal_type_hint is None
+
 
 # ============================================================================
 # StaticMemory Tests (no external dependencies)

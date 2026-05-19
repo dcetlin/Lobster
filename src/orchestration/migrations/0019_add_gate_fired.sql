@@ -1,0 +1,28 @@
+-- Migration 0019: add gate_fired column for dispatch topology tracking (issue #1093).
+--
+-- Problem:
+--   The UoWCompletionSurface spec (docs/wos/wos-completion-report-spec.md) includes
+--   a gate_fired field that classifies the dispatch topology gate most severe during
+--   a UoW's lifetime: spiral, dead_end, burst, or none. Without this column, the
+--   notification layer cannot include topology signal in completion pings, and the
+--   daily digest cannot report gate churn.
+--
+-- Fix:
+--   Add gate_fired TEXT NULL DEFAULT 'none' to uow_registry.
+--   Written by the Steward in run_steward_cycle when _check_dispatch_eligibility
+--   returns a non-dispatch verdict. Upgrade-only: only higher-severity values
+--   overwrite lower ones (spiral=3 > dead_end=2 > burst=1 > none=0).
+--
+-- Backward compatibility:
+--   Existing UoWs get gate_fired = NULL (not 'none'). The notification layer
+--   defaults to 'none' when reading NULL. Column is nullable throughout.
+--   write_gate_fired only writes when IS_UPGRADE, so NULL rows are treated as
+--   severity-0 for the upgrade check.
+--
+-- Values:
+--   'spiral'   — escalate verdict: repeated oracle passes (infinite loop risk)
+--   'dead_end' — pause verdict: too many failures/blocks (stuck UoW)
+--   'burst'    — throttle verdict: queue depth spike (system overload)
+--   'none'     — dispatch verdict: no gate fired (clean path)
+
+ALTER TABLE uow_registry ADD COLUMN gate_fired TEXT NULL;

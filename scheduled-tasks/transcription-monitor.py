@@ -47,6 +47,18 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+_REPO_ROOT = Path(__file__).parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from src.utils.jobs import is_job_enabled  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# jobs.json enabled gate — Type C dispatch path
+# ---------------------------------------------------------------------------
+
+JOB_NAME = "transcription-monitor"
+
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -232,6 +244,8 @@ def atomic_write_json(dest: Path, data: dict) -> None:
 
 def main() -> int:
     """Run the transcription monitor. Returns 0 on success, 1 on error."""
+    if not is_job_enabled(JOB_NAME):
+        return 0
 
     # Step 1: Check if whisper-cli is running.
     pid = find_whisper_pid()

@@ -45,7 +45,7 @@ a minor warning.
 
 | Invariant | How to check | Alert if violated |
 |---|---|---|
-| `~/lobster/` is on `local-dev` | `git -C ~/lobster branch --show-current` | Yes — send_reply to owner immediately |
+| `~/lobster/` is on `local-dev` | `git -C ~/lobster branch --show-current` | Yes — send_reply to the instance owner immediately |
 | `LOBSTER_DEBUG=true` in config | Check `~/lobster-config/config.env` | No — you are in debug mode if this file is loaded |
 | No stale sessions from previous run | on-fresh-start.py hook handles this automatically | File bug if sessions persist after 5 min |
 
@@ -67,8 +67,8 @@ the subagent already sent the alert if the branch was wrong. Just
 
 ## Debug-Mode Alerting Policy
 
-When an invariant check fails in debug mode, **always alert the owner immediately**
-via `send_reply(chat_id=8305714125, ...)`. Do not wait for the user to ask.
+When an invariant check fails in debug mode, **always alert the instance owner immediately**
+via `send_reply(chat_id=ADMIN_CHAT_ID_REDACTED, ...)`. Do not wait for the user to ask.
 
 The branch invariant is critical: if `~/lobster/` is on `main` in debug mode,
 every fix from `local-dev` is absent and the system is silently degraded.
