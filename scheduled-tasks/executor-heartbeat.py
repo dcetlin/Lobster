@@ -376,83 +376,6 @@ def check_github_rate_limit(
 # Executor cycle — claim and dispatch all ready-for-executor UoWs
 # ---------------------------------------------------------------------------
 
-def run_ttl_recovery(registry, dry_run: bool = False) -> list[str]:
-    """
-    Recover UoWs stuck in 'active' state for more than TTL_EXCEEDED_HOURS.
-
-    In dry_run mode: queries but does NOT transition any UoW.
-    Returns the list of recovered uow_ids (empty on dry_run or nothing to recover).
-    """
-    try:
-        from src.orchestration.executor import TTL_EXCEEDED_HOURS, recover_ttl_exceeded_uows
-    except ImportError:
-        log.error(
-            "TTL recovery skipped — TTL_EXCEEDED_HOURS not available in executor.py (see #1216). "
-            "Stall recovery is degraded: active UoWs past TTL will NOT be marked failed by this path. "
-            "The reset_expired_claims() path (Phase 1 primary) is unaffected."
-        )
-        _write_crash_alert(
-            job_name="executor-heartbeat",
-            exc=ImportError(
-                "TTL_EXCEEDED_HOURS missing from executor.py (#1216 partial implementation). "
-                "TTL-based stall recovery is degraded."
-            ),
-            extra=(
-                "Structural gap: TTL_EXCEEDED_HOURS was removed during #1216 but "
-                "run_ttl_recovery() still imports it. "
-                "The primary reset_expired_claims() path is unaffected. "
-                "Fix: restore TTL_EXCEEDED_HOURS in executor.py or remove run_ttl_recovery()."
-            ),
-        )
-        return []
-    import sqlite3
-    from datetime import datetime, timezone, timedelta
-
-    if dry_run:
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=TTL_EXCEEDED_HOURS)
-        cutoff_iso = cutoff.isoformat()
-        try:
-            conn = sqlite3.connect(str(registry.db_path), timeout=10.0)
-            conn.row_factory = sqlite3.Row
-            try:
-                rows = conn.execute(
-                    """
-                    SELECT id FROM uow_registry
-                    WHERE status IN ('active', 'executing')
-                      AND started_at IS NOT NULL
-                      AND started_at < ?
-                    """,
-                    (cutoff_iso,),
-                ).fetchall()
-                stalled = [r["id"] for r in rows]
-            finally:
-                conn.close()
-        except Exception as e:
-            log.warning("TTL recovery (DRY RUN): query failed — %s", e)
-            return []
-        if stalled:
-            log.info(
-                "TTL recovery (DRY RUN): %d stalled UoWs would be recovered — %s",
-                len(stalled), stalled,
-            )
-        else:
-            log.info("TTL recovery (DRY RUN): no stalled UoWs found")
-        return []
-
-    try:
-        recovered = recover_ttl_exceeded_uows(registry)
-    except Exception as e:
-        log.warning("TTL recovery: unexpected error — %s", e)
-        return []
-
-    if recovered:
-        log.info("TTL recovery: marked %d stalled UoW(s) as failed — %s", len(recovered), recovered)
-    else:
-        log.debug("TTL recovery: no stalled UoWs found")
-
-    return recovered
-
-
 def _filter_stale_uows(
     ready_uows: list,
     stale_minutes: int,
@@ -751,14 +674,9 @@ def _main_inner() -> int:
     # Phase 1: Stall recovery — always runs regardless of execution_enabled so
     # that stalled active UoWs are recovered even when dispatch is paused.
     #
-    # Primary path: registry.reset_expired_claims() uses the visibility-timeout
-    # model (claimed_until) to reset expired claims back to 'ready-for-executor'.
-    # This is the designed replacement for the legacy recover_ttl_exceeded_uows()
-    # approach — see executor.py module docstring and registry.py:1354.
-    #
-    # Legacy fallback: run_ttl_recovery() wraps recover_ttl_exceeded_uows() with
-    # a try/except ImportError guard (TTL_EXCEEDED_HOURS was removed in #1216).
-    # Retained as a defensive fallback; silently returns [] if the symbol is absent.
+    # Uses the visibility-timeout model (claimed_until) via reset_expired_claims()
+    # to reset expired claims back to 'ready-for-executor'.
+    # See executor.py module docstring and registry.py for implementation details.
     if not dry_run:
         try:
             reset_ids = registry.reset_expired_claims()
@@ -773,7 +691,6 @@ def _main_inner() -> int:
             log.warning("Stall recovery (reset_expired_claims) failed — %s", e)
     else:
         log.info("Stall recovery (DRY RUN): skipping reset_expired_claims")
-    run_ttl_recovery(registry, dry_run=dry_run)
 
     # Phase 1b: Heartbeat sidecar — write heartbeats for all in-flight UoWs.
     # Structural enforcement: heartbeats are written by the cron-driven executor
