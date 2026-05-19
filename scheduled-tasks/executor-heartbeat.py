@@ -40,6 +40,8 @@ import logging
 import os
 import subprocess
 import sys
+import traceback
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,6 +70,63 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
 log = logging.getLogger("executor-heartbeat")
+
+# Admin chat_id for crash alerts (env-injected, falls back to hardcoded)
+_ADMIN_CHAT_ID: str = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
+
+
+# ---------------------------------------------------------------------------
+# Crash alert — write a system inbox message so the dispatcher relays it to Dan
+# ---------------------------------------------------------------------------
+
+def _write_crash_alert(job_name: str, exc: BaseException, extra: str = "") -> None:
+    """Write a scheduled_task_crash inbox message so the dispatcher alerts Dan.
+
+    This is a best-effort fire-and-forget write. Failures here are logged but
+    do not mask the original exception — the caller must re-raise or sys.exit
+    after calling this function.
+
+    The inbox message shape is intentionally simple: source=system,
+    type=scheduled_task_crash, text=human-readable alert. The dispatcher's
+    LLM loop reads the message and relays it to Dan as a Telegram notification.
+    """
+    tb_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    tb_str = "".join(tb_lines).strip()
+    # Truncate traceback to avoid oversized messages (keep last 2000 chars)
+    if len(tb_str) > 2000:
+        tb_str = "...(truncated)...\n" + tb_str[-2000:]
+
+    text = (
+        f"[CRASH] {job_name} crashed with {type(exc).__name__}: {exc}\n\n"
+        f"```\n{tb_str}\n```"
+    )
+    if extra:
+        text += f"\n\n{extra}"
+
+    from datetime import datetime as _datetime, timezone as _timezone
+
+    msg_id = str(uuid.uuid4())
+    msg = {
+        "id": msg_id,
+        "source": "system",
+        "type": "scheduled_task_crash",
+        "chat_id": _ADMIN_CHAT_ID,
+        "job_name": job_name,
+        "timestamp": _datetime.now(_timezone.utc).isoformat(),
+        "text": text,
+    }
+
+    try:
+        messages_base = Path(os.environ.get("LOBSTER_MESSAGES", Path.home() / "messages"))
+        inbox_dir = messages_base / "inbox"
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = inbox_dir / f"{msg_id}.json.tmp"
+        dest_path = inbox_dir / f"{msg_id}.json"
+        tmp_path.write_text(json.dumps(msg, indent=2), encoding="utf-8")
+        tmp_path.rename(dest_path)
+        log.info("Crash alert written to inbox (%s)", msg_id)
+    except Exception as write_exc:
+        log.error("Failed to write crash alert to inbox: %s", write_exc)
 
 
 # ---------------------------------------------------------------------------
@@ -327,8 +386,23 @@ def run_ttl_recovery(registry, dry_run: bool = False) -> list[str]:
     try:
         from src.orchestration.executor import TTL_EXCEEDED_HOURS, recover_ttl_exceeded_uows
     except ImportError:
-        log.warning(
-            "TTL recovery skipped — TTL_EXCEEDED_HOURS not available in executor.py (see #1216)"
+        log.error(
+            "TTL recovery skipped — TTL_EXCEEDED_HOURS not available in executor.py (see #1216). "
+            "Stall recovery is degraded: active UoWs past TTL will NOT be marked failed by this path. "
+            "The reset_expired_claims() path (Phase 1 primary) is unaffected."
+        )
+        _write_crash_alert(
+            job_name="executor-heartbeat",
+            exc=ImportError(
+                "TTL_EXCEEDED_HOURS missing from executor.py (#1216 partial implementation). "
+                "TTL-based stall recovery is degraded."
+            ),
+            extra=(
+                "Structural gap: TTL_EXCEEDED_HOURS was removed during #1216 but "
+                "run_ttl_recovery() still imports it. "
+                "The primary reset_expired_claims() path is unaffected. "
+                "Fix: restore TTL_EXCEEDED_HOURS in executor.py or remove run_ttl_recovery()."
+            ),
         )
         return []
     import sqlite3
@@ -626,6 +700,16 @@ def main() -> int:
 
     Returns exit code: 0 on success, 1 on unhandled error.
     """
+    try:
+        return _main_inner()
+    except Exception as exc:
+        log.error("executor-heartbeat crashed with unhandled exception: %s", exc, exc_info=True)
+        _write_crash_alert(job_name="executor-heartbeat", exc=exc)
+        return 1
+
+
+def _main_inner() -> int:
+    """Inner implementation of main() — wrapped by main() for crash alerting."""
     parser = argparse.ArgumentParser(description="Executor Heartbeat — WOS Phase 2")
     parser.add_argument(
         "--dry-run",
