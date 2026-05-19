@@ -693,7 +693,6 @@ def handle_wos_execute(uow_id: str, instructions: str, output_ref: str) -> str:
         f"response across all turns and report the total. This enables per-UoW cost telemetry.\n"
         f"Omit token_usage if you did not track it.\n\n"
         f"Minimum viable output: {output_ref} with uow_id, outcome, and success fields.\n"
-        f"Boundary: do not modify executor.py, registry.py, or any WOS source files.\n"
     )
 
 
