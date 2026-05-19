@@ -912,6 +912,15 @@ restart_services() {
     fi
 
     info "Note: lobster-claude restart skipped — the dispatcher restarts itself on the next message cycle."
+    info ""
+    info "Manual dispatcher restart IS needed after upgrades that change:"
+    info "  • MCP server configuration (lobster-mcp-local.service, mcp_config.json, or any MCP server source files)"
+    info "  • Agent bootup files (.claude/sys.*.bootup.md, user config bootup files) — the in-flight session"
+    info "    has already loaded these; a new session is required to pick up the changes."
+    info "  • Hook scripts (hooks/*.py, .claude/settings.json hook entries) — hooks are loaded at session start."
+    info ""
+    info "Safe restart: ~/lobster/scripts/restart-mcp.sh"
+    info "(Never run 'sudo systemctl restart lobster-claude' directly — it kills the active session immediately.)"
 
     log_to_file "Services restarted"
 }
@@ -4465,6 +4474,12 @@ main() {
     if [ "$ERRORS" -gt 0 ]; then
         error "$ERRORS error(s) during upgrade"
     fi
+    echo ""
+    echo -e "${YELLOW}Post-upgrade checklist:${NC}"
+    echo "  • If this upgrade changed MCP config, bootup files, or hook scripts:"
+    echo "    Run: ~/lobster/scripts/restart-mcp.sh"
+    echo "  • If this upgrade only changed Python logic / migrations / job files:"
+    echo "    No manual restart needed — the dispatcher picks up changes on the next message cycle."
     echo ""
 
     cleanup_lock
