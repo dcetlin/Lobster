@@ -813,7 +813,7 @@ Written by `steward._write_owner_required_message` when a WOS subagent writes `o
 4. mark_processed(message_id)
 ```
 
-Dan's reply in the primary thread provides the decision. To re-queue the UoW after receiving the decision, set it back to `ready-for-steward` with the decision as a note.
+Dan's reply provides the decision. The notification text includes the exact command to re-queue: `/decide <uow_id> owner <decision>`. This calls `handle_owner_decide` in `dispatcher_handlers.py`, which records the decision in the UoW's steward_log and transitions it from `awaiting-owner` → `ready-for-steward`.
 
 Implementation: `route_wos_message` is the single entry point. The handler is `handle_wos_owner_required` in `src/orchestration/dispatcher_handlers.py`. Call `route_wos_message(msg)` — do not call `handle_wos_owner_required` directly.
 

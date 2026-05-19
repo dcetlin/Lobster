@@ -2511,6 +2511,8 @@ WOS control:
 Decision:
   /approve <uow-id>   — approve a proposed UoW
   /decide <uow-id> <action> — resolve a blocked UoW
+    actions: proceed, retry, retry force, abandon, defer [note], owner <decision>
+    owner action: re-queues an awaiting-owner UoW with the given decision note
 
 Config (user bootup files):
   /config list                  — list all user config files with line counts
