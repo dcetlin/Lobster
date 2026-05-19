@@ -7,7 +7,7 @@ Telegram. No MCP tools, no network calls — those belong in the dispatcher.
 
 The dispatcher calls these handlers when it recognizes:
   /approve <uow-id>                    → handle_approve(uow_id, registry)
-  /decide <uow-id> <proceed|abandon|retry> → handle_decide(uow_id, action, registry)
+  /decide <uow-id> <proceed|abandon|retry|owner <decision>> → handle_decide(uow_id, action, registry)
   /wos status [status]                 → handle_wos_status(status, registry)
   /wos uow <uow-id>                    → handle_wos_uow(uow_id, registry) → dispatcher spawns subagent
   /wos unblock                         → handle_wos_unblock()
@@ -450,7 +450,7 @@ def handle_decide_close(uow_id: str, *, registry: "Registry") -> str:
     )
 
 
-_VALID_DECIDE_ACTIONS = frozenset({"proceed", "abandon", "retry", "defer"})
+_VALID_DECIDE_ACTIONS = frozenset({"proceed", "abandon", "retry", "defer", "owner"})
 
 
 def handle_decide_defer(uow_id: str, note: str = "", *, registry: "Registry") -> str:
@@ -479,28 +479,63 @@ def handle_decide_defer(uow_id: str, note: str = "", *, registry: "Registry") ->
     )
 
 
+def handle_owner_decide(uow_id: str, decision_note: str, *, registry: "Registry") -> str:
+    """
+    Handle `/decide <uow-id> owner <decision>` — provide an owner decision to a paused UoW.
+
+    Called when Dan provides a decision for a UoW that was paused in
+    `awaiting-owner` status (i.e., a subagent wrote outcome=owner_decision_required).
+
+    The decision text is recorded in the UoW's steward_log and the UoW is
+    transitioned back to ready-for-steward so the Steward can read the decision
+    and prescribe the next execution step accordingly.
+
+    Returns a human-readable Telegram message describing the outcome.
+    """
+    if not decision_note.strip():
+        return (
+            f"Decision text is required for owner action.\n"
+            f"Usage: `/decide {uow_id} owner <your decision text>`"
+        )
+    rows = registry.owner_decide(uow_id, decision_note.strip())
+    if rows == 1:
+        return (
+            f"UoW `{uow_id}` re-queued with owner decision.\n"
+            f"Status: `awaiting-owner → ready-for-steward`\n"
+            f"Decision recorded: {decision_note.strip()}"
+        )
+    return (
+        f"UoW `{uow_id}` could not be re-queued — it is not currently in `awaiting-owner` status.\n"
+        f"Run `/wos status awaiting-owner` to see UoWs awaiting a decision."
+    )
+
+
 def handle_decide(uow_id: str, action: str, *, registry: "Registry") -> str:
     """
-    Handle /decide <uow-id> <proceed|abandon|retry[force]|defer[note]>.
+    Handle /decide <uow-id> <proceed|abandon|retry[force]|defer[note]|owner <decision>>.
 
     Provides a single unified command for resolving blocked UoWs from Telegram.
     Action semantics:
-      proceed          — unblock and re-queue to ready-for-steward (preserves steward_cycles)
-      retry            — reset steward_cycles to 0 and re-queue to ready-for-steward (full retry)
-      retry force      — override the hard-cap commitment gate (explicit operator intent required)
+      proceed              — unblock and re-queue to ready-for-steward (preserves steward_cycles)
+      retry                — reset steward_cycles to 0 and re-queue to ready-for-steward (full retry)
+      retry force          — override the hard-cap commitment gate (explicit operator intent required)
       abandon          — close the UoW as user-requested failure (blocked → failed)
       defer [note]     — leave in blocked, write a dated audit entry with optional note
+      owner <decision> — record owner decision and re-queue awaiting-owner → ready-for-steward
 
-    All actions operate only on UoWs in `blocked` status — optimistic lock
-    prevents accidental double-writes if the UoW has already been advanced.
+    Most actions operate only on UoWs in `blocked` status. The `owner` action
+    operates only on UoWs in `awaiting-owner` status. Optimistic lock prevents
+    accidental double-writes if the UoW has already been advanced.
 
     Returns a human-readable Telegram message describing the outcome.
     """
     # Support "retry force" as a two-word action token.
     # Support "defer <note>" where any trailing text after "defer" is the note.
+    # Support "owner <decision>" where trailing text is the owner decision note.
     action_normalized = action.lower().strip()
     force_retry = False
     defer_note = ""
+    owner_decision = ""
 
     if action_normalized in ("retry force", "force retry"):
         action_normalized = "retry"
@@ -509,6 +544,10 @@ def handle_decide(uow_id: str, action: str, *, registry: "Registry") -> str:
         # "defer waiting on external review" → action=defer, note="waiting on external review"
         defer_note = action.strip()[len("defer "):].strip()
         action_normalized = "defer"
+    elif action_normalized.startswith("owner "):
+        # "owner proceed with option A" → action=owner, decision="proceed with option A"
+        owner_decision = action.strip()[len("owner "):].strip()
+        action_normalized = "owner"
 
     if action_normalized not in _VALID_DECIDE_ACTIONS:
         valid = ", ".join(sorted(_VALID_DECIDE_ACTIONS))
@@ -536,6 +575,8 @@ def handle_decide(uow_id: str, action: str, *, registry: "Registry") -> str:
             return handle_decide_close(uow_id, registry=registry)
         case "defer":
             return handle_decide_defer(uow_id, defer_note, registry=registry)
+        case "owner":
+            return handle_owner_decide(uow_id, owner_decision, registry=registry)
         case _:
             # Unreachable — guarded by frozenset check above — but satisfies mypy exhaustiveness
             return f"Unhandled action `{action}`."

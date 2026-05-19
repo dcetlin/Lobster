@@ -4209,7 +4209,7 @@ def _write_owner_required_message(uow: UoW, decision_text: str) -> None:
     text = (
         f"UoW awaiting your decision: {uow_title}\n\n"
         f"{decision_text}\n\n"
-        f"To re-queue: reply with the decision and I'll update the UoW."
+        f"Reply with your decision, then use /wos reset {uow_id} to requeue it."
     )
 
     msg_id = str(uuid.uuid4())
