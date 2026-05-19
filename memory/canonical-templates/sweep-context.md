@@ -99,6 +99,63 @@ Before the detection pass on Night 5 (Code layer), run a cron-vs-jobs.json consi
 
 This pre-scan runs before any code-layer detection reading. Its output becomes the structural context for the rest of the Night 5 pass.
 
+### Step 1c-N4: Night 4 Pipeline Pre-flight (Night 4 only)
+
+**Gate: Run this step only on Night 4, before any other Night 4 steps.** Its purpose is to detect setup failures before they surface mid-sweep — a misconfigured pipeline discovered at step 1f is more costly than one found here.
+
+#### Pre-flight checks
+
+**1. Night agreement check**
+
+Read `~/lobster-workspace/hygiene/rotation-state.json` and note the `current_night` value. Independently assess which night this is based on the rotation schedule (count from the last known Night 1 start, or derive from the cycle position). If the two assessments disagree:
+- Log the disagreement in the sweep file: "Pre-flight: rotation-state.json reports Night N but independent assessment indicates Night M. Proceeding with rotation-state.json value as authoritative."
+- Do NOT abort — proceed using the rotation-state.json value. The disagreement is itself an entropy item to include in the Detection Pass.
+
+If the two agree, log: "Pre-flight: Night agreement confirmed (Night 4)."
+
+**2. decay-detector.py existence and runtime check**
+
+Check whether `~/lobster/scheduled-tasks/decay-detector.py` exists:
+- If the file does not exist: log "Pre-flight: decay-detector.py not found — skipping decay detection this run" and continue. Add to Detection Pass as a missing dependency.
+- If the file exists, run it: `uv run ~/lobster/scheduled-tasks/decay-detector.py --dry-run 2>&1 | head -20` (or the appropriate invocation if `--dry-run` is not supported — check the script's `--help` first).
+  - If it runs without error: log "Pre-flight: decay-detector.py ran cleanly."
+  - If it reports an internal state that disagrees with rotation-state.json (e.g., "not Night 4" while rotation-state.json says Night 4): log the disagreement — "Pre-flight: decay-detector.py internal state disagrees with rotation-state.json (script says: [X], state file says: Night 4)." Do NOT abort; log it as an entropy item for the Detection Pass.
+  - If it errors: log the error output and continue. Add to Detection Pass as a broken dependency.
+
+**3. Pipeline Mode B script existence check**
+
+Check whether the Pipeline Mode B script exists. The canonical location is `~/lobster/scheduled-tasks/pipeline-mode-b.py` (or equivalent — check `~/lobster-workspace/scheduled-jobs/jobs.json` for a job referencing "mode-b" or "pipeline" to find the actual path).
+
+- If the script does not exist: log "Pre-flight: Pipeline Mode B script not found. Falling back to inline ripeness classification (Step 1f protocol)." Continue with the inline 1f protocol as normal — the pre-flight makes this explicit rather than a silent gap.
+- If the script exists: log "Pre-flight: Pipeline Mode B script found at [path]." Proceed normally.
+
+**4. Other Night 4 dependency scan**
+
+Scan for any other files referenced in Night 4 steps (Steps 1d, 1e, 1f) before running them:
+- `~/lobster-workspace/hygiene/pipeline-ripeness-state.json` — if absent, note "will be created fresh this run" (not an error)
+- `~/lobster-workspace/hygiene/rotation-state.json` — already checked above
+- Verify `gh` CLI is available and authenticated: `gh auth status 2>&1 | head -5`
+
+If `gh` is not authenticated, log this as a blocking pre-flight failure: "Pre-flight BLOCKED: gh CLI not authenticated — Night 4 issue scan cannot proceed." In this case, write the pre-flight findings to the sweep file, send Ping 1 with "Night 4 aborted: gh authentication failure", and exit without running Steps 1d–1f.
+
+#### Pre-flight output
+
+Write a `## Night 4 Pre-flight` section at the top of the sweep file (before the Detection Pass), with a one-line result for each check:
+
+```markdown
+## Night 4 Pre-flight
+
+- Night agreement: [confirmed / disagreement: state file=N, assessment=M]
+- decay-detector.py: [not found / ran cleanly / internal state disagrees (details) / errored (details)]
+- Pipeline Mode B script: [found at path / not found — falling back to 1f inline protocol]
+- pipeline-ripeness-state.json: [exists / absent — will be created fresh]
+- gh CLI: [authenticated / NOT AUTHENTICATED — blocked]
+```
+
+Only after writing this section and confirming no blocking failures: proceed to Step 1d.
+
+---
+
 ### Step 1d: Memory Pre-Pass (Night 4 only)
 
 Before reading memory entries for Night 4 (Issues + memory domain), run a signal-flood check:
