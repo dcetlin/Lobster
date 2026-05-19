@@ -17,6 +17,7 @@ The dispatcher calls these handlers when it recognizes:
   decide retry <uow-id>                → handle_decide_retry(uow_id, registry)
   decide close <uow-id>                → handle_decide_close(uow_id, registry)
   type: "wos_execute"                  → handle_wos_execute(uow_id, instructions, output_ref)
+  type: "wos_owner_required"           → handle_wos_owner_required(msg)
   type: "callback" (decide_retry/close)→ route_callback_message(msg)
 
 ## Compaction-resilient dispatch
@@ -679,9 +680,14 @@ def handle_wos_execute(uow_id: str, instructions: str, output_ref: str) -> str:
         f'  {{"uow_id": "{uow_id}", "outcome": "complete", "success": true}}\n'
         f'  {{"uow_id": "{uow_id}", "outcome": "failed", "success": false, "reason": "<why>"}}\n'
         f'  {{"uow_id": "{uow_id}", "outcome": "partial", "success": false, "reason": "<what was done and what was not>"}}\n'
-        f'  {{"uow_id": "{uow_id}", "outcome": "blocked", "success": false, "reason": "<what is blocking and why>"}}\n\n'
-        f"Outcome values: \"complete\" | \"partial\" | \"failed\" | \"blocked\"\n"
+        f'  {{"uow_id": "{uow_id}", "outcome": "blocked", "success": false, "reason": "<what is blocking and why>"}}\n'
+        f'  {{"uow_id": "{uow_id}", "outcome": "owner_decision_required", "success": false, "reason": "<what decision is needed and why only the owner can resolve it>"}}\n\n'
+        f"Outcome values: \"complete\" | \"partial\" | \"failed\" | \"blocked\" | \"owner_decision_required\"\n"
         f"\"success\" must be true if and only if outcome == \"complete\".\n\n"
+        f"Use \"owner_decision_required\" only when you have reached a genuine decision point\n"
+        f"that only the owner (Dan) can resolve and you cannot proceed without the answer.\n"
+        f"Do not use it for transient errors or blockers that a retry might resolve — use\n"
+        f"\"blocked\" or \"failed\" for those instead.\n\n"
         f"Steps to write the file:\n"
         f"  1. mkdir -p {'/'.join(output_ref.split('/')[:-1])}\n"
         f"  2. Write JSON to {output_ref}.tmp, then rename to {output_ref}\n\n"
@@ -1098,6 +1104,11 @@ WOS_MESSAGE_TYPE_DISPATCH: dict[str, str] = {
     # Non-fatal write: steward.py swallows inbox write errors so the Done/Failed
     # registry transition is never blocked.
     "wos_done": "handle_wos_done",
+    # Owner escalation: written by steward._write_owner_required_message when a subagent
+    # writes outcome=owner_decision_required in its result file. Fast-path — dispatched
+    # before the spawn-gate; returns action="send_reply" to notify Dan directly.
+    # No subagent spawn required.
+    "wos_owner_required": "handle_wos_owner_required",
 }
 
 
@@ -1994,6 +2005,45 @@ def handle_wos_done(msg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def handle_wos_owner_required(msg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Handle a ``wos_owner_required`` inbox message — owner escalation from a subagent.
+
+    Called by route_wos_message when the dispatcher receives a message written by
+    steward._write_owner_required_message when a subagent writes
+    outcome=owner_decision_required in its result file.
+
+    This handler is a fast-path: it returns action="send_reply" so the dispatcher
+    delivers the pre-formatted owner decision request to Dan directly, without
+    spawning a subagent.
+
+    The UoW has already been transitioned to 'awaiting-owner' status by the steward
+    before this message was written to the inbox. Dan's reply in the primary thread
+    constitutes the decision; the dispatcher can then re-queue the UoW to
+    ready-for-steward with the decision as a note.
+
+    Args:
+        msg: The raw wos_owner_required inbox message dict. Expected fields:
+            - ``text`` (str): Pre-formatted notification text from the steward.
+            - ``chat_id`` (str|int): Admin chat_id to deliver the notification to.
+            - ``uow_id`` (str): The UoW ID — carried for dispatcher reference.
+            - ``uow_title`` (str): UoW summary — carried for dispatcher reference.
+
+    Returns:
+        A dict with action="send_reply" and the notification text.
+    """
+    _default_chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
+    text: str = msg.get("text", "WOS UoW awaiting your decision (no detail available)")
+    chat_id: str = str(msg.get("chat_id", _default_chat_id))
+
+    return {
+        "action": "send_reply",
+        "text": text,
+        "chat_id": chat_id,
+        "message_type": "wos_owner_required",
+    }
+
+
 def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
     """
     Route an inbox message whose `type` is listed in WOS_MESSAGE_TYPE_DISPATCH.
@@ -2169,6 +2219,34 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
                     f"WOS completion ping handler raised an error "
                     f"({type(exc).__name__}: {exc}). "
                     "Completion ping was NOT delivered. Check logs."
+                ),
+                "message_type": msg_type,
+            }
+
+    # ---------------------------------------------------------------------------
+    # wos_owner_required fast-path: written by steward._write_owner_required_message
+    # when a subagent writes outcome=owner_decision_required. The UoW is already
+    # transitioned to awaiting-owner by the steward before this message is written.
+    # Always returns action="send_reply" — no subagent spawn required.
+    # ---------------------------------------------------------------------------
+    if msg_type == "wos_owner_required":
+        try:
+            owner_result = handle_wos_owner_required(msg)
+            owner_result["message_type"] = msg_type
+            return owner_result
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).error(
+                "route_wos_message: handle_wos_owner_required raised %s: %s — "
+                "returning send_reply alert",
+                type(exc).__name__, exc,
+            )
+            return {
+                "action": "send_reply",
+                "text": (
+                    f"WOS owner-required handler raised an error "
+                    f"({type(exc).__name__}: {exc}). "
+                    "Owner notification was NOT delivered. Check logs."
                 ),
                 "message_type": msg_type,
             }

@@ -802,6 +802,23 @@ Injected by the MCP server after every 20 real user messages. Spawn session-note
 
 ---
 
+### wos_owner_required (`type: "wos_owner_required"`)
+
+Written by `steward._write_owner_required_message` when a WOS subagent writes `outcome=owner_decision_required` in its result file. The UoW has already been transitioned to `awaiting-owner` status by the steward before this message arrives. The message is pre-formatted — no subagent spawn needed.
+
+```
+1. mark_processing(message_id)
+2. route_wos_message(msg) → returns action="send_reply" with pre-formatted text
+3. send_reply(chat_id=result["chat_id"], text=result["text"], source="telegram")
+4. mark_processed(message_id)
+```
+
+Dan's reply in the primary thread provides the decision. To re-queue the UoW after receiving the decision, set it back to `ready-for-steward` with the decision as a note.
+
+Implementation: `route_wos_message` is the single entry point. The handler is `handle_wos_owner_required` in `src/orchestration/dispatcher_handlers.py`. Call `route_wos_message(msg)` — do not call `handle_wos_owner_required` directly.
+
+---
+
 ## Message Source Handling
 
 Always pass the correct `source` parameter to `send_reply` — Telegram and Slack messages may arrive interleaved.

@@ -1197,6 +1197,11 @@ def _assess_completion(
                         # Return is_complete=False so the normal prescription path
                         # is skipped; the caller must check executor_outcome for routing.
                         return False, f"outcome=blocked: {reason}", "blocked"
+                    elif outcome == "owner_decision_required":
+                        # Subagent reached a genuine decision point that only the owner
+                        # can resolve.  Return is_complete=False so _process_uow can
+                        # transition the UoW to awaiting-owner instead of re-prescribing.
+                        return False, f"outcome=owner_decision_required: {reason}", "owner_decision_required"
                     elif outcome in ("partial", "failed"):
                         return False, f"outcome={outcome}: {reason}", outcome
                     elif outcome is not None:
@@ -3422,6 +3427,12 @@ def _diagnose_uow(
     if executor_outcome == "blocked" and stuck_condition is None:
         stuck_condition = "executor_blocked"
 
+    # owner_decision_required: subagent escalates to the owner.
+    # Use a dedicated stuck_condition so _process_uow can write the awaiting-owner
+    # inbox message and transition the UoW without consuming the retry budget.
+    if executor_outcome == "owner_decision_required" and stuck_condition is None:
+        stuck_condition = "owner_decision_required"
+
     # Hard cap overrides completion
     if stuck_condition == "hard_cap":
         is_complete = False
@@ -4179,6 +4190,57 @@ def _send_escalation_notification(uow: UoW) -> None:
         log.error("Failed to write WOS escalation message to inbox: %s", e)
 
 
+def _write_owner_required_message(uow: UoW, decision_text: str) -> None:
+    """
+    Write a wos_owner_required inbox message when a subagent escalates with
+    outcome=owner_decision_required.
+
+    The dispatcher handles wos_owner_required as a fast-path send_reply — no
+    subagent spawn needed. The pre-formatted text is delivered directly to Dan
+    via Telegram so he can provide the decision in the primary thread.
+
+    Non-fatal: write errors are logged but do not block the awaiting-owner
+    transition that was already committed before this function is called.
+    """
+    uow_id = uow.id
+    chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", _DAN_CHAT_ID)
+    uow_title = (uow.summary or uow_id)[:200]
+
+    text = (
+        f"UoW awaiting your decision: {uow_title}\n\n"
+        f"{decision_text}\n\n"
+        f"To re-queue: reply with the decision and I'll update the UoW."
+    )
+
+    msg_id = str(uuid.uuid4())
+    msg: dict[str, Any] = {
+        "id": msg_id,
+        "type": "wos_owner_required",
+        "source": "system",
+        "chat_id": chat_id,
+        "timestamp": time.time(),
+        "uow_id": uow_id,
+        "uow_title": uow_title,
+        "text": text,
+    }
+
+    inbox_dir = _INBOX_DIR_PATH
+    try:
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        (inbox_dir / f"{msg_id}.json").write_text(
+            json.dumps(msg, indent=2), encoding="utf-8"
+        )
+        log.info(
+            "wos_owner_required message written to inbox: %s (uow_id=%s)",
+            msg_id, uow_id,
+        )
+    except Exception as e:
+        log.error(
+            "Failed to write wos_owner_required message for UoW %s: %s",
+            uow_id, e,
+        )
+
+
 # ---------------------------------------------------------------------------
 # DB fetch helpers
 # ---------------------------------------------------------------------------
@@ -4343,6 +4405,42 @@ def _process_uow(
         _write_steward_fields(registry, uow_id, steward_agenda=json.dumps(trace_agenda))
 
     # Step 4: Convergence or prescription
+
+    # 4a-pre: owner_decision_required fast-path — handled before the generic stuck
+    # branch because it uses a dedicated awaiting-owner transition rather than the
+    # normal blocked transition and avoids consuming the retry budget.
+    if stuck_condition == "owner_decision_required" and not dry_run:
+        decision_text = diagnosis.completion_rationale or "no decision detail provided"
+        # Record the escalation event in the audit log.
+        registry.append_audit_log(uow_id, {
+            "event": "owner_decision_required",
+            "actor": _ACTOR_STEWARD,
+            "uow_id": uow_id,
+            "decision_text": decision_text,
+            "timestamp": _now_iso(),
+        })
+        # Transition UoW to awaiting-owner via the dedicated registry method.
+        try:
+            registry.set_awaiting_owner(uow_id, decision_text)
+        except Exception as _exc:
+            log.error(
+                "steward: set_awaiting_owner failed for UoW %s — %s: %s; "
+                "falling back to blocked",
+                uow_id, type(_exc).__name__, _exc,
+            )
+            registry.transition(uow_id, _STATUS_BLOCKED, _STATUS_DIAGNOSING)
+        # Write the wos_owner_required inbox message so the dispatcher can
+        # forward it to Dan without spawning a subagent.
+        _write_owner_required_message(uow, decision_text)
+        _append_cycle_trace(
+            uow_id=uow_id,
+            cycle_num=cycles,
+            subagent_excerpt=_read_output_ref(uow.output_ref),
+            return_reason=return_reason or "",
+            next_action="awaiting_owner",
+            artifact_dir=artifact_dir,
+        )
+        return Surfaced(uow_id=uow_id, condition="owner_decision_required")
 
     # 4a: Stuck condition check (fires before completion/prescription)
     if stuck_condition:

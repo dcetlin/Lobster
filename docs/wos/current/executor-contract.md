@@ -24,7 +24,7 @@ The Steward checks both paths, preferring the primary convention.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `uow_id` | `str` | yes | The UoW ID this result belongs to. Must match the UoW record's `id` field — the Steward validates this before reading any other field. |
-| `outcome` | `"complete"` \| `"partial"` \| `"failed"` \| `"blocked"` | yes | Execution outcome (see Failure Taxonomy below). This is the primary signal the Steward routes on. |
+| `outcome` | `"complete"` \| `"partial"` \| `"failed"` \| `"blocked"` \| `"owner_decision_required"` | yes | Execution outcome (see Failure Taxonomy and Steward Interpretation Table below). This is the primary signal the Steward routes on. |
 | `success` | `bool` | yes | Backward-compatibility field. Derived from `outcome == "complete"`. Must be `True` if and only if `outcome == "complete"`. Executors must write both fields consistently. |
 | `reason` | `str` | no | Human-readable explanation for any non-`complete` outcome. Required for `partial`, `failed`, and `blocked`; omitted for `complete`. |
 | `steps_completed` | `int` | no | Number of discrete steps completed before the Executor stopped. Useful for `partial` outcomes and multi-step workflows. |
@@ -39,10 +39,11 @@ from enum import StrEnum
 from dataclasses import dataclass
 
 class ExecutorOutcome(StrEnum):
-    COMPLETE = "complete"
-    PARTIAL  = "partial"
-    FAILED   = "failed"
-    BLOCKED  = "blocked"
+    COMPLETE                = "complete"
+    PARTIAL                 = "partial"
+    FAILED                  = "failed"
+    BLOCKED                 = "blocked"
+    OWNER_DECISION_REQUIRED = "owner_decision_required"
 
     def is_terminal(self) -> bool:
         """True when the Executor considers no further execution possible."""
@@ -102,6 +103,7 @@ The Steward reads the result file in `_assess_completion()` after verifying that
 | `failed` | no | any | Re-diagnose. Prescribe retry or surface to Dan based on `reason` severity. |
 | `blocked` | yes | any | Transition UoW to `blocked` status. Write `reason` to audit log. Surface to Dan with blocked context. Await Dan's `/decide` to resume. |
 | `blocked` | no | any | Same as above. `blocked` always surfaces to Dan — the Executor has determined that external resolution is required. |
+| `owner_decision_required` | any | any | Transition UoW to `awaiting-owner` status. Write a `wos_owner_required` inbox message so the dispatcher can notify Dan directly in the primary thread. Does not consume the retry budget — this is a pause, not a failure. Dan re-queues the UoW (sets back to `ready-for-steward` with the decision as a note) or marks it done. |
 | *(file absent)* | yes | < 5 | Steward cannot declare done. Treat as inconclusive. Increment `steward_cycles`, prescribe investigation or retry. |
 | *(file absent)* | yes | >= 5 | Hard cap reached. Surface to Dan. This is a contract violation — the Executor did not write a result file. |
 | *(file absent)* | no | any | Fall back to posture-based heuristic (Phase 1 / legacy UoWs only). Write `success_criteria_missing` audit entry. |
@@ -109,6 +111,7 @@ The Steward reads the result file in `_assess_completion()` after verifying that
 **Key invariants:**
 - The Steward never reads `success` without first checking `outcome`. `success` is a backward-compat convenience field; `outcome` is the routing signal.
 - `blocked` always routes to Dan — no prescription is possible without external resolution.
+- `owner_decision_required` pauses the UoW without consuming the retry budget. Use it only for genuine owner-level decisions — not for blockers that a retry might resolve.
 - Absence of the result file when `success_criteria` is present is a contract violation, not an ambiguous state.
 
 ---
