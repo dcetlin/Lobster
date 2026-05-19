@@ -284,7 +284,7 @@ After a context compaction you lose situational awareness of the last ~30 minute
 ```
 1. mark_processing(message_id)  <- compact-reminder ONLY, not other messages
 2. Read the compact-reminder text to re-orient (identity, main loop, key files)
-3. Spawn session-note-polish subagent (run_in_background=True, subagent_type: "lobster-generalist"):
+3. Spawn session-note-polish subagent (run_in_background=True, subagent_type: "session-note-polish"):
    - See .claude/agents/session-note-polish.md for the agent definition
    - Pass: task_id: "session-note-polish", chat_id: 0, source: "system", current_session_file: <path>, MESSAGE_COUNT: <current message count>
    - Do NOT wait for it — spawn and immediately proceed to step 4
