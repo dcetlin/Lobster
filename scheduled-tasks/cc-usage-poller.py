@@ -35,8 +35,8 @@ dispatcher involvement). The jobs.json enabled gate is checked at the top
 of main() so that runtime enable/disable is respected without touching cron.
 
 Session cookie:
-    Store the sessionKey cookie value (from claude.ai DevTools → Application
-    → Cookies → sessionKey) in ~/lobster-user-config/cc-usage-session-cookie
+    Store the sessionKey cookie value (from https://claude.ai/settings/usage)
+    in ~/lobster-user-config/cc-usage-session-cookie
     as a single plain-text line with no quotes.
 
 Dependencies (auto-installed by uv):
@@ -120,7 +120,7 @@ COOKIE_EXPIRY_SENTINEL_PREFIX = "/tmp/cc-usage-cookie-expired-alert-"
 COOKIE_EXPIRY_ALERT_TEXT = (
     "CC usage cookie expired — paste a new session key into "
     "~/lobster-user-config/cc-usage-session-cookie\n\n"
-    "Get it from: claude.ai -> DevTools -> Application -> Cookies -> sessionKey"
+    "Get it from: https://claude.ai/settings/usage"
 )
 
 # ---------------------------------------------------------------------------
@@ -463,7 +463,7 @@ def main(dry_run: bool = False) -> int:
     if cookie is None:
         log.warning(
             "Session cookie not configured. Create %s and paste your claude.ai "
-            "sessionKey cookie value (from DevTools -> Application -> Cookies -> sessionKey). "
+            "sessionKey cookie value (from https://claude.ai/settings/usage). "
             "Skipping this run.",
             COOKIE_CONFIG_PATH,
         )
@@ -488,7 +488,7 @@ def main(dry_run: bool = False) -> int:
         if http_code in (401, 403):
             log.error(
                 "Auth error %d from claude.ai — session cookie may be expired. "
-                "Refresh it: DevTools -> Application -> Cookies -> sessionKey -> copy value -> "
+                "Refresh it: https://claude.ai/settings/usage -> copy value -> "
                 "paste into %s",
                 http_code,
                 COOKIE_CONFIG_PATH,
