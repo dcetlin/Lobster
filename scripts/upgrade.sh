@@ -912,6 +912,22 @@ restart_services() {
     fi
 
     info "Note: lobster-claude restart skipped — the dispatcher restarts itself on the next message cycle."
+    info ""
+    info "Some upgrades require a manual restart. The correct restart type depends on what changed:"
+    info ""
+    info "  MCP server configuration (lobster-mcp-local.service, mcp_config.json, MCP server source files):"
+    info "    Restart the MCP server: ~/lobster/scripts/restart-mcp.sh"
+    info "    (Never run 'sudo systemctl restart lobster-mcp-local' directly — use the safe wrapper.)"
+    info ""
+    info "  Agent bootup files (.claude/sys.*.bootup.md, ~/lobster-user-config/agents/*.bootup.md,"
+    info "    CLAUDE.md) or hook scripts (hooks/*.py, .claude/settings.json hook entries):"
+    info "    A new dispatcher session is required — these are loaded at session start and cannot be"
+    info "    reloaded mid-session. Restart the Claude Code dispatcher:"
+    info "      sudo systemctl restart lobster-claude"
+    info "    (This restarts the dispatcher process, not the MCP server — it is safe to run directly.)"
+    info ""
+    info "  Python logic, migrations, job files, scheduled tasks:"
+    info "    No manual restart needed — the dispatcher picks up changes on the next message cycle."
 
     log_to_file "Services restarted"
 }
@@ -4465,6 +4481,18 @@ main() {
     if [ "$ERRORS" -gt 0 ]; then
         error "$ERRORS error(s) during upgrade"
     fi
+    echo ""
+    echo -e "${YELLOW}Post-upgrade checklist:${NC}"
+    echo "  If this upgrade changed MCP server config (mcp_config.json, lobster-mcp-local.service):"
+    echo "    Run: ~/lobster/scripts/restart-mcp.sh"
+    echo ""
+    echo "  If this upgrade changed bootup files (.claude/sys.*.bootup.md, user bootup files,"
+    echo "    CLAUDE.md) or hook scripts (hooks/*.py, .claude/settings.json hook entries):"
+    echo "    Run: sudo systemctl restart lobster-claude"
+    echo "    (Restarts the dispatcher session so it loads the new files at startup.)"
+    echo ""
+    echo "  If this upgrade only changed Python logic, migrations, or job files:"
+    echo "    No manual restart needed — the dispatcher picks up changes on the next message cycle."
     echo ""
 
     cleanup_lock
