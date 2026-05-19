@@ -696,13 +696,11 @@ def main() -> int:
     # reliable proxy for context pressure and a contributing cause of the
     # 2026-04 restart storm (WOS running at full speed → faster compaction cycles).
     #
-    # Raised from 5 → 20 (2026-05-19): the old threshold of 5 caused the pipeline
-    # to stall when 5 long-running "executing" UoWs occupied session slots but had
-    # no live subagents — the heartbeat sidecar kept their heartbeat_at fresh,
-    # preventing TTL recovery. With 168 UoWs ready-for-steward and only 1 real
-    # session active, the effective cap was 5, blocking all new dispatch.
-    # The quota gate (CC quota, GitHub rate limit) remains the real throttle;
-    # this threshold is now a safety backstop rather than an active dispatch cap.
+    # get_active_sessions() reads agent_sessions (Claude session store), not
+    # uow_registry executing status — these are separate tracking systems.
+    # Real throttles: CC quota gate (90%) and GitHub rate limit gate. This
+    # threshold is a safety backstop against session accumulation (e.g. orphaned
+    # agent_sessions rows from subagents that died without writing results).
     #
     # TTL recovery (Phase 1) and heartbeat sidecar (Phase 1b) always run above —
     # only new dispatch is throttled here.
