@@ -41,6 +41,8 @@ import json
 import logging
 import os
 import sys
+import traceback
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from enum import StrEnum
@@ -81,8 +83,62 @@ logging.basicConfig(
 )
 log = logging.getLogger("steward-heartbeat")
 
+# Admin chat_id for crash alerts (env-injected, falls back to hardcoded)
+_ADMIN_CHAT_ID: str = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
+
 
 # ---------------------------------------------------------------------------
+# Crash alert — write a system inbox message so the dispatcher relays it to Dan
+# ---------------------------------------------------------------------------
+
+def _write_crash_alert(job_name: str, exc: BaseException, extra: str = "") -> None:
+    """Write a scheduled_task_crash inbox message so the dispatcher alerts Dan.
+
+    This is a best-effort fire-and-forget write. Failures here are logged but
+    do not mask the original exception — the caller must re-raise or sys.exit
+    after calling this function.
+
+    The inbox message shape is intentionally simple: source=system,
+    type=scheduled_task_crash, text=human-readable alert. The dispatcher's
+    LLM loop reads the message and relays it to Dan as a Telegram notification.
+    """
+    tb_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    tb_str = "".join(tb_lines).strip()
+    # Truncate traceback to avoid oversized messages (keep last 2000 chars)
+    if len(tb_str) > 2000:
+        tb_str = "...(truncated)...\n" + tb_str[-2000:]
+
+    text = (
+        f"[CRASH] {job_name} crashed with {type(exc).__name__}: {exc}\n\n"
+        f"```\n{tb_str}\n```"
+    )
+    if extra:
+        text += f"\n\n{extra}"
+
+    msg_id = str(uuid.uuid4())
+    msg = {
+        "id": msg_id,
+        "source": "system",
+        "type": "scheduled_task_crash",
+        "chat_id": _ADMIN_CHAT_ID,
+        "job_name": job_name,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "text": text,
+    }
+
+    try:
+        messages_base = Path(os.environ.get("LOBSTER_MESSAGES", Path.home() / "messages"))
+        inbox_dir = messages_base / "inbox"
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = inbox_dir / f"{msg_id}.json.tmp"
+        dest_path = inbox_dir / f"{msg_id}.json"
+        tmp_path.write_text(json.dumps(msg, indent=2), encoding="utf-8")
+        tmp_path.rename(dest_path)
+        log.info("Crash alert written to inbox (%s)", msg_id)
+    except Exception as write_exc:
+        log.error("Failed to write crash alert to inbox: %s", write_exc)
+
+
 # ---------------------------------------------------------------------------
 # Named constants
 # ---------------------------------------------------------------------------
@@ -923,6 +979,16 @@ def main() -> int:
 
     Returns exit code: 0 on success, 1 on unhandled error.
     """
+    try:
+        return _main_inner()
+    except Exception as exc:
+        log.error("steward-heartbeat crashed with unhandled exception: %s", exc, exc_info=True)
+        _write_crash_alert(job_name="steward-heartbeat", exc=exc)
+        return 1
+
+
+def _main_inner() -> int:
+    """Inner implementation of main() — wrapped by main() for crash alerting."""
     parser = argparse.ArgumentParser(description="Steward Heartbeat — WOS Phase 2")
     parser.add_argument(
         "--dry-run",
