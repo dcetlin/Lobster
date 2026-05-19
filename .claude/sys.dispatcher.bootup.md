@@ -479,6 +479,26 @@ Background subagents call `write_result(task_id, chat_id, text, ...)`, which dro
            pr_parts = pr_url.rstrip("/").split("/")
            pr_number = pr_parts[-1]
            pr_repo = f"{pr_parts[-4]}/{pr_parts[-3]}"
+
+           # WOS PR coordinator fast-path: WOS-originated PRs bypass the review
+           # agent and go directly to the coordinator which owns oracle→fix→merge.
+           from src.orchestration.dispatcher_handlers import route_wos_pr_result
+           wos_routing = route_wos_pr_result(
+               pr_url=pr_url,
+               task_id=msg.get("task_id"),
+               chat_id=msg["chat_id"],
+               result_text=msg["text"],
+           )
+           if wos_routing["action"] == "spawn_subagent":
+               Task(
+                   subagent_type=wos_routing["agent_type"],
+                   run_in_background=True,
+                   prompt=wos_routing["prompt"],
+               )
+               mark_processed(message_id)
+               continue
+           # else: task_id does not start with "wos-" — fall through to review agent
+
            # Dedup check: skip if reviewer already running for this PR
            active = get_active_sessions()
            reviewer_task_id = f"review-{msg.get('task_id', 'unknown')}"
