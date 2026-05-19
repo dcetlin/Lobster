@@ -324,7 +324,13 @@ def run_ttl_recovery(registry, dry_run: bool = False) -> list[str]:
     In dry_run mode: queries but does NOT transition any UoW.
     Returns the list of recovered uow_ids (empty on dry_run or nothing to recover).
     """
-    from src.orchestration.executor import TTL_EXCEEDED_HOURS, recover_ttl_exceeded_uows
+    try:
+        from src.orchestration.executor import TTL_EXCEEDED_HOURS, recover_ttl_exceeded_uows
+    except ImportError:
+        log.warning(
+            "TTL recovery skipped — TTL_EXCEEDED_HOURS not available in executor.py (see #1216)"
+        )
+        return []
     import sqlite3
     from datetime import datetime, timezone, timedelta
 
