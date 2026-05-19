@@ -517,10 +517,80 @@ Background subagents call `write_result(task_id, chat_id, text, ...)`, which dro
                mark_processed(message_id)
            continue
 
+       # --- METABOLIC CLASSIFICATION (src/orchestration/metabolic_router.py) ---
+       # Apply classify_result() heuristics to the result text before relaying.
+       # Rules are documented in metabolic_router.py — apply them cognitively in order:
+       #   1. HEAT  : len < 120 and no artifact signals
+       #   2. PEARL : task_id starts with "review-" AND "VERDICT: APPROVED" in text
+       #   3. PEARL : len > 800 AND 2+ artifact signals (URLs, #refs, /home/ paths, PR #N)
+       #   4. SEED  : forward-trajectory language ("could", "next step", etc.) AND len < 600
+       #   5. SHIT  : failure vocabulary ("failed", "traceback", etc.) AND no "VERDICT: APPROVED"
+       #   6. JUICE : len > 400 AND forward-trajectory AND artifact signals (not caught by SEED)
+       #   7. MIXED : default
+       #
+       # ARTIFACT_PATTERNS: https?://\S+  |  #\d{2,5}\b  |  /home/\S+  |  oracle/verdicts/  |  VERDICT:  |  PR #\d+  |  Issue #\d+
+       #
+       result_text = msg["text"]
+       task_id_for_cls = msg.get("task_id", "")
+       cls_result = classify_result(result_text, task_id_for_cls, {})  # apply rules above
+       # cls_result.cls is one of: pearl, seed, shit, heat, juice, mixed
+       # cls_result.artifacts is the list of extracted artifact strings
+       # cls_result.provisional is always True in cycle 1
+       #
+       prefix_map = {
+           "pearl": "🔵 Pearl",
+           "seed":  "🌱 Seed",
+           "shit":  "⚠️ Issue",
+           "heat":  None,    # relay as-is
+           "juice": "⚡ Juice",
+           "mixed": None,    # relay as-is
+       }
+       cls_prefix = prefix_map.get(cls_result.cls if isinstance(cls_result, object) else str(cls_result), None)
+       reply_text = f"[{cls_prefix}] {result_text}" if cls_prefix else result_text
+       #
+       # Pearl: dispatch background preservation agent
+       if (cls_result.cls if hasattr(cls_result, "cls") else cls_result) == "pearl":
+           pearl_task_id = f"preserve-pearl-{task_id_for_cls[:20]}"
+           pearl_date = datetime.utcnow().strftime("%Y%m%d")
+           pearl_file = f"~/lobster-user-config/memory/canonical/pearls/pearl-{task_id_for_cls}-{pearl_date}.md"
+           artifacts_yaml = "\n".join(f"  - {a}" for a in (cls_result.artifacts if hasattr(cls_result, "artifacts") else []))
+           cls_confidence = cls_result.confidence if hasattr(cls_result, "confidence") else 0.0
+           cls_rationale = cls_result.rationale if hasattr(cls_result, "rationale") else ""
+           Task(
+               subagent_type="lobster-generalist",
+               run_in_background=True,
+               prompt=(
+                   f"---\ntask_id: {pearl_task_id}\nchat_id: 0\nsource: system\n---\n\n"
+                   f"Write a structured pearl record. Create directory if needed.\n\n"
+                   f"1. Write this file: {pearl_file}\n\n"
+                   f"```\n---\nsource_task_id: {task_id_for_cls}\n"
+                   f"produced_at: {datetime.utcnow().isoformat()}Z\n"
+                   f"classification_confidence: {cls_confidence}\n"
+                   f"rationale: {cls_rationale}\n"
+                   f"artifacts:\n{artifacts_yaml}\n"
+                   f"tags: [pearl]\n---\n\n"
+                   f"# Pearl: {task_id_for_cls}\n\n{result_text}\n```\n\n"
+                   f"2. Call memory_store with tags=['pearl', '{task_id_for_cls}'] and the full result text above.\n\n"
+                   f"Minimum viable output: markdown file written and memory_store called.\n"
+                   f"Boundary: do not send_reply to the user — background preservation only.\n"
+                   f"Call write_result(task_id='{pearl_task_id}', sent_reply_to_user=False, status='success') when done."
+               ),
+           )
+       #
+       # Shit: append to sweep-candidates.jsonl (fire-and-forget Bash append, no LLM)
+       if (cls_result.cls if hasattr(cls_result, "cls") else cls_result) == "shit":
+           import json as _json
+           _sweep_entry = _json.dumps({
+               "task_id": task_id_for_cls,
+               "flagged_at": datetime.utcnow().isoformat() + "Z",
+               "reason": "metabolic-shit",
+               "text_preview": result_text[:200],
+           })
+           Bash(f"echo '{_sweep_entry}' >> ~/lobster-workspace/data/sweep-candidates.jsonl")
+       #
        # --- RELAY ---
        # Never call Read(artifact_path) on the main thread — it violates the 7-second rule.
        # Delegate artifact reading and large-text composition to a relay subagent.
-       reply_text = msg["text"]
 
        if msg.get("artifacts"):
            # Artifacts present: delegate reading and composition to relay subagent

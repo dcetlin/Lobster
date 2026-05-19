@@ -111,6 +111,12 @@ CREATE TABLE IF NOT EXISTS uow_registry (
     --   Steward-private (excluded from executor_uow_view). Data collection only — no gating logic.
     prescription_confidence REAL NULL,
 
+    -- claimed_until: ISO timestamp set by the Executor when dispatching a UoW
+    --   (transition_to_executing). Cleared on completion (complete_uow) or failure (fail_uow).
+    --   If now() > claimed_until, the claim has expired and the UoW is reclaimable by the
+    --   next executor-heartbeat cycle — no separate recovery job needed.
+    claimed_until TEXT NULL,
+
     UNIQUE(source_issue_number, sweep_date)
 );
 -- vision_ref: JSON {layer, field, statement, anchored_at}

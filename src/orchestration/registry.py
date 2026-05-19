@@ -1351,6 +1351,69 @@ class Registry:
         finally:
             conn.close()
 
+    def reset_expired_claims(self) -> list[str]:
+        """
+        Reset UoWs whose visibility-timeout (claimed_until) has expired back to
+        'ready-for-executor' so the next executor-heartbeat cycle can re-dispatch them.
+
+        A UoW claim expires when:
+          status IN ('active', 'executing')
+          AND claimed_until IS NOT NULL
+          AND claimed_until < datetime('now')
+
+        Supersedes the started_at-based recover_ttl_exceeded_uows() approach:
+        claimed_until is set to 2× estimated_runtime at dispatch time, so expiry
+        means the agent had enough headroom and genuinely stalled or crashed.
+
+        Returns the list of uow_ids that were reset (may be empty).
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT id FROM uow_registry
+                WHERE status IN ('active', 'executing')
+                  AND claimed_until IS NOT NULL
+                  AND claimed_until < datetime('now')
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+
+        reset_ids: list[str] = []
+        for row in rows:
+            uow_id = row["id"]
+            conn2 = self._connect()
+            try:
+                now = _now_iso()
+                conn2.execute("BEGIN IMMEDIATE")
+                conn2.execute(
+                    """
+                    INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                    VALUES (?, ?, 'claim_expired', NULL, 'ready-for-executor', 'executor', ?)
+                    """,
+                    (now, uow_id, json.dumps({"actor": "executor", "reason": "claimed_until expired", "timestamp": now})),
+                )
+                cursor = conn2.execute(
+                    """
+                    UPDATE uow_registry
+                    SET status = 'ready-for-executor', claimed_until = NULL, updated_at = ?
+                    WHERE id = ? AND status IN ('active', 'executing') AND claimed_until < datetime('now')
+                    """,
+                    (now, uow_id),
+                )
+                if cursor.rowcount == 1:
+                    conn2.commit()
+                    reset_ids.append(uow_id)
+                else:
+                    conn2.rollback()
+            except Exception:
+                conn2.rollback()
+            finally:
+                conn2.close()
+
+        return reset_ids
+
     def get_started_at(self, uow_id: str) -> str | None:
         """
         Return the started_at timestamp string for a UoW, or None if the UoW
@@ -1825,6 +1888,13 @@ class Registry:
         conn = self._connect()
         try:
             now = _now_iso()
+            # claimed_until = 2× estimated_runtime from the UoW, fallback 3600s.
+            row = conn.execute(
+                "SELECT estimated_runtime FROM uow_registry WHERE id = ?", (uow_id,)
+            ).fetchone()
+            estimated_runtime = (row["estimated_runtime"] if row else None) or 3600
+            dispatch_ttl = int(estimated_runtime) * 2
+            claimed_until = (datetime.now(timezone.utc) + timedelta(seconds=dispatch_ttl)).isoformat()
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
@@ -1834,8 +1904,8 @@ class Registry:
                 (now, uow_id, json.dumps({"actor": "executor", "executor_id": executor_id, "timestamp": now})),
             )
             conn.execute(
-                "UPDATE uow_registry SET status = 'executing', updated_at = ? WHERE id = ?",
-                (now, uow_id),
+                "UPDATE uow_registry SET status = 'executing', claimed_until = ?, updated_at = ? WHERE id = ?",
+                (claimed_until, now, uow_id),
             )
             conn.commit()
         except Exception:
@@ -1906,7 +1976,8 @@ class Registry:
                 UPDATE uow_registry
                 SET status = 'ready-for-steward', updated_at = ?, completed_at = ?,
                     token_usage = COALESCE(?, token_usage),
-                    outcome_category = COALESCE(?, outcome_category)
+                    outcome_category = COALESCE(?, outcome_category),
+                    claimed_until = NULL
                 WHERE id = ?
                 """,
                 (now, now, token_usage, outcome_category, uow_id),
@@ -2108,7 +2179,7 @@ class Registry:
                 (now, uow_id, current_status, json.dumps({"actor": "executor", "reason": reason, "timestamp": now})),
             )
             conn.execute(
-                "UPDATE uow_registry SET status = 'failed', updated_at = ? WHERE id = ?",
+                "UPDATE uow_registry SET status = 'failed', updated_at = ?, claimed_until = NULL WHERE id = ?",
                 (now, uow_id),
             )
             conn.commit()
