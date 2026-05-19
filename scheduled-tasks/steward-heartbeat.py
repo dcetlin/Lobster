@@ -683,6 +683,126 @@ _BACKLOG_STATE_MAX_AGE_SECONDS: int = 900  # 15 min — reset history if gap exc
 
 
 @dataclass(frozen=True, slots=True)
+class SidecarMaskedResult:
+    """Pure result value returned by detect_sidecar_masked_uows."""
+    checked: int
+    recovered: int
+    skipped_dry_run: int
+
+
+# Grace window (seconds) before a UoW is eligible for sidecar-mask detection.
+# Matches the 5-minute threshold in the multiposture spec §2.3: a UoW must be
+# older than this before we expect its agent to have written a heartbeat.
+SIDECAR_MASK_MIN_AGE_SECONDS: int = 300
+
+
+def detect_sidecar_masked_uows(
+    registry,
+    dry_run: bool = False,
+    min_age_seconds: int = SIDECAR_MASK_MIN_AGE_SECONDS,
+) -> SidecarMaskedResult:
+    """
+    Detect and re-queue UoWs that are sidecar-masked (orphan_kill_before_start).
+
+    A sidecar-masked UoW has fresh heartbeat_at (written by the sidecar every
+    3 minutes) but no agent-originated entries in uow_heartbeat_log (no rows
+    with token_usage IS NOT NULL after the dispatch grace window). This means
+    the sidecar is masking a dead agent — the agent never ran or died before
+    its first write_heartbeat call.
+
+    This is the Change 1b detection path from the multi-posture spec §2.3:
+    the discriminator is token_usage presence in uow_heartbeat_log, not the
+    freshness of heartbeat_at.
+
+    Detection condition (all must hold):
+    - status IN ('active', 'executing')
+    - updated_at < now - min_age_seconds (past the startup grace window)
+    - No uow_heartbeat_log rows with token_usage IS NOT NULL after dispatch
+
+    Recovery action: transition to 'ready-for-steward' via
+    record_sidecar_masked_stall(), which writes a stall_detected audit entry
+    with stall_type='sidecar_masked'.
+
+    In dry_run mode: detects candidates but does NOT write audit entries or
+    transition status. Returns count in skipped_dry_run.
+
+    Args:
+        registry: WOSRegistry instance.
+        dry_run: If True, detect only — no state transitions.
+        min_age_seconds: Minimum UoW age before eligibility. Default 300s.
+
+    Returns:
+        SidecarMaskedResult(checked, recovered, skipped_dry_run).
+    """
+    try:
+        candidates = registry.get_sidecar_masked_uows(min_age_seconds=min_age_seconds)
+    except Exception as e:
+        log.warning("Sidecar-masked detection: failed to query candidates — %s", e)
+        return SidecarMaskedResult(checked=0, recovered=0, skipped_dry_run=0)
+
+    recovered = 0
+    skipped_dry_run = 0
+
+    for uow in candidates:
+        uow_id = uow.id if not isinstance(uow, dict) else uow["id"]
+
+        # Compute age for logging.
+        age_seconds: float = 0.0
+        try:
+            updated_at = uow.updated_at if not isinstance(uow, dict) else uow["updated_at"]
+            if updated_at:
+                age_seconds = (_utc_now() - _parse_iso(updated_at)).total_seconds()
+        except (ValueError, TypeError, AttributeError):
+            pass
+
+        if dry_run:
+            log.info(
+                "Sidecar-masked (DRY RUN): UoW %s would be re-queued "
+                "(age=%.0fs, no agent-originated heartbeats in uow_heartbeat_log)",
+                uow_id, age_seconds,
+            )
+            skipped_dry_run += 1
+            continue
+
+        try:
+            rows = registry.record_sidecar_masked_stall(
+                uow_id=uow_id,
+                age_seconds=age_seconds,
+            )
+        except Exception as e:
+            log.warning(
+                "Sidecar-masked: failed to re-queue UoW %s — %s",
+                uow_id, e,
+            )
+            continue
+
+        if rows == 1:
+            recovered += 1
+            log.warning(
+                "Sidecar-masked: UoW %s re-queued to ready-for-steward "
+                "(stall_type=sidecar_masked, age=%.0fs, "
+                "no agent-originated heartbeats found after grace window)",
+                uow_id, age_seconds,
+            )
+            _append_observation(
+                f"sidecar_masked: UoW {uow_id} re-queued — "
+                f"no agent heartbeats in uow_heartbeat_log after {int(age_seconds)}s "
+                f"(orphan_kill_before_start)"
+            )
+        else:
+            log.debug(
+                "Sidecar-masked: race on UoW %s — already advanced (rows_affected=0)",
+                uow_id,
+            )
+
+    return SidecarMaskedResult(
+        checked=len(candidates),
+        recovered=recovered,
+        skipped_dry_run=skipped_dry_run,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class StuckHeartbeatResult:
     """Pure result value returned by detect_stuck_heartbeat_uows."""
     checked: int
@@ -1080,6 +1200,23 @@ def _main_inner() -> int:
         )
     except Exception:
         log.exception("Heartbeat stall recovery failed — continuing to Steward main loop")
+
+    # Phase 2b-ii: Sidecar-masked detection (Change 1b, multiposture-spec §2.3).
+    # Detects UoWs where heartbeat_at appears fresh (sidecar writes) but no
+    # agent-originated heartbeats exist in uow_heartbeat_log. These UoWs are
+    # classified as orphan_kill_before_start and re-queued regardless of
+    # heartbeat_at freshness.
+    # Requires: migration 0017 (uow_heartbeat_log table).
+    log.info("--- Phase 2b-ii: Sidecar-masked detection ---")
+    try:
+        masked_result = detect_sidecar_masked_uows(registry, dry_run=dry_run)
+        log.info(
+            "Sidecar-masked detection complete: %d checked, %d recovered, "
+            "%d skipped (dry-run)",
+            masked_result.checked, masked_result.recovered, masked_result.skipped_dry_run,
+        )
+    except Exception:
+        log.exception("Sidecar-masked detection failed — continuing to Steward main loop")
 
     # Phase 2c: Stuck-agent detection — progress governor (migration 0017, issue #994).
     # Agents that write heartbeats while consuming no tokens are alive but not progressing.
