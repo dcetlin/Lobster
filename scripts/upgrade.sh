@@ -4234,6 +4234,18 @@ PYEOF
         substep "Migration 119: execution_enabled=false — leaving timers disabled (pipeline is paused)"
     fi
 
+    # Migration 120: Add orchestration/artifacts/ daily cleanup cron entry.
+    local ARTIFACTS_CLEANUP_MARKER="# LOBSTER-ORCHESTRATION-ARTIFACTS-CLEANUP"
+    if ! crontab -l 2>/dev/null | grep -q "$ARTIFACTS_CLEANUP_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$ARTIFACTS_CLEANUP_MARKER" \
+            "15 3 * * * cd $HOME/lobster && $HOME/.local/bin/uv run scheduled-tasks/orchestration-artifacts-cleanup.py >> $WORKSPACE_DIR/scheduled-jobs/logs/orchestration-artifacts-cleanup.log 2>&1 $ARTIFACTS_CLEANUP_MARKER" \
+            && substep "Migration 120: added orchestration-artifacts-cleanup cron entry (daily 03:15 UTC)" \
+            || warn "Migration 120: could not add cron entry — run: cron-manage.sh add '$ARTIFACTS_CLEANUP_MARKER' '15 3 * * * cd \$HOME/lobster && uv run scheduled-tasks/orchestration-artifacts-cleanup.py >> \$HOME/lobster-workspace/scheduled-jobs/logs/orchestration-artifacts-cleanup.log 2>&1 $ARTIFACTS_CLEANUP_MARKER'"
+        migrated=$((migrated + 1))
+    else
+        substep "Migration 120: orchestration-artifacts-cleanup cron entry already present"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
