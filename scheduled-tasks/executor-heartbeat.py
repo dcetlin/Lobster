@@ -696,9 +696,15 @@ def main() -> int:
     # reliable proxy for context pressure and a contributing cause of the
     # 2026-04 restart storm (WOS running at full speed → faster compaction cycles).
     #
+    # get_active_sessions() reads agent_sessions (Claude session store), not
+    # uow_registry executing status — these are separate tracking systems.
+    # Real throttles: CC quota gate (90%) and GitHub rate limit gate. This
+    # threshold is a safety backstop against session accumulation (e.g. orphaned
+    # agent_sessions rows from subagents that died without writing results).
+    #
     # TTL recovery (Phase 1) and heartbeat sidecar (Phase 1b) always run above —
     # only new dispatch is throttled here.
-    CONTEXT_PRESSURE_AGENT_THRESHOLD: int = 5
+    CONTEXT_PRESSURE_AGENT_THRESHOLD: int = 20
     try:
         from src.agents.session_store import get_active_sessions
         active_session_count = len(get_active_sessions())
