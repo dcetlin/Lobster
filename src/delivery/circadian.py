@@ -23,7 +23,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from utils.timezone import get_owner_zoneinfo as _get_owner_zoneinfo
+from src.utils.timezone import get_owner_zoneinfo as _get_owner_zoneinfo
 
 # Keywords that signal an urgent job output (health failures, system alerts).
 # Checked case-insensitively against message text.
