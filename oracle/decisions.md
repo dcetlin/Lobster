@@ -417,3 +417,17 @@ If sweep quality degrades, the correct response is to add a signal-quality check
 ### Interaction with Cultivator Dedup
 
 On its next cycle, the cultivator's `promote_to_wos()` will encounter sweep-promoted UoWs via `registry.upsert()`'s non-terminal pre-check. These will be returned as `SKIPPED_DEDUP`. No duplicate UoWs will be created. The cultivator and sweep promoter are independent and dedup correctly.
+
+---
+
+## Reference: WOS PR Results Route to wos-pr-coordinator Agent
+
+**Date:** 2026-05-19
+**PR:** #1223 (feat/wos: WOS PR pipeline coordinator)
+**Full decision:** `oracle/decisions/decision-wos-pr-coordinator.md`
+
+WOS PR results (`task_id.startswith("wos-")`) now route to the `wos-pr-coordinator`
+agent instead of spawning an oracle review agent directly. Non-WOS PRs fall through
+to the existing review agent path unchanged. This is a durable behavioral default
+change anchored to vision.yaml principle-3 and principle-4. See the full decision
+file for constraint-3 authorization and vision anchors.

@@ -479,6 +479,26 @@ Background subagents call `write_result(task_id, chat_id, text, ...)`, which dro
            pr_parts = pr_url.rstrip("/").split("/")
            pr_number = pr_parts[-1]
            pr_repo = f"{pr_parts[-4]}/{pr_parts[-3]}"
+
+           # WOS PR coordinator fast-path: WOS-originated PRs bypass the review
+           # agent and go directly to the coordinator which owns oracle→fix→merge.
+           from src.orchestration.dispatcher_handlers import route_wos_pr_result
+           wos_routing = route_wos_pr_result(
+               pr_url=pr_url,
+               task_id=msg.get("task_id"),
+               chat_id=msg["chat_id"],
+               result_text=msg["text"],
+           )
+           if wos_routing["action"] == "spawn_subagent":
+               Task(
+                   subagent_type=wos_routing["agent_type"],
+                   run_in_background=True,
+                   prompt=wos_routing["prompt"],
+               )
+               mark_processed(message_id)
+               continue
+           # else: task_id does not start with "wos-" — fall through to review agent
+
            # Dedup check: skip if reviewer already running for this PR
            active = get_active_sessions()
            reviewer_task_id = f"review-{msg.get('task_id', 'unknown')}"
@@ -705,6 +725,22 @@ Dead/failed agent events routed by the reconciler. These are system-internal —
 
 ---
 
+### scheduled_task_crash (`type: "scheduled_task_crash"`)
+
+Written by heartbeat scripts (`executor-heartbeat.py`, `steward-heartbeat.py`) when `main()` raises an unhandled exception. The script catches the exception in its outer crash handler, writes this inbox message, and exits with code 1.
+
+```
+1. mark_processing(message_id)
+2. send_reply(chat_id=msg["chat_id"], text=msg["text"])
+3. mark_processed(message_id)
+```
+
+**Key fields:** `job_name` (which heartbeat crashed), `text` (human-readable crash summary with traceback, pre-formatted for Telegram).
+
+No subagent needed — relay the `text` field directly. The crash alert is already formatted for user delivery by the heartbeat script.
+
+---
+
 ### cron_reminder (`type: "cron_reminder"`)
 
 System cron jobs write a `cron_reminder` when they finish. Always delegate output triage to a subagent.
@@ -783,6 +819,23 @@ Injected by the MCP server after every 20 real user messages. Spawn session-note
            pending_responses: <pending_responses list from step 3>
 5. mark_processed(message_id)
 ```
+
+---
+
+### wos_owner_required (`type: "wos_owner_required"`)
+
+Written by `steward._write_owner_required_message` when a WOS subagent writes `outcome=owner_decision_required` in its result file. The UoW has already been transitioned to `awaiting-owner` status by the steward before this message arrives. The message is pre-formatted — no subagent spawn needed.
+
+```
+1. mark_processing(message_id)
+2. route_wos_message(msg) → returns action="send_reply" with pre-formatted text
+3. send_reply(chat_id=result["chat_id"], text=result["text"], source="telegram")
+4. mark_processed(message_id)
+```
+
+Dan's reply provides the decision. The notification text includes the exact command to re-queue: `/decide <uow_id> owner <decision>`. This calls `handle_owner_decide` in `dispatcher_handlers.py`, which records the decision in the UoW's steward_log and transitions it from `awaiting-owner` → `ready-for-steward`.
+
+Implementation: `route_wos_message` is the single entry point. The handler is `handle_wos_owner_required` in `src/orchestration/dispatcher_handlers.py`. Call `route_wos_message(msg)` — do not call `handle_wos_owner_required` directly.
 
 ---
 

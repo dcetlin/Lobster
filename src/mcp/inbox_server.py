@@ -70,7 +70,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 # IFTTT behavioral rules store
-from utils.ifttt_rules import (
+from src.utils.ifttt_rules import (
     load_rules as _ifttt_load_rules,
     save_rules as _ifttt_save_rules,
     add_rule as _ifttt_add_rule,
@@ -574,7 +574,7 @@ _REPLY_TRACK_MAX = 100
 # ---------------------------------------------------------------------------
 
 try:
-    from utils.timezone import (
+    from src.utils.timezone import (
         format_for_user as _tz_format_for_user,
         format_iso_for_user as _tz_format_iso_for_user,
         format_with_utc_and_local as _tz_format_with_utc_and_local,

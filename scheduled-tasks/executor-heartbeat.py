@@ -40,6 +40,8 @@ import logging
 import os
 import subprocess
 import sys
+import traceback
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,6 +70,63 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
 log = logging.getLogger("executor-heartbeat")
+
+# Admin chat_id for crash alerts (env-injected, falls back to hardcoded)
+_ADMIN_CHAT_ID: str = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
+
+
+# ---------------------------------------------------------------------------
+# Crash alert — write a system inbox message so the dispatcher relays it to Dan
+# ---------------------------------------------------------------------------
+
+def _write_crash_alert(job_name: str, exc: BaseException, extra: str = "") -> None:
+    """Write a scheduled_task_crash inbox message so the dispatcher alerts Dan.
+
+    This is a best-effort fire-and-forget write. Failures here are logged but
+    do not mask the original exception — the caller must re-raise or sys.exit
+    after calling this function.
+
+    The inbox message shape is intentionally simple: source=system,
+    type=scheduled_task_crash, text=human-readable alert. The dispatcher's
+    LLM loop reads the message and relays it to Dan as a Telegram notification.
+    """
+    tb_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    tb_str = "".join(tb_lines).strip()
+    # Truncate traceback to avoid oversized messages (keep last 2000 chars)
+    if len(tb_str) > 2000:
+        tb_str = "...(truncated)...\n" + tb_str[-2000:]
+
+    text = (
+        f"[CRASH] {job_name} crashed with {type(exc).__name__}: {exc}\n\n"
+        f"```\n{tb_str}\n```"
+    )
+    if extra:
+        text += f"\n\n{extra}"
+
+    from datetime import datetime as _datetime, timezone as _timezone
+
+    msg_id = str(uuid.uuid4())
+    msg = {
+        "id": msg_id,
+        "source": "system",
+        "type": "scheduled_task_crash",
+        "chat_id": _ADMIN_CHAT_ID,
+        "job_name": job_name,
+        "timestamp": _datetime.now(_timezone.utc).isoformat(),
+        "text": text,
+    }
+
+    try:
+        messages_base = Path(os.environ.get("LOBSTER_MESSAGES", Path.home() / "messages"))
+        inbox_dir = messages_base / "inbox"
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = inbox_dir / f"{msg_id}.json.tmp"
+        dest_path = inbox_dir / f"{msg_id}.json"
+        tmp_path.write_text(json.dumps(msg, indent=2), encoding="utf-8")
+        tmp_path.rename(dest_path)
+        log.info("Crash alert written to inbox (%s)", msg_id)
+    except Exception as write_exc:
+        log.error("Failed to write crash alert to inbox: %s", write_exc)
 
 
 # ---------------------------------------------------------------------------
@@ -317,68 +376,6 @@ def check_github_rate_limit(
 # Executor cycle — claim and dispatch all ready-for-executor UoWs
 # ---------------------------------------------------------------------------
 
-def run_ttl_recovery(registry, dry_run: bool = False) -> list[str]:
-    """
-    Recover UoWs stuck in 'active' state for more than TTL_EXCEEDED_HOURS.
-
-    In dry_run mode: queries but does NOT transition any UoW.
-    Returns the list of recovered uow_ids (empty on dry_run or nothing to recover).
-    """
-    try:
-        from src.orchestration.executor import TTL_EXCEEDED_HOURS, recover_ttl_exceeded_uows
-    except ImportError:
-        log.warning(
-            "TTL recovery skipped — TTL_EXCEEDED_HOURS not available in executor.py (see #1216)"
-        )
-        return []
-    import sqlite3
-    from datetime import datetime, timezone, timedelta
-
-    if dry_run:
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=TTL_EXCEEDED_HOURS)
-        cutoff_iso = cutoff.isoformat()
-        try:
-            conn = sqlite3.connect(str(registry.db_path), timeout=10.0)
-            conn.row_factory = sqlite3.Row
-            try:
-                rows = conn.execute(
-                    """
-                    SELECT id FROM uow_registry
-                    WHERE status IN ('active', 'executing')
-                      AND started_at IS NOT NULL
-                      AND started_at < ?
-                    """,
-                    (cutoff_iso,),
-                ).fetchall()
-                stalled = [r["id"] for r in rows]
-            finally:
-                conn.close()
-        except Exception as e:
-            log.warning("TTL recovery (DRY RUN): query failed — %s", e)
-            return []
-        if stalled:
-            log.info(
-                "TTL recovery (DRY RUN): %d stalled UoWs would be recovered — %s",
-                len(stalled), stalled,
-            )
-        else:
-            log.info("TTL recovery (DRY RUN): no stalled UoWs found")
-        return []
-
-    try:
-        recovered = recover_ttl_exceeded_uows(registry)
-    except Exception as e:
-        log.warning("TTL recovery: unexpected error — %s", e)
-        return []
-
-    if recovered:
-        log.info("TTL recovery: marked %d stalled UoW(s) as failed — %s", len(recovered), recovered)
-    else:
-        log.debug("TTL recovery: no stalled UoWs found")
-
-    return recovered
-
-
 def _filter_stale_uows(
     ready_uows: list,
     stale_minutes: int,
@@ -626,6 +623,16 @@ def main() -> int:
 
     Returns exit code: 0 on success, 1 on unhandled error.
     """
+    try:
+        return _main_inner()
+    except Exception as exc:
+        log.error("executor-heartbeat crashed with unhandled exception: %s", exc, exc_info=True)
+        _write_crash_alert(job_name="executor-heartbeat", exc=exc)
+        return 1
+
+
+def _main_inner() -> int:
+    """Inner implementation of main() — wrapped by main() for crash alerting."""
     parser = argparse.ArgumentParser(description="Executor Heartbeat — WOS Phase 2")
     parser.add_argument(
         "--dry-run",
@@ -667,14 +674,9 @@ def main() -> int:
     # Phase 1: Stall recovery — always runs regardless of execution_enabled so
     # that stalled active UoWs are recovered even when dispatch is paused.
     #
-    # Primary path: registry.reset_expired_claims() uses the visibility-timeout
-    # model (claimed_until) to reset expired claims back to 'ready-for-executor'.
-    # This is the designed replacement for the legacy recover_ttl_exceeded_uows()
-    # approach — see executor.py module docstring and registry.py:1354.
-    #
-    # Legacy fallback: run_ttl_recovery() wraps recover_ttl_exceeded_uows() with
-    # a try/except ImportError guard (TTL_EXCEEDED_HOURS was removed in #1216).
-    # Retained as a defensive fallback; silently returns [] if the symbol is absent.
+    # Uses the visibility-timeout model (claimed_until) via reset_expired_claims()
+    # to reset expired claims back to 'ready-for-executor'.
+    # See executor.py module docstring and registry.py for implementation details.
     if not dry_run:
         try:
             reset_ids = registry.reset_expired_claims()
@@ -689,7 +691,6 @@ def main() -> int:
             log.warning("Stall recovery (reset_expired_claims) failed — %s", e)
     else:
         log.info("Stall recovery (DRY RUN): skipping reset_expired_claims")
-    run_ttl_recovery(registry, dry_run=dry_run)
 
     # Phase 1b: Heartbeat sidecar — write heartbeats for all in-flight UoWs.
     # Structural enforcement: heartbeats are written by the cron-driven executor

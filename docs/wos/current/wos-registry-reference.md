@@ -36,6 +36,7 @@ The path can be overridden with the `REGISTRY_DB_PATH` environment variable
 | `active` | No | Executor is currently working this UoW |
 | `diagnosing` | No | Steward is diagnosing a return |
 | `blocked` | No | Steward surfaced a blocker; awaiting user `decide` action |
+| `awaiting-owner` | No | Subagent escalated with `outcome=owner_decision_required`; UoW is paused pending Dan's decision. Dan re-queues (→ `ready-for-steward` with decision note) or marks done. |
 | `done` | **Yes** | Steward declared loop closed with `close_reason` |
 | `failed` | **Yes** | Terminated as failed (system or user-initiated) |
 | `expired` | **Yes** | Proposed UoW expired before approval (14-day timeout) |
@@ -70,6 +71,13 @@ proposed ──approve──> [pending] ──> ready-for-steward ──> ready-
                                                          │
                                                         done (terminal)
                                                      (via Steward close)
+
+                                    awaiting-owner (paused — not failed)
+                                    │
+                                    └─ triggered by outcome=owner_decision_required
+                                    │
+                                    ├─ Dan re-queues ──> ready-for-steward (with decision note)
+                                    └─ Dan marks done ──> done (terminal)
 ```
 
 Simplified linear path:
@@ -78,6 +86,7 @@ Simplified linear path:
 proposed → [pending] → ready-for-steward → ready-for-executor → active → done
                                 │                                    └──> failed
                              blocked ──> (retry or close)            └──> expired
+                         awaiting-owner ──> (re-queue or close)
 ```
 
 `pending` is no longer a resting state. The `approve` command transitions

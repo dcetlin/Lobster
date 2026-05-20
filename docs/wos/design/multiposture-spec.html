@@ -1,0 +1,948 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WOS Multi-Posture Execution Architecture</title>
+<style>
+:root {
+  --bg: #0b0d14;
+  --surface: #141720;
+  --surface2: #1c2030;
+  --surface3: #232840;
+  --border: #2a2f45;
+  --border2: #363d5a;
+  --text: #e4e6f0;
+  --text2: #9aa0bb;
+  --text3: #5c6480;
+  --accent: #6ea8fe;
+  --accent2: #a78bfa;
+  --accent3: #34d399;
+  --warn: #f59e0b;
+  --danger: #f87171;
+}
+body.light-mode {
+  --bg: #f8f9fb;
+  --surface: #ffffff;
+  --surface2: #f0f2f7;
+  --surface3: #e8ecf4;
+  --border: #dde1ee;
+  --border2: #c8cedf;
+  --text: #1a1d2e;
+  --text2: #4a5068;
+  --text3: #8890a8;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.7;
+}
+.wrap { max-width: 980px; margin: 0 auto; padding: 48px 24px 120px; }
+
+/* Header */
+.doc-header { margin-bottom: 48px; padding-bottom: 24px; border-bottom: 1px solid var(--border); }
+.doc-title { font-size: 22px; font-weight: 700; color: var(--text); letter-spacing: -.01em; margin-bottom: 6px; }
+.doc-meta { font-size: 12px; color: var(--text3); font-family: 'SF Mono', 'Fira Code', monospace; }
+.doc-meta span { margin-right: 20px; }
+
+/* Sections */
+.section { margin-bottom: 48px; }
+.section-header {
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--text2);
+  margin-bottom: 18px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.section-id {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text3);
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  margin-right: 8px;
+  user-select: none;
+}
+.subsection { margin-bottom: 28px; }
+.subsection-header {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--text3);
+  margin-bottom: 10px;
+}
+.subsection-id {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  margin-right: 6px;
+  font-size: 10px;
+}
+p { margin-bottom: 12px; color: var(--text2); }
+p:last-child { margin-bottom: 0; }
+
+/* Posture cards */
+.posture-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 24px; }
+@media (max-width: 700px) { .posture-grid { grid-template-columns: 1fr; } }
+.posture-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px;
+}
+.posture-card.posture-1 { border-top: 3px solid var(--accent); }
+.posture-card.posture-2 { border-top: 3px solid var(--accent2); }
+.posture-card.posture-3 { border-top: 3px solid var(--accent3); }
+.posture-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .1em;
+  margin-bottom: 4px;
+}
+.posture-1 .posture-label { color: var(--accent); }
+.posture-2 .posture-label { color: var(--accent2); }
+.posture-3 .posture-label { color: var(--accent3); }
+.posture-name { font-size: 14px; font-weight: 700; color: var(--text); margin-bottom: 10px; }
+.posture-card p { font-size: 12px; color: var(--text2); }
+.posture-tag {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 4px;
+  margin-top: 10px;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+}
+.tag-keep { background: rgba(110,168,254,.12); color: var(--accent); }
+.tag-new { background: rgba(167,139,250,.12); color: var(--accent2); }
+.tag-merged { background: rgba(52,211,153,.12); color: var(--accent3); }
+
+/* Root cause box */
+.root-cause-box {
+  background: var(--surface);
+  border: 1px solid var(--border2);
+  border-left: 3px solid var(--warn);
+  border-radius: 8px;
+  padding: 16px 20px;
+  margin-bottom: 20px;
+}
+.root-cause-box .label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .1em;
+  color: var(--warn);
+  margin-bottom: 8px;
+}
+
+/* Flow diagrams */
+.flow {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px 20px;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 12px;
+  line-height: 1.9;
+  margin-bottom: 16px;
+  overflow-x: auto;
+  white-space: pre;
+  color: var(--text2);
+}
+
+/* Code blocks */
+pre, code {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+}
+.code-block {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px 20px;
+  font-size: 12px;
+  line-height: 1.7;
+  margin-bottom: 16px;
+  overflow-x: auto;
+  white-space: pre;
+  color: var(--text2);
+}
+.code-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--text3);
+  margin-bottom: 6px;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+}
+code { background: var(--surface2); padding: 1px 5px; border-radius: 3px; font-size: 12px; color: var(--accent); }
+
+/* Tables */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 18px;
+  font-size: 13px;
+}
+th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--text3);
+  border-bottom: 1px solid var(--border2);
+  padding: 8px 12px;
+}
+td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text2);
+  vertical-align: top;
+}
+td:first-child { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; color: var(--text); }
+tr:last-child td { border-bottom: none; }
+
+/* Pill badges */
+.pill {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+}
+.pill-blue { background: rgba(110,168,254,.15); color: var(--accent); }
+.pill-purple { background: rgba(167,139,250,.15); color: var(--accent2); }
+.pill-green { background: rgba(52,211,153,.15); color: var(--accent3); }
+.pill-yellow { background: rgba(245,158,11,.15); color: var(--warn); }
+.pill-red { background: rgba(248,113,113,.15); color: var(--danger); }
+
+/* Change blocks */
+.change-block {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px 24px;
+  margin-bottom: 20px;
+}
+.change-block + .change-block { margin-top: -4px; }
+.change-number {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .1em;
+  color: var(--text3);
+  margin-bottom: 6px;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+}
+.change-title { font-size: 15px; font-weight: 700; color: var(--text); margin-bottom: 12px; }
+
+/* Decision row */
+.decision-row {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.decision-option {
+  flex: 1;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+.decision-option .opt-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--text3);
+  margin-bottom: 6px;
+}
+.decision-option.recommended {
+  border-color: var(--accent);
+}
+.decision-option.recommended .opt-label { color: var(--accent); }
+@media (max-width: 600px) { .decision-row { flex-direction: column; } }
+
+/* Non-goals list */
+.nongoal-list { list-style: none; padding: 0; }
+.nongoal-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--text2);
+  font-size: 13px;
+}
+.nongoal-list li:last-child { border-bottom: none; }
+.nongoal-list li::before {
+  content: '✕';
+  color: var(--danger);
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+/* Migration steps */
+.migration-step {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.step-num {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--surface2);
+  border: 1px solid var(--border2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent);
+  flex-shrink: 0;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+}
+.step-content { flex: 1; }
+.step-title { font-size: 13px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
+.step-desc { font-size: 12px; color: var(--text2); }
+
+/* Theme toggle */
+#theme-toggle {
+  position: fixed;
+  top: 14px;
+  right: 18px;
+  z-index: 1000;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text2);
+  cursor: pointer;
+  transition: background .15s, color .15s;
+}
+#theme-toggle:hover { background: var(--surface3); color: var(--text); }
+
+/* Comment widget */
+.comment-widget { margin-top: 48px; padding: 20px 24px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
+.comment-widget-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .09em; color: var(--text3); margin-bottom: 14px; }
+.comment-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.comment-label { font-size: 11px; font-weight: 700; font-family: monospace; color: var(--text3); min-width: 40px; }
+.comment-input { flex: 1; background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 12px; color: var(--text); outline: none; }
+.comment-input:focus { border-color: var(--accent); }
+.copy-comments-btn { margin-top: 12px; padding: 8px 18px; background: var(--accent); color: #fff; border: none; border-radius: 6px; font-size: 12px; font-weight: 700; cursor: pointer; transition: opacity .15s; }
+.copy-comments-btn:hover { opacity: .85; }
+.copy-feedback { margin-top: 8px; font-size: 11px; color: var(--accent3); min-height: 16px; }
+</style>
+</head>
+<body>
+<button id="theme-toggle" onclick="toggleTheme()">&#9788; Light</button>
+<div class="wrap">
+
+<div class="doc-header">
+  <div class="doc-title">WOS Multi-Posture Execution Architecture</div>
+  <div class="doc-meta">
+    <span>status: DRAFT</span>
+    <span>date: 2026-05-19</span>
+    <span>supersedes: issue #1216 (visibility-timeout)</span>
+    <span>converges: design discourse between Dan and Lobster</span>
+  </div>
+</div>
+
+<!-- §1 Architecture Overview -->
+<div class="section" id="s1">
+  <div class="section-header"><span class="section-id">§1</span> Architecture Overview</div>
+
+  <p>
+    The WOS pipeline currently has one execution lane: <strong>executor-heartbeat</strong> dispatches all UoWs via batch polling, rate-limited and autonomous, running every 3 minutes via cron. This spec adds two more lanes, creating a three-posture system where each posture addresses a distinct execution need without replacing the others.
+  </p>
+
+  <div class="posture-grid">
+    <div class="posture-card posture-1">
+      <div class="posture-label">Posture 1</div>
+      <div class="posture-name">Batch Dispatch</div>
+      <p>executor-heartbeat polls the registry every 3 minutes and dispatches ready-for-executor UoWs via inbox message. Rate-limited, autonomous, works even when the dispatcher session is down.</p>
+      <span class="posture-tag tag-keep">keep — no change</span>
+    </div>
+    <div class="posture-card posture-2">
+      <div class="posture-label">Posture 2</div>
+      <div class="posture-name">Dispatcher-Direct</div>
+      <p>Dispatcher spawns a specific UoW as a background Agent via the CC Agent tool, on user command or priority trigger. Full Claude Code session with sub-agents, tools, file access. Priority lane for things that need the full stack immediately.</p>
+      <span class="posture-tag tag-new">new — this spec</span>
+    </div>
+    <div class="posture-card posture-3">
+      <div class="posture-label">Posture 3</div>
+      <div class="posture-name">Self-Initiated Upward</div>
+      <p>UoW agents surface to Dan when stuck, via <code>outcome=owner_decision_required</code> and the awaiting-owner lifecycle state. The bottom-up channel that prevents silent stalls.</p>
+      <span class="posture-tag tag-merged">merged — PR #1232</span>
+    </div>
+  </div>
+
+  <div class="subsection" id="s1-1">
+    <div class="subsection-header"><span class="subsection-id">§1.1</span> Root Cause: Why Compaction Kills UoWs</div>
+    <div class="root-cause-box">
+      <div class="label">Root Cause</div>
+      <p>
+        UoW agents do not reliably write heartbeats to the registry while executing. <strong>executor-heartbeat's heartbeat sidecar</strong> (Phase 1b) compensates by writing <code>heartbeat_at</code> for every active/executing UoW every 3 minutes, which prevents the observation loop from detecting stalls. The result is a false sense of liveness: the pipeline believes agents are running when they are dead.
+      </p>
+      <p style="margin-top:8px;">
+        When context compaction kills a dispatcher session mid-execution, active UoWs accumulate in <code>executing</code> state with no live agent and no heartbeat gap, blocking new dispatch through the context-pressure threshold and the TTL-recovery window.
+      </p>
+    </div>
+    <p>
+      The incident on 2026-05-18/19 (referenced in issue #1216) demonstrated this failure mode: 5 executing UoWs with no live subagents occupied all dispatch slots for 22–24h, blocking 168 ready-for-steward UoWs. The fix at the time was to raise the context-pressure threshold from 5 to 20 (PR #1215). That is a guard rail, not a solution.
+    </p>
+    <p>
+      The structural fix is to make heartbeat writes agent-originated rather than sidecar-compensated. When agents write their own heartbeats, the sidecar can be demoted from a liveness mask to a backup, and the observation loop can detect genuine stalls in minutes rather than hours.
+    </p>
+  </div>
+
+  <div class="subsection" id="s1-2">
+    <div class="subsection-header"><span class="subsection-id">§1.2</span> Three-Change Structural Plan</div>
+    <p>Three targeted changes implement this architecture. They are independent and can be shipped separately, in the order listed below. No change removes an existing capability; each adds precision where bluntness currently exists.</p>
+    <table>
+      <thead>
+        <tr><th>Change</th><th>What it does</th><th>Posture affected</th><th>Priority</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Change 1</td>
+          <td>UoW agents write their own heartbeats. The sidecar becomes a backup, not the primary liveness signal. Orphan detection becomes reliable.</td>
+          <td><span class="pill pill-blue">Posture 1</span></td>
+          <td>Critical — fixes the root cause</td>
+        </tr>
+        <tr>
+          <td>Change 2</td>
+          <td>New dispatcher handler: <code>/dispatch &lt;uow_id&gt;</code> spawns a specific UoW as a background Agent immediately, bypassing the 3-minute poll cycle.</td>
+          <td><span class="pill pill-purple">Posture 2</span></td>
+          <td>High — enables priority lane</td>
+        </tr>
+        <tr>
+          <td>Change 3</td>
+          <td>Disposition of <code>claimed_until</code> / visibility-timeout (issue #1216) in light of the heartbeat fix. Heartbeats make TTL-recovery mostly redundant; this change clarifies what remains.</td>
+          <td><span class="pill pill-blue">Posture 1</span></td>
+          <td>Medium — cleanup after Change 1</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="subsection" id="s1-3">
+    <div class="subsection-header"><span class="subsection-id">§1.3</span> Coexistence Model</div>
+    <p>The three postures share the same registry and use the same status lifecycle. They do not conflict:</p>
+    <div class="flow">Posture 1 (Batch)         Posture 2 (Direct)        Posture 3 (Upward)
+────────────────────      ────────────────────      ────────────────────
+executor-heartbeat        dispatcher receives        agent writes outcome=
+polls registry every      /dispatch &lt;uow_id&gt;        owner_decision_required
+3 min, claims and
+dispatches via            dispatcher calls           steward transitions UoW
+wos_execute inbox msg     Agent tool directly        to awaiting-owner
+
+agent writes heartbeat    agent writes heartbeat     Dan replies via Telegram
+every 60-90s              every 60-90s
+                                                     dispatcher calls
+agent writes result       agent writes result        handle_owner_decide()
+to output_ref             to output_ref
+                                                     UoW → ready-for-steward
+steward reads result      dispatcher receives
+on next cycle             write_result callback</div>
+    <p>Postures 1 and 2 converge on the same agent execution path: same prompt template, same heartbeat contract, same result file schema. The dispatcher-direct path (Posture 2) is simply a faster on-ramp that bypasses the 3-minute polling cycle and writes a Claude Code session directly rather than routing through an inbox message.</p>
+  </div>
+</div>
+
+<!-- §2 Change 1: UoW Heartbeat Writes -->
+<div class="section" id="s2">
+  <div class="section-header"><span class="section-id">§2</span> Change 1: Agent-Side Heartbeat Writes</div>
+
+  <p>
+    This change makes the heartbeat contract in the UoW agent prompt template mandatory and structurally enforced, and revises the sidecar's role from primary liveness writer to backup gap-filler. The observation loop then distinguishes live agents from truly dead ones based on whether the agent itself has written a heartbeat since dispatch.
+  </p>
+
+  <div class="subsection" id="s2-1">
+    <div class="subsection-header"><span class="subsection-id">§2.1</span> The Field: heartbeat_at in uow_registry</div>
+    <p>
+      The <code>heartbeat_at</code> column already exists in <code>uow_registry</code>. No schema migration is required for this change. The field is an ISO-8601 UTC timestamp, updated by <code>registry.write_heartbeat(uow_id, token_usage)</code>. The companion <code>uow_heartbeat_log</code> table (migration 0017) records per-heartbeat token snapshots for cost telemetry.
+    </p>
+    <table>
+      <thead><tr><th>Field</th><th>Type</th><th>Current semantics</th></tr></thead>
+      <tbody>
+        <tr><td>heartbeat_at</td><td>TIMESTAMP NULL</td><td>Last write by sidecar or agent; NULL until first write after dispatch</td></tr>
+        <tr><td>heartbeat_ttl</td><td>INTEGER</td><td>Max silence (seconds) before stall detection fires; default 300</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <strong>After Change 1:</strong> <code>heartbeat_at</code> written by the agent itself is the primary liveness signal. The sidecar continues to write heartbeats as a backup but its writes no longer mask dead agents.
+    </p>
+  </div>
+
+  <div class="subsection" id="s2-2">
+    <div class="subsection-header"><span class="subsection-id">§2.2</span> What Agents Must Write, and When</div>
+    <p>
+      The existing <code>handle_wos_execute</code> prompt template in <code>dispatcher_handlers.py</code> already documents a heartbeat contract. Change 1 upgrades this from advisory to structural: the observation loop will not tolerate an agent that fails to write its first heartbeat within 5 minutes of dispatch.
+    </p>
+    <p><strong>Required checkpoints (minimum):</strong></p>
+    <table>
+      <thead><tr><th>Checkpoint</th><th>When to write</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>startup</td><td>Immediately after receiving the prompt, before any other work</td><td>Proves the agent started. No startup heartbeat = agent never ran</td></tr>
+        <tr><td>post-read</td><td>After reading the GitHub issue and understanding the task</td><td>Distinguishes "started but stuck reading" from "started"</td></tr>
+        <tr><td>post-impl</td><td>After completing the implementation, before PR creation</td><td>Confirms work completed; last heartbeat before high-latency gh operations</td></tr>
+        <tr><td>pre-result</td><td>Immediately before writing the result file</td><td>Proves the agent is about to commit its outcome</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Interval:</strong> At most 90 seconds between heartbeat writes throughout execution. If no natural checkpoint falls within 90 seconds, write one unconditionally.</p>
+    <div class="code-label">Preferred form (MCP tool — no Python imports)</div>
+    <div class="code-block">mcp__lobster-inbox__write_wos_heartbeat(
+    uow_id='&lt;uow_id&gt;',
+    token_usage=&lt;cumulative_input_plus_output_tokens&gt;
+)</div>
+    <div class="code-label">Fallback form (Bash via registry)</div>
+    <div class="code-block">import sys; sys.path.insert(0, '/home/lobster/lobster')
+from src.orchestration.registry import Registry
+Registry().write_heartbeat('&lt;uow_id&gt;', token_usage=&lt;cumulative_tokens&gt;)</div>
+    <p>
+      <strong>Return value semantics:</strong> <code>write_heartbeat()</code> returns rowcount 1 on success, 0 if the UoW status has changed (i.e. the steward has already recovered or re-queued it). An agent that receives rowcount 0 must stop execution immediately and call <code>write_result</code> with <code>outcome=failed</code>. This prevents zombie agents from writing stale results.
+    </p>
+  </div>
+
+  <div class="subsection" id="s2-3">
+    <div class="subsection-header"><span class="subsection-id">§2.3</span> How executor-heartbeat Uses Heartbeats After Change 1</div>
+    <p>
+      The sidecar (<code>write_heartbeats_for_active_uows</code> in <code>heartbeat_sidecar.py</code>) continues to run but its classification role changes. The observation loop in steward-heartbeat needs to distinguish three states:
+    </p>
+    <table>
+      <thead><tr><th>Agent state</th><th>heartbeat_at signature</th><th>Correct response</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Alive and writing</td>
+          <td><code>heartbeat_at</code> updated within last 90s, last write was agent-originated (token_usage present in heartbeat_log)</td>
+          <td>Leave it alone</td>
+        </tr>
+        <tr>
+          <td>Dead — sidecar masking</td>
+          <td><code>heartbeat_at</code> fresh but no agent-originated heartbeats in heartbeat_log since dispatch (token_usage always NULL)</td>
+          <td>Declare orphan, kill, re-queue</td>
+        </tr>
+        <tr>
+          <td>Dead — sidecar absent or failed</td>
+          <td><code>heartbeat_at</code> older than <code>heartbeat_ttl + buffer</code></td>
+          <td>Declare orphan, kill, re-queue (existing path)</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      The critical detection path is the second row: an agent that never wrote a heartbeat (all NULL token_usage in heartbeat_log) with a recently-dispatched UoW is dead. The sidecar's writes are the only signal in <code>heartbeat_at</code> and they are masking a corpse.
+    </p>
+    <p>
+      <strong>Implementation approach:</strong> The observation loop (steward-heartbeat, Phase 2b) adds a sub-check: for any UoW in <code>executing</code> status whose <code>heartbeat_at</code> appears fresh, query <code>uow_heartbeat_log</code> for any rows written after <code>dispatch_ts + 300s</code>. If none exist and the UoW is more than 5 minutes old, classify as <code>orphan_kill_before_start</code> regardless of the value of <code>heartbeat_at</code>.
+    </p>
+    <div class="code-label">Detection query (conceptual)</div>
+    <div class="code-block">-- UoWs that are executing but have never had an agent-originated heartbeat
+-- (sidecar writes heartbeat_at but not uow_heartbeat_log rows)
+SELECT r.id
+FROM uow_registry r
+WHERE r.status IN ('active', 'executing')
+  AND r.updated_at &lt; datetime('now', '-5 minutes')
+  AND NOT EXISTS (
+    SELECT 1 FROM uow_heartbeat_log l
+    WHERE l.uow_id = r.id
+      AND l.recorded_at &gt; datetime(r.updated_at, '+300 seconds')
+  )</div>
+    <p>
+      Once Change 1 is fully deployed and all active UoW agents are writing heartbeats, the sidecar can be downgraded to a pure backup: it writes heartbeats only for UoWs that have not received an agent-originated heartbeat within the last 90 seconds, rather than writing for all active UoWs unconditionally. This change to the sidecar is a follow-on after Change 1 is validated.
+    </p>
+  </div>
+</div>
+
+<!-- §3 Change 2: Dispatcher-Direct Spawn -->
+<div class="section" id="s3">
+  <div class="section-header"><span class="section-id">§3</span> Change 2: Dispatcher-Direct Spawn Path</div>
+
+  <p>
+    Posture 2 adds a new dispatcher command — <code>/dispatch &lt;uow_id&gt;</code> — that spawns a specific UoW as a background Claude Code Agent immediately, without waiting for the next executor-heartbeat poll cycle. This is the priority lane: for UoWs where the user wants immediate execution with the full tool stack available.
+  </p>
+
+  <div class="subsection" id="s3-1">
+    <div class="subsection-header"><span class="subsection-id">§3.1</span> New Handler: handle_wos_dispatch</div>
+    <p>
+      A new function <code>handle_wos_dispatch(uow_id, registry)</code> is added to <code>src/orchestration/dispatcher_handlers.py</code>. The dispatcher calls this when it receives a message matching <code>/dispatch &lt;uow_id&gt;</code>.
+    </p>
+    <p>
+      The function is pure: it validates the UoW state and returns a prompt string. The dispatcher owns the actual Agent tool call, the session registration, and the status transition.
+    </p>
+    <div class="code-label">Handler signature (dispatcher_handlers.py)</div>
+    <div class="code-block">def handle_wos_dispatch(uow_id: str, *, registry: "Registry") -> str | None:
+    """
+    Build the Task prompt for a dispatcher-direct UoW dispatch.
+
+    Returns the prompt string when the UoW is eligible for dispatch.
+    Returns None with a human-readable error string as a second value
+    when the UoW cannot be dispatched (wrong status, not found, etc.).
+
+    This function is pure: it does not modify registry state.
+    The dispatcher is responsible for claiming the UoW, spawning the Agent,
+    and registering the session after calling this function.
+
+    Gate conditions (all must pass):
+    - UoW exists in the registry
+    - UoW status is ready-for-executor OR ready-for-steward
+      (operator may want to force-execute a steward-queued UoW directly)
+    - execution_enabled == True in wos-config.json
+    - CC quota below CC_QUOTA_SKIP_THRESHOLD
+
+    Returns: (prompt_str, None) on success, (None, error_msg) on failure.
+    """</div>
+    <div class="code-label">Dispatcher routing addition (.claude/sys.dispatcher.bootup.md or dispatcher loop)</div>
+    <div class="code-block">if text.startswith('/dispatch '):
+    uow_id = text.split()[1].strip()
+    prompt, err = handle_wos_dispatch(uow_id, registry=registry)
+    if err:
+        send_reply(chat_id=chat_id, text=err)
+    else:
+        # Spawn background Agent (Posture 2)
+        # Dispatcher uses the Task/Agent tool — not wos_execute inbox path
+        session = Task(prompt=prompt)
+        session_start(agent_id=f"wos-direct-{uow_id}", ...)
+        send_reply(chat_id=chat_id, text=f"Dispatching UoW {uow_id} directly...")</div>
+  </div>
+
+  <div class="subsection" id="s3-2">
+    <div class="subsection-header"><span class="subsection-id">§3.2</span> Prompt Template for Dispatcher-Direct Agents</div>
+    <p>
+      The dispatcher-direct agent prompt reuses <code>handle_wos_execute</code>'s output as its core, but adds Posture 2 metadata and changes the <code>chat_id</code> to the user's actual chat ID so that <code>write_result</code> notifies Dan directly upon completion.
+    </p>
+    <div class="code-label">Prompt template (built by handle_wos_dispatch)</div>
+    <div class="code-block">---
+task_id: wos-{uow_id}
+uow_id: {uow_id}
+chat_id: {admin_chat_id}     # real chat_id — dispatcher-direct agents notify Dan
+source: telegram
+posture: direct              # marks this as Posture 2 for audit logging
+---
+
+You are executing a Work Order System (WOS) unit of work via the
+DISPATCHER-DIRECT path (Posture 2). You were spawned by the dispatcher
+in response to a /dispatch command — not by the batch executor.
+
+All contracts below are identical to the standard wos_execute path.
+The only difference is that write_result will notify Dan directly
+upon completion (chat_id is set to the operator's Telegram ID).
+
+{...standard heartbeat contract from handle_wos_execute...}
+
+{...PR-close guard from handle_wos_execute...}
+
+## Instructions
+
+{instructions}
+
+## Result contract
+
+{...standard result contract from handle_wos_execute...}</div>
+    <p>
+      The <code>task_id</code> is the same <code>wos-{uow_id}</code> slug used by the Posture 1 path. The <code>posture: direct</code> YAML field is metadata for audit logs — it does not change agent behavior.
+    </p>
+  </div>
+
+  <div class="subsection" id="s3-3">
+    <div class="subsection-header"><span class="subsection-id">§3.3</span> Gate Conditions: Posture 2 vs. Posture 1</div>
+    <table>
+      <thead><tr><th>Condition</th><th>Posture 1 (Batch)</th><th>Posture 2 (Direct)</th></tr></thead>
+      <tbody>
+        <tr><td>Trigger</td><td>Cron tick every 3 min; picks all eligible UoWs</td><td>Explicit <code>/dispatch &lt;uow_id&gt;</code> command from Dan</td></tr>
+        <tr><td>UoW status gate</td><td><code>ready-for-executor</code> only</td><td><code>ready-for-executor</code> or <code>ready-for-steward</code> (operator override allowed)</td></tr>
+        <tr><td>execution_enabled gate</td><td>Hard gate — skips if false</td><td>Soft gate — warns but proceeds if Dan forces it</td></tr>
+        <tr><td>CC quota gate</td><td>Skips dispatch cycle if &gt;= 90%</td><td>Warns Dan; Dan decides whether to proceed</td></tr>
+        <tr><td>GitHub rate limit gate</td><td>Hard gate — skips cycle if low</td><td>Warns; Dan decides</td></tr>
+        <tr><td>Context pressure threshold</td><td>Hard gate — skips if &gt;= 20 active sessions</td><td>Warns; not a hard gate (dispatcher has visibility to judge)</td></tr>
+        <tr><td>Result routing</td><td><code>chat_id=0</code> (system; steward reads result file)</td><td><code>chat_id=&lt;admin&gt;</code> (notifies Dan on completion)</td></tr>
+        <tr><td>Status transition on dispatch</td><td>UoW transitions to <code>executing</code> via inbox path</td><td>UoW transitions to <code>executing</code> immediately by dispatcher before Agent spawn</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <strong>When to use Posture 2:</strong> A UoW that is high-priority and cannot wait for the next executor-heartbeat cycle; a UoW that requires direct feedback to Dan on completion; a UoW that was stuck in <code>ready-for-steward</code> and the operator wants to skip steward re-diagnosis; a debugging run where the operator wants to observe execution in real time.
+    </p>
+    <p>
+      <strong>When not to use Posture 2:</strong> Normal steady-state throughput — that is Posture 1's job. Posture 2 should not become the default execution path. It adds a CC session that counts against the context-pressure threshold, bypasses the scaling governor, and routes completion notifications to Dan's Telegram directly.
+    </p>
+  </div>
+
+  <div class="subsection" id="s3-4">
+    <div class="subsection-header"><span class="subsection-id">§3.4</span> How the Dispatcher-Direct Agent Writes Its Result Back</div>
+    <p>
+      The agent writes the same result file at <code>output_ref</code> and calls <code>write_result</code> in exactly the same way as a Posture 1 agent — with one difference: <code>chat_id</code> is the operator's real Telegram ID, so the dispatcher receives a <code>subagent_notification</code> message and relays the outcome to Dan.
+    </p>
+    <p>
+      The steward's next heartbeat cycle reads the result file and transitions the UoW from <code>executing</code> to <code>ready-for-steward</code> as normal. No special Posture 2 path is needed in steward-heartbeat. The posture distinction lives entirely in the dispatch side, not the result-processing side.
+    </p>
+    <div class="flow">Posture 2 execution flow:
+
+  Dan: /dispatch wos-abc123
+       │
+  Dispatcher: handle_wos_dispatch('abc123', registry)
+       │       → validates UoW status (ready-for-executor or ready-for-steward)
+       │       → claims UoW (status → executing)
+       │       → builds prompt with chat_id = admin_chat_id
+       │
+  Dispatcher: Agent(prompt=...) → background CC session spawned
+       │
+  Agent: write_heartbeat (startup) ← first signal that agent is alive
+  Agent: reads issue, implements, writes heartbeat at each checkpoint
+  Agent: writes output_ref (result JSON)
+  Agent: write_result(task_id="wos-abc123", chat_id=admin_chat_id, ...)
+       │
+  Dispatcher: receives subagent_notification → send_reply to Dan
+  Dan: sees "WOS UoW abc123: outcome=complete"
+       │
+  Steward (next 3-min cycle): reads output_ref → transitions UoW to done</div>
+  </div>
+</div>
+
+<!-- §4 Change 3: claimed_until Disposition -->
+<div class="section" id="s4">
+  <div class="section-header"><span class="section-id">§4</span> Change 3: claimed_until / Visibility-Timeout Disposition</div>
+
+  <p>
+    Issue #1216 proposed replacing the heartbeat model with a visibility-timeout (<code>claimed_until</code>) model: each UoW dispatch sets a timestamp N minutes in the future, and the registry automatically makes the UoW available again when that timestamp expires. This is the Amazon SQS visibility-timeout pattern.
+  </p>
+  <p>
+    The heartbeat fix (Change 1) resolves the underlying problem that motivated issue #1216. This section documents the disposition: what to keep, what to deprecate, and why.
+  </p>
+
+  <div class="subsection" id="s4-1">
+    <div class="subsection-header"><span class="subsection-id">§4.1</span> Current State of claimed_until</div>
+    <p>
+      <code>claimed_until</code> already exists in <code>uow_registry</code> and is already in use. The executor sets it to <code>dispatch_ts + 2 × estimated_runtime</code> on dispatch (at minimum 3600s), and <code>reset_expired_claims()</code> in registry.py resets expired claims back to <code>ready-for-executor</code>. This is the Phase 1 stall recovery path in executor-heartbeat.
+    </p>
+  </div>
+
+  <div class="subsection" id="s4-2">
+    <div class="subsection-header"><span class="subsection-id">§4.2</span> Recommended Disposition: Make Optional</div>
+    <div class="decision-row">
+      <div class="decision-option recommended">
+        <div class="opt-label">Recommended: Make Optional (keep as backstop)</div>
+        <p style="font-size:12px; color:var(--text2); margin-top:8px;">
+          Keep <code>claimed_until</code> in the schema and keep <code>reset_expired_claims()</code> as a fallback recovery path. But let the heartbeat mechanism be the primary detection path. When agents write their own heartbeats (Change 1), the observation loop detects dead agents in 90–300 seconds rather than waiting for <code>claimed_until</code> to expire (potentially hours). In steady state, <code>claimed_until</code> expiry becomes a rare event — only when both the agent fails AND the observation loop misses the stall.
+        </p>
+      </div>
+      <div class="decision-option">
+        <div class="opt-label">Alternative: Deprecate and Remove</div>
+        <p style="font-size:12px; color:var(--text2); margin-top:8px;">
+          Remove <code>claimed_until</code> entirely once Change 1 is validated in production. Simpler schema, fewer recovery paths. Higher risk during the transition period if heartbeat compliance is imperfect. Not recommended until Change 1 has run for at least 2 weeks with no orphan incidents.
+        </p>
+      </div>
+    </div>
+    <p>
+      The "make optional" path means: after Change 1 ships, <code>claimed_until</code> is still set on dispatch and <code>reset_expired_claims()</code> still runs in executor-heartbeat Phase 1. But the TTL can be shortened significantly (e.g. from 2 × estimated_runtime to 30 minutes) because the observation loop is now the primary detection mechanism. A UoW that loses its agent will be detected via heartbeat gap within 5–10 minutes; the <code>claimed_until</code> expiry is a defense-in-depth fallback.
+    </p>
+  </div>
+
+  <div class="subsection" id="s4-3">
+    <div class="subsection-header"><span class="subsection-id">§4.3</span> Issue #1216 Disposition</div>
+    <p>
+      Issue #1216 proposed adding <code>claimed_until</code> as a new field and building the entire recovery model around it. The field already exists and is already wired into the executor. The multi-posture architecture supersedes the issue's proposed design: rather than replacing the heartbeat model with visibility-timeout, we fix the heartbeat model and keep visibility-timeout as a backstop.
+    </p>
+    <p>
+      Recommended action: close issue #1216 as "superseded by multiposture-spec" and reference this document. The schema change proposed in #1216 (adding <code>claimed_until</code>) has already been implemented; the behavioral changes (making it the primary recovery mechanism) are deferred in favor of the heartbeat fix.
+    </p>
+  </div>
+</div>
+
+<!-- §5 Migration Path -->
+<div class="section" id="s5">
+  <div class="section-header"><span class="section-id">§5</span> Migration Path</div>
+
+  <p>
+    The three changes are independent and deployable in sequence. No single deployment is a big bang. Each change is observable via the existing logging and audit infrastructure.
+  </p>
+
+  <div class="subsection" id="s5-1">
+    <div class="subsection-header"><span class="subsection-id">§5.1</span> Deployment Sequence</div>
+
+    <div class="migration-step">
+      <div class="step-num">1</div>
+      <div class="step-content">
+        <div class="step-title">Change 1a: Update UoW agent prompt template</div>
+        <div class="step-desc">
+          In <code>handle_wos_execute()</code> (<code>dispatcher_handlers.py</code>), strengthen the heartbeat section:
+          (a) Add an explicit "startup heartbeat" instruction as the first action item before any other work.
+          (b) Specify the maximum interval (90 seconds) as a hard requirement, not a suggestion.
+          (c) Add: "if write_heartbeat returns 0 (rowcount=0), stop immediately — the steward has already recovered this UoW."
+          No registry schema changes required. Rollout: next PR; takes effect on all subsequent UoW dispatches.
+        </div>
+      </div>
+    </div>
+
+    <div class="migration-step">
+      <div class="step-num">2</div>
+      <div class="step-content">
+        <div class="step-title">Change 1b: Update observation loop to use heartbeat_log for liveness</div>
+        <div class="step-desc">
+          In <code>steward-heartbeat.py</code> Phase 2b (stale heartbeat detection), add the sub-check:
+          for executing UoWs with fresh <code>heartbeat_at</code>, query <code>uow_heartbeat_log</code> for any post-dispatch rows with non-NULL token_usage.
+          If none found and UoW is older than 5 minutes, classify as <code>orphan_kill_before_start</code> regardless of <code>heartbeat_at</code>.
+          This is a targeted addition to the observation loop — it does not change the existing stale-heartbeat detection path.
+        </div>
+      </div>
+    </div>
+
+    <div class="migration-step">
+      <div class="step-num">3</div>
+      <div class="step-content">
+        <div class="step-title">Change 1c: Demote sidecar from primary to backup</div>
+        <div class="step-desc">
+          After Change 1a and 1b are in production and validated (at least 7 days with no false stalls):
+          modify <code>heartbeat_sidecar.py</code> to skip writing heartbeats for UoWs that have agent-originated heartbeat_log rows within the last 90 seconds.
+          The sidecar only writes for UoWs that have no recent agent-originated heartbeat — i.e., it becomes a true backup.
+          This step eliminates the sidecar-masking problem structurally.
+        </div>
+      </div>
+    </div>
+
+    <div class="migration-step">
+      <div class="step-num">4</div>
+      <div class="step-content">
+        <div class="step-title">Change 2: Add handle_wos_dispatch handler</div>
+        <div class="step-desc">
+          Add <code>handle_wos_dispatch(uow_id, registry)</code> to <code>dispatcher_handlers.py</code>.
+          Add the <code>/dispatch &lt;uow_id&gt;</code> route to the dispatcher's command table.
+          Add to <code>WOS_MESSAGE_TYPE_DISPATCH</code> if appropriate, or handle as a text command.
+          No registry schema changes required. Test with a single low-priority UoW before enabling broadly.
+        </div>
+      </div>
+    </div>
+
+    <div class="migration-step">
+      <div class="step-num">5</div>
+      <div class="step-content">
+        <div class="step-title">Change 3: Shorten claimed_until TTL</div>
+        <div class="step-desc">
+          After Change 1 is validated: reduce the <code>claimed_until</code> window from <code>2 × estimated_runtime</code> to a fixed 30 minutes (or make it configurable per UoW type).
+          The observation loop now provides fast recovery; the long TTL is no longer needed as a primary safety window.
+          Update <code>reset_expired_claims()</code> logging to reflect its new backstop role.
+          Close issue #1216 as superseded.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="subsection" id="s5-2">
+    <div class="subsection-header"><span class="subsection-id">§5.2</span> Registry Schema Changes</div>
+    <table>
+      <thead><tr><th>Field</th><th>Change?</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>heartbeat_at</td><td>No change</td><td>Already exists; no migration needed</td></tr>
+        <tr><td>heartbeat_ttl</td><td>No change</td><td>Already exists; default 300s remains correct</td></tr>
+        <tr><td>claimed_until</td><td>No schema change; TTL value shortened</td><td>Already exists; behavioral change only (Step 5 above)</td></tr>
+        <tr><td>uow_heartbeat_log</td><td>No change</td><td>Already exists (migration 0017); token_usage column used by observation loop</td></tr>
+      </tbody>
+    </table>
+    <p>No new tables or columns are required by this spec. All changes are behavioral, confined to Python code and prompt templates.</p>
+  </div>
+
+  <div class="subsection" id="s5-3">
+    <div class="subsection-header"><span class="subsection-id">§5.3</span> Observability Checkpoints</div>
+    <p>At each deployment step, verify via the following checks before proceeding to the next step:</p>
+    <table>
+      <thead><tr><th>After step</th><th>Check</th></tr></thead>
+      <tbody>
+        <tr><td>1 (prompt update)</td><td>Dispatch a test UoW via executor-heartbeat and confirm <code>uow_heartbeat_log</code> contains rows with non-NULL <code>token_usage</code> within 5 minutes of dispatch</td></tr>
+        <tr><td>2 (observation loop)</td><td>Simulate a dead agent (dispatch a UoW, kill its session manually) and confirm the steward classifies it as <code>orphan_kill_before_start</code> within 10 minutes</td></tr>
+        <tr><td>3 (sidecar demotion)</td><td>Monitor <code>executor-heartbeat</code> logs for "Heartbeat sidecar: checked=N written=0" on UoWs that are actively executing — confirms agents are writing their own heartbeats and the sidecar is finding nothing to do</td></tr>
+        <tr><td>4 (dispatch handler)</td><td>Issue <code>/dispatch &lt;test-uow-id&gt;</code> and confirm: (a) write_result notification appears in Telegram; (b) UoW transitions to done; (c) no duplicate dispatch from executor-heartbeat</td></tr>
+        <tr><td>5 (TTL shortening)</td><td>Monitor <code>reset_expired_claims()</code> output; confirm it only fires on genuine stalls (not on healthy executing UoWs)</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- §6 Non-Goals -->
+<div class="section" id="s6">
+  <div class="section-header"><span class="section-id">§6</span> Non-Goals</div>
+
+  <p>This spec explicitly does not do the following. These items are excluded by design, not oversight. If any of them are desirable in the future, they require a separate spec.</p>
+
+  <ul class="nongoal-list">
+    <li>Replace executor-heartbeat. Posture 1 (batch dispatch) remains the steady-state throughput lane. Posture 2 is a second lane, not a replacement. executor-heartbeat.py is not modified by this spec.</li>
+    <li>Make the dispatcher an orchestrator-of-orchestrators. The dispatcher spawns one UoW at a time in Posture 2. It does not manage a pool of concurrent UoW sessions, does not re-dispatch on failure, and does not monitor running UoW agents. Those responsibilities stay with steward-heartbeat and executor-heartbeat.</li>
+    <li>Implement the full visibility-timeout model proposed in issue #1216. That design replaces heartbeats with a TTL-expiry model. This spec retains heartbeats as the primary mechanism and uses claimed_until as a backstop.</li>
+    <li>Change the UoW status lifecycle. No new statuses are added. The existing lifecycle (proposed → pending → ready-for-steward → ready-for-executor → executing → done/failed) is unchanged.</li>
+    <li>Add streaming or progress updates from UoW agents. Agents remain fire-and-forget. Heartbeats prove liveness but are not surfaced to Dan in real time during Posture 1 execution. (Posture 2 does notify Dan on completion; it does not stream intermediate state.)</li>
+    <li>Change how the steward prescribes work. The steward's prescription logic, retry arc, and hard-cap enforcement are out of scope. The steward continues to write wos_execute inbox messages for Posture 1 exactly as today.</li>
+    <li>Modify executor-heartbeat.py in any way. The only changes are to: dispatcher_handlers.py (Change 2), steward-heartbeat.py Phase 2b (Change 1b), heartbeat_sidecar.py (Change 1c, deferred), and the UoW agent prompt template in handle_wos_execute (Change 1a).</li>
+    <li>Build a UI or dashboard for multi-posture monitoring. Observability remains in the existing logs, audit table, and wos-health-check job.</li>
+  </ul>
+</div>
+
+<!-- Comment widget -->
+<div class="comment-widget" id="comment-widget">
+  <div class="comment-widget-title">Section Comments</div>
+  <div class="comment-inputs" id="comment-inputs"></div>
+  <button class="copy-comments-btn" onclick="copyComments()">Copy comments</button>
+  <div class="copy-feedback" id="copy-feedback"></div>
+</div>
+
+</div><!-- /wrap -->
+
+<script>
+// Theme toggle
+function toggleTheme() {
+  const isLight = document.body.classList.toggle('light-mode');
+  localStorage.setItem('theme', isLight ? 'light' : 'dark');
+  document.getElementById('theme-toggle').textContent = isLight ? '☾ Dark' : '☀ Light';
+}
+(function() {
+  if (localStorage.getItem('theme') === 'light') {
+    document.body.classList.add('light-mode');
+    const btn = document.getElementById('theme-toggle');
+    if (btn) btn.textContent = '☾ Dark';
+  }
+})();
+
+// Comment widget
+const sections = [
+  { id: 's1', label: '§1' },
+  { id: 's2', label: '§2' },
+  { id: 's3', label: '§3' },
+  { id: 's4', label: '§4' },
+  { id: 's5', label: '§5' },
+  { id: 's6', label: '§6' },
+];
+(function buildCommentWidget() {
+  const container = document.getElementById('comment-inputs');
+  if (!container) return;
+  sections.forEach(function(s) {
+    const row = document.createElement('div');
+    row.className = 'comment-row';
+    row.innerHTML = '<span class="comment-label">' + s.label + '</span><input class="comment-input" type="text" id="ci-' + s.id + '" placeholder="Comment on ' + s.label + '…">';
+    container.appendChild(row);
+  });
+})();
+function copyComments() {
+  const parts = sections.map(function(s) {
+    const val = (document.getElementById('ci-' + s.id) || {}).value || '';
+    return val.trim() ? '[' + s.label + '] ' + val.trim() : null;
+  }).filter(Boolean);
+  if (!parts.length) {
+    document.getElementById('copy-feedback').textContent = 'Nothing to copy.';
+    return;
+  }
+  navigator.clipboard.writeText(parts.join(' | ')).then(function() {
+    document.getElementById('copy-feedback').textContent = 'Copied to clipboard.';
+    setTimeout(function() { document.getElementById('copy-feedback').textContent = ''; }, 2500);
+  });
+}
+</script>
+</body>
+</html>

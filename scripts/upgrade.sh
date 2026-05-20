@@ -4262,6 +4262,22 @@ PYEOF
         substep "Migration 120: orchestration-artifacts-cleanup cron entry already present"
     fi
 
+    # Migration 121: Add LOBSTER-PHILOSOPHY-HARVEST cron entry.
+    # Registers the philosophy-harvest.py Type C cron-direct script that scans
+    # ~/lobster/philosophy/**/*.md for action_seeds blocks and routes bootup
+    # candidates to the inbox and observations to the reflective surface queue.
+    # Runs every 6 hours, matching the jobs.json schedule entry.
+    local PHILOSOPHY_HARVEST_MARKER="# LOBSTER-PHILOSOPHY-HARVEST"
+    if ! crontab -l 2>/dev/null | grep -qF "$PHILOSOPHY_HARVEST_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$PHILOSOPHY_HARVEST_MARKER" \
+            "0 */6 * * * cd $LOBSTER_DIR && uv run scheduled-tasks/philosophy-harvest.py >> $LOBSTER_WORKSPACE/scheduled-jobs/logs/philosophy-harvest.log 2>&1 $PHILOSOPHY_HARVEST_MARKER" \
+            && substep "Added philosophy-harvest cron entry (Migration 121)" \
+            || warn "Could not add philosophy-harvest cron entry — check cron-manage.sh"
+        migrated=$((migrated + 1))
+    else
+        substep "philosophy-harvest cron entry already present — skipping Migration 121"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
