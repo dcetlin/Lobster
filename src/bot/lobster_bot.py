@@ -31,6 +31,10 @@ from bot.pre_handler import (  # noqa: E402
     handle_quota_command,
     handle_status_command,
     handle_help_command,
+    handle_subagents_command,
+    handle_jobs_command,
+    handle_wos_command,
+    handle_restart_command,
     try_handle as _pre_handler_try_handle,
     handle_todo_callback as _pre_handler_todo_callback,
     handle_restart_callback as _pre_handler_restart_callback,
@@ -2276,6 +2280,11 @@ async def run_bot():
     bot_app.add_handler(CommandHandler("todos", handle_todos_command))
     bot_app.add_handler(CommandHandler("quota", handle_quota_command))
     bot_app.add_handler(CommandHandler("status", handle_status_command))
+    bot_app.add_handler(CommandHandler("subagents", handle_subagents_command))
+    bot_app.add_handler(CommandHandler("jobs", handle_jobs_command))
+    bot_app.add_handler(CommandHandler("wos", handle_wos_command))
+    bot_app.add_handler(CommandHandler("restart", handle_restart_command))
+    bot_app.add_handler(CommandHandler("help", handle_help_command))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     bot_app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_message))
     bot_app.add_handler(MessageHandler(filters.PHOTO, handle_message))

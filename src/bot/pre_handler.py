@@ -142,6 +142,48 @@ async def handle_help_command(
     await update.message.reply_text(handle_help())
 
 
+async def handle_subagents_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Pre-handler for /subagents — active session list, bypasses dispatcher."""
+    user = update.effective_user
+    if not user or user.id not in _ALLOWED_USERS:
+        return
+    await _handle_subagents(update.message)
+
+
+async def handle_jobs_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Pre-handler for /jobs — scheduled jobs from jobs.json, bypasses dispatcher."""
+    user = update.effective_user
+    if not user or user.id not in _ALLOWED_USERS:
+        return
+    await _handle_jobs(update.message)
+
+
+async def handle_wos_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Pre-handler for /wos — WOS queue counts and dashboard link, bypasses dispatcher."""
+    user = update.effective_user
+    if not user or user.id not in _ALLOWED_USERS:
+        return
+    await _handle_wos(update.message)
+
+
+async def handle_restart_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Pre-handler for /restart — confirmation gate or safety warning, bypasses dispatcher."""
+    user = update.effective_user
+    if not user or user.id not in _ALLOWED_USERS:
+        return
+    parts = (update.message.text or "").strip().split()
+    args = parts[1:]  # everything after /restart
+    await _handle_restart(update.message, args)
+
+
 # ---------------------------------------------------------------------------
 # Message-based private implementations (used by try_handle and command handlers)
 # ---------------------------------------------------------------------------
@@ -268,7 +310,7 @@ async def _handle_jobs(message: "Message") -> None:
 async def _handle_wos(message: "Message") -> None:
     from orchestration.dispatcher_handlers import read_wos_config  # noqa: PLC0415
     from orchestration.registry import Registry  # noqa: PLC0415
-    from orchestration.wos_dashboard import _get_bisque_relay_base_url  # noqa: PLC0415
+    from orchestration.wos_dashboard import _get_bisque_relay_base_url  # noqa: PLC0415  # private import intentional; try/except below bounds the risk
 
     config = read_wos_config()
     execution_enabled = bool(config.get("execution_enabled", False))
