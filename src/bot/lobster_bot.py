@@ -26,6 +26,19 @@ _SRC_DIR = str(Path(__file__).resolve().parent.parent)
 if _SRC_DIR not in _sys.path:
     _sys.path.insert(0, _SRC_DIR)
 from src.utils.fs import atomic_write_json  # noqa: E402
+from bot.pre_handler import (  # noqa: E402
+    handle_todos_command,
+    handle_quota_command,
+    handle_status_command,
+    handle_help_command,
+    handle_subagents_command,
+    handle_jobs_command,
+    handle_wos_command,
+    handle_restart_command,
+    try_handle as _pre_handler_try_handle,
+    handle_todo_callback as _pre_handler_todo_callback,
+    handle_restart_callback as _pre_handler_restart_callback,
+)
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -976,6 +989,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # Wake Claude if hibernating
     wake_claude_if_hibernating()
 
+    # Intercept pre-handler callbacks before they reach the inbox.
+    cb_data = query.data or ""
+    if cb_data.startswith("todo-"):
+        await _pre_handler_todo_callback(query)
+        return
+    if cb_data.startswith("confirm-restart-") or cb_data == "cancel-restart":
+        await _pre_handler_restart_callback(query)
+        return
+
     # Create a message file for the callback
     msg_id = f"{int(time.time() * 1000)}_{query.id}"
 
@@ -1271,6 +1293,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = message.text
     if not text:
+        return
+
+    # Intercept deterministic pre-handler commands before they reach the inbox.
+    if await _pre_handler_try_handle(text, message, context):
         return
 
     # Determine group-chat engagement state before writing to inbox
@@ -2249,6 +2275,16 @@ async def run_bot():
     bot_app.add_handler(CommandHandler("whitelist", whitelist_command))
     bot_app.add_handler(CommandHandler("unwhitelist", unwhitelist_command))
     bot_app.add_handler(CommandHandler("list_groups", list_groups_command))
+    # Pre-handler: deterministic commands that bypass the dispatcher inbox entirely.
+    # These reply directly from the bot process — no LLM round-trip, no inbox write.
+    bot_app.add_handler(CommandHandler("todos", handle_todos_command))
+    bot_app.add_handler(CommandHandler("quota", handle_quota_command))
+    bot_app.add_handler(CommandHandler("status", handle_status_command))
+    bot_app.add_handler(CommandHandler("subagents", handle_subagents_command))
+    bot_app.add_handler(CommandHandler("jobs", handle_jobs_command))
+    bot_app.add_handler(CommandHandler("wos", handle_wos_command))
+    bot_app.add_handler(CommandHandler("restart", handle_restart_command))
+    bot_app.add_handler(CommandHandler("help", handle_help_command))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     bot_app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_message))
     bot_app.add_handler(MessageHandler(filters.PHOTO, handle_message))
