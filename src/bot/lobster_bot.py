@@ -30,6 +30,10 @@ from bot.pre_handler import (  # noqa: E402
     handle_todos_command,
     handle_quota_command,
     handle_status_command,
+    handle_help_command,
+    try_handle as _pre_handler_try_handle,
+    handle_todo_callback as _pre_handler_todo_callback,
+    handle_restart_callback as _pre_handler_restart_callback,
 )
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -981,6 +985,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # Wake Claude if hibernating
     wake_claude_if_hibernating()
 
+    # Intercept pre-handler callbacks before they reach the inbox.
+    cb_data = query.data or ""
+    if cb_data.startswith("todo-"):
+        await _pre_handler_todo_callback(query)
+        return
+    if cb_data.startswith("confirm-restart-") or cb_data == "cancel-restart":
+        await _pre_handler_restart_callback(query)
+        return
+
     # Create a message file for the callback
     msg_id = f"{int(time.time() * 1000)}_{query.id}"
 
@@ -1276,6 +1289,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = message.text
     if not text:
+        return
+
+    # Intercept deterministic pre-handler commands before they reach the inbox.
+    if await _pre_handler_try_handle(text, message, context):
         return
 
     # Determine group-chat engagement state before writing to inbox
