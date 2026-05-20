@@ -124,6 +124,19 @@ def run_migrations(db_path: Path) -> list[int]:
                 conn.execute("BEGIN IMMEDIATE")
                 _record_migration(conn, version, path.name, now)
                 conn.commit()
+            except sqlite3.OperationalError as exc:
+                conn.rollback()
+                # "duplicate column name" means ALTER TABLE ADD COLUMN was
+                # already applied in a previous partial run (DDL committed but
+                # the migration record was never written).  The schema is
+                # already in the intended state, so record the migration and
+                # continue rather than crashing.
+                if "duplicate column name" in str(exc).lower():
+                    conn.execute("BEGIN IMMEDIATE")
+                    _record_migration(conn, version, path.name, now)
+                    conn.commit()
+                else:
+                    raise
             except Exception:
                 # executescript commits implicitly, so a partial DDL run may
                 # have succeeded. We do not attempt a rollback of DDL (SQLite
