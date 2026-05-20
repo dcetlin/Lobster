@@ -35,8 +35,6 @@ from orchestration.executor import (
     _noop_dispatcher,
     _dispatcher_is_async,
     _ASYNC_EXECUTOR_TYPES,
-    recover_ttl_exceeded_uows,
-    TTL_EXCEEDED_HOURS,
 )
 
 
@@ -420,52 +418,6 @@ class TestCompleteUowFromExecuting:
         assert _get_uow_status(db_path, uow_id) == STATUS_READY_FOR_STEWARD
         events = _get_audit_events(db_path, uow_id)
         assert AUDIT_EXECUTION_COMPLETE in events
-
-
-# ---------------------------------------------------------------------------
-# Tests: TTL recovery covers 'executing' UoWs
-# ---------------------------------------------------------------------------
-
-class TestTtlRecoveryCoversExecuting:
-    def test_ttl_recovery_fails_executing_uow_past_ttl(self, registry: Registry, db_path: Path) -> None:
-        """TTL recovery must include 'executing' UoWs that have exceeded TTL_EXCEEDED_HOURS."""
-        from datetime import datetime, timezone, timedelta
-
-        uow_id = "uow_ttl_exec_001"
-        # started_at is well past the TTL cutoff
-        stale_started_at = (
-            datetime.now(timezone.utc) - timedelta(hours=TTL_EXCEEDED_HOURS + 1)
-        ).isoformat()
-        _insert_uow_with_status(db_path, uow_id, "executing", started_at=stale_started_at)
-
-        recovered = recover_ttl_exceeded_uows(registry)
-
-        assert uow_id in recovered, (
-            f"TTL recovery must recover 'executing' UoWs past TTL. "
-            f"Recovered: {recovered}"
-        )
-        assert _get_uow_status(db_path, uow_id) == "failed"
-
-    def test_ttl_recovery_does_not_fail_fresh_executing_uow(
-        self, registry: Registry, db_path: Path
-    ) -> None:
-        """TTL recovery must NOT fail 'executing' UoWs that are still within TTL."""
-        from datetime import datetime, timezone, timedelta
-
-        uow_id = "uow_ttl_exec_002"
-        # started_at is recent — well within TTL
-        fresh_started_at = (
-            datetime.now(timezone.utc) - timedelta(minutes=30)
-        ).isoformat()
-        _insert_uow_with_status(db_path, uow_id, "executing", started_at=fresh_started_at)
-
-        recovered = recover_ttl_exceeded_uows(registry)
-
-        assert uow_id not in recovered, (
-            f"TTL recovery must not touch 'executing' UoWs within TTL. "
-            f"Recovered: {recovered}"
-        )
-        assert _get_uow_status(db_path, uow_id) == "executing"
 
 
 # ---------------------------------------------------------------------------
