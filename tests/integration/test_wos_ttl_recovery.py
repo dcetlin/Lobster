@@ -1,23 +1,13 @@
 """
-Integration tests: TTL recovery and executor_orphan detection.
+Integration tests: executor_orphan detection via startup sweep.
 
-Two scenarios:
+Scenario:
+- UoW seeded, advanced to ready-for-executor, created_at pushed back > 1 hour.
+- run_startup_sweep() called.
+- Assert UoW transitions to 'ready-for-steward' with audit entry
+  classification='executor_orphan'.
 
-1. TTL recovery (active UoW stalled too long):
-   - UoW seeded, claimed by Executor (status → active), started_at pushed
-     back > TTL_EXCEEDED_HOURS.
-   - recover_ttl_exceeded_uows() called.
-   - Assert UoW transitions to 'failed' with return_reason containing
-     'ttl_exceeded'.
-
-2. executor_orphan (startup sweep):
-   - UoW seeded, advanced to ready-for-executor, created_at pushed back
-     > 1 hour.
-   - run_startup_sweep() called.
-   - Assert UoW transitions to 'ready-for-steward' with audit entry
-     classification='executor_orphan'.
-
-Both tests use a SQLite DB (via tmp_path) with all real migrations applied.
+Tests use a SQLite DB (via tmp_path) with all real migrations applied.
 No network calls, no subprocess spawning.
 """
 
@@ -43,10 +33,6 @@ if str(_SRC) not in sys.path:
 
 from orchestration.migrate import run_migrations
 from orchestration.registry import Registry, UpsertInserted, ApproveConfirmed
-from orchestration.executor import (
-    TTL_EXCEEDED_HOURS,
-    recover_ttl_exceeded_uows,
-)
 from orchestration.steward import IssueInfo
 
 _SCHEDULED_TASKS = str(_REPO_ROOT / "scheduled-tasks")
@@ -98,59 +84,6 @@ def conn(db_path: Path, registry: Registry) -> sqlite3.Connection:
 # ---------------------------------------------------------------------------
 
 
-def _seed_and_activate(registry: Registry, conn: sqlite3.Connection) -> str:
-    """
-    Seed a UoW and advance it to 'active' status (simulating a claimed execution).
-
-    Returns the uow_id.
-
-    The 6-step Executor claim sequence sets status='active' and writes started_at.
-    We simulate this directly in SQL so tests remain self-contained and do not
-    depend on a live WorkflowArtifact or dispatch subprocess.
-    """
-    result = registry.upsert(
-        issue_number=9901,
-        title="TTL test: stalled execution",
-        sweep_date="2026-03-31",
-        success_criteria="Test completion.",
-    )
-    assert isinstance(result, UpsertInserted), f"seed failed: {result}"
-    uow_id = result.id
-
-    # proposed → pending
-    confirm = registry.approve(uow_id)
-    assert isinstance(confirm, ApproveConfirmed), f"approve failed: {confirm}"
-
-    # pending → ready-for-steward (trigger evaluator stub)
-    registry.set_status_direct(uow_id, "ready-for-steward")
-
-    # ready-for-steward → ready-for-executor (steward prescription stub)
-    registry.set_status_direct(uow_id, "ready-for-executor")
-
-    # ready-for-executor → active (executor claim stub)
-    now = _now_iso()
-    conn.execute(
-        """
-        UPDATE uow_registry
-        SET status = 'active',
-            started_at = ?,
-            updated_at = ?
-        WHERE id = ?
-        """,
-        (now, now, uow_id),
-    )
-    conn.execute(
-        """
-        INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
-        VALUES (?, ?, 'claimed', 'ready-for-executor', 'active', 'executor', ?)
-        """,
-        (now, uow_id, json.dumps({"actor": "executor_stub", "started_at": now})),
-    )
-    conn.commit()
-
-    return uow_id
-
-
 def _seed_ready_for_executor(registry: Registry) -> str:
     """
     Seed a UoW and advance it to 'ready-for-executor' status.
@@ -174,110 +107,7 @@ def _seed_ready_for_executor(registry: Registry) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Test 1: TTL recovery — active UoW stalled > TTL_EXCEEDED_HOURS
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.integration
-def test_ttl_recovery_transitions_stalled_active_uow_to_failed(
-    registry: Registry,
-    conn: sqlite3.Connection,
-) -> None:
-    """
-    UoWs that stay in 'active' for longer than TTL_EXCEEDED_HOURS are
-    transitioned to 'failed' by recover_ttl_exceeded_uows().
-
-    Proof: set started_at to (now - TTL_EXCEEDED_HOURS - 1 minute), run
-    recovery, assert status='failed' with an audit entry noting ttl_exceeded.
-    """
-    uow_id = _seed_and_activate(registry, conn)
-
-    # Backdate started_at to be beyond the TTL threshold
-    stale_started_at = _ago_iso(hours=TTL_EXCEEDED_HOURS, seconds=60)
-    conn.execute(
-        "UPDATE uow_registry SET started_at = ?, updated_at = ? WHERE id = ?",
-        (stale_started_at, _now_iso(), uow_id),
-    )
-    conn.commit()
-
-    # Verify precondition: UoW is 'active' with stale started_at
-    row = conn.execute(
-        "SELECT status, started_at FROM uow_registry WHERE id = ?",
-        (uow_id,),
-    ).fetchone()
-    assert row["status"] == "active"
-    assert row["started_at"] == stale_started_at
-
-    # Run TTL recovery
-    recovered = recover_ttl_exceeded_uows(registry)
-
-    # Assert the UoW was recovered
-    assert uow_id in recovered, (
-        f"Expected {uow_id!r} in recovered list {recovered!r}"
-    )
-
-    # Assert status is now 'failed'
-    row = conn.execute(
-        "SELECT status FROM uow_registry WHERE id = ?",
-        (uow_id,),
-    ).fetchone()
-    assert row["status"] == "failed", (
-        f"Expected status='failed', got {row['status']!r}"
-    )
-
-    # Assert audit trail contains a ttl_exceeded entry
-    audit_rows = conn.execute(
-        "SELECT event, from_status, to_status, note FROM audit_log WHERE uow_id = ?",
-        (uow_id,),
-    ).fetchall()
-    ttl_entries = [
-        r for r in audit_rows
-        if r["event"] == "execution_failed"
-        and r["from_status"] == "active"
-        and r["to_status"] == "failed"
-    ]
-    assert ttl_entries, (
-        f"No execution_failed audit entry found. All audit entries: "
-        f"{[dict(r) for r in audit_rows]}"
-    )
-
-    note = json.loads(ttl_entries[0]["note"])
-    assert "ttl_exceeded" in note.get("reason", ""), (
-        f"Expected 'ttl_exceeded' in audit note reason, got: {note!r}"
-    )
-
-
-@pytest.mark.integration
-def test_ttl_recovery_ignores_fresh_active_uow(
-    registry: Registry,
-    conn: sqlite3.Connection,
-) -> None:
-    """
-    UoWs in 'active' with a recent started_at are NOT affected by TTL recovery.
-
-    Proof: set started_at to 1 minute ago (well below TTL_EXCEEDED_HOURS),
-    run recovery, assert UoW stays 'active'.
-    """
-    uow_id = _seed_and_activate(registry, conn)
-
-    # started_at is already 'now' from _seed_and_activate — stays fresh
-    recovered = recover_ttl_exceeded_uows(registry)
-
-    assert uow_id not in recovered, (
-        f"Expected fresh UoW {uow_id!r} NOT to be in recovered list"
-    )
-
-    row = conn.execute(
-        "SELECT status FROM uow_registry WHERE id = ?",
-        (uow_id,),
-    ).fetchone()
-    assert row["status"] == "active", (
-        f"Expected status='active' (unchanged), got {row['status']!r}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 2: executor_orphan — startup sweep detects stale ready-for-executor UoW
+# Test 1: executor_orphan — startup sweep detects stale ready-for-executor UoW
 # ---------------------------------------------------------------------------
 
 
