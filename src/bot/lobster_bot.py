@@ -26,6 +26,11 @@ _SRC_DIR = str(Path(__file__).resolve().parent.parent)
 if _SRC_DIR not in _sys.path:
     _sys.path.insert(0, _SRC_DIR)
 from src.utils.fs import atomic_write_json  # noqa: E402
+from bot.pre_handler import (  # noqa: E402
+    handle_todos_command,
+    handle_quota_command,
+    handle_status_command,
+)
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -2249,6 +2254,11 @@ async def run_bot():
     bot_app.add_handler(CommandHandler("whitelist", whitelist_command))
     bot_app.add_handler(CommandHandler("unwhitelist", unwhitelist_command))
     bot_app.add_handler(CommandHandler("list_groups", list_groups_command))
+    # Pre-handler: deterministic commands that bypass the dispatcher inbox entirely.
+    # These reply directly from the bot process — no LLM round-trip, no inbox write.
+    bot_app.add_handler(CommandHandler("todos", handle_todos_command))
+    bot_app.add_handler(CommandHandler("quota", handle_quota_command))
+    bot_app.add_handler(CommandHandler("status", handle_status_command))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     bot_app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_message))
     bot_app.add_handler(MessageHandler(filters.PHOTO, handle_message))
