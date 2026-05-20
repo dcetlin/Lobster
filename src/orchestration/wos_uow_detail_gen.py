@@ -314,6 +314,51 @@ def _fmt_duration(seconds: int | None) -> str:
     return f"{hours}h {minutes}m"
 
 
+
+# ---------------------------------------------------------------------------
+# Action footer — pure function, no side effects
+# ---------------------------------------------------------------------------
+
+def _action_footer_html(uow_id: str) -> str:
+    """Return an HTML action footer with four Telegram deep-link action buttons.
+
+    Uses the same base64url payload encoding as wos_dashboard._tg_deep_link.
+    Bot username read from TELEGRAM_BOT_USERNAME env var.
+    """
+    import base64
+    import json as _json
+    bot = os.environ.get("TELEGRAM_BOT_USERNAME", "LobsterBot")
+
+    def _link(action: str) -> str:
+        payload = base64.urlsafe_b64encode(
+            _json.dumps({"a": action, "u": uow_id}, separators=(",", ":")).encode()
+        ).rstrip(b"=").decode()
+        return f"https://t.me/{bot}?start={payload}"
+
+    actions = [
+        ("↺ Retry", _link("retry"), "#1565c0", "#e3f0ff"),
+        ("⬆ Escalate", _link("escalate"), "#a06000", "#fef3cd"),
+        ("✓ Mark Resolved", _link("mark_resolved"), "#1a7a3c", "#d4f7e0"),
+        ("✗ Close Won't Fix", _link("close_wont_fix"), "#666", "#eee"),
+    ]
+    btns = " ".join(
+        f"<a href='{url}' style='display:inline-block;padding:7px 14px;margin:4px;"
+        f"border-radius:8px;font-size:.82rem;font-weight:600;text-decoration:none;"
+        f"color:{fg};background:{bg};border:1px solid {fg}'>{label}</a>"
+        for label, url, fg, bg in actions
+    )
+    return (
+        f"<div style='margin-top:24px;padding:14px;background:var(--surface2);"
+        f"border-radius:10px;border:1px solid var(--border)'>"
+        f"<h2 style='font-size:.78rem;font-weight:600;color:var(--text3);"
+        f"text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px'>Actions</h2>"
+        f"{btns}"
+        f"<p style='font-size:.68rem;color:var(--text3);margin-top:8px'>"
+        f"Each button opens Telegram and sends the action to Lobster.</p>"
+        f"</div>"
+    )
+
+
 # ---------------------------------------------------------------------------
 # HTML template — same CSS primitives as v4 wos_dashboard_gen.py
 # ---------------------------------------------------------------------------
@@ -661,7 +706,9 @@ def generate_html(
 
     d_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
 
-    return _HTML_TEMPLATE.format(uow_id=uow_id, uow_id_display=uow_id, D_JSON=d_json)
+    html = _HTML_TEMPLATE.format(uow_id=uow_id, uow_id_display=uow_id, D_JSON=d_json)
+    action_footer = _action_footer_html(uow_id)
+    return html.replace("</div>\n</body>\n</html>", f"{action_footer}\n</div>\n</body>\n</html>")
 
 
 # ---------------------------------------------------------------------------

@@ -1249,6 +1249,31 @@ Task(
 send_reply(chat_id=chat_id, text="Querying WOS pipeline...", source=source)
 ```
 
+
+**`/wos dashboard`** — generate and upload the v5 HTML dashboard, return the stable URL.
+
+Dispatch to a background subagent:
+
+```python
+task_id = f"wos-dashboard-{chat_id}"
+Task(
+    subagent_type="lobster-generalist",
+    run_in_background=True,
+    prompt=(
+        f"---\ntask_id: {task_id}\nchat_id: {chat_id}\nsource: {source}\n---\n\n"
+        "Run the WOS Dashboard v5 generator and send the result URL to the user.\n\n"
+        "Steps:\n"
+        "1. Run: uv run src/orchestration/wos_dashboard.py --format html\n"
+        "2. The script prints a public URL to stdout (stable bisque URL).\n"
+        "3. Send that URL to the user via send_reply.\n\n"
+        "Minimum viable output: a send_reply with the dashboard URL.\n"
+        "Boundary: do not run --with-drilldowns (too slow for on-demand use).\n"
+    ),
+)
+send_reply(chat_id=chat_id, text="Generating dashboard...", source=source)
+mark_processed(message_id)
+```
+
 **`/wos uow <uow-id>`** — show detail for a specific Unit of Work.
 
 Accepts a full ID (`uow_20260501_abc123`) or just the trailing hex suffix (`abc123`).
@@ -1403,6 +1428,20 @@ from src.orchestration.dispatcher_handlers import handle_debug
 on = cmd == "debug on"
 text = handle_debug(on=on)
 send_reply(chat_id=chat_id, text=text, source=source, message_id=message_id)
+```
+
+**`/start <payload>`** — Telegram deep-link callback. If the text starts with `/start ` and the payload decodes as a WOS action JSON (`{"a":..., "u":...}`), route to `handle_wos_action`. Handled inline (no subagent — registry write is fast):
+
+```python
+from src.orchestration.dispatcher_handlers import handle_wos_action
+from src.orchestration.registry import Registry
+
+cmd = msg["text"].strip()
+if cmd.startswith("/start "):
+    payload_b64 = cmd[len("/start "):].strip()
+    registry = Registry()
+    result = handle_wos_action(payload_b64, chat_id=chat_id, registry=registry)
+    send_reply(chat_id=chat_id, text=result, source=source, message_id=message_id)
 ```
 
 ---
