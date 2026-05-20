@@ -347,36 +347,38 @@ def _active_uows(registry: Any) -> list[dict]:
 
     Each dict has: id, status, steward_cycles, time_in_state_seconds,
     issue_url (raw, for downstream enrichment).
+
+    Queries specific statuses to avoid 'closed' legacy rows that fail UoWStatus parsing.
     """
     from src.orchestration.registry import UoWStatus
-    active_statuses = {
-        UoWStatus.ACTIVE,
-        UoWStatus.READY_FOR_EXECUTOR,
-        # 'executing' is not a canonical UoWStatus in the StrEnum but guard
-        # against future additions by using string comparison below.
-    }
+    active_status_strs = [
+        str(UoWStatus.ACTIVE),
+        str(UoWStatus.READY_FOR_EXECUTOR),
+        "executing",
+    ]
 
     now = datetime.now(timezone.utc)
     result = []
 
-    for uow in registry.list():
-        if uow.status not in active_statuses and str(uow.status) != "executing":
-            continue
-
-        # Compute time-in-state as seconds since updated_at
+    for status_str in active_status_strs:
         try:
-            updated = datetime.fromisoformat(uow.updated_at.replace("Z", "+00:00"))
-            time_in_state = int((now - updated).total_seconds())
-        except (AttributeError, ValueError):
-            time_in_state = -1
+            uow_list = registry.list(status=status_str)
+        except Exception:
+            continue
+        for uow in uow_list:
+            try:
+                updated = datetime.fromisoformat(uow.updated_at.replace("Z", "+00:00"))
+                time_in_state = int((now - updated).total_seconds())
+            except (AttributeError, ValueError):
+                time_in_state = -1
 
-        result.append({
-            "id": uow.id,
-            "status": str(uow.status),
-            "steward_cycles": uow.steward_cycles,
-            "time_in_state_seconds": time_in_state,
-            "issue_url": getattr(uow, "issue_url", None),
-        })
+            result.append({
+                "id": uow.id,
+                "status": str(uow.status),
+                "steward_cycles": uow.steward_cycles,
+                "time_in_state_seconds": time_in_state,
+                "issue_url": getattr(uow, "issue_url", None),
+            })
 
     return result
 
@@ -438,28 +440,33 @@ def _stalled_uows(registry: Any, stall_threshold_minutes: int = 30) -> list[dict
     """Return UoWs in ready-for-steward or ready-for-executor for longer than threshold.
 
     Each dict has: id, status, time_in_state_seconds.
+
+    Queries specific statuses to avoid 'closed' legacy rows that fail UoWStatus parsing.
     """
     from src.orchestration.registry import UoWStatus
-    stall_statuses = {UoWStatus.READY_FOR_STEWARD, UoWStatus.READY_FOR_EXECUTOR}
+    stall_status_strs = [str(UoWStatus.READY_FOR_STEWARD), str(UoWStatus.READY_FOR_EXECUTOR)]
     threshold_seconds = stall_threshold_minutes * 60
     now = datetime.now(timezone.utc)
     result = []
 
-    for uow in registry.list():
-        if uow.status not in stall_statuses:
-            continue
+    for status_str in stall_status_strs:
         try:
-            updated = datetime.fromisoformat(uow.updated_at.replace("Z", "+00:00"))
-            elapsed = int((now - updated).total_seconds())
-        except (AttributeError, ValueError):
-            elapsed = -1
+            uow_list = registry.list(status=status_str)
+        except Exception:
+            continue
+        for uow in uow_list:
+            try:
+                updated = datetime.fromisoformat(uow.updated_at.replace("Z", "+00:00"))
+                elapsed = int((now - updated).total_seconds())
+            except (AttributeError, ValueError):
+                elapsed = -1
 
-        if elapsed >= threshold_seconds:
-            result.append({
-                "id": uow.id,
-                "status": str(uow.status),
-                "time_in_state_seconds": elapsed,
-            })
+            if elapsed >= threshold_seconds:
+                result.append({
+                    "id": uow.id,
+                    "status": str(uow.status),
+                    "time_in_state_seconds": elapsed,
+                })
 
     return result
 
@@ -575,6 +582,21 @@ def _fmt_duration(seconds: int) -> str:
     return f"{hours}h {minutes}m"
 
 
+
+
+def _tg_deep_link(action: str, uow_id: str) -> str:
+    """Return a Telegram https://t.me deep link that encodes a WOS action callback.
+
+    Payload format: base64url(JSON) where JSON is {"a": action, "u": uow_id}.
+    Uses short keys to stay within Telegram's 64-char start-parameter limit.
+    Bot username is read from TELEGRAM_BOT_USERNAME env var; falls back to 'LobsterBot'.
+    """
+    import base64
+    payload_json = json.dumps({"a": action, "u": uow_id}, separators=(",", ":"))
+    payload_b64 = base64.urlsafe_b64encode(payload_json.encode()).rstrip(b"=").decode()
+    bot_username = os.environ.get("TELEGRAM_BOT_USERNAME", "LobsterBot")
+    return f"https://t.me/{bot_username}?start={payload_b64}"
+
 def render_text(data: dict[str, Any]) -> str:
     """Render the dashboard data as a plain-text report string."""
     lines: list[str] = []
@@ -644,24 +666,30 @@ def _uow_id_cell(uow_id: str, drilldown_urls: dict[str, str]) -> str:
 
 
 def _active_uow_row(u: dict, drilldown_urls: dict[str, str]) -> str:
-    """Render a single active-UoW table row, including title and category badge.
-
-    Columns: UoW ID (linked if drilldown available), issue title (or em-dash),
-    status badge + category badge, steward cycle count, time in state.
-    """
     title_display = u.get("issue_title") or "—"
     category = u.get("category") or "general"
+    status = u["status"]
     id_cell = _uow_id_cell(u["id"], drilldown_urls)
     category_badge = f"<span class='badge bc' style='margin-left:4px'>{category}</span>"
 
+    retry_url = _tg_deep_link("retry", u["id"])
+    escalate_url = _tg_deep_link("escalate", u["id"])
+    action_cell = (
+        f"<td style='white-space:nowrap'>"
+        f"<a class='act-btn' href='{retry_url}'>↺ retry</a> "
+        f"<a class='act-btn act-esc' href='{escalate_url}'>⬆ escalate</a>"
+        f"</td>"
+    )
+
     return (
-        f"<tr>"
+        f"<tr data-status='{status}'>"
         f"{id_cell}"
         f"<td style='font-size:.78rem;color:var(--text2)'>{title_display}</td>"
-        f"<td><span class='badge {_status_badge_class(u['status'])}'>{u['status']}</span>"
+        f"<td><span class='badge {_status_badge_class(status)}'>{status}</span>"
         f"{category_badge}</td>"
         f"<td>{u['steward_cycles']}</td>"
         f"<td>{_fmt_duration(u['time_in_state_seconds'])}</td>"
+        f"{action_cell}"
         f"</tr>"
     )
 
@@ -698,12 +726,27 @@ def render_html(data: dict[str, Any], drilldown_urls: dict[str, str]) -> str:
             for u in active
         )
         active_section = f"""
-        <table class="tbl">
-          <thead><tr>
-            <th>UoW ID</th><th>Title</th><th>Status / Category</th><th>Cycles</th><th>In State</th>
-          </tr></thead>
-          <tbody>{active_rows}</tbody>
-        </table>"""
+    <div class="filter-bar">
+      <span style="color:var(--text3);font-weight:600">Filter:</span>
+      <select id="status-filter" onchange="applyFilters()">
+        <option value="">All statuses</option>
+        <option value="active">active</option>
+        <option value="ready-for-executor">ready-for-executor</option>
+        <option value="ready-for-steward">ready-for-steward</option>
+        <option value="executing">executing</option>
+        <option value="blocked">blocked</option>
+      </select>
+      <label>
+        <input type="checkbox" id="stalled-only" onchange="applyFilters()">
+        Show only stalled
+      </label>
+    </div>
+    <table class="tbl" id="uow-table">
+      <thead><tr>
+        <th>UoW ID</th><th>Title</th><th>Status / Category</th><th>Cycles</th><th>In State</th><th>Actions</th>
+      </tr></thead>
+      <tbody>{active_rows}</tbody>
+    </table>"""
     else:
         active_section = "<p class='empty'>No active UoWs</p>"
 
@@ -784,6 +827,13 @@ h2{{font-size:.8rem;font-weight:600;margin-bottom:10px;color:var(--text2);text-t
 .scard .n{{font-size:1.4rem;font-weight:700;color:var(--accent)}}
 .scard .l{{font-size:.65rem;color:var(--text3);text-transform:uppercase;letter-spacing:.04em}}
 .empty{{color:var(--text3);font-size:.82rem;padding:8px 0}}
+.act-btn{{display:inline-block;padding:2px 7px;border-radius:6px;font-size:.7rem;font-weight:600;text-decoration:none;color:var(--accent);border:1px solid var(--accent);margin-right:3px;white-space:nowrap}}
+.act-btn:hover{{background:var(--act-bg)}}
+.act-esc{{color:var(--pend-col);border-color:var(--pend-col)}}
+.act-esc:hover{{background:var(--pend-bg)}}
+.filter-bar{{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px;padding:8px 10px;background:var(--surface2);border-radius:8px;font-size:.8rem}}
+.filter-bar label{{display:flex;align-items:center;gap:4px;cursor:pointer}}
+.filter-bar select{{font-size:.78rem;padding:2px 6px;border-radius:5px;border:1px solid var(--border);background:var(--surface);color:var(--text)}}
 </style>
 </head>
 <body>
@@ -823,6 +873,20 @@ h2{{font-size:.8rem;font-weight:600;margin-bottom:10px;color:var(--text2);text-t
 </div>
 
 </div>
+<script>
+function applyFilters() {{
+  var statusVal = document.getElementById('status-filter').value;
+  var stalledOnly = document.getElementById('stalled-only').checked;
+  var rows = document.querySelectorAll('#uow-table tbody tr');
+  rows.forEach(function(row) {{
+    var status = row.getAttribute('data-status') || '';
+    var matchStatus = !statusVal || status === statusVal;
+    var stalledStatuses = ['ready-for-steward', 'ready-for-executor', 'blocked'];
+    var matchStalled = !stalledOnly || stalledStatuses.indexOf(status) !== -1;
+    row.style.display = (matchStatus && matchStalled) ? '' : 'none';
+  }});
+}}
+</script>
 </body>
 </html>"""
 

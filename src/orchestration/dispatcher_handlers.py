@@ -1094,6 +1094,66 @@ def handle_wos_uow(uow_id: str, *, registry: "Registry") -> str:
     return "found"
 
 
+
+
+def handle_wos_action(payload_b64: str, *, chat_id: int, registry: "Registry") -> str:
+    """Parse a base64url action payload from a Telegram deep-link callback and route it.
+
+    Payload format: base64url(JSON) where JSON is {"a": action, "u": uow_id}.
+    Valid actions: "retry", "escalate", "mark_resolved", "close_wont_fix".
+
+    Returns a human-readable result string for send_reply, or an error message if
+    the payload is malformed or the UoW is not found.
+
+    Auth: only executes if the caller's chat_id matches TELEGRAM_ADMIN_CHAT_ID env var.
+    If the env var is unset, auth check is skipped (permissive default for single-user installs).
+    """
+    import base64
+
+    admin_chat_id_str = os.environ.get("TELEGRAM_ADMIN_CHAT_ID", "")
+    if admin_chat_id_str and str(chat_id) != admin_chat_id_str:
+        return "Unauthorized: WOS actions are restricted to the admin user."
+
+    try:
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        decoded = base64.urlsafe_b64decode(padded).decode("utf-8")
+        payload = json.loads(decoded)
+        action = payload["a"]
+        uow_id = payload["u"]
+    except Exception as exc:
+        return f"Could not parse WOS action payload: {exc}"
+
+    if action not in ("retry", "escalate", "mark_resolved", "close_wont_fix"):
+        return f"Unknown action: {action!r}"
+
+    uow = registry.get(uow_id)
+    if uow is None:
+        return f"UoW not found: {uow_id}"
+
+    from src.orchestration.registry import UoWStatus
+
+    if action == "retry":
+        registry.set_status_direct(uow_id, str(UoWStatus.READY_FOR_STEWARD))
+        registry.append_audit_log(uow_id, {"event": "dashboard_action", "action": "retry", "note": "retry requested via dashboard action"})
+        return f"UoW `{uow_id}` queued for retry (→ ready-for-steward)."
+
+    if action == "escalate":
+        registry.set_status_direct(uow_id, str(UoWStatus.NEEDS_HUMAN_REVIEW))
+        registry.append_audit_log(uow_id, {"event": "dashboard_action", "action": "escalate", "note": "escalated via dashboard action"})
+        return f"UoW `{uow_id}` escalated (→ needs-human-review)."
+
+    if action == "mark_resolved":
+        registry.set_status_direct(uow_id, str(UoWStatus.DONE))
+        registry.append_audit_log(uow_id, {"event": "dashboard_action", "action": "mark_resolved", "note": "marked resolved via dashboard action"})
+        return f"UoW `{uow_id}` marked resolved (→ done)."
+
+    if action == "close_wont_fix":
+        registry.set_status_direct(uow_id, str(UoWStatus.CANCELLED))
+        registry.append_audit_log(uow_id, {"event": "dashboard_action", "action": "close_wont_fix", "note": "closed won't fix via dashboard action"})
+        return f"UoW `{uow_id}` closed as won't fix (→ cancelled)."
+
+    return f"Unhandled action: {action!r}"
+
 # ---------------------------------------------------------------------------
 # Compaction-resilient message-type dispatch table
 #
