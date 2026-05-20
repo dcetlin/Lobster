@@ -70,6 +70,44 @@ def _applied_versions(conn: sqlite3.Connection) -> frozenset[int]:
     return frozenset(row["version"] for row in rows)
 
 
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """Return True if *column* already exists in *table* (via PRAGMA table_info)."""
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(row[1] == column for row in rows)
+
+
+_ALTER_ADD_COLUMN_RE = re.compile(
+    r"ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)",
+    re.IGNORECASE,
+)
+
+
+def _strip_idempotent_add_columns(
+    conn: sqlite3.Connection,
+    sql: str,
+) -> str:
+    """
+    Remove ALTER TABLE … ADD COLUMN statements for columns that already exist.
+
+    SQLite does not support ALTER TABLE … ADD COLUMN IF NOT EXISTS.  This helper
+    implements the guard in Python: it scans *sql* statement-by-statement and
+    drops any ADD COLUMN statement where the column is already present (as
+    detected by PRAGMA table_info).  All other statements are returned unchanged.
+    """
+    # Split on semicolons; preserve empties so the index stays consistent.
+    statements = sql.split(";")
+    kept: list[str] = []
+    for stmt in statements:
+        m = _ALTER_ADD_COLUMN_RE.search(stmt)
+        if m:
+            table, column = m.group(1), m.group(2)
+            if _column_exists(conn, table, column):
+                # Column already present — skip this statement.
+                continue
+        kept.append(stmt)
+    return ";".join(kept)
+
+
 def _record_migration(
     conn: sqlite3.Connection,
     version: int,
@@ -113,7 +151,12 @@ def run_migrations(db_path: Path) -> list[int]:
             if version in applied:
                 continue
 
-            sql = path.read_text()
+            raw_sql = path.read_text()
+            # Strip ADD COLUMN statements for columns that already exist —
+            # SQLite has no ALTER TABLE … ADD COLUMN IF NOT EXISTS, so we guard
+            # at the Python level via PRAGMA table_info rather than catching
+            # "duplicate column name" errors after the fact.
+            sql = _strip_idempotent_add_columns(conn, raw_sql)
             now = datetime.now(timezone.utc).isoformat()
 
             conn.execute("BEGIN IMMEDIATE")
@@ -124,19 +167,6 @@ def run_migrations(db_path: Path) -> list[int]:
                 conn.execute("BEGIN IMMEDIATE")
                 _record_migration(conn, version, path.name, now)
                 conn.commit()
-            except sqlite3.OperationalError as exc:
-                conn.rollback()
-                # "duplicate column name" means ALTER TABLE ADD COLUMN was
-                # already applied in a previous partial run (DDL committed but
-                # the migration record was never written).  The schema is
-                # already in the intended state, so record the migration and
-                # continue rather than crashing.
-                if "duplicate column name" in str(exc).lower():
-                    conn.execute("BEGIN IMMEDIATE")
-                    _record_migration(conn, version, path.name, now)
-                    conn.commit()
-                else:
-                    raise
             except Exception:
                 # executescript commits implicitly, so a partial DDL run may
                 # have succeeded. We do not attempt a rollback of DDL (SQLite

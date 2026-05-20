@@ -658,6 +658,13 @@ _HARD_CAP_CYCLES = 9
 # an orphan classification) count toward this cap. See issue #962.
 MAX_RETRIES: int = 3
 
+# Orphan kill retry budget: number of times a UoW may be requeued after an
+# orphan_kill_during_execution event before permanent failure.
+# Context compaction kills are environmental interruptions, not subagent bugs —
+# permanently failing on the first kill discards valid work.
+# orphan_kill_before_start is excluded: before-start means no partial work exists.
+ORPHAN_KILL_RETRY_BUDGET: int = 2
+
 # Return reasons that represent infrastructure kill events, not confirmed executions.
 # When return_reason is in this set, execution_attempts must NOT be incremented and
 # the retry cap must NOT apply. The agent session was killed before or during dispatch —
@@ -4609,6 +4616,34 @@ def _process_uow(
         "orphan_kill_before_start",
         "orphan_kill_during_execution",
     ):
+        # Retry-budget gate for orphan_kill_during_execution.
+        # Context compaction kills are environmental interruptions — requeue rather than
+        # permanently fail until the budget (ORPHAN_KILL_RETRY_BUDGET) is exhausted.
+        # orphan_kill_before_start has no partial work to retry; fall through unconditionally.
+        if reentry_posture == "orphan_kill_during_execution":
+            current_retry_count = uow.orphan_retry_count or 0
+            if current_retry_count < ORPHAN_KILL_RETRY_BUDGET:
+                if not dry_run:
+                    new_count = registry.retry_orphan_kill(uow_id)
+                    orphan_retry_log = {
+                        "event": "orphan_retry_scheduled",
+                        "uow_id": uow_id,
+                        "kill_classification": reentry_posture,
+                        "orphan_retry_count": new_count,
+                        "retry_budget": ORPHAN_KILL_RETRY_BUDGET,
+                        "ts": _now_iso(),
+                    }
+                    current_log_str = _append_steward_log_entry(
+                        registry, uow_id, current_log_str, orphan_retry_log
+                    )
+                    _write_steward_fields(registry, uow_id, steward_log=current_log_str)
+                    log.info(
+                        "_process_uow: UoW %s orphan_kill_during_execution retry %d/%d — requeued as pending",
+                        uow_id, new_count, ORPHAN_KILL_RETRY_BUDGET,
+                    )
+                return Surfaced(uow_id=uow_id, condition="orphan_retry_scheduled")
+            # Budget exhausted — fall through to permanent failure below.
+
         surface_condition = reentry_posture  # preserve precise kill classification
         orphan_reason = f"{reentry_posture}: subagent exited without calling write_result"
         orphan_log_entry = {

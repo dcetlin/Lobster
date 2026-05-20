@@ -313,6 +313,11 @@ class UoW:
     #   TEXT matches inbox message_id format: "{ts}_{telegram_msg_id}", e.g.
     #   "1778365681821_8563". No foreign key — inbox messages live in a separate DB.
     trigger_message_id: str | None = None
+    # orphan_retry_count: number of times this UoW has been requeued after an
+    #   orphan_kill_during_execution event (populated after migration 0026).
+    #   Permanent failure is deferred until this reaches ORPHAN_KILL_RETRY_BUDGET.
+    #   orphan_kill_before_start and non-orphan failures are unaffected.
+    orphan_retry_count: int = 0
 
 
 def _now_iso() -> str:
@@ -509,6 +514,7 @@ class Registry:
             heartbeat_ttl=d.get("heartbeat_ttl") or 300,
             retry_count=d.get("retry_count") or 0,
             execution_attempts=d.get("execution_attempts") or 0,
+            orphan_retry_count=d.get("orphan_retry_count") or 0,
             artifacts=_deserialize_json(d.get("artifacts")) if d.get("artifacts") else None,
             file_scope=_deserialize_json(d.get("file_scope")) if d.get("file_scope") else None,
             shard_id=d.get("shard_id"),
@@ -2323,6 +2329,50 @@ class Registry:
             conn.commit()
         except Exception:
             conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def retry_orphan_kill(self, uow_id: str) -> int:
+        """
+        Requeue a UoW after orphan_kill_during_execution, incrementing orphan_retry_count.
+        Returns the new orphan_retry_count value.
+        """
+        now = _now_iso()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, orphan_retry_count FROM uow_registry WHERE id = ?",
+                (uow_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"UoW {uow_id} not found")
+            new_count = (row["orphan_retry_count"] or 0) + 1
+            conn.execute(
+                """INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (now, uow_id, "orphan_retry_scheduled", row["status"], "pending",
+                 "steward", json.dumps({
+                     "actor": "steward",
+                     "reason": "orphan_kill_during_execution: retry budget not exhausted",
+                     "orphan_retry_count": new_count,
+                     "timestamp": now,
+                 }))
+            )
+            conn.execute(
+                """UPDATE uow_registry
+                   SET status = 'pending',
+                       orphan_retry_count = ?,
+                       claimed_until = NULL,
+                       updated_at = ?
+                   WHERE id = ?""",
+                (new_count, now, uow_id)
+            )
+            conn.execute("COMMIT")
+            return new_count
+        except Exception:
+            conn.execute("ROLLBACK")
             raise
         finally:
             conn.close()
