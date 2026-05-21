@@ -571,6 +571,7 @@ class LLMPrescription:
     instructions: str
     success_criteria_check: str
     estimated_cycles: int
+    boundary_present: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -2106,6 +2107,14 @@ success_criteria_check: <one or two sentences describing exactly how to verify t
         )
         return None
 
+    boundary_present = "Boundary:" in instructions
+    if not boundary_present:
+        log.warning(
+            "_llm_prescribe: prescription for %s is missing explicit Boundary clause "
+            "(see 2026-05-03 prescription audit)",
+            uow.id,
+        )
+
     log.info(
         "_llm_prescribe: LLM prescription generated for %s (model=%s, estimated_cycles=%d)",
         uow.id, model, estimated_cycles,
@@ -2114,6 +2123,7 @@ success_criteria_check: <one or two sentences describing exactly how to verify t
         instructions=instructions,
         success_criteria_check=success_criteria_check,
         estimated_cycles=max(1, min(3, estimated_cycles)),
+        boundary_present=boundary_present,
     )
 
 
@@ -5172,6 +5182,7 @@ def _process_uow(
             "instructions_preview": instructions[:80],
             "prescription_path": prescription_path,
             "prescription_confidence": confidence,
+            "boundary_present": "Boundary:" in instructions,
             "timestamp": _now_iso(),
         })
 
