@@ -36,7 +36,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from src.orchestration.registry import UoW, UoWStatus, UoWRegister, UoWType
+from src.orchestration.registry import (
+    UoW, UoWStatus, UoWRegister, UoWType,
+    validate_steward_executor_schema as validate_steward_schema,
+    validate_phase2_schema,
+)
 from src.orchestration.paths import WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG
 from src.orchestration.error_capture import (
     run_subprocess_with_error_capture,
@@ -830,19 +834,6 @@ def _compute_prescription_confidence(
         return CONFIDENCE_FIRST_EXECUTION
     return CONFIDENCE_LOW_ATTEMPTS
 
-
-# Fields required by the Steward for operation
-_STEWARD_REQUIRED_FIELDS = frozenset({
-    "workflow_artifact",
-    "success_criteria",
-    "prescribed_skills",
-    "steward_cycles",
-    "lifetime_cycles",
-    "timeout_at",
-    "estimated_runtime",
-    "steward_agenda",
-    "steward_log",
-})
 
 # Executor types
 _EXECUTOR_TYPE_GENERAL = "general"
@@ -3381,39 +3372,6 @@ def _build_prescription_instructions(
             + f"\n\nCompletion check: {success_check}"
         )
     return instructions
-
-
-# ---------------------------------------------------------------------------
-# Schema validation
-# ---------------------------------------------------------------------------
-
-def validate_steward_schema(conn: sqlite3.Connection) -> None:
-    """
-    Validate that all fields required for Steward operation are present in uow_registry.
-
-    Raises RuntimeError with a specific message if any required field is absent.
-    Call this at Steward startup before processing any UoW.
-
-    Args:
-        conn: An open SQLite connection to the registry database.
-
-    Raises:
-        RuntimeError: If any required field is missing. Message includes
-            "schema migration not applied" and the list of missing fields.
-    """
-    rows = conn.execute("PRAGMA table_info(uow_registry)").fetchall()
-    existing_cols = {row[1] for row in rows}
-    missing = _STEWARD_REQUIRED_FIELDS - existing_cols
-    if missing:
-        missing_sorted = sorted(missing)
-        raise RuntimeError(
-            f"schema migration not applied — run scripts/migrate_add_steward_fields.py first. "
-            f"Missing fields: {missing_sorted}"
-        )
-
-
-# Keep the old name as an alias so any existing callers continue to work.
-validate_phase2_schema = validate_steward_schema
 
 
 # ---------------------------------------------------------------------------
