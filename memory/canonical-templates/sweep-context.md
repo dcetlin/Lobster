@@ -91,10 +91,10 @@ Before the detection pass on Night 5 (Code layer), run a cron-vs-jobs.json consi
 
 1. Read `~/lobster-workspace/scheduled-jobs/jobs.json`. Collect all jobs with `"type": "B"` (cron-direct) and `"enabled": true`.
 2. Read the active crontab: `crontab -l`. For each Type B job that is enabled in jobs.json, verify a corresponding entry exists in the crontab (match on job name or script path via the `# LOBSTER-<NAME>` marker).
-3. Read all scripts in `~/lobster/scheduled-tasks/` that are invoked directly by cron (look for `dispatch: "cron-direct"` entries in jobs.json or identify by the `# LOBSTER-` cron marker). For each such script, verify it calls `_is_job_enabled(<job_name>)` at the top of `main()` before any substantive work.
+3. Read all scripts in `~/lobster/scheduled-tasks/` that are invoked directly by cron (look for `dispatch: "cron-direct"` entries in jobs.json or identify by the `# LOBSTER-` cron marker). For each such script, verify it imports `from src.utils.jobs import is_job_enabled` and calls `is_job_enabled(<job_name>)` at the top of `main()` before any substantive work.
 4. Produce two lists:
    - **Cron gaps:** Type B jobs enabled in jobs.json but absent from crontab
-   - **Gate gaps:** Cron-direct scripts that lack a `_is_job_enabled` gate at the top of `main()`
+   - **Gate gaps:** Cron-direct scripts that lack a `is_job_enabled` gate (via `from src.utils.jobs import is_job_enabled`) at the top of `main()`
 5. If either list is non-empty, add the missing entries as escalation candidates (they are structural defects, not behavioral ones — do not attempt autonomous fixes unless the gap is clearly a stale entry).
 
 This pre-scan runs before any code-layer detection reading. Its output becomes the structural context for the rest of the Night 5 pass.

@@ -272,7 +272,7 @@ Never use cron for user-space jobs. Never use systemd tools for system-level inf
   */N * * * * cd ~/lobster && uv run scheduled-tasks/my-script.py >> ~/lobster-workspace/scheduled-jobs/logs/my-script.log 2>&1 # LOBSTER-MY-SCRIPT
   ```
 
-  **Required: jobs.json gate.** Add `_is_job_enabled(job_name)` at the top of `main()` before any DB work. This preserves runtime enable/disable via `wos start/stop` and direct jobs.json edits. See `scheduled-tasks/executor-heartbeat.py` and `scheduled-tasks/steward-heartbeat.py` for the reference implementation.
+  **Required: jobs.json gate.** Add `from src.utils.jobs import is_job_enabled` at the top of the file (after your `sys.path` setup) and call `is_job_enabled(job_name)` at the top of `main()` before any DB work. This preserves runtime enable/disable via `wos start/stop` and direct jobs.json edits. See `scheduled-tasks/executor-heartbeat.py` and `scheduled-tasks/steward-heartbeat.py` for the reference implementation.
 
   **jobs.json fields for Type B jobs:**
   ```json

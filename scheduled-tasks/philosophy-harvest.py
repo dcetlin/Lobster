@@ -20,31 +20,6 @@ from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
-# jobs.json enabled gate — Type B/C cron-direct dispatch path
-# ---------------------------------------------------------------------------
-
-
-def _is_job_enabled(job_name: str) -> bool:
-    """
-    Return True if the job is enabled in jobs.json, False if explicitly disabled.
-
-    Defaults to True when:
-    - jobs.json is absent
-    - the job entry is missing
-    - the file is unreadable or malformed
-
-    This mirrors the gate logic in dispatch-job.sh so cron-direct jobs
-    respect the same runtime enable/disable toggle as LLM-dispatch jobs.
-    """
-    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-    jobs_file = workspace / "scheduled-jobs" / "jobs.json"
-    try:
-        data = json.loads(jobs_file.read_text())
-        return bool(data.get("jobs", {}).get(job_name, {}).get("enabled", True))
-    except Exception:
-        return True
-
-# ---------------------------------------------------------------------------
 # Path setup -- allow running as a script or via importlib (tests)
 # ---------------------------------------------------------------------------
 
@@ -56,6 +31,7 @@ import yaml  # noqa: E402
 
 from src.orchestration.paths import SURFACE_QUEUE  # noqa: E402
 from src.utils.inbox_write import _task_outputs_dir, write_inbox_message  # noqa: E402
+from src.utils.jobs import is_job_enabled  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +312,7 @@ def main() -> None:
 
     # jobs.json enabled gate — respect runtime enable/disable toggled via
     # the dispatcher 'wos start/stop' commands or direct jobs.json edits.
-    if not _is_job_enabled(JOB_NAME):
+    if not is_job_enabled(JOB_NAME):
         print(f"{JOB_NAME}: skipped (disabled in jobs.json)")
         sys.exit(0)
 

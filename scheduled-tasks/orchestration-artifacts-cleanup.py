@@ -13,11 +13,16 @@ WOS-UoW: uow_20260518_f729fe
 
 from __future__ import annotations
 
-import json
 import logging
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from src.utils.jobs import is_job_enabled  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,15 +35,6 @@ ARTIFACTS_DIR = Path.home() / "lobster-workspace/orchestration/artifacts"
 KEEP_DAYS = 14
 KEEP_MIN_COUNT = 500
 DELETE_AFTER_DAYS = 30
-
-
-def _is_job_enabled(job_name: str) -> bool:
-    jobs_file = Path.home() / "lobster-workspace/scheduled-jobs/jobs.json"
-    try:
-        data = json.loads(jobs_file.read_text())
-        return data.get("jobs", data).get(job_name, {}).get("enabled", True)
-    except Exception:
-        return True
 
 
 def cleanup_dir(directory: Path) -> tuple[int, int]:
@@ -69,7 +65,7 @@ def cleanup_dir(directory: Path) -> tuple[int, int]:
 
 
 def main() -> None:
-    if not _is_job_enabled("orchestration-artifacts-cleanup"):
+    if not is_job_enabled("orchestration-artifacts-cleanup"):
         log.info("Job disabled, skipping.")
         sys.exit(0)
 
