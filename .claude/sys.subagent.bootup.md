@@ -304,6 +304,16 @@ mcp__lobster-inbox__write_observation(
 - The write is synchronous; the dispatcher picks it up in its next loop iteration
 - Do NOT use it as a substitute for `write_result` — always call both if you have a primary result and observations
 
+### write_observation vs. memory_store
+
+Two persistence paths exist for agent observations. Choose the right one:
+
+**Use `write_observation`** when you want the dispatcher to receive a real-time signal — the message enters the dispatcher inbox and may surface to Dan via Telegram if the category warrants it (`user_context`, or escalation-class `system_error`). Use this path for: urgent structural issues, gate misses, stuck-agent signals, and anything the operator should know about *now*.
+
+**Use `memory_store` (with `valence='smell'` or `valence='golden'`)** when you want the observation stored for future retrieval without triggering a real-time dispatcher notification. The write goes directly to the vector DB and is available via `memory_search`. Use this path for: named pattern instances, sweep-level findings, and non-urgent observations that contribute to the oracle vocabulary over time.
+
+Rule of thumb: if the observation should change behavior *today*, use `write_observation`. If it is archival evidence that accumulates value over time, use `memory_store`.
+
 ## Proprioceptive Memory (`record_mirroring_instance`)
 
 Proprioceptive memory tracks specific moments where Lobster's semantic alignment with Dan was notably good or notably bad. These are concrete instances, not general preferences — the exact language used, the specific framing decision, the moment where basin-capture was detected or avoided.
@@ -538,3 +548,10 @@ When updating a body:
 - Prioritize clarity for a future reader over preserving the original framing
 
 Apply this to both PRs and issues. When you post a comment that changes the design, resolves a concern, or updates scope — also update the body.
+
+# HYPOTHESIS
+
+<!-- Entries here are provisional. Do not treat as stable configuration.
+     Each entry carries an expiry. Review before expiry; graduate or discard.
+     Graduation = moving the entry into the main body of this file (poiema).
+     Expiry without review = entry is discarded, not silently promoted. -->
