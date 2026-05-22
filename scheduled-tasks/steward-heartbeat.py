@@ -55,10 +55,10 @@ _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from src.orchestration.paths import REGISTRY_DB
-from src.orchestration.steward import is_bootup_candidate_gate_active, run_steward_cycle
-from src.orchestration.github_sync import run_post_completion_sync
-from src.orchestration.dispatcher_handlers import read_wos_config, _PAUSE_REASON_USER_COMMAND
+from orchestration.paths import REGISTRY_DB
+from orchestration.steward import is_bootup_candidate_gate_active, run_steward_cycle
+from orchestration.github_sync import run_post_completion_sync
+from orchestration.dispatcher_handlers import read_wos_config, _PAUSE_REASON_USER_COMMAND
 from src.utils.jobs import is_job_enabled
 from src.utils.inbox_write import write_crash_alert
 
@@ -1078,7 +1078,7 @@ def _main_inner() -> int:
     gate_active = is_bootup_candidate_gate_active()
     log.info("BOOTUP_CANDIDATE_GATE = %s", gate_active)
 
-    from src.orchestration.registry import Registry
+    from orchestration.registry import Registry
 
     db_path = REGISTRY_DB
     if not db_path.exists():
@@ -1205,7 +1205,7 @@ def _main_inner() -> int:
     # run because they are cheap and ensure state consistency even when WOS is
     # paused. Phase 3 (LLM prescription) and Phase 4 (GitHub sync) are skipped
     # when execution_enabled=false to prevent LLM cost drain.
-    from src.orchestration.dispatcher_handlers import is_execution_enabled  # noqa: PLC0415
+    from orchestration.dispatcher_handlers import is_execution_enabled  # noqa: PLC0415
 
     # Alert condition 2: queue depth when execution is disabled (#618).
     # Check before skipping Phase 3 so the alert fires even when WOS is paused.
