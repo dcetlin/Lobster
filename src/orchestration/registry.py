@@ -1531,7 +1531,7 @@ class Registry:
                 SELECT id FROM uow_registry
                 WHERE status IN ('active', 'executing')
                   AND claimed_until IS NOT NULL
-                  AND claimed_until < datetime('now')
+                  AND datetime(claimed_until) < datetime('now')
                 """
             ).fetchall()
         finally:
@@ -1560,7 +1560,7 @@ class Registry:
                     """
                     UPDATE uow_registry
                     SET status = 'ready-for-steward', claimed_until = NULL, updated_at = ?
-                    WHERE id = ? AND status IN ('active', 'executing') AND claimed_until < datetime('now')
+                    WHERE id = ? AND status IN ('active', 'executing') AND datetime(claimed_until) < datetime('now')
                     """,
                     (now, uow_id),
                 )

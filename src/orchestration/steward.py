@@ -985,6 +985,11 @@ def _most_recent_return_reason(audit_entries: list[dict]) -> str | None:
             # dead. Extract return_reason from the audit note (written by
             # reset_expired_claims as "executing_orphan") so the steward can apply
             # orphan_retry_count and ORPHAN_KILL_RETRY_BUDGET correctly.
+            #
+            # Note: the generic `if "return_reason" in note_data` check above this
+            # loop already catches this case (the audit note carries return_reason
+            # explicitly). This elif branch is defense-in-depth: it ensures correct
+            # behavior if the generic check above is ever removed or modified.
             rr = note_data.get("return_reason")
             if rr:
                 return rr
