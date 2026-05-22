@@ -40,8 +40,6 @@ import logging
 import os
 import subprocess
 import sys
-import traceback
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -59,6 +57,7 @@ if str(_SRC_ROOT) not in sys.path:
 
 from src.orchestration.paths import REGISTRY_DB
 from src.utils.jobs import is_job_enabled
+from src.utils.inbox_write import write_crash_alert
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -70,63 +69,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
 log = logging.getLogger("executor-heartbeat")
-
-# Admin chat_id for crash alerts (env-injected, falls back to hardcoded)
-_ADMIN_CHAT_ID: str = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
-
-
-# ---------------------------------------------------------------------------
-# Crash alert — write a system inbox message so the dispatcher relays it to Dan
-# ---------------------------------------------------------------------------
-
-def _write_crash_alert(job_name: str, exc: BaseException, extra: str = "") -> None:
-    """Write a scheduled_task_crash inbox message so the dispatcher alerts Dan.
-
-    This is a best-effort fire-and-forget write. Failures here are logged but
-    do not mask the original exception — the caller must re-raise or sys.exit
-    after calling this function.
-
-    The inbox message shape is intentionally simple: source=system,
-    type=scheduled_task_crash, text=human-readable alert. The dispatcher's
-    LLM loop reads the message and relays it to Dan as a Telegram notification.
-    """
-    tb_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
-    tb_str = "".join(tb_lines).strip()
-    # Truncate traceback to avoid oversized messages (keep last 2000 chars)
-    if len(tb_str) > 2000:
-        tb_str = "...(truncated)...\n" + tb_str[-2000:]
-
-    text = (
-        f"[CRASH] {job_name} crashed with {type(exc).__name__}: {exc}\n\n"
-        f"```\n{tb_str}\n```"
-    )
-    if extra:
-        text += f"\n\n{extra}"
-
-    from datetime import datetime as _datetime, timezone as _timezone
-
-    msg_id = str(uuid.uuid4())
-    msg = {
-        "id": msg_id,
-        "source": "system",
-        "type": "scheduled_task_crash",
-        "chat_id": _ADMIN_CHAT_ID,
-        "job_name": job_name,
-        "timestamp": _datetime.now(_timezone.utc).isoformat(),
-        "text": text,
-    }
-
-    try:
-        messages_base = Path(os.environ.get("LOBSTER_MESSAGES", Path.home() / "messages"))
-        inbox_dir = messages_base / "inbox"
-        inbox_dir.mkdir(parents=True, exist_ok=True)
-        tmp_path = inbox_dir / f"{msg_id}.json.tmp"
-        dest_path = inbox_dir / f"{msg_id}.json"
-        tmp_path.write_text(json.dumps(msg, indent=2), encoding="utf-8")
-        tmp_path.rename(dest_path)
-        log.info("Crash alert written to inbox (%s)", msg_id)
-    except Exception as write_exc:
-        log.error("Failed to write crash alert to inbox: %s", write_exc)
 
 
 # ---------------------------------------------------------------------------
@@ -627,7 +569,7 @@ def main() -> int:
         return _main_inner()
     except Exception as exc:
         log.error("executor-heartbeat crashed with unhandled exception: %s", exc, exc_info=True)
-        _write_crash_alert(job_name="executor-heartbeat", exc=exc)
+        write_crash_alert(job_name="executor-heartbeat", exc=exc)
         return 1
 
 
