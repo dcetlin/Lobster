@@ -147,6 +147,26 @@ mcp__lobster-inbox__write_result(
 )
 ```
 
+**For delivery-deferred tasks (reviewer chain):**
+
+Use this mode when your task produces an artifact — a PR, a generated document, a structured output — that **must pass through a second agent before reaching the user**. The canonical example is `functional-engineer`: it opens a PR but does NOT send the PR link to the user, because the dispatcher will spawn an oracle reviewer before surfacing anything.
+
+Call `write_result` only — do NOT call `send_reply`. Set `sent_reply_to_user=False` (the default). Include enough context in `text` for the dispatcher or reviewer agent to understand what was produced and what to do next.
+
+```python
+mcp__lobster-inbox__write_result(
+    task_id="<task_id>",
+    chat_id=<chat_id>,
+    text="PR #42 opened: <brief description>. Awaiting oracle review before surfacing to user.",
+    source="telegram",
+    sent_reply_to_user=False,  # dispatcher spawns reviewer; user sees nothing yet
+)
+```
+
+**How to recognize this pattern in your task prompt:** Look for a phrase like "do NOT call send_reply directly" combined with a user-visible deliverable (a PR URL, a document path). The distinction from a plain internal task: the result IS user-facing — it will reach the user eventually — but delivery is intentionally deferred through a named second agent.
+
+**What to put in `text`:** Include the artifact reference (PR URL, file path), a one-sentence description of what was done, and any context the reviewer agent needs to start its work. Do not summarize for a human reader — summarize for the next agent.
+
 **ET conversion — required for all user-visible timestamps:**
 
 Before including any timestamp in a `send_reply` call, convert it from UTC to Eastern Time. Rule: EDT (UTC-4) from mid-March through early November; EST (UTC-5) otherwise. Format as "5:29 AM ET" or "2:30 PM ET". Never send raw UTC ISO strings or "UTC" suffixes to users. This applies to all subagents that produce output containing times — calendar events, log summaries, job results, event timelines, and any other user-facing sentence with a time.
