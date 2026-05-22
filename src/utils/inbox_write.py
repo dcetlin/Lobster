@@ -12,6 +12,10 @@ write_inbox_message(job_name, chat_id, text, timestamp) -> str
     Non-urgent messages sent outside the morning window are queued in
     pending-deliveries.jsonl instead of the inbox (circadian delivery).
 
+write_crash_alert(job_name, exc, extra) -> None
+    Write a scheduled_task_crash inbox message so the dispatcher alerts Dan.
+    Best-effort; failures are logged but do not mask the original exception.
+
 _inbox_dir() -> Path
 _task_outputs_dir() -> Path
     Directory helpers; exposed for scripts that need the raw path (e.g. to
@@ -21,9 +25,14 @@ _task_outputs_dir() -> Path
 from __future__ import annotations
 
 import json
+import logging
 import os
+import traceback
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 def _inbox_dir() -> Path:
@@ -106,3 +115,45 @@ def write_inbox_message(
     tmp_path.write_text(json.dumps(msg, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp_path.replace(out_path)
     return msg_id
+
+
+def write_crash_alert(job_name: str, exc: BaseException, extra: str = "") -> None:
+    """Write a scheduled_task_crash inbox message so the dispatcher alerts Dan.
+
+    Best-effort fire-and-forget. Failures are logged but do not mask the
+    original exception — the caller must re-raise or sys.exit after this call.
+    """
+    admin_chat_id: str = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
+
+    tb_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    tb_str = "".join(tb_lines).strip()
+    if len(tb_str) > 2000:
+        tb_str = "...(truncated)...\n" + tb_str[-2000:]
+
+    text = (
+        f"[CRASH] {job_name} crashed with {type(exc).__name__}: {exc}\n\n"
+        f"```\n{tb_str}\n```"
+    )
+    if extra:
+        text += f"\n\n{extra}"
+
+    msg_id = str(uuid.uuid4())
+    msg = {
+        "id": msg_id,
+        "source": "system",
+        "type": "scheduled_task_crash",
+        "chat_id": admin_chat_id,
+        "job_name": job_name,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "text": text,
+    }
+
+    try:
+        inbox = _inbox_dir()
+        tmp_path = inbox / f"{msg_id}.json.tmp"
+        dest_path = inbox / f"{msg_id}.json"
+        tmp_path.write_text(json.dumps(msg, indent=2), encoding="utf-8")
+        tmp_path.rename(dest_path)
+        log.info("Crash alert written to inbox (%s)", msg_id)
+    except Exception as write_exc:
+        log.error("Failed to write crash alert to inbox: %s", write_exc)
