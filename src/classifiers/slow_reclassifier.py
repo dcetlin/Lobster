@@ -905,8 +905,8 @@ def run_pass(conn: sqlite3.Connection) -> tuple[int, int, int]:
                 pattern.event_ids,
             )
 
-            # Write a pattern_observation event — skip if identical entry exists within 12 hours
-            if _recent_duplicate_exists(conn, pattern):
+            # Write a pattern_observation event — skip if identical entry exists within the dedup window
+            if _recent_duplicate_exists(conn, pattern, hours=_DEDUP_WINDOW_HOURS):
                 log.debug(
                     "Dedup gate: skipping duplicate pattern_observation %s source=%s",
                     pattern.pattern_type,
