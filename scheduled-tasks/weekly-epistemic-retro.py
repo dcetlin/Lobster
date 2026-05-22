@@ -21,9 +21,8 @@ Run standalone:
 
 import json
 import os
-import subprocess
+import sqlite3
 import sys
-import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -73,43 +72,31 @@ def artifact_path(retros_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# MCP call via claude -p
+# Conversation history — direct DB read
 # ---------------------------------------------------------------------------
 
-def call_mcp(mcp_call_description: str) -> str:
-    """
-    Invoke a one-shot Claude subagent that makes a single MCP call and returns
-    the result as plain text.  This lets the Python script remain pure — all
-    Lobster I/O goes through Claude's tool layer.
-    """
-    try:
-        result = subprocess.run(
-            [
-                "claude", "-p", mcp_call_description,
-                "--dangerously-skip-permissions",
-                "--max-turns", "5",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=120,
-        )
-        return result.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        print(f"ERROR: claude -p failed (exit {e.returncode}): {e.stderr or e.stdout or 'no output'}")
-        return ""
-    except Exception as e:
-        print(f"ERROR: Unexpected error running claude -p subprocess: {e}")
-        return ""
-
-
 def fetch_conversation_history() -> str:
-    """Fetch the last 7 days of conversation history via MCP."""
-    prompt = (
-        "Call get_conversation_history with limit=100 and return the raw JSON result "
-        "exactly as the tool returns it. No commentary, no formatting — just the JSON."
-    )
-    return call_mcp(prompt)
+    """Fetch last 7 days of conversation history directly from messages.db."""
+    db_path = Path(
+        os.environ.get("LOBSTER_MESSAGES", str(Path.home() / "messages"))
+    ) / "messages.db"
+    if not db_path.exists():
+        print(f"WARNING: messages.db not found at {db_path}")
+        return ""
+    since = week_ago_iso()
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT direction, text, transcription, timestamp, type, chat_id
+               FROM messages WHERE timestamp >= ? ORDER BY timestamp ASC LIMIT 100""",
+            (since,),
+        ).fetchall()
+        conn.close()
+        return json.dumps([dict(r) for r in rows], default=str, indent=2)
+    except Exception as e:
+        print(f"ERROR: could not fetch conversation history from messages.db: {e}")
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -221,35 +208,25 @@ def generate_retro(
     conversation_history: str,
     date: str,
 ) -> str:
-    """
-    Run a Claude subagent to produce the retro artifact.
-    Returns the artifact text.
-    """
+    """Generate the retro artifact using the Anthropic API directly."""
+    import anthropic
+
     prompt = RETRO_PROMPT_TEMPLATE.format(
         date=date,
         epistemic_md=epistemic_md,
         bootup_md=bootup_md,
         conversation_history=conversation_history,
     )
-
     try:
-        result = subprocess.run(
-            [
-                "claude", "-p", prompt,
-                "--dangerously-skip-permissions",
-                "--max-turns", "3",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=300,
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model="claude-opus-4-7",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
         )
-        return result.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        print(f"ERROR: retro generation failed (exit {e.returncode}): {e.stderr or e.stdout or 'no output'}")
-        return ""
+        return response.content[0].text.strip()
     except Exception as e:
-        print(f"ERROR: Unexpected error running retro generation subprocess: {e}")
+        print(f"ERROR: retro generation failed: {e}")
         return ""
 
 
@@ -319,13 +296,24 @@ def deliver_and_log(summary: str, artifact_path_str: str) -> None:
     Both operations are direct filesystem writes — no subprocess dependency.
     """
     chat_id = int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586"))
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    write_inbox_message(JOB_NAME, chat_id, summary, timestamp)
-    write_task_output_record(
-        f"Retro completed. Artifact written to {artifact_path_str}. Summary delivered to Telegram.",
-        "success",
-        timestamp,
-    )
+    ts = datetime.now(timezone.utc)
+    timestamp = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        write_inbox_message(JOB_NAME, chat_id, summary, timestamp)
+        write_task_output_record(
+            f"Retro completed. Artifact written to {artifact_path_str}. Summary delivered to Telegram.",
+            "success",
+            timestamp,
+        )
+    except Exception as e:
+        print(f"[{JOB_NAME}] inbox write failed: {e}\nDATA:\n{summary}", file=sys.stderr)
+        fallback = (
+            Path.home() / "lobster-workspace" / "scheduled-jobs" / "logs"
+            / f"{JOB_NAME}-fallback-{ts.strftime('%Y%m%d-%H%M%S')}.txt"
+        )
+        fallback.parent.mkdir(parents=True, exist_ok=True)
+        fallback.write_text(f"inbox write failed: {e}\n\n{summary}")
+        raise
 
 
 # ---------------------------------------------------------------------------

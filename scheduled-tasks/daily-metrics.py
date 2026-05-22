@@ -384,9 +384,20 @@ def deliver(summary: str, date: str) -> None:
     Both operations are direct filesystem writes — no subprocess dependency.
     """
     chat_id = int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586"))
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    write_inbox_message(JOB_NAME, chat_id, summary, timestamp)
-    write_task_output_record(f"Daily metrics for {date} delivered to Telegram.", "success", timestamp)
+    ts = datetime.now(timezone.utc)
+    timestamp = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        write_inbox_message(JOB_NAME, chat_id, summary, timestamp)
+        write_task_output_record(f"Daily metrics for {date} delivered to Telegram.", "success", timestamp)
+    except Exception as e:
+        print(f"[{JOB_NAME}] inbox write failed: {e}\nDATA:\n{summary}", file=sys.stderr)
+        fallback = (
+            Path.home() / "lobster-workspace" / "scheduled-jobs" / "logs"
+            / f"{JOB_NAME}-fallback-{ts.strftime('%Y%m%d-%H%M%S')}.txt"
+        )
+        fallback.parent.mkdir(parents=True, exist_ok=True)
+        fallback.write_text(f"inbox write failed: {e}\n\n{summary}")
+        raise
 
 
 # ---------------------------------------------------------------------------
