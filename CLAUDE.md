@@ -165,6 +165,7 @@ Before consulting any gate, classify the message as ACTION or DESIGN_OPEN. These
 | **Relay filter** | If the key signal in a send_reply to Dan is buried past paragraph 2, move it to the lead. | Advisory — apply before every send_reply. |
 | **PR Merge Gate** | Every code PR must pass oracle review before merge. Flow: open PR → oracle agent → writes `oracle/verdicts/pr-{number}.md` → if first line is `VERDICT: APPROVED` dispatch merge agent; if `VERDICT: NEEDS_CHANGES` dispatch fix agent → re-oracle → repeat. Merge agent must read `oracle/verdicts/pr-{number}.md` and confirm first line is `VERDICT: APPROVED` before merging, then move file to `oracle/verdicts/archive/pr-{number}.md`. Oracle round cap: Rounds 1–2: auto-fix. Round 3: notify Dan before dispatching another fix. Round 4+: escalate to Dan before dispatching; include a summary of what gaps keep re-opening and why. | Advisory — never dispatch a merge agent without first confirming `VERDICT: APPROVED` in `oracle/verdicts/pr-{number}.md`. Two enforcement paths: **Option A** — if `LOBSTER_REVIEW_TOKEN` is configured, the oracle posts a formal GitHub Approved review via the GitHub API (required for branch protection rules with non-author reviewer requirement); **Option B** (always active, Option A fallback) — dispatcher checks the verdict file directly. If Option A is configured but the `gh api` call fails, a warning is appended to the verdict file and Option B governs. |
 | **WOS Execute Gate** | A message with `type: "wos_execute"` must be routed by calling `route_wos_message(msg)` from `src/orchestration/dispatcher_handlers.py` — never by re-reading prose that may be absent after compaction. | Structural — if you receive a `wos_execute` message, call `route_wos_message` unconditionally; the import is always available. |
+| **Behavioral Failure Gate** | A behavioral failure is detected (gate miss, misclassification, wrong routing decision). | Advisory — open a GitHub issue in `dcetlin/Lobster` with label `needs-discriminator-fix`; title: the specific failure class; body: the concrete example that triggered detection. Do NOT add advisory text to bootup docs or CLAUDE.md instead. Behavioral failure → GitHub issue, not advisory text. |
 
 ### Long-Running Dispatch Preamble
 
@@ -210,12 +211,13 @@ mcp__lobster-inbox__write_observation(
 )
 ```
 
-Gate names for the `gate=` field: `7_second_rule`, `design_gate`, `bias_to_action`, `dispatch_template`, `no_self_relay`, `relay_filter`, `pr_merge_gate`, `wos_execute_gate`.
+Gate names for the `gate=` field: `7_second_rule`, `design_gate`, `bias_to_action`, `dispatch_template`, `no_self_relay`, `relay_filter`, `pr_merge_gate`, `wos_execute_gate`, `behavioral_failure_gate`.
 
 Examples:
 - You reach for `Bash` or `Glob` directly (7-second rule): log `gate=7_second_rule condition=direct_tool_call outcome=miss`
 - You route a DESIGN_OPEN message directly to action without checking the discriminator: log `gate=design_gate condition=no_artifact_stated outcome=miss`
 - A PR result arrives without an oracle approval check: log `gate=pr_merge_gate condition=missing_oracle_check outcome=miss`
+- You are about to add advisory text to a bootup doc encoding a previously-failed behavioral rule: log `gate=behavioral_failure_gate condition=advisory_text_addition outcome=miss` and open a GitHub issue with label `needs-discriminator-fix` instead.
 
 This fires **in addition to** the correct recovery action (e.g., delegating to a subagent). Log the miss, then do the right thing. Do not log a miss for a gate that correctly fired and was honored.
 
