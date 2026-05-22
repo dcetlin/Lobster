@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from src.orchestration.registry import UoW, UoWStatus, UoWRegister
+from src.orchestration.registry import UoW, UoWStatus, UoWRegister, UoWType
 from src.orchestration.paths import WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG
 from src.orchestration.error_capture import (
     run_subprocess_with_error_capture,
@@ -1703,22 +1703,67 @@ def _build_prescription_route_reason(
     return heuristic_reason
 
 
+_DEBUG_POSTURES: frozenset[str] = frozenset({
+    ReentryPosture.CRASHED_NO_OUTPUT,
+    ReentryPosture.CRASHED_ZERO_BYTES,
+    ReentryPosture.CRASHED_OUTPUT_REF_MISSING,
+    ReentryPosture.EXECUTION_FAILED,
+    ReentryPosture.STALL_DETECTED,
+    ReentryPosture.EXECUTOR_ORPHAN,
+    ReentryPosture.EXECUTING_ORPHAN,
+    ReentryPosture.DIAGNOSING_ORPHAN,
+})
+
+_VERIFY_POSTURES: frozenset[str] = frozenset({
+    ReentryPosture.EXECUTION_COMPLETE,
+    ReentryPosture.STARTUP_SWEEP_POSSIBLY_COMPLETE,
+})
+
+# Broader summary fallback keywords — only used when no structured field resolves.
+_SUMMARY_DEBUG_TOKENS: frozenset[str] = frozenset({
+    "bug", "fix", "error", "crash", "fail", "regression", "broken", "incorrect", "wrong",
+})
+_SUMMARY_VERIFY_TOKENS: frozenset[str] = frozenset({
+    "pr", "pull request", "review", "merge", "approve", "approval",
+})
+
+
 def _select_prescribed_skills(uow: "UoW", reentry_posture: str) -> list[str]:
     """
-    Select prescribed skills appropriate to the UoW type and posture.
+    Select prescribed skills from structured UoW fields.
 
+    Inspection order: reentry_posture → register → type → summary fallback.
+    Summary fallback fires only when no structured field resolves a skill.
     Returns a list of skill IDs.
     """
-    summary = uow.summary.lower()
-    skills = []
+    skills: list[str] = []
 
-    if "bug" in summary or "fix" in summary or "error" in summary:
+    # --- Structured field 1: reentry_posture (execution-state signal) ---
+    if reentry_posture in _DEBUG_POSTURES:
         skills.append("systematic-debugging")
-    if "pr" in summary or "pull request" in summary or reentry_posture == "execution_complete":
+    if reentry_posture in _VERIFY_POSTURES:
         skills.append("verification-before-completion")
-    if reentry_posture in ("crashed_no_output", "execution_failed"):
+
+    # --- Structured field 2: register (attentional complexity signal) ---
+    # Iterative-convergent work is inherently multi-cycle and benefits from
+    # systematic debugging regardless of posture.
+    if uow.register == UoWRegister.ITERATIVE_CONVERGENT:
         if "systematic-debugging" not in skills:
             skills.append("systematic-debugging")
+
+    # --- Structured field 3: type (workflow category) ---
+    # Non-executable UoWs (seed, routing, classification) have no execution
+    # artifact to debug or verify — skip summary fallback entirely for them.
+    if uow.type != UoWType.EXECUTABLE:
+        return skills
+
+    # --- Summary fallback: only when structured fields produced no signal ---
+    if not skills:
+        summary = uow.summary.lower()
+        if any(token in summary for token in _SUMMARY_DEBUG_TOKENS):
+            skills.append("systematic-debugging")
+        if any(token in summary for token in _SUMMARY_VERIFY_TOKENS):
+            skills.append("verification-before-completion")
 
     return skills
 
