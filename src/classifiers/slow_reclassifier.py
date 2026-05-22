@@ -423,6 +423,31 @@ def write_pattern_event(conn: sqlite3.Connection, obs: PatternObservation) -> in
     return event_id
 
 
+def _recent_duplicate_exists(
+    conn: sqlite3.Connection,
+    obs: PatternObservation,
+    hours: int = 12,
+) -> bool:
+    """Return True if an identical pattern_observation exists within the last `hours` hours.
+
+    Checks pattern_type + source match. Prevents accumulation of structurally
+    identical entries when the same signal recurs within a short window.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    row = conn.execute(
+        """
+        SELECT 1 FROM events
+        WHERE type = 'pattern_observation'
+          AND source = ?
+          AND json_extract(metadata, '$.pattern_type') = ?
+          AND timestamp >= ?
+        LIMIT 1
+        """,
+        (obs.source, obs.pattern_type, cutoff),
+    ).fetchone()
+    return row is not None
+
+
 def write_run_log(
     processed: int,
     revised: int,
@@ -878,8 +903,15 @@ def run_pass(conn: sqlite3.Connection) -> tuple[int, int, int]:
                 pattern.event_ids,
             )
 
-            # Write a pattern_observation event to the events table
-            write_pattern_event(conn, pattern)
+            # Write a pattern_observation event — skip if identical entry exists within 12 hours
+            if _recent_duplicate_exists(conn, pattern):
+                log.debug(
+                    "Dedup gate: skipping duplicate pattern_observation %s source=%s",
+                    pattern.pattern_type,
+                    pattern.source,
+                )
+            else:
+                write_pattern_event(conn, pattern)
 
             # Revise the classification tag for each contributing event
             for event_id in pattern.event_ids:
