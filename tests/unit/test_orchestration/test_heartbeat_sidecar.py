@@ -129,6 +129,7 @@ def _insert_uow_with_status(
     heartbeat_at: str | None = None,
     heartbeat_ttl: int = DEFAULT_HEARTBEAT_TTL_SECONDS,
     started_at: str | None = None,
+    claimed_until: str | None = None,
 ) -> str:
     """Insert a UoW directly via SQLite, returning the uow_id."""
     uow_id = f"uow_test_{uuid.uuid4().hex[:8]}"
@@ -144,10 +145,12 @@ def _insert_uow_with_status(
             INSERT INTO uow_registry
                 (id, type, source, source_issue_number, sweep_date, status, posture,
                  created_at, updated_at, summary, success_criteria, started_at,
-                 heartbeat_at, heartbeat_ttl, route_evidence, trigger, register, uow_mode)
+                 heartbeat_at, heartbeat_ttl, route_evidence, trigger, register, uow_mode,
+                 claimed_until)
             VALUES (?, 'executable', ?, ?, '2026-01-01', ?, 'solo',
                     ?, ?, 'Test UoW', 'Test done.', ?,
-                    ?, ?, '{}', '{"type": "immediate"}', 'operational', 'operational')
+                    ?, ?, '{}', '{"type": "immediate"}', 'operational', 'operational',
+                    ?)
             """,
             (
                 uow_id,
@@ -159,6 +162,7 @@ def _insert_uow_with_status(
                 started_at or now,
                 heartbeat_at,
                 heartbeat_ttl,
+                claimed_until,
             ),
         )
         conn.commit()
@@ -416,3 +420,70 @@ class TestSidecarPreventsFlaseStalls:
         assert uow_id not in stale_ids, (
             "Sidecar should have refreshed heartbeat_at so the UoW is not stale"
         )
+
+
+# Named constant for the claim expiry tests — matches the spec phrase
+# "whose claimed_until is non-null and already past".
+CLAIM_EXPIRED_PAST_SECONDS: int = 600   # 10 minutes in the past — unambiguously expired
+CLAIM_FUTURE_SECONDS: int = 3600        # 1 hour in the future — unambiguously live
+
+
+class TestSidecarSkipsExpiredClaims:
+    """Sidecar must not refresh heartbeat_at for UoWs whose agent is dead.
+
+    A UoW with claimed_until in the past has a dead agent by definition — the
+    claim window closed without the executor finishing or renewing. Refreshing its
+    heartbeat_at would prevent the steward's observation loop from detecting the
+    orphan (it needs now - heartbeat_at > heartbeat_ttl + buffer, which can never
+    fire if the sidecar keeps heartbeat_at fresh).
+    """
+
+    def test_sidecar_skips_uow_with_expired_claimed_until(
+        self, registry: Registry, db_path: Path
+    ) -> None:
+        """UoW with claimed_until in the past is excluded from heartbeat candidates.
+
+        Expected: result.checked == 0 and write_heartbeat is never called for
+        this UoW. The sidecar should log a debug skip and move on.
+        """
+        expired_claim = _iso_offset(-CLAIM_EXPIRED_PAST_SECONDS)
+        _insert_uow_with_status(
+            db_path,
+            status="active",
+            heartbeat_at=_iso_offset(-120),   # 2 minutes ago — would normally need refresh
+            claimed_until=expired_claim,
+        )
+
+        result = write_heartbeats_for_active_uows(registry)
+
+        # The UoW was skipped before reaching write_heartbeat, so checked == 0
+        assert result.checked == 0, (
+            "UoW with expired claimed_until should be excluded from heartbeat candidates"
+        )
+        assert result.written == 0
+        assert result.errors == 0
+
+    def test_sidecar_writes_heartbeat_for_uow_with_future_claimed_until(
+        self, registry: Registry, db_path: Path
+    ) -> None:
+        """UoW with claimed_until in the future receives a normal heartbeat write.
+
+        The claim is still live, so the agent may be alive and the sidecar should
+        keep heartbeat_at fresh to prevent false stall detection.
+        """
+        future_claim = _iso_offset(CLAIM_FUTURE_SECONDS)
+        old_heartbeat = _iso_offset(-120)   # 2 minutes ago — needs refresh
+        uow_id = _insert_uow_with_status(
+            db_path,
+            status="active",
+            heartbeat_at=old_heartbeat,
+            claimed_until=future_claim,
+        )
+
+        result = write_heartbeats_for_active_uows(registry)
+
+        new_heartbeat = _read_heartbeat_at(db_path, uow_id)
+        assert result.checked == 1, "Live-claim UoW should be a heartbeat candidate"
+        assert result.written == 1
+        assert new_heartbeat is not None
+        assert new_heartbeat > old_heartbeat, "heartbeat_at should be updated"

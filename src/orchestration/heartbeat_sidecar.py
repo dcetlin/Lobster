@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 log = logging.getLogger("heartbeat_sidecar")
 
@@ -130,14 +131,52 @@ def write_heartbeats_for_active_uows(registry: object) -> HeartbeatSidecarResult
 
 def _collect_in_flight_uows(registry: object) -> list:
     """
-    Return all UoWs in 'active' or 'executing' status.
+    Return UoWs in 'active' or 'executing' status whose claim has not yet expired.
 
     Pure read: no side effects. Uses registry.list(status=...) for each status
-    and merges the results. Returns a flat list of UoW objects.
+    and merges the results. Filters out UoWs whose claimed_until is in the past —
+    those have a dead agent by definition (the claim window closed without the
+    agent completing or renewing), so refreshing their heartbeat_at would mask
+    stall detection in the steward's observation loop.
+
+    Returns a flat list of UoW objects eligible for heartbeat refresh.
     """
+    now = datetime.now(timezone.utc)
     active = _safe_list(registry, "active")
     executing = _safe_list(registry, "executing")
-    return active + executing
+    candidates = []
+    for uow in active + executing:
+        if _claim_expired(uow, now):
+            log.debug(
+                "Heartbeat sidecar: skipping UoW %s — claimed_until %s is in the past",
+                uow.id, getattr(uow, "claimed_until", None),
+            )
+            continue
+        candidates.append(uow)
+    return candidates
+
+
+def _claim_expired(uow: object, now: datetime) -> bool:
+    """
+    Return True if the UoW's claimed_until deadline has already passed.
+
+    A UoW with no claimed_until (NULL) is not considered expired — it either
+    has not been claimed yet or was claimed before the visibility-timeout schema
+    migration. Such UoWs are included in the heartbeat candidates.
+
+    Pure function: reads only from the uow object and the provided now timestamp.
+    No database access, no side effects.
+    """
+    claimed_until = getattr(uow, "claimed_until", None)
+    if not claimed_until:
+        return False
+    try:
+        deadline = datetime.fromisoformat(claimed_until.replace("Z", "+00:00"))
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        return deadline < now
+    except (ValueError, AttributeError):
+        return False
 
 
 def _safe_list(registry: object, status: str) -> list:

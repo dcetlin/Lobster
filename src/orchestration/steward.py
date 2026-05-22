@@ -980,6 +980,14 @@ def _most_recent_return_reason(audit_entries: list[dict]) -> str | None:
             clf = note_data.get("return_reason") or note_data.get("classification")
             if clf:
                 return clf
+        elif event == "claim_expired":
+            # Claim window expired while the UoW was active/executing — the agent is
+            # dead. Extract return_reason from the audit note (written by
+            # reset_expired_claims as "executing_orphan") so the steward can apply
+            # orphan_retry_count and ORPHAN_KILL_RETRY_BUDGET correctly.
+            rr = note_data.get("return_reason")
+            if rr:
+                return rr
 
     return None
 
