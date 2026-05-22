@@ -35,28 +35,9 @@ if str(_REPO_ROOT) not in sys.path:
 
 from src.utils.inbox_write import _inbox_dir, _task_outputs_dir  # noqa: E402
 from src.delivery.circadian import flush_morning_queue  # noqa: E402
+from src.utils.jobs import is_job_enabled  # noqa: E402
 
 JOB_NAME = "morning-delivery-flush"
-
-
-# ---------------------------------------------------------------------------
-# jobs.json enabled gate — Type C dispatch path
-# ---------------------------------------------------------------------------
-
-def _is_job_enabled(job_name: str) -> bool:
-    """
-    Return True if the job is enabled in jobs.json, False if explicitly disabled.
-
-    Defaults to True when jobs.json is absent, the entry is missing, or the
-    file is unreadable or malformed.
-    """
-    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-    jobs_file = workspace / "scheduled-jobs" / "jobs.json"
-    try:
-        data = json.loads(jobs_file.read_text())
-        return bool(data.get("jobs", {}).get(job_name, {}).get("enabled", True))
-    except Exception:
-        return True
 
 
 def _make_send_fn(dry_run: bool):
@@ -106,7 +87,7 @@ def _write_task_output(output: str, status: str, timestamp: str) -> None:
 
 
 def run(dry_run: bool = False) -> int:
-    if not _is_job_enabled(JOB_NAME):
+    if not is_job_enabled(JOB_NAME):
         return 0
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
