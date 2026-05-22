@@ -3,8 +3,8 @@
 Executor Heartbeat — WOS recovery poller for missed or stuck UoWs.
 
 Runs every 3 minutes. On each invocation:
-1. Recovers UoWs stuck in 'active' state for more than TTL_EXCEEDED_HOURS (4h)
-   by marking them 'failed' so the Steward can re-diagnose.
+1. Calls registry.reset_expired_claims() to reset UoWs whose claimed_until has
+   expired back to 'ready-for-executor' so the next cycle can re-dispatch them.
 2. Recovery-dispatches UoWs in `ready-for-executor` state that have been waiting
    longer than RECOVERY_STALE_MINUTES — these are UoWs that were NOT picked up
    by the primary event-driven inbox dispatch path (e.g. due to a race condition,
