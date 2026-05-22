@@ -2383,7 +2383,7 @@ class Registry:
     # time (issue #669) and are looping in the steward queue without advancing.
     # 'awaiting-owner' allows the existing decide_retry path to transition a UoW
     # back to ready-for-steward when Dan provides a decision via /wos reset.
-    RETRYABLE_STATUSES: frozenset[str] = frozenset({"blocked", "ready-for-steward", "awaiting-owner"})
+    RETRYABLE_STATUSES: frozenset[str] = frozenset({"blocked", "failed", "ready-for-steward", "awaiting-owner"})
 
     # Sentinel value returned by decide_retry when the UoW was cleaned up by
     # the hard-cap arc and a bare retry is rejected. Callers check for this
@@ -2400,6 +2400,7 @@ class Registry:
 
         Transitions: blocked → ready-for-steward
                      ready-for-steward → ready-for-steward (with cycle reset)
+                     failed → ready-for-steward (with cycle reset AND steward_log clear)
         Resets steward_cycles to 0 so the Steward treats it as a fresh start,
         but first adds the current steward_cycles value to lifetime_cycles so
         cumulative effort is never lost. The hard-cap check uses lifetime_cycles,
@@ -2446,6 +2447,12 @@ class Registry:
             current_lifetime: int = row["lifetime_cycles"] or 0
             new_lifetime: int = current_lifetime + current_cycles
 
+            # Determine whether to wipe steward_log. Only cleared on failed→ready-for-steward
+            # because prior prescription context in steward_log is legitimately useful when
+            # retrying from blocked or awaiting-owner, but causes immediate re-fail when the
+            # log captures the orphan posture that caused the failure.
+            steward_log_clause = ", steward_log = NULL" if from_status == "failed" else ""
+
             note_json = json.dumps({
                 "event": "decide_retry",
                 "actor": "user",
@@ -2453,6 +2460,7 @@ class Registry:
                 "timestamp": now,
                 "from_status": from_status,
                 "force_override": force,
+                "steward_log_cleared": from_status == "failed",
                 "note": (
                     f"user requested retry — steward_cycles reset to 0, "
                     f"lifetime_cycles updated from {current_lifetime} to {new_lifetime}"
@@ -2476,7 +2484,7 @@ class Registry:
                     lifetime_cycles = ?,
                     close_reason = NULL,
                     closed_at = NULL,
-                    updated_at = ?
+                    updated_at = ?{steward_log_clause}
                 WHERE id = ? AND status IN ({placeholders})
                 """,
                 (new_lifetime, now, uow_id, *self.RETRYABLE_STATUSES),

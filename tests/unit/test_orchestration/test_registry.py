@@ -1042,6 +1042,37 @@ def _make_blocked_uow(conn: sqlite3.Connection, registry, steward_cycles: int = 
     return uow_id
 
 
+def _make_failed_uow(
+    conn: sqlite3.Connection,
+    registry,
+    steward_cycles: int = 2,
+    lifetime_cycles: int = 0,
+    steward_log: str | None = '{"event":"orphan_kill","timestamp":"2026-01-01T00:00:00Z"}',
+    issue_number_offset: int = 0,
+) -> str:
+    """
+    Insert a UoW in 'failed' status with steward_log set.
+    Returns the uow_id.
+    """
+    from src.orchestration.registry import UpsertInserted
+    issue_num = 8800 + steward_cycles + lifetime_cycles + issue_number_offset
+    result = registry.upsert(
+        issue_number=issue_num,
+        title=f"Failed UoW test (sc={steward_cycles})",
+        success_criteria="Test criteria.",
+    )
+    assert isinstance(result, UpsertInserted)
+    uow_id = result.id
+    conn.execute(
+        """UPDATE uow_registry
+           SET status='failed', steward_cycles=?, lifetime_cycles=?, steward_log=?
+           WHERE id=?""",
+        (steward_cycles, lifetime_cycles, steward_log, uow_id),
+    )
+    conn.commit()
+    return uow_id
+
+
 class TestLifetimeCycles:
     """
     Tests for lifetime_cycles — the cumulative steward cycle counter that
@@ -1231,6 +1262,121 @@ class TestLifetimeCycles:
         with pytest.raises(RuntimeError, match="lifetime_cycles"):
             validate_steward_executor_schema(conn)
         conn.close()
+
+
+class TestDecideRetryFromFailed:
+    """
+    Tests for the failed→ready-for-steward reset path.
+
+    Spec:
+    - decide_retry on a 'failed' UoW returns 1 (success)
+    - steward_log is cleared to NULL after reset
+    - steward_cycles is reset to 0
+    - lifetime_cycles accumulates steward_cycles before reset (same as blocked path)
+    - Audit entry is written with event='decide_retry'
+    - decide_retry from 'blocked' does NOT clear steward_log (regression guard)
+    """
+
+    def test_failed_uow_retry_returns_one(self, registry, db_path):
+        """decide_retry on a failed UoW returns 1 (was silently 0 before the fix)."""
+        conn = _open_db(db_path)
+        uow_id = _make_failed_uow(conn, registry)
+        conn.close()
+
+        result = registry.decide_retry(uow_id)
+        assert result == 1, "decide_retry must return 1 for a failed UoW"
+
+    def test_failed_uow_retry_transitions_to_ready_for_steward(self, registry, db_path):
+        """After reset, UoW status is 'ready-for-steward'."""
+        conn = _open_db(db_path)
+        uow_id = _make_failed_uow(conn, registry, issue_number_offset=10)
+        conn.close()
+
+        registry.decide_retry(uow_id)
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.status == "ready-for-steward"
+
+    def test_failed_uow_retry_clears_steward_log(self, registry, db_path):
+        """steward_log must be NULL after failed→ready-for-steward reset."""
+        conn = _open_db(db_path)
+        uow_id = _make_failed_uow(
+            conn, registry,
+            steward_log='{"event":"orphan_kill","timestamp":"2026-01-01T00:00:00Z"}',
+            issue_number_offset=20,
+        )
+        conn.close()
+
+        registry.decide_retry(uow_id)
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.steward_log is None, (
+            "steward_log must be cleared on failed→ready-for-steward reset; "
+            "leaving it causes the steward to immediately re-fail the UoW"
+        )
+
+    def test_failed_uow_retry_resets_steward_cycles(self, registry, db_path):
+        """steward_cycles is 0 after reset."""
+        conn = _open_db(db_path)
+        uow_id = _make_failed_uow(conn, registry, steward_cycles=4, issue_number_offset=30)
+        conn.close()
+
+        registry.decide_retry(uow_id)
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.steward_cycles == 0
+
+    def test_failed_uow_retry_accumulates_lifetime_cycles(self, registry, db_path):
+        """lifetime_cycles accumulates steward_cycles before the reset."""
+        conn = _open_db(db_path)
+        uow_id = _make_failed_uow(conn, registry, steward_cycles=3, lifetime_cycles=5, issue_number_offset=40)
+        conn.close()
+
+        registry.decide_retry(uow_id)
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.lifetime_cycles == 8, "5 + 3 = 8"
+
+    def test_failed_uow_retry_writes_audit_entry(self, registry, db_path):
+        """Audit log must record the decide_retry event."""
+        conn = _open_db(db_path)
+        uow_id = _make_failed_uow(conn, registry, issue_number_offset=50)
+        conn.close()
+
+        registry.decide_retry(uow_id)
+
+        conn2 = _open_db(db_path)
+        row = conn2.execute(
+            "SELECT event, from_status, to_status FROM audit_log WHERE uow_id=? AND event='decide_retry'",
+            (uow_id,),
+        ).fetchone()
+        conn2.close()
+
+        assert row is not None
+        assert row["from_status"] == "failed"
+        assert row["to_status"] == "ready-for-steward"
+
+    def test_blocked_uow_retry_preserves_steward_log(self, registry, db_path):
+        """
+        Regression guard: decide_retry from 'blocked' must NOT clear steward_log.
+        Prior prescription history is legitimate context for a blocked retry.
+        """
+        conn = _open_db(db_path)
+        uow_id = _make_blocked_uow(conn, registry, steward_cycles=2)
+        prior_log = '{"event":"prescription","timestamp":"2026-01-01T00:00:00Z"}'
+        conn.execute(
+            "UPDATE uow_registry SET steward_log=? WHERE id=?",
+            (prior_log, uow_id),
+        )
+        conn.commit()
+        conn.close()
+
+        registry.decide_retry(uow_id)
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.steward_log == prior_log, (
+            "decide_retry from 'blocked' must not clear steward_log"
+        )
 
 
 # ---------------------------------------------------------------------------
