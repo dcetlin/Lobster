@@ -63,10 +63,11 @@ _EXECUTOR_ORPHAN_THRESHOLD_SECONDS = 3600  # 1 hour: ready-for-executor age thre
 # The heartbeat staleness check (get_stale_heartbeat_uows) already catches
 # most of these within heartbeat_ttl + 30s (typically ~5–8 minutes). This
 # constant covers the gap for UoWs whose heartbeat_at was never written (i.e.
-# the agent crashed before it could write a single heartbeat). 10 minutes is
-# generous: it absorbs startup jitter while catching true orphans well ahead
-# of the 24h TTL recovery ceiling.
-_EXECUTING_ORPHAN_THRESHOLD_SECONDS = 600  # 10 minutes
+# the agent crashed before it could write a single heartbeat). 30 minutes gives
+# design/arch UoWs (10–30 min runtime) time to start without false-positive
+# orphan detection; true orphans are still caught well ahead of the 24h ceiling.
+# Configurable via wos-config.json key `executing_orphan_threshold_seconds`.
+_EXECUTING_ORPHAN_THRESHOLD_SECONDS = 1800  # 30 minutes
 
 # Grace window (seconds) after executor_dispatch before we expect the subagent
 # to have written its first heartbeat.  Absorbs agent startup jitter (model
@@ -355,7 +356,8 @@ def run_startup_sweep(
     orphan_threshold_seconds: minimum age before a `ready-for-executor` UoW
         is classified as executor_orphan. Default: 3600 s.
     executing_orphan_threshold_seconds: minimum age before an `executing` UoW
-        is classified as executing_orphan. Default: 600 s (10 minutes).
+        is classified as executing_orphan. Default: 1800 s (30 minutes).
+        Configurable via wos-config.json key `executing_orphan_threshold_seconds`.
     heartbeat_skip_threshold_seconds: maximum age (seconds) of heartbeat_at
         before a heartbeat is considered stale. Default: 120 s. UoWs with a
         heartbeat younger than this are skipped (agent is alive). Pass 0 to

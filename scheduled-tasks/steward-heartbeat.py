@@ -1161,7 +1161,18 @@ def _main_inner() -> int:
     # Phase 1: Startup sweep
     log.info("--- Phase 1: Startup sweep ---")
     try:
-        sweep_result = run_startup_sweep(registry, dry_run=dry_run, bootup_candidate_gate=gate_active)
+        # Read executing_orphan_threshold_seconds from wos-config.json so it can
+        # be tuned without a code change. Fallback is the constant default (1800 s).
+        _wos_cfg = read_wos_config()
+        _executing_orphan_threshold = int(
+            _wos_cfg.get("executing_orphan_threshold_seconds", 1800)
+        )
+        sweep_result = run_startup_sweep(
+            registry,
+            dry_run=dry_run,
+            bootup_candidate_gate=gate_active,
+            executing_orphan_threshold_seconds=_executing_orphan_threshold,
+        )
         log.info(
             "Startup sweep complete: active_swept=%d executor_orphans=%d "
             "diagnosing=%d skipped_dry_run=%d executing_orphans=%d",
