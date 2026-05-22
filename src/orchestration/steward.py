@@ -575,6 +575,34 @@ class LLMPrescription:
 
 
 @dataclass(frozen=True, slots=True)
+class PrescriptionV2:
+    """
+    Full 7-section v2 prescription produced by generate_v2_prescription().
+    Maps 1:1 to docs/prescription-format-spec.md schema.
+    Schema version: 1.0.0
+    """
+    diagnosis: dict[str, Any]
+    prescription: dict[str, Any]
+    workflow: dict[str, Any]
+    constraints: dict[str, Any]
+    success_criteria: dict[str, Any]
+    dan_context: dict[str, Any]
+    audit_metadata: dict[str, Any]
+
+    def to_json(self) -> str:
+        """Serialize to compact JSON string for audit log storage."""
+        return json.dumps({
+            "diagnosis": self.diagnosis,
+            "prescription": self.prescription,
+            "workflow": self.workflow,
+            "constraints": self.constraints,
+            "success_criteria": self.success_criteria,
+            "dan_context": self.dan_context,
+            "audit_metadata": self.audit_metadata,
+        })
+
+
+@dataclass(frozen=True, slots=True)
 class CycleResult:
     """
     Result of a complete Steward heartbeat cycle.
@@ -1941,6 +1969,356 @@ def _load_dan_register_excerpt(max_chars: int = 8000) -> str:
     if len(excerpt) > max_chars:
         excerpt = excerpt[:max_chars] + "\n[...truncated]"
     return excerpt.strip()
+
+
+# ---------------------------------------------------------------------------
+# V2 prescription generation
+# ---------------------------------------------------------------------------
+
+def _build_v2_prescription_deterministic(
+    uow: "UoW",
+    diagnosis_section: dict[str, Any],
+    executor_posture: str,
+    selected_executor_type: str,
+    prescribed_skills: list[str],
+    cycles: int,
+    now_iso: str,
+) -> "PrescriptionV2":
+    """
+    Build a minimal but schema-valid PrescriptionV2 without LLM.
+
+    Used as fallback when _llm_prescribe_v2 fails. Fills all required
+    fields with deterministic values derived from UoW state.
+    """
+    reentry_posture = diagnosis_section["reentry_posture"]
+    completion_gap = diagnosis_section.get("completion_gap", "")
+    success_criteria_text = uow.success_criteria or "Verify deliverables match the UoW summary."
+
+    instructions_text = (
+        f"Execute the following task:\n\nSummary: {uow.summary}\n\n"
+        f"Success criteria: {success_criteria_text}\n\n"
+        "Write your output to the output_ref path.\n\n"
+        f"Minimum viable output: Complete the task described in the summary.\n"
+        f"Boundary: do not exceed the scope stated in the success criteria."
+    )
+    if cycles > 0 and completion_gap:
+        instructions_text = (
+            f"Re-execution (cycle {cycles}):\n\n"
+            f"Gap identified: {completion_gap}\n\n"
+            f"Original task: {uow.summary}\n\n"
+            f"Success criteria: {success_criteria_text}\n\n"
+            f"Minimum viable output: Complete the gap identified above.\n"
+            f"Boundary: do not modify components outside the gap scope."
+        )
+
+    return PrescriptionV2(
+        diagnosis=diagnosis_section,
+        prescription={
+            "summary": uow.summary or "Execute the UoW.",
+            "instructions": instructions_text,
+            "estimated_cycles": 1,
+            "minimum_viable_output": "Complete the task described in the UoW summary.",
+            "boundary": "do not exceed the scope stated in the success criteria",
+        },
+        workflow={
+            "agent_type": selected_executor_type,
+            "steps": ["Execute the task described in the UoW summary.", "Write output to output_ref."],
+            "fan_out": None,
+        },
+        constraints={
+            "boundary": "do not exceed the scope stated in the success criteria",
+            "no_modify": [],
+            "no_deploy": False,
+        },
+        success_criteria={
+            "check": success_criteria_text,
+            "artifacts": [],
+            "commands": [],
+            "gate_command": None,
+        },
+        dan_context={
+            "orientation": "",
+            "priority_signal": "",
+            "open_questions": [],
+            "load_bearing_assumption": "",
+        },
+        audit_metadata={
+            "uow_id": uow.id,
+            "cycle": cycles,
+            "executor_posture": executor_posture,
+            "schema_version": "1.0.0",
+            "prescribed_at": now_iso,
+            "prescribed_skills": prescribed_skills,
+        },
+    )
+
+
+def _llm_prescribe_v2(
+    uow: "UoW",
+    diagnosis_section: dict[str, Any],
+    executor_posture: str,
+    selected_executor_type: str,
+    issue_body: str,
+    vision_orientation: str,
+    dan_register: str,
+    prescribed_skills: list[str],
+    cycles: int,
+    now_iso: str,
+) -> "PrescriptionV2":
+    """
+    Call Claude to generate a full 7-section v2 prescription as JSON.
+
+    Dispatches via `claude -p`. Returns a PrescriptionV2 dataclass.
+    Falls back to _build_v2_prescription_deterministic() if the LLM call
+    fails or returns invalid JSON.
+    """
+    context_parts: list[str] = [
+        f"UoW ID: {uow.id}",
+        f"Summary: {uow.summary}",
+        f"Type: {uow.type}",
+        f"Register: {uow.register or 'operational'}",
+        f"Execution cycle: {cycles} (0 = first pass)",
+        f"Executor posture: {executor_posture}",
+    ]
+    if uow.success_criteria:
+        context_parts.append(f"Success criteria:\n{uow.success_criteria}")
+    elif issue_body:
+        excerpt = issue_body.strip()
+        if len(excerpt) > 2000:
+            excerpt = excerpt[:2000] + "\n[...truncated]"
+        context_parts.append(f"Issue body:\n{excerpt}")
+
+    reentry_posture = diagnosis_section["reentry_posture"]
+    completion_gap = diagnosis_section["completion_gap"]
+    if completion_gap:
+        context_parts.append(f"Completion gap: {completion_gap}")
+
+    uow_context = "\n".join(context_parts)
+    orientation_block = f"\n## Dan's current orientation\n\n{dan_register}\n" if dan_register else ""
+    vision_block = f"\n## Vision context\n\n{vision_orientation}\n" if vision_orientation else ""
+
+    spec_path = Path(__file__).parent.parent.parent / "docs" / "prescription-format-spec.md"
+    schema_path = Path(__file__).parent.parent.parent / "docs" / "prescription-format.schema.json"
+    try:
+        spec_text = spec_path.read_text(encoding="utf-8")
+        if len(spec_text) > 6000:
+            spec_text = spec_text[:6000] + "\n[...truncated]"
+    except OSError:
+        spec_text = "(spec unavailable — use 7-section structure: diagnosis, prescription, workflow, constraints, success_criteria, dan_context, audit_metadata)"
+    try:
+        schema_text = schema_path.read_text(encoding="utf-8")
+        if len(schema_text) > 4000:
+            schema_text = schema_text[:4000] + "\n[...truncated]"
+    except OSError:
+        schema_text = ""
+
+    system_prompt = (
+        "You are the WOS Steward. Generate a 7-section v2 prescription for the given "
+        "Unit of Work. Output ONLY a valid JSON object — no preamble, no markdown fences, "
+        "no explanation. The JSON must conform to the prescription format schema."
+    )
+
+    user_prompt = f"""Generate a 7-section v2 prescription for this Unit of Work.
+
+{uow_context}
+{orientation_block}{vision_block}
+## Format specification (excerpt)
+{spec_text}
+
+## Pre-populated fields (use these exactly)
+- diagnosis.reentry_posture: "{reentry_posture}"
+- diagnosis.prior_cycle_count: {cycles}
+- diagnosis.completion_gap: "{completion_gap}"
+- diagnosis.executor_outcome: {json.dumps(diagnosis_section.get("executor_outcome"))}
+- audit_metadata.uow_id: "{uow.id}"
+- audit_metadata.cycle: {cycles}
+- audit_metadata.executor_posture: "{executor_posture}"
+- audit_metadata.schema_version: "1.0.0"
+- audit_metadata.prescribed_at: "{now_iso}"
+- audit_metadata.prescribed_skills: {json.dumps(prescribed_skills)}
+- workflow.agent_type: "{selected_executor_type}"
+
+Output ONLY valid JSON. No preamble. No markdown. No code fences."""
+
+    prompt = f"{system_prompt}\n\n{user_prompt}"
+    timeout_secs = _get_llm_prescription_timeout()
+    model = select_steward_model(uow)
+    command = [_CLAUDE_BIN, "-p", prompt, "--output-format", "text", "--model", model]
+    claude_env = _build_claude_env()
+
+    proc, error = run_subprocess_with_error_capture(
+        component="steward_prescription_v2",
+        uow_id=uow.id,
+        command=command,
+        timeout_seconds=timeout_secs,
+        check=False,
+        env=claude_env,
+    )
+
+    if error or proc is None or proc.returncode != 0 or not (proc.stdout or "").strip():
+        log.warning(
+            "_llm_prescribe_v2: LLM call failed for %s, using deterministic fallback",
+            uow.id,
+        )
+        return _build_v2_prescription_deterministic(
+            uow=uow,
+            diagnosis_section=diagnosis_section,
+            executor_posture=executor_posture,
+            selected_executor_type=selected_executor_type,
+            prescribed_skills=prescribed_skills,
+            cycles=cycles,
+            now_iso=now_iso,
+        )
+
+    raw = proc.stdout.strip()
+    raw = _extract_json_from_llm_output(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        log.warning(
+            "_llm_prescribe_v2: JSON parse failed for %s (%s), using deterministic fallback",
+            uow.id, exc,
+        )
+        return _build_v2_prescription_deterministic(
+            uow=uow,
+            diagnosis_section=diagnosis_section,
+            executor_posture=executor_posture,
+            selected_executor_type=selected_executor_type,
+            prescribed_skills=prescribed_skills,
+            cycles=cycles,
+            now_iso=now_iso,
+        )
+
+    required_keys = {"diagnosis", "prescription", "workflow", "constraints", "success_criteria", "dan_context", "audit_metadata"}
+    missing = required_keys - set(data.keys())
+    if missing:
+        log.warning(
+            "_llm_prescribe_v2: missing required sections %s for %s, using deterministic fallback",
+            missing, uow.id,
+        )
+        return _build_v2_prescription_deterministic(
+            uow=uow,
+            diagnosis_section=diagnosis_section,
+            executor_posture=executor_posture,
+            selected_executor_type=selected_executor_type,
+            prescribed_skills=prescribed_skills,
+            cycles=cycles,
+            now_iso=now_iso,
+        )
+
+    log.info("_llm_prescribe_v2: v2 prescription generated for %s (model=%s)", uow.id, model)
+    return PrescriptionV2(
+        diagnosis=data["diagnosis"],
+        prescription=data["prescription"],
+        workflow=data["workflow"],
+        constraints=data["constraints"],
+        success_criteria=data["success_criteria"],
+        dan_context=data["dan_context"],
+        audit_metadata=data["audit_metadata"],
+    )
+
+
+def generate_v2_prescription(
+    uow: "UoW",
+    diagnosis: "Diagnosis",
+    issue_info: "IssueInfo | None",
+    cycles: int,
+    registry: Any,
+    dry_run: bool = False,
+) -> "PrescriptionV2":
+    """
+    Generate a 7-section v2 prescription for a UoW at the point of prescribe.
+
+    Reads:
+    - UoW state (summary, type, register, source, vision_ref, success_criteria)
+    - Diagnosis (reentry_posture, is_complete, completion_rationale, executor_outcome)
+    - Vision Object context via resolve_vision_route()
+    - Dan's developmental register via _load_dan_register_excerpt()
+    - Audit trail for prior cycles via registry.fetch_audit_log()
+
+    Writes one audit entry to registry.append_audit_log() before returning
+    (skipped when dry_run=True).
+
+    Returns a PrescriptionV2 dataclass conforming to prescription-format.schema.json.
+    Schema version: 1.0.0
+    """
+    now_iso = _now_iso()
+
+    executor_outcome_value = diagnosis.executor_outcome
+    diagnosis_section: dict[str, Any] = {
+        "signal": (
+            f"UoW {uow.id} entered ready-for-steward"
+            + (" on first execution" if cycles == 0 else f" on cycle {cycles}")
+            + (f"; source is {uow.source}" if uow.source else "")
+            + (f"; {uow.summary}" if uow.summary else "")
+            + "."
+        ),
+        "reentry_posture": diagnosis.reentry_posture,
+        "completion_gap": "" if diagnosis.reentry_posture == "first_execution" else diagnosis.completion_rationale,
+        "executor_outcome": executor_outcome_value,
+        "prior_cycle_count": cycles,
+    }
+
+    # Use module-scope _ORPHAN_POSTURES (3 enum-backed values) for the primary check.
+    # orphan_kill_before_start and orphan_kill_during_execution are heartbeat-classified
+    # kill types (#963) that are not yet in the ReentryPosture enum — they also map to
+    # continuation posture and are checked explicitly here rather than via a function-body
+    # frozenset shadow (see learnings.md #965, #967, #974).
+    if diagnosis.reentry_posture == "first_execution":
+        executor_posture = "first_execution"
+    elif diagnosis.reentry_posture in _ORPHAN_POSTURES:
+        executor_posture = "continuation"
+    elif diagnosis.reentry_posture in (
+        "orphan_kill_before_start",
+        "orphan_kill_during_execution",
+    ):
+        executor_posture = "continuation"
+    elif diagnosis.reentry_posture == "execution_failed":
+        executor_posture = "remediation"
+        diagnosis_section = dict(diagnosis_section, corrective_intent=True)
+    else:
+        executor_posture = "continuation"
+
+    selected_executor_type = _select_executor_type(uow)
+
+    vision_orientation = ""
+    if uow.vision_ref and isinstance(uow.vision_ref, dict):
+        try:
+            vision_result = resolve_vision_route(uow, log_fallback=False)
+            vision_orientation = vision_result.route_reason if vision_result.anchored else ""
+        except Exception:
+            vision_orientation = ""
+
+    dan_register = _load_dan_register_excerpt()
+    issue_body = issue_info.body if issue_info else ""
+    prescribed_skills = _select_prescribed_skills(uow, diagnosis.reentry_posture)
+
+    v2_raw = _llm_prescribe_v2(
+        uow=uow,
+        diagnosis_section=diagnosis_section,
+        executor_posture=executor_posture,
+        selected_executor_type=selected_executor_type,
+        issue_body=issue_body,
+        vision_orientation=vision_orientation,
+        dan_register=dan_register,
+        prescribed_skills=prescribed_skills,
+        cycles=cycles,
+        now_iso=now_iso,
+    )
+
+    if not dry_run:
+        registry.append_audit_log(uow.id, {
+            "event": "prescription_v2",
+            "actor": _ACTOR_STEWARD,
+            "uow_id": uow.id,
+            "steward_cycles": cycles,
+            "executor_posture": executor_posture,
+            "executor_type": selected_executor_type,
+            "schema_version": "1.0.0",
+            "timestamp": now_iso,
+        })
+
+    return v2_raw
 
 
 def _llm_prescribe(
@@ -5214,6 +5592,35 @@ def _process_uow(
         "next_posture_rationale": route_reason,
     }
     current_log_str = _append_steward_log_entry(registry, uow_id, current_log_str, prescription_log_entry)
+
+    # Generate v2 prescription alongside current WorkflowArtifact (transition period).
+    # The v2 prescription is written to the audit trail; the executor still reads
+    # WorkflowArtifact from disk. Full executor migration is handled in issue #576.
+    if not dry_run:
+        try:
+            v2_prescription = generate_v2_prescription(
+                uow=uow,
+                diagnosis=diagnosis,
+                issue_info=issue_info,
+                cycles=cycles,
+                registry=registry,
+                dry_run=False,
+            )
+            registry.append_audit_log(uow_id, {
+                "event": "prescription_v2_written",
+                "actor": _ACTOR_STEWARD,
+                "uow_id": uow_id,
+                "steward_cycles": cycles,
+                "prescription_v2_json": v2_prescription.to_json(),
+                "timestamp": _now_iso(),
+            })
+            log.info("_process_uow: v2 prescription written to audit trail for %s", uow_id)
+        except Exception as v2_exc:
+            log.warning(
+                "_process_uow: v2 prescription generation failed for %s (%s) — "
+                "continuing with v1 WorkflowArtifact",
+                uow_id, v2_exc,
+            )
 
     if not dry_run:
         # Write workflow artifact to disk first
