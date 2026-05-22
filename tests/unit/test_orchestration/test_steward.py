@@ -4842,3 +4842,129 @@ class TestLLMPrescribeIncludesOrientationBlock:
 
         assert captured_prompts, "subprocess.run was not called"
         assert "## Dan's current orientation" not in captured_prompts[0]
+
+
+# ---------------------------------------------------------------------------
+# Tests for _select_prescribed_skills — structured-field inspection
+# ---------------------------------------------------------------------------
+
+
+class TestSelectPrescribedSkills:
+    """Tests for _select_prescribed_skills().
+
+    The function must derive skill selections from structured UoW fields
+    (reentry_posture, register, type) before falling back to summary text.
+    Keyword-matching on summary must only fire when no structured field resolves.
+    WOS-UoW: uow_20260427_585de1
+    """
+
+    def _make_uow(
+        self,
+        summary: str = "Implement the widget feature",
+        register: str = "operational",
+        uow_type: str = "executable",
+    ):
+        from src.orchestration.registry import UoW, UoWStatus, UoWRegister, UoWType
+        return UoW(
+            id="uow_test_skills",
+            status=UoWStatus.READY_FOR_STEWARD,
+            summary=summary,
+            source="github:issue/42",
+            source_issue_number=42,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+            register=UoWRegister(register),
+            type=UoWType(uow_type),
+        )
+
+    def _call(self, uow, reentry_posture: str) -> list[str]:
+        import sys
+        from pathlib import Path
+        repo_root = Path(__file__).parent.parent.parent.parent
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        from src.orchestration.steward import _select_prescribed_skills
+        return _select_prescribed_skills(uow, reentry_posture)
+
+    # --- Structured field: reentry_posture drives systematic-debugging ---
+
+    def test_crash_posture_selects_debugging(self):
+        """Crash reentry postures select systematic-debugging via structured field."""
+        uow = self._make_uow(summary="add new widget")  # no bug/fix keywords
+        skills = self._call(uow, "crashed_no_output")
+        assert "systematic-debugging" in skills
+        assert "verification-before-completion" not in skills
+
+    def test_execution_failed_posture_selects_debugging(self):
+        uow = self._make_uow(summary="add new widget")
+        skills = self._call(uow, "execution_failed")
+        assert "systematic-debugging" in skills
+
+    def test_execution_complete_posture_selects_verification(self):
+        """execution_complete selects verification via posture, not summary scan."""
+        uow = self._make_uow(summary="add new widget")  # no pr/review keywords
+        skills = self._call(uow, "execution_complete")
+        assert "verification-before-completion" in skills
+        assert "systematic-debugging" not in skills
+
+    # --- Structured field: register drives systematic-debugging ---
+
+    def test_iterative_convergent_register_selects_debugging(self):
+        """iterative-convergent register selects systematic-debugging via structured field."""
+        uow = self._make_uow(
+            summary="add new widget",  # no bug/fix keywords
+            register="iterative-convergent",
+        )
+        skills = self._call(uow, "first_execution")
+        assert "systematic-debugging" in skills
+
+    def test_operational_register_first_execution_no_skills(self):
+        """operational register on first_execution with neutral summary yields no skills."""
+        uow = self._make_uow(summary="add new widget", register="operational")
+        skills = self._call(uow, "first_execution")
+        assert skills == []
+
+    # --- Structured field: type gates summary fallback ---
+
+    def test_seed_type_skips_summary_fallback(self):
+        """seed-type UoW with bug/fix keywords in summary does NOT get systematic-debugging."""
+        uow = self._make_uow(summary="fix all the bugs", uow_type="seed")
+        skills = self._call(uow, "first_execution")
+        assert "systematic-debugging" not in skills
+
+    def test_classification_type_skips_summary_fallback(self):
+        uow = self._make_uow(summary="fix all the bugs", uow_type="classification")
+        skills = self._call(uow, "first_execution")
+        assert "systematic-debugging" not in skills
+
+    # --- Summary fallback only when no structured field resolved ---
+
+    def test_summary_fallback_bug_token_selects_debugging(self):
+        """When no structured field fires, bug token in summary selects debugging."""
+        uow = self._make_uow(summary="fix the login bug", register="operational")
+        skills = self._call(uow, "first_execution")
+        assert "systematic-debugging" in skills
+
+    def test_summary_fallback_pr_token_selects_verification(self):
+        uow = self._make_uow(summary="open pull request for the feature", register="operational")
+        skills = self._call(uow, "first_execution")
+        assert "verification-before-completion" in skills
+
+    def test_summary_fallback_not_called_when_posture_already_resolved(self):
+        """If posture already resolved a skill, summary fallback is skipped (skills non-empty)."""
+        # execution_complete resolves verification — summary with no pr/review tokens still
+        # should not trigger another debug skill from fallback.
+        uow = self._make_uow(
+            summary="add new widget",  # no debug or verify tokens
+            register="operational",
+        )
+        skills = self._call(uow, "execution_complete")
+        # Only verification from posture; no spurious debugging from summary
+        assert "verification-before-completion" in skills
+        assert "systematic-debugging" not in skills
+
+    def test_no_duplicate_skills(self):
+        """iterative-convergent + crash posture → systematic-debugging appears once."""
+        uow = self._make_uow(register="iterative-convergent")
+        skills = self._call(uow, "crashed_no_output")
+        assert skills.count("systematic-debugging") == 1
