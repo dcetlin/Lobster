@@ -108,6 +108,8 @@ META_THREAD_WINDOW_MINUTES = 120
 PHILOSOPHY_THREAD_THRESHOLD = 2    # 2+ philosophy events within 4 hours → philosophy_thread
 PHILOSOPHY_THREAD_WINDOW_MINUTES = 240
 
+_DEDUP_WINDOW_HOURS = 12            # suppress duplicate pattern_observation within this window
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -426,7 +428,7 @@ def write_pattern_event(conn: sqlite3.Connection, obs: PatternObservation) -> in
 def _recent_duplicate_exists(
     conn: sqlite3.Connection,
     obs: PatternObservation,
-    hours: int = 12,
+    hours: int = _DEDUP_WINDOW_HOURS,
 ) -> bool:
     """Return True if an identical pattern_observation exists within the last `hours` hours.
 

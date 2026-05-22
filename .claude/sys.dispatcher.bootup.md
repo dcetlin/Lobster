@@ -1089,31 +1089,6 @@ IFTTT rules are loaded at startup (step 2b) and applied throughout the session. 
 
 ---
 
-## Routing Preferences (HITL-confirmed agent routing rules)
-
-Routing preferences are stored in `~/lobster-user-config/routing-preferences.yaml` and confirmed by Dan via Telegram inline buttons (proposed by the morning briefing job when recurring `pattern_observation` events cross a confidence threshold).
-
-**Applying:** Before determining which subagent to route a user message to, check routing preferences:
-
-```python
-from src.orchestration.dispatcher_handlers import check_routing_preferences
-
-agent_hint = check_routing_preferences(msg["text"])
-if agent_hint and not is_explicit_command(msg["text"]):
-    subagent_type = agent_hint  # prefer the matched routing preference
-# else: proceed with normal routing decision
-```
-
-- `check_routing_preferences` reads from disk on every call (no caching) and returns the `agent_hint` for the first matching preference, or `None` if none match.
-- Matching uses case-insensitive substring check against each preference's `condition` field.
-- **Do not override explicit commands.** If the message is a `/command`, a named WOS operation, or a `/decide`/`/approve` action, skip routing preference checks.
-- When a preference fires, `check_routing_preferences` logs `routing_preference_applied: <id>` to the Python logger. No additional logging needed.
-- This check costs a single file read (~1ms) — do it on every user message (not just at startup).
-
-**Callback handling:** Routing preference confirmations and rejections arrive as `type: "callback"` with `callback_data` starting with `routing_pref_confirm:` or `routing_pref_reject:`. These are handled by `route_callback_message` in `src/orchestration/dispatcher_handlers.py` (already wired into the callback dispatch table above — step 8).
-
----
-
 ## Session File Management
 
 One session note file per session. Lives in `~/lobster-user-config/memory/canonical/sessions/`, named `YYYYMMDD-NNN.md`.
@@ -1860,4 +1835,34 @@ No background subagent is needed — `create_task` is a synchronous MCP call.
      Each entry carries an expiry. Review before expiry; graduate or discard.
      Graduation = moving the entry into the main body of this file (poiema).
      Expiry without review = entry is discarded, not silently promoted. -->
+
+## [HYPOTHESIS] routing-preferences-dispatcher-check
+**Added:** 2026-05-22
+**Expires:** 2026-06-05
+**Confidence:** forming
+**Observation basis:** routing-preferences.yaml and check_routing_preferences() exist in dispatcher_handlers.py; callback wiring for routing_pref_confirm:/routing_pref_reject: was added in uow_20260522_c2b5a0 without a prior oracle decision.
+
+Routing preferences are stored in `~/lobster-user-config/routing-preferences.yaml` and confirmed by Dan via Telegram inline buttons (proposed by the morning briefing job when recurring `pattern_observation` events cross a confidence threshold).
+
+**Applying:** Before determining which subagent to route a user message to, check routing preferences:
+
+```python
+from src.orchestration.dispatcher_handlers import check_routing_preferences
+
+agent_hint = check_routing_preferences(msg["text"])
+# Do not apply if message is an explicit command (/command, wos operation, /decide, /approve)
+if agent_hint and not msg["text"].startswith("/"):
+    subagent_type = agent_hint  # prefer the matched routing preference
+# else: proceed with normal routing decision
+```
+
+- `check_routing_preferences` reads from disk on every call (no caching) and returns the `agent_hint` for the first matching preference, or `None` if none match.
+- Matching uses case-insensitive substring check against each preference's `condition` field.
+- **Do not override explicit commands.** If the message is a `/command`, a named WOS operation, or a `/decide`/`/approve` action, skip routing preference checks.
+- When a preference fires, `check_routing_preferences` logs `routing_preference_applied: <id>` to the Python logger. No additional logging needed.
+- This check costs a single file read (~1ms) — do it on every user message (not just at startup).
+
+**Callback handling:** Routing preference confirmations and rejections arrive as `type: "callback"` with `callback_data` starting with `routing_pref_confirm:` or `routing_pref_reject:`. These are handled by `route_callback_message` in `src/orchestration/dispatcher_handlers.py` (already wired into the callback dispatch table — step 8).
+
+**Review question:** Has the routing preferences feature shipped a complete HITL loop (morning briefing proposes → Dan confirms → preference fires in dispatch) and been verified correct at least twice in production?
 
