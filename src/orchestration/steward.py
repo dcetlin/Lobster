@@ -36,23 +36,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from src.orchestration.registry import (
+from orchestration.registry import (
     UoW, UoWStatus, UoWRegister, UoWType,
     validate_steward_executor_schema as validate_steward_schema,
     validate_phase2_schema,
 )
-from src.orchestration.paths import WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG
-from src.orchestration.error_capture import (
+from orchestration.paths import WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG
+from orchestration.error_capture import (
     run_subprocess_with_error_capture,
     log_subprocess_error,
     classify_error,
     has_repeated_error,
 )
-from src.orchestration.config import TimeoutConfig
-from src.orchestration.vision_routing import resolve_vision_route
+from orchestration.config import TimeoutConfig
+from orchestration.vision_routing import resolve_vision_route
 from src.ooda.fast_thorough_selector import select_path as _ooda_select_path, cite_basis as _ooda_cite_basis
-from src.orchestration.gate_fired import translate_eligibility_to_gate
-from src.orchestration.wos_completion_notifier import notify_uow_done, notify_uow_failed
+from orchestration.gate_fired import translate_eligibility_to_gate
+from orchestration.wos_completion_notifier import notify_uow_done, notify_uow_failed
 
 log = logging.getLogger("steward")
 
@@ -109,7 +109,7 @@ def _read_prescription_model_config() -> str | None:
     without needing to mock the full dispatcher_handlers module.
     """
     try:
-        from src.orchestration.dispatcher_handlers import read_wos_config
+        from orchestration.dispatcher_handlers import read_wos_config
         config = read_wos_config()
         model = config.get("prescription_model", "")
         if model:
@@ -645,7 +645,7 @@ class CycleResult:
 # Module-level constants
 # ---------------------------------------------------------------------------
 
-# _GATE_CLEARED_FLAG is imported from src.orchestration.paths (WOS_GATE_CLEARED_FLAG).
+# _GATE_CLEARED_FLAG is imported from orchestration.paths (WOS_GATE_CLEARED_FLAG).
 # See paths.py for the single canonical definition.
 
 
@@ -3969,7 +3969,7 @@ def _write_workflow_artifact(
     artifact_dir: override for the artifact directory (used in tests).
     executor_type: the executor type to embed in the artifact (defaults to general).
     """
-    from src.orchestration.workflow_artifact import WorkflowArtifact, to_frontmatter
+    from orchestration.workflow_artifact import WorkflowArtifact, to_frontmatter
     artifact = WorkflowArtifact(
         uow_id=uow_id,
         executor_type=executor_type,
@@ -5763,7 +5763,7 @@ def run_steward_cycle(
         Typed dataclass with fields: evaluated, prescribed, done, surfaced, skipped,
         race_skipped, considered_ids. Call .as_dict() for dict compatibility.
     """
-    from src.orchestration.registry import Registry
+    from orchestration.registry import Registry
 
     if registry is None:
         registry = Registry(db_path)  # db_path=None → Registry resolves canonical path
@@ -5850,7 +5850,7 @@ def run_steward_cycle(
     # _executing_uows is updated within the loop as UoWs are prescribed
     # so that subsequent candidates in the same cycle see the updated
     # in-flight count (prevents over-dispatch within a single heartbeat).
-    from src.orchestration.shard_dispatch import (
+    from orchestration.shard_dispatch import (
         check_shard_dispatch_eligibility,
         read_max_parallel,
         DispatchAllowed,
@@ -5924,7 +5924,7 @@ def run_steward_cycle(
         _sweep_classification = _most_recent_classification(audit_entries)
         if _sweep_classification == "executor_orphan":
             try:
-                from src.orchestration.dispatcher_handlers import is_execution_enabled
+                from orchestration.dispatcher_handlers import is_execution_enabled
                 _execution_currently_enabled = is_execution_enabled()
             except Exception:
                 _execution_currently_enabled = False
@@ -6051,7 +6051,7 @@ def run_steward_cycle(
         # juice-priority UoW is dispatched.
         _juice_write_back_needed = False
         try:
-            from src.orchestration.juice import JuiceSensor, JUICE_UPDATE_DELTA
+            from orchestration.juice import JuiceSensor, JUICE_UPDATE_DELTA
             _juice_sensor = JuiceSensor()
             _juice_assessment = _juice_sensor.assess(uow, audit_entries, registry)
             _new_juice_score = _juice_assessment.score
