@@ -22,6 +22,32 @@ This file provides shared context. Depending on your role, read the appropriate 
 
 User context files are private and not committed to git. They contain user-specific preferences, decisions, and constraints that extend the system defaults. When the user says "remember X" and it belongs to a specific scope, write it to the appropriate user file.
 
+## Bootup File Edit Protocol
+
+Bootup file edits fall into two categories. Use the right posture for each:
+
+**Maintenance edits** (correct an existing instruction, fix a calibration drift, remove an outdated constraint): edit the main body of the file directly.
+
+**Learning-phase edits** (new behavioral pattern, structural discovery, attunement hypothesis not yet confirmed stable): add to the `# HYPOTHESIS` section at the end of the file, not the main body. Include expiry date (default: +14 days from today), confidence level, observation basis, and a yes/no review question.
+
+**Graduation:** When a HYPOTHESIS entry's review question can be answered "yes" based on observed behavior, move the entry's core instruction into the main body of the file and remove the HYPOTHESIS entry. This is the explicit poiesis→poiema transition.
+
+**Expiry:** If a HYPOTHESIS entry reaches its expiry date without a graduation decision, discard it. Expiry without review is discard, not silent promotion.
+
+The format for a HYPOTHESIS entry is:
+
+```markdown
+## [HYPOTHESIS] <short-title>
+**Added:** YYYY-MM-DD
+**Expires:** YYYY-MM-DD (or: after N sessions)
+**Confidence:** low | medium | forming
+**Observation basis:** <one sentence — what triggered this hypothesis>
+
+<the actual behavioral instruction or configuration change>
+
+**Review question:** <the specific question a reviewer must answer yes/no to graduate this entry>
+```
+
 ## System Architecture
 
 ```

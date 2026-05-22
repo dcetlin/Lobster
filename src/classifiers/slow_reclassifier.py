@@ -108,6 +108,8 @@ META_THREAD_WINDOW_MINUTES = 120
 PHILOSOPHY_THREAD_THRESHOLD = 2    # 2+ philosophy events within 4 hours → philosophy_thread
 PHILOSOPHY_THREAD_WINDOW_MINUTES = 240
 
+_DEDUP_WINDOW_HOURS = 12            # suppress duplicate pattern_observation within this window
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -421,6 +423,31 @@ def write_pattern_event(conn: sqlite3.Connection, obs: PatternObservation) -> in
 
     conn.commit()
     return event_id
+
+
+def _recent_duplicate_exists(
+    conn: sqlite3.Connection,
+    obs: PatternObservation,
+    hours: int = _DEDUP_WINDOW_HOURS,
+) -> bool:
+    """Return True if an identical pattern_observation exists within the last `hours` hours.
+
+    Checks pattern_type + source match. Prevents accumulation of structurally
+    identical entries when the same signal recurs within a short window.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    row = conn.execute(
+        """
+        SELECT 1 FROM events
+        WHERE type = 'pattern_observation'
+          AND source = ?
+          AND json_extract(metadata, '$.pattern_type') = ?
+          AND timestamp >= ?
+        LIMIT 1
+        """,
+        (obs.source, obs.pattern_type, cutoff),
+    ).fetchone()
+    return row is not None
 
 
 def write_run_log(
@@ -878,8 +905,15 @@ def run_pass(conn: sqlite3.Connection) -> tuple[int, int, int]:
                 pattern.event_ids,
             )
 
-            # Write a pattern_observation event to the events table
-            write_pattern_event(conn, pattern)
+            # Write a pattern_observation event — skip if identical entry exists within the dedup window
+            if _recent_duplicate_exists(conn, pattern, hours=_DEDUP_WINDOW_HOURS):
+                log.debug(
+                    "Dedup gate: skipping duplicate pattern_observation %s source=%s",
+                    pattern.pattern_type,
+                    pattern.source,
+                )
+            else:
+                write_pattern_event(conn, pattern)
 
             # Revise the classification tag for each contributing event
             for event_id in pattern.event_ids:

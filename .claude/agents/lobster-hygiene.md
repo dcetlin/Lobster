@@ -44,6 +44,19 @@ The form-function lens sharpens this question. An element is load-bearing when r
 
 **Question 3 — Accumulation without signal:** Is total instruction volume increasing without corresponding increase in precision or behavioral distinctiveness of outputs? Name specific files that have grown without commensurate behavioral signal.
 
+**Step 2b: HYPOTHESIS Section Review**
+
+For each bootup file with a `# HYPOTHESIS` section, list all entries:
+- Entry title
+- Added date
+- Expiry date
+- Whether expiry has passed (flag as EXPIRED if so)
+- Review question
+
+Bootup files to check: `.claude/sys.dispatcher.bootup.md`, `.claude/sys.subagent.bootup.md`, `~/lobster-user-config/agents/user.base.bootup.md`, `~/lobster-user-config/agents/user.dispatcher.bootup.md`, `~/lobster-user-config/agents/user.subagent.bootup.md`.
+
+Surface entries expiring within 7 days or already expired. Do not graduate or discard — surface only. Graduation is a Dan decision.
+
 **Step 3: Write output**
 
 Append to `~/lobster-workspace/meta/hygiene-review.md`:
