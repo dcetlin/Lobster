@@ -1444,3 +1444,167 @@ class TestFileScopeUpsert:
         ).fetchone()
         conn.close()
         assert _json.loads(row["file_scope"]) == paths
+
+
+# ---------------------------------------------------------------------------
+# reset_expired_claims() — visibility-timeout orphan recovery
+# ---------------------------------------------------------------------------
+
+# Named constant for the claim expiry tests — matches the spec phrase
+# "executing_orphan" return_reason embedded in the audit note.
+CLAIM_EXPIRED_RETURN_REASON: str = "executing_orphan"
+
+# Time offsets for claim deadline tests
+PAST_CLAIM_OFFSET_HOURS: int = 1    # claimed_until 1 hour ago — unambiguously expired
+FUTURE_CLAIM_OFFSET_HOURS: int = 1  # claimed_until 1 hour from now — not expired
+
+
+def _seed_uow_in_executing(registry, db_path: Path) -> str:
+    """
+    Seed a UoW and advance it to 'executing' status with a claimed_until set.
+
+    Returns the uow_id. Uses set_status_direct to bypass the full executor
+    dispatch path — we only need the status + claimed_until for these tests.
+    """
+    today = datetime.now(timezone.utc).date().isoformat()
+    from src.orchestration.registry import UpsertInserted
+    result = registry.upsert(
+        issue_number=int(datetime.now(timezone.utc).timestamp()) % 90000 + 10000,
+        title="Claim expiry test UoW",
+        sweep_date=today,
+        success_criteria="Test completion.",
+    )
+    assert isinstance(result, UpsertInserted)
+    uow_id = result.id
+
+    registry.approve(uow_id)
+    registry.set_status_direct(uow_id, "ready-for-steward")
+    registry.set_status_direct(uow_id, "ready-for-executor")
+    registry.set_status_direct(uow_id, "active")
+    registry.set_status_direct(uow_id, "executing")
+
+    # Manually set claimed_until so we can backdate or advance it in tests
+    conn = _open_db(db_path)
+    future = (datetime.now(timezone.utc) + timedelta(hours=FUTURE_CLAIM_OFFSET_HOURS)).isoformat()
+    conn.execute(
+        "UPDATE uow_registry SET claimed_until = ? WHERE id = ?",
+        (future, uow_id),
+    )
+    conn.commit()
+    conn.close()
+
+    return uow_id
+
+
+class TestResetExpiredClaims:
+    """reset_expired_claims() routes expired-claim UoWs to ready-for-steward.
+
+    Behavior verified (derived from spec, not from implementation):
+
+    - Expired claims transition to 'ready-for-steward' (not 'ready-for-executor')
+      so the steward can apply orphan_retry_count / ORPHAN_KILL_RETRY_BUDGET.
+    - The audit log entry carries to_status='ready-for-steward' and note JSON
+      containing return_reason='executing_orphan'.
+    - UoWs with claimed_until in the future are not touched.
+    """
+
+    def test_reset_expired_claims_transitions_to_ready_for_steward(
+        self, registry, db_path: Path
+    ) -> None:
+        """Expired-claim UoW transitions to ready-for-steward, not ready-for-executor.
+
+        Routing through the steward is required so the steward can apply
+        orphan_retry_count, MAX_RETRIES, and ORPHAN_KILL_RETRY_BUDGET before
+        deciding to re-dispatch. Bypassing to ready-for-executor skips all of
+        that logic and causes indefinite retry cycles.
+        """
+        uow_id = _seed_uow_in_executing(registry, db_path)
+
+        # Backdate claimed_until to the past so the claim is expired
+        past = (
+            datetime.now(timezone.utc) - timedelta(hours=PAST_CLAIM_OFFSET_HOURS)
+        ).isoformat()
+        conn = _open_db(db_path)
+        conn.execute(
+            "UPDATE uow_registry SET claimed_until = ? WHERE id = ?",
+            (past, uow_id),
+        )
+        conn.commit()
+        conn.close()
+
+        reset_ids = registry.reset_expired_claims()
+
+        assert uow_id in reset_ids, (
+            f"Expected uow_id {uow_id!r} to be in reset_ids; got {reset_ids!r}"
+        )
+
+        # Check status and claimed_until
+        conn = _open_db(db_path)
+        row = conn.execute(
+            "SELECT status, claimed_until FROM uow_registry WHERE id = ?",
+            (uow_id,),
+        ).fetchone()
+        conn.close()
+
+        assert row["status"] == "ready-for-steward", (
+            f"Expected status='ready-for-steward', got {row['status']!r}"
+        )
+        assert row["claimed_until"] is None, (
+            "Expected claimed_until IS NULL after reset"
+        )
+
+        # Check the audit log entry has the correct to_status and return_reason
+        conn = _open_db(db_path)
+        audit_rows = conn.execute(
+            """
+            SELECT to_status, note FROM audit_log
+            WHERE uow_id = ? AND event = 'claim_expired'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (uow_id,),
+        ).fetchall()
+        conn.close()
+
+        assert len(audit_rows) == 1, (
+            "Expected exactly one 'claim_expired' audit entry"
+        )
+        audit_row = audit_rows[0]
+        assert audit_row["to_status"] == "ready-for-steward", (
+            f"Audit entry to_status should be 'ready-for-steward', got {audit_row['to_status']!r}"
+        )
+
+        note = json.loads(audit_row["note"])
+        assert note.get("return_reason") == CLAIM_EXPIRED_RETURN_REASON, (
+            f"Audit note must carry return_reason={CLAIM_EXPIRED_RETURN_REASON!r}; "
+            f"got {note!r}"
+        )
+
+    def test_reset_expired_claims_does_not_touch_future_claimed_until(
+        self, registry, db_path: Path
+    ) -> None:
+        """UoW with claimed_until in the future is NOT reset.
+
+        The agent is presumed alive while the claim window is open. Resetting
+        it would race with a live agent and corrupt the execution state.
+        """
+        uow_id = _seed_uow_in_executing(registry, db_path)
+        # claimed_until is already set to 1 hour in the future by _seed_uow_in_executing
+
+        reset_ids = registry.reset_expired_claims()
+
+        assert uow_id not in reset_ids, (
+            f"UoW {uow_id!r} has a future claimed_until — must not be reset; "
+            f"reset_ids={reset_ids!r}"
+        )
+
+        # Status should remain 'executing'
+        conn = _open_db(db_path)
+        row = conn.execute(
+            "SELECT status FROM uow_registry WHERE id = ?",
+            (uow_id,),
+        ).fetchone()
+        conn.close()
+
+        assert row["status"] == "executing", (
+            f"Expected status='executing' (unchanged), got {row['status']!r}"
+        )

@@ -4,7 +4,7 @@ Integration tests: WOS visibility-timeout (claimed_until) model.
 Tests cover reset_expired_claims() and the claimed_until lifecycle:
 - Dispatch sets claimed_until
 - complete_uow clears claimed_until
-- Expired claim resets UoW to ready-for-executor
+- Expired claim resets UoW to ready-for-steward (via steward for orphan retry logic)
 - Unexpired claim is not reset
 - Multiple expired claims all reset without blocking dispatch slots
 
@@ -178,12 +178,12 @@ def test_complete_uow_clears_claimed_until(
 
 
 # ---------------------------------------------------------------------------
-# Test C — Expired claim resets UoW to ready-for-executor
+# Test C — Expired claim resets UoW to ready-for-steward
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration
-def test_expired_claim_resets_to_ready_for_executor(
+def test_expired_claim_resets_to_ready_for_steward(
     registry: Registry,
     conn: sqlite3.Connection,
 ) -> None:
@@ -191,7 +191,11 @@ def test_expired_claim_resets_to_ready_for_executor(
     When claimed_until has expired, reset_expired_claims() must:
     - Return the uow_id in its result list
     - Set claimed_until to NULL
-    - Set status back to 'ready-for-executor'
+    - Set status to 'ready-for-steward' (not 'ready-for-executor')
+
+    The steward path is required so that orphan_retry_count, MAX_RETRIES, and
+    ORPHAN_KILL_RETRY_BUDGET are applied before the UoW is re-dispatched.
+    Routing directly to 'ready-for-executor' bypasses all of that logic.
     """
     uow_id = _seed_ready_for_executor(registry)
 
@@ -217,8 +221,8 @@ def test_expired_claim_resets_to_ready_for_executor(
         (uow_id,),
     ).fetchone()
 
-    assert row["status"] == "ready-for-executor", (
-        f"Expected status='ready-for-executor', got {row['status']!r}"
+    assert row["status"] == "ready-for-steward", (
+        f"Expected status='ready-for-steward', got {row['status']!r}"
     )
     assert row["claimed_until"] is None, (
         f"Expected claimed_until IS NULL after reset, got {row['claimed_until']!r}"
@@ -274,7 +278,7 @@ def test_multiple_expired_claims_all_reset(
 ) -> None:
     """
     When 5 UoWs all have expired claimed_until values, reset_expired_claims()
-    must reset all 5 back to 'ready-for-executor' and leave no UoWs in 'executing'.
+    must reset all 5 back to 'ready-for-steward' and leave no UoWs in 'executing'.
     """
     uow_ids = []
     for i in range(5):
@@ -306,14 +310,14 @@ def test_multiple_expired_claims_all_reset(
         f"Expected no UoWs in 'executing' after reset, still executing: {executing_ids!r}"
     )
 
-    # All 5 should now be 'ready-for-executor'
+    # All 5 should now be 'ready-for-steward'
     for uow_id in uow_ids:
         row = conn.execute(
             "SELECT status, claimed_until FROM uow_registry WHERE id = ?",
             (uow_id,),
         ).fetchone()
-        assert row["status"] == "ready-for-executor", (
-            f"UoW {uow_id!r}: expected 'ready-for-executor', got {row['status']!r}"
+        assert row["status"] == "ready-for-steward", (
+            f"UoW {uow_id!r}: expected 'ready-for-steward', got {row['status']!r}"
         )
         assert row["claimed_until"] is None, (
             f"UoW {uow_id!r}: expected claimed_until IS NULL, got {row['claimed_until']!r}"

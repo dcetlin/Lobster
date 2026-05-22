@@ -225,6 +225,11 @@ class UoW:
     #   to 'active' status. Used by startup sweep for per-UoW age threshold when
     #   combined with estimated_runtime (#572). NULL until execution begins.
     started_at: str | None = None
+    # claimed_until: ISO timestamp deadline for the current execution claim (migration 0025).
+    #   Set by the Executor to 2× estimated_runtime at dispatch time.
+    #   If now() > claimed_until, the claim has expired and the UoW is reclaimable.
+    #   NULL when not currently claimed (proposed/ready/done states).
+    claimed_until: str | None = None
     # GardenCaretaker source tracking fields (populated after migration 0004)
     source_ref: str | None = None
     source_last_seen_at: str | None = None
@@ -522,6 +527,7 @@ class Registry:
             juice_rationale=d.get("juice_rationale"),
             prescription_confidence=d.get("prescription_confidence"),
             trigger_message_id=d.get("trigger_message_id"),
+            claimed_until=d.get("claimed_until"),
         )
 
     def _write_audit(
@@ -1497,8 +1503,9 @@ class Registry:
 
     def reset_expired_claims(self) -> list[str]:
         """
-        Reset UoWs whose visibility-timeout (claimed_until) has expired back to
-        'ready-for-executor' so the next executor-heartbeat cycle can re-dispatch them.
+        Reset UoWs whose visibility-timeout (claimed_until) has expired to
+        'ready-for-steward' so the steward can apply orphan retry logic before
+        re-dispatching.
 
         A UoW claim expires when:
           status IN ('active', 'executing')
@@ -1509,6 +1516,12 @@ class Registry:
         claimed_until is set to 2× estimated_runtime at dispatch time, so expiry
         means the agent had enough headroom and genuinely stalled or crashed.
 
+        Routes to 'ready-for-steward' (not 'ready-for-executor') so the steward
+        can apply orphan_retry_count checks, MAX_RETRIES, and ORPHAN_KILL_RETRY_BUDGET
+        before deciding whether to re-dispatch. The audit note carries
+        return_reason='executing_orphan' so _most_recent_return_reason_from_audit
+        can classify the event correctly.
+
         Returns the list of uow_ids that were reset (may be empty).
         """
         conn = self._connect()
@@ -1518,7 +1531,7 @@ class Registry:
                 SELECT id FROM uow_registry
                 WHERE status IN ('active', 'executing')
                   AND claimed_until IS NOT NULL
-                  AND claimed_until < datetime('now')
+                  AND datetime(claimed_until) < datetime('now')
                 """
             ).fetchall()
         finally:
@@ -1534,15 +1547,20 @@ class Registry:
                 conn2.execute(
                     """
                     INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
-                    VALUES (?, ?, 'claim_expired', NULL, 'ready-for-executor', 'executor', ?)
+                    VALUES (?, ?, 'claim_expired', NULL, 'ready-for-steward', 'executor', ?)
                     """,
-                    (now, uow_id, json.dumps({"actor": "executor", "reason": "claimed_until expired", "timestamp": now})),
+                    (now, uow_id, json.dumps({
+                        "actor": "executor",
+                        "reason": "claimed_until expired",
+                        "return_reason": "executing_orphan",
+                        "timestamp": now,
+                    })),
                 )
                 cursor = conn2.execute(
                     """
                     UPDATE uow_registry
-                    SET status = 'ready-for-executor', claimed_until = NULL, updated_at = ?
-                    WHERE id = ? AND status IN ('active', 'executing') AND claimed_until < datetime('now')
+                    SET status = 'ready-for-steward', claimed_until = NULL, updated_at = ?
+                    WHERE id = ? AND status IN ('active', 'executing') AND datetime(claimed_until) < datetime('now')
                     """,
                     (now, uow_id),
                 )
