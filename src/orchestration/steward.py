@@ -2188,13 +2188,19 @@ def generate_v2_prescription(
         "prior_cycle_count": cycles,
     }
 
-    _ORPHAN_POSTURES = frozenset({
-        "executor_orphan", "executing_orphan", "diagnosing_orphan",
-        "orphan_kill_before_start", "orphan_kill_during_execution",
-    })
+    # Use module-scope _ORPHAN_POSTURES (3 enum-backed values) for the primary check.
+    # orphan_kill_before_start and orphan_kill_during_execution are heartbeat-classified
+    # kill types (#963) that are not yet in the ReentryPosture enum — they also map to
+    # continuation posture and are checked explicitly here rather than via a function-body
+    # frozenset shadow (see learnings.md #965, #967, #974).
     if diagnosis.reentry_posture == "first_execution":
         executor_posture = "first_execution"
     elif diagnosis.reentry_posture in _ORPHAN_POSTURES:
+        executor_posture = "continuation"
+    elif diagnosis.reentry_posture in (
+        "orphan_kill_before_start",
+        "orphan_kill_during_execution",
+    ):
         executor_posture = "continuation"
     elif diagnosis.reentry_posture == "execution_failed":
         executor_posture = "remediation"
