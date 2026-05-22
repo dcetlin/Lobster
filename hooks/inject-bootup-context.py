@@ -13,6 +13,7 @@ File injection order (dispatcher):
 1. sys.dispatcher.bootup.md
 2. ~/lobster-user-config/agents/user.base.bootup.md (if exists)
 3. ~/lobster-user-config/agents/user.dispatcher.bootup.md (if exists)
+4. Active user model delta (live signal block, dispatcher non-compact starts only)
 
 File injection order (subagent):
 1. sys.subagent.bootup.md
@@ -547,6 +548,23 @@ def main() -> None:
     else:
         if _inject_if_exists(USER_SUBAGENT_BOOTUP, "user.subagent.bootup.md"):
             injected.append(USER_SUBAGENT_BOOTUP.name)
+
+    # 4. Inject active user model delta (dispatcher non-compact starts only).
+    # Computes live signals from recent messages, brain dumps, and memory events.
+    # Never blocks session start — all errors are caught inside compute_session_delta().
+    if is_dispatcher and not is_compact_start:
+        try:
+            _repo_root = Path(__file__).parent.parent
+            import sys as _sys
+            if str(_repo_root) not in _sys.path:
+                _sys.path.insert(0, str(_repo_root))
+            from src.mcp.user_model.session_delta import compute_session_delta
+            delta = compute_session_delta()
+            if delta:
+                print(delta)
+                injected.append("active-user-model-delta")
+        except Exception as _e:
+            print(f"[{HOOK_NAME}] active user delta failed (non-fatal): {_e}", file=sys.stderr)
 
     _append_injection_log(session_id, role, injected)
     sys.exit(0)
