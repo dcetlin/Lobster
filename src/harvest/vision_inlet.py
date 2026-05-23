@@ -15,8 +15,10 @@ Schema for vision_object_proposals in action_seeds YAML:
 
 Eligible field paths (all others are rejected):
   - current_focus.*                  (any depth under current_focus)
-  - core.inviolable_constraints      (list append only — never replace)
-  - active_project.phase_intent      (scalar replace)
+
+  Anchored by od-1 (2026-03-28): agents may propose changes to current_focus.*
+  with Dan confirmation. core.inviolable_constraints and active_project.phase_intent
+  are Dan-only fields and are not eligible for agent proposals.
 
 Storage:
   - Pending proposals: ~/lobster-workspace/data/vision-proposals-pending.json
@@ -28,13 +30,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
+import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
+from ruamel.yaml import YAML as _RUAMEL_YAML
 
 
 # ---------------------------------------------------------------------------
@@ -56,13 +59,12 @@ DISCARD_JSONL = LOBSTER_WORKSPACE / "data" / "vision-proposals-discard.jsonl"
 # Fields under current_focus.* match via prefix
 _CURRENT_FOCUS_PREFIX = "current_focus."
 
-# These fields are eligible as exact matches (non-prefix)
-_ELIGIBLE_EXACT = frozenset(
-    {
-        "core.inviolable_constraints",
-        "active_project.phase_intent",
-    }
-)
+# These fields are eligible as exact matches (non-prefix).
+# Anchored by od-1 (2026-03-28): agents may propose changes to current_focus.*
+# and life_domains.* with Dan confirmation.
+# core.inviolable_constraints and active_project.phase_intent are Dan-only
+# per the vision.yaml authority model and are NOT eligible for agent proposals.
+_ELIGIBLE_EXACT: frozenset[str] = frozenset()
 
 
 def is_eligible_field_path(field_path: str) -> bool:
@@ -160,7 +162,7 @@ def validate_vision_proposals(
         if not is_eligible_field_path(field_path):
             reason = (
                 f"field_path '{field_path}' is not in the eligible set "
-                f"(current_focus.*, core.inviolable_constraints, active_project.phase_intent)"
+                f"(current_focus.* only — anchored by od-1)"
             )
             _record_discard(p, rejection_reason=reason)
             rejected.append({**p, "rejection_reason": reason})
@@ -175,15 +177,14 @@ def validate_vision_proposals(
             rejected.append({**p, "rejection_reason": reason})
             continue
 
-        # 3. No-op check — skip for list fields (core.inviolable_constraints)
-        if field_path != "core.inviolable_constraints":
-            if str(current_value).strip() == proposed_value:
-                reason = (
-                    f"no-op: proposed_value is identical to current value for '{field_path}'"
-                )
-                _record_discard(p, rejection_reason=reason)
-                rejected.append({**p, "rejection_reason": reason})
-                continue
+        # 3. No-op check
+        if str(current_value).strip() == proposed_value:
+            reason = (
+                f"no-op: proposed_value is identical to current value for '{field_path}'"
+            )
+            _record_discard(p, rejection_reason=reason)
+            rejected.append({**p, "rejection_reason": reason})
+            continue
 
         valid.append(p)
 
@@ -274,7 +275,7 @@ def _call_mcp_send_reply(chat_id: int, text: str, buttons: list) -> bool:
 
 def dispatch_vision_proposals(
     valid_proposals: list[dict],
-    chat_id: int = 6036,
+    chat_id: int = int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")),
     vision_yaml_path: Path = VISION_YAML_PATH,
 ) -> list[str]:
     """
@@ -337,18 +338,16 @@ def dispatch_vision_proposals(
 def handle_vision_accept(
     field_path: str,
     phash: str,
-    chat_id: int = 6036,
+    chat_id: int = int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")),
     vision_yaml_path: Path = VISION_YAML_PATH,
 ) -> str:
     """
     Handle vision_accept:<field_path>:<hash> callback.
 
     1. Looks up proposal in pending.
-    2. Loads vision.yaml.
-    3. Navigates to field_path and writes the value.
-       - For core.inviolable_constraints: appends to list.
-       - All other eligible fields: replace scalar value.
-    4. Writes vision.yaml back.
+    2. Loads vision.yaml using ruamel.yaml round-trip loader (preserves comment block).
+    3. Navigates to field_path and writes the proposed scalar value.
+    4. Writes vision.yaml back with comments intact.
     5. Removes from pending, appends to accepted log.
     6. Returns a reply string.
     """
@@ -359,11 +358,15 @@ def handle_vision_accept(
 
     proposed_value = str(proposal.get("proposed_value", ""))
 
-    # Load vision.yaml
+    # Load vision.yaml using ruamel.yaml round-trip loader to preserve comment block.
+    # PyYAML's yaml.dump silently strips all comments on write; ruamel.yaml preserves them.
+    _ry = _RUAMEL_YAML()
+    _ry.preserve_quotes = True
     try:
+        import io as _io
         vision_text = vision_yaml_path.read_text()
-        vision_data = yaml.safe_load(vision_text)
-    except (OSError, yaml.YAMLError) as e:
+        vision_data = _ry.load(vision_text)
+    except (OSError, Exception) as e:
         return f"Error loading vision.yaml: {e}"
 
     path_parts = field_path.split(".")
@@ -371,33 +374,14 @@ def handle_vision_accept(
     if not found:
         return f"Field path '{field_path}' no longer exists in vision.yaml — cannot write."
 
-    # Apply the change
-    if field_path == "core.inviolable_constraints":
-        # Append to the list
-        if not isinstance(current_value, list):
-            return f"core.inviolable_constraints is not a list — cannot append."
-        # Generate a new constraint id
-        existing_ids = [
-            int(re.sub(r"\D", "", c.get("id", "0")))
-            for c in current_value
-            if isinstance(c, dict)
-        ]
-        next_id = max(existing_ids, default=0) + 1
-        new_constraint = {
-            "id": f"constraint-{next_id}",
-            "statement": proposed_value,
-            "rationale": proposal.get("basis", ""),
-        }
-        current_value.append(new_constraint)
-        _set_yaml_value(vision_data, path_parts, current_value)
-    else:
-        _set_yaml_value(vision_data, path_parts, proposed_value)
+    # Apply the change (only current_focus.* fields are eligible at this point)
+    _set_yaml_value(vision_data, path_parts, proposed_value)
 
-    # Write vision.yaml back using PyYAML with block style
+    # Write vision.yaml back using ruamel.yaml to preserve the authority model comment block
     try:
-        vision_yaml_path.write_text(
-            yaml.dump(vision_data, default_flow_style=False, allow_unicode=True)
-        )
+        buf = _io.StringIO()
+        _ry.dump(vision_data, buf)
+        vision_yaml_path.write_text(buf.getvalue())
     except OSError as e:
         return f"Error writing vision.yaml: {e}"
 
@@ -414,7 +398,7 @@ def handle_vision_accept(
 def handle_vision_decline(
     field_path: str,
     phash: str,
-    chat_id: int = 6036,
+    chat_id: int = int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")),
 ) -> str:
     """
     Handle vision_decline:<field_path>:<hash> callback.
@@ -439,7 +423,7 @@ def handle_vision_decline(
     return "Declined. Proposal discarded."
 
 
-def handle_vision_callback(callback_data: str, chat_id: int = 6036) -> str | None:
+def handle_vision_callback(callback_data: str, chat_id: int = int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586"))) -> str | None:
     """
     Top-level dispatcher for vision_accept: and vision_decline: callbacks.
 
