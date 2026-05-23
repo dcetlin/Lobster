@@ -182,6 +182,18 @@ Applied in WOS Phase 2 design (2026-03-30):
 
 ---
 
+### [2026-05-23] Pattern: binary confirm with pending-JSON and ruamel round-trip write
+
+**Pattern:** When an agent proposes a structural change to a signed data file (e.g., vision.yaml), implement the accept/decline path as: (1) hash-keyed pending JSON for idempotent storage before dispatch; (2) binary Telegram inline keyboard (Accept / Decline buttons) as the Dan-gate; (3) ruamel.yaml round-trip loader for comment-preserving writes on accept; (4) append-only JSONL logs for accepted and discarded proposals. The eligible field scope is encoded as a frozenset anchored to a logged decision (od-1).
+
+**Why it works:** The pattern cleanly separates the three concerns: proposal validation (against the live file), Dan confirmation (binary, no text input required), and durable write (comment-preserving, atomic via tmp-rename). Pending JSON keyed by hash is idempotent — repeated dispatch of the same proposal does not create duplicate buttons. The ruamel round-trip loader is the correct tool for YAML files where the comment block carries governance meaning (as vision.yaml's authority model header does). PyYAML's `yaml.dump` silently strips all comments, which destroys the governance record on first write. The JSONL audit trail (accepted and discard) makes every proposal traceable without any DB dependency.
+
+**Where it appears:** `src/harvest/vision_inlet.py` introduced in PR #834 (Round 3 APPROVED). `dispatch_vision_proposals`, `handle_vision_accept`, `handle_vision_decline`, and `handle_vision_callback` implement the full pattern. Wired into `route_callback_message` in `dispatcher_handlers.py` via `CALLBACK_DATA_HANDLERS` frozenset and a startswith branch.
+
+**Reuse guidance:** Apply whenever an agent needs to propose a change to a human-governed file and the change requires explicit human confirmation before write. The minimum required elements: (1) a hash-keyed pending store (JSON, atomic write via tmp-rename); (2) a binary button UI (not prose); (3) a comment-preserving write mechanism for the target file type (ruamel.yaml for YAML, not PyYAML); (4) append-only JSONL logs for both accept and decline paths; (5) eligible scope anchored to a logged decision — not inferred from the file's own authority model header. The authorized scope must be in code (a frozenset), not in documentation.
+
+---
+
 ### [2026-04-22] Pattern: caller-declared identity in shared utilities
 
 **Pattern:** When consolidating copy-pasted functions into a shared utility, add a `job_name` (or equivalent identity) parameter at the call site rather than hardcoding the prefix inside the shared function or inspecting the call stack. Each caller passes its own stable identifier literal, and the shared function uses it as-is.
