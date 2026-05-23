@@ -4,6 +4,9 @@
 **Schedule**: Daily at 2:00 (`0 2 * * *`)
 **Created**: 2026-03-25 08:07 PM UTC
 
+**Minimum viable output:** A dated sweep file identifying structural smells, an escalation list with GitHub issues filed for each item, and a resolution rate metric — no narrative padding.
+**Economy constraint:** Trim to load-bearing findings before delivery. Do not expand toward comprehensiveness.
+
 ## Context
 
 You are running as a scheduled task. The main Lobster instance created this job.
