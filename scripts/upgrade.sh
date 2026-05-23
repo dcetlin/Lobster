@@ -4278,6 +4278,70 @@ PYEOF
         substep "philosophy-harvest cron entry already present — skipping Migration 121"
     fi
 
+    # Migration 122: Add council-note-accumulation-check cron entry (Type B) and
+    # register the council-sunday-sweep and council-deliberation task files.
+    # The council note-accumulation script checks every 30 minutes whether 5+ new
+    # ergonomics notes have accumulated; if so, it writes an inbox trigger so the
+    # dispatcher spawns a council-deliberation subagent. The Sunday sweep job runs
+    # weekly to process any accumulated notes and pending queue items.
+    local COUNCIL_NOTE_CHECK_MARKER="# LOBSTER-COUNCIL-NOTE-CHECK"
+    if ! crontab -l 2>/dev/null | grep -qF "$COUNCIL_NOTE_CHECK_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$COUNCIL_NOTE_CHECK_MARKER" \
+            "*/30 * * * * cd $LOBSTER_DIR && uv run scheduled-tasks/council-note-accumulation-check.py >> $LOBSTER_WORKSPACE/scheduled-jobs/logs/council-note-check.log 2>&1 $COUNCIL_NOTE_CHECK_MARKER" \
+            && substep "Added council-note-accumulation-check cron entry (Migration 122)" \
+            || warn "Could not add council-note-check cron entry — check cron-manage.sh"
+        migrated=$((migrated + 1))
+    else
+        substep "council-note-check cron entry already present — skipping Migration 122a"
+    fi
+
+    # Copy council task files to the workspace tasks directory
+    local task_src="$LOBSTER_DIR/scheduled-jobs/tasks"
+    local task_dst="$LOBSTER_WORKSPACE/scheduled-jobs/tasks"
+    for task_file in council-deliberation.md council-sunday-sweep.md; do
+        if [ -f "$task_src/$task_file" ] && [ ! -f "$task_dst/$task_file" ]; then
+            cp "$task_src/$task_file" "$task_dst/$task_file"
+            substep "Copied $task_file to workspace tasks (Migration 122b)"
+            migrated=$((migrated + 1))
+        fi
+    done
+
+    # Ensure council canon directories exist in the workspace workstreams area
+    local canon_base="$LOBSTER_WORKSPACE/workstreams/agent-council/canon"
+    for zone in material-science biomechanics phenomenology systems-ecology tool-design cognitive-ergonomics; do
+        if [ ! -d "$canon_base/$zone" ]; then
+            mkdir -p "$canon_base/$zone"
+            substep "Created canon/$zone directory (Migration 122c)"
+            migrated=$((migrated + 1))
+        fi
+    done
+
+    # Ensure ergonomics notes directory exists
+    local notes_dir="$LOBSTER_WORKSPACE/workstreams/ergonomics-orient/notes"
+    if [ ! -d "$notes_dir" ]; then
+        mkdir -p "$notes_dir"
+        substep "Created ergonomics-orient/notes/ directory (Migration 122d)"
+        migrated=$((migrated + 1))
+    fi
+
+    # Ensure council-state.json exists (initialize if absent)
+    local council_state="$LOBSTER_WORKSPACE/workstreams/agent-council/council-state.json"
+    if [ ! -f "$council_state" ]; then
+        mkdir -p "$(dirname "$council_state")"
+        cat > "$council_state" << 'EOF'
+{
+  "last_deliberation_at": null,
+  "notes_processed_count": 0,
+  "notes_since_last_run": 0,
+  "entries_committed_total": 0,
+  "pending_queue": [],
+  "runs": []
+}
+EOF
+        substep "Created council-state.json (Migration 122e)"
+        migrated=$((migrated + 1))
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
