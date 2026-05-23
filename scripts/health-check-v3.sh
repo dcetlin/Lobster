@@ -1578,10 +1578,7 @@ check_session_age() {
     # restarts Claude. This is a graceful exit, not a crash.
     if kill -TERM "$dispatcher_pid" 2>/dev/null; then
         log_warn "Session age: SIGTERM sent to dispatcher PID $dispatcher_pid"
-        send_telegram_alert_deduped "proactive-session-restart" "Lobster: proactive restart at ${session_age}s (before the 7440s CC hard limit).
-
-Dispatcher PID $dispatcher_pid sent SIGTERM. Stop hook will fire, session will restart cleanly.
-Next session will start fresh — no context lost from hard limit."
+        send_telegram_alert_deduped "proactive-session-restart" "[Routine] Session rotation at ${session_age}s — restarting before the 7440s CC hard limit. Stop hook will fire cleanly; no context lost. This happens every ~2h and is expected."
         # Delete the start timestamp so a subsequent health check run (within the
         # next 4 minutes) does not send a second SIGTERM before the restart completes.
         rm -f "$DISPATCHER_SESSION_START_FILE" 2>/dev/null || true
