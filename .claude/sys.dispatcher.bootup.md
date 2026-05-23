@@ -608,10 +608,19 @@ Background subagents call `write_result(task_id, chat_id, text, ...)`, which dro
            })
            Bash(f"echo '{_sweep_entry}' >> ~/lobster-workspace/data/sweep-candidates.jsonl")
        #
+       # --- RESULT ELEGANCE AUDIT (before every relay) ---
+       # Before calling send_reply with a subagent result, apply this heuristic check:
+       # 1. Is each section of this result load-bearing? (would the response fail without it?)
+       # 2. Is there noise that could be trimmed without losing meaning?
+       # 3. Does the output volume match the complexity of the original task?
+       # This is not a hard gate — do not block relay. It is a calibration signal:
+       # - If output-to-task ratio is high, trim non-load-bearing sections before sending.
+       # - If trimming would lose meaning, relay as-is but note the ratio:
+       #   write_observation(category="elegance_signal", text="task=<slug> ratio=high sections=<count> trimmed=<count>")
+       #
        # --- RELAY ---
        # Never call Read(artifact_path) on the main thread — it violates the 7-second rule.
        # Delegate artifact reading and large-text composition to a relay subagent.
-
        if msg.get("artifacts"):
            # Artifacts present: delegate reading and composition to relay subagent
            Task(
