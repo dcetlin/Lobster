@@ -1543,6 +1543,65 @@ pr_ref = parts[1].strip() if len(parts) > 1 else ""
 
 ---
 
+## Agent Council — "council: [topic]" Trigger
+
+When a user message matches `^council:\s+(.+)` (case-insensitive), extract the topic and dispatch a council-deliberation subagent.
+
+**Match trigger:**
+```python
+import re
+council_match = re.match(r'^council:\s+(.+)', msg["text"].strip(), re.IGNORECASE)
+```
+
+**Dispatch pattern:**
+```python
+if council_match:
+    topic = council_match.group(1).strip()
+    council_task_id = f"council-{re.sub(r'[^a-z0-9]+', '-', topic.lower())[:40]}"
+    send_reply(
+        chat_id=chat_id,
+        text=f"Deliberating on: {topic}",
+        source=source,
+        reply_to_message_id=msg.get("telegram_message_id"),
+    )
+    Task(
+        subagent_type="lobster-generalist",
+        run_in_background=True,
+        prompt=(
+            f"---\n"
+            f"task_id: {council_task_id}\n"
+            f"chat_id: {chat_id}\n"
+            f"source: {source}\n"
+            f"background: true\n"
+            f"---\n\n"
+            f"Run a council deliberation on the following topic:\n\n"
+            f"TOPIC: {topic}\n"
+            f"DOMAIN_CONTEXT_PATH: ~/lobster-workspace/workstreams/ergonomics-orient/frontier.md\n"
+            f"CANON_PATH: ~/lobster-workspace/workstreams/agent-council/canon/\n"
+            f"COUNCIL_STATE_PATH: ~/lobster-workspace/workstreams/agent-council/council-state.json\n"
+            f"SOURCE: in-conversation\n"
+            f"CHAT_ID: {chat_id}\n\n"
+            f"Follow the council-deliberation task definition at:\n"
+            f"~/lobster-workspace/scheduled-jobs/tasks/council-deliberation.md\n\n"
+            f"Minimum viable output: A write_result call with the deliberation outcome — "
+            f"either a committed canon entry or a clear note on why the topic was deferred.\n"
+            f"Boundary: do not include the Researcher/Synthesizer/Canon-Keeper deliberation transcript "
+            f"in the output — only the committed claim (or deferral note) goes to Dan.\n"
+            f"Boundary: do not implement Devil's Advocate — this is the 3-role MVP (Researcher, "
+            f"Synthesizer, Canon-Keeper only)."
+        ),
+    )
+    mark_processed(message_id)
+    continue
+```
+
+**When the council result arrives** (`task_id` starts with `council-`, `chat_id` is user's chat):
+- Result is relayed normally through the subagent_result handler
+- Short results (< 500 chars): relay inline
+- The result text is already in Dan's output format — do not reformat or summarize
+
+---
+
 ## System Investigations (lobster-auditor)
 
 When the user asks to investigate a system issue — restart cause, missing messages, hook failures, queue anomalies — spawn `lobster-auditor`.

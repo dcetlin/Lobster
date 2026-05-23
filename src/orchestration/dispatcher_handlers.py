@@ -1894,6 +1894,44 @@ def parse_diagnose_command(text: str) -> str | None:
     return None
 
 
+def parse_council_command(text: str) -> str | None:
+    """
+    Parse a ``council: <topic>`` Telegram command and return the topic.
+
+    The dispatcher calls this to detect the Agent Council invocation pattern.
+    Matches ``council: <topic>`` (case-insensitive, leading/trailing whitespace
+    ignored). Returns the topic string if the command matches; ``None`` otherwise.
+
+    The council deliberation is a three-role sequential process (Researcher →
+    Synthesizer → Canon-Keeper) implemented in the council-deliberation task
+    definition. This parser is a pure predicate — no side effects.
+
+    Args:
+        text: The raw Telegram message text.
+
+    Returns:
+        The topic string if the command matches; ``None`` otherwise.
+
+    Examples::
+
+        parse_council_command("council: stiffness-toughness tradeoff")
+        # → "stiffness-toughness tradeoff"
+
+        parse_council_command("Council: What does ergonomics say about API friction?")
+        # → "What does ergonomics say about API friction?"
+
+        parse_council_command("wos status")
+        # → None
+    """
+    import re as _re
+
+    stripped = text.strip()
+    m = _re.match(r'^council:\s+(.+)', stripped, _re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
 def parse_wos_abort_command(text: str) -> str | None:
     """
     Parse a ``wos abort <uow_id>`` Telegram command and return the UoW ID.
