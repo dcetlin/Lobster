@@ -58,6 +58,8 @@ INBOX_SYSTEM_TYPES: frozenset[str] = frozenset({
     "wos_execute",            # WOS executor dispatched a UoW — dispatcher must call route_wos_message() to spawn subagent (issue #856)
     "wos_owner_required",     # WOS subagent escalated with outcome=owner_decision_required; UoW is awaiting-owner; dispatcher relays to Dan
     "scheduled_task_crash",   # heartbeat script caught an unhandled exception and wrote a crash alert (fields: job_name, text)
+    "pr_review_request",      # PR-review sweeper coordinator requests oracle review for a specific PR (source: pr_review_sweeper)
+    "wos_pr_sweep_result",    # WOS PR sweeper reports stale/merged PRs with pending UoWs (source: wos_pr_sweep)
 })
 
 # ---------------------------------------------------------------------------
@@ -76,8 +78,10 @@ INBOX_MESSAGE_SOURCES: frozenset[str] = frozenset({
     "whatsapp",
     "bisque",
     "system",
-    "bot-talk",  # cross-Lobster bot-to-bot messages (issue #1350)
-    "gmail",     # email poller injects messages with source="gmail"
+    "bot-talk",           # cross-Lobster bot-to-bot messages (issue #1350)
+    "gmail",              # email poller injects messages with source="gmail"
+    "pr_review_sweeper",  # PR-review sweep coordinator — dispatches pr_review_request messages (issue #1268)
+    "wos_pr_sweep",       # WOS PR sweep cron script — reports stale/merged PRs (scheduled-tasks/wos-pr-sweeper.py)
 })
 
 # ---------------------------------------------------------------------------

@@ -113,7 +113,9 @@ class TestUnrecognizedSourceQuarantine:
 
         from src.mcp.inbox_server import handle_check_inbox
 
-        result = asyncio.run(handle_check_inbox({}))
+        # Pass an explicit limit matching the source count so the test stays
+        # correct as INBOX_MESSAGE_SOURCES grows beyond the default limit of 10.
+        result = asyncio.run(handle_check_inbox({"limit": len(recognized_sources)}))
         result_text = result[0].text
 
         # All recognized-source messages should be returned
