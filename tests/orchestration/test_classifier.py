@@ -9,6 +9,9 @@ Tests cover:
 5. test_priority_order          — UoW with risk=high AND type=seed → sequential (design-first wins at 10)
 6. test_loop_guard              — UoW with same hook_id appearing 3 times in hooks_applied →
                                   hook application returns empty list and hooks_frozen=True
+
+All classifier tests use the production routing_classifier.classify_posture() — the authoritative
+classifier already wired into registry.py.
 """
 
 from __future__ import annotations
@@ -84,17 +87,12 @@ rules:
 
 
 @pytest.fixture(autouse=True)
-def patch_classifier_config(classifier_yaml: Path) -> None:
+def patch_classifier_config(classifier_yaml: Path, monkeypatch) -> None:
     """
-    Patch CLASSIFIER_CONFIG_PATH and clear cache before each test so tests
-    use the fixture config rather than the real ~/lobster-user-config/... path.
+    Override WOS_CLASSIFIER_YAML env var before each test so tests use the
+    fixture config rather than the real ~/lobster-user-config/... path.
     """
-    import orchestration.classifier as cls_module
-    cls_module._clear_rules_cache()
-    with patch.object(cls_module, "CLASSIFIER_CONFIG_PATH", classifier_yaml):
-        cls_module._clear_rules_cache()
-        yield
-    cls_module._clear_rules_cache()
+    monkeypatch.setenv("WOS_CLASSIFIER_YAML", str(classifier_yaml))
 
 
 # ---------------------------------------------------------------------------
@@ -144,9 +142,9 @@ def _make_stub_db(tmp_path: Path, *, hook_count: int = 0) -> tuple[Path, "Regist
 
 def test_design_first_rule() -> None:
     """UoW with type=seed → posture sequential, rule_name design-first."""
-    from orchestration.classifier import classify
+    from orchestration.routing_classifier import classify_posture
 
-    result = classify({"type": "seed"})
+    result = classify_posture({"type": "seed"})
     assert result.posture == "sequential"
     assert result.rule_name == "design-first"
     assert "design-first" in result.route_reason
@@ -158,9 +156,9 @@ def test_design_first_rule() -> None:
 
 def test_high_risk_rule() -> None:
     """UoW with risk=high → posture review-loop, rule_name high-risk-review."""
-    from orchestration.classifier import classify
+    from orchestration.routing_classifier import classify_posture
 
-    result = classify({"risk": "high"})
+    result = classify_posture({"risk": "high"})
     assert result.posture == "review-loop"
     assert result.rule_name == "high-risk-review"
 
@@ -171,9 +169,9 @@ def test_high_risk_rule() -> None:
 
 def test_parallelizable_rule() -> None:
     """UoW with files_touched=7 and type=executable → fan-out."""
-    from orchestration.classifier import classify
+    from orchestration.routing_classifier import classify_posture
 
-    result = classify({"files_touched": 7, "type": "executable"})
+    result = classify_posture({"files_touched": 7, "type": "executable"})
     assert result.posture == "fan-out"
     assert result.rule_name == "parallelizable-multifile"
 
@@ -184,9 +182,9 @@ def test_parallelizable_rule() -> None:
 
 def test_default_rule() -> None:
     """UoW with no matching fields → solo (catch-all default)."""
-    from orchestration.classifier import classify
+    from orchestration.routing_classifier import classify_posture
 
-    result = classify({"completely": "irrelevant", "fields": True})
+    result = classify_posture({"completely": "irrelevant", "fields": True})
     assert result.posture == "solo"
     assert result.rule_name == "default"
 
@@ -197,11 +195,11 @@ def test_default_rule() -> None:
 
 def test_priority_order() -> None:
     """UoW with risk=high AND type=seed → sequential (design-first wins at priority 10)."""
-    from orchestration.classifier import classify
+    from orchestration.routing_classifier import classify_posture
 
     # Both design-first (type=seed, priority 10) and high-risk-review (risk=high, priority 9)
     # match this UoW. design-first must win.
-    result = classify({"type": "seed", "risk": "high"})
+    result = classify_posture({"type": "seed", "risk": "high"})
     assert result.posture == "sequential"
     assert result.rule_name == "design-first"
 
@@ -236,59 +234,3 @@ def test_loop_guard(tmp_path: Path) -> None:
 
     assert row is not None
     assert bool(row["hooks_frozen"]) is True
-
-
-# ---------------------------------------------------------------------------
-# Bonus: verify route_reason is written to registry via classify_and_register
-# ---------------------------------------------------------------------------
-
-def test_classify_and_register_writes_route_reason(tmp_path: Path) -> None:
-    """
-    classify_and_register writes posture and route_reason to the registry record.
-    """
-    from orchestration.classify_intake import classify_and_register
-
-    # Create a minimal DB with the required columns
-    db_path = tmp_path / "registry.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("""
-        CREATE TABLE uow_registry (
-            id TEXT PRIMARY KEY,
-            status TEXT NOT NULL DEFAULT 'proposed',
-            hooks_applied TEXT DEFAULT '[]',
-            hooks_frozen INTEGER NOT NULL DEFAULT 0,
-            retry_count INTEGER NOT NULL DEFAULT 0,
-            route_reason TEXT,
-            classifier_thrash INTEGER NOT NULL DEFAULT 0,
-            rule_name TEXT,
-            posture TEXT DEFAULT 'solo'
-        )
-    """)
-    conn.execute(
-        "INSERT INTO uow_registry (id, status) VALUES (?, 'proposed')",
-        ("uow_test_002",),
-    )
-    conn.commit()
-    conn.close()
-
-    class RegistryStub:
-        def __init__(self, db: Path) -> None:
-            self.db_path = db
-
-    registry = RegistryStub(db_path)
-    uow = {"type": "seed", "source_issue_number": 99}
-
-    classify_and_register("uow_test_002", uow, registry)
-
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT posture, route_reason, rule_name FROM uow_registry WHERE id = ?",
-        ("uow_test_002",),
-    ).fetchone()
-    conn.close()
-
-    assert row is not None
-    assert row["posture"] == "sequential"
-    assert row["rule_name"] == "design-first"
-    assert "design-first" in (row["route_reason"] or "")

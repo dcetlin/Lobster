@@ -208,6 +208,10 @@ def _hook_retry_on_failure(uow_id: str, event: str, db_path: Path) -> bool:
     Fires on ``on_failure`` event only. Increments retry_count and re-queues
     the UoW to 'proposed' if retry_count < _MAX_RETRIES. Returns True if the
     hook fired (i.e., event matches and the hook ran its logic).
+
+    NOTE: Callers must run the loop-guard check BEFORE calling this function so
+    that loop-guard can prevent the requeue from happening on the cycle where
+    the threshold is crossed. See apply_hooks() for the correct call sequence.
     """
     if event != "on_failure":
         return False
@@ -289,18 +293,19 @@ def apply_hooks(uow_id: str, event: str, registry) -> list[str]:
     fired: list[str] = []
 
     # --- retry-on-failure ---
-    if _hook_retry_on_failure(uow_id, event, db_path):
+    # Loop-guard check fires BEFORE the hook runs so it can suppress the requeue
+    # on the cycle where the threshold is crossed. Without this ordering,
+    # _hook_retry_on_failure would call _requeue_uow before loop-guard freezes.
+    if event == "on_failure":
         hook_id = HOOK_RETRY_ON_FAILURE
-        # Re-read fields to reflect updated hooks_applied before loop-guard check.
-        fields = _get_uow_hook_fields(db_path, uow_id) or fields
-        # Loop-guard check for retry-on-failure itself.
         loop_fired = _hook_loop_guard(uow_id, hook_id, db_path, fields)
-        if not loop_fired:
-            _append_hook_applied(db_path, uow_id, hook_id)
-            fired.append(hook_id)
-        # If loop-guard fired, hooks are now frozen — do not append or continue.
-        if fields.get("hooks_frozen") or loop_fired:
+        if loop_fired:
+            # Hooks are now frozen — do not run the retry hook or requeue.
             return fired
+        # Loop-guard did not fire — run the retry hook (may requeue).
+        _hook_retry_on_failure(uow_id, event, db_path)
+        _append_hook_applied(db_path, uow_id, hook_id)
+        fired.append(hook_id)
 
     # --- loop-guard is a meta-hook; it fires during any hook application above ---
     # No explicit loop-guard entry in fired — it acts as a guard, not a primary hook.
