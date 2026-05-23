@@ -1,3 +1,4 @@
+| 2026-05-23 | PR #837 | Round 1 | APPROVED |
 | 2026-05-23 | PR #1012 | Round 1 | APPROVED |
 | 2026-05-23 | PR #542 | Round 1 | APPROVED |
 | 2026-05-23 | PR #1278 | Round 1 | APPROVED |
