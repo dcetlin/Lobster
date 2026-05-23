@@ -1,4 +1,4 @@
--- Migration 0009: WOS Phase 3 — classifier and hook system fields.
+-- Migration 0027: WOS Phase 3 — classifier and hook system fields.
 --
 -- Adds columns required by the Phase 3 routing classifier and hook system:
 --   hooks_frozen      — BOOL: set by loop-guard when the same hook fires >= 3x;
