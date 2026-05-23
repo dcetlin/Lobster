@@ -4342,6 +4342,58 @@ EOF
         migrated=$((migrated + 1))
     fi
 
+    # Migration 122f: Register council-note-check entry in jobs.json (Type B gate)
+    # is_job_enabled("council-note-check") returns True by default when the key is absent,
+    # making the runtime enable/disable gate non-functional. This step ensures the entry
+    # exists so that "wos stop council-note-check" can write enabled=false and pause the job.
+    local _m122f_jobs_file="$WORKSPACE_DIR/scheduled-jobs/jobs.json"
+    if [ -f "$_m122f_jobs_file" ]; then
+        local _m122f_missing=0
+        uv run python3 -c "import json,sys; d=json.load(open('$_m122f_jobs_file')); sys.exit(0 if 'council-note-check' in d.get('jobs',{}) else 1)" 2>/dev/null || _m122f_missing=1
+        if [ "$_m122f_missing" -eq 1 ]; then
+            uv run python3 - <<'PYEOF'
+import json, os
+from datetime import datetime, timezone
+from pathlib import Path
+
+workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+jobs_file = workspace / "scheduled-jobs" / "jobs.json"
+try:
+    data = json.loads(jobs_file.read_text())
+except Exception:
+    data = {"jobs": {}}
+
+data.setdefault("jobs", {})
+now = datetime.now(timezone.utc).isoformat()
+
+if "council-note-check" not in data["jobs"]:
+    data["jobs"]["council-note-check"] = {
+        "name": "council-note-check",
+        "type": "B",
+        "dispatch": "cron-direct",
+        "schedule": "*/30 * * * *",
+        "schedule_human": "Every 30 minutes",
+        "task_file": None,
+        "created_at": now,
+        "updated_at": now,
+        "enabled": True,
+        "last_run": None,
+        "last_status": None,
+    }
+    jobs_file.write_text(json.dumps(data, indent=2))
+    print("Added council-note-check to jobs.json")
+else:
+    print("council-note-check already in jobs.json — skipped")
+PYEOF
+            migrated=$((migrated + 1))
+            substep "Registered council-note-check in jobs.json (Migration 122f)"
+        else
+            substep "council-note-check already in jobs.json — skipping Migration 122f"
+        fi
+    else
+        warn "jobs.json not found — skipping Migration 122f (council-note-check registration)"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
