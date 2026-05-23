@@ -237,7 +237,7 @@
 | 2026-05-22 | PR #1261 | Round 1 | APPROVED |
 | 2026-05-22 | PR #1261 | Round 1 | APPROVED |
 | 2026-05-23 | PR #1022 | Round 1 | APPROVED |
-| 2026-05-23 | PR #836 | Round 2 | APPROVED |
+| 2026-05-23 | PR #836 | Round 2 | APPROVED — merged, verdict archived |
 | 2026-05-23 | PR #836 | Round 1 | NEEDS_CHANGES |
 | 2026-05-23 | PR #833 | Round 2 | APPROVED |
 | 2026-05-23 | PR #833 | Round 1 | NEEDS_CHANGES |
