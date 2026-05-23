@@ -2444,6 +2444,8 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
 CALLBACK_DATA_HANDLERS: frozenset[str] = frozenset({
     "decide_retry:",
     "decide_close:",
+    "vision_accept:",
+    "vision_decline:",
 })
 
 
@@ -2458,10 +2460,12 @@ def route_callback_message(msg: dict[str, Any], *, registry: "Registry | None" =
     Currently handles:
     - ``decide_retry:<uow_id>`` — retry a blocked UoW (calls ``handle_decide_retry``)
     - ``decide_close:<uow_id>`` — close a blocked UoW (calls ``handle_decide_close``)
+    - ``vision_accept:<field_path>:<hash>`` — accept a vision proposal
+    - ``vision_decline:<field_path>:<hash>`` — decline a vision proposal
 
-    All other callback_data values fall through to an "unknown callback" reply,
-    which lets the dispatcher handle other callback types (job-confirm, delete-confirm,
-    etc.) via its existing prose routing logic.
+    All other callback_data values fall through to ``handled=False``, which lets
+    the dispatcher handle other callback types (job-confirm, delete-confirm, etc.)
+    via its existing prose routing logic.
 
     Args:
         msg: The raw inbox message dict.  Must contain ``callback_data`` and
@@ -2483,7 +2487,7 @@ def route_callback_message(msg: dict[str, Any], *, registry: "Registry | None" =
             The chat to reply to (echoed from ``msg["chat_id"]``).
 
         ``handled`` (bool):
-            ``True`` if callback_data matched a known WOS pattern;
+            ``True`` if callback_data matched a known pattern;
             ``False`` if the dispatcher should fall through to its own
             handling (e.g. job-confirm-yes, delete-confirm-yes).
 
@@ -2517,8 +2521,57 @@ def route_callback_message(msg: dict[str, Any], *, registry: "Registry | None" =
         text = handle_decide_close(uow_id, registry=reg)
         return {"action": "send_reply", "text": text, "chat_id": chat_id, "handled": True}
 
-    # Not a WOS callback — signal the dispatcher to use its own handling
+    if data.startswith("vision_accept:") or data.startswith("vision_decline:"):
+        effective_chat_id = int(chat_id) if chat_id is not None else int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586"))
+        text = handle_vision_callback(data, chat_id=effective_chat_id)
+        if text is None:
+            text = f"Unknown vision callback: {data}"
+        return {"action": "send_reply", "text": text, "chat_id": chat_id, "handled": True}
+
+    # Not a known callback — signal the dispatcher to use its own handling
     return {"action": "send_reply", "text": f"Unknown callback: {data}", "chat_id": chat_id, "handled": False}
+
+
+# ---------------------------------------------------------------------------
+# Vision Object callback handler — vision_accept / vision_decline
+# ---------------------------------------------------------------------------
+
+
+def handle_vision_callback(
+    callback_data: str,
+    chat_id: int = int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")),
+) -> str | None:
+    """
+    Handle Telegram inline keyboard callbacks for the Vision Object inlet.
+
+    Parses ``callback_data`` for ``vision_accept:<field_path>:<hash>`` and
+    ``vision_decline:<field_path>:<hash>`` prefixes and routes to the accept or
+    decline handler in ``src.harvest.vision_inlet``.
+
+    Returns a reply string if this is a vision callback, or ``None`` if the
+    callback_data does not match a vision prefix (so the caller can route other
+    callbacks normally).
+
+    Dispatcher integration — call via ``route_callback_message`` which wires this
+    automatically for type="callback" messages::
+
+        from src.orchestration.dispatcher_handlers import route_callback_message
+
+        if msg.get("type") == "callback":
+            result = route_callback_message(msg)
+            if result["handled"]:
+                send_reply(chat_id=result["chat_id"], text=result["text"],
+                           message_id=message_id)
+    """
+    if not (callback_data.startswith("vision_accept:") or callback_data.startswith("vision_decline:")):
+        return None
+
+    try:
+        from src.harvest.vision_inlet import handle_vision_callback as _vi_callback  # type: ignore[import]
+    except ImportError:
+        return "vision_inlet module unavailable — cannot process vision callback."
+
+    return _vi_callback(callback_data, chat_id=chat_id)
 
 
 # ---------------------------------------------------------------------------
