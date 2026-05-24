@@ -351,14 +351,15 @@ def _active_uows(registry: Any) -> list[dict]:
 
     Each dict has: id, status, steward_cycles, time_in_state_seconds,
     issue_url (raw, for downstream enrichment).
+
+    Queries specific statuses to avoid 'closed' legacy rows that fail UoWStatus parsing.
     """
     from src.orchestration.registry import UoWStatus
-    active_statuses = {
-        UoWStatus.ACTIVE,
-        UoWStatus.READY_FOR_EXECUTOR,
-        # 'executing' is not a canonical UoWStatus in the StrEnum but guard
-        # against future additions by using string comparison below.
-    }
+    active_status_strs = [
+        str(UoWStatus.ACTIVE),
+        str(UoWStatus.READY_FOR_EXECUTOR),
+        "executing",
+    ]
 
     now = datetime.now(timezone.utc)
     result = []
@@ -372,21 +373,21 @@ def _active_uows(registry: Any) -> list[dict]:
             # Other exception types propagate so the dashboard fails loudly.
             _log.warning("_active_uows: skipping status %r — enum parsing failed", status_str)
             continue
+        for uow in uow_list:
+            # Compute time-in-state as seconds since updated_at
+            try:
+                updated = datetime.fromisoformat(uow.updated_at.replace("Z", "+00:00"))
+                time_in_state = int((now - updated).total_seconds())
+            except (AttributeError, ValueError):
+                time_in_state = -1
 
-        # Compute time-in-state as seconds since updated_at
-        try:
-            updated = datetime.fromisoformat(uow.updated_at.replace("Z", "+00:00"))
-            time_in_state = int((now - updated).total_seconds())
-        except (AttributeError, ValueError):
-            time_in_state = -1
-
-        result.append({
-            "id": uow.id,
-            "status": str(uow.status),
-            "steward_cycles": uow.steward_cycles,
-            "time_in_state_seconds": time_in_state,
-            "issue_url": getattr(uow, "issue_url", None),
-        })
+            result.append({
+                "id": uow.id,
+                "status": str(uow.status),
+                "steward_cycles": uow.steward_cycles,
+                "time_in_state_seconds": time_in_state,
+                "issue_url": getattr(uow, "issue_url", None),
+            })
 
     return result
 
@@ -448,9 +449,11 @@ def _stalled_uows(registry: Any, stall_threshold_minutes: int = 30) -> list[dict
     """Return UoWs in ready-for-steward or ready-for-executor for longer than threshold.
 
     Each dict has: id, status, time_in_state_seconds.
+
+    Queries specific statuses to avoid 'closed' legacy rows that fail UoWStatus parsing.
     """
     from src.orchestration.registry import UoWStatus
-    stall_statuses = {UoWStatus.READY_FOR_STEWARD, UoWStatus.READY_FOR_EXECUTOR}
+    stall_status_strs = [str(UoWStatus.READY_FOR_STEWARD), str(UoWStatus.READY_FOR_EXECUTOR)]
     threshold_seconds = stall_threshold_minutes * 60
     now = datetime.now(timezone.utc)
     result = []
@@ -464,18 +467,19 @@ def _stalled_uows(registry: Any, stall_threshold_minutes: int = 30) -> list[dict
             # Other exception types propagate so the dashboard fails loudly.
             _log.warning("_stalled_uows: skipping status %r — enum parsing failed", status_str)
             continue
-        try:
-            updated = datetime.fromisoformat(uow.updated_at.replace("Z", "+00:00"))
-            elapsed = int((now - updated).total_seconds())
-        except (AttributeError, ValueError):
-            elapsed = -1
+        for uow in uow_list:
+            try:
+                updated = datetime.fromisoformat(uow.updated_at.replace("Z", "+00:00"))
+                elapsed = int((now - updated).total_seconds())
+            except (AttributeError, ValueError):
+                elapsed = -1
 
-        if elapsed >= threshold_seconds:
-            result.append({
-                "id": uow.id,
-                "status": str(uow.status),
-                "time_in_state_seconds": elapsed,
-            })
+            if elapsed >= threshold_seconds:
+                result.append({
+                    "id": uow.id,
+                    "status": str(uow.status),
+                    "time_in_state_seconds": elapsed,
+                })
 
     return result
 
