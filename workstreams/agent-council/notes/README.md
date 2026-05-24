@@ -1,9 +1,7 @@
-# Council Notes
+# Council Notes (Seeds for Deliberation)
 
-Seeds and deliberation inputs. These are inputs to the council sweep — not settled canon.
+Flat list. Files here are inputs to the council sweep — not settled canon.
 
-The sweep processes these notes and produces canon entries through deliberation.
+## Awaiting deliberation
 
-## Current seeds awaiting deliberation
-
-- `systems-ecology/metabolic-taxonomy.md` — 8-state metabolic taxonomy; submitted 2026-05-24
+- metabolic-taxonomy.md — 8-state metabolic flow taxonomy; submitted 2026-05-24
