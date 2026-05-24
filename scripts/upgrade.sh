@@ -4424,6 +4424,36 @@ PYEOF
     #   log_ok "block-claude-p hook removed from settings.json"
     # fi
 
+    # Migration 125: Add TELEGRAM_ADMIN_CHAT_ID to config.env if missing.
+    # handle_wos_action uses this to restrict WOS dashboard actions to the admin
+    # user.  Without it the guard is a no-op and any Telegram user who can craft
+    # a valid deep-link can write to the WOS registry.
+    # Derives from LOBSTER_ADMIN_CHAT_ID (already present after Migration 56) so
+    # no manual intervention is required on single-user installs.
+    if [ -f "$CONFIG_FILE" ]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE" 2>/dev/null || true
+        if [ -z "${TELEGRAM_ADMIN_CHAT_ID:-}" ]; then
+            local _m125_derived
+            _m125_derived="${LOBSTER_ADMIN_CHAT_ID:-}"
+            if [ -z "$_m125_derived" ]; then
+                # Fall back to TELEGRAM_ALLOWED_USERS first value if LOBSTER_ADMIN_CHAT_ID
+                # was not set by Migration 56 (e.g. very old install).
+                _m125_derived=$(echo "${TELEGRAM_ALLOWED_USERS:-}" | cut -d',' -f1 | tr -d '[:space:]')
+            fi
+            if [ -n "$_m125_derived" ]; then
+                echo "" >> "$CONFIG_FILE"
+                echo "# Admin chat ID for WOS dashboard action auth (derived from LOBSTER_ADMIN_CHAT_ID)" >> "$CONFIG_FILE"
+                echo "TELEGRAM_ADMIN_CHAT_ID=$_m125_derived" >> "$CONFIG_FILE"
+                substep "Migration 125: added TELEGRAM_ADMIN_CHAT_ID=$_m125_derived to config.env"
+                migrated=$((migrated + 1))
+            else
+                warn "Migration 125: TELEGRAM_ADMIN_CHAT_ID not set and could not be derived — set it manually in $CONFIG_FILE to secure WOS dashboard actions"
+            fi
+        else
+            substep "Migration 125: TELEGRAM_ADMIN_CHAT_ID already set — skipping"
+        fi
+    fi
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

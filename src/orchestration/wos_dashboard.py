@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -50,6 +51,9 @@ from pathlib import Path
 from typing import Any
 
 from src.orchestration.analytics import outcome_cost_correlation
+from src.orchestration.wos_action_link import tg_deep_link as _tg_deep_link
+
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -359,8 +363,14 @@ def _active_uows(registry: Any) -> list[dict]:
     now = datetime.now(timezone.utc)
     result = []
 
-    for uow in registry.list():
-        if uow.status not in active_statuses and str(uow.status) != "executing":
+    for status_str in active_status_strs:
+        try:
+            uow_list = registry.list(status=status_str)
+        except ValueError:
+            # Guard against enum parsing failures on legacy status values.
+            # ValueError is what UoWStatus raises on an invalid string.
+            # Other exception types propagate so the dashboard fails loudly.
+            _log.warning("_active_uows: skipping status %r — enum parsing failed", status_str)
             continue
 
         # Compute time-in-state as seconds since updated_at
@@ -445,8 +455,14 @@ def _stalled_uows(registry: Any, stall_threshold_minutes: int = 30) -> list[dict
     now = datetime.now(timezone.utc)
     result = []
 
-    for uow in registry.list():
-        if uow.status not in stall_statuses:
+    for status_str in stall_status_strs:
+        try:
+            uow_list = registry.list(status=status_str)
+        except ValueError:
+            # Guard against enum parsing failures on legacy status values.
+            # ValueError is what UoWStatus raises on an invalid string.
+            # Other exception types propagate so the dashboard fails loudly.
+            _log.warning("_stalled_uows: skipping status %r — enum parsing failed", status_str)
             continue
         try:
             updated = datetime.fromisoformat(uow.updated_at.replace("Z", "+00:00"))
@@ -573,6 +589,7 @@ def _fmt_duration(seconds: int) -> str:
     hours = seconds // 3600
     minutes = (seconds % 3600) // 60
     return f"{hours}h {minutes}m"
+
 
 
 def render_text(data: dict[str, Any]) -> str:
