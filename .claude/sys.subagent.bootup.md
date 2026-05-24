@@ -167,9 +167,9 @@ mcp__lobster-inbox__write_result(
 
 **What to put in `text`:** Include the artifact reference (PR URL, file path), a one-sentence description of what was done, and any context the reviewer agent needs to start its work. Do not summarize for a human reader — summarize for the next agent.
 
-**ET conversion — required for all user-visible timestamps:**
+**Timezone conversion — required for all user-visible timestamps:**
 
-Before including any timestamp in a `send_reply` call, convert it from UTC to Eastern Time. Rule: EDT (UTC-4) from mid-March through early November; EST (UTC-5) otherwise. Format as "5:29 AM ET" or "2:30 PM ET". Never send raw UTC ISO strings or "UTC" suffixes to users. This applies to all subagents that produce output containing times — calendar events, log summaries, job results, event timelines, and any other user-facing sentence with a time.
+Before including any timestamp in a `send_reply` call, convert it from UTC to the user's local timezone. Determine the timezone dynamically: check `LOBSTER_USER_TZ` in the environment first; if absent, read it from `~/lobster-user-config/agents/user.base.bootup.md` (look for a `LOBSTER_USER_TZ=` line or the timezone preference). Format times with the appropriate timezone abbreviation (e.g. "5:29 AM ET", "2:30 PM PT"). Never send raw UTC ISO strings or "UTC" suffixes to users. This applies to all subagents that produce output containing times — calendar events, log summaries, job results, event timelines, and any other user-facing sentence with a time.
 
 **Large results — use artifacts, not inline text:**
 
@@ -405,7 +405,7 @@ Lobster uses a tiered model strategy to balance cost and quality. Each subagent 
 **Agent model assignments:**
 
 - **Opus**: `functional-engineer`, `lobster-oracle`, `review` -- tasks requiring deep adversarial reasoning or thorough code review
-- **Sonnet**: `brain-dumps`, `compact-catchup`, `lobster-auditor`, `lobster-generalist`, `lobster-hygiene`, `lobster-meta`, `nightly-consolidation`, `session-note-polish` -- structured work, synthesis, planning
+- **Sonnet**: `brain-dumps`, `compact-catchup`, `lobster-auditor`, `lobster-generalist`, `lobster-hygiene`, `lobster-meta`, `nightly-consolidation`, `session-note-polish`, `wos-pr-coordinator` -- structured work, synthesis, planning
 - **Haiku**: `lobster-ops`, `session-note-appender` -- lightweight ops and incremental logging
 
 **When to override:** If a task normally handled by a Sonnet agent requires unusually deep reasoning (e.g., a complex multi-system execution plan), consider using `functional-engineer` (Opus) instead.

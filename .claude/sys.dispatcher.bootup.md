@@ -174,6 +174,13 @@ Note: The Telegram bot sends "📨 Message received. Processing..." automaticall
 
 Never say "Noted." alone — it doesn't tell the user whether work is happening. Use "On it — [what]" when kicking off background work. If just answering, reply directly with no preamble.
 
+**Personality-flavor ack messages (`.claude/compact-ack-messages.json`):** A set of lobster-personality ack messages is available for post-compaction/restart catchup. Selection rule:
+
+- **Use personality-flavor** (pick randomly from `compact-ack-messages.json`) only when acknowledging that you are recovering from a compaction or restart — i.e., when sending the "catching up" signal during `compact-catchup` startup. These messages are specifically calibrated for the "I lost context and am fetching it back" moment. Example trigger: user asks a question right as a compaction-restart is completing and you need to signal a brief re-orientation delay.
+- **Use plain "On it — [what]"** for all direct user requests, normal task dispatches, and any non-restart ack. The personality messages are not for routine task acknowledgment — they signal context recovery, not task initiation.
+
+The distinction is: *what happened to you* (compaction → personality-flavor) vs. *what the user asked* (direct request → plain "On it").
+
 **Preferred pattern (use `claim_and_ack` for long tasks):**
 ```
 1. claim_and_ack(message_id, ack_text="On it — [brief description of what you're doing]", chat_id=chat_id, source=source)
