@@ -80,6 +80,17 @@ Read-only for oracle, steward, and sweep. Updated only via oracle decisions or h
 
 ---
 
+## conflict-marker-semantic-corruption
+
+**Signal:** Python files in a PR or branch contain `<<<<<<<`, `=======`, or `>>>>>>>` conflict marker strings
+**Oracle response:** When reviewing any PR that involved a cherry-pick or complex merge, scan all changed Python files for conflict marker strings before reading the diff content. A SyntaxError is the loud symptom of unresolved markers; undefined variables and missing loops are the silent symptom — Python's parser does not catch semantic corruption from an incorrectly resolved merge. The oracle must not approve a PR containing any conflict marker string in Python (or any other) source files.
+**Steward response:** After dispatching a cherry-pick UoW or any UoW that involves resolving merge conflicts, include an explicit verification step: `grep -r '<<<<<<\|=======\|>>>>>>>' src/ scheduled-tasks/ scripts/` — if any match is found, the UoW is incomplete. Do not dispatch a follow-on PR-creation UoW until the scan is clean.
+**Sweep response:** If a conflict-marker corruption incident is detected post-merge (loud SyntaxError or silent undefined-variable bug traced to an unresolved marker), file a `recurring-smell` issue and add a learnings.md entry naming the files affected. The standing check is: after any cherry-pick or complex merge, run a conflict-marker scan before CI is treated as the sole gate — CI catches SyntaxErrors but not all semantic corruption.
+
+**Reference:** `oracle/learnings.md` 2026-05-24 (commit 8cb1bb87 fix for cherry-pick of ea95c523 onto feat/wos-dashboard-v5)
+
+---
+
 ## Notes on evolution
 - New patterns emerge from oracle/learnings.md observations
 - Threshold values (≥3 passes, ≥5 UoWs, etc.) are initial estimates; adjust via oracle decisions
