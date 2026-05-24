@@ -78,7 +78,12 @@ See: `canon/resistance-registers-lexicon.md` → Tier 1: Threshold (Phase-Transf
 ### Void state → post-Threshold liminal space
 Void follows when the Threshold register fires: the old configuration has ended, the new one hasn't formed. The three-step void decomposition (void-event → scaffold → seed) describes how a system navigates the Threshold register's aftermath.
 
-See: `canon/resistance-registers-lexicon.md` → Tier 1: Threshold (Phase-Transforming)
+Void's irreversibility is the metabolic expression of the Threshold register's hysteresis (resistance registers lexicon, Tier 2 → Hysteresis). The three-step void decomposition (void-event → scaffold → seed) describes the hysteresis arc: you cannot return to the pre-transformation configuration from within the same cycle. Restoration requires completing the generative cycle (scaffold → seed → juice) before a new Threshold-eligible state is reached. This is maximum Threshold hysteresis — the transformation was written permanently into the system (coupling the Threshold event to the Inscription register), so the return path cannot retrace the loading path.
+
+Not all Threshold events produce void. Low-hysteresis Threshold events (e.g., tone onset at bow hair rosin threshold) allow return to sub-threshold behavior by load reversal alone. Void marks the specific case where Threshold hysteresis is maximal.
+
+See: `canon/resistance-registers-lexicon.md` → Tier 1: Threshold (Phase-Transforming)  
+See: `canon/resistance-registers-lexicon.md` → Tier 2: Hysteresis
 
 ### Hormetic window characterization (open question, partially answered)
 The lexicon asks what characterizes the hormetic window. The metabolic taxonomy's transmutation fork is a structural answer: the hormetic window is the range where Threshold-register load produces transmutation rather than shit-produced. The fork determinant (holding structure integrity at moment of load) is the hormetic window boundary condition.

@@ -202,6 +202,20 @@ Parameters that measure specific properties within a register. Each parameter is
 
 ---
 
+### Hysteresis
+**Parent register:** Threshold  
+The lag between loading and unloading paths — quantified as the energy cost difference between transformation and restoration. Hysteresis measures the degree to which the Threshold register's return path diverges from its forward path. It is a variable property: some Threshold events have low hysteresis (the system returns to sub-threshold behavior by simply reducing load), others have high hysteresis (restoration requires an explicit reset — a different class of input), and some have maximum hysteresis (the pre-threshold configuration is not recoverable within the same cycle; restoration requires a new generative cycle).
+
+In cognitive and systems contexts: once the Threshold register fires with sufficient energy, the return path requires not load reversal but a new generative arc (void → scaffold → seed → juice). This is the metabolic expression of maximum Threshold hysteresis: the transformation was written permanently (coupling the Threshold event to the Inscription register), so restoration cannot retrace the loading path. The void state's irreversibility IS the Threshold register's maximum hysteresis expressed in metabolic terms.
+
+**Domain examples:**
+- *Materials:* Plastic deformation — metal bent past yield cannot spring back to its original shape; the forward path (load → yield) and return path (unload) enclose a finite hysteresis area. First-order phase transitions (ice→water vs. water→ice) occur at different temperatures depending on load direction.
+- *Biology:* Cell differentiation — a differentiated cell cannot dedifferentiate without complete molecular reprogramming (maximum hysteresis). Immune activation — adaptive response winds down as antigen load decreases, but memory cells persist (high but not maximum hysteresis).
+- *Software:* Database state migrations — a migrated schema cannot roll back without a new forward migration; rollback is not load reversal, it is a new transformation (maximum hysteresis). Circuit breakers — re-close only after an explicit reset, not after load reduction alone (high hysteresis by design).
+- *Cognition:* Paradigm shift — the pre-shift belief structure is not recoverable after a Threshold event that rewrites the framework; what emerges is a reorganized form that must be seeded anew (maximum hysteresis).
+
+---
+
 ## Tier 3: Cross-register Measurements
 
 Measurements that span multiple registers. These are properties of systems or interfaces rather than of individual register elements.
@@ -266,7 +280,10 @@ Principle: OODA register-mismatch severs the feedback loop — the correction si
 ### Void state → Threshold register depletion
 The Threshold register fires a phase transformation when load exceeds its characteristic threshold. The metabolic Void state is what follows: the old phase has collapsed (transformation fired), the new phase hasn't stabilized. Void is the phenomenological name for post-Threshold liminal space.
 
-See: `notes/metabolic-taxonomy.md` → Void state, three-step void decomposition
+The Threshold register's hysteresis is what makes void irreversible: once the Threshold fires with sufficient energy, the pre-threshold configuration cannot be recovered by load reversal alone — restoration requires a new generative cycle (scaffold → seed → juice). The three-step void decomposition describes the maximum-hysteresis return path. Low-hysteresis Threshold events (e.g., bow hair rosin threshold) do not produce void because the system can return to sub-threshold behavior by reducing load.
+
+See: `notes/metabolic-taxonomy.md` → Void state, three-step void decomposition  
+See: Tier 2 → Hysteresis (Threshold parameter)
 
 ---
 
