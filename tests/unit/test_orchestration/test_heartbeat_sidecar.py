@@ -66,6 +66,8 @@ from src.orchestration.heartbeat_sidecar import (
     write_heartbeats_for_active_uows,
     HeartbeatSidecarResult,
     SIDECAR_WRITES_PER_CYCLE,
+    _get_session_output_file,
+    _is_agent_output_stale,
 )
 
 # ---------------------------------------------------------------------------
@@ -487,3 +489,352 @@ class TestSidecarSkipsExpiredClaims:
         assert result.written == 1
         assert new_heartbeat is not None
         assert new_heartbeat > old_heartbeat, "heartbeat_at should be updated"
+
+
+# ---------------------------------------------------------------------------
+# Helper: write a minimal agent_sessions.db row for testing the liveness gate
+# ---------------------------------------------------------------------------
+
+def _write_agent_session(
+    sessions_db: Path,
+    *,
+    task_id: str,
+    output_file: str | None = None,
+    status: str = "running",
+) -> None:
+    """Write a minimal agent_sessions row to the test DB."""
+    import sqlite3 as _sqlite3
+    conn = _sqlite3.connect(str(sessions_db))
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_sessions (
+            id TEXT PRIMARY KEY,
+            task_id TEXT,
+            agent_type TEXT,
+            description TEXT,
+            chat_id TEXT,
+            source TEXT,
+            status TEXT,
+            spawned_at TEXT,
+            output_file TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO agent_sessions
+            (id, task_id, agent_type, description, chat_id, source, status, spawned_at, output_file)
+        VALUES (?, ?, 'functional-engineer', 'test session', '0', 'system', ?, datetime('now'), ?)
+        """,
+        (task_id, task_id, status, output_file),
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestLivenessGate:
+    """Sidecar skips heartbeat when the agent output file is stale (issue #1253).
+
+    Behavior verified:
+    - test_skips_heartbeat_when_output_file_is_stale:
+      UoW with a registered output file that hasn't been updated is skipped.
+    - test_writes_heartbeat_when_output_file_is_recent:
+      UoW whose output file was updated recently proceeds to write_heartbeat.
+    - test_writes_heartbeat_when_output_file_absent_from_db:
+      UoW with no output_file in sessions DB proceeds (fail-open).
+    - test_writes_heartbeat_when_output_file_not_on_disk:
+      UoW with a registered output_file path that doesn't exist on disk is
+      treated as "agent starting" — fail-open, proceed with heartbeat.
+    - test_writes_heartbeat_when_sessions_db_absent:
+      If sessions DB doesn't exist, fail-open and write heartbeat normally.
+    - test_dead_agent_skipped_count_is_accurate:
+      HeartbeatSidecarResult.dead_agent_skipped reflects the number skipped.
+    """
+
+    def test_skips_heartbeat_when_output_file_is_stale(
+        self, registry: Registry, db_path: Path, tmp_path: Path
+    ) -> None:
+        """A UoW whose agent output file has not been updated is skipped."""
+        sessions_db = tmp_path / "agent_sessions.db"
+        output_file = tmp_path / "wos-uow_test_stale.output"
+
+        # Create an output file with a very old mtime (30 minutes ago)
+        output_file.write_text("tool_use\n")
+        old_mtime = datetime.now(timezone.utc).timestamp() - 1800  # 30 minutes ago
+        import os as _os
+        _os.utime(str(output_file), (old_mtime, old_mtime))
+
+        # Insert a future claimed_until (24h) so the claim-expiry filter passes
+        future_claim = _iso_offset(86400)
+        uow_id = _insert_uow_with_status(
+            db_path,
+            status="executing",
+            heartbeat_at=_iso_offset(-120),
+            claimed_until=future_claim,
+        )
+
+        # Register the session with this output_file
+        _write_agent_session(
+            sessions_db,
+            task_id=f"wos-{uow_id}",
+            output_file=str(output_file),
+        )
+
+        # Use a short stale threshold (60s) — file is 1800s old, so stale
+        import os as _os
+        result = write_heartbeats_for_active_uows(
+            registry,
+            sessions_db_path=sessions_db,
+        )
+
+        # The UoW was checked but skipped at the liveness gate
+        assert result.checked == 1, "UoW with live claim should be a candidate"
+        assert result.written == 0, "Stale output file — heartbeat must NOT be written"
+        assert result.dead_agent_skipped == 1, "Should count as dead-agent skip"
+        assert result.errors == 0
+
+    def test_writes_heartbeat_when_output_file_is_recent(
+        self, registry: Registry, db_path: Path, tmp_path: Path
+    ) -> None:
+        """A UoW whose output file was just written proceeds normally."""
+        sessions_db = tmp_path / "agent_sessions.db"
+        output_file = tmp_path / "wos-uow_test_recent.output"
+
+        # Create a fresh output file (just now)
+        output_file.write_text("tool_use\n")
+
+        future_claim = _iso_offset(86400)
+        uow_id = _insert_uow_with_status(
+            db_path,
+            status="executing",
+            heartbeat_at=_iso_offset(-120),
+            claimed_until=future_claim,
+        )
+        _write_agent_session(
+            sessions_db,
+            task_id=f"wos-{uow_id}",
+            output_file=str(output_file),
+        )
+
+        result = write_heartbeats_for_active_uows(
+            registry,
+            sessions_db_path=sessions_db,
+        )
+
+        assert result.checked == 1
+        assert result.written == 1, "Recent output file — heartbeat must be written"
+        assert result.dead_agent_skipped == 0
+
+    def test_writes_heartbeat_when_output_file_absent_from_db(
+        self, registry: Registry, db_path: Path, tmp_path: Path
+    ) -> None:
+        """No output_file in sessions DB — fail-open and write heartbeat."""
+        sessions_db = tmp_path / "agent_sessions.db"
+
+        future_claim = _iso_offset(86400)
+        uow_id = _insert_uow_with_status(
+            db_path,
+            status="executing",
+            heartbeat_at=_iso_offset(-120),
+            claimed_until=future_claim,
+        )
+        # Register session with NO output_file
+        _write_agent_session(
+            sessions_db,
+            task_id=f"wos-{uow_id}",
+            output_file=None,
+        )
+
+        result = write_heartbeats_for_active_uows(
+            registry,
+            sessions_db_path=sessions_db,
+        )
+
+        assert result.written == 1, "No output_file — fail-open, heartbeat must be written"
+        assert result.dead_agent_skipped == 0
+
+    def test_writes_heartbeat_when_output_file_not_on_disk(
+        self, registry: Registry, db_path: Path, tmp_path: Path
+    ) -> None:
+        """output_file registered but file doesn't exist on disk — fail-open."""
+        sessions_db = tmp_path / "agent_sessions.db"
+        output_file = tmp_path / "does_not_exist.output"  # deliberately not created
+
+        future_claim = _iso_offset(86400)
+        uow_id = _insert_uow_with_status(
+            db_path,
+            status="executing",
+            heartbeat_at=_iso_offset(-120),
+            claimed_until=future_claim,
+        )
+        _write_agent_session(
+            sessions_db,
+            task_id=f"wos-{uow_id}",
+            output_file=str(output_file),
+        )
+
+        result = write_heartbeats_for_active_uows(
+            registry,
+            sessions_db_path=sessions_db,
+        )
+
+        assert result.written == 1, "File absent on disk — fail-open, heartbeat must be written"
+        assert result.dead_agent_skipped == 0
+
+    def test_writes_heartbeat_when_sessions_db_absent(
+        self, registry: Registry, db_path: Path, tmp_path: Path
+    ) -> None:
+        """sessions DB doesn't exist — fail-open and write heartbeat."""
+        missing_sessions_db = tmp_path / "nonexistent" / "agent_sessions.db"
+
+        future_claim = _iso_offset(86400)
+        _insert_uow_with_status(
+            db_path,
+            status="executing",
+            heartbeat_at=_iso_offset(-120),
+            claimed_until=future_claim,
+        )
+
+        result = write_heartbeats_for_active_uows(
+            registry,
+            sessions_db_path=missing_sessions_db,
+        )
+
+        assert result.written == 1, "Missing sessions DB — fail-open, heartbeat must be written"
+        assert result.dead_agent_skipped == 0
+        assert result.errors == 0
+
+    def test_dead_agent_skipped_count_is_accurate(
+        self, registry: Registry, db_path: Path, tmp_path: Path
+    ) -> None:
+        """dead_agent_skipped count reflects exactly how many were gated."""
+        sessions_db = tmp_path / "agent_sessions.db"
+
+        future_claim = _iso_offset(86400)
+
+        # UoW A: stale output file (dead agent)
+        stale_output = tmp_path / "stale.output"
+        stale_output.write_text("tool_use\n")
+        import os as _os
+        old_mtime = datetime.now(timezone.utc).timestamp() - 1800
+        _os.utime(str(stale_output), (old_mtime, old_mtime))
+
+        uow_a = _insert_uow_with_status(
+            db_path, status="executing",
+            heartbeat_at=_iso_offset(-120), claimed_until=future_claim,
+        )
+        _write_agent_session(sessions_db, task_id=f"wos-{uow_a}", output_file=str(stale_output))
+
+        # UoW B: recent output file (live agent)
+        fresh_output = tmp_path / "fresh.output"
+        fresh_output.write_text("tool_use\n")
+
+        uow_b = _insert_uow_with_status(
+            db_path, status="executing",
+            heartbeat_at=_iso_offset(-120), claimed_until=future_claim,
+        )
+        _write_agent_session(sessions_db, task_id=f"wos-{uow_b}", output_file=str(fresh_output))
+
+        result = write_heartbeats_for_active_uows(
+            registry,
+            sessions_db_path=sessions_db,
+        )
+
+        assert result.checked == 2
+        assert result.written == 1, "Only live UoW B should get a heartbeat"
+        assert result.dead_agent_skipped == 1, "Only dead UoW A should be skipped"
+        assert result.errors == 0
+
+
+class TestGetSessionOutputFile:
+    """Unit tests for _get_session_output_file."""
+
+    def test_returns_output_file_when_session_exists(self, tmp_path: Path) -> None:
+        """Returns output_file path when session is found by task_id."""
+        sessions_db = tmp_path / "agent_sessions.db"
+        _write_agent_session(
+            sessions_db,
+            task_id="wos-uow_abc123",
+            output_file="/tmp/agent.output",
+        )
+
+        result = _get_session_output_file("uow_abc123", sessions_db)
+        assert result == "/tmp/agent.output"
+
+    def test_returns_none_when_session_missing(self, tmp_path: Path) -> None:
+        """Returns None when no session row matches the task_id."""
+        sessions_db = tmp_path / "agent_sessions.db"
+        # Create empty DB
+        _write_agent_session(sessions_db, task_id="wos-other_uow", output_file="/x")
+
+        result = _get_session_output_file("uow_not_present", sessions_db)
+        assert result is None
+
+    def test_returns_none_when_db_absent(self, tmp_path: Path) -> None:
+        """Returns None when the sessions DB file doesn't exist."""
+        missing = tmp_path / "no_db" / "agent_sessions.db"
+        result = _get_session_output_file("uow_xyz", missing)
+        assert result is None
+
+    def test_returns_none_when_output_file_is_null(self, tmp_path: Path) -> None:
+        """Returns None when output_file column is NULL."""
+        sessions_db = tmp_path / "agent_sessions.db"
+        _write_agent_session(sessions_db, task_id="wos-uow_nullfile", output_file=None)
+
+        result = _get_session_output_file("uow_nullfile", sessions_db)
+        assert result is None
+
+
+class TestIsAgentOutputStale:
+    """Unit tests for _is_agent_output_stale."""
+
+    def test_returns_true_for_stale_file(self, tmp_path: Path) -> None:
+        """Returns True when file exists but mtime is older than threshold."""
+        sessions_db = tmp_path / "agent_sessions.db"
+        output_file = tmp_path / "stale.output"
+        output_file.write_text("tool_use\n")
+
+        import os as _os
+        old_mtime = datetime.now(timezone.utc).timestamp() - 700  # 700s > 600s threshold
+        _os.utime(str(output_file), (old_mtime, old_mtime))
+
+        _write_agent_session(sessions_db, task_id="wos-uow_stale", output_file=str(output_file))
+
+        now = datetime.now(timezone.utc)
+        result = _is_agent_output_stale("uow_stale", now, 600, sessions_db)
+        assert result is True
+
+    def test_returns_false_for_fresh_file(self, tmp_path: Path) -> None:
+        """Returns False when file exists and mtime is within threshold."""
+        sessions_db = tmp_path / "agent_sessions.db"
+        output_file = tmp_path / "fresh.output"
+        output_file.write_text("tool_use\n")
+        # mtime is NOW — well within any threshold
+
+        _write_agent_session(sessions_db, task_id="wos-uow_fresh", output_file=str(output_file))
+
+        now = datetime.now(timezone.utc)
+        result = _is_agent_output_stale("uow_fresh", now, 600, sessions_db)
+        assert result is False
+
+    def test_returns_false_when_file_missing(self, tmp_path: Path) -> None:
+        """Returns False when output_file path doesn't exist on disk (fail-open)."""
+        sessions_db = tmp_path / "agent_sessions.db"
+        _write_agent_session(
+            sessions_db,
+            task_id="wos-uow_nofile",
+            output_file=str(tmp_path / "nonexistent.output"),
+        )
+
+        now = datetime.now(timezone.utc)
+        result = _is_agent_output_stale("uow_nofile", now, 600, sessions_db)
+        assert result is False
+
+    def test_returns_false_when_no_session(self, tmp_path: Path) -> None:
+        """Returns False when no session record is found (fail-open)."""
+        sessions_db = tmp_path / "agent_sessions.db"
+        _write_agent_session(sessions_db, task_id="wos-other_uow", output_file="/x")
+
+        now = datetime.now(timezone.utc)
+        result = _is_agent_output_stale("uow_absent", now, 600, sessions_db)
+        assert result is False
