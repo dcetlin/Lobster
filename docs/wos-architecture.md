@@ -482,6 +482,7 @@ defaulting. The mechanism is in place; discipline is required to maintain it.
 /wos start                       set execution_enabled=true in wos-config.json
 /wos stop                        set execution_enabled=false in wos-config.json
 /wos unblock                     clear BOOTUP_CANDIDATE_GATE flag
+/wos dashboard                   generate fresh HTML dashboard → bisque URL
 diagnose <uow_id>                spawn diagnostic subagent via wos_diagnose
 ```
 

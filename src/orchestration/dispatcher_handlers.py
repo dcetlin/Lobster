@@ -13,6 +13,7 @@ The dispatcher calls these handlers when it recognizes:
   /wos unblock                         → handle_wos_unblock()
   /wos start                           → handle_wos_start()
   /wos stop                            → handle_wos_stop()
+  /wos dashboard (or "wos dashboard")  → handle_wos_dashboard()
   wos abort <uow-id>                   → handle_wos_abort(uow_id, registry)
   decide retry <uow-id>                → handle_decide_retry(uow_id, registry)
   decide close <uow-id>                → handle_decide_close(uow_id, registry)
@@ -614,6 +615,25 @@ def handle_wos_status(status: str | None, *, registry: "Registry") -> str:
         lines.append(f"`{r.id}` | {summary} | source: {source} | created: {created}")
 
     return "\n".join(lines)
+
+
+def handle_wos_dashboard() -> str:
+    """
+    Generate a fresh WOS HTML dashboard from live registry data and upload to Bisque.
+
+    Calls wos_dashboard_gen.generate_and_upload() which:
+      1. Queries the registry DB for all UoW data (status counts, audit trail, etc.)
+      2. Reads the token ledger for Claude Code usage stats
+      3. Renders a self-contained HTML file with embedded JSON
+      4. Writes it to ~/messages/bisque-uploads/ with a UUID filename
+      5. Returns the public Bisque URL
+
+    Returns a formatted reply string with the URL.
+    """
+    from src.orchestration.wos_dashboard_gen import generate_and_upload
+
+    url = generate_and_upload()
+    return f"WOS Dashboard ready: {url}"
 
 
 def handle_wos_execute(uow_id: str, instructions: str, output_ref: str) -> str:
@@ -1967,6 +1987,41 @@ def parse_wos_abort_command(text: str) -> str | None:
         if tokens:
             return tokens[0]
     return None
+
+
+def parse_wos_dashboard_command(text: str) -> bool:
+    """
+    Return True if the text matches the ``wos dashboard`` command.
+
+    Matches ``wos dashboard`` or ``/wos dashboard`` (case-insensitive, leading/trailing
+    whitespace ignored). Returns True if the command matches; False otherwise.
+
+    The dispatcher calls this to detect the "wos dashboard" text command before
+    routing to handle_wos_dashboard().
+
+    Args:
+        text: The raw Telegram message text.
+
+    Returns:
+        True if the text is the ``wos dashboard`` command; False otherwise.
+
+    Examples::
+
+        parse_wos_dashboard_command("wos dashboard")
+        # → True
+
+        parse_wos_dashboard_command("/wos dashboard")
+        # → True
+
+        parse_wos_dashboard_command("WOS DASHBOARD")
+        # → True
+
+        parse_wos_dashboard_command("wos status")
+        # → False
+    """
+    stripped = text.strip()
+    lower = stripped.lower()
+    return lower in ("wos dashboard", "/wos dashboard")
 
 
 def _load_instructions_from_artifact(uow_id: str) -> str:
