@@ -64,6 +64,12 @@ class UoWStatus(StrEnum):
     # Treated as terminal (allows re-proposal). Previously a legacy DB-only value
     # not covered by the enum — UoWStatus('cancelled') raised ValueError.
     CANCELLED = "cancelled"
+    # CLOSED: legacy terminal status that predates the UoWStatus enum.
+    # Semantically equivalent to 'done' — the UoW reached a terminal state.
+    # Was set externally on rows before enum enforcement was introduced (768 such
+    # rows exist in production). Previously not in the enum, causing ValueError
+    # in any code path that called _row_to_uow() on a 'closed' row (issue #1279).
+    CLOSED = "closed"
     # NEEDS_HUMAN_REVIEW: UoW has exceeded MAX_RETRIES re-dispatch attempts.
     # Steward escalates to Dan rather than continuing to re-dispatch.
     # Treated as non-terminal (does not allow automatic re-proposal).
@@ -76,17 +82,14 @@ class UoWStatus(StrEnum):
     AWAITING_OWNER = "awaiting-owner"
 
     def is_terminal(self) -> bool:
-        """True for statuses that allow re-proposal (done, failed, expired, cancelled).
-
-        Note: 'closed' is NOT included here. 'closed' is a legacy DB status that
-        predates the UoWStatus enum — it was set externally on rows that existed
-        before enum enforcement was introduced. Semantically it means "done", but
-        it cannot be expressed as a UoWStatus value (UoWStatus('closed') raises
-        ValueError). SQL queries that need to exclude terminal rows therefore handle
-        'closed' separately via _TERMINAL_STATUSES_FOR_ISSUE_CHECK; this method
-        covers only the enum-representable statuses.
-        """
-        return self in {UoWStatus.DONE, UoWStatus.FAILED, UoWStatus.EXPIRED, UoWStatus.CANCELLED}
+        """True for statuses that allow re-proposal (done, failed, expired, cancelled, closed)."""
+        return self in {
+            UoWStatus.DONE,
+            UoWStatus.FAILED,
+            UoWStatus.EXPIRED,
+            UoWStatus.CANCELLED,
+            UoWStatus.CLOSED,
+        }
 
     def is_in_flight(self) -> bool:
         """True for statuses that block re-proposal (active, executing, pending, ready-for-steward, ready-for-executor, diagnosing, awaiting-owner)."""
@@ -1172,7 +1175,9 @@ class Registry:
         return self.list(status=status)
 
     # Terminal statuses for has_active_uow_for_issue — mirrors the exclusion list
-    # in _upsert_typed. 'closed' is a legacy DB status treated as terminal here.
+    # Terminal statuses used for issue-check queries. Kept as raw strings
+    # so SQL IN clauses work without enum serialization overhead.
+    # Must stay in sync with UoWStatus.is_terminal().
     _TERMINAL_STATUSES_FOR_ISSUE_CHECK = frozenset({
         "done", "failed", "expired", "cancelled", "closed",
     })

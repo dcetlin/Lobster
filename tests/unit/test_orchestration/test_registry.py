@@ -1608,3 +1608,116 @@ class TestResetExpiredClaims:
         assert row["status"] == "executing", (
             f"Expected status='executing' (unchanged), got {row['status']!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for 'closed' legacy status (Issue #1279)
+# ---------------------------------------------------------------------------
+
+class TestClosedStatus:
+    """
+    'closed' is a legacy DB status that predates the UoWStatus enum.
+    It is semantically equivalent to 'done' — a terminal state.
+    Before the fix, any code path that called _row_to_uow() on a 'closed'
+    row raised ValueError because 'closed' was not in the enum.
+    """
+
+    def _insert_closed_row(self, db_path: Path, issue_number: int = 9999) -> str:
+        """Insert a row with status='closed' directly via SQL, bypassing enum validation."""
+        import uuid
+        uow_id = str(uuid.uuid4())
+        conn = _open_db(db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO uow_registry
+                    (id, status, summary, source, created_at, updated_at,
+                     type, posture, register, steward_cycles, lifetime_cycles,
+                     heartbeat_ttl, retry_count, execution_attempts, orphan_retry_count,
+                     source_issue_number)
+                VALUES
+                    (?, 'closed', 'Legacy closed UoW', 'test', datetime('now'), datetime('now'),
+                     'executable', 'solo', 'operational', 0, 0,
+                     300, 0, 0, 0,
+                     ?)
+                """,
+                (uow_id, issue_number),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return uow_id
+
+    def test_closed_is_valid_uow_status(self):
+        """UoWStatus('closed') must not raise ValueError."""
+        from src.orchestration.registry import UoWStatus
+        status = UoWStatus("closed")
+        assert status == UoWStatus.CLOSED
+
+    def test_closed_is_terminal(self):
+        """UoWStatus.CLOSED.is_terminal() must return True."""
+        from src.orchestration.registry import UoWStatus
+        assert UoWStatus.CLOSED.is_terminal() is True
+
+    def test_closed_is_not_in_flight(self):
+        """UoWStatus.CLOSED.is_in_flight() must return False."""
+        from src.orchestration.registry import UoWStatus
+        assert UoWStatus.CLOSED.is_in_flight() is False
+
+    def test_registry_list_does_not_raise_on_closed_row(self, registry, db_path):
+        """
+        Registry.list() must not raise ValueError when the DB contains a
+        row with status='closed'. This was the root cause of issue #1279.
+        """
+        self._insert_closed_row(db_path)
+        # Must not raise ValueError
+        results = registry.list()
+        closed_uows = [u for u in results if u.status == "closed"]
+        assert len(closed_uows) == 1
+
+    def test_registry_list_filtered_by_closed_returns_closed_uow(self, registry, db_path):
+        """
+        Registry.list(status='closed') must return only the closed UoW.
+        """
+        uow_id = self._insert_closed_row(db_path)
+        results = registry.list(status="closed")
+        assert len(results) == 1
+        assert results[0].id == uow_id
+        from src.orchestration.registry import UoWStatus
+        assert results[0].status == UoWStatus.CLOSED
+
+    def test_registry_get_does_not_raise_on_closed_row(self, registry, db_path):
+        """
+        Registry.get(uow_id) must not raise ValueError for a 'closed' row.
+        """
+        uow_id = self._insert_closed_row(db_path)
+        uow = registry.get(uow_id)
+        assert uow is not None
+        from src.orchestration.registry import UoWStatus
+        assert uow.status == UoWStatus.CLOSED
+
+    def test_closed_in_terminal_statuses_for_issue_check(self):
+        """
+        _TERMINAL_STATUSES_FOR_ISSUE_CHECK must contain 'closed' so that
+        stale-issue detection correctly skips closed UoWs.
+        """
+        from src.orchestration.registry import Registry
+        assert "closed" in Registry._TERMINAL_STATUSES_FOR_ISSUE_CHECK
+
+    def test_upsert_allows_reproprose_after_closed(self, registry, db_path):
+        """
+        A UoW in 'closed' status is terminal and must allow re-proposal
+        for the same issue. upsert() must return UpsertInserted (not UpsertSkipped)
+        when the existing row for the same issue is 'closed'.
+        """
+        from src.orchestration.registry import UpsertInserted
+        self._insert_closed_row(db_path, issue_number=8888)
+
+        result = registry.upsert(
+            issue_number=8888,
+            title="Re-proposal after closed",
+            success_criteria="The re-proposal was accepted.",
+        )
+        assert isinstance(result, UpsertInserted), (
+            f"Expected UpsertInserted (re-proposal after closed), got {type(result).__name__}: {result!r}"
+        )
