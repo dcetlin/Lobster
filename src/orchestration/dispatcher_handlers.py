@@ -12,6 +12,7 @@ The dispatcher calls these handlers when it recognizes:
   /wos unblock                         → handle_wos_unblock()
   /wos start                           → handle_wos_start()
   /wos stop                            → handle_wos_stop()
+  /wos dashboard (or "wos dashboard")  → handle_wos_dashboard()
   wos abort <uow-id>                   → handle_wos_abort(uow_id, registry)
   decide retry <uow-id>                → handle_decide_retry(uow_id, registry)
   decide close <uow-id>                → handle_decide_close(uow_id, registry)
@@ -1601,6 +1602,41 @@ def parse_wos_abort_command(text: str) -> str | None:
         if tokens:
             return tokens[0]
     return None
+
+
+def parse_wos_dashboard_command(text: str) -> bool:
+    """
+    Return True if the text matches the ``wos dashboard`` command.
+
+    Matches ``wos dashboard`` or ``/wos dashboard`` (case-insensitive, leading/trailing
+    whitespace ignored). Returns True if the command matches; False otherwise.
+
+    The dispatcher calls this to detect the "wos dashboard" text command before
+    routing to handle_wos_dashboard().
+
+    Args:
+        text: The raw Telegram message text.
+
+    Returns:
+        True if the text is the ``wos dashboard`` command; False otherwise.
+
+    Examples::
+
+        parse_wos_dashboard_command("wos dashboard")
+        # → True
+
+        parse_wos_dashboard_command("/wos dashboard")
+        # → True
+
+        parse_wos_dashboard_command("WOS DASHBOARD")
+        # → True
+
+        parse_wos_dashboard_command("wos status")
+        # → False
+    """
+    stripped = text.strip()
+    lower = stripped.lower()
+    return lower in ("wos dashboard", "/wos dashboard")
 
 
 def _load_instructions_from_artifact(uow_id: str) -> str:

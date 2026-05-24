@@ -32,6 +32,15 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
+# Sonnet 4.6 pricing constants (USD per million tokens)
+# ---------------------------------------------------------------------------
+
+SONNET_4_6_INPUT_PER_MTK: float = 3.0
+SONNET_4_6_OUTPUT_PER_MTK: float = 15.0
+SONNET_4_6_CACHE_READ_PER_MTK: float = 0.30
+
+
+# ---------------------------------------------------------------------------
 # Path resolution — all through canonical sources, no inline derivation
 # ---------------------------------------------------------------------------
 
@@ -349,8 +358,11 @@ def _build_cc_data(ledger_path: Path) -> dict[str, Any]:
     total_output = sum(e.get("output", 0) for e in all_entries)
     total_cache_read = sum(e.get("cache_read", 0) for e in all_entries)
     total_input = sum(e.get("input", 0) for e in all_entries)
-    # Sonnet 4.6 pricing: $3/1M input, $15/1M output, $0.30/1M cache_read
-    est_cost = (total_input * 3 + total_output * 15) / 1_000_000 + total_cache_read * 0.30 / 1_000_000
+    # Sonnet 4.6 pricing — use named constants to stay in sync with any future rate changes
+    est_cost = (
+        total_input * SONNET_4_6_INPUT_PER_MTK
+        + total_output * SONNET_4_6_OUTPUT_PER_MTK
+    ) / 1_000_000 + total_cache_read * SONNET_4_6_CACHE_READ_PER_MTK / 1_000_000
 
     # Daily chart — last 7 days
     recent_entries = [e for e in all_entries if e.get("ts", 0) >= cutoff_ts]
@@ -392,8 +404,9 @@ def _build_cc_data(ledger_path: Path) -> dict[str, Any]:
             uow_tokens[uid]["cache_write"] += e.get("cache_write", 0)
             uow_tokens[uid]["calls"] += 1
             uow_tokens[uid]["est_cost"] += (
-                e.get("input", 0) * 3 + e.get("output", 0) * 15
-            ) / 1_000_000 + e.get("cache_read", 0) * 0.30 / 1_000_000
+                e.get("input", 0) * SONNET_4_6_INPUT_PER_MTK
+                + e.get("output", 0) * SONNET_4_6_OUTPUT_PER_MTK
+            ) / 1_000_000 + e.get("cache_read", 0) * SONNET_4_6_CACHE_READ_PER_MTK / 1_000_000
 
     # Top 20 UoWs by output tokens
     top20 = sorted(uow_tokens.items(), key=lambda x: -x[1]["output"])[:20]
@@ -442,7 +455,7 @@ def _enrich_uow_tokens(d_data: dict, cc_data: dict) -> None:
             out = tok.get("output", 0) or 0
             inp = tok.get("input", 0) or 0
             cr = tok.get("cache_read", 0) or 0
-            uow["ec"] = f"${round((inp * 3 + out * 15) / 1_000_000 + cr * 0.30 / 1_000_000, 4)}"
+            uow["ec"] = f"${round((inp * SONNET_4_6_INPUT_PER_MTK + out * SONNET_4_6_OUTPUT_PER_MTK) / 1_000_000 + cr * SONNET_4_6_CACHE_READ_PER_MTK / 1_000_000, 4)}"
 
 
 def _build_data(
