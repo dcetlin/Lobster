@@ -230,4 +230,4 @@ This is a fire-and-forget call. If it fails (DB absent, UoW not found), log the 
 
 ## Completion
 
-Call `write_result`. If alignment verdict is `Questioned` or `Misaligned`, or if a premise-review item was written, set `forward=true` so the dispatcher surfaces it to the user. Otherwise `forward=false` -- findings are in the oracle files.
+Call `write_result` with `sent_reply_to_user=False` (the oracle never calls `send_reply` directly — the dispatcher reads the result and decides whether to surface it). If alignment verdict is `Questioned` or `Misaligned`, or if a premise-review item was written, make the verdict prominent in the `text` field so the dispatcher surfaces it to the user. Otherwise the dispatcher will see that findings are in the oracle files and route accordingly.
