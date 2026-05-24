@@ -208,11 +208,46 @@ The lag between loading and unloading paths — quantified as the energy cost di
 
 In cognitive and systems contexts: once the Threshold register fires with sufficient energy, the return path requires not load reversal but a new generative arc (void → scaffold → seed → juice). This is the metabolic expression of maximum Threshold hysteresis: the transformation was written permanently (coupling the Threshold event to the Inscription register), so restoration cannot retrace the loading path. The void state's irreversibility IS the Threshold register's maximum hysteresis expressed in metabolic terms.
 
+**Inscription coupling boundary:** A Threshold event writes into the Inscription register (activating maximum hysteresis) when the event's transformation energy exceeds the system's Resilience ceiling. Below that ceiling, the transformation remains elastically reversible; above it, the excess must be permanently absorbed. The boundary condition is therefore: Inscription threshold = current Resilience ceiling. See Tier 3: Inscription Threshold.
+
 **Domain examples:**
 - *Materials:* Plastic deformation — metal bent past yield cannot spring back to its original shape; the forward path (load → yield) and return path (unload) enclose a finite hysteresis area. First-order phase transitions (ice→water vs. water→ice) occur at different temperatures depending on load direction.
 - *Biology:* Cell differentiation — a differentiated cell cannot dedifferentiate without complete molecular reprogramming (maximum hysteresis). Immune activation — adaptive response winds down as antigen load decreases, but memory cells persist (high but not maximum hysteresis).
 - *Software:* Database state migrations — a migrated schema cannot roll back without a new forward migration; rollback is not load reversal, it is a new transformation (maximum hysteresis). Circuit breakers — re-close only after an explicit reset, not after load reduction alone (high hysteresis by design).
 - *Cognition:* Paradigm shift — the pre-shift belief structure is not recoverable after a Threshold event that rewrites the framework; what emerges is a reorganized form that must be seeded anew (maximum hysteresis).
+
+---
+
+### Phase Continuity
+**Parent register:** Threshold (sub-parameter of Hysteresis)  
+**Definition:** Whether the state change at threshold is continuous (gradual, order-parameter-connected) or discontinuous (discrete jump). Continuous transitions (second-order analog) produce low or zero hysteresis; discontinuous transitions (first-order analog) produce high or maximum hysteresis. Phase Continuity is the primary determinant of whether a Threshold event has appreciable hysteresis at all.
+
+**Domain examples:**
+- *Materials:* Curie point (second-order — continuous) has near-zero hysteresis; ice→water phase transition (first-order — discontinuous) has measurable hysteresis.
+- *Cognition:* Gradual attitudinal shift under sustained evidence (continuous) is more reversible than a sudden belief revision triggered by a single high-impact event (discontinuous).
+- *Software:* A configuration flag flip (discontinuous, discrete) has high hysteresis by design; a gradual parameter drift can be reversed proportionally (low hysteresis).
+
+---
+
+### Configuration Retention
+**Parent register:** Threshold (sub-parameter of Hysteresis)  
+**Definition:** Whether the old configuration's structural information survives the threshold transition. When the old configuration is retained (even if temporarily inaccessible in the new state), restoration is possible via a reset input. When the old configuration is overwritten — coupled to the Inscription register — restoration requires seeding a new configuration rather than recovering the old one. Configuration Retention determines whether hysteresis is bounded (high) or maximal (maximum/irreversible).
+
+**Domain examples:**
+- *Materials:* A circuit breaker retains its pre-trip circuit configuration — the reset restores it. A metal bent past yield does not retain the original crystalline geometry in a recoverable form.
+- *Biology:* Learned motor patterns can be temporarily suppressed (configuration retained, accessible via retraining) but acute spinal injury to motor pathways may destroy the configuration (maximum hysteresis).
+- *Cognition:* A suppressed but accessible memory retains its configuration; a belief structure overwritten by a paradigm-shifting event loses its old configuration to Inscription.
+
+---
+
+### New-State Self-Coherence
+**Parent register:** Threshold (sub-parameter of Hysteresis)  
+**Definition:** Whether the new post-threshold state is internally self-sustaining without ongoing load. A state that collapses back to baseline when load is removed has zero hysteresis regardless of the transition character — the Threshold fires, but the new phase has no internal coherence and cannot maintain itself. New-State Self-Coherence is a gate parameter: a Threshold event with low self-coherence in the new state produces zero effective hysteresis, regardless of the transition's discontinuity or configuration-retention character.
+
+**Domain examples:**
+- *Materials:* Helmholtz stick-slip oscillation (bow hair) has low self-coherence — oscillation ceases when contact pressure drops below threshold. A crystalline phase transition produces a state with high self-coherence — the new lattice is internally stable.
+- *Biology:* A stress response that subsides immediately when stressor is removed has low self-coherence. Immune memory (activated B and T cells) has high self-coherence — it persists as a new stable state.
+- *Software:* A circuit breaker's tripped state has high self-coherence (does not spontaneously reclose). A timeout that expires when the load drops to zero has low self-coherence.
 
 ---
 
@@ -265,6 +300,20 @@ Measurements that span multiple registers. These are properties of systems or in
 
 ---
 
+### Inscription Threshold
+**Registers spanned:** Threshold + Storage + Inscription  
+**Definition:** The Threshold event energy at which Inscription coupling activates — the boundary between reversible transformation (high hysteresis) and permanent write (maximum hysteresis). Formally: Inscription threshold = current Resilience ceiling. When a Threshold event fires with energy below the Inscription threshold, the transformation is elastically recoverable (the new state can be reversed via reset or load reduction). When the event energy exceeds the Inscription threshold, the transformation energy cannot be contained within the system's elastic capacity; the excess writes permanently into Inscription, and the old configuration's structural information is overwritten.
+
+This boundary is dynamic: the Inscription threshold shifts with the system's current Resilience ceiling, which changes with fatigue, depletion, or growth. The same triggering event may produce high hysteresis (reversible) in a well-resourced system and maximum hysteresis (irreversible) in a depleted one.
+
+**Domain examples:**
+- *Materials:* The yield point is the material's Inscription threshold — below it, deformation is elastic; above it, permanent plastic deformation begins.
+- *Biology:* Psychological Resilience ceiling — a stressor that produces adaptive response in a rested person can produce trauma-level Inscription in an exhausted person, not because the stressor changed but because the Resilience ceiling dropped.
+- *Software:* A system under normal load handles schema migrations with low hysteresis; under peak load, the same migration may cause cascading state corruption (Inscription coupling at reduced Resilience).
+- *Cognition:* The ZPD ceiling is a cognitive Inscription threshold — learning events within the ZPD are generatively absorbed; events beyond it overwhelm elastic capacity and either produce Inscription (schema fracture/reconstruction) or are simply rejected.
+
+---
+
 ## Council Cross-references
 
 ### Hormetic window → Metabolic transmutation fork
@@ -285,6 +334,22 @@ The Threshold register's hysteresis is what makes void irreversible: once the Th
 See: `notes/metabolic-taxonomy.md` → Void state, three-step void decomposition  
 See: Tier 2 → Hysteresis (Threshold parameter)
 
+### Hormetic window → Threshold × Storage × Generation
+
+The hormetic window is the load range where stress is net-generative — where challenge produces adaptive strengthening rather than neutral transmission or destructive damage. In load-path terms, the hormetic window is bounded by two register thresholds:
+
+- *Lower bound (Threshold Strength):* The Threshold register must fire. Sub-threshold load produces only Storage/Transmission response with no phase transformation and no adaptive reorganization.
+- *Upper bound (Inscription threshold = Resilience ceiling):* The Threshold event's energy must stay within the system's Resilience ceiling. Above this bound, Inscription coupling activates, the old configuration is overwritten, and restoration requires a new generative cycle (void decomposition) rather than adaptive recovery.
+
+Within this window, Threshold fires AND the transformation energy is absorbed via the Generation register rather than written into Inscription. The system reorganizes adaptively — the new configuration is not the old configuration (not zero hysteresis) but is reachable without a full generative cycle. The net result is growth: the system exits the event with greater capacity than it entered.
+
+The hormetic window is thus: `[Threshold Strength, Inscription threshold)`. Width of the window is determined by `Inscription threshold − Strength` — the gap between the activation load and the Resilience ceiling. Systems with high Resilience and low Threshold Strength have wide hormetic windows; systems with low Resilience or very high Threshold Strength have narrow ones.
+
+This provides a partial answer to Q5.3 (see Structural Notes below). The open remainder: what determines whether the Generation register successfully routes the transformation energy, and how the window width varies with system state.
+
+See: Tier 2 → Hysteresis; Tier 3 → Inscription Threshold, Strength, Resilience  
+See: `notes/metabolic-taxonomy.md` → Transmutation state
+
 ---
 
 ## Structural Notes
@@ -304,6 +369,6 @@ The mismatch detection logic (see §4.7 of generative-resistance.html for the fu
 **Source document open questions** (not resolved by this extraction — see §5 of generative-resistance.html):
 - Q5.1: Operational test for path-coupling in cognitively complex systems
 - Q5.2: Multi-output load path design (element must serve different registers simultaneously)
-- Q5.3: Universal characterization of the antifragility (hormetic) window in load-path terms
+- Q5.3: Universal characterization of the antifragility (hormetic) window in load-path terms. *Partial answer (2026-05-24):* The hormetic window is the load range `[Threshold Strength, Inscription threshold)` — bounded below by the Threshold activation load (Strength) and above by the Inscription threshold (= current Resilience ceiling). Within this window, Threshold fires and transformation energy is routed through the Generation register rather than written into Inscription. Net result: adaptive growth. Open remainder: what determines whether Generation routing succeeds, and how window width varies with system state. See Council Cross-references → Hormetic window.
 - Q5.4: Whether path-external resistance always produces proprioceptive masking, or only in certain domains
 - Q5.5: Aesthetic correlate of load-path coupling — whether felt coherence tracks structural coupling mechanistically
