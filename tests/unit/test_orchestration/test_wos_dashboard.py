@@ -70,10 +70,22 @@ def _make_uow(
 
 
 def _make_registry(uows: list[MagicMock] | None = None) -> MagicMock:
-    """Create a mock Registry whose .list() returns the given UoWs."""
+    """Create a mock Registry whose .list() returns only UoWs matching the status filter.
+
+    When called as registry.list(status=<str>), returns only those UoWs whose
+    .status attribute equals the requested status string.  When called without a
+    status argument, returns all UoWs (matches real Registry behaviour).
+    """
     registry = MagicMock()
     uows_list = uows or []
-    registry.list.return_value = uows_list
+
+    def _list(status: str | None = None):
+        if status is None:
+            return list(uows_list)
+        return [u for u in uows_list if str(u.status) == status]
+
+    registry.list.side_effect = _list
+
     # registry.get(id) maps by id
     def _get(uow_id: str):
         for u in uows_list:
