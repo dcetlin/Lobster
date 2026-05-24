@@ -63,7 +63,7 @@ The format for a HYPOTHESIS entry is:
               ┌─────────────┼─────────────┐
               │               │               │
          Telegram Bot    Slack Bot      (Future: Signal, SMS)
-         (active)        (optional)     (see docs/FUTURE.md)
+         (active)        (optional)     (see docs/setup/FUTURE.md)
 ```
 
 ## Available Tools (MCP)

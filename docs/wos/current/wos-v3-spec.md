@@ -4,6 +4,10 @@
 > This is the single source of truth for WOS v3 architecture and implementation.
 > wos-v3-proposal.md and wos-v3-steward-executor-spec.md are archived at docs/wos/archived/.
 
+> **Production vs. Spec:** This document describes the full V3 architecture as designed. Not all sections reflect current production behavior.
+> **Currently in production (as of 2026-05):** UoW lifecycle (proposed → pending → executing → done/failed), Steward diagnosis and prescription (`run_steward_cycle`, `_process_uow`), Executor dispatch (`functional-engineer` type), corrective trace one-cycle gate (`trace_gate_waited` / `trace_gate_contract_violation`, PR #607), LLM-only prescription path, and basic stuck-condition detection (`hard_cap`, `crash_repeated`).
+> **Planned / not yet in production:** Register-aware diagnosis (`_register_completion_policy`, `_assess_completion` policy branch), register-mismatch gate (`_check_register_executor_compatibility`), frontier-writer executor type and dispatch, expanded Dan interrupt conditions (`philosophical_register`, `no_gate_improvement` stuck conditions), corrective trace injection in the prescribe branch (beyond the one-cycle gate), and Observation Loop drift detection.
+
 ---
 
 ## 1. Vision and Design Premises
