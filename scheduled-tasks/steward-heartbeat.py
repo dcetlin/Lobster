@@ -55,6 +55,10 @@ _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+_SRC_ROOT = _REPO_ROOT / "src"
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+
 from orchestration.paths import REGISTRY_DB
 from orchestration.steward import is_bootup_candidate_gate_active, run_steward_cycle
 from orchestration.github_sync import run_post_completion_sync
