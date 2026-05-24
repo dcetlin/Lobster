@@ -155,7 +155,7 @@ The tradeoff is inbox coupling. The steward's heartbeat observation loop is the 
 
 ## Related Documentation
 
-- `docs/executor-contract.md` — Executor protocol and result.json contract
+- `docs/wos/current/executor-contract.md` — Executor protocol and result.json contract
 - `docs/wos-v2-design.md` — WOS architecture overview
 - `docs/wos-sprint3-part2-design.md` — S3P2-E issue specification
 - PR #584 — Original inbox dispatch refactor
