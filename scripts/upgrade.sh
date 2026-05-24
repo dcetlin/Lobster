@@ -4454,6 +4454,110 @@ PYEOF
             substep "Migration 125: TELEGRAM_ADMIN_CHAT_ID already set — skipping"
         fi
     fi
+    # Migration 126: Register los-action-scanner in jobs.json.
+    # The script and task file existed since issue #1285 but the job was never
+    # added to jobs.json, so it never ran automatically. This migration adds
+    # the entry so the hourly Telegram message scanner is activated.
+    local _JOBS_FILE="$WORKSPACE_DIR/scheduled-jobs/jobs.json"
+    if [ -f "$_JOBS_FILE" ]; then
+        if ! uv run python3 -c "import json,sys; d=json.load(open('$_JOBS_FILE')); sys.exit(0 if 'los-action-scanner' in d.get('jobs',{}) else 1)" 2>/dev/null; then
+            substep "Migration 126: adding los-action-scanner to jobs.json"
+            local _m126_tmp
+            _m126_tmp=$(mktemp)
+            uv run python3 - <<'PY126' "$_JOBS_FILE" "$_m126_tmp"
+import json, sys
+from datetime import datetime, timezone
+jobs_path, tmp_path = sys.argv[1], sys.argv[2]
+with open(jobs_path) as f:
+    data = json.load(f)
+data.setdefault("jobs", {})["los-action-scanner"] = {
+    "name": "los-action-scanner",
+    "schedule": "0 * * * *",
+    "schedule_human": "Hourly",
+    "task_file": "tasks/los-action-scanner.md",
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+    "enabled": True,
+    "last_run": None,
+    "last_status": None,
+    "description": "Hourly: scan Telegram conversation history for action commitments and persist to self_action_items.db",
+}
+with open(tmp_path, "w") as f:
+    json.dump(data, f, indent=2, default=str)
+print("OK")
+PY126
+            if [ -s "$_m126_tmp" ]; then
+                mv "$_m126_tmp" "$_JOBS_FILE"
+                substep "Migration 126: los-action-scanner added to jobs.json"
+                migrated=$((migrated + 1))
+            else
+                rm -f "$_m126_tmp"
+                warn "Migration 126: failed to update jobs.json — add los-action-scanner manually"
+            fi
+        else
+            substep "Migration 126: los-action-scanner already in jobs.json — skipping"
+        fi
+    else
+        warn "Migration 126: jobs.json not found at $_JOBS_FILE — los-action-scanner not registered"
+    fi
+
+    # Migration 127: Register vault-journal-scanner in jobs.json and add cron entry.
+    # New Type B script that scans Obsidian vault journal files for unchecked
+    # checkbox items (- [ ] ...) and persists them to self_action_items.db hourly.
+    # This closes the core gap in the journal → TODO pipeline (issue #1285).
+    local VAULT_JOURNAL_SCANNER_MARKER="# LOBSTER-VAULT-JOURNAL-SCANNER"
+    if [ -f "$_JOBS_FILE" ]; then
+        if ! uv run python3 -c "import json,sys; d=json.load(open('$_JOBS_FILE')); sys.exit(0 if 'vault-journal-scanner' in d.get('jobs',{}) else 1)" 2>/dev/null; then
+            substep "Migration 127: adding vault-journal-scanner to jobs.json"
+            local _m127_tmp
+            _m127_tmp=$(mktemp)
+            uv run python3 - <<'PY127' "$_JOBS_FILE" "$_m127_tmp"
+import json, sys
+from datetime import datetime, timezone
+jobs_path, tmp_path = sys.argv[1], sys.argv[2]
+with open(jobs_path) as f:
+    data = json.load(f)
+data.setdefault("jobs", {})["vault-journal-scanner"] = {
+    "name": "vault-journal-scanner",
+    "type": "B",
+    "dispatch": "cron-direct",
+    "schedule": "0 * * * *",
+    "schedule_human": "Hourly",
+    "task_file": None,
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+    "enabled": True,
+    "last_run": None,
+    "last_status": None,
+    "description": "Hourly: scan new Obsidian vault journal files for unchecked - [ ] items; persist to self_action_items.db",
+}
+with open(tmp_path, "w") as f:
+    json.dump(data, f, indent=2, default=str)
+print("OK")
+PY127
+            if [ -s "$_m127_tmp" ]; then
+                mv "$_m127_tmp" "$_JOBS_FILE"
+                substep "Migration 127: vault-journal-scanner added to jobs.json"
+                migrated=$((migrated + 1))
+            else
+                rm -f "$_m127_tmp"
+                warn "Migration 127: failed to update jobs.json — add vault-journal-scanner manually"
+            fi
+        else
+            substep "Migration 127: vault-journal-scanner already in jobs.json — skipping"
+        fi
+    fi
+
+    if ! crontab -l 2>/dev/null | grep -qF "$VAULT_JOURNAL_SCANNER_MARKER"; then
+        local VAULT_JOURNAL_SCANNER_ENTRY="0 * * * * cd $LOBSTER_DIR && uv run scheduled-tasks/vault-journal-scanner.py >> $WORKSPACE_DIR/scheduled-jobs/logs/vault-journal-scanner.log 2>&1 $VAULT_JOURNAL_SCANNER_MARKER"
+        (crontab -l 2>/dev/null; echo "$VAULT_JOURNAL_SCANNER_ENTRY") | crontab - && {
+            substep "Migration 127: added LOBSTER-VAULT-JOURNAL-SCANNER cron entry (hourly)"
+            migrated=$((migrated + 1))
+        } || warn "Could not add LOBSTER-VAULT-JOURNAL-SCANNER cron entry — add manually"
+    else
+        substep "Migration 127: LOBSTER-VAULT-JOURNAL-SCANNER cron entry already present — skipping"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
