@@ -86,10 +86,10 @@ All dispatch attempts are logged to `~/lobster-workspace/logs/dispatch-boundary.
 |-------|------|-------------|
 | `ts` | ISO 8601 | Timestamp of the dispatch attempt |
 | `uow_id` | string | The UoW being dispatched |
-| `dispatch_attempt` | int | Attempt number (1 for first, 2+ for retries) |
-| `outcome` | enum | `success`, `retry`, or `failure` |
+| `dispatch_attempt` | int | Attempt number (always `1`; `2+` reserved for a future retry loop) |
+| `outcome` | enum | `success` or `failure` (`retry` is a reserved value; no current code path emits it) |
 | `msg_id` | string? | Inbox message ID (on success) |
-| `failure_reason` | string? | Reason for failure or retry (on non-success) |
+| `failure_reason` | string? | Reason for failure (on non-success) |
 
 ### Query Examples
 
@@ -155,7 +155,7 @@ The tradeoff is inbox coupling. The steward's heartbeat observation loop is the 
 
 ## Related Documentation
 
-- `docs/executor-contract.md` — Executor protocol and result.json contract
+- `docs/wos/current/executor-contract.md` — Executor protocol and result.json contract
 - `docs/wos-v2-design.md` — WOS architecture overview
 - `docs/wos-sprint3-part2-design.md` — S3P2-E issue specification
 - PR #584 — Original inbox dispatch refactor

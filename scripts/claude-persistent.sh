@@ -554,8 +554,28 @@ launch_claude() {
     local dispatcher_pid_file="$MESSAGES_DIR/config/dispatcher.pid"
     mkdir -p "$(dirname "$dispatcher_pid_file")"
 
+    # Write a session-start sentinel to the session log BEFORE launching Claude.
+    # The quota-exhaustion check reads this log after Claude exits; without a
+    # per-session boundary the check can match "You've hit your limit" lines
+    # that were written by a previous session (the log is append-only and never
+    # rotated), producing a false-positive that puts the system to sleep until
+    # midnight even when the current quota is fine.  The sentinel is a fixed
+    # string that awk uses to reset its scan window, so only lines from the
+    # current session are tested.
+    echo "=== SESSION_START attempt=$attempt ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) ===" \
+        >> "$LOG_DIR/claude-session.log"
+
     (
         echo "$BASHPID" > "$dispatcher_pid_file"
+        # Write the dispatcher startup flag so inject-bootup-context.py can
+        # identify this as the dispatcher session on SessionStart.
+        # The flag contains $BASHPID — the same PID that becomes the claude
+        # process PID after exec. We write before exec so the flag is always
+        # present when SessionStart fires. inject-bootup-context.py reads the
+        # flag, verifies the PID is alive via kill -0, consumes the flag, and
+        # injects dispatcher bootup context. Stale flags (dead PID) are ignored.
+        mkdir -p "$WORKSPACE_DIR/data"
+        echo "$BASHPID" > "$WORKSPACE_DIR/data/dispatcher-startup-flag"
         exec claude --dangerously-skip-permissions \
             --model sonnet \
             --max-turns 150 \
@@ -634,19 +654,70 @@ with open('$tmp_state', 'w') as f:
         log "Claude exited with code $exit_code. Will restart after backoff."
         write_state "restarting" "exit_code=$exit_code"
 
-        # Detect quota exhaustion — sleep until midnight UTC before retrying
-        if tail -20 "$LOG_DIR/claude-session.log" 2>/dev/null | grep -qi "out of extra usage\|you.ve hit your limit\|hit your limit\|you.re out of"; then
-            log "QUOTA EXHAUSTED: Detected usage quota error. Sleeping until midnight UTC."
-            local now midnight_utc sleep_secs wake_time_et
+        # Detect quota exhaustion — sleep until midnight UTC before retrying.
+        # Only scan output from the *current* session to avoid false positives
+        # from stale quota messages left in the append-only log by prior sessions.
+        # awk resets its capture window each time it sees a SESSION_START sentinel,
+        # so `current_session_output` contains only what this session wrote.
+        #
+        # Two distinct quota message patterns observed in practice:
+        #   "You've hit your limit · resets Xam (UTC)"   — 5-hour session window
+        #   "You're out of extra usage · resets ..."     — weekly quota exhausted
+        # The phrase is the discriminator; the reset timestamp in the message
+        # is human-readable only and not used for sleep calculation here.
+        local current_session_output
+        current_session_output=$(awk '/^=== SESSION_START /{buf=""} {buf=buf"\n"$0} END{print buf}' \
+            "$LOG_DIR/claude-session.log" 2>/dev/null)
+        if echo "$current_session_output" | grep -qi "out of extra usage\|you.ve hit your limit\|hit your limit\|you.re out of"; then
+            # Classify quota type from the message text to send a specific alert.
+            local quota_type="unknown"
+            if echo "$current_session_output" | grep -qi "out of extra usage\|you.re out of"; then
+                quota_type="weekly"
+            elif echo "$current_session_output" | grep -qi "you.ve hit your limit\|hit your limit"; then
+                quota_type="session"
+            fi
+
+            log "QUOTA EXHAUSTED: Detected usage quota error (type=$quota_type). Parsing actual reset time."
+            local now reset_ts sleep_secs wake_time_et
             now=$(date +%s)
-            midnight_utc=$(date -u -d 'tomorrow 00:00:00' +%s)
-            sleep_secs=$(( midnight_utc - now ))
-            wake_time_et=$(TZ="America/New_York" date -d "@$midnight_utc" "+%-I:%M %p ET")
-            write_state "quota_wait" "sleeping until midnight UTC ($wake_time_et), ${sleep_secs}s"
-            send_telegram_alert "⏸ *Lobster Quota Exhausted*
+            
+            # Extract reset time from error like "resets 6pm (UTC)"
+            local reset_str=$(echo "$current_session_output" | grep -oP 'resets \K[^(]+' | head -1 | xargs)
+            
+            if [[ -n "$reset_str" ]]; then
+                reset_ts=$(date -u -d "$reset_str" +%s 2>/dev/null || echo "")
+                if [[ -z "$reset_ts" ]] || [[ $reset_ts -lt $now ]]; then
+                    reset_ts=$(date -u -d "tomorrow $reset_str" +%s 2>/dev/null || echo "")
+                fi
+            fi
+            
+            if [[ -z "$reset_ts" ]] || [[ $reset_ts -lt $now ]]; then
+                reset_ts=$(date -u -d 'tomorrow 00:00:00' +%s)
+                log "QUOTA: Using midnight UTC fallback"
+            else
+                log "QUOTA: Parsed reset time from error: $reset_str"
+            fi
+            
+            sleep_secs=$(( reset_ts - now ))
+            wake_time_et=$(TZ="America/New_York" date -d "@$reset_ts" "+%-I:%M %p ET")
+            write_state "quota_wait" "sleeping until quota reset time ($wake_time_et), ${sleep_secs}s, type=$quota_type"
+
+            local quota_alert_text
+            if [[ "$quota_type" == "session" ]]; then
+                quota_alert_text="⏸ *Session Quota Hit*
+
+Usage quota hit (5h session limit). Sleeping until quota resets. Will auto-restart."
+            elif [[ "$quota_type" == "weekly" ]]; then
+                quota_alert_text="⏸ *Weekly Quota Hit*
+
+Usage quota hit (weekly limit). Sleeping until midnight UTC ($wake_time_et). Will auto-restart at quota reset."
+            else
+                quota_alert_text="⏸ *Lobster Quota Exhausted*
 
 Usage quota hit. Sleeping until midnight UTC ($wake_time_et).
 Will auto-restart at quota reset. No action needed."
+            fi
+            send_telegram_alert "$quota_alert_text"
             sleep "$sleep_secs"
             log "QUOTA WAIT COMPLETE: Midnight UTC reached, resuming restart."
 
@@ -685,8 +756,8 @@ Will auto-restart at quota reset. No action needed."
             return 1
         fi
 
-        # Detect auth failures from session log
-        if tail -5 "$LOG_DIR/claude-session.log" 2>/dev/null | grep -q "authentication_error\|OAuth token has expired\|API usage limits"; then
+        # Detect auth failures from session log (current session only)
+        if echo "$current_session_output" | grep -q "authentication_error\|OAuth token has expired\|API usage limits"; then
             AUTH_FAIL_COUNT=$((AUTH_FAIL_COUNT + 1))
             if [[ $AUTH_FAIL_COUNT -ge 3 ]] && [[ "$AUTH_FAIL_ALERTED" != "true" ]]; then
                 AUTH_FAIL_ALERTED=true

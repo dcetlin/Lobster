@@ -13,12 +13,40 @@ These tests are written spec-first and serve as a living contract for the
 `lobstertalk-unified` task definition.
 """
 
+import importlib.util
 import json
+import os
+import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+# ---------------------------------------------------------------------------
+# Load the production module to access named constants
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_SCRIPT_PATH = _REPO_ROOT / "scheduled-tasks" / "lobstertalk_unified.py"
+
+
+def _load_lobstertalk_unified():
+    # The module requires several env vars at import time; provide test stubs.
+    _tmp = tempfile.mkdtemp()
+    os.environ.setdefault("BOT_TALK_URL", "http://localhost:0/test")
+    os.environ.setdefault("BOT_TALK_SENDER", "TestLobster")
+    os.environ.setdefault("LOBSTER_ADMIN_CHAT_ID", "12345")
+    spec = importlib.util.spec_from_file_location(
+        "lobstertalk_unified_direction_test", _SCRIPT_PATH
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_lt = _load_lobstertalk_unified()
 
 # ---------------------------------------------------------------------------
 # Pure helper implementations mirroring the task definition's direction
@@ -79,9 +107,6 @@ def advance_cursor(messages: list[dict], current_ts: str) -> str:
     return max(m["timestamp"] for m in messages)
 
 
-HOT_MODE_TIMEOUT_SECS = 20 * 60  # 20 minutes
-
-
 def update_hot_mode(
     state: dict[str, Any],
     messages_received: int,
@@ -90,7 +115,7 @@ def update_hot_mode(
     """Return updated state with hot-mode transitions applied.
 
     Hot-mode entry: any messages received → hot_mode=True, update last_activity_ts.
-    Hot-mode exit: time-based — if now - last_activity_ts >= HOT_MODE_TIMEOUT_SECS,
+    Hot-mode exit: time-based — if now - last_activity_ts >= _lt.HOT_MODE_TIMEOUT_SECS,
     exit hot mode regardless of poll count.
     """
     if now is None:
@@ -109,7 +134,7 @@ def update_hot_mode(
                 if last_dt.tzinfo is None:
                     last_dt = last_dt.replace(tzinfo=timezone.utc)
                 idle_secs = (now - last_dt).total_seconds()
-                if idle_secs >= HOT_MODE_TIMEOUT_SECS:
+                if idle_secs >= _lt.HOT_MODE_TIMEOUT_SECS:
                     state["hot_mode"] = False
                     state["hot_mode_activated_at"] = None
             except (ValueError, TypeError):
@@ -335,11 +360,11 @@ class TestSelfMessageFilter:
 
     The email-autoresponder skill logs both sides of conversations to bot-talk with
     prefixes like "[INBOUND from TELEGRAM]" or "[OUTBOUND →]". These have
-    sender == "SaharLobster" (or whatever the local identity is) and must be
+    sender == "OwnerLobster" (or whatever the local identity is) and must be
     skipped during the GET /messages receive step.
     """
 
-    LOCAL_IDENTITY = "SaharLobster"
+    LOCAL_IDENTITY = "OwnerLobster"
 
     def _make_msg(self, sender: str, content: str = "hello") -> dict:
         return {
@@ -351,7 +376,7 @@ class TestSelfMessageFilter:
 
     def test_self_messages_are_filtered_out(self):
         msgs = [
-            self._make_msg("SaharLobster", "[INBOUND from TELEGRAM] user: hello"),
+            self._make_msg("OwnerLobster", "[INBOUND from TELEGRAM] user: hello"),
             self._make_msg("AlbertLobster", "hi there"),
         ]
         result = filter_self_messages(msgs, self.LOCAL_IDENTITY)
@@ -360,8 +385,8 @@ class TestSelfMessageFilter:
 
     def test_all_self_messages_filtered(self):
         msgs = [
-            self._make_msg("SaharLobster", "[OUTBOUND →] hi"),
-            self._make_msg("SaharLobster", "[INBOUND from TELEGRAM] user: test"),
+            self._make_msg("OwnerLobster", "[OUTBOUND →] hi"),
+            self._make_msg("OwnerLobster", "[INBOUND from TELEGRAM] user: test"),
         ]
         result = filter_self_messages(msgs, self.LOCAL_IDENTITY)
         assert result == []
@@ -380,12 +405,12 @@ class TestSelfMessageFilter:
     def test_filter_is_identity_specific(self):
         """Filter only removes messages matching the exact local identity."""
         msgs = [
-            self._make_msg("SaharLobster2"),  # different identity, should pass through
-            self._make_msg("SaharLobster"),   # exact match, should be filtered
+            self._make_msg("OwnerLobster2"),  # different identity, should pass through
+            self._make_msg("OwnerLobster"),   # exact match, should be filtered
         ]
         result = filter_self_messages(msgs, self.LOCAL_IDENTITY)
         assert len(result) == 1
-        assert result[0]["sender"] == "SaharLobster2"
+        assert result[0]["sender"] == "OwnerLobster2"
 
 
 class TestLogRotation:

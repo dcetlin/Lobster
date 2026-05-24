@@ -6,6 +6,8 @@ Fires before mcp__lobster-inbox__send_reply tool calls.
 
 Convention:
 - When a message has side effects: end with a ```side-effects: ... ``` code block.
+- When a decision is being surfaced: end with a ```decision: ... ``` code block.
+- Both `side-effects:` and `decision:` are valid footer labels and may coexist.
 - When a message has no side effects: omit the footer entirely — write nothing.
 - `side-effects: none` in any form is BANNED. Omit the footer instead.
 - Any footer-like code block with a wrong label (signals:, effects:, etc.) is blocked.
@@ -24,6 +26,10 @@ import sys
 # Only "side-effects:" is accepted — no other label is valid.
 # This enforces the canonical format from sys.subagent.bootup.md.
 SIDE_EFFECTS_BLOCK_RE = re.compile(r"```side-effects:[^`]*```", re.DOTALL)
+
+# Match a decision code block with the canonical label.
+# "decision:" is the second accepted footer type alongside "side-effects:".
+DECISION_BLOCK_RE = re.compile(r"```decision:[^`]*```", re.DOTALL)
 
 # Match "side-effects: none" in any form:
 # 1. As a bare line: "side-effects: none"
@@ -109,15 +115,17 @@ def main():
         )
         sys.exit(2)
 
-    # Check 2: If a footer-like code block is present, its label must be exactly "side-effects:".
-    # A canonical side-effects block is valid — allow it.
+    # Check 2: If a footer-like code block is present, its label must be "side-effects:" or "decision:".
+    # A canonical side-effects or decision block is valid — allow it.
     # A wrong-label block is blocked.
-    if not SIDE_EFFECTS_BLOCK_RE.search(text):
+    has_valid_footer = SIDE_EFFECTS_BLOCK_RE.search(text) or DECISION_BLOCK_RE.search(text)
+    if not has_valid_footer:
         wrong_label = detect_wrong_label(text)
         if wrong_label is not None:
             print(
-                f"BLOCKED: Wrong footer label — must be exactly `side-effects:` (got `{wrong_label}`). "
+                f"BLOCKED: Wrong footer label — must be `side-effects:` or `decision:` (got `{wrong_label}`). "
                 "Use ```side-effects:\\n<signals>\\n``` for messages with side effects. "
+                "Use ```decision:\\n<choice>\\n``` when surfacing a decision. "
                 "Omit the footer entirely when there are no side effects.",
                 file=sys.stderr,
             )

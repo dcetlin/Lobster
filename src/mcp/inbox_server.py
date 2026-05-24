@@ -70,7 +70,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 # IFTTT behavioral rules store
-from utils.ifttt_rules import (
+from src.utils.ifttt_rules import (
     load_rules as _ifttt_load_rules,
     save_rules as _ifttt_save_rules,
     add_rule as _ifttt_add_rule,
@@ -159,8 +159,14 @@ except Exception as _db_import_err:
 
 # Memory system (optional — gracefully degrades to static file search)
 _memory_provider = None
+# VALID_SIGNAL_TYPES is imported here so the memory_store tool schema enum
+# is derived from the single source of truth in provider.py rather than
+# duplicated as a raw string list. See learnings.md mirror-constant pattern.
+_VALID_SIGNAL_TYPES_FOR_SCHEMA: list[str] = []
 try:
     from memory import create_memory_provider, MemoryEvent
+    from memory.provider import VALID_SIGNAL_TYPES as _VALID_SIGNAL_TYPES
+    _VALID_SIGNAL_TYPES_FOR_SCHEMA = sorted(_VALID_SIGNAL_TYPES)
     _memory_provider = create_memory_provider(use_vector=True)
 except Exception as _mem_err:
     # Memory system is optional; log and continue
@@ -568,7 +574,7 @@ _REPLY_TRACK_MAX = 100
 # ---------------------------------------------------------------------------
 
 try:
-    from utils.timezone import (
+    from src.utils.timezone import (
         format_for_user as _tz_format_for_user,
         format_iso_for_user as _tz_format_iso_for_user,
         format_with_utc_and_local as _tz_format_with_utc_and_local,
@@ -843,6 +849,7 @@ from message_types import (  # noqa: E402 — placed after path-setup at top of 
     INBOX_MESSAGE_SOURCES,
     USER_FACING_TYPES,
 )
+from lobster_meta import build_lobster_meta  # noqa: E402 — same path-setup above
 
 # ---------------------------------------------------------------------------
 # Message type normalization (issue #635)
@@ -2201,7 +2208,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "status": {
                         "type": "string",
-                        "description": "Filter by status: pending, in_progress, completed, or all (default).",
+                        "description": "Filter by status: pending, in_progress, completed, blocked, or all (default). Use 'blocked' to find tasks Lobster committed to but is waiting on the user to answer before proceeding.",
                         "default": "all",
                     },
                     "chat_id": {
@@ -2223,7 +2230,12 @@ async def list_tools() -> list[Tool]:
                     },
                     "description": {
                         "type": "string",
-                        "description": "Detailed description of what needs to be done.",
+                        "description": "Detailed description of what needs to be done. For blocked tasks, start with 'BLOCKED: <reason>' so the surfacing logic can show context at a glance.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Initial status: pending (default), in_progress, completed, or blocked. Use 'blocked' when Lobster has made a commitment and asked clarifying questions, but cannot proceed until the user responds.",
+                        "default": "pending",
                     },
                     "chat_id": {
                         "type": "string",
@@ -2245,7 +2257,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "status": {
                         "type": "string",
-                        "description": "New status: pending, in_progress, or completed.",
+                        "description": "New status: pending, in_progress, completed, or blocked. Set to 'blocked' when waiting on user input; set to 'in_progress' when the user has answered and work can resume.",
                     },
                     "subject": {
                         "type": "string",
@@ -2899,7 +2911,7 @@ async def list_tools() -> list[Tool]:
                         "type": "integer",
                         "description": (
                             "Expected maximum runtime in minutes. Agents older than this without "
-                            "recent output file activity can be presumed dead. Default: 30."
+                            "recent output file activity can be presumed dead. Default: 90."
                         ),
                     },
                     "idempotency": {
@@ -3227,6 +3239,10 @@ async def list_tools() -> list[Tool]:
                         "description": "Optional labels to apply (e.g., ['urgent', 'project:xyz']).",
                         "items": {"type": "string"},
                     },
+                    "item_owner": {
+                        "type": "string",
+                        "description": "Who owns this action item: 'dan' (Dan needs to do this) or 'lobster' (Lobster will execute this). Defaults to 'dan' if omitted.",
+                    },
                 },
                 "required": ["owner", "repo", "brain_dump_issue", "title"],
             },
@@ -3353,6 +3369,20 @@ async def list_tools() -> list[Tool]:
                             "'neutral' for observations with no strong directional signal (default)."
                         ),
                         "default": "neutral",
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Short noun-phrase label for what this event is about (e.g. 'OAuth implementation', 'hiking trip planning').",
+                    },
+                    "signal_type_hint": {
+                        "type": "string",
+                        # Derived from VALID_SIGNAL_TYPES in memory/provider.py — do not hardcode here.
+                        # _VALID_SIGNAL_TYPES_FOR_SCHEMA is populated at server startup from the same
+                        # frozenset that runtime validation uses. If memory is unavailable, the enum
+                        # key is omitted and the schema accepts any string (runtime validation still
+                        # applies via handle_memory_store).
+                        **( {"enum": _VALID_SIGNAL_TYPES_FOR_SCHEMA} if _VALID_SIGNAL_TYPES_FOR_SCHEMA else {} ),
+                        "description": "Caller's pre-classification of the event's signal type. When provided, the slow-reclassifier will use this value and skip content inference.",
                     },
                     "task_id": {
                         "type": "string",
@@ -4357,6 +4387,46 @@ def _find_message_file(directory: Path, message_id: str) -> Path | None:
         except Exception:
             continue
     return None
+
+
+def _find_all_message_files(directories: list[Path], message_id: str) -> list[Path]:
+    """Find ALL message files across directories whose 'id' field matches message_id.
+
+    Unlike _find_message_file (which returns the first match), this function
+    returns every file whose JSON 'id' field equals message_id, across all
+    provided directories.  Used by handle_mark_processed to archive duplicate
+    files that share the same logical ID — a condition that arises when
+    concurrent hook invocations write multiple files with identical IDs but
+    different millisecond-precision filenames (issue #2039).
+
+    Files that match by filename substring (message_id in f.name) are also
+    included to catch the common case where the filename embeds the message ID.
+    """
+    matches: list[Path] = []
+    seen: set[Path] = set()  # deduplicate if matched by both name and content
+
+    for directory in directories:
+        if not directory.exists():
+            continue
+        for f in directory.glob("*.json"):
+            if f in seen:
+                continue
+            # Fast path: filename contains the message_id
+            if message_id in f.name:
+                matches.append(f)
+                seen.add(f)
+                continue
+            # Slow path: read JSON and check the 'id' field
+            try:
+                with open(f) as fp:
+                    msg = json.load(fp)
+                if msg.get("id") == message_id:
+                    matches.append(f)
+                    seen.add(f)
+            except Exception:
+                continue
+
+    return matches
 
 
 def _stale_timeout_for_message(msg: dict) -> int:
@@ -5612,7 +5682,7 @@ async def handle_mark_processed(args: dict) -> list[TextContent]:
         except (json.JSONDecodeError, OSError):
             pass  # If we can't read the message, skip the guard
 
-    # Move to processed
+    # Move the primary file to processed.
     dest = PROCESSED_DIR / found.name
     found.rename(dest)
 
@@ -5626,6 +5696,28 @@ async def handle_mark_processed(args: dict) -> list[TextContent]:
             _db_persist_inbound(json.loads(dest.read_text()))
         except Exception as _db_exc:
             log.warning(f"[DB] inbound persist failed for {message_id}: {_db_exc}")
+
+    # Fix #2039: archive any duplicate files sharing the same message ID.
+    #
+    # Concurrent hook invocations (e.g. multiple subagent SessionStart events
+    # within the same second) can write multiple files with identical 'id'
+    # fields but different millisecond-precision filenames.  _find_message_file
+    # returns only the first match, so the remaining N-1 files would stay in
+    # inbox/ and re-surface on the next wait_for_messages call — causing the
+    # dispatcher to see the same message 4–6 times even after marking it
+    # processed.
+    #
+    # Scan inbox/ and processing/ for additional files with the same ID and
+    # archive them silently.  The primary file has already been moved above,
+    # so it will no longer appear in these directories.
+    duplicates = _find_all_message_files([INBOX_DIR, PROCESSING_DIR], message_id)
+    for dup in duplicates:
+        try:
+            dup_dest = PROCESSED_DIR / dup.name
+            dup.rename(dup_dest)
+            log.info(f"Archived duplicate message file {dup.name} for id={message_id!r}")
+        except Exception as dup_exc:
+            log.warning(f"Failed to archive duplicate {dup.name} for id={message_id!r}: {dup_exc}")
 
     # Write a per-message heartbeat so the health check can distinguish a
     # dispatcher that is actively draining a long message batch from one that
@@ -5753,9 +5845,13 @@ async def handle_mark_processing(args: dict) -> list[TextContent]:
     # Shared helper handles filtering, incrementing, and reminder injection.
     _tick_user_message_counter(msg_type, msg_source)
 
-    # Stamp _processing_started_at so stale detection uses actual claim time, not file mtime.
+    # Stamp _processing_started_at and _lobster_meta (issue #1023) so stale detection
+    # uses actual claim time and downstream consumers have pre-computed routing hints.
     try:
         msg_data["_processing_started_at"] = datetime.now(timezone.utc).isoformat()
+        # _lobster_meta: fast heuristic classification (<5ms, no LLM calls).
+        # Fields are hints only — dispatcher must never trust them blindly.
+        msg_data["_lobster_meta"] = build_lobster_meta(msg_data)
         atomic_write_json(dest, msg_data)
     except Exception:
         pass  # non-fatal; stale recovery falls back to mtime
@@ -6473,6 +6569,22 @@ def save_tasks(data: dict) -> None:
     atomic_write_json(TASKS_FILE, data)
 
 
+
+# Valid task statuses. 'blocked' marks a task where Lobster made an explicit
+# commitment to the user, asked clarifying questions, and is now waiting on the
+# user's answers before it can proceed. These are surfaced proactively at session
+# start so committed work is never silently dropped after a crash/restart cycle.
+VALID_TASK_STATUSES = {"pending", "in_progress", "completed", "blocked"}
+
+# Status display metadata: (emoji, display label, sort priority — lower = shown first)
+_TASK_STATUS_META = {
+    "blocked":     ("🚧", "Blocked (Waiting on You)", 0),
+    "in_progress": ("🔄", "In Progress",              1),
+    "pending":     ("⏳", "Pending",                   2),
+    "completed":   ("✅", "Completed",                 3),
+}
+
+
 async def handle_list_tasks(args: dict) -> list[TextContent]:
     """List all tasks."""
     status_filter = args.get("status", "all").lower()
@@ -6490,29 +6602,37 @@ async def handle_list_tasks(args: dict) -> list[TextContent]:
     if not tasks:
         return [TextContent(type="text", text="📋 No tasks found.")]
 
-    # Group by status
-    pending = [t for t in tasks if t.get("status") == "pending"]
-    in_progress = [t for t in tasks if t.get("status") == "in_progress"]
-    completed = [t for t in tasks if t.get("status") == "completed"]
+    # Group by status in priority order so blocked commitments appear first
+    groups: dict[str, list] = {s: [] for s in _TASK_STATUS_META}
+    for t in tasks:
+        s = t.get("status", "pending")
+        groups.setdefault(s, []).append(t)
 
     output = "📋 **Tasks:**\n\n"
 
-    if in_progress:
-        output += "**🔄 In Progress:**\n"
-        for t in in_progress:
-            output += f"  #{t['id']} {t['subject']}\n"
+    for status in sorted(_TASK_STATUS_META, key=lambda s: _TASK_STATUS_META[s][2]):
+        group = groups.get(status, [])
+        if not group:
+            continue
+        emoji, label, _ = _TASK_STATUS_META[status]
+        output += f"**{emoji} {label}:**\n"
+        for t in group:
+            desc_preview = ""
+            if status == "blocked" and t.get("description"):
+                # Show first line of description for blocked tasks — it contains
+                # the blocking reason (e.g. "BLOCKED: waiting on user's answer about X")
+                first_line = t["description"].split("\n")[0][:80]
+                desc_preview = f" — {first_line}"
+            output += f"  #{t['id']} {t['subject']}{desc_preview}\n"
         output += "\n"
 
-    if pending:
-        output += "**⏳ Pending:**\n"
-        for t in pending:
-            output += f"  #{t['id']} {t['subject']}\n"
-        output += "\n"
-
-    if completed:
-        output += "**✅ Completed:**\n"
-        for t in completed:
-            output += f"  #{t['id']} {t['subject']}\n"
+    # Show tasks with unrecognized statuses (e.g. legacy "done") in a fallback group
+    # rather than silently dropping them from the display.
+    other_tasks = [t for s, lst in groups.items() if s not in _TASK_STATUS_META for t in lst]
+    if other_tasks:
+        output += "**❓ Other (unrecognized status):**\n"
+        for t in other_tasks:
+            output += f"  #{t['id']} {t['subject']} [{t.get('status', 'unknown')}]\n"
         output += "\n"
 
     output += f"---\nTotal: {len(tasks)} task(s)"
@@ -6525,9 +6645,13 @@ async def handle_create_task(args: dict) -> list[TextContent]:
     subject = args.get("subject", "").strip()
     description = args.get("description", "").strip()
     chat_id = args.get("chat_id")
+    initial_status = args.get("status", "pending")
 
     if not subject:
         return [TextContent(type="text", text="Error: subject is required.")]
+
+    if initial_status not in VALID_TASK_STATUSES:
+        return [TextContent(type="text", text=f"Error: Invalid status '{initial_status}'. Use: {', '.join(sorted(VALID_TASK_STATUSES))}")]
 
     data = load_tasks()
     task_id = data.get("next_id", 1)
@@ -6536,7 +6660,7 @@ async def handle_create_task(args: dict) -> list[TextContent]:
         "id": task_id,
         "subject": subject,
         "description": description,
-        "status": "pending",
+        "status": initial_status,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -6569,10 +6693,10 @@ async def handle_update_task(args: dict) -> list[TextContent]:
     # Update fields
     if "status" in args:
         status = args["status"].lower()
-        if status in ["pending", "in_progress", "completed"]:
+        if status in VALID_TASK_STATUSES:
             task["status"] = status
         else:
-            return [TextContent(type="text", text=f"Error: Invalid status '{status}'. Use: pending, in_progress, completed")]
+            return [TextContent(type="text", text=f"Error: Invalid status '{status}'. Use: {', '.join(sorted(VALID_TASK_STATUSES))}")]
 
     if "subject" in args:
         task["subject"] = args["subject"]
@@ -6583,8 +6707,8 @@ async def handle_update_task(args: dict) -> list[TextContent]:
     task["updated_at"] = datetime.now(timezone.utc).isoformat()
     save_tasks(data)
 
-    status_emoji = {"pending": "⏳", "in_progress": "🔄", "completed": "✅"}.get(task["status"], "")
-    return [TextContent(type="text", text=f"{status_emoji} Task #{task_id} updated: {task['subject']} [{task['status']}]")]
+    emoji = _TASK_STATUS_META.get(task["status"], ("", "", 9))[0]
+    return [TextContent(type="text", text=f"{emoji} Task #{task_id} updated: {task['subject']} [{task['status']}]")]
 
 
 async def handle_get_task(args: dict) -> list[TextContent]:
@@ -6603,11 +6727,11 @@ async def handle_get_task(args: dict) -> list[TextContent]:
     if not task:
         return [TextContent(type="text", text=f"Error: Task #{task_id} not found.")]
 
-    status_emoji = {"pending": "⏳", "in_progress": "🔄", "completed": "✅"}.get(task["status"], "")
+    emoji = _TASK_STATUS_META.get(task["status"], ("", "", 9))[0]
 
     output = f"📋 **Task #{task['id']}**\n\n"
     output += f"**Subject:** {task['subject']}\n"
-    output += f"**Status:** {status_emoji} {task['status']}\n"
+    output += f"**Status:** {emoji} {task['status']}\n"
     if task.get("description"):
         output += f"\n**Description:**\n{task['description']}\n"
     output += f"\n**Created:** {task.get('created_at', 'N/A')}\n"
@@ -8701,6 +8825,7 @@ async def handle_create_action_item(args: dict) -> list[TextContent]:
     title = args.get("title", "").strip()
     body = args.get("body", "").strip()
     labels = args.get("labels", [])
+    item_owner = args.get("item_owner", "dan").strip().lower() or "dan"
 
     if not owner or not repo:
         return [TextContent(type="text", text="Error: owner and repo are required.")]
@@ -8718,6 +8843,8 @@ async def handle_create_action_item(args: dict) -> list[TextContent]:
         issue_body_lines.append(body)
         issue_body_lines.append("")
 
+    issue_body_lines.append(f"owner: {item_owner}")
+    issue_body_lines.append("")
     issue_body_lines.append("---")
     issue_body_lines.append(f"**Source:** Brain dump #{brain_dump_issue}")
     issue_body_lines.append("")
@@ -8996,9 +9123,20 @@ async def handle_memory_store(arguments: dict[str, Any]) -> list[TextContent]:
         )
         return [TextContent(type="text", text=f"Skipped: event type '{event_type}' is excluded from memory ingestion.")]
 
-    from memory.provider import VALENCE_VALUES
+    from memory.provider import VALENCE_VALUES, VALID_SIGNAL_TYPES
     raw_valence = arguments.get("valence", "neutral")
     valence = raw_valence if raw_valence in VALENCE_VALUES else "neutral"
+
+    # Validate signal_type_hint if provided
+    signal_type_hint = arguments.get("signal_type_hint")
+    if signal_type_hint is not None and signal_type_hint not in VALID_SIGNAL_TYPES:
+        return [TextContent(
+            type="text",
+            text=f"Error: invalid signal_type_hint '{signal_type_hint}'. Must be one of: {', '.join(sorted(VALID_SIGNAL_TYPES))}"
+        )]
+
+    subject = arguments.get("subject")
+
     metadata = {"tags": arguments.get("tags", [])}
     chat_id_arg = arguments.get("chat_id")
     if chat_id_arg is not None:
@@ -9013,6 +9151,8 @@ async def handle_memory_store(arguments: dict[str, Any]) -> list[TextContent]:
         content=content,
         metadata=metadata,
         valence=valence,
+        subject=subject,
+        signal_type_hint=signal_type_hint,
     )
 
     try:
@@ -10975,7 +11115,7 @@ async def reconcile_agent_sessions() -> None:
       - Session in DB with status='running', scanner says 'done'
         → call session_end(..., status='completed'), enqueue Telegram notification
       - Session in DB with status='running', output file missing AND session
-        is older than its registered timeout_minutes (default 30 min) →
+        is older than its registered timeout_minutes (default 90 min) →
         call session_end(..., status='dead'), enqueue Telegram notification
       - Session in DB with status='running', file shows stop_reason=tool_use AND
         session is older than its registered timeout_minutes (default 120 min) →
@@ -11002,17 +11142,18 @@ async def reconcile_agent_sessions() -> None:
     that does not exist on this system — and even if fixed, Claude Code places
     output symlinks in project-specific subdirectories, not a flat tasks dir.
     """
-    from agents.session_store import check_output_file_status, get_output_file_mtime
+    from agents.session_store import check_output_file_status, get_output_file_mtime, get_workstream_status_mtime
 
-    DEFAULT_DEAD_THRESHOLD_SECONDS = 30 * 60   # 30 minutes — fallback for missing output files
+    DEFAULT_DEAD_THRESHOLD_SECONDS = 90 * 60   # 90 minutes — fallback for missing output files (raised from 30 in issue #1922)
     DEFAULT_DEAD_THRESHOLD_RUNNING_SECONDS = 120 * 60  # 120 minutes — fallback for stuck tool_use files
     GRACE_PERIOD_SECONDS = 30          # Newly spawned agents get grace before DEAD
     # Mtime staleness gate (issue #868): if output file hasn't been written to in
     # this many seconds, treat the agent as interrupted rather than actively running.
     # An active agent updates its JSONL output continuously; an interrupted one stops
     # immediately. 15 minutes gives ample margin to avoid false positives during slow
-    # tool calls, while cutting the misclassification window from 120 min → 30 min.
+    # tool calls, while cutting the misclassification window from 120 min → 90 min.
     MTIME_STALE_THRESHOLD_SECONDS = 15 * 60    # 15 minutes
+    WORKSTREAM_STATUS_STALE_SECONDS = 600       # 10 min stale threshold for status.md liveness
 
     # Startup sweep: re-send notifications for sessions that completed while down
     await _startup_sweep()
@@ -11119,27 +11260,36 @@ async def reconcile_agent_sessions() -> None:
                     #      stops updating immediately; detectable within 15 minutes.
                     #   2. Legitimately slow tool call — mtime keeps ticking; leave alone.
                     #
-                    # Mtime gate (issue #868): if the output file has been idle for
-                    # MTIME_STALE_THRESHOLD_SECONDS, use the short threshold (same as
-                    # the "missing file" branch) rather than the generous 120-minute cap.
-                    # This closes the gap where interrupted agents are misclassified as
-                    # "still running" for up to 120 minutes.
+                    # Two staleness signals feed the same short-threshold gate:
+                    # - Mtime gate (issue #868): output file idle >15 min.
+                    # - Workstream gate: workstream/status.md idle >10 min (earlier signal
+                    #   for long-running dispatches that update status.md every ~5 min).
+                    # Either signal is sufficient; output_file logic is fallback when
+                    # no workstream directory exists.
+                    task_id = session.get("task_id")
+                    ws_mtime = get_workstream_status_mtime(task_id) if task_id else None
                     output_mtime = get_output_file_mtime(output_file)
                     now_ts = time.time()
+                    ws_is_stale = (
+                        ws_mtime is not None
+                        and (now_ts - ws_mtime) > WORKSTREAM_STATUS_STALE_SECONDS
+                    )
                     file_is_stale = (
                         output_mtime is not None
                         and (now_ts - output_mtime) > MTIME_STALE_THRESHOLD_SECONDS
                     )
+                    effective_stale = ws_is_stale or file_is_stale
                     effective_running_threshold = (
-                        dead_threshold_missing if file_is_stale else dead_threshold_running
+                        dead_threshold_missing if effective_stale else dead_threshold_running
                     )
 
                     if elapsed > effective_running_threshold:
-                        stale_note = (
-                            f", file idle {int(now_ts - output_mtime)}s (mtime gate active)"
-                            if file_is_stale
-                            else ""
-                        )
+                        if ws_is_stale:
+                            stale_note = f", workstream/status.md idle {int(now_ts - ws_mtime)}s (ws gate active)"
+                        elif file_is_stale:
+                            stale_note = f", file idle {int(now_ts - output_mtime)}s (mtime gate active)"
+                        else:
+                            stale_note = ""
                         log.warning(
                             f"[reconciler] Agent {agent_id!r} output stuck at tool_use "
                             f"after {elapsed}s (>{effective_running_threshold}s{stale_note}) "
@@ -11149,8 +11299,8 @@ async def reconcile_agent_sessions() -> None:
                             id_or_task_id=agent_id,
                             status="dead",
                             result_summary=(
-                                f"Auto-closed by reconciler: output idle "
-                                f"after {elapsed}s"
+                                f"Auto-closed by reconciler: output idle after {elapsed}s"
+                                + (f" (workstream/status.md stale {int(now_ts - ws_mtime)}s)" if ws_is_stale else "")
                                 + (f" (mtime stale {int(now_ts - output_mtime)}s)" if file_is_stale else "")
                             ),
                         )

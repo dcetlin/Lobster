@@ -1,0 +1,11 @@
+{
+  "_comment": "Copy this file to ~/lobster-user-config/data/vault-watch-config.json and fill in your values.",
+  "enabled": true,
+  "vault_path": "~/lobster-workspace/obsidian-vault",
+  "debounce_seconds": 60,
+  "max_debounce_seconds": 300,
+  "watched_files": ["✅ ACTIVE TODOS.md"],
+  "annotation_scope": "all",
+  "lobster_chat_id": 0,
+  "webhook_mode": false
+}

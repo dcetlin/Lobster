@@ -64,6 +64,22 @@ Read-only for oracle, steward, and sweep. Updated only via oracle decisions or h
 
 ---
 
+## recurring-smell
+
+**Signal:** The same structural smell (identified by component name, file path, or smell description) appears in the Detection Pass of 2 or more consecutive sweep files, regardless of which domain night each was.
+**Definition:** A smell becomes "recurring" when it survives at least one full sweep cycle without being remediated. Recurrence means: the sweep saw it, the system had opportunity to act, and it persisted into the next run.
+**Sweep response:**
+- Check for recurrences before running the detection pass (see Recurrence Pre-Check step in sweep-context.md).
+- If a recurring smell is found and no GitHub issue exists, file one with the `recurring-smell` label.
+- If an issue already exists but lacks the `recurring-smell` label, add the label and note the recurrence in a comment.
+- Do not re-file a new issue if a labeled one already exists — add a comment noting the second occurrence.
+- Record recurring smells at the top of the Detection Pass section, before any new findings, so they are not buried by fresh findings.
+**Oracle response:** When reviewing PRs or UoWs that address a recurring smell, verify that the fix is structural (removes the root cause) rather than cosmetic (renames or wraps the same defect). A cosmetic fix on a recurring smell should not be approved without a structural explanation.
+**Steward response:** If a recurring smell has an open issue and no UoW has been dispatched against it within 7 days of the issue being labeled, escalate to Dan: the issue exists but has not been converted into executable work.
+**Threshold:** Two consecutive sweep files is the minimum. Three or more consecutive files without a fix warrants direct escalation to Dan regardless of issue state.
+
+---
+
 ## Notes on evolution
 - New patterns emerge from oracle/learnings.md observations
 - Threshold values (≥3 passes, ≥5 UoWs, etc.) are initial estimates; adjust via oracle decisions

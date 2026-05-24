@@ -34,6 +34,7 @@ from src.orchestration.analytics import (
     convergence_summary,
     diagnostic_accuracy_summary,
     execution_fidelity_summary,
+    outcome_cost_correlation,
     prescription_quality_summary,
 )
 
@@ -91,6 +92,7 @@ def build_report_data(
         "diagnostic_accuracy": diagnostic_accuracy_summary(registry_path),
         "convergence": convergence_summary(registry_path),
         "complexity": complexity_appropriateness_summary(registry_path),
+        "outcome_cost": outcome_cost_correlation(registry_path),
     }
 
 
@@ -195,6 +197,44 @@ def render_text(report: dict[str, Any]) -> str:
             over = stats.get("over_complex_count", 0)
             if over:
                 lines.append(f"    Over-complex:     {over} flagged")
+    lines.append("")
+
+    # --- Outcome x Token Cost ---
+    lines.append("== Outcome x Token Cost ==")
+    oc = report.get("outcome_cost", {})
+    if oc.get("data_gap"):
+        lines.append(f"  Note: {oc['data_gap']}")
+    else:
+        per_cat = oc.get("per_outcome_category", {})
+        # Count total UoWs with both fields (sum of all category counts)
+        total_with_fields = sum(v.get("count", 0) for v in per_cat.values())
+        lines.append(f"  UoWs with both fields: {total_with_fields}")
+        lines.append("  Per category:")
+        canonical_order = ["pearl", "seed", "heat", "shit"]
+        for cat in canonical_order:
+            if cat not in per_cat:
+                continue
+            stats = per_cat[cat]
+            lines.append(
+                f"    [{cat}]"
+                f"  count={_fmt_val(stats.get('count'))}"
+                f"  avg_tokens={_fmt_val(stats.get('avg_tokens'), 0)}"
+                f"  total={_fmt_val(stats.get('total_tokens', 0), 0)}"
+            )
+        bloat = oc.get("bloat_candidates", [])
+        lines.append("  Bloat candidates (heat/shit, above median tokens):")
+        if not bloat:
+            lines.append("    (none)")
+        else:
+            for entry in bloat[:5]:
+                summary_snippet = (entry.get("summary") or "")[:60]
+                lines.append(
+                    f"    {entry['id']}"
+                    f"  [{entry['outcome_category']}]"
+                    f"  tokens={entry['token_usage']}"
+                    f"  cycles={entry.get('steward_cycles', 'n/a')}"
+                    f"  {summary_snippet}"
+                )
     lines.append("")
 
     return "\n".join(lines)

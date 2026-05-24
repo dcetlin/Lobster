@@ -40,15 +40,6 @@ qm = _load_module()
 
 
 # ---------------------------------------------------------------------------
-# Constants — must match the spec, not derived from implementation
-# ---------------------------------------------------------------------------
-
-STARVATION_CONSECUTIVE_READINGS = 12    # 6 hours at 30-min cadence
-TOXICITY_DEPTH_THRESHOLD = 10
-TOXICITY_CONSECUTIVE_READINGS = 3
-
-
-# ---------------------------------------------------------------------------
 # detect_starvation
 # ---------------------------------------------------------------------------
 
@@ -59,23 +50,23 @@ class TestDetectStarvation:
 
     def test_starvation_fires_after_12_consecutive_zero_readings(self):
         """12 zero readings at 30-min cadence = exactly 6 hours — must fire."""
-        history = self._history([0] * STARVATION_CONSECUTIVE_READINGS)
+        history = self._history([0] * qm.STARVATION_CONSECUTIVE_READINGS)
         assert qm.detect_starvation(history) is True
 
     def test_starvation_does_not_fire_with_11_zero_readings(self):
         """One reading short of the threshold — must not fire."""
-        history = self._history([0] * (STARVATION_CONSECUTIVE_READINGS - 1))
+        history = self._history([0] * (qm.STARVATION_CONSECUTIVE_READINGS - 1))
         assert qm.detect_starvation(history) is False
 
     def test_starvation_does_not_fire_if_tail_has_nonzero(self):
         """12 readings but the last one is nonzero — no starvation."""
-        depths = [0] * (STARVATION_CONSECUTIVE_READINGS - 1) + [1]
+        depths = [0] * (qm.STARVATION_CONSECUTIVE_READINGS - 1) + [1]
         history = self._history(depths)
         assert qm.detect_starvation(history) is False
 
     def test_starvation_fires_on_longer_history_when_tail_is_all_zero(self):
         """20 readings where the last 12 are all zero — must fire."""
-        depths = [5] * 8 + [0] * STARVATION_CONSECUTIVE_READINGS
+        depths = [5] * 8 + [0] * qm.STARVATION_CONSECUTIVE_READINGS
         history = self._history(depths)
         assert qm.detect_starvation(history) is True
 
@@ -87,8 +78,8 @@ class TestDetectStarvation:
         assert qm.detect_starvation(history) is False
 
     def test_starvation_uses_named_constant_not_magic_literal(self):
-        """Verify the module exposes the constant matching the spec."""
-        assert qm.STARVATION_CONSECUTIVE_READINGS == STARVATION_CONSECUTIVE_READINGS
+        """Verify the module exposes the constant matching the spec (12 = 6h at 30-min cadence)."""
+        assert qm.STARVATION_CONSECUTIVE_READINGS == 12
 
 
 # ---------------------------------------------------------------------------
@@ -145,8 +136,8 @@ class TestDetectToxicity:
         assert fired is False
 
     def test_toxicity_uses_named_constants_matching_spec(self):
-        assert qm.TOXICITY_DEPTH_THRESHOLD == TOXICITY_DEPTH_THRESHOLD
-        assert qm.TOXICITY_CONSECUTIVE_READINGS == TOXICITY_CONSECUTIVE_READINGS
+        assert qm.TOXICITY_DEPTH_THRESHOLD == 10
+        assert qm.TOXICITY_CONSECUTIVE_READINGS == 3
 
 
 # ---------------------------------------------------------------------------

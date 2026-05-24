@@ -277,6 +277,91 @@ class TestUpsert:
         conn2.close()
         assert row["status"] == "pending"
 
+    def test_repropose_active_issue_returns_upsert_skipped(self, registry, db_path):
+        """Re-proposing an issue with an existing non-terminal UoW must return UpsertSkipped.
+
+        Regression test for the intake dedup bug: if a UoW already exists for
+        an issue in any non-terminal status (proposed, ready-for-steward, active,
+        etc.), a subsequent upsert for the same issue must be idempotent — no
+        duplicate row created.
+        """
+        from src.orchestration.registry import UpsertInserted, UpsertSkipped
+
+        ISSUE_NUMBER = 42
+        DAY_1 = "2026-04-01"
+        DAY_2 = "2026-04-02"
+
+        # Insert initial UoW in proposed status.
+        first = registry.upsert(
+            issue_number=ISSUE_NUMBER, title="Issue 42", sweep_date=DAY_1,
+            success_criteria="Completion criteria.",
+        )
+        assert isinstance(first, UpsertInserted)
+
+        # Transition to a non-terminal in-flight status.
+        registry.set_status_direct(first.id, "ready-for-steward")
+
+        # Second upsert on a different sweep_date must be skipped.
+        second = registry.upsert(
+            issue_number=ISSUE_NUMBER, title="Issue 42", sweep_date=DAY_2,
+            success_criteria="Completion criteria.",
+        )
+        assert isinstance(second, UpsertSkipped), (
+            f"Expected UpsertSkipped but got {type(second).__name__}"
+        )
+
+        # Exactly one row for issue 42 in the registry.
+        conn = _open_db(db_path)
+        rows = conn.execute(
+            "SELECT id FROM uow_registry WHERE source_issue_number = ?",
+            (ISSUE_NUMBER,),
+        ).fetchall()
+        conn.close()
+        assert len(rows) == 1, f"Expected exactly 1 row for issue {ISSUE_NUMBER}, got {len(rows)}"
+
+    def test_repropose_terminal_issue_creates_new_uow(self, registry, db_path):
+        """Re-proposing an issue whose only UoW is terminal must create a new UoW.
+
+        Verifies that terminal statuses (done, closed) correctly allow
+        re-proposal — the dedup gate must not block legitimate re-intake.
+        """
+        from src.orchestration.registry import UpsertInserted
+
+        ISSUE_NUMBER = 43
+        DAY_1 = "2026-04-01"
+        DAY_2 = "2026-04-02"
+        DAY_3 = "2026-04-03"
+
+        # Insert and mark done.
+        first = registry.upsert(
+            issue_number=ISSUE_NUMBER, title="Issue 43", sweep_date=DAY_1,
+            success_criteria="Completion criteria.",
+        )
+        registry.set_status_direct(first.id, "done")
+
+        second = registry.upsert(
+            issue_number=ISSUE_NUMBER, title="Issue 43 reopened", sweep_date=DAY_2,
+            success_criteria="Completion criteria.",
+        )
+        assert isinstance(second, UpsertInserted), (
+            f"Expected UpsertInserted after done, got {type(second).__name__}"
+        )
+
+        # Also verify 'closed' (legacy terminal status) allows re-proposal.
+        registry.set_status_direct(second.id, "done")
+        conn = _open_db(db_path)
+        conn.execute("UPDATE uow_registry SET status='closed' WHERE id=?", (second.id,))
+        conn.commit()
+        conn.close()
+
+        third = registry.upsert(
+            issue_number=ISSUE_NUMBER, title="Issue 43 re-reopened", sweep_date=DAY_3,
+            success_criteria="Completion criteria.",
+        )
+        assert isinstance(third, UpsertInserted), (
+            f"Expected UpsertInserted after closed, got {type(third).__name__}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Issue #488: success_criteria enforcement and issue_url population
@@ -957,6 +1042,37 @@ def _make_blocked_uow(conn: sqlite3.Connection, registry, steward_cycles: int = 
     return uow_id
 
 
+def _make_failed_uow(
+    conn: sqlite3.Connection,
+    registry,
+    steward_cycles: int = 2,
+    lifetime_cycles: int = 0,
+    steward_log: str | None = '{"event":"orphan_kill","timestamp":"2026-01-01T00:00:00Z"}',
+    issue_number_offset: int = 0,
+) -> str:
+    """
+    Insert a UoW in 'failed' status with steward_log set.
+    Returns the uow_id.
+    """
+    from src.orchestration.registry import UpsertInserted
+    issue_num = 8800 + steward_cycles + lifetime_cycles + issue_number_offset
+    result = registry.upsert(
+        issue_number=issue_num,
+        title=f"Failed UoW test (sc={steward_cycles})",
+        success_criteria="Test criteria.",
+    )
+    assert isinstance(result, UpsertInserted)
+    uow_id = result.id
+    conn.execute(
+        """UPDATE uow_registry
+           SET status='failed', steward_cycles=?, lifetime_cycles=?, steward_log=?
+           WHERE id=?""",
+        (steward_cycles, lifetime_cycles, steward_log, uow_id),
+    )
+    conn.commit()
+    return uow_id
+
+
 class TestLifetimeCycles:
     """
     Tests for lifetime_cycles — the cumulative steward cycle counter that
@@ -1148,6 +1264,121 @@ class TestLifetimeCycles:
         conn.close()
 
 
+class TestDecideRetryFromFailed:
+    """
+    Tests for the failed→ready-for-steward reset path.
+
+    Spec:
+    - decide_retry on a 'failed' UoW returns 1 (success)
+    - steward_log is cleared to NULL after reset
+    - steward_cycles is reset to 0
+    - lifetime_cycles accumulates steward_cycles before reset (same as blocked path)
+    - Audit entry is written with event='decide_retry'
+    - decide_retry from 'blocked' does NOT clear steward_log (regression guard)
+    """
+
+    def test_failed_uow_retry_returns_one(self, registry, db_path):
+        """decide_retry on a failed UoW returns 1 (was silently 0 before the fix)."""
+        conn = _open_db(db_path)
+        uow_id = _make_failed_uow(conn, registry)
+        conn.close()
+
+        result = registry.decide_retry(uow_id)
+        assert result == 1, "decide_retry must return 1 for a failed UoW"
+
+    def test_failed_uow_retry_transitions_to_ready_for_steward(self, registry, db_path):
+        """After reset, UoW status is 'ready-for-steward'."""
+        conn = _open_db(db_path)
+        uow_id = _make_failed_uow(conn, registry, issue_number_offset=10)
+        conn.close()
+
+        registry.decide_retry(uow_id)
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.status == "ready-for-steward"
+
+    def test_failed_uow_retry_clears_steward_log(self, registry, db_path):
+        """steward_log must be NULL after failed→ready-for-steward reset."""
+        conn = _open_db(db_path)
+        uow_id = _make_failed_uow(
+            conn, registry,
+            steward_log='{"event":"orphan_kill","timestamp":"2026-01-01T00:00:00Z"}',
+            issue_number_offset=20,
+        )
+        conn.close()
+
+        registry.decide_retry(uow_id)
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.steward_log is None, (
+            "steward_log must be cleared on failed→ready-for-steward reset; "
+            "leaving it causes the steward to immediately re-fail the UoW"
+        )
+
+    def test_failed_uow_retry_resets_steward_cycles(self, registry, db_path):
+        """steward_cycles is 0 after reset."""
+        conn = _open_db(db_path)
+        uow_id = _make_failed_uow(conn, registry, steward_cycles=4, issue_number_offset=30)
+        conn.close()
+
+        registry.decide_retry(uow_id)
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.steward_cycles == 0
+
+    def test_failed_uow_retry_accumulates_lifetime_cycles(self, registry, db_path):
+        """lifetime_cycles accumulates steward_cycles before the reset."""
+        conn = _open_db(db_path)
+        uow_id = _make_failed_uow(conn, registry, steward_cycles=3, lifetime_cycles=5, issue_number_offset=40)
+        conn.close()
+
+        registry.decide_retry(uow_id)
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.lifetime_cycles == 8, "5 + 3 = 8"
+
+    def test_failed_uow_retry_writes_audit_entry(self, registry, db_path):
+        """Audit log must record the decide_retry event."""
+        conn = _open_db(db_path)
+        uow_id = _make_failed_uow(conn, registry, issue_number_offset=50)
+        conn.close()
+
+        registry.decide_retry(uow_id)
+
+        conn2 = _open_db(db_path)
+        row = conn2.execute(
+            "SELECT event, from_status, to_status FROM audit_log WHERE uow_id=? AND event='decide_retry'",
+            (uow_id,),
+        ).fetchone()
+        conn2.close()
+
+        assert row is not None
+        assert row["from_status"] == "failed"
+        assert row["to_status"] == "ready-for-steward"
+
+    def test_blocked_uow_retry_preserves_steward_log(self, registry, db_path):
+        """
+        Regression guard: decide_retry from 'blocked' must NOT clear steward_log.
+        Prior prescription history is legitimate context for a blocked retry.
+        """
+        conn = _open_db(db_path)
+        uow_id = _make_blocked_uow(conn, registry, steward_cycles=2)
+        prior_log = '{"event":"prescription","timestamp":"2026-01-01T00:00:00Z"}'
+        conn.execute(
+            "UPDATE uow_registry SET steward_log=? WHERE id=?",
+            (prior_log, uow_id),
+        )
+        conn.commit()
+        conn.close()
+
+        registry.decide_retry(uow_id)
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.steward_log == prior_log, (
+            "decide_retry from 'blocked' must not clear steward_log"
+        )
+
+
 # ---------------------------------------------------------------------------
 # file_scope tests
 # ---------------------------------------------------------------------------
@@ -1213,3 +1444,167 @@ class TestFileScopeUpsert:
         ).fetchone()
         conn.close()
         assert _json.loads(row["file_scope"]) == paths
+
+
+# ---------------------------------------------------------------------------
+# reset_expired_claims() — visibility-timeout orphan recovery
+# ---------------------------------------------------------------------------
+
+# Named constant for the claim expiry tests — matches the spec phrase
+# "executing_orphan" return_reason embedded in the audit note.
+CLAIM_EXPIRED_RETURN_REASON: str = "executing_orphan"
+
+# Time offsets for claim deadline tests
+PAST_CLAIM_OFFSET_HOURS: int = 1    # claimed_until 1 hour ago — unambiguously expired
+FUTURE_CLAIM_OFFSET_HOURS: int = 1  # claimed_until 1 hour from now — not expired
+
+
+def _seed_uow_in_executing(registry, db_path: Path) -> str:
+    """
+    Seed a UoW and advance it to 'executing' status with a claimed_until set.
+
+    Returns the uow_id. Uses set_status_direct to bypass the full executor
+    dispatch path — we only need the status + claimed_until for these tests.
+    """
+    today = datetime.now(timezone.utc).date().isoformat()
+    from src.orchestration.registry import UpsertInserted
+    result = registry.upsert(
+        issue_number=int(datetime.now(timezone.utc).timestamp()) % 90000 + 10000,
+        title="Claim expiry test UoW",
+        sweep_date=today,
+        success_criteria="Test completion.",
+    )
+    assert isinstance(result, UpsertInserted)
+    uow_id = result.id
+
+    registry.approve(uow_id)
+    registry.set_status_direct(uow_id, "ready-for-steward")
+    registry.set_status_direct(uow_id, "ready-for-executor")
+    registry.set_status_direct(uow_id, "active")
+    registry.set_status_direct(uow_id, "executing")
+
+    # Manually set claimed_until so we can backdate or advance it in tests
+    conn = _open_db(db_path)
+    future = (datetime.now(timezone.utc) + timedelta(hours=FUTURE_CLAIM_OFFSET_HOURS)).isoformat()
+    conn.execute(
+        "UPDATE uow_registry SET claimed_until = ? WHERE id = ?",
+        (future, uow_id),
+    )
+    conn.commit()
+    conn.close()
+
+    return uow_id
+
+
+class TestResetExpiredClaims:
+    """reset_expired_claims() routes expired-claim UoWs to ready-for-steward.
+
+    Behavior verified (derived from spec, not from implementation):
+
+    - Expired claims transition to 'ready-for-steward' (not 'ready-for-executor')
+      so the steward can apply orphan_retry_count / ORPHAN_KILL_RETRY_BUDGET.
+    - The audit log entry carries to_status='ready-for-steward' and note JSON
+      containing return_reason='executing_orphan'.
+    - UoWs with claimed_until in the future are not touched.
+    """
+
+    def test_reset_expired_claims_transitions_to_ready_for_steward(
+        self, registry, db_path: Path
+    ) -> None:
+        """Expired-claim UoW transitions to ready-for-steward, not ready-for-executor.
+
+        Routing through the steward is required so the steward can apply
+        orphan_retry_count, MAX_RETRIES, and ORPHAN_KILL_RETRY_BUDGET before
+        deciding to re-dispatch. Bypassing to ready-for-executor skips all of
+        that logic and causes indefinite retry cycles.
+        """
+        uow_id = _seed_uow_in_executing(registry, db_path)
+
+        # Backdate claimed_until to the past so the claim is expired
+        past = (
+            datetime.now(timezone.utc) - timedelta(hours=PAST_CLAIM_OFFSET_HOURS)
+        ).isoformat()
+        conn = _open_db(db_path)
+        conn.execute(
+            "UPDATE uow_registry SET claimed_until = ? WHERE id = ?",
+            (past, uow_id),
+        )
+        conn.commit()
+        conn.close()
+
+        reset_ids = registry.reset_expired_claims()
+
+        assert uow_id in reset_ids, (
+            f"Expected uow_id {uow_id!r} to be in reset_ids; got {reset_ids!r}"
+        )
+
+        # Check status and claimed_until
+        conn = _open_db(db_path)
+        row = conn.execute(
+            "SELECT status, claimed_until FROM uow_registry WHERE id = ?",
+            (uow_id,),
+        ).fetchone()
+        conn.close()
+
+        assert row["status"] == "ready-for-steward", (
+            f"Expected status='ready-for-steward', got {row['status']!r}"
+        )
+        assert row["claimed_until"] is None, (
+            "Expected claimed_until IS NULL after reset"
+        )
+
+        # Check the audit log entry has the correct to_status and return_reason
+        conn = _open_db(db_path)
+        audit_rows = conn.execute(
+            """
+            SELECT to_status, note FROM audit_log
+            WHERE uow_id = ? AND event = 'claim_expired'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (uow_id,),
+        ).fetchall()
+        conn.close()
+
+        assert len(audit_rows) == 1, (
+            "Expected exactly one 'claim_expired' audit entry"
+        )
+        audit_row = audit_rows[0]
+        assert audit_row["to_status"] == "ready-for-steward", (
+            f"Audit entry to_status should be 'ready-for-steward', got {audit_row['to_status']!r}"
+        )
+
+        note = json.loads(audit_row["note"])
+        assert note.get("return_reason") == CLAIM_EXPIRED_RETURN_REASON, (
+            f"Audit note must carry return_reason={CLAIM_EXPIRED_RETURN_REASON!r}; "
+            f"got {note!r}"
+        )
+
+    def test_reset_expired_claims_does_not_touch_future_claimed_until(
+        self, registry, db_path: Path
+    ) -> None:
+        """UoW with claimed_until in the future is NOT reset.
+
+        The agent is presumed alive while the claim window is open. Resetting
+        it would race with a live agent and corrupt the execution state.
+        """
+        uow_id = _seed_uow_in_executing(registry, db_path)
+        # claimed_until is already set to 1 hour in the future by _seed_uow_in_executing
+
+        reset_ids = registry.reset_expired_claims()
+
+        assert uow_id not in reset_ids, (
+            f"UoW {uow_id!r} has a future claimed_until — must not be reset; "
+            f"reset_ids={reset_ids!r}"
+        )
+
+        # Status should remain 'executing'
+        conn = _open_db(db_path)
+        row = conn.execute(
+            "SELECT status FROM uow_registry WHERE id = ?",
+            (uow_id,),
+        ).fetchone()
+        conn.close()
+
+        assert row["status"] == "executing", (
+            f"Expected status='executing' (unchanged), got {row['status']!r}"
+        )

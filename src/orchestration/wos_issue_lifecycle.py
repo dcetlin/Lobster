@@ -50,6 +50,13 @@ WOS_EXECUTING_LABEL_COLOR: str = "0052cc"
 #: Subprocess timeout for gh CLI calls (seconds).
 _GH_TIMEOUT: int = 30
 
+#: Labels that indicate a PR requires human review before any automated action.
+HUMAN_GATE_LABELS: frozenset[str] = frozenset({
+    "awaiting-sign-off",
+    "needs-decision",
+    "blocked-on-dan",
+})
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers — pure composition
@@ -207,6 +214,37 @@ def _close_issue(issue_number: int, repo: str, gh_bin: str = "gh") -> None:
         ["issue", "close", str(issue_number), "--repo", repo],
         gh_bin=gh_bin,
     )
+
+
+def is_pr_human_gated(pr_number: int, repo: str, gh_bin: str = "gh") -> str | None:
+    """
+    Return the first human-gate label found on the PR, or None if no gate label is present.
+
+    A PR is human-gated when it carries any label in HUMAN_GATE_LABELS.
+    Callers should skip automated close operations and surface to the dispatcher
+    when this returns a non-None value.
+
+    Returns "unknown-check-failed" (a non-None string) on gh CLI failure —
+    callers must treat a non-None return value as gated and skip the close
+    operation rather than silently proceed.
+    """
+    try:
+        result = _run_gh(
+            ["pr", "view", str(pr_number), "--repo", repo, "--json", "labels",
+             "--jq", "[.labels[].name]"],
+            gh_bin=gh_bin,
+        )
+        labels: list[str] = json.loads(result.stdout.decode().strip())
+        for label in labels:
+            if label in HUMAN_GATE_LABELS:
+                return label
+        return None
+    except Exception:
+        log.warning(
+            "wos_issue_lifecycle: is_pr_human_gated failed for %s#%d — treating as gated",
+            repo, pr_number,
+        )
+        return "unknown-check-failed"
 
 
 # ---------------------------------------------------------------------------

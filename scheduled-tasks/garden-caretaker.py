@@ -44,6 +44,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 from src.orchestration.paths import REGISTRY_DB
+from src.utils.jobs import is_job_enabled
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -61,31 +62,6 @@ log = logging.getLogger("garden-caretaker")
 # ---------------------------------------------------------------------------
 
 _REPO = "dcetlin/Lobster"
-_JOB_NAME = "garden-caretaker"
-
-
-# ---------------------------------------------------------------------------
-# jobs.json enabled gate — Type C dispatch path
-# ---------------------------------------------------------------------------
-
-def _is_job_enabled(job_name: str) -> bool:
-    """Return True if the job is enabled in jobs.json, False if explicitly disabled.
-
-    Defaults to True when:
-    - jobs.json is absent
-    - the job entry is missing
-    - the file is unreadable or malformed
-
-    Mirrors the gate logic in executor-heartbeat.py so Type C (cron-direct)
-    jobs respect the same runtime enable/disable toggle as Type A/B jobs.
-    """
-    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-    jobs_file = workspace / "scheduled-jobs" / "jobs.json"
-    try:
-        data = json.loads(jobs_file.read_text())
-        return bool(data.get("jobs", {}).get(job_name, {}).get("enabled", True))
-    except Exception:
-        return True
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +88,7 @@ def main() -> int:
         log.info("GardenCaretaker heartbeat starting")
 
     # Gate 1: jobs.json enabled check
-    if not _is_job_enabled(_JOB_NAME):
+    if not is_job_enabled("garden-caretaker"):
         log.info(
             "GardenCaretaker: job disabled in jobs.json (enabled=false) "
             "— skipping cycle. Set enabled=true in jobs.json to re-enable."

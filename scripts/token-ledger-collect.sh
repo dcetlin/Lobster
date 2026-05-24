@@ -227,6 +227,35 @@ PYEOF2
 PROMPT_TASK_ID=$(python3 "${TMPPY2}" "${INPUT}" 2>/dev/null || true)
 rm -f "${TMPPY2}"
 
+# Extract uow_id from Agent prompt frontmatter (explicit canonical UoW ID field)
+UOW_ID_VAL=""
+TMPPY3=$(mktemp /tmp/token-ledger-uow.XXXXXX.py)
+cat > "${TMPPY3}" <<'PYEOF3'
+import sys
+import json
+import re
+
+input_json = sys.argv[1]
+
+try:
+    data = json.loads(input_json)
+    prompt = data.get('tool_input', {}).get('prompt', '')
+    m = re.search(r'^---\s*\n(.*?)^---', prompt, re.DOTALL | re.MULTILINE)
+    if m:
+        for line in m.group(1).splitlines():
+            if ':' in line:
+                k, _, v = line.partition(':')
+                if k.strip() == 'uow_id':
+                    print(v.strip())
+                    sys.exit(0)
+except Exception:
+    pass
+sys.exit(1)
+PYEOF3
+
+UOW_ID_VAL=$(uv run python3 "${TMPPY3}" "${INPUT}" 2>/dev/null || true)
+rm -f "${TMPPY3}"
+
 if [[ -n "${PROMPT_TASK_ID}" ]]; then
   TASK_ID_VAL="${PROMPT_TASK_ID}"
 fi
@@ -282,6 +311,7 @@ ENTRY=$(jq -cn \
   --argjson ts "${NOW_S}" \
   --arg source "${SOURCE_TAG}" \
   --arg task_id "${TASK_ID_VAL}" \
+  --arg uow_id "${UOW_ID_VAL}" \
   --arg model "${MODEL_VAL}" \
   --argjson input_tokens "${INPUT_TOKENS}" \
   --argjson output_tokens "${OUTPUT_TOKENS}" \
@@ -298,7 +328,7 @@ ENTRY=$(jq -cn \
     "cache_read": $cache_read,
     "cache_write": $cache_write,
     "session_id": $session_id
-  }' 2>/dev/null || true)
+  } + (if $uow_id != "" then {"uow_id": $uow_id} else {} end)' 2>/dev/null || true)
 
 if [[ -z "${ENTRY}" ]]; then
   log_failure "failed to build ledger entry JSON"

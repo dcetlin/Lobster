@@ -93,7 +93,6 @@ with patch.dict("sys.modules", _PATCH_TARGETS):
 
 _consecutive_zero_delta_tail = _MODULE._consecutive_zero_delta_tail
 detect_stuck_heartbeat_uows = _MODULE.detect_stuck_heartbeat_uows
-STUCK_HEARTBEAT_CONSECUTIVE_INTERVALS = _MODULE.STUCK_HEARTBEAT_CONSECUTIVE_INTERVALS
 
 
 # ---------------------------------------------------------------------------

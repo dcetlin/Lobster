@@ -109,6 +109,8 @@ META_THREAD_WINDOW_MINUTES = 120
 PHILOSOPHY_THREAD_THRESHOLD = 2    # 2+ philosophy events within 4 hours → philosophy_thread
 PHILOSOPHY_THREAD_WINDOW_MINUTES = 240
 
+_DEDUP_WINDOW_HOURS = 12            # suppress duplicate pattern_observation within this window
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -274,7 +276,7 @@ def read_recent_events(conn: sqlite3.Connection, hours: int = LOOK_BACK_HOURS) -
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     cursor = conn.execute("""
-        SELECT e.id, e.timestamp, e.type, e.source, e.content, e.metadata
+        SELECT e.id, e.timestamp, e.type, e.source, e.content, e.metadata, e.subject, e.signal_type_hint
         FROM events e
         INNER JOIN classification_tags ct ON ct.entry_id = CAST(e.id AS TEXT)
             AND ct.classifier = 'quick-v1'
@@ -293,13 +295,32 @@ def read_recent_events(conn: sqlite3.Connection, hours: int = LOOK_BACK_HOURS) -
                 ts = ts.replace(tzinfo=timezone.utc)
         except (ValueError, TypeError):
             ts = datetime.now(timezone.utc)
+
+        # Extract subject and signal_type_hint (may be absent on older DBs)
+        try:
+            subject = r["subject"]
+        except (IndexError, KeyError):
+            subject = None
+
+        try:
+            signal_type_hint = r["signal_type_hint"]
+        except (IndexError, KeyError):
+            signal_type_hint = None
+
+        metadata = json.loads(r["metadata"] or "{}")
+        # Store subject and signal_type_hint in metadata so EventRow can access them
+        if subject is not None:
+            metadata["subject"] = subject
+        if signal_type_hint is not None:
+            metadata["signal_type_hint"] = signal_type_hint
+
         rows.append(EventRow(
             id=r["id"],
             timestamp=ts,
             event_type=r["type"],
             source=r["source"] or "unknown",
             content=r["content"] or "",
-            metadata=json.loads(r["metadata"] or "{}"),
+            metadata=metadata,
         ))
     return rows
 
@@ -405,6 +426,31 @@ def write_pattern_event(conn: sqlite3.Connection, obs: PatternObservation) -> in
     return event_id
 
 
+def _recent_duplicate_exists(
+    conn: sqlite3.Connection,
+    obs: PatternObservation,
+    hours: int = _DEDUP_WINDOW_HOURS,
+) -> bool:
+    """Return True if an identical pattern_observation exists within the last `hours` hours.
+
+    Checks pattern_type + source match. Prevents accumulation of structurally
+    identical entries when the same signal recurs within a short window.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    row = conn.execute(
+        """
+        SELECT 1 FROM events
+        WHERE type = 'pattern_observation'
+          AND source = ?
+          AND json_extract(metadata, '$.pattern_type') = ?
+          AND timestamp >= ?
+        LIMIT 1
+        """,
+        (obs.source, obs.pattern_type, cutoff),
+    ).fetchone()
+    return row is not None
+
+
 # ---------------------------------------------------------------------------
 # Action routing — threshold-gated actions on pattern observations
 # ---------------------------------------------------------------------------
@@ -495,6 +541,8 @@ def create_task_for_pattern(obs: PatternObservation, pattern_event_id: int) -> s
     tasks_path.write_text(json.dumps(existing, indent=2))
     log.info("Created task for pattern %s: %s", obs.pattern_type, subject)
     return subject
+
+
 def flag_for_digest(conn: sqlite3.Connection, obs: PatternObservation) -> int:
     """Insert a digest_flag event for nightly digest consumption."""
     content = (
@@ -570,6 +618,7 @@ def route_pattern_to_action(
         record_action(conn, pattern_event_id, obs, "digest_flag", str(digest_event_id))
     else:
         log.warning("Unknown pattern type %s — no action routed.", obs.pattern_type)
+
 
 
 def write_run_log(
@@ -669,10 +718,14 @@ def detect_design_session(
     """
     Detect design sessions: 3+ events tagged design_question within 60 minutes.
     Returns one PatternObservation per detected window (non-overlapping greedy).
+
+    Prefers signal_type_hint (from writer) over quick-classifier content inference.
     """
     design_events = [
         ev for ev in cluster
-        if quick_tags.get(ev.id, {}).get("signal_type") == "design_question"
+        if ev.metadata.get("signal_type_hint") == "design_question"
+        or (ev.metadata.get("signal_type_hint") is None
+            and quick_tags.get(ev.id, {}).get("signal_type") == "design_question")
     ]
     design_events.sort(key=lambda e: e.timestamp)
 
@@ -703,10 +756,14 @@ def detect_brainstorm_mode(
 ) -> list[PatternObservation]:
     """
     Detect brainstorm mode: 3+ events tagged voice_note within 30 minutes.
+
+    Prefers signal_type_hint (from writer) over quick-classifier content inference.
     """
     voice_events = [
         ev for ev in cluster
-        if quick_tags.get(ev.id, {}).get("signal_type") == "voice_note"
+        if ev.metadata.get("signal_type_hint") == "voice_note"
+        or (ev.metadata.get("signal_type_hint") is None
+            and quick_tags.get(ev.id, {}).get("signal_type") == "voice_note")
     ]
     voice_events.sort(key=lambda e: e.timestamp)
 
@@ -776,10 +833,14 @@ def detect_meta_thread(
 ) -> list[PatternObservation]:
     """
     Detect meta threads: 2+ events tagged meta_reflection within 2 hours.
+
+    Prefers signal_type_hint (from writer) over quick-classifier content inference.
     """
     meta_events = [
         ev for ev in cluster
-        if quick_tags.get(ev.id, {}).get("signal_type") == "meta_reflection"
+        if ev.metadata.get("signal_type_hint") == "meta_reflection"
+        or (ev.metadata.get("signal_type_hint") is None
+            and quick_tags.get(ev.id, {}).get("signal_type") == "meta_reflection")
     ]
     meta_events.sort(key=lambda e: e.timestamp)
 
@@ -815,10 +876,14 @@ def detect_philosophy_thread(
     conceptual exploration, phenomenological language, ToL arc references, or
     epistemic framework questions — not operational retrospection. They route to
     the philosophy handler, not generic meta routing.
+
+    Prefers signal_type_hint (from writer) over quick-classifier content inference.
     """
     philosophy_events = [
         ev for ev in cluster
-        if quick_tags.get(ev.id, {}).get("signal_type") == "philosophy"
+        if ev.metadata.get("signal_type_hint") == "philosophy"
+        or (ev.metadata.get("signal_type_hint") is None
+            and quick_tags.get(ev.id, {}).get("signal_type") == "philosophy")
     ]
     philosophy_events.sort(key=lambda e: e.timestamp)
 
@@ -960,8 +1025,40 @@ def run_pass(conn: sqlite3.Connection) -> tuple[int, int, int]:
         int(r["entry_id"]): dict(r) for r in cursor.fetchall()
     }
 
+    # Fast path: Events with signal_type_hint bypass pattern detection.
+    # Write slow-v1 tags directly using the provided hint as signal_type with high confidence.
+    hinted_event_ids: set[int] = set()
+    for event in events:
+        hint = event.metadata.get("signal_type_hint")
+        if hint:
+            quick_tag = quick_tags.get(event.id)
+            # Build a slow-v1 tag using the hint as signal_type
+            hinted_tag = ClassificationTag(
+                entry_id=str(event.id),
+                entry_type="event",
+                classifier="slow-v1",
+                significant=quick_tag.get("significant", 0) if quick_tag else 0,
+                signal_a=quick_tag.get("signal_a", 0) if quick_tag else 0,
+                signal_b=quick_tag.get("signal_b", 0) if quick_tag else 0,
+                signal_c=quick_tag.get("signal_c", 0) if quick_tag else 0,
+                signal_d=quick_tag.get("signal_d", 0) if quick_tag else 0,
+                signal_e=quick_tag.get("signal_e", 0) if quick_tag else 0,
+                confidence="high",  # Writer has direct context
+                notes=f"signal_type from writer-provided hint: {hint}",
+                classified_at=datetime.now(timezone.utc).isoformat(),
+                signal_type=hint,
+                urgency=quick_tag.get("urgency", "normal") if quick_tag else "normal",
+                posture_hint=quick_tag.get("posture_hint", "minimal_cognitive_friction") if quick_tag else "minimal_cognitive_friction",
+            )
+            write_tag(conn, hinted_tag)
+            hinted_event_ids.add(event.id)
+            log.info("Fast path: event %d tagged with hint signal_type=%s", event.id, hint)
+
+    # Filter out hinted events from pattern detection
+    events_for_pattern_detection = [e for e in events if e.id not in hinted_event_ids]
+
     # Cluster events into 30-minute source windows
-    clusters = cluster_events_by_source_and_window(events, CLUSTER_WINDOW_MINUTES)
+    clusters = cluster_events_by_source_and_window(events_for_pattern_detection, CLUSTER_WINDOW_MINUTES)
 
     tags_revised = 0
     patterns_found = 0
@@ -979,9 +1076,16 @@ def run_pass(conn: sqlite3.Connection) -> tuple[int, int, int]:
                 pattern.event_ids,
             )
 
-            # Write a pattern_observation event to the events table
-            pattern_event_id = write_pattern_event(conn, pattern)
-            route_pattern_to_action(conn, pattern, pattern_event_id)
+            # Write a pattern_observation event — skip if identical entry exists within the dedup window
+            if _recent_duplicate_exists(conn, pattern, hours=_DEDUP_WINDOW_HOURS):
+                log.debug(
+                    "Dedup gate: skipping duplicate pattern_observation %s source=%s",
+                    pattern.pattern_type,
+                    pattern.source,
+                )
+            else:
+                pattern_event_id = write_pattern_event(conn, pattern)
+                route_pattern_to_action(conn, pattern, pattern_event_id)
 
             # Revise the classification tag for each contributing event
             for event_id in pattern.event_ids:
@@ -1003,7 +1107,11 @@ def run_pass(conn: sqlite3.Connection) -> tuple[int, int, int]:
         passthrough = build_passthrough_tag(event_id, quick_tag)
         write_tag(conn, passthrough)
 
-    return len(processed_event_ids), tags_revised, patterns_found
+    # Count hinted events as processed
+    total_processed = len(processed_event_ids) + len(hinted_event_ids)
+    total_revised = tags_revised + len(hinted_event_ids)
+
+    return total_processed, total_revised, patterns_found
 
 
 # ---------------------------------------------------------------------------

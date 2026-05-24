@@ -147,6 +147,26 @@ mcp__lobster-inbox__write_result(
 )
 ```
 
+**For delivery-deferred tasks (reviewer chain):**
+
+Use this mode when your task produces an artifact — a PR, a generated document, a structured output — that **must pass through a second agent before reaching the user**. The canonical example is `functional-engineer`: it opens a PR but does NOT send the PR link to the user, because the dispatcher will spawn an oracle reviewer before surfacing anything.
+
+Call `write_result` only — do NOT call `send_reply`. Set `sent_reply_to_user=False` (the default). Include enough context in `text` for the dispatcher or reviewer agent to understand what was produced and what to do next.
+
+```python
+mcp__lobster-inbox__write_result(
+    task_id="<task_id>",
+    chat_id=<chat_id>,
+    text="PR #42 opened: <brief description>. Awaiting oracle review before surfacing to user.",
+    source="telegram",
+    sent_reply_to_user=False,  # dispatcher spawns reviewer; user sees nothing yet
+)
+```
+
+**How to recognize this pattern in your task prompt:** Look for a phrase like "do NOT call send_reply directly" combined with a user-visible deliverable (a PR URL, a document path). The distinction from a plain internal task: the result IS user-facing — it will reach the user eventually — but delivery is intentionally deferred through a named second agent.
+
+**What to put in `text`:** Include the artifact reference (PR URL, file path), a one-sentence description of what was done, and any context the reviewer agent needs to start its work. Do not summarize for a human reader — summarize for the next agent.
+
 **ET conversion — required for all user-visible timestamps:**
 
 Before including any timestamp in a `send_reply` call, convert it from UTC to Eastern Time. Rule: EDT (UTC-4) from mid-March through early November; EST (UTC-5) otherwise. Format as "5:29 AM ET" or "2:30 PM ET". Never send raw UTC ISO strings or "UTC" suffixes to users. This applies to all subagents that produce output containing times — calendar events, log summaries, job results, event timelines, and any other user-facing sentence with a time.
@@ -203,7 +223,7 @@ See `docs/oracle-review-protocol.md` for the full frontmatter schema and when ea
 
 ## Signal Footer (Required on All Replies Referencing Completed Work)
 
-**Canonical label: `side-effects:`** — this is the only accepted label. Do not use `signals:`, `effects:`, or any other variant.
+**Valid footer labels: `side-effects:` and `decision:`.** These are the only accepted code block labels. Do not use `signals:`, `effects:`, or any other variant. Any other label is wrong and will cause drift across compaction.
 
 When a `send_reply` has side effects, include a signal footer. When there are no side effects, omit the footer entirely. The hook `hooks/signal-footer-check.py` validates footer labels and blocks `side-effects: none` in any form.
 
@@ -219,6 +239,18 @@ Your reply text here.
 
 **When you have NO side effects:** write nothing — omit the footer completely. Do NOT write `side-effects: none`.
 
+**When you are surfacing a decision:** end the message with a `decision:` code block containing the decision text. One block, one decision per reply. `decision:` and `side-effects:` can coexist in the same message when a decision also has side effects.
+
+````
+Your reply text here.
+
+```decision:
+Option B oracle gate (over Option A two-token model)
+```
+````
+
+The `💬 decide` signal (see legend below) documents that a decision was surfaced. The `decision:` footer block routes the decision text to the decisions ledger at `~/lobster-workspace/data/decisions-ledger.md` for future retrieval via `hooks/decision-router.py`.
+
 Signal legend (10-signal set):
 - `🚀 spawned  <task-name>` — agent or background task launched (include the task slug; list each on its own line)
 - `✅` done — task completed
@@ -231,7 +263,7 @@ Signal legend (10-signal set):
 - `🔧` config — configuration changed
 - `💬` decide — decision made or surfaced
 
-**The label `side-effects:` is authoritative.** The hook validates the code block label and blocks wrong labels — `side-effects:` is the only accepted label. Any other label is wrong and will cause drift across compaction.
+**Valid footer labels:** `side-effects:` and `decision:`. These are the only accepted code block labels. Any other label is wrong and will cause drift across compaction.
 
 ## Surfacing Observations (`write_observation`)
 
@@ -271,6 +303,16 @@ mcp__lobster-inbox__write_observation(
 - You can call it multiple times if you have multiple observations
 - The write is synchronous; the dispatcher picks it up in its next loop iteration
 - Do NOT use it as a substitute for `write_result` — always call both if you have a primary result and observations
+
+### write_observation vs. memory_store
+
+Two persistence paths exist for agent observations. Choose the right one:
+
+**Use `write_observation`** when you want the dispatcher to receive a real-time signal — the message enters the dispatcher inbox and may surface to Dan via Telegram if the category warrants it (`user_context`, or escalation-class `system_error`). Use this path for: urgent structural issues, gate misses, stuck-agent signals, and anything the operator should know about *now*.
+
+**Use `memory_store` (with `valence='smell'` or `valence='golden'`)** when you want the observation stored for future retrieval without triggering a real-time dispatcher notification. The write goes directly to the vector DB and is available via `memory_search`. Use this path for: named pattern instances, sweep-level findings, and non-urgent observations that contribute to the oracle vocabulary over time.
+
+Rule of thumb: if the observation should change behavior *today*, use `write_observation`. If it is archival evidence that accumulates value over time, use `memory_store`.
 
 ## Proprioceptive Memory (`record_mirroring_instance`)
 
@@ -437,6 +479,9 @@ Before declaring any integration or manual test PASS:
 
 - **Default repo:** `SiderealPress/lobster` (owner=SiderealPress, repo=lobster) is the Lobster *system* repo — for Lobster maintenance tasks. For user work tasks, get the target repo from the task context or message; do not default to the system repo.
 
+- **Always specify `--repo dcetlin/Lobster` in `gh` CLI commands.**
+  When running `gh pr` or `gh issue` commands in WOS dispatch or any task context, always pass `--repo dcetlin/Lobster` explicitly. Never rely on the working directory's git remote to determine the target repository — the remote may point to `SiderealPress/lobster` (the upstream public fork) and will silently operate on the wrong repo.
+
 - **Linear API:** Access Linear via REST API. The `LINEAR_API_KEY` environment variable is set. GraphQL endpoint: `https://api.linear.app/graphql`. Use `curl -H "Authorization: $LINEAR_API_KEY" -H "Content-Type: application/json"`.
 
 - **Python:** Always use `uv run` not `python` or `python3`.
@@ -503,3 +548,10 @@ When updating a body:
 - Prioritize clarity for a future reader over preserving the original framing
 
 Apply this to both PRs and issues. When you post a comment that changes the design, resolves a concern, or updates scope — also update the body.
+
+# HYPOTHESIS
+
+<!-- Entries here are provisional. Do not treat as stable configuration.
+     Each entry carries an expiry. Review before expiry; graduate or discard.
+     Graduation = moving the entry into the main body of this file (poiema).
+     Expiry without review = entry is discarded, not silently promoted. -->

@@ -34,7 +34,7 @@ Record the current counts for each status.
 ### Step 2: Run startup-sweep to recover orphaned/stuck UoWs
 
 ```bash
-cd /home/lobster/lobster && uv run scheduled-tasks/startup-sweep.py 2>&1 | tail -20
+cd /home/lobster/lobster && uv run scheduled-tasks/startup_sweep.py 2>&1 | tail -20
 ```
 
 Note how many UoWs were recovered (if any).

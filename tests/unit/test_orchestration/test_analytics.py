@@ -32,6 +32,7 @@ from src.orchestration.analytics import (
     diagnostic_accuracy_summary,
     convergence_summary,
     complexity_appropriateness_summary,
+    outcome_cost_correlation,
     _CONVERGENCE_SCORE_THRESHOLD,
     _STALL_TAIL_LENGTH,
     _OPERATIONAL_COMPLEXITY_THRESHOLD,
@@ -1003,3 +1004,157 @@ class TestComplexityAppropriatenessSummary:
         _insert_complexity_uow(db_path, "uow-blank", register="operational", steward_log="")
         result = complexity_appropriateness_summary(registry_path=db_path)
         assert result["per_uow"][0]["prescription_path"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Helpers for outcome_cost_correlation tests
+# ---------------------------------------------------------------------------
+
+def _insert_outcome_cost_uow(
+    db_path: Path,
+    uow_id: str,
+    outcome_category: str,
+    token_usage: int,
+    steward_cycles: int = 1,
+    summary: str = "test uow",
+) -> None:
+    """Insert a UoW with outcome_category and token_usage for cost correlation tests."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        INSERT INTO uow_registry
+            (id, source, status, summary, created_at, updated_at,
+             steward_cycles, steward_log, success_criteria,
+             outcome_category, token_usage)
+        VALUES (?, ?, 'done', ?, '2026-01-01T00:00:00', '2026-01-01T00:00:00',
+                ?, '', '', ?, ?)
+        """,
+        (uow_id, "github:issue/1", summary, steward_cycles,
+         outcome_category, token_usage),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Tests: outcome_cost_correlation
+# ---------------------------------------------------------------------------
+
+class TestOutcomeCostCorrelation:
+    # Expected top-level keys in every returned dict
+    _EXPECTED_KEYS = {
+        "per_outcome_category",
+        "top_20_by_token_cost",
+        "bloat_candidates",
+        "data_gap",
+    }
+
+    def test_db_absent_returns_structured_error(self, tmp_path):
+        """Non-existent DB path returns a structured error dict, no exception raised."""
+        result = outcome_cost_correlation(registry_path=tmp_path / "no-such.db")
+        assert set(result.keys()) == self._EXPECTED_KEYS
+        assert result["per_outcome_category"] == {}
+        assert result["top_20_by_token_cost"] == []
+        assert result["bloat_candidates"] == []
+        assert result["data_gap"] is not None
+        assert "not found" in result["data_gap"].lower()
+
+    def test_empty_bad_outcome_set_returns_empty_bloat_candidates(self, tmp_path):
+        """When there are no bad-outcome (heat/shit) UoWs, bloat_candidates is empty."""
+        db_path = _init_db(tmp_path)
+        # Insert several UoWs with good outcome categories
+        for i in range(4):
+            _insert_outcome_cost_uow(
+                db_path, f"uow-good-{i}", outcome_category="good", token_usage=1000 * (i + 1)
+            )
+        result = outcome_cost_correlation(registry_path=db_path)
+        assert result["bloat_candidates"] == []
+        assert set(result.keys()) == self._EXPECTED_KEYS
+
+    def test_single_bad_outcome_equal_to_median_excluded(self, tmp_path):
+        """
+        Single bad-outcome UoW: median == that UoW's token_usage.
+        The filter condition is strictly >, so the single UoW is excluded
+        (it equals the median, not exceeds it).
+        """
+        db_path = _init_db(tmp_path)
+        _insert_outcome_cost_uow(
+            db_path, "uow-heat-1", outcome_category="heat", token_usage=5000
+        )
+        result = outcome_cost_correlation(registry_path=db_path)
+        # With one bad-outcome UoW, median == 5000. 5000 > 5000 is False, so excluded.
+        assert result["bloat_candidates"] == []
+
+    def test_uniform_token_values_all_excluded_from_bloat_candidates(self, tmp_path):
+        """
+        When all bad-outcome UoWs have the same token_usage, median equals
+        every value, so none pass the strict > filter.
+        """
+        db_path = _init_db(tmp_path)
+        for i in range(4):
+            _insert_outcome_cost_uow(
+                db_path, f"uow-shit-{i}", outcome_category="shit", token_usage=2000
+            )
+        result = outcome_cost_correlation(registry_path=db_path)
+        # All values are 2000 → median is 2000 → 2000 > 2000 is False for all.
+        assert result["bloat_candidates"] == []
+
+    def test_bloat_candidates_excludes_at_median_includes_above(self, tmp_path):
+        """
+        With a clear split between token values, only UoWs strictly above
+        the median appear in bloat_candidates.
+        """
+        db_path = _init_db(tmp_path)
+        # Two low-cost bad-outcome UoWs and one high-cost bad-outcome UoW.
+        # sorted token values: [1000, 2000, 8000] → median = 2000
+        _insert_outcome_cost_uow(db_path, "uow-heat-low-1", outcome_category="heat", token_usage=1000)
+        _insert_outcome_cost_uow(db_path, "uow-heat-low-2", outcome_category="heat", token_usage=2000)
+        _insert_outcome_cost_uow(db_path, "uow-heat-high", outcome_category="heat", token_usage=8000)
+        result = outcome_cost_correlation(registry_path=db_path)
+        candidate_ids = [c["id"] for c in result["bloat_candidates"]]
+        # Only the UoW with 8000 tokens (> median 2000) is a bloat candidate
+        assert "uow-heat-high" in candidate_ids
+        assert "uow-heat-low-1" not in candidate_ids
+        assert "uow-heat-low-2" not in candidate_ids
+
+    def test_per_outcome_category_stats(self, tmp_path):
+        """per_outcome_category groups UoWs by category with correct count/total/avg/max."""
+        db_path = _init_db(tmp_path)
+        # Insert 3 "good" UoWs (1000, 2000, 3000 tokens) and 1 "heat" UoW (5000 tokens)
+        for i, tokens in enumerate([1000, 2000, 3000]):
+            _insert_outcome_cost_uow(
+                db_path, f"uow-good-{i}", outcome_category="good", token_usage=tokens
+            )
+        _insert_outcome_cost_uow(db_path, "uow-heat-1", outcome_category="heat", token_usage=5000)
+        result = outcome_cost_correlation(registry_path=db_path)
+        per_cat = result["per_outcome_category"]
+        assert "good" in per_cat
+        assert "heat" in per_cat
+        good = per_cat["good"]
+        assert good["count"] == 3
+        assert good["total_tokens"] == 6000
+        assert good["avg_tokens"] == 2000
+        assert good["max_tokens"] == 3000
+        heat = per_cat["heat"]
+        assert heat["count"] == 1
+        assert heat["total_tokens"] == 5000
+
+    def test_top_20_by_token_cost_ordered_descending(self, tmp_path):
+        """top_20_by_token_cost returns UoWs sorted by token_usage descending."""
+        db_path = _init_db(tmp_path)
+        for i in range(5):
+            _insert_outcome_cost_uow(
+                db_path, f"uow-{i}", outcome_category="good", token_usage=(i + 1) * 100
+            )
+        result = outcome_cost_correlation(registry_path=db_path)
+        token_usages = [r["token_usage"] for r in result["top_20_by_token_cost"]]
+        assert token_usages == sorted(token_usages, reverse=True)
+
+    def test_uow_missing_outcome_or_tokens_excluded(self, tmp_path):
+        """UoWs with NULL outcome_category or token_usage are excluded from results."""
+        db_path = _init_db(tmp_path)
+        # Insert a UoW without outcome_category (uses _insert_uow helper)
+        _insert_uow(db_path, uow_id="uow-no-outcome", status="done", steward_cycles=2)
+        result = outcome_cost_correlation(registry_path=db_path)
+        assert result["top_20_by_token_cost"] == []
+        assert result["bloat_candidates"] == []

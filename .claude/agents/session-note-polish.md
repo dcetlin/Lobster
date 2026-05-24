@@ -30,7 +30,7 @@ When summarizing recent activity, cover the last **30 minutes OR 25 messages, wh
    - Avoid: "Merged PR #N, commented on issue #M, ran tests."
    - Synthesize from ALL snapshot blocks, not just the most recent context window.
 
-   **Open Threads** — Remove in-progress noise; keep only what is genuinely unresolved. Check snapshot entries for threads that have since resolved.
+   **Open Threads** — Remove in-progress noise; keep only what is genuinely unresolved. Check snapshot entries for threads that have since resolved. When a finding references work that was completed earlier in the same session, mark it as superseded: prefix the entry with `[superseded]` and append a brief note identifying the completing action (e.g., `[superseded — closed by task-id X]`).
 
    **Open Tasks** — Consolidate into two sub-lists:
    - **Just completed** (finished in the last 30 min): task_id + one-line outcome

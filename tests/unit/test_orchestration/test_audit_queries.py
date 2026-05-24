@@ -413,6 +413,7 @@ class TestCompletedUowDurations:
         created_at: str,
         completed_at: str,
         steward_cycles: int = 1,
+        lifetime_cycles: int = 0,
         register: str = "operational",
     ) -> None:
         conn = sqlite3.connect(str(db_path))
@@ -420,11 +421,11 @@ class TestCompletedUowDurations:
             """
             INSERT INTO uow_registry
                 (id, source, status, summary, created_at, updated_at,
-                 steward_cycles, steward_log, success_criteria, completed_at, register)
-            VALUES (?, ?, 'done', ?, ?, ?, ?, '', '', ?, ?)
+                 steward_cycles, lifetime_cycles, steward_log, success_criteria, completed_at, register)
+            VALUES (?, ?, 'done', ?, ?, ?, ?, ?, '', '', ?, ?)
             """,
             (uow_id, "github:issue/1", "test", created_at, created_at,
-             steward_cycles, completed_at, register),
+             steward_cycles, lifetime_cycles, completed_at, register),
         )
         conn.commit()
         conn.close()
@@ -472,6 +473,20 @@ class TestCompletedUowDurations:
         )
         result = completed_uow_durations("2026-01-01", registry_path=db_path)
         assert result[0]["register"] == "reflective"
+
+    def test_lifetime_cycles_field_included(self, db_path):
+        from src.orchestration.audit_queries import completed_uow_durations
+
+        self._insert_done_uow(
+            db_path, "uow-lc",
+            created_at="2026-01-01T00:00:00+00:00",
+            completed_at="2026-01-01T03:00:00+00:00",
+            steward_cycles=2,
+            lifetime_cycles=7,
+        )
+        result = completed_uow_durations("2026-01-01", registry_path=db_path)
+        assert len(result) == 1
+        assert result[0]["lifetime_cycles"] == 7
 
 
 # ---------------------------------------------------------------------------

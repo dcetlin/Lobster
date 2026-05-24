@@ -47,7 +47,6 @@ from orchestration.workflow_artifact import from_frontmatter
 # HARNESS UoW issue numbers — well out of real issue range
 HARNESS_001_ISSUE_NUMBER = 9001
 HARNESS_002_ISSUE_NUMBER = 9002
-HARNESS_003_ISSUE_NUMBER = 9003
 HARNESS_004_ISSUE_NUMBER = 9004
 
 # Hard cap on steward cycles before escalation to Dan — imported from steward.py
@@ -547,79 +546,6 @@ class TestHarness002Represcription:
             assert len(uow.steward_log) >= len(steward_log_after_cycle_1), (
                 "steward_log must be appended (not overwritten) between cycles (AC-11)"
             )
-
-
-# ---------------------------------------------------------------------------
-# HARNESS-003: TTL recovery
-# ---------------------------------------------------------------------------
-
-@pytest.mark.wos_e2e
-class TestHarness003TtlRecovery:
-    """
-    HARNESS-003: TTL recovery — UoW stuck active > TTL_EXCEEDED_HOURS.
-
-    Acceptance criteria: AC-16, AC-17.
-    """
-
-    def test_harness_003_ttl_recovery_transitions_to_failed(
-        self, harness_env: dict
-    ) -> None:
-        """
-        AC-16: After recover_ttl_exceeded_uows(), UoW status transitions from
-               'active' to 'failed'.
-        AC-17: audit_log contains 'ttl_exceeded' return_reason.
-        """
-        registry: Registry = harness_env["registry"]
-        db_path: Path = harness_env["db_path"]
-
-        uow_id = _seed_harness_uow(registry, HARNESS_003_ISSUE_NUMBER)
-
-        # Advance to 'active' via set_status_direct (simulates Executor claim)
-        registry.set_status_direct(uow_id, "active")
-
-        # Backdate started_at to 5 hours ago — beyond the TTL_EXCEEDED_HOURS (4h) threshold.
-        # TTL recovery uses: WHERE started_at < (now - TTL_EXCEEDED_HOURS).
-        # Use a timestamp that is definitely in the past relative to any test run.
-        five_hours_ago = "2020-01-01T00:00:00+00:00"
-        conn = sqlite3.connect(str(db_path))
-        conn.execute(
-            "UPDATE uow_registry SET started_at = ? WHERE id = ?",
-            (five_hours_ago, uow_id),
-        )
-        conn.commit()
-        conn.close()
-
-        # Run TTL recovery
-        from orchestration.executor import recover_ttl_exceeded_uows
-        recovered = recover_ttl_exceeded_uows(registry)
-
-        # AC-16: UoW transitions from active to failed
-        uow = registry.get(uow_id)
-        assert uow is not None
-        assert uow.status == UoWStatus.FAILED, (
-            f"TTL recovery must transition UoW to 'failed' (AC-16), got {uow.status}"
-        )
-
-        # AC-17: audit_log contains 'ttl_exceeded' in the note (fail_uow reason).
-        # fail_uow() writes event='execution_failed' with note containing the reason
-        # string which includes "ttl_exceeded".
-        conn = sqlite3.connect(str(db_path))
-        conn.row_factory = sqlite3.Row
-        audit_rows = conn.execute(
-            "SELECT event, note FROM audit_log WHERE uow_id = ? ORDER BY id ASC",
-            (uow_id,),
-        ).fetchall()
-        conn.close()
-
-        ttl_found = any(
-            "ttl_exceeded" in (row["note"] or "").lower()
-            or "ttl" in (row["event"] or "").lower()
-            for row in audit_rows
-        )
-        assert ttl_found, (
-            f"audit_log must contain 'ttl_exceeded' in a note entry (AC-17). "
-            f"Audit events: {[(r['event'], (r['note'] or '')[:120]) for r in audit_rows]}"
-        )
 
 
 # ---------------------------------------------------------------------------

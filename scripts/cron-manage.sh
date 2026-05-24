@@ -15,9 +15,42 @@
 #   Both subcommands use the (crontab -l | grep -v MARKER; ...) | crontab -
 #   pattern to avoid overwriting the entire crontab. Raw `echo | crontab -`
 #   usage is prohibited — always use this script instead.
+#
+# Prerequisites:
+#   The calling user must be in the crontab group (or the system must allow
+#   crontab writes via the setgid bit on /usr/bin/crontab). If you see a
+#   "mkstemp: Permission denied" error, run upgrade.sh which applies Migration 46
+#   to add the lobster user to the crontab group, or run manually:
+#     sudo usermod -aG crontab $USER
+#   The change takes effect on the next login (or via: newgrp crontab).
 #===============================================================================
 
 set -euo pipefail
+
+# Write a new crontab from stdin, capturing stderr to provide an actionable
+# error message when crontab writes fail due to group permissions.
+crontab_write() {
+    local tmp_err
+    tmp_err=$(mktemp)
+    if ! crontab - 2>"$tmp_err"; then
+        local err_text
+        err_text=$(cat "$tmp_err")
+        rm -f "$tmp_err"
+        if echo "$err_text" | grep -qi "permission denied\|mkstemp\|cannot create"; then
+            echo "Error: crontab write failed — $err_text" >&2
+            echo "" >&2
+            echo "Fix: the lobster user needs to be in the crontab group." >&2
+            echo "  sudo usermod -aG crontab \$USER" >&2
+            echo "  newgrp crontab  (or log out and back in)" >&2
+            echo "" >&2
+            echo "Alternatively, run upgrade.sh which applies Migration 46 automatically." >&2
+        else
+            echo "$err_text" >&2
+        fi
+        return 1
+    fi
+    rm -f "$tmp_err"
+}
 
 usage() {
     cat >&2 <<EOF
@@ -48,13 +81,13 @@ case "$SUBCOMMAND" in
         ENTRY="$3"
         # Remove any existing entry with the same marker, then append the new one.
         # The `|| true` guards against grep returning exit code 1 when no lines match.
-        (crontab -l 2>/dev/null | grep -vF "$MARKER" || true; echo "$ENTRY") | crontab -
+        (crontab -l 2>/dev/null | grep -vF "$MARKER" || true; echo "$ENTRY") | crontab_write
         echo "Cron entry added: $ENTRY"
         ;;
 
     remove)
         # Strip all lines containing the marker. If none match, crontab is unchanged.
-        (crontab -l 2>/dev/null | grep -vF "$MARKER" || true) | crontab -
+        (crontab -l 2>/dev/null | grep -vF "$MARKER" || true) | crontab_write
         echo "Cron entry removed (marker: $MARKER)"
         ;;
 

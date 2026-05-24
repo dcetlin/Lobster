@@ -280,6 +280,8 @@ def store_memory_observation(obs: MemoryObservation, dry_run: bool) -> bool:
                json.dumps({"content": obs.text, "type": "note",
                            "tags": [obs.type], "source": "internal",
                            "valence": obs.valence,
+                           "subject": obs.type,
+                           "signal_type_hint": "philosophy",
                            "task_id": "philosophy-harvester"})]
 
     result = subprocess.run(mcp_cmd, capture_output=True, text=True, timeout=15)
@@ -297,6 +299,8 @@ def store_memory_observation(obs: MemoryObservation, dry_run: bool) -> bool:
         "tags": [obs.type],
         "source": "philosophy-harvester",
         "valence": obs.valence,
+        "subject": obs.type,
+        "signal_type_hint": "philosophy",
     }
     with pending_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")

@@ -4,14 +4,14 @@ Tests for scheduled-tasks/wos-health-check.py
 Tests are derived from the spec in the WOS audit doc (wos-audit-20260422.md)
 and issue #849:
 
-- Stale UoW detection: UoWs stuck in proposed/pending >STARVATION_THRESHOLD_HOURS
+- Stale UoW detection: UoWs stuck in proposed/pending >hc.STARVATION_THRESHOLD_HOURS
   are returned as starvation candidates.
 - Short-duration UoWs are not flagged as starvation candidates.
 - Heartbeat liveness: UoWs in active/executing with stale heartbeats are detected.
 - UoWs in active/executing with no heartbeat (NULL heartbeat_at) are reported
   as stall_type="no_heartbeat".
 - UoWs with a fresh heartbeat within heartbeat_ttl are NOT reported as stale.
-- Long-running in-flight UoWs (>ALERT_THRESHOLD_HOURS) trigger alert logic.
+- Long-running in-flight UoWs (>hc.ALERT_THRESHOLD_HOURS) trigger alert logic.
 - Executor heartbeat liveness check returns is_stale=True when log absent.
 - jobs.json enabled gate: job skips when disabled.
 """
@@ -47,13 +47,6 @@ def _load_module():
 
 hc = _load_module()
 
-# ---------------------------------------------------------------------------
-# Constants — must match the spec, not derived from implementation
-# ---------------------------------------------------------------------------
-
-STARVATION_THRESHOLD_HOURS = 24   # from audit doc: "starvation candidates" = >24h
-ALERT_THRESHOLD_HOURS = 48         # from audit doc: inbox alert for >48h in-flight
-HEARTBEAT_STALE_BUFFER_SECONDS = 60
 
 
 # ---------------------------------------------------------------------------
@@ -137,47 +130,47 @@ def _insert_uow(
 
 class TestQueryStarvationCandidates:
     def test_uow_stuck_in_proposed_beyond_threshold_is_returned(self, db_path):
-        _insert_uow(db_path, "uow-old", "proposed", created_hours_ago=STARVATION_THRESHOLD_HOURS + 1)
-        results = hc.query_starvation_candidates(db_path, STARVATION_THRESHOLD_HOURS)
+        _insert_uow(db_path, "uow-old", "proposed", created_hours_ago=hc.STARVATION_THRESHOLD_HOURS + 1)
+        results = hc.query_starvation_candidates(db_path, hc.STARVATION_THRESHOLD_HOURS)
         ids = [r["id"] for r in results]
         assert "uow-old" in ids
 
     def test_uow_stuck_in_pending_beyond_threshold_is_returned(self, db_path):
-        _insert_uow(db_path, "uow-pending", "pending", created_hours_ago=STARVATION_THRESHOLD_HOURS + 2)
-        results = hc.query_starvation_candidates(db_path, STARVATION_THRESHOLD_HOURS)
+        _insert_uow(db_path, "uow-pending", "pending", created_hours_ago=hc.STARVATION_THRESHOLD_HOURS + 2)
+        results = hc.query_starvation_candidates(db_path, hc.STARVATION_THRESHOLD_HOURS)
         ids = [r["id"] for r in results]
         assert "uow-pending" in ids
 
     def test_recent_proposed_uow_is_not_returned(self, db_path):
         _insert_uow(db_path, "uow-new", "proposed", created_hours_ago=1)
-        results = hc.query_starvation_candidates(db_path, STARVATION_THRESHOLD_HOURS)
+        results = hc.query_starvation_candidates(db_path, hc.STARVATION_THRESHOLD_HOURS)
         ids = [r["id"] for r in results]
         assert "uow-new" not in ids
 
     def test_uow_exactly_at_threshold_is_not_returned(self, db_path):
         # At exactly threshold hours, the UoW has NOT exceeded the threshold yet
-        _insert_uow(db_path, "uow-boundary", "proposed", created_hours_ago=STARVATION_THRESHOLD_HOURS - 0.01)
-        results = hc.query_starvation_candidates(db_path, STARVATION_THRESHOLD_HOURS)
+        _insert_uow(db_path, "uow-boundary", "proposed", created_hours_ago=hc.STARVATION_THRESHOLD_HOURS - 0.01)
+        results = hc.query_starvation_candidates(db_path, hc.STARVATION_THRESHOLD_HOURS)
         ids = [r["id"] for r in results]
         assert "uow-boundary" not in ids
 
     def test_active_uow_not_returned_as_starvation_candidate(self, db_path):
         # Starvation check only covers proposed/pending, not active
-        _insert_uow(db_path, "uow-active", "active", created_hours_ago=STARVATION_THRESHOLD_HOURS + 5)
-        results = hc.query_starvation_candidates(db_path, STARVATION_THRESHOLD_HOURS)
+        _insert_uow(db_path, "uow-active", "active", created_hours_ago=hc.STARVATION_THRESHOLD_HOURS + 5)
+        results = hc.query_starvation_candidates(db_path, hc.STARVATION_THRESHOLD_HOURS)
         ids = [r["id"] for r in results]
         assert "uow-active" not in ids
 
     def test_absent_db_returns_empty_list(self, tmp_path):
-        results = hc.query_starvation_candidates(tmp_path / "nonexistent.db", STARVATION_THRESHOLD_HOURS)
+        results = hc.query_starvation_candidates(tmp_path / "nonexistent.db", hc.STARVATION_THRESHOLD_HOURS)
         assert results == []
 
     def test_result_contains_age_hours_field(self, db_path):
-        _insert_uow(db_path, "uow-aged", "proposed", created_hours_ago=STARVATION_THRESHOLD_HOURS + 3)
-        results = hc.query_starvation_candidates(db_path, STARVATION_THRESHOLD_HOURS)
+        _insert_uow(db_path, "uow-aged", "proposed", created_hours_ago=hc.STARVATION_THRESHOLD_HOURS + 3)
+        results = hc.query_starvation_candidates(db_path, hc.STARVATION_THRESHOLD_HOURS)
         aged = next(r for r in results if r["id"] == "uow-aged")
         assert aged["age_hours"] is not None
-        assert aged["age_hours"] >= STARVATION_THRESHOLD_HOURS
+        assert aged["age_hours"] >= hc.STARVATION_THRESHOLD_HOURS
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +186,7 @@ class TestQueryStaleHeartbeats:
             created_hours_ago=2, started_hours_ago=2,
             heartbeat_at=stale_hb, heartbeat_ttl=300,
         )
-        results = hc.query_stale_heartbeats(db_path, HEARTBEAT_STALE_BUFFER_SECONDS)
+        results = hc.query_stale_heartbeats(db_path, hc.HEARTBEAT_STALE_BUFFER_SECONDS)
         ids = [r["id"] for r in results]
         assert "uow-stale-hb" in ids
         result = next(r for r in results if r["id"] == "uow-stale-hb")
@@ -207,7 +200,7 @@ class TestQueryStaleHeartbeats:
             created_hours_ago=1, started_hours_ago=1,
             heartbeat_at=fresh_hb, heartbeat_ttl=300,
         )
-        results = hc.query_stale_heartbeats(db_path, HEARTBEAT_STALE_BUFFER_SECONDS)
+        results = hc.query_stale_heartbeats(db_path, hc.HEARTBEAT_STALE_BUFFER_SECONDS)
         ids = [r["id"] for r in results]
         assert "uow-fresh-hb" not in ids
 
@@ -218,7 +211,7 @@ class TestQueryStaleHeartbeats:
             created_hours_ago=2, started_hours_ago=2,
             heartbeat_at=None, heartbeat_ttl=300,
         )
-        results = hc.query_stale_heartbeats(db_path, HEARTBEAT_STALE_BUFFER_SECONDS)
+        results = hc.query_stale_heartbeats(db_path, hc.HEARTBEAT_STALE_BUFFER_SECONDS)
         ids = [r["id"] for r in results]
         assert "uow-no-hb" in ids
         result = next(r for r in results if r["id"] == "uow-no-hb")
@@ -232,18 +225,18 @@ class TestQueryStaleHeartbeats:
             created_hours_ago=1, started_hours_ago=1,
             heartbeat_at=stale_hb, heartbeat_ttl=300,
         )
-        results = hc.query_stale_heartbeats(db_path, HEARTBEAT_STALE_BUFFER_SECONDS)
+        results = hc.query_stale_heartbeats(db_path, hc.HEARTBEAT_STALE_BUFFER_SECONDS)
         ids = [r["id"] for r in results]
         assert "uow-exec-stale" in ids
 
     def test_done_uow_not_included_in_heartbeat_check(self, db_path):
         _insert_uow(db_path, "uow-done", "done", created_hours_ago=5)
-        results = hc.query_stale_heartbeats(db_path, HEARTBEAT_STALE_BUFFER_SECONDS)
+        results = hc.query_stale_heartbeats(db_path, hc.HEARTBEAT_STALE_BUFFER_SECONDS)
         ids = [r["id"] for r in results]
         assert "uow-done" not in ids
 
     def test_absent_db_returns_empty_list(self, tmp_path):
-        results = hc.query_stale_heartbeats(tmp_path / "nonexistent.db", HEARTBEAT_STALE_BUFFER_SECONDS)
+        results = hc.query_stale_heartbeats(tmp_path / "nonexistent.db", hc.HEARTBEAT_STALE_BUFFER_SECONDS)
         assert results == []
 
 
@@ -298,10 +291,10 @@ class TestLongRunningAlert:
     def test_uow_stuck_beyond_alert_threshold_is_returned(self, db_path):
         _insert_uow(
             db_path, "uow-long", "active",
-            created_hours_ago=ALERT_THRESHOLD_HOURS + 1,
-            started_hours_ago=ALERT_THRESHOLD_HOURS + 1,
+            created_hours_ago=hc.ALERT_THRESHOLD_HOURS + 1,
+            started_hours_ago=hc.ALERT_THRESHOLD_HOURS + 1,
         )
-        results = hc.query_long_running_in_flight(db_path, ALERT_THRESHOLD_HOURS)
+        results = hc.query_long_running_in_flight(db_path, hc.ALERT_THRESHOLD_HOURS)
         ids = [r["id"] for r in results]
         assert "uow-long" in ids
 
@@ -310,6 +303,6 @@ class TestLongRunningAlert:
             db_path, "uow-recent", "active",
             created_hours_ago=1, started_hours_ago=1,
         )
-        results = hc.query_long_running_in_flight(db_path, ALERT_THRESHOLD_HOURS)
+        results = hc.query_long_running_in_flight(db_path, hc.ALERT_THRESHOLD_HOURS)
         ids = [r["id"] for r in results]
         assert "uow-recent" not in ids

@@ -55,9 +55,12 @@ _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from src.orchestration.paths import REGISTRY_DB
-from src.orchestration.steward import is_bootup_candidate_gate_active, run_steward_cycle
-from src.orchestration.github_sync import run_post_completion_sync
+from orchestration.paths import REGISTRY_DB
+from orchestration.steward import is_bootup_candidate_gate_active, run_steward_cycle
+from orchestration.github_sync import run_post_completion_sync
+from orchestration.dispatcher_handlers import read_wos_config, _PAUSE_REASON_USER_COMMAND
+from src.utils.jobs import is_job_enabled
+from src.utils.inbox_write import write_crash_alert
 
 # ---------------------------------------------------------------------------
 # Startup sweep — imported from startup_sweep.py (Phase 1 concern)
@@ -78,31 +81,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
 log = logging.getLogger("steward-heartbeat")
-
-
-# ---------------------------------------------------------------------------
-# jobs.json enabled gate — Type C dispatch path
-# ---------------------------------------------------------------------------
-
-def _is_job_enabled(job_name: str) -> bool:
-    """
-    Return True if the job is enabled in jobs.json, False if explicitly disabled.
-
-    Defaults to True when:
-    - jobs.json is absent
-    - the job entry is missing
-    - the file is unreadable or malformed
-
-    This mirrors the enabled gate pattern used by all Type C (cron-direct) scripts
-    so runtime enable/disable (e.g. "wos stop") is respected without touching cron.
-    """
-    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
-    jobs_file = workspace / "scheduled-jobs" / "jobs.json"
-    try:
-        data = json.loads(jobs_file.read_text())
-        return bool(data.get("jobs", {}).get(job_name, {}).get("enabled", True))
-    except Exception:
-        return True
 
 
 # ---------------------------------------------------------------------------
@@ -638,6 +616,136 @@ STUCK_HEARTBEAT_CONSECUTIVE_INTERVALS: int = 2
 STUCK_HEARTBEAT_MIN_DELTA: int = 0
 
 
+# ---------------------------------------------------------------------------
+# Named constants — backlog alert governor (Phase 2d)
+# ---------------------------------------------------------------------------
+
+TOXICITY_CONSECUTIVE_CYCLES: int = 3    # N strictly-increasing depth readings → toxicity
+STARVATION_CONSECUTIVE_CYCLES: int = 3  # N readings at/below threshold → starvation
+STARVATION_MIN_DEPTH: int = 0           # depth <= this value counts as starvation cycle
+_BACKLOG_STATE_MAX_AGE_SECONDS: int = 900  # 15 min — reset history if gap exceeds this
+
+
+@dataclass(frozen=True, slots=True)
+class SidecarMaskedResult:
+    """Pure result value returned by detect_sidecar_masked_uows."""
+    checked: int
+    recovered: int
+    skipped_dry_run: int
+
+
+# Grace window (seconds) before a UoW is eligible for sidecar-mask detection.
+# Matches the 5-minute threshold in the multiposture spec §2.3: a UoW must be
+# older than this before we expect its agent to have written a heartbeat.
+SIDECAR_MASK_MIN_AGE_SECONDS: int = 300
+
+
+def detect_sidecar_masked_uows(
+    registry,
+    dry_run: bool = False,
+    min_age_seconds: int = SIDECAR_MASK_MIN_AGE_SECONDS,
+) -> SidecarMaskedResult:
+    """
+    Detect and re-queue UoWs that are sidecar-masked (orphan_kill_before_start).
+
+    A sidecar-masked UoW has fresh heartbeat_at (written by the sidecar every
+    3 minutes) but no agent-originated entries in uow_heartbeat_log (no rows
+    with token_usage IS NOT NULL after the dispatch grace window). This means
+    the sidecar is masking a dead agent — the agent never ran or died before
+    its first write_heartbeat call.
+
+    This is the Change 1b detection path from the multi-posture spec §2.3:
+    the discriminator is token_usage presence in uow_heartbeat_log, not the
+    freshness of heartbeat_at.
+
+    Detection condition (all must hold):
+    - status IN ('active', 'executing')
+    - updated_at < now - min_age_seconds (past the startup grace window)
+    - No uow_heartbeat_log rows with token_usage IS NOT NULL after dispatch
+
+    Recovery action: transition to 'ready-for-steward' via
+    record_sidecar_masked_stall(), which writes a stall_detected audit entry
+    with stall_type='sidecar_masked'.
+
+    In dry_run mode: detects candidates but does NOT write audit entries or
+    transition status. Returns count in skipped_dry_run.
+
+    Args:
+        registry: WOSRegistry instance.
+        dry_run: If True, detect only — no state transitions.
+        min_age_seconds: Minimum UoW age before eligibility. Default 300s.
+
+    Returns:
+        SidecarMaskedResult(checked, recovered, skipped_dry_run).
+    """
+    try:
+        candidates = registry.get_sidecar_masked_uows(min_age_seconds=min_age_seconds)
+    except Exception as e:
+        log.warning("Sidecar-masked detection: failed to query candidates — %s", e)
+        return SidecarMaskedResult(checked=0, recovered=0, skipped_dry_run=0)
+
+    recovered = 0
+    skipped_dry_run = 0
+
+    for uow in candidates:
+        uow_id = uow.id if not isinstance(uow, dict) else uow["id"]
+
+        # Compute age for logging.
+        age_seconds: float = 0.0
+        try:
+            updated_at = uow.updated_at if not isinstance(uow, dict) else uow["updated_at"]
+            if updated_at:
+                age_seconds = (_utc_now() - _parse_iso(updated_at)).total_seconds()
+        except (ValueError, TypeError, AttributeError):
+            pass
+
+        if dry_run:
+            log.info(
+                "Sidecar-masked (DRY RUN): UoW %s would be re-queued "
+                "(age=%.0fs, no agent-originated heartbeats in uow_heartbeat_log)",
+                uow_id, age_seconds,
+            )
+            skipped_dry_run += 1
+            continue
+
+        try:
+            rows = registry.record_sidecar_masked_stall(
+                uow_id=uow_id,
+                age_seconds=age_seconds,
+            )
+        except Exception as e:
+            log.warning(
+                "Sidecar-masked: failed to re-queue UoW %s — %s",
+                uow_id, e,
+            )
+            continue
+
+        if rows == 1:
+            recovered += 1
+            log.warning(
+                "Sidecar-masked: UoW %s re-queued to ready-for-steward "
+                "(stall_type=sidecar_masked, age=%.0fs, "
+                "no agent-originated heartbeats found after grace window)",
+                uow_id, age_seconds,
+            )
+            _append_observation(
+                f"sidecar_masked: UoW {uow_id} re-queued — "
+                f"no agent heartbeats in uow_heartbeat_log after {int(age_seconds)}s "
+                f"(orphan_kill_before_start)"
+            )
+        else:
+            log.debug(
+                "Sidecar-masked: race on UoW %s — already advanced (rows_affected=0)",
+                uow_id,
+            )
+
+    return SidecarMaskedResult(
+        checked=len(candidates),
+        recovered=recovered,
+        skipped_dry_run=skipped_dry_run,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class StuckHeartbeatResult:
     """Pure result value returned by detect_stuck_heartbeat_uows."""
@@ -765,6 +873,167 @@ def detect_stuck_heartbeat_uows(
 
 
 # ---------------------------------------------------------------------------
+# Phase 2d: Backlog alerts — asymmetric governor (toxicity + starvation)
+# ---------------------------------------------------------------------------
+
+def _backlog_state_path() -> Path:
+    workspace = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+    return workspace / "logs" / "backlog-alert-state.json"
+
+
+def _load_backlog_state() -> dict:
+    """Load depth history from state file; return fresh state if absent or stale."""
+    path = _backlog_state_path()
+    try:
+        raw = json.loads(path.read_text())
+        last_updated = raw.get("last_updated")
+        if last_updated:
+            age = (_utc_now() - _parse_iso(last_updated)).total_seconds()
+            if age > _BACKLOG_STATE_MAX_AGE_SECONDS:
+                log.info(
+                    "Backlog alert state is stale (%.0fs > %ds) — resetting history",
+                    age, _BACKLOG_STATE_MAX_AGE_SECONDS,
+                )
+                return {"depths": [], "last_updated": None}
+        return raw
+    except Exception:
+        return {"depths": [], "last_updated": None}
+
+
+def _save_backlog_state(state: dict) -> None:
+    """Write depth history to state file atomically."""
+    path = _backlog_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+@dataclass(frozen=True, slots=True)
+class BacklogAlertResult:
+    """Pure result value returned by check_backlog_alerts."""
+    backlog_depth: int
+    toxicity_alert: bool
+    starvation_alert: bool
+
+
+def check_backlog_alerts(
+    registry,
+    dry_run: bool = False,
+) -> BacklogAlertResult:
+    """
+    Asymmetric governor — check ready-for-executor queue depth for toxicity
+    and starvation over consecutive heartbeat cycles.
+
+    Toxicity: depth has been strictly increasing for TOXICITY_CONSECUTIVE_CYCLES
+    consecutive cycles — executor is under-capacity relative to cultivator output.
+
+    Starvation: depth has been <= STARVATION_MIN_DEPTH for
+    STARVATION_CONSECUTIVE_CYCLES consecutive cycles — cultivator not proposing
+    or germinator not germinating; queue depth zero is not rest, it is throughput
+    death.
+
+    Cycle history is persisted to backlog-alert-state.json so consecutive-cycle
+    detection works across separate cron invocations. State older than
+    _BACKLOG_STATE_MAX_AGE_SECONDS is discarded (avoids false alerts after
+    planned downtime or steward disable).
+
+    In dry_run mode: detects conditions and logs them but does NOT write state
+    file or call _append_observation.
+
+    Returns BacklogAlertResult(backlog_depth, toxicity_alert, starvation_alert).
+    """
+    try:
+        ready = registry.list(status="ready-for-executor")
+        depth = len(ready)
+    except Exception as e:
+        log.warning("Backlog alert check: failed to query registry — %s", e)
+        return BacklogAlertResult(backlog_depth=0, toxicity_alert=False, starvation_alert=False)
+
+    state = _load_backlog_state()
+    depths: list[int] = state.get("depths", [])
+
+    depths.append(depth)
+    max_history = max(TOXICITY_CONSECUTIVE_CYCLES + 1, STARVATION_CONSECUTIVE_CYCLES)
+    depths = depths[-max_history:]
+
+    # Toxicity: last TOXICITY_CONSECUTIVE_CYCLES+1 depths are all strictly increasing.
+    toxicity_alert = False
+    needed_for_toxicity = TOXICITY_CONSECUTIVE_CYCLES + 1
+    if len(depths) >= needed_for_toxicity:
+        tail = depths[-needed_for_toxicity:]
+        if all(tail[i] < tail[i + 1] for i in range(len(tail) - 1)):
+            toxicity_alert = True
+
+    # Starvation: last STARVATION_CONSECUTIVE_CYCLES depths are all <= threshold.
+    starvation_alert = False
+    if len(depths) >= STARVATION_CONSECUTIVE_CYCLES:
+        tail = depths[-STARVATION_CONSECUTIVE_CYCLES:]
+        if all(d <= STARVATION_MIN_DEPTH for d in tail):
+            starvation_alert = True
+
+    if not dry_run:
+        state["depths"] = depths
+        state["last_updated"] = _now_iso()
+        _save_backlog_state(state)
+
+    if toxicity_alert:
+        growth = depths[-1] - depths[-needed_for_toxicity]
+        msg = (
+            f"backlog_toxicity: ready-for-executor queue growing for "
+            f"{TOXICITY_CONSECUTIVE_CYCLES} consecutive cycles "
+            f"(current_depth={depth}, growth=+{growth} over {TOXICITY_CONSECUTIVE_CYCLES} cycles) "
+            f"— executor under-capacity relative to cultivator output"
+        )
+        log.warning("%s", msg)
+        if not dry_run:
+            _append_observation(msg)
+
+    if starvation_alert:
+        # Guard: suppress the starvation alert when WOS execution is intentionally
+        # paused by the user. An empty ready-for-executor queue is expected and
+        # benign when execution_enabled=false and pause_reason="user_command".
+        # The alert is still emitted when execution_enabled=false but pause_reason
+        # is absent or not "user_command" — an infrastructure-triggered disable
+        # is not safe to suppress.
+        try:
+            _starvation_wos_config = read_wos_config()
+        except Exception:
+            _starvation_wos_config = {}
+
+        if (
+            not _starvation_wos_config.get("execution_enabled", True)
+            and _starvation_wos_config.get("pause_reason") == _PAUSE_REASON_USER_COMMAND
+        ):
+            log.info(
+                "backlog_starvation suppressed: wos execution intentionally paused "
+                "(execution_enabled=false, pause_reason=user_command) — "
+                "empty queue is expected"
+            )
+        else:
+            msg = (
+                f"backlog_starvation: ready-for-executor queue at zero for "
+                f"{STARVATION_CONSECUTIVE_CYCLES} consecutive cycles "
+                f"(current_depth={depth}) "
+                f"— cultivator not proposing or germinator not germinating; "
+                f"throughput death, not rest"
+            )
+            log.warning("%s", msg)
+            if not dry_run:
+                _append_observation(msg)
+
+    log.debug(
+        "Backlog alert check: depth=%d toxicity=%s starvation=%s history=%s",
+        depth, toxicity_alert, starvation_alert, depths,
+    )
+    return BacklogAlertResult(
+        backlog_depth=depth,
+        toxicity_alert=toxicity_alert,
+        starvation_alert=starvation_alert,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -774,6 +1043,16 @@ def main() -> int:
 
     Returns exit code: 0 on success, 1 on unhandled error.
     """
+    try:
+        return _main_inner()
+    except Exception as exc:
+        log.error("steward-heartbeat crashed with unhandled exception: %s", exc, exc_info=True)
+        write_crash_alert(job_name="steward-heartbeat", exc=exc)
+        return 1
+
+
+def _main_inner() -> int:
+    """Inner implementation of main() — wrapped by main() for crash alerting."""
     parser = argparse.ArgumentParser(description="Steward Heartbeat — WOS Phase 2")
     parser.add_argument(
         "--dry-run",
@@ -790,7 +1069,7 @@ def main() -> int:
 
     # jobs.json enabled gate — respect runtime enable/disable toggled via
     # the dispatcher commands or direct jobs.json edits.
-    if not _is_job_enabled("steward-heartbeat"):
+    if not is_job_enabled("steward-heartbeat"):
         log.info("Steward heartbeat: skipped (disabled in jobs.json)")
         return 0
 
@@ -799,7 +1078,7 @@ def main() -> int:
     gate_active = is_bootup_candidate_gate_active()
     log.info("BOOTUP_CANDIDATE_GATE = %s", gate_active)
 
-    from src.orchestration.registry import Registry
+    from orchestration.registry import Registry
 
     db_path = REGISTRY_DB
     if not db_path.exists():
@@ -826,7 +1105,18 @@ def main() -> int:
     # Phase 1: Startup sweep
     log.info("--- Phase 1: Startup sweep ---")
     try:
-        sweep_result = run_startup_sweep(registry, dry_run=dry_run, bootup_candidate_gate=gate_active)
+        # Read executing_orphan_threshold_seconds from wos-config.json so it can
+        # be tuned without a code change. Fallback is the constant default (1800 s).
+        _wos_cfg = read_wos_config()
+        _executing_orphan_threshold = int(
+            _wos_cfg.get("executing_orphan_threshold_seconds", 1800)
+        )
+        sweep_result = run_startup_sweep(
+            registry,
+            dry_run=dry_run,
+            bootup_candidate_gate=gate_active,
+            executing_orphan_threshold_seconds=_executing_orphan_threshold,
+        )
         log.info(
             "Startup sweep complete: active_swept=%d executor_orphans=%d "
             "diagnosing=%d skipped_dry_run=%d executing_orphans=%d",
@@ -866,6 +1156,23 @@ def main() -> int:
     except Exception:
         log.exception("Heartbeat stall recovery failed — continuing to Steward main loop")
 
+    # Phase 2b-ii: Sidecar-masked detection (Change 1b, multiposture-spec §2.3).
+    # Detects UoWs where heartbeat_at appears fresh (sidecar writes) but no
+    # agent-originated heartbeats exist in uow_heartbeat_log. These UoWs are
+    # classified as orphan_kill_before_start and re-queued regardless of
+    # heartbeat_at freshness.
+    # Requires: migration 0017 (uow_heartbeat_log table).
+    log.info("--- Phase 2b-ii: Sidecar-masked detection ---")
+    try:
+        masked_result = detect_sidecar_masked_uows(registry, dry_run=dry_run)
+        log.info(
+            "Sidecar-masked detection complete: %d checked, %d recovered, "
+            "%d skipped (dry-run)",
+            masked_result.checked, masked_result.recovered, masked_result.skipped_dry_run,
+        )
+    except Exception:
+        log.exception("Sidecar-masked detection failed — continuing to Steward main loop")
+
     # Phase 2c: Stuck-agent detection — progress governor (migration 0017, issue #994).
     # Agents that write heartbeats while consuming no tokens are alive but not progressing.
     # Detection only — no kill logic in this PR (future gate).
@@ -879,12 +1186,26 @@ def main() -> int:
     except Exception:
         log.exception("Stuck-agent detection failed — continuing to Steward main loop")
 
+    # Phase 2d: Backlog alerts — asymmetric governor (toxicity + starvation).
+    # Runs regardless of execution_enabled so monitoring is active even when WOS is paused.
+    log.info("--- Phase 2d: Backlog alerts ---")
+    try:
+        backlog_result = check_backlog_alerts(registry, dry_run=dry_run)
+        log.info(
+            "Backlog alert check complete: depth=%d toxicity=%s starvation=%s",
+            backlog_result.backlog_depth,
+            backlog_result.toxicity_alert,
+            backlog_result.starvation_alert,
+        )
+    except Exception:
+        log.exception("Backlog alert check failed — continuing to Steward main loop")
+
     # execution_enabled gate — mirrors the executor-heartbeat pattern.
     # Phases 0–2 (stale agent cleanup, startup sweep, observation loop) always
     # run because they are cheap and ensure state consistency even when WOS is
     # paused. Phase 3 (LLM prescription) and Phase 4 (GitHub sync) are skipped
     # when execution_enabled=false to prevent LLM cost drain.
-    from src.orchestration.dispatcher_handlers import is_execution_enabled
+    from orchestration.dispatcher_handlers import is_execution_enabled  # noqa: PLC0415
 
     # Alert condition 2: queue depth when execution is disabled (#618).
     # Check before skipping Phase 3 so the alert fires even when WOS is paused.

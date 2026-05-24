@@ -260,7 +260,7 @@ def promote_to_wos(
 
     Naming note: this function is part of the *GitHub Issue Cultivator* scheduled
     job. The Germinator (germinator.py) is a separate component called here at
-    germination time. See docs/WOS-INDEX.md for the component glossary.
+    germination time. See docs/wos/current/INDEX.md for the component glossary.
 
     Note: source is written by Registry as "github:issue/{number}" which traces
     back to dcetlin/Lobster since that is the only repo cultivator operates on.

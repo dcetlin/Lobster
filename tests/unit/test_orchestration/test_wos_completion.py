@@ -1565,3 +1565,214 @@ class TestOutcomeCategoryForwarding:
             ).fetchone()["outcome_category"]
             conn.close()
             assert stored == label, f"Expected {label!r} stored, got {stored!r}"
+
+
+# ---------------------------------------------------------------------------
+# token_usage written to result.json (issue #1033)
+# ---------------------------------------------------------------------------
+
+#: Named constant anchoring tests to the issue spec: token_usage must appear in
+#: result.json so per-UoW cost is visible to tooling that reads files directly.
+TOKEN_USAGE_FIELD = "token_usage"
+
+
+class TestTokenUsageInResultJson:
+    """
+    token_usage must be present in result.json after a successful UoW completion
+    when the subagent reports it via write_result.
+
+    Before issue #1033, token_usage was stored only in the registry DB (SQLite).
+    The fix threads it through _enrich_result_file and _backpropagate_result_to_output_file
+    so the on-disk file matches the DB.
+    """
+
+    def _seed_executing_uow(self, registry: Registry, output_dir: Path) -> tuple[str, str]:
+        """Seed a UoW and advance it to 'executing'. Returns (uow_id, output_ref)."""
+        result = registry.upsert(
+            issue_number=9910,
+            title="Token usage result.json test UoW",
+            success_criteria="token_usage appears in result.json",
+        )
+        assert isinstance(result, UpsertInserted)
+        uow_id = result.id
+        registry.approve(uow_id)
+
+        output_ref = str(output_dir / f"{uow_id}.json")
+        registry.set_status_direct(uow_id, "active")
+        conn = sqlite3.connect(str(registry.db_path))
+        conn.execute(
+            "UPDATE uow_registry SET output_ref = ? WHERE id = ?",
+            (output_ref, uow_id),
+        )
+        conn.commit()
+        conn.close()
+        registry.transition_to_executing(uow_id, "mock-executor-token-test")
+        return uow_id, output_ref
+
+    def test_token_usage_written_to_backpropagated_result_json(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        When no result.json exists before completion and token_usage is provided,
+        _backpropagate_result_to_output_file must include token_usage in the
+        synthetic result.json it creates.
+        """
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id, output_ref = self._seed_executing_uow(registry, output_dir)
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        with patch("orchestration.wos_completion.subprocess.run"), \
+             patch.dict(os.environ, {"REGISTRY_DB_PATH": str(db_path)}):
+            maybe_complete_wos_uow(
+                task_id,
+                WRITE_RESULT_SUCCESS_STATUS,
+                result_text="PR #99 opened on dcetlin/Lobster.",
+                token_usage=42000,
+            )
+
+        # Derive result.json path (mirrors _result_json_path convention)
+        p = Path(output_ref)
+        result_path = p.with_suffix(".result.json") if p.suffix else Path(str(p) + ".result.json")
+
+        assert result_path.exists(), f"result.json must exist at {result_path}"
+        import json
+        payload = json.loads(result_path.read_text())
+        assert TOKEN_USAGE_FIELD in payload, (
+            f"result.json must contain '{TOKEN_USAGE_FIELD}' field. "
+            f"Found keys: {list(payload.keys())}"
+        )
+        assert payload[TOKEN_USAGE_FIELD] == 42000, (
+            f"token_usage must be 42000, got {payload[TOKEN_USAGE_FIELD]!r}"
+        )
+
+    def test_token_usage_written_when_result_json_already_exists(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        When a result.json already exists (written by the subagent via result_writer),
+        _enrich_result_file must add token_usage to it without clobbering existing fields.
+        """
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id, output_ref = self._seed_executing_uow(registry, output_dir)
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        # Pre-write a result.json as if the subagent used result_writer
+        p = Path(output_ref)
+        result_path = p.with_suffix(".result.json") if p.suffix else Path(str(p) + ".result.json")
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        import json
+        existing_payload = {
+            "status": "complete",
+            "outcome": "complete",
+            "success": True,
+            "summary": "PR #77 opened.",
+            "written_at": "2026-01-01T00:00:00+00:00",
+        }
+        result_path.write_text(json.dumps(existing_payload, indent=2))
+
+        with patch("orchestration.wos_completion.subprocess.run"), \
+             patch.dict(os.environ, {"REGISTRY_DB_PATH": str(db_path)}):
+            maybe_complete_wos_uow(
+                task_id,
+                WRITE_RESULT_SUCCESS_STATUS,
+                result_text="PR #77 opened.",
+                token_usage=8500,
+            )
+
+        payload = json.loads(result_path.read_text())
+        assert TOKEN_USAGE_FIELD in payload, (
+            f"_enrich_result_file must add '{TOKEN_USAGE_FIELD}' to existing result.json. "
+            f"Found keys: {list(payload.keys())}"
+        )
+        assert payload[TOKEN_USAGE_FIELD] == 8500, (
+            f"token_usage must be 8500, got {payload[TOKEN_USAGE_FIELD]!r}"
+        )
+        # Existing fields must be preserved
+        assert payload.get("summary") == "PR #77 opened.", "existing summary must be preserved"
+        assert payload.get("success") is True, "existing success field must be preserved"
+
+    def test_token_usage_absent_when_not_provided(self, tmp_path: Path) -> None:
+        """
+        When write_result is called without token_usage, the result.json must not
+        contain the token_usage field — absence is correct, not zero.
+        """
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id, output_ref = self._seed_executing_uow(registry, output_dir)
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        with patch("orchestration.wos_completion.subprocess.run"), \
+             patch.dict(os.environ, {"REGISTRY_DB_PATH": str(db_path)}):
+            maybe_complete_wos_uow(
+                task_id,
+                WRITE_RESULT_SUCCESS_STATUS,
+                result_text="Completed without token count.",
+                token_usage=None,
+            )
+
+        p = Path(output_ref)
+        result_path = p.with_suffix(".result.json") if p.suffix else Path(str(p) + ".result.json")
+
+        if result_path.exists():
+            import json
+            payload = json.loads(result_path.read_text())
+            assert TOKEN_USAGE_FIELD not in payload, (
+                f"token_usage must not appear in result.json when not provided. "
+                f"Found: {payload.get(TOKEN_USAGE_FIELD)!r}"
+            )
+
+    def test_existing_token_usage_in_result_json_is_not_overwritten(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        If a result.json already has a token_usage field (written by the subagent
+        itself via result_writer), _enrich_result_file must not overwrite it.
+        """
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id, output_ref = self._seed_executing_uow(registry, output_dir)
+        task_id = f"{WOS_TASK_ID_PREFIX}{uow_id}"
+
+        p = Path(output_ref)
+        result_path = p.with_suffix(".result.json") if p.suffix else Path(str(p) + ".result.json")
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        import json
+        # Subagent pre-wrote its own token_usage = 5000
+        existing_payload = {
+            "status": "complete",
+            "outcome": "complete",
+            "success": True,
+            "summary": "Done.",
+            "written_at": "2026-01-01T00:00:00+00:00",
+            "token_usage": 5000,
+        }
+        result_path.write_text(json.dumps(existing_payload, indent=2))
+
+        with patch("orchestration.wos_completion.subprocess.run"), \
+             patch.dict(os.environ, {"REGISTRY_DB_PATH": str(db_path)}):
+            maybe_complete_wos_uow(
+                task_id,
+                WRITE_RESULT_SUCCESS_STATUS,
+                result_text="Done.",
+                token_usage=9999,  # different value — must not overwrite the existing 5000
+            )
+
+        payload = json.loads(result_path.read_text())
+        assert payload.get(TOKEN_USAGE_FIELD) == 5000, (
+            f"Pre-existing token_usage=5000 must not be overwritten. "
+            f"Got {payload.get(TOKEN_USAGE_FIELD)!r}"
+        )

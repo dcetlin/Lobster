@@ -3,9 +3,18 @@ Central timezone utility for Lobster.
 
 Rules:
   - All internal storage uses UTC (timezone-aware datetimes).
-  - All display/output to users adapts to the owner's timezone, read from
-    owner.toml (field: owner.timezone).
+  - All display/output to users adapts to the owner's configured timezone.
   - Falls back to UTC if no timezone is configured.
+
+Timezone resolution priority (highest to lowest):
+  1. Explicit ``user_tz`` argument passed to the display helpers.
+  2. ``LOBSTER_USER_TZ`` environment variable (IANA name, e.g. 'America/New_York').
+  3. ``owner.toml`` field ``owner.timezone``.
+  4. UTC fallback.
+
+To change the system timezone without editing owner.toml, set::
+
+    export LOBSTER_USER_TZ=America/New_York   # or any IANA zone
 
 Public API
 ----------
@@ -14,15 +23,13 @@ Public API
   to_user_tz(dt, user_tz=None)      -> datetime (user-tz-aware)
   format_for_user(dt, fmt=..., user_tz=None) -> str
   format_iso_for_user(iso_str, fmt=..., user_tz=None) -> str
-  get_owner_tz_name()               -> str  (IANA name, e.g. 'America/Los_Angeles')
+  get_owner_tz_name()               -> str  (IANA name, e.g. 'America/New_York')
   get_owner_zoneinfo()              -> ZoneInfo
 
-Per-user timezone overrides
+Per-call timezone overrides
 ---------------------------
   Pass ``user_tz`` (IANA string or ZoneInfo) to any ``to_user_tz`` /
-  ``format_for_user`` call.  The owner.toml timezone is the default; per-user
-  overrides are stored in the user model (observation key "timezone") and can be
-  passed through by callers who have already resolved the preference.
+  ``format_for_user`` call.  The configured timezone is the default.
 
   Example::
 
@@ -34,9 +41,15 @@ Stdlib-only — no third-party dependencies required.
 
 from __future__ import annotations
 
+import os
 import zoneinfo
 from datetime import datetime, timezone as _tz_utc
 from typing import Union
+
+# Environment variable name for the global timezone override.
+# Set this to an IANA timezone string (e.g. "America/New_York") to override
+# the owner.toml setting without editing any config files.
+LOBSTER_USER_TZ_ENV = "LOBSTER_USER_TZ"
 
 # Type alias accepted by public helpers
 _TZish = Union[str, zoneinfo.ZoneInfo, None]
@@ -76,23 +89,40 @@ def _resolve_tz(user_tz: _TZish) -> zoneinfo.ZoneInfo:
 
 def get_owner_tz_name() -> str:
     """
-    Return the owner's IANA timezone string from owner.toml.
+    Return the user's IANA timezone string.
 
-    Falls back to 'UTC' if not configured or on any error.
+    Resolution order (first non-empty value wins):
+      1. ``LOBSTER_USER_TZ`` environment variable
+      2. ``owner.toml`` field ``owner.timezone``
+      3. ``'UTC'`` fallback
+
+    The returned name is always non-empty and safe to pass to ``zoneinfo.ZoneInfo()``.
+    If the name is invalid (unknown IANA zone), ``get_owner_zoneinfo()`` falls back
+    to UTC so callers never crash.
     """
+    # 1. Environment variable override — highest priority
+    env_tz = os.environ.get(LOBSTER_USER_TZ_ENV, "").strip()
+    if env_tz:
+        return env_tz
+
+    # 2. owner.toml — try direct import first, then package-qualified path
     try:
         from user_model.owner import get_owner_timezone as _get
         name = _get()
-        return name if name else "UTC"
+        if name:
+            return name
     except Exception:
         pass
-    # Secondary fallback: try importing via package path
     try:
         from mcp.user_model.owner import get_owner_timezone as _get2
         name = _get2()
-        return name if name else "UTC"
+        if name:
+            return name
     except Exception:
-        return "UTC"
+        pass
+
+    # 3. UTC fallback
+    return "UTC"
 
 
 def get_owner_zoneinfo() -> zoneinfo.ZoneInfo:

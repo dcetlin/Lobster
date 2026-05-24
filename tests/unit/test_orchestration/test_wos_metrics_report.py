@@ -51,6 +51,7 @@ EXPECTED_TOP_LEVEL_KEYS = {
     "diagnostic_accuracy",
     "convergence",
     "complexity",
+    "outcome_cost",
 }
 
 

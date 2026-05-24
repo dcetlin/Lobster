@@ -21,6 +21,8 @@ HYGIENE_DIR = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-wo
 STALE_THRESHOLD_DAYS = 60
 JACCARD_THRESHOLD = 0.7
 EXEMPT_LABELS = {"design-seed"}
+# Rotation state written *after* Night 4 sweep completes (off-by-one is intentional)
+NIGHT4_ROTATION_STATE = 5
 
 # Template noise strings — issues whose body is only these are considered empty
 TEMPLATE_DEFAULTS = {
@@ -65,7 +67,7 @@ def is_night4_rotation() -> bool:
     state_file = HYGIENE_DIR / "rotation-state.json"
     try:
         state = json.loads(state_file.read_text())
-        return int(state["current_night"]) == 5
+        return int(state["current_night"]) == NIGHT4_ROTATION_STATE
     except Exception:
         return False
 

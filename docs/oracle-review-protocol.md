@@ -81,6 +81,12 @@ Do NOT apply to:
 - Short reference stubs or index files
 - Internal scaffolding files
 
+### oracle_status frontmatter on agent definitions
+
+The `oracle_status: approved` field in `.claude/agents/lobster-oracle.md` is **not a template** for other agent definitions. It is present on the oracle agent only as an exceptional self-applying test — the oracle agent definition is itself a substantial document (it was reviewed in PR #864) and carries frontmatter to record that review status, exactly as any other substantial document would.
+
+No other agent definition requires `oracle_status` frontmatter. No code reads this field from agent definitions. Adding it to other agent definitions has no behavioral effect and should not be done.
+
 ## Integration with Delivery
 
 See `sys.subagent.bootup.md` for the pre-delivery check: before calling `send_reply` to deliver a substantial document, verify that `oracle_status: approved` is present in its frontmatter. If not, use `write_task_output` with `status=pending` and stop.

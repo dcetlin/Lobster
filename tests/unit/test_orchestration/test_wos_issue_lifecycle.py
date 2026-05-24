@@ -45,8 +45,10 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from orchestration.wos_issue_lifecycle import (
+    HUMAN_GATE_LABELS,
     WOS_EXECUTING_LABEL,
     WOS_EXECUTING_LABEL_COLOR,
+    is_pr_human_gated,
     stamp_issue_executing,
     stamp_issue_complete,
     stamp_issue_failed,
@@ -434,3 +436,62 @@ class TestStampIssueUnverifiable:
             result = stamp_issue_unverifiable(_TEST_ISSUE, _TEST_UOW_ID, repo=_TEST_REPO)
 
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# is_pr_human_gated
+# ---------------------------------------------------------------------------
+
+class TestIsPrHumanGated:
+    """Tests for the PR human-gate label check."""
+
+    def test_pr_carrying_human_gate_label_returns_label(self) -> None:
+        """
+        When the PR carries a label in HUMAN_GATE_LABELS, returns the first
+        gate label found (a truthy non-None string).
+        """
+        import json as _json
+        gate_label = next(iter(sorted(HUMAN_GATE_LABELS)))  # deterministic: first alphabetically
+        stdout = _json.dumps([gate_label, "bug", "enhancement"])
+        result_proc = _make_completed_process(returncode=0, stdout=stdout)
+
+        with patch("subprocess.run", return_value=result_proc):
+            result = is_pr_human_gated(99, _TEST_REPO)
+
+        assert result == gate_label, (
+            f"Expected first gate label found ({gate_label!r}), got {result!r}"
+        )
+
+    def test_pr_with_no_human_gate_labels_returns_none(self) -> None:
+        """
+        When the PR carries no labels in HUMAN_GATE_LABELS, returns None —
+        indicating automated close is permitted.
+        """
+        import json as _json
+        stdout = _json.dumps(["bug", "enhancement", "wip"])
+        result_proc = _make_completed_process(returncode=0, stdout=stdout)
+
+        with patch("subprocess.run", return_value=result_proc):
+            result = is_pr_human_gated(99, _TEST_REPO)
+
+        assert result is None, (
+            f"Expected None for a PR with no gate labels, got {result!r}"
+        )
+
+    def test_gh_cli_failure_returns_unknown_check_failed(self) -> None:
+        """
+        When the gh CLI raises (network error, auth failure, etc.),
+        returns 'unknown-check-failed' — a non-None value that causes
+        callers to treat the PR as gated and skip the close operation.
+        """
+        with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "gh")):
+            result = is_pr_human_gated(99, _TEST_REPO)
+
+        assert result == "unknown-check-failed", (
+            f"Expected 'unknown-check-failed' on gh CLI failure, got {result!r}"
+        )
+        # Non-None is the critical property: callers must not proceed on failure
+        assert result is not None, (
+            "is_pr_human_gated must return a non-None value on failure "
+            "so callers treat the PR as gated"
+        )

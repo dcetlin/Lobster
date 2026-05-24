@@ -75,10 +75,10 @@ def _make_steward_result(prescribed=0):
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# Load the module once at module level for constant access
 # ---------------------------------------------------------------------------
 
-HIGH_THRESHOLD = 10  # must match HIGH_PRESCRIPTION_THRESHOLD in steward-heartbeat.py
+_steward_hb = _load_steward_heartbeat()
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +95,7 @@ class TestPrescriptionsTaskOutput:
         db_path.touch()
         prescribed_count = 3
 
-        with patch.object(steward_heartbeat, "_is_job_enabled", return_value=True), \
+        with patch.object(steward_heartbeat, "is_job_enabled", return_value=True), \
              patch.object(steward_heartbeat, "is_bootup_candidate_gate_active", return_value=False), \
              patch("src.orchestration.dispatcher_handlers.is_execution_enabled", return_value=True), \
              patch.object(steward_heartbeat, "_default_db_path", return_value=db_path), \
@@ -128,7 +128,7 @@ class TestPrescriptionsTaskOutput:
         db_path = tmp_path / "registry.db"
         db_path.touch()
 
-        with patch.object(steward_heartbeat, "_is_job_enabled", return_value=True), \
+        with patch.object(steward_heartbeat, "is_job_enabled", return_value=True), \
              patch.object(steward_heartbeat, "is_bootup_candidate_gate_active", return_value=False), \
              patch("src.orchestration.dispatcher_handlers.is_execution_enabled", return_value=True), \
              patch.object(steward_heartbeat, "_default_db_path", return_value=db_path), \
@@ -166,9 +166,9 @@ class TestHighPrescriptionAlert:
         steward_heartbeat = _load_steward_heartbeat()
         db_path = tmp_path / "registry.db"
         db_path.touch()
-        prescribed_count = HIGH_THRESHOLD + 1  # 11
+        prescribed_count = _steward_hb.HIGH_PRESCRIPTION_THRESHOLD + 1  # 11
 
-        with patch.object(steward_heartbeat, "_is_job_enabled", return_value=True), \
+        with patch.object(steward_heartbeat, "is_job_enabled", return_value=True), \
              patch.object(steward_heartbeat, "is_bootup_candidate_gate_active", return_value=False), \
              patch("src.orchestration.dispatcher_handlers.is_execution_enabled", return_value=True), \
              patch.object(steward_heartbeat, "_default_db_path", return_value=db_path), \
@@ -208,7 +208,7 @@ class TestHighPrescriptionAlert:
         db_path = tmp_path / "registry.db"
         db_path.touch()
 
-        with patch.object(steward_heartbeat, "_is_job_enabled", return_value=True), \
+        with patch.object(steward_heartbeat, "is_job_enabled", return_value=True), \
              patch.object(steward_heartbeat, "is_bootup_candidate_gate_active", return_value=False), \
              patch("src.orchestration.dispatcher_handlers.is_execution_enabled", return_value=True), \
              patch.object(steward_heartbeat, "_default_db_path", return_value=db_path), \
@@ -221,7 +221,7 @@ class TestHighPrescriptionAlert:
              patch.object(steward_heartbeat, "run_observation_loop",
                           return_value=Mock(checked=0, stalled=0, skipped_dry_run=0)), \
              patch.object(steward_heartbeat, "run_steward_cycle",
-                          return_value=_make_steward_result(prescribed=HIGH_THRESHOLD)), \
+                          return_value=_make_steward_result(prescribed=_steward_hb.HIGH_PRESCRIPTION_THRESHOLD)), \
              patch.object(steward_heartbeat, "run_post_completion_sync",
                           return_value=Mock(synced=0, skipped_no_url=0, failed=0, errors=[])), \
              patch.object(steward_heartbeat, "_write_task_output"), \
@@ -244,7 +244,7 @@ class TestHighPrescriptionAlert:
         db_path = tmp_path / "registry.db"
         db_path.touch()
 
-        with patch.object(steward_heartbeat, "_is_job_enabled", return_value=True), \
+        with patch.object(steward_heartbeat, "is_job_enabled", return_value=True), \
              patch.object(steward_heartbeat, "is_bootup_candidate_gate_active", return_value=False), \
              patch("src.orchestration.dispatcher_handlers.is_execution_enabled", return_value=True), \
              patch.object(steward_heartbeat, "_default_db_path", return_value=db_path), \
@@ -290,7 +290,7 @@ class TestQueueDepthAlert:
         eligible_uows = [Mock(), Mock(), Mock()]
         registry = _make_mock_registry(ready_for_steward_uows=eligible_uows)
 
-        with patch.object(steward_heartbeat, "_is_job_enabled", return_value=True), \
+        with patch.object(steward_heartbeat, "is_job_enabled", return_value=True), \
              patch.object(steward_heartbeat, "is_bootup_candidate_gate_active", return_value=False), \
              patch("src.orchestration.dispatcher_handlers.is_execution_enabled", return_value=False), \
              patch.object(steward_heartbeat, "_default_db_path", return_value=db_path), \
@@ -326,7 +326,7 @@ class TestQueueDepthAlert:
 
         registry = _make_mock_registry(ready_for_steward_uows=[])
 
-        with patch.object(steward_heartbeat, "_is_job_enabled", return_value=True), \
+        with patch.object(steward_heartbeat, "is_job_enabled", return_value=True), \
              patch.object(steward_heartbeat, "is_bootup_candidate_gate_active", return_value=False), \
              patch("src.orchestration.dispatcher_handlers.is_execution_enabled", return_value=False), \
              patch.object(steward_heartbeat, "_default_db_path", return_value=db_path), \
@@ -360,7 +360,7 @@ class TestQueueDepthAlert:
         eligible_uows = [Mock() for _ in range(5)]
         registry = _make_mock_registry(ready_for_steward_uows=eligible_uows)
 
-        with patch.object(steward_heartbeat, "_is_job_enabled", return_value=True), \
+        with patch.object(steward_heartbeat, "is_job_enabled", return_value=True), \
              patch.object(steward_heartbeat, "is_bootup_candidate_gate_active", return_value=False), \
              patch("src.orchestration.dispatcher_handlers.is_execution_enabled", return_value=True), \
              patch.object(steward_heartbeat, "_default_db_path", return_value=db_path), \

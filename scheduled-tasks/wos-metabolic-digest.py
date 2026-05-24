@@ -2,28 +2,42 @@
 """
 WOS Metabolic Digest — daily pipeline health signal.
 
-Runs once per day (default 09:00 UTC). On each invocation:
-1. Reads UoWs completed (status changed to 'done' or 'failed') in the past 24h.
-2. Classifies each as pearl/heat/seed/shit based on outcome heuristics.
-3. Computes aggregates: total by classification, average duration, register breakdown.
-4. Sends a Telegram message to the admin chat_id with the digest.
-5. Writes output to the scheduled-jobs log.
+Runs once per day (default 10:00 UTC / 6 AM ET). On each invocation:
+1. Reads UoWs that transitioned to a terminal status (done/failed/expired/cancelled)
+   in the past 24h.
+2. Uses outcome_category from uow_registry (real-time classification set at
+   write_result time) — no heuristic re-classification needed.
+3. Computes aggregates: total by outcome category, average tokens, average cycles,
+   seeds surfaced (interim: from artifacts table), gate churn (from gate_fired column).
+4. Formats a Telegram-friendly digest per the WOS completion report spec.
+5. Writes an inbox message for the dispatcher to relay, then writes job output.
 
-Classification heuristics (from the audit doc and WOS architecture):
-  pearl — UoW produced a PR or implementation (output_ref has content, outcome 'complete',
-           close_reason mentions 'pr' or 'implementation')
-  heat  — UoW produced a review or analysis (output_ref has content, outcome 'complete',
-           close_reason mentions 'review' or 'analysis' or 'design')
-  seed  — UoW created a new issue or follow-up (close_reason matches phrase-level patterns
-           like 'opened issue #N', 'spawned issue', 'created uow', 'seeded', 'follow-up')
-  shit  — UoW failed, expired, hit TTL, or produced no verifiable output
+Classification source:
+  outcome_category is set at write_result time by the subagent (pearl/heat/seed/shit).
+  UoWs without outcome_category (pre-migration, or subagent did not classify) are
+  counted as 'shit' (no verifiable outcome signal) for digest purposes.
 
-Cron schedule (daily at 09:00 UTC):
-    0 9 * * * cd ~/lobster && uv run scheduled-tasks/wos-metabolic-digest.py >> ~/lobster-workspace/scheduled-jobs/logs/wos-metabolic-digest.log 2>&1 # LOBSTER-WOS-METABOLIC-DIGEST
+Digest suppression:
+  - Zero completed UoWs today → no message sent (idle-day suppression per spec).
+  - 1–2 completed UoWs → one-liner format.
+  - 3+ completed UoWs → full digest format per spec.
 
-Type C dispatch: cron calls this script directly (no inbox/ message, no dispatcher
-involvement). The jobs.json enabled gate is checked at the top of main() so that
-runtime enable/disable is respected without touching cron.
+Gate churn (requires migration 0019 gate_fired column):
+  - spiral   — escalate verdict (infinite-loop risk)
+  - dead_end — pause verdict (stuck UoW)
+  - burst    — throttle verdict (queue overload)
+  - none     — clean dispatch path
+
+Seeds surfaced (interim approximation):
+  Count of artifacts with category='seed' across completed UoWs (over-counts
+  auto-extracted issue refs but acceptable until migration 0020 lands structured seeds).
+
+Cron schedule (daily at 10:00 UTC / 6 AM ET):
+    0 10 * * * cd ~/lobster && uv run scheduled-tasks/wos-metabolic-digest.py >> ~/lobster-workspace/scheduled-jobs/logs/wos-metabolic-digest.log 2>&1 # LOBSTER-WOS-METABOLIC-DIGEST
+
+Type B dispatch: cron calls this script directly (no inbox/ message, no LLM round-trip).
+The jobs.json enabled gate is checked at the top of main() so that runtime enable/disable
+is respected without touching cron.
 
 Run standalone:
     uv run ~/lobster/scheduled-tasks/wos-metabolic-digest.py [--dry-run] [--hours N]
@@ -35,7 +49,6 @@ import argparse
 import json
 import logging
 import os
-import re
 import sqlite3
 import sys
 import uuid
@@ -49,6 +62,8 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+from src.utils.jobs import is_job_enabled  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -76,11 +91,28 @@ ADMIN_CHAT_ID: str = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586")
 # Terminal statuses that indicate a UoW completed in some form
 TERMINAL_STATUSES: tuple[str, ...] = ("done", "failed", "expired", "cancelled")
 
-# Outcome category names (from the audit doc and WOS architecture)
+# Outcome category names per WOS metabolic taxonomy
 OUTCOME_PEARL = "pearl"
 OUTCOME_HEAT = "heat"
 OUTCOME_SEED = "seed"
 OUTCOME_SHIT = "shit"
+
+# All valid outcome categories (any other value or NULL → shit)
+VALID_OUTCOME_CATEGORIES: frozenset[str] = frozenset({
+    OUTCOME_PEARL, OUTCOME_HEAT, OUTCOME_SEED, OUTCOME_SHIT,
+})
+
+# Gate churn labels (from migration 0019 gate_fired column)
+GATE_SPIRAL = "spiral"
+GATE_DEAD_END = "dead_end"
+GATE_BURST = "burst"
+GATE_NONE = "none"
+
+# Minimum UoW count to emit the full digest format (per spec)
+FULL_DIGEST_THRESHOLD: int = 3
+
+# Default stall threshold for still-running UoWs
+STALL_THRESHOLD_HOURS: int = 6
 
 
 # ---------------------------------------------------------------------------
@@ -98,198 +130,9 @@ def _registry_db_path() -> Path:
     return _workspace() / "orchestration" / "registry.db"
 
 
-def _jobs_file() -> Path:
-    return _workspace() / "scheduled-jobs" / "jobs.json"
-
-
 def _inbox_dir() -> Path:
     messages_base = Path(os.environ.get("LOBSTER_MESSAGES", Path.home() / "messages"))
     return messages_base / "inbox"
-
-
-# ---------------------------------------------------------------------------
-# jobs.json enabled gate — Type C dispatch pattern
-# ---------------------------------------------------------------------------
-
-def _is_job_enabled() -> bool:
-    """
-    Return True if this job is enabled in jobs.json, False if explicitly disabled.
-
-    Defaults to True when:
-    - jobs.json is absent
-    - the job entry is missing
-    - the file is unreadable or malformed
-    """
-    try:
-        data = json.loads(_jobs_file().read_text())
-        return bool(data.get("jobs", {}).get(JOB_NAME, {}).get("enabled", True))
-    except Exception:
-        return True
-
-
-# ---------------------------------------------------------------------------
-# Classification heuristics — pure functions, testable without DB
-# ---------------------------------------------------------------------------
-
-def classify_uow(uow: dict) -> str:
-    """
-    Classify a completed UoW into one of: pearl, heat, seed, shit.
-
-    Classification is based on close_reason, output_ref size, and status.
-    The heuristics are intentionally simple and conservative — when in doubt,
-    classify as 'shit' (no verifiable output). Callers can tune thresholds
-    by modifying the keyword sets below.
-
-    Args:
-        uow: A dict with keys: id, status, close_reason, output_ref, register,
-             steward_cycles, started_at, closed_at.
-
-    Returns:
-        One of: "pearl", "heat", "seed", "shit"
-    """
-    status = (uow.get("status") or "").lower()
-    close_reason = (uow.get("close_reason") or "").lower()
-    output_ref = uow.get("output_ref") or ""
-
-    # shit: definitively failed, expired, or TTL-exceeded
-    if status in ("failed", "expired", "cancelled"):
-        return OUTCOME_SHIT
-    if "ttl_exceeded" in close_reason or "ttl" in close_reason:
-        return OUTCOME_SHIT
-    if "hard_cap" in close_reason or "user_closed" in close_reason:
-        return OUTCOME_SHIT
-
-    # For 'done' UoWs, classify by close_reason and output content
-    if status != "done":
-        return OUTCOME_SHIT  # any non-terminal status that reached here is unexpected
-
-    # seed: spawned a new issue or seeded future work.
-    # Use phrase-level patterns to avoid false positives from close_reason values
-    # that merely reference a source issue without creating a new one.
-    # "issue" as a bare substring is too broad — "issue #456 was referenced in this
-    # pr" or "issue analysis complete" would incorrectly classify as seed.
-    _SEED_ISSUE_PATTERN = re.compile(
-        r"(opened|created|filed|new|spawned)\s+issue\s*#?\d*",
-        re.IGNORECASE,
-    )
-    _SEED_UOW_PATTERN = re.compile(
-        r"(spawned|created|spawn)\s+(uow|new\s+uow)",
-        re.IGNORECASE,
-    )
-    if (
-        _SEED_ISSUE_PATTERN.search(close_reason)
-        or _SEED_UOW_PATTERN.search(close_reason)
-        or "seeded" in close_reason
-        or "follow-up" in close_reason
-        or "follow_up" in close_reason
-    ):
-        return OUTCOME_SEED
-
-    # pearl: produced a PR, implementation, or code change
-    pearl_keywords = {"pr", "pull request", "implementation", "commit", "merge", "patch", "fix"}
-    if any(kw in close_reason for kw in pearl_keywords):
-        return OUTCOME_PEARL
-
-    # Check output_ref size — a substantial output file suggests real work
-    if output_ref:
-        try:
-            output_path = Path(output_ref)
-            if output_path.exists() and output_path.stat().st_size > 500:
-                # heat: review/analysis/design output
-                heat_keywords = {"review", "analysis", "design", "synthesis", "assessment", "report"}
-                if any(kw in close_reason for kw in heat_keywords):
-                    return OUTCOME_HEAT
-                # Default for done + substantial output = pearl (best-effort)
-                return OUTCOME_PEARL
-        except Exception:
-            pass
-
-    # heat: review or analysis output (by close_reason alone)
-    heat_keywords = {"review", "analysis", "design", "synthesis", "assessment", "report"}
-    if any(kw in close_reason for kw in heat_keywords):
-        return OUTCOME_HEAT
-
-    # No clear signal — default to shit (no verifiable output)
-    return OUTCOME_SHIT
-
-
-def compute_duration_minutes(uow: dict) -> float | None:
-    """
-    Compute UoW duration in minutes from started_at to closed_at.
-
-    Returns None if either timestamp is missing or unparseable.
-    """
-    started = uow.get("started_at") or uow.get("created_at")
-    closed = uow.get("closed_at") or uow.get("updated_at")
-    if not started or not closed:
-        return None
-    try:
-        start_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
-        close_dt = datetime.fromisoformat(closed.replace("Z", "+00:00"))
-        delta = (close_dt - start_dt).total_seconds()
-        return round(delta / 60, 1) if delta >= 0 else None
-    except (ValueError, TypeError):
-        return None
-
-
-def aggregate_by_classification(classified: list[tuple[dict, str]]) -> dict[str, list[dict]]:
-    """
-    Group (uow, classification) pairs by classification label.
-
-    Returns a dict mapping classification → list of uow dicts.
-    All four keys are always present (possibly empty lists).
-    """
-    groups: dict[str, list[dict]] = {
-        OUTCOME_PEARL: [],
-        OUTCOME_HEAT: [],
-        OUTCOME_SEED: [],
-        OUTCOME_SHIT: [],
-    }
-    for uow, label in classified:
-        groups[label].append(uow)
-    return groups
-
-
-def compute_avg_duration(uows: list[dict]) -> str:
-    """
-    Compute average duration in minutes for a list of UoWs.
-
-    Returns "N/A" if no durations available.
-    """
-    durations = [d for d in (compute_duration_minutes(u) for u in uows) if d is not None]
-    if not durations:
-        return "N/A"
-    avg = round(sum(durations) / len(durations), 1)
-    return f"{avg} min"
-
-
-def aggregate_token_usage(uows: list[dict]) -> int | None:
-    """
-    Sum token_usage across UoWs that reported it.
-
-    Returns the total token count, or None if no UoW reported usage.
-    UoWs with NULL token_usage (pre-migration or unreported) are excluded from
-    the sum but do not invalidate it — partial data is better than no data.
-    """
-    values = [u["token_usage"] for u in uows if u.get("token_usage") is not None]
-    return sum(values) if values else None
-
-
-def compute_wall_clock_stats(uows: list[dict]) -> dict:
-    """
-    Compute wall_clock_seconds statistics across UoWs.
-
-    Returns a dict with keys: count (UoWs with data), total_seconds, avg_seconds.
-    All values are None when no UoWs reported wall_clock_seconds.
-    """
-    values = [u["wall_clock_seconds"] for u in uows if u.get("wall_clock_seconds") is not None]
-    if not values:
-        return {"count": 0, "total_seconds": None, "avg_seconds": None}
-    return {
-        "count": len(values),
-        "total_seconds": sum(values),
-        "avg_seconds": round(sum(values) / len(values)),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +144,12 @@ def query_completed_uows(db_path: Path, lookback_hours: int) -> list[dict]:
     Return UoWs that transitioned to a terminal status in the past lookback_hours.
 
     Uses audit_log to find UoWs that entered a terminal state (done, failed,
-    expired, cancelled) within the window. Returns full UoW rows for each match.
+    expired, cancelled) within the window. Returns full UoW rows for each match,
+    including outcome_category (migration 0018), gate_fired (migration 0019),
+    token_usage (migration 0015), and steward_cycles.
+
+    gate_fired and seeds_surfaced columns are selected defensively — they fall back
+    to NULL when the column is absent (pre-migration instance).
 
     Returns [] if DB absent or table missing.
     """
@@ -333,22 +181,23 @@ def query_completed_uows(db_path: Path, lookback_hours: int) -> list[dict]:
             uow_ids = [r["uow_id"] for r in transition_rows]
             id_placeholders = ",".join("?" * len(uow_ids))
 
-            # Fetch full UoW records for each matched ID.
-            # token_usage: per-UoW cost telemetry (issue #990); NULL for pre-migration rows.
-            # wall_clock_seconds: derived from completed_at - started_at delta at query time.
+            # Check which optional columns exist (defensive for pre-migration instances)
+            col_info = conn.execute(
+                "PRAGMA table_info(uow_registry)"
+            ).fetchall()
+            col_names = {row["name"] for row in col_info}
+
+            gate_fired_col = "gate_fired" if "gate_fired" in col_names else "NULL AS gate_fired"
+            seeds_surfaced_col = "seeds_surfaced" if "seeds_surfaced" in col_names else "NULL AS seeds_surfaced"
+
             rows = conn.execute(
                 f"""
                 SELECT id, status, summary, register, close_reason, output_ref,
-                       started_at, closed_at, updated_at, created_at, steward_cycles,
-                       token_usage,
-                       CASE
-                         WHEN completed_at IS NOT NULL AND started_at IS NOT NULL
-                         THEN CAST(
-                           (julianday(completed_at) - julianday(started_at)) * 86400.0
-                           AS INTEGER
-                         )
-                         ELSE NULL
-                       END AS wall_clock_seconds
+                       started_at, closed_at, updated_at, created_at, completed_at,
+                       steward_cycles, token_usage,
+                       outcome_category,
+                       {gate_fired_col},
+                       {seeds_surfaced_col}
                 FROM uow_registry
                 WHERE id IN ({id_placeholders})
                   AND status IN ({terminal_placeholders})
@@ -362,6 +211,38 @@ def query_completed_uows(db_path: Path, lookback_hours: int) -> list[dict]:
     except Exception as exc:
         log.warning("Completed UoW query failed: %s", exc)
         return []
+
+
+def query_seeds_from_artifacts(db_path: Path, uow_ids: list[str]) -> int:
+    """
+    Interim seeds count from artifacts table (migration 0020 approximation).
+
+    Counts artifacts with category='seed' across the given UoW IDs.
+    Over-counts auto-extracted issue refs but is acceptable until structured
+    seeds_surfaced field (migration 0020) lands.
+
+    Returns 0 if the artifacts table is absent or query fails.
+    """
+    if not db_path.exists() or not uow_ids:
+        return 0
+
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=10.0)
+        try:
+            id_placeholders = ",".join("?" * len(uow_ids))
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS cnt FROM artifacts
+                WHERE uow_id IN ({id_placeholders})
+                  AND category = 'seed'
+                """,
+                uow_ids,
+            ).fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+    except Exception:
+        return 0
 
 
 def query_still_running(db_path: Path, threshold_hours: int) -> list[dict]:
@@ -399,6 +280,115 @@ def query_still_running(db_path: Path, threshold_hours: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Classification — reads outcome_category from the DB row
+# ---------------------------------------------------------------------------
+
+def resolve_outcome_category(uow: dict) -> str:
+    """
+    Return the metabolic outcome category for a UoW.
+
+    Uses outcome_category if present and valid. Falls back to 'shit' for:
+    - NULL outcome_category (subagent did not classify, or pre-migration)
+    - unrecognized outcome_category value
+    - non-done terminal statuses (failed, expired, cancelled) regardless of
+      outcome_category (these are definitively shit unless reclassified)
+
+    Note: unlike the old heuristic classifier, this function trusts the
+    subagent's classification from write_result time. The only override is
+    terminal failure: failed/expired/cancelled always map to shit.
+    """
+    status = (uow.get("status") or "").lower()
+
+    # Hard override: failure/expiry/cancellation → shit regardless of outcome_category
+    if status in ("failed", "expired", "cancelled"):
+        return OUTCOME_SHIT
+
+    cat = (uow.get("outcome_category") or "").lower()
+    if cat in VALID_OUTCOME_CATEGORIES:
+        return cat
+
+    # Null or unrecognized outcome_category → shit (no verifiable signal)
+    return OUTCOME_SHIT
+
+
+def aggregate_by_category(uows: list[dict]) -> dict[str, list[dict]]:
+    """
+    Group UoWs by resolved outcome category.
+
+    Returns a dict mapping category → list of uow dicts.
+    All four keys are always present (possibly empty lists).
+    """
+    groups: dict[str, list[dict]] = {
+        OUTCOME_PEARL: [],
+        OUTCOME_HEAT: [],
+        OUTCOME_SEED: [],
+        OUTCOME_SHIT: [],
+    }
+    for uow in uows:
+        label = resolve_outcome_category(uow)
+        groups[label].append(uow)
+    return groups
+
+
+# ---------------------------------------------------------------------------
+# Aggregate helpers
+# ---------------------------------------------------------------------------
+
+def _avg_int(values: list[int | None]) -> float | None:
+    nums = [v for v in values if v is not None]
+    return round(sum(nums) / len(nums), 1) if nums else None
+
+
+def aggregate_token_usage(uows: list[dict]) -> int | None:
+    values = [u["token_usage"] for u in uows if u.get("token_usage") is not None]
+    return sum(values) if values else None
+
+
+def aggregate_gate_churn(uows: list[dict]) -> dict[str, int]:
+    """
+    Count UoWs by gate_fired value.
+
+    Returns dict with keys spiral, dead_end, burst (zero-filled for absent values).
+    The 'none' gate (clean path) is excluded from the churn signal — churn is
+    specifically about non-clean paths.
+    """
+    churn: dict[str, int] = {GATE_SPIRAL: 0, GATE_DEAD_END: 0, GATE_BURST: 0}
+    for uow in uows:
+        gate = (uow.get("gate_fired") or GATE_NONE).lower()
+        if gate in churn:
+            churn[gate] += 1
+    return churn
+
+
+def count_seeds_surfaced(uows: list[dict], db_path: Path) -> int:
+    """
+    Return total seeds surfaced across completed UoWs.
+
+    Prefers the structured seeds_surfaced column (migration 0020) per UoW.
+    Falls back to the artifacts-table approximation when seeds_surfaced is absent
+    or NULL for all UoWs (interim until migration 0020 is universally deployed).
+    """
+    # Try structured seeds_surfaced column first
+    structured_values = []
+    for uow in uows:
+        sv = uow.get("seeds_surfaced")
+        if sv is not None:
+            try:
+                parsed = json.loads(sv) if isinstance(sv, str) else sv
+                count = len(parsed) if isinstance(parsed, list) else int(parsed)
+                structured_values.append(count)
+            except (ValueError, TypeError):
+                pass
+
+    if structured_values:
+        return sum(structured_values)
+
+    # Interim: count from artifacts table
+    uow_ids = [u["id"] for u in uows]
+    return query_seeds_from_artifacts(db_path, uow_ids)
+
+
+# ---------------------------------------------------------------------------
 # Digest formatter — pure function, returns Telegram-ready text
 # ---------------------------------------------------------------------------
 
@@ -406,19 +396,21 @@ def format_digest(
     groups: dict[str, list[dict]],
     stalled: list[dict],
     lookback_hours: int,
-    now_iso: str,
-) -> str:
+    now_dt: datetime,
+    seeds_total: int,
+) -> str | None:
     """
     Format the metabolic digest as a Telegram message.
 
-    Args:
-        groups:        Classification groups from aggregate_by_classification.
-        stalled:       UoWs still running past the stall threshold.
-        lookback_hours: The window used for the digest.
-        now_iso:        ISO timestamp for the report header.
+    Returns None if no UoWs completed (idle-day suppression per spec).
+    Returns a one-liner for 1-2 UoWs, full format for 3+.
 
-    Returns:
-        A multi-line string ready to send via Telegram.
+    Args:
+        groups:         Classification groups from aggregate_by_category.
+        stalled:        UoWs still running past the stall threshold.
+        lookback_hours: The window used for the digest.
+        now_dt:         Current datetime (UTC) for the report header.
+        seeds_total:    Total seeds surfaced count.
     """
     pearl_count = len(groups[OUTCOME_PEARL])
     heat_count = len(groups[OUTCOME_HEAT])
@@ -426,54 +418,79 @@ def format_digest(
     shit_count = len(groups[OUTCOME_SHIT])
     total = pearl_count + heat_count + seed_count + shit_count
 
-    # Register breakdown — count by register across all classified UoWs
-    register_counts: dict[str, int] = {}
-    all_uows: list[dict] = []
-    for label, uows in groups.items():
-        all_uows.extend(uows)
-        for uow in uows:
-            reg = uow.get("register") or "operational"
-            register_counts[reg] = register_counts.get(reg, 0) + 1
+    # Idle-day suppression: no UoWs completed → no digest
+    if total == 0:
+        return None
 
-    register_parts = ", ".join(
-        f"{count} {reg}" for reg, count in sorted(register_counts.items())
-    ) if register_counts else "none"
+    all_uows = [u for uows in groups.values() for u in uows]
+    date_str = now_dt.strftime("%Y-%m-%d")
 
-    # Average durations per category
-    pearl_avg = compute_avg_duration(groups[OUTCOME_PEARL])
-    heat_avg = compute_avg_duration(groups[OUTCOME_HEAT])
+    # One-liner for < FULL_DIGEST_THRESHOLD completed UoWs
+    if total < FULL_DIGEST_THRESHOLD:
+        total_tokens = aggregate_token_usage(all_uows)
+        token_str = f" — {total_tokens:,} tokens" if total_tokens is not None else ""
+        parts = []
+        if pearl_count:
+            parts.append(f"pearl {pearl_count}")
+        if heat_count:
+            parts.append(f"heat {heat_count}")
+        if seed_count:
+            parts.append(f"seed {seed_count}")
+        if shit_count:
+            parts.append(f"shit {shit_count}")
+        categories = ", ".join(parts) if parts else "none"
+        return f"WOS: {total} completed ({categories}){token_str}"
 
-    # Telemetry: aggregate token_usage and wall_clock_seconds (issue #990)
-    total_tokens = aggregate_token_usage(all_uows)
-    wall_clock = compute_wall_clock_stats(all_uows)
-
-    # Stalled display
-    stalled_line = ""
-    if stalled:
-        stalled_ids = ", ".join(u["id"] for u in stalled[:5])
-        stalled_line = f"\nStalled (>6h): {stalled_ids}"
-        if len(stalled) > 5:
-            stalled_line += f" (+{len(stalled) - 5} more)"
-
+    # Full digest format (per spec)
     lines = [
-        "WOS Daily Metabolic Report",
-        f"Last {lookback_hours}h: {pearl_count} pearl / {heat_count} heat / {seed_count} seed / {shit_count} shit",
+        f"WOS Daily — {date_str}",
+        f"Completed : {total} UoW(s)",
+        f"  pearl {pearl_count}  seed {seed_count}  heat {heat_count}  shit {shit_count}",
     ]
 
-    if total > 0:
-        lines.append(f"Register breakdown: {register_parts}")
-        lines.append(f"Avg duration: {pearl_avg} (pearl), {heat_avg} (heat)")
-        # Token and wall-clock telemetry — only show when data is available
-        if total_tokens is not None:
-            lines.append(f"Tokens: {total_tokens:,} total")
-        if wall_clock["avg_seconds"] is not None:
-            avg_min = round(wall_clock["avg_seconds"] / 60, 1)
-            lines.append(f"Wall-clock avg: {avg_min} min ({wall_clock['count']} UoWs with data)")
-    else:
-        lines.append("No UoWs completed in this window.")
+    # Seeds surfaced
+    if seeds_total > 0:
+        lines.append(f"  Seeds surfaced: {seeds_total}")
 
-    if stalled_line:
-        lines.append(stalled_line)
+    # Average tokens and cycles
+    avg_tokens = _avg_int([u.get("token_usage") for u in all_uows])
+    avg_cycles = _avg_int([u.get("steward_cycles") for u in all_uows])
+    if avg_tokens is not None:
+        lines.append(f"  Avg tokens: {int(avg_tokens):,}")
+    if avg_cycles is not None:
+        lines.append(f"  Avg cycles: {avg_cycles}")
+
+    # Failed UoWs (non-done terminal statuses are already counted in shit)
+    failed_uows = [u for u in all_uows if u.get("status") in ("failed", "expired", "cancelled")]
+    if failed_uows:
+        # Dominant gate among failed UoWs
+        gate_counts: dict[str, int] = {}
+        for u in failed_uows:
+            g = (u.get("gate_fired") or GATE_NONE).lower()
+            gate_counts[g] = gate_counts.get(g, 0) + 1
+        dominant_gate = max(gate_counts, key=gate_counts.__getitem__) if gate_counts else GATE_NONE
+        lines.append(f"Failed    : {len(failed_uows)} UoW(s) ({dominant_gate})")
+
+    # Gate churn across all completed UoWs
+    churn = aggregate_gate_churn(all_uows)
+    churn_total = sum(churn.values())
+    if churn_total > 0:
+        churn_parts = []
+        if churn[GATE_SPIRAL]:
+            churn_parts.append(f"{churn[GATE_SPIRAL]} spiral")
+        if churn[GATE_DEAD_END]:
+            churn_parts.append(f"{churn[GATE_DEAD_END]} dead-end")
+        if churn[GATE_BURST]:
+            churn_parts.append(f"{churn[GATE_BURST]} burst")
+        lines.append(f"Churn     : {' / '.join(churn_parts)} today")
+
+    # Stalled UoWs
+    if stalled:
+        stalled_ids = ", ".join(u["id"] for u in stalled[:5])
+        stall_line = f"Stalled   : {stalled_ids}"
+        if len(stalled) > 5:
+            stall_line += f" (+{len(stalled) - 5} more)"
+        lines.append(stall_line)
 
     return "\n".join(lines)
 
@@ -515,40 +532,45 @@ def _write_inbox_digest(text: str, dry_run: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main runner
 # ---------------------------------------------------------------------------
 
 def run_digest(db_path: Path, lookback_hours: int, dry_run: bool = False) -> dict:
     """
     Run the metabolic digest and return a structured result dict.
     """
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
 
     # Query completed UoWs
     completed = query_completed_uows(db_path, lookback_hours)
     log.info("Completed UoWs in last %dh: %d", lookback_hours, len(completed))
 
-    # Classify each
-    classified = [(uow, classify_uow(uow)) for uow in completed]
-    groups = aggregate_by_classification(classified)
-
+    # Group by outcome_category
+    groups = aggregate_by_category(completed)
     for label, uows in groups.items():
         log.info("  %s: %d", label, len(uows))
 
+    # Seeds surfaced (structured or interim artifact approximation)
+    seeds_total = count_seeds_surfaced(completed, db_path)
+
     # Stalled UoWs (>6h in flight)
-    stalled = query_still_running(db_path, threshold_hours=6)
+    stalled = query_still_running(db_path, threshold_hours=STALL_THRESHOLD_HOURS)
     if stalled:
-        log.warning("Still running >6h: %d", len(stalled))
+        log.warning("Still running >%dh: %d", STALL_THRESHOLD_HOURS, len(stalled))
 
-    # Format and send digest
-    digest_text = format_digest(groups, stalled, lookback_hours, now_iso)
-    log.info("Digest:\n%s", digest_text)
+    # Format digest (may return None for idle days)
+    digest_text = format_digest(groups, stalled, lookback_hours, now_dt, seeds_total)
 
-    _write_inbox_digest(digest_text, dry_run=dry_run)
+    if digest_text is None:
+        log.info("No UoWs completed in last %dh — suppressing idle-day digest", lookback_hours)
+    else:
+        log.info("Digest:\n%s", digest_text)
+        _write_inbox_digest(digest_text, dry_run=dry_run)
 
-    all_uows = [uow for uows in groups.values() for uow in uows]
+    all_uows = [u for uows in groups.values() for u in uows]
     total_tokens = aggregate_token_usage(all_uows)
-    wall_stats = compute_wall_clock_stats(all_uows)
+    churn = aggregate_gate_churn(all_uows)
 
     return {
         "timestamp": now_iso,
@@ -558,13 +580,15 @@ def run_digest(db_path: Path, lookback_hours: int, dry_run: bool = False) -> dic
         "heat": len(groups[OUTCOME_HEAT]),
         "seed": len(groups[OUTCOME_SEED]),
         "shit": len(groups[OUTCOME_SHIT]),
+        "seeds_surfaced": seeds_total,
         "stalled_count": len(stalled),
+        "gate_churn_spiral": churn[GATE_SPIRAL],
+        "gate_churn_dead_end": churn[GATE_DEAD_END],
+        "gate_churn_burst": churn[GATE_BURST],
+        "total_tokens": total_tokens,
+        "suppressed": digest_text is None,
         "dry_run": dry_run,
         "digest_text": digest_text,
-        # Telemetry (issue #990) — None when no UoWs reported data
-        "total_tokens": total_tokens,
-        "wall_clock_uow_count": wall_stats["count"],
-        "wall_clock_avg_seconds": wall_stats["avg_seconds"],
     }
 
 
@@ -575,7 +599,7 @@ def main() -> int:
                         help=f"Lookback window in hours (default: {DEFAULT_LOOKBACK_HOURS})")
     args = parser.parse_args()
 
-    if not _is_job_enabled():
+    if not is_job_enabled(JOB_NAME):
         log.info("Job '%s' is disabled in jobs.json — skipping", JOB_NAME)
         return 0
 
@@ -587,8 +611,9 @@ def main() -> int:
 
     result = run_digest(db_path, lookback_hours=args.hours, dry_run=args.dry_run)
     log.info(
-        "Digest complete — pearl=%d heat=%d seed=%d shit=%d stalled=%d",
-        result["pearl"], result["heat"], result["seed"], result["shit"], result["stalled_count"],
+        "Digest complete — pearl=%d heat=%d seed=%d shit=%d stalled=%d suppressed=%s",
+        result["pearl"], result["heat"], result["seed"], result["shit"],
+        result["stalled_count"], result["suppressed"],
     )
     return 0
 

@@ -1033,6 +1033,24 @@ def get_output_file_mtime(output_file: str) -> float | None:
         return None
 
 
+WORKSTREAM_BASE = Path.home() / "lobster-workspace" / "workstreams"
+WORKSTREAM_STATUS_STALE_SECONDS = 600  # 10 min — matches ~5 min update cadence with buffer
+
+
+def get_workstream_status_mtime(task_id: str) -> float | None:
+    """Return mtime of workstream/{task_id}/status.md, or None if absent.
+
+    Pure function: reads filesystem metadata only, no side effects.
+    """
+    if not task_id:
+        return None
+    status_file = WORKSTREAM_BASE / task_id / "status.md"
+    try:
+        return status_file.stat().st_mtime
+    except OSError:
+        return None
+
+
 def scan_agent_outputs(
     tasks_dir: Path | None = None,
 ) -> dict[str, str]:

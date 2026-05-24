@@ -36,17 +36,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from src.orchestration.registry import UoW
-from src.orchestration.paths import WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG
-from src.orchestration.error_capture import (
+from orchestration.registry import (
+    UoW, UoWStatus, UoWRegister, UoWType,
+    validate_steward_executor_schema as validate_steward_schema,
+    validate_phase2_schema,
+)
+from orchestration.paths import WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG
+from orchestration.error_capture import (
     run_subprocess_with_error_capture,
     log_subprocess_error,
     classify_error,
     has_repeated_error,
 )
-from src.orchestration.config import TimeoutConfig
-from src.orchestration.vision_routing import resolve_vision_route
+from orchestration.config import TimeoutConfig
+from orchestration.vision_routing import resolve_vision_route
 from src.ooda.fast_thorough_selector import select_path as _ooda_select_path, cite_basis as _ooda_cite_basis
+from orchestration.gate_fired import translate_eligibility_to_gate
+from orchestration.wos_completion_notifier import notify_uow_done, notify_uow_failed
 
 log = logging.getLogger("steward")
 
@@ -103,7 +109,7 @@ def _read_prescription_model_config() -> str | None:
     without needing to mock the full dispatcher_handlers module.
     """
     try:
-        from src.orchestration.dispatcher_handlers import read_wos_config
+        from orchestration.dispatcher_handlers import read_wos_config
         config = read_wos_config()
         model = config.get("prescription_model", "")
         if model:
@@ -435,29 +441,8 @@ def _build_claude_env() -> dict[str, str]:
     return env
 
 
-# ---------------------------------------------------------------------------
-# Status enum (golden pattern: StrEnum so values serialize as plain strings)
-# ---------------------------------------------------------------------------
-
-class UoWStatus(StrEnum):
-    PROPOSED = "proposed"
-    PENDING = "pending"
-    READY_FOR_STEWARD = "ready-for-steward"
-    DIAGNOSING = "diagnosing"
-    READY_FOR_EXECUTOR = "ready-for-executor"
-    ACTIVE = "active"
-    DONE = "done"
-    BLOCKED = "blocked"
-    FAILED = "failed"
-    EXPIRED = "expired"
-    # NEEDS_HUMAN_REVIEW: retry cap exceeded; UoW awaits human decision.
-    NEEDS_HUMAN_REVIEW = "needs-human-review"
-
-    def is_terminal(self) -> bool:
-        return self in {UoWStatus.DONE, UoWStatus.FAILED, UoWStatus.EXPIRED}
-
-    def is_in_flight(self) -> bool:
-        return self in {UoWStatus.ACTIVE, UoWStatus.READY_FOR_EXECUTOR, UoWStatus.DIAGNOSING}
+# UoWStatus and UoWRegister are imported from registry — see top of file.
+# The local definition was removed to eliminate the duplicate.
 
 
 # ---------------------------------------------------------------------------
@@ -590,6 +575,35 @@ class LLMPrescription:
     instructions: str
     success_criteria_check: str
     estimated_cycles: int
+    boundary_present: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PrescriptionV2:
+    """
+    Full 7-section v2 prescription produced by generate_v2_prescription().
+    Maps 1:1 to docs/prescription-format-spec.md schema.
+    Schema version: 1.0.0
+    """
+    diagnosis: dict[str, Any]
+    prescription: dict[str, Any]
+    workflow: dict[str, Any]
+    constraints: dict[str, Any]
+    success_criteria: dict[str, Any]
+    dan_context: dict[str, Any]
+    audit_metadata: dict[str, Any]
+
+    def to_json(self) -> str:
+        """Serialize to compact JSON string for audit log storage."""
+        return json.dumps({
+            "diagnosis": self.diagnosis,
+            "prescription": self.prescription,
+            "workflow": self.workflow,
+            "constraints": self.constraints,
+            "success_criteria": self.success_criteria,
+            "dan_context": self.dan_context,
+            "audit_metadata": self.audit_metadata,
+        })
 
 
 @dataclass(frozen=True, slots=True)
@@ -631,7 +645,7 @@ class CycleResult:
 # Module-level constants
 # ---------------------------------------------------------------------------
 
-# _GATE_CLEARED_FLAG is imported from src.orchestration.paths (WOS_GATE_CLEARED_FLAG).
+# _GATE_CLEARED_FLAG is imported from orchestration.paths (WOS_GATE_CLEARED_FLAG).
 # See paths.py for the single canonical definition.
 
 
@@ -676,6 +690,13 @@ _HARD_CAP_CYCLES = 9
 # the retry budget. Only cycles where an agent confirmed execution (return_reason is not
 # an orphan classification) count toward this cap. See issue #962.
 MAX_RETRIES: int = 3
+
+# Orphan kill retry budget: number of times a UoW may be requeued after an
+# orphan_kill_during_execution event before permanent failure.
+# Context compaction kills are environmental interruptions, not subagent bugs —
+# permanently failing on the first kill discards valid work.
+# orphan_kill_before_start is excluded: before-start means no partial work exists.
+ORPHAN_KILL_RETRY_BUDGET: int = 2
 
 # Return reasons that represent infrastructure kill events, not confirmed executions.
 # When return_reason is in this set, execution_attempts must NOT be incremented and
@@ -813,19 +834,6 @@ def _compute_prescription_confidence(
         return CONFIDENCE_FIRST_EXECUTION
     return CONFIDENCE_LOW_ATTEMPTS
 
-
-# Fields required by the Steward for operation
-_STEWARD_REQUIRED_FIELDS = frozenset({
-    "workflow_artifact",
-    "success_criteria",
-    "prescribed_skills",
-    "steward_cycles",
-    "lifetime_cycles",
-    "timeout_at",
-    "estimated_runtime",
-    "steward_agenda",
-    "steward_log",
-})
 
 # Executor types
 _EXECUTOR_TYPE_GENERAL = "general"
@@ -991,6 +999,19 @@ def _most_recent_return_reason(audit_entries: list[dict]) -> str | None:
             clf = note_data.get("return_reason") or note_data.get("classification")
             if clf:
                 return clf
+        elif event == "claim_expired":
+            # Claim window expired while the UoW was active/executing — the agent is
+            # dead. Extract return_reason from the audit note (written by
+            # reset_expired_claims as "executing_orphan") so the steward can apply
+            # orphan_retry_count and ORPHAN_KILL_RETRY_BUDGET correctly.
+            #
+            # Note: the generic `if "return_reason" in note_data` check above this
+            # loop already catches this case (the audit note carries return_reason
+            # explicitly). This elif branch is defense-in-depth: it ensures correct
+            # behavior if the generic check above is ever removed or modified.
+            rr = note_data.get("return_reason")
+            if rr:
+                return rr
 
     return None
 
@@ -1216,6 +1237,11 @@ def _assess_completion(
                         # Return is_complete=False so the normal prescription path
                         # is skipped; the caller must check executor_outcome for routing.
                         return False, f"outcome=blocked: {reason}", "blocked"
+                    elif outcome == "owner_decision_required":
+                        # Subagent reached a genuine decision point that only the owner
+                        # can resolve.  Return is_complete=False so _process_uow can
+                        # transition the UoW to awaiting-owner instead of re-prescribing.
+                        return False, f"outcome=owner_decision_required: {reason}", "owner_decision_required"
                     elif outcome in ("partial", "failed"):
                         return False, f"outcome={outcome}: {reason}", outcome
                     elif outcome is not None:
@@ -1696,22 +1722,67 @@ def _build_prescription_route_reason(
     return heuristic_reason
 
 
+_DEBUG_POSTURES: frozenset[str] = frozenset({
+    ReentryPosture.CRASHED_NO_OUTPUT,
+    ReentryPosture.CRASHED_ZERO_BYTES,
+    ReentryPosture.CRASHED_OUTPUT_REF_MISSING,
+    ReentryPosture.EXECUTION_FAILED,
+    ReentryPosture.STALL_DETECTED,
+    ReentryPosture.EXECUTOR_ORPHAN,
+    ReentryPosture.EXECUTING_ORPHAN,
+    ReentryPosture.DIAGNOSING_ORPHAN,
+})
+
+_VERIFY_POSTURES: frozenset[str] = frozenset({
+    ReentryPosture.EXECUTION_COMPLETE,
+    ReentryPosture.STARTUP_SWEEP_POSSIBLY_COMPLETE,
+})
+
+# Broader summary fallback keywords — only used when no structured field resolves.
+_SUMMARY_DEBUG_TOKENS: frozenset[str] = frozenset({
+    "bug", "fix", "error", "crash", "fail", "regression", "broken", "incorrect", "wrong",
+})
+_SUMMARY_VERIFY_TOKENS: frozenset[str] = frozenset({
+    "pr", "pull request", "review", "merge", "approve", "approval",
+})
+
+
 def _select_prescribed_skills(uow: "UoW", reentry_posture: str) -> list[str]:
     """
-    Select prescribed skills appropriate to the UoW type and posture.
+    Select prescribed skills from structured UoW fields.
 
+    Inspection order: reentry_posture → register → type → summary fallback.
+    Summary fallback fires only when no structured field resolves a skill.
     Returns a list of skill IDs.
     """
-    summary = uow.summary.lower()
-    skills = []
+    skills: list[str] = []
 
-    if "bug" in summary or "fix" in summary or "error" in summary:
+    # --- Structured field 1: reentry_posture (execution-state signal) ---
+    if reentry_posture in _DEBUG_POSTURES:
         skills.append("systematic-debugging")
-    if "pr" in summary or "pull request" in summary or reentry_posture == "execution_complete":
+    if reentry_posture in _VERIFY_POSTURES:
         skills.append("verification-before-completion")
-    if reentry_posture in ("crashed_no_output", "execution_failed"):
+
+    # --- Structured field 2: register (attentional complexity signal) ---
+    # Iterative-convergent work is inherently multi-cycle and benefits from
+    # systematic debugging regardless of posture.
+    if uow.register == UoWRegister.ITERATIVE_CONVERGENT:
         if "systematic-debugging" not in skills:
             skills.append("systematic-debugging")
+
+    # --- Structured field 3: type (workflow category) ---
+    # Non-executable UoWs (seed, routing, classification) have no execution
+    # artifact to debug or verify — skip summary fallback entirely for them.
+    if uow.type != UoWType.EXECUTABLE:
+        return skills
+
+    # --- Summary fallback: only when structured fields produced no signal ---
+    if not skills:
+        summary = uow.summary.lower()
+        if any(token in summary for token in _SUMMARY_DEBUG_TOKENS):
+            skills.append("systematic-debugging")
+        if any(token in summary for token in _SUMMARY_VERIFY_TOKENS):
+            skills.append("verification-before-completion")
 
     return skills
 
@@ -1845,6 +1916,402 @@ def _parse_workflow_artifact(raw_text: str) -> dict:
     }
 
 
+def _load_dan_register_excerpt(max_chars: int = 8000) -> str:
+    """Return a focused excerpt of Dan's developmental register from user.base.context.md.
+
+    Extracts the section from "Lobster Developmental Map" through the capability
+    coupling / attentional budget sections — the part of the file that captures
+    Dan's current arc, active focus areas, and developmental posture.  Returns an
+    empty string if the file is absent or the section cannot be found, so callers
+    can treat it as optional enrichment.
+
+    The excerpt is capped at ``max_chars`` to keep the injected context tight.
+    A trailing "[...truncated]" marker is appended when the cap is applied.
+
+    Anchor string: "## Lobster Developmental Map"
+    This is a prefix match against the production heading, which reads:
+    "## Lobster Developmental Map (Theory of Learning, <date>)".
+    If the heading is ever renamed, find() returns -1 and the excerpt is silently
+    absent — callers treat an empty return as optional enrichment, so no error
+    is raised. Any rename of this section heading must update this anchor.
+
+    Cap rationale: the production "Lobster Developmental Map" section is ~6,888
+    chars (as of 2026-05-02). 8000 chars safely covers the full section including
+    the "Capability ceiling and Embodiment distinction" subsection and the
+    "Attentional Budget Constraint" and "Capability Coupling Structure" subsections
+    that carry the most prescription-relevant orientation signals. The previous
+    1500-char cap truncated the section at ~22% and never reached these subsections.
+    """
+    register_path = Path.home() / "lobster-user-config" / "agents" / "user.base.context.md"
+    try:
+        text = register_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+    # Find the anchor section that starts the developmental register.
+    # Exact anchor string: "## Lobster Developmental Map"
+    # Production heading: "## Lobster Developmental Map (Theory of Learning, YYYY-MM-DD)"
+    anchor = "## Lobster Developmental Map"
+    start = text.find(anchor)
+    if start == -1:
+        return ""
+
+    excerpt = text[start:]
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[:max_chars] + "\n[...truncated]"
+    return excerpt.strip()
+
+
+# ---------------------------------------------------------------------------
+# V2 prescription generation
+# ---------------------------------------------------------------------------
+
+def _build_v2_prescription_deterministic(
+    uow: "UoW",
+    diagnosis_section: dict[str, Any],
+    executor_posture: str,
+    selected_executor_type: str,
+    prescribed_skills: list[str],
+    cycles: int,
+    now_iso: str,
+) -> "PrescriptionV2":
+    """
+    Build a minimal but schema-valid PrescriptionV2 without LLM.
+
+    Used as fallback when _llm_prescribe_v2 fails. Fills all required
+    fields with deterministic values derived from UoW state.
+    """
+    reentry_posture = diagnosis_section["reentry_posture"]
+    completion_gap = diagnosis_section.get("completion_gap", "")
+    success_criteria_text = uow.success_criteria or "Verify deliverables match the UoW summary."
+
+    instructions_text = (
+        f"Execute the following task:\n\nSummary: {uow.summary}\n\n"
+        f"Success criteria: {success_criteria_text}\n\n"
+        "Write your output to the output_ref path.\n\n"
+        f"Minimum viable output: Complete the task described in the summary.\n"
+        f"Boundary: do not exceed the scope stated in the success criteria."
+    )
+    if cycles > 0 and completion_gap:
+        instructions_text = (
+            f"Re-execution (cycle {cycles}):\n\n"
+            f"Gap identified: {completion_gap}\n\n"
+            f"Original task: {uow.summary}\n\n"
+            f"Success criteria: {success_criteria_text}\n\n"
+            f"Minimum viable output: Complete the gap identified above.\n"
+            f"Boundary: do not modify components outside the gap scope."
+        )
+
+    return PrescriptionV2(
+        diagnosis=diagnosis_section,
+        prescription={
+            "summary": uow.summary or "Execute the UoW.",
+            "instructions": instructions_text,
+            "estimated_cycles": 1,
+            "minimum_viable_output": "Complete the task described in the UoW summary.",
+            "boundary": "do not exceed the scope stated in the success criteria",
+        },
+        workflow={
+            "agent_type": selected_executor_type,
+            "steps": ["Execute the task described in the UoW summary.", "Write output to output_ref."],
+            "fan_out": None,
+        },
+        constraints={
+            "boundary": "do not exceed the scope stated in the success criteria",
+            "no_modify": [],
+            "no_deploy": False,
+        },
+        success_criteria={
+            "check": success_criteria_text,
+            "artifacts": [],
+            "commands": [],
+            "gate_command": None,
+        },
+        dan_context={
+            "orientation": "",
+            "priority_signal": "",
+            "open_questions": [],
+            "load_bearing_assumption": "",
+        },
+        audit_metadata={
+            "uow_id": uow.id,
+            "cycle": cycles,
+            "executor_posture": executor_posture,
+            "schema_version": "1.0.0",
+            "prescribed_at": now_iso,
+            "prescribed_skills": prescribed_skills,
+        },
+    )
+
+
+def _llm_prescribe_v2(
+    uow: "UoW",
+    diagnosis_section: dict[str, Any],
+    executor_posture: str,
+    selected_executor_type: str,
+    issue_body: str,
+    vision_orientation: str,
+    dan_register: str,
+    prescribed_skills: list[str],
+    cycles: int,
+    now_iso: str,
+) -> "PrescriptionV2":
+    """
+    Call Claude to generate a full 7-section v2 prescription as JSON.
+
+    Dispatches via `claude -p`. Returns a PrescriptionV2 dataclass.
+    Falls back to _build_v2_prescription_deterministic() if the LLM call
+    fails or returns invalid JSON.
+    """
+    context_parts: list[str] = [
+        f"UoW ID: {uow.id}",
+        f"Summary: {uow.summary}",
+        f"Type: {uow.type}",
+        f"Register: {uow.register or 'operational'}",
+        f"Execution cycle: {cycles} (0 = first pass)",
+        f"Executor posture: {executor_posture}",
+    ]
+    if uow.success_criteria:
+        context_parts.append(f"Success criteria:\n{uow.success_criteria}")
+    elif issue_body:
+        excerpt = issue_body.strip()
+        if len(excerpt) > 2000:
+            excerpt = excerpt[:2000] + "\n[...truncated]"
+        context_parts.append(f"Issue body:\n{excerpt}")
+
+    reentry_posture = diagnosis_section["reentry_posture"]
+    completion_gap = diagnosis_section["completion_gap"]
+    if completion_gap:
+        context_parts.append(f"Completion gap: {completion_gap}")
+
+    uow_context = "\n".join(context_parts)
+    orientation_block = f"\n## Dan's current orientation\n\n{dan_register}\n" if dan_register else ""
+    vision_block = f"\n## Vision context\n\n{vision_orientation}\n" if vision_orientation else ""
+
+    spec_path = Path(__file__).parent.parent.parent / "docs" / "prescription-format-spec.md"
+    schema_path = Path(__file__).parent.parent.parent / "docs" / "prescription-format.schema.json"
+    try:
+        spec_text = spec_path.read_text(encoding="utf-8")
+        if len(spec_text) > 6000:
+            spec_text = spec_text[:6000] + "\n[...truncated]"
+    except OSError:
+        spec_text = "(spec unavailable — use 7-section structure: diagnosis, prescription, workflow, constraints, success_criteria, dan_context, audit_metadata)"
+    try:
+        schema_text = schema_path.read_text(encoding="utf-8")
+        if len(schema_text) > 4000:
+            schema_text = schema_text[:4000] + "\n[...truncated]"
+    except OSError:
+        schema_text = ""
+
+    system_prompt = (
+        "You are the WOS Steward. Generate a 7-section v2 prescription for the given "
+        "Unit of Work. Output ONLY a valid JSON object — no preamble, no markdown fences, "
+        "no explanation. The JSON must conform to the prescription format schema."
+    )
+
+    user_prompt = f"""Generate a 7-section v2 prescription for this Unit of Work.
+
+{uow_context}
+{orientation_block}{vision_block}
+## Format specification (excerpt)
+{spec_text}
+
+## Pre-populated fields (use these exactly)
+- diagnosis.reentry_posture: "{reentry_posture}"
+- diagnosis.prior_cycle_count: {cycles}
+- diagnosis.completion_gap: "{completion_gap}"
+- diagnosis.executor_outcome: {json.dumps(diagnosis_section.get("executor_outcome"))}
+- audit_metadata.uow_id: "{uow.id}"
+- audit_metadata.cycle: {cycles}
+- audit_metadata.executor_posture: "{executor_posture}"
+- audit_metadata.schema_version: "1.0.0"
+- audit_metadata.prescribed_at: "{now_iso}"
+- audit_metadata.prescribed_skills: {json.dumps(prescribed_skills)}
+- workflow.agent_type: "{selected_executor_type}"
+
+Output ONLY valid JSON. No preamble. No markdown. No code fences."""
+
+    prompt = f"{system_prompt}\n\n{user_prompt}"
+    timeout_secs = _get_llm_prescription_timeout()
+    model = select_steward_model(uow)
+    command = [_CLAUDE_BIN, "-p", prompt, "--output-format", "text", "--model", model]
+    claude_env = _build_claude_env()
+
+    proc, error = run_subprocess_with_error_capture(
+        component="steward_prescription_v2",
+        uow_id=uow.id,
+        command=command,
+        timeout_seconds=timeout_secs,
+        check=False,
+        env=claude_env,
+    )
+
+    if error or proc is None or proc.returncode != 0 or not (proc.stdout or "").strip():
+        log.warning(
+            "_llm_prescribe_v2: LLM call failed for %s, using deterministic fallback",
+            uow.id,
+        )
+        return _build_v2_prescription_deterministic(
+            uow=uow,
+            diagnosis_section=diagnosis_section,
+            executor_posture=executor_posture,
+            selected_executor_type=selected_executor_type,
+            prescribed_skills=prescribed_skills,
+            cycles=cycles,
+            now_iso=now_iso,
+        )
+
+    raw = proc.stdout.strip()
+    raw = _extract_json_from_llm_output(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        log.warning(
+            "_llm_prescribe_v2: JSON parse failed for %s (%s), using deterministic fallback",
+            uow.id, exc,
+        )
+        return _build_v2_prescription_deterministic(
+            uow=uow,
+            diagnosis_section=diagnosis_section,
+            executor_posture=executor_posture,
+            selected_executor_type=selected_executor_type,
+            prescribed_skills=prescribed_skills,
+            cycles=cycles,
+            now_iso=now_iso,
+        )
+
+    required_keys = {"diagnosis", "prescription", "workflow", "constraints", "success_criteria", "dan_context", "audit_metadata"}
+    missing = required_keys - set(data.keys())
+    if missing:
+        log.warning(
+            "_llm_prescribe_v2: missing required sections %s for %s, using deterministic fallback",
+            missing, uow.id,
+        )
+        return _build_v2_prescription_deterministic(
+            uow=uow,
+            diagnosis_section=diagnosis_section,
+            executor_posture=executor_posture,
+            selected_executor_type=selected_executor_type,
+            prescribed_skills=prescribed_skills,
+            cycles=cycles,
+            now_iso=now_iso,
+        )
+
+    log.info("_llm_prescribe_v2: v2 prescription generated for %s (model=%s)", uow.id, model)
+    return PrescriptionV2(
+        diagnosis=data["diagnosis"],
+        prescription=data["prescription"],
+        workflow=data["workflow"],
+        constraints=data["constraints"],
+        success_criteria=data["success_criteria"],
+        dan_context=data["dan_context"],
+        audit_metadata=data["audit_metadata"],
+    )
+
+
+def generate_v2_prescription(
+    uow: "UoW",
+    diagnosis: "Diagnosis",
+    issue_info: "IssueInfo | None",
+    cycles: int,
+    registry: Any,
+    dry_run: bool = False,
+) -> "PrescriptionV2":
+    """
+    Generate a 7-section v2 prescription for a UoW at the point of prescribe.
+
+    Reads:
+    - UoW state (summary, type, register, source, vision_ref, success_criteria)
+    - Diagnosis (reentry_posture, is_complete, completion_rationale, executor_outcome)
+    - Vision Object context via resolve_vision_route()
+    - Dan's developmental register via _load_dan_register_excerpt()
+    - Audit trail for prior cycles via registry.fetch_audit_log()
+
+    Writes one audit entry to registry.append_audit_log() before returning
+    (skipped when dry_run=True).
+
+    Returns a PrescriptionV2 dataclass conforming to prescription-format.schema.json.
+    Schema version: 1.0.0
+    """
+    now_iso = _now_iso()
+
+    executor_outcome_value = diagnosis.executor_outcome
+    diagnosis_section: dict[str, Any] = {
+        "signal": (
+            f"UoW {uow.id} entered ready-for-steward"
+            + (" on first execution" if cycles == 0 else f" on cycle {cycles}")
+            + (f"; source is {uow.source}" if uow.source else "")
+            + (f"; {uow.summary}" if uow.summary else "")
+            + "."
+        ),
+        "reentry_posture": diagnosis.reentry_posture,
+        "completion_gap": "" if diagnosis.reentry_posture == "first_execution" else diagnosis.completion_rationale,
+        "executor_outcome": executor_outcome_value,
+        "prior_cycle_count": cycles,
+    }
+
+    # Use module-scope _ORPHAN_POSTURES (3 enum-backed values) for the primary check.
+    # orphan_kill_before_start and orphan_kill_during_execution are heartbeat-classified
+    # kill types (#963) that are not yet in the ReentryPosture enum — they also map to
+    # continuation posture and are checked explicitly here rather than via a function-body
+    # frozenset shadow (see learnings.md #965, #967, #974).
+    if diagnosis.reentry_posture == "first_execution":
+        executor_posture = "first_execution"
+    elif diagnosis.reentry_posture in _ORPHAN_POSTURES:
+        executor_posture = "continuation"
+    elif diagnosis.reentry_posture in (
+        "orphan_kill_before_start",
+        "orphan_kill_during_execution",
+    ):
+        executor_posture = "continuation"
+    elif diagnosis.reentry_posture == "execution_failed":
+        executor_posture = "remediation"
+        diagnosis_section = dict(diagnosis_section, corrective_intent=True)
+    else:
+        executor_posture = "continuation"
+
+    selected_executor_type = _select_executor_type(uow)
+
+    vision_orientation = ""
+    if uow.vision_ref and isinstance(uow.vision_ref, dict):
+        try:
+            vision_result = resolve_vision_route(uow, log_fallback=False)
+            vision_orientation = vision_result.route_reason if vision_result.anchored else ""
+        except Exception:
+            vision_orientation = ""
+
+    dan_register = _load_dan_register_excerpt()
+    issue_body = issue_info.body if issue_info else ""
+    prescribed_skills = _select_prescribed_skills(uow, diagnosis.reentry_posture)
+
+    v2_raw = _llm_prescribe_v2(
+        uow=uow,
+        diagnosis_section=diagnosis_section,
+        executor_posture=executor_posture,
+        selected_executor_type=selected_executor_type,
+        issue_body=issue_body,
+        vision_orientation=vision_orientation,
+        dan_register=dan_register,
+        prescribed_skills=prescribed_skills,
+        cycles=cycles,
+        now_iso=now_iso,
+    )
+
+    if not dry_run:
+        registry.append_audit_log(uow.id, {
+            "event": "prescription_v2",
+            "actor": _ACTOR_STEWARD,
+            "uow_id": uow.id,
+            "steward_cycles": cycles,
+            "executor_posture": executor_posture,
+            "executor_type": selected_executor_type,
+            "schema_version": "1.0.0",
+            "timestamp": now_iso,
+        })
+
+    return v2_raw
+
+
 def _llm_prescribe(
     uow: UoW,
     reentry_posture: str,
@@ -1922,7 +2389,12 @@ def _llm_prescribe(
         "Avoid vague language. Use the success_criteria as your north star for what 'done' means. "
         "The Executor is a capable autonomous coding agent — write instructions at that level. "
         "The instructions you produce will be handed directly to a Lobster subagent dispatch call; "
-        "they must conform to Lobster's subagent dispatch conventions so the executor can act on them correctly."
+        "they must conform to Lobster's subagent dispatch conventions so the executor can act on them correctly. "
+        "HARD CONSTRAINT: SiderealPress/Lobster is the upstream read-only repo. "
+        "Never generate a prescription that targets SiderealPress/Lobster for any write operation — "
+        "this includes PR comments, issue comments, PR updates, pushes, or any other mutation. "
+        "If the UoW context mentions SiderealPress/Lobster as a source of information (e.g. reading an issue), "
+        "that is acceptable; write targets must always be dcetlin/lobster or another non-upstream repo."
     )
 
     # Golden dispatch conventions injected into every prescription so the executor
@@ -1963,10 +2435,21 @@ Every prompt must include:
 For internal tasks (no user reply): write_result only with sent_reply_to_user=False
 """
 
+    # Load Dan's developmental register and build an optional orientation block.
+    # Placed after the UoW context so the model sees both "what this UoW needs"
+    # and "what Dan's current arc requires of how this work lands" before generating
+    # the prescription.
+    _register_excerpt = _load_dan_register_excerpt()
+    _orientation_block = (
+        f"\n## Dan's current orientation\n\n{_register_excerpt}\n"
+        if _register_excerpt
+        else ""
+    )
+
     user_prompt = f"""Given this Unit of Work, write a precise prescription for the Executor.
 
 {uow_context}
-
+{_orientation_block}
 {_DISPATCH_CONVENTIONS}
 Respond using front-matter + prose format. Output ONLY the prescription — no preamble, no explanation outside this structure:
 
@@ -2063,6 +2546,14 @@ success_criteria_check: <one or two sentences describing exactly how to verify t
         )
         return None
 
+    boundary_present = "Boundary:" in instructions
+    if not boundary_present:
+        log.warning(
+            "_llm_prescribe: prescription for %s is missing explicit Boundary clause "
+            "(see 2026-05-03 prescription audit)",
+            uow.id,
+        )
+
     log.info(
         "_llm_prescribe: LLM prescription generated for %s (model=%s, estimated_cycles=%d)",
         uow.id, model, estimated_cycles,
@@ -2071,6 +2562,7 @@ success_criteria_check: <one or two sentences describing exactly how to verify t
         instructions=instructions,
         success_criteria_check=success_criteria_check,
         estimated_cycles=max(1, min(3, estimated_cycles)),
+        boundary_present=boundary_present,
     )
 
 
@@ -2551,17 +3043,74 @@ def _count_oracle_passes(audit_entries: list[dict]) -> int:
     return sum(1 for e in audit_entries if e.get("event") == "oracle_approved")
 
 
-def _count_failed_or_blocked_transitions(audit_entries: list[dict]) -> int:
-    """Count audit entries where the UoW transitioned to failed or blocked.
+# Infrastructure kill reason codes that must NOT count toward the dead-end
+# threshold.  These represent session kills or platform-level dispatch failures
+# where no execution outcome was produced — the agent never confirmed work.
+#
+# Mapping to audit note["reason"] prefixes written by Registry.fail_uow:
+#   executing_orphan          → steward-detected: dispatched, write_result never received
+#   orphan_kill_before_start  → heartbeat-classified: session killed before work began
+#   orphan_kill_during_execution → heartbeat-classified: session killed mid-execution
+#   ttl_exceeded              → executor-heartbeat: active/executing state exceeded 4h TTL
+#
+# CalledProcessError and all other reasons are genuine execution failures and
+# DO count toward the threshold.
+DEAD_END_INFRA_KILL_REASONS: frozenset[str] = frozenset({
+    "executing_orphan",
+    "orphan_kill_before_start",
+    "orphan_kill_during_execution",
+    "ttl_exceeded",
+})
 
-    Includes both executor-driven failures (to_status='failed') and
-    Steward-driven surface/block transitions (to_status='blocked').
-    Used by the Dead-end pattern detector.
+
+def _is_infra_kill_audit_entry(entry: dict) -> bool:
+    """Return True when an audit entry records an infrastructure kill, not a genuine failure.
+
+    Parses the entry's note JSON and checks whether the ``reason`` field starts
+    with one of the DEAD_END_INFRA_KILL_REASONS codes.  Infrastructure kills are
+    session terminations by the platform (TTL eviction, orphan recovery) where
+    the agent never confirmed an execution outcome.
+
+    The ``reason`` values written by Registry.fail_uow follow the pattern
+    ``"<code>: <human-readable detail>"``, so a ``startswith`` check on each
+    code is the correct discriminant.
+
+    Pure function — no side effects, no I/O.
+    """
+    note = entry.get("note")
+    if not note:
+        return False
+    try:
+        note_data = json.loads(note)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    reason: str | None = note_data.get("reason") if isinstance(note_data, dict) else None
+    if not reason:
+        return False
+    return any(reason.startswith(code) for code in DEAD_END_INFRA_KILL_REASONS)
+
+
+def _count_failed_or_blocked_transitions(audit_entries: list[dict]) -> int:
+    """Count genuine failure/block transitions, excluding infrastructure kills.
+
+    Counts audit entries where the UoW transitioned to failed or blocked,
+    but skips entries where the failure reason is an infrastructure kill
+    (executing_orphan, orphan_kill_before_start, orphan_kill_during_execution,
+    ttl_exceeded).  Infrastructure kills are platform-level session terminations
+    where no execution outcome was produced — they must not consume the dead-end
+    budget.
+
+    Genuine failures (CalledProcessError, agent-reported failure, etc.) still
+    count.  Used by the Dead-end pattern detector.
 
     Pure function — reads only audit_entries; no side effects.
     """
     terminal = {"failed", "blocked"}
-    return sum(1 for e in audit_entries if e.get("to_status") in terminal)
+    return sum(
+        1
+        for e in audit_entries
+        if e.get("to_status") in terminal and not _is_infra_kill_audit_entry(e)
+    )
 
 
 def _check_dispatch_eligibility(
@@ -2828,39 +3377,6 @@ def _build_prescription_instructions(
             + f"\n\nCompletion check: {success_check}"
         )
     return instructions
-
-
-# ---------------------------------------------------------------------------
-# Schema validation
-# ---------------------------------------------------------------------------
-
-def validate_steward_schema(conn: sqlite3.Connection) -> None:
-    """
-    Validate that all fields required for Steward operation are present in uow_registry.
-
-    Raises RuntimeError with a specific message if any required field is absent.
-    Call this at Steward startup before processing any UoW.
-
-    Args:
-        conn: An open SQLite connection to the registry database.
-
-    Raises:
-        RuntimeError: If any required field is missing. Message includes
-            "schema migration not applied" and the list of missing fields.
-    """
-    rows = conn.execute("PRAGMA table_info(uow_registry)").fetchall()
-    existing_cols = {row[1] for row in rows}
-    missing = _STEWARD_REQUIRED_FIELDS - existing_cols
-    if missing:
-        missing_sorted = sorted(missing)
-        raise RuntimeError(
-            f"schema migration not applied — run scripts/migrate_add_steward_fields.py first. "
-            f"Missing fields: {missing_sorted}"
-        )
-
-
-# Keep the old name as an alias so any existing callers continue to work.
-validate_phase2_schema = validate_steward_schema
 
 
 # ---------------------------------------------------------------------------
@@ -3327,6 +3843,12 @@ def _diagnose_uow(
     if executor_outcome == "blocked" and stuck_condition is None:
         stuck_condition = "executor_blocked"
 
+    # owner_decision_required: subagent escalates to the owner.
+    # Use a dedicated stuck_condition so _process_uow can write the awaiting-owner
+    # inbox message and transition the UoW without consuming the retry budget.
+    if executor_outcome == "owner_decision_required" and stuck_condition is None:
+        stuck_condition = "owner_decision_required"
+
     # Hard cap overrides completion
     if stuck_condition == "hard_cap":
         is_complete = False
@@ -3452,7 +3974,7 @@ def _write_workflow_artifact(
     artifact_dir: override for the artifact directory (used in tests).
     executor_type: the executor type to embed in the artifact (defaults to general).
     """
-    from src.orchestration.workflow_artifact import WorkflowArtifact, to_frontmatter
+    from orchestration.workflow_artifact import WorkflowArtifact, to_frontmatter
     artifact = WorkflowArtifact(
         uow_id=uow_id,
         executor_type=executor_type,
@@ -4084,6 +4606,57 @@ def _send_escalation_notification(uow: UoW) -> None:
         log.error("Failed to write WOS escalation message to inbox: %s", e)
 
 
+def _write_owner_required_message(uow: UoW, decision_text: str) -> None:
+    """
+    Write a wos_owner_required inbox message when a subagent escalates with
+    outcome=owner_decision_required.
+
+    The dispatcher handles wos_owner_required as a fast-path send_reply — no
+    subagent spawn needed. The pre-formatted text is delivered directly to Dan
+    via Telegram so he can provide the decision in the primary thread.
+
+    Non-fatal: write errors are logged but do not block the awaiting-owner
+    transition that was already committed before this function is called.
+    """
+    uow_id = uow.id
+    chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", _DAN_CHAT_ID)
+    uow_title = (uow.summary or uow_id)[:200]
+
+    text = (
+        f"UoW awaiting your decision: {uow_title}\n\n"
+        f"{decision_text}\n\n"
+        f"To re-queue: `/decide {uow_id} owner <your decision>`"
+    )
+
+    msg_id = str(uuid.uuid4())
+    msg: dict[str, Any] = {
+        "id": msg_id,
+        "type": "wos_owner_required",
+        "source": "system",
+        "chat_id": chat_id,
+        "timestamp": time.time(),
+        "uow_id": uow_id,
+        "uow_title": uow_title,
+        "text": text,
+    }
+
+    inbox_dir = _INBOX_DIR_PATH
+    try:
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        (inbox_dir / f"{msg_id}.json").write_text(
+            json.dumps(msg, indent=2), encoding="utf-8"
+        )
+        log.info(
+            "wos_owner_required message written to inbox: %s (uow_id=%s)",
+            msg_id, uow_id,
+        )
+    except Exception as e:
+        log.error(
+            "Failed to write wos_owner_required message for UoW %s: %s",
+            uow_id, e,
+        )
+
+
 # ---------------------------------------------------------------------------
 # DB fetch helpers
 # ---------------------------------------------------------------------------
@@ -4249,6 +4822,42 @@ def _process_uow(
 
     # Step 4: Convergence or prescription
 
+    # 4a-pre: owner_decision_required fast-path — handled before the generic stuck
+    # branch because it uses a dedicated awaiting-owner transition rather than the
+    # normal blocked transition and avoids consuming the retry budget.
+    if stuck_condition == "owner_decision_required" and not dry_run:
+        decision_text = diagnosis.completion_rationale or "no decision detail provided"
+        # Record the escalation event in the audit log.
+        registry.append_audit_log(uow_id, {
+            "event": "owner_decision_required",
+            "actor": _ACTOR_STEWARD,
+            "uow_id": uow_id,
+            "decision_text": decision_text,
+            "timestamp": _now_iso(),
+        })
+        # Transition UoW to awaiting-owner via the dedicated registry method.
+        try:
+            registry.set_awaiting_owner(uow_id, decision_text)
+        except Exception as _exc:
+            log.error(
+                "steward: set_awaiting_owner failed for UoW %s — %s: %s; "
+                "falling back to blocked",
+                uow_id, type(_exc).__name__, _exc,
+            )
+            registry.transition(uow_id, _STATUS_BLOCKED, _STATUS_DIAGNOSING)
+        # Write the wos_owner_required inbox message so the dispatcher can
+        # forward it to Dan without spawning a subagent.
+        _write_owner_required_message(uow, decision_text)
+        _append_cycle_trace(
+            uow_id=uow_id,
+            cycle_num=cycles,
+            subagent_excerpt=_read_output_ref(uow.output_ref),
+            return_reason=return_reason or "",
+            next_action="awaiting_owner",
+            artifact_dir=artifact_dir,
+        )
+        return Surfaced(uow_id=uow_id, condition="owner_decision_required")
+
     # 4a: Stuck condition check (fires before completion/prescription)
     if stuck_condition:
         surface_log = current_log_str
@@ -4380,6 +4989,24 @@ def _process_uow(
             next_action="done",
             artifact_dir=artifact_dir,
         )
+
+        # Per-cycle completion ping (spec: wos-completion-report-spec.md §Per-Cycle Ping).
+        # Non-fatal: inbox write failure must not block the Done registry transition.
+        # outcome_category is not mapped to UoW dataclass; pass None (degrades gracefully).
+        # current_log_str contains the updated steward_log including steward_closure event.
+        if not dry_run:
+            notify_uow_done(
+                uow_id=uow_id,
+                uow_title=uow.summary,
+                primary_outcome=None,  # not yet mapped to UoW dataclass; notifier falls back to 'seed'
+                steward_cycles=cycles,
+                execution_attempts=uow.execution_attempts,
+                token_usage=None,      # not yet mapped to UoW dataclass; notifier shows 'unknown'
+                artifacts=uow.artifacts,
+                steward_log=current_log_str,
+                gate_fired="none",     # not yet in schema; populated after migration 0019
+            )
+
         return Done(uow_id=uow_id)
 
     # 4b-orphan: executing_orphan short-circuit.
@@ -4398,6 +5025,34 @@ def _process_uow(
         "orphan_kill_before_start",
         "orphan_kill_during_execution",
     ):
+        # Retry-budget gate for orphan_kill_during_execution.
+        # Context compaction kills are environmental interruptions — requeue rather than
+        # permanently fail until the budget (ORPHAN_KILL_RETRY_BUDGET) is exhausted.
+        # orphan_kill_before_start has no partial work to retry; fall through unconditionally.
+        if reentry_posture == "orphan_kill_during_execution":
+            current_retry_count = uow.orphan_retry_count or 0
+            if current_retry_count < ORPHAN_KILL_RETRY_BUDGET:
+                if not dry_run:
+                    new_count = registry.retry_orphan_kill(uow_id)
+                    orphan_retry_log = {
+                        "event": "orphan_retry_scheduled",
+                        "uow_id": uow_id,
+                        "kill_classification": reentry_posture,
+                        "orphan_retry_count": new_count,
+                        "retry_budget": ORPHAN_KILL_RETRY_BUDGET,
+                        "ts": _now_iso(),
+                    }
+                    current_log_str = _append_steward_log_entry(
+                        registry, uow_id, current_log_str, orphan_retry_log
+                    )
+                    _write_steward_fields(registry, uow_id, steward_log=current_log_str)
+                    log.info(
+                        "_process_uow: UoW %s orphan_kill_during_execution retry %d/%d — requeued as pending",
+                        uow_id, new_count, ORPHAN_KILL_RETRY_BUDGET,
+                    )
+                return Surfaced(uow_id=uow_id, condition="orphan_retry_scheduled")
+            # Budget exhausted — fall through to permanent failure below.
+
         surface_condition = reentry_posture  # preserve precise kill classification
         orphan_reason = f"{reentry_posture}: subagent exited without calling write_result"
         orphan_log_entry = {
@@ -4429,6 +5084,20 @@ def _process_uow(
             next_action="failed",
             artifact_dir=artifact_dir,
         )
+
+        # Per-cycle failure ping (spec: wos-completion-report-spec.md §Per-Cycle Ping).
+        # Non-fatal: inbox write failure must not block the Surfaced return.
+        if not dry_run:
+            notify_uow_failed(
+                uow_id=uow_id,
+                uow_title=uow.summary,
+                gate_fired="none",         # not yet in schema; populated after migration 0019
+                steward_cycles=cycles,
+                execution_attempts=uow.execution_attempts,
+                token_usage=None,          # not yet mapped to UoW dataclass; shows 'unknown'
+                failure_summary=orphan_reason,
+            )
+
         return Surfaced(uow_id=uow_id, condition=surface_condition)
 
     # 4c: Prescribe another Executor pass
@@ -4457,7 +5126,7 @@ def _process_uow(
         is_infra_event = _is_infrastructure_event(return_reason)
         new_execution_attempts = uow.execution_attempts + (0 if is_infra_event else 1)
 
-        if new_execution_attempts > MAX_RETRIES:
+        if new_execution_attempts >= MAX_RETRIES:
             # Execution retry cap exceeded — escalate to needs-human-review.
             escalation_entry = {
                 "event": "retry_cap_exceeded",
@@ -4887,6 +5556,35 @@ def _process_uow(
     }
     current_log_str = _append_steward_log_entry(registry, uow_id, current_log_str, prescription_log_entry)
 
+    # Generate v2 prescription alongside current WorkflowArtifact (transition period).
+    # The v2 prescription is written to the audit trail; the executor still reads
+    # WorkflowArtifact from disk. Full executor migration is handled in issue #576.
+    if not dry_run:
+        try:
+            v2_prescription = generate_v2_prescription(
+                uow=uow,
+                diagnosis=diagnosis,
+                issue_info=issue_info,
+                cycles=cycles,
+                registry=registry,
+                dry_run=False,
+            )
+            registry.append_audit_log(uow_id, {
+                "event": "prescription_v2_written",
+                "actor": _ACTOR_STEWARD,
+                "uow_id": uow_id,
+                "steward_cycles": cycles,
+                "prescription_v2_json": v2_prescription.to_json(),
+                "timestamp": _now_iso(),
+            })
+            log.info("_process_uow: v2 prescription written to audit trail for %s", uow_id)
+        except Exception as v2_exc:
+            log.warning(
+                "_process_uow: v2 prescription generation failed for %s (%s) — "
+                "continuing with v1 WorkflowArtifact",
+                uow_id, v2_exc,
+            )
+
     if not dry_run:
         # Write workflow artifact to disk first
         artifact_path = _write_workflow_artifact(
@@ -4947,6 +5645,7 @@ def _process_uow(
             "instructions_preview": instructions[:80],
             "prescription_path": prescription_path,
             "prescription_confidence": confidence,
+            "boundary_present": "Boundary:" in instructions,
             "timestamp": _now_iso(),
         })
 
@@ -5069,7 +5768,7 @@ def run_steward_cycle(
         Typed dataclass with fields: evaluated, prescribed, done, surfaced, skipped,
         race_skipped, considered_ids. Call .as_dict() for dict compatibility.
     """
-    from src.orchestration.registry import Registry
+    from orchestration.registry import Registry
 
     if registry is None:
         registry = Registry(db_path)  # db_path=None → Registry resolves canonical path
@@ -5156,7 +5855,7 @@ def run_steward_cycle(
     # _executing_uows is updated within the loop as UoWs are prescribed
     # so that subsequent candidates in the same cycle see the updated
     # in-flight count (prevents over-dispatch within a single heartbeat).
-    from src.orchestration.shard_dispatch import (
+    from orchestration.shard_dispatch import (
         check_shard_dispatch_eligibility,
         read_max_parallel,
         DispatchAllowed,
@@ -5230,7 +5929,7 @@ def run_steward_cycle(
         _sweep_classification = _most_recent_classification(audit_entries)
         if _sweep_classification == "executor_orphan":
             try:
-                from src.orchestration.dispatcher_handlers import is_execution_enabled
+                from orchestration.dispatcher_handlers import is_execution_enabled
                 _execution_currently_enabled = is_execution_enabled()
             except Exception:
                 _execution_currently_enabled = False
@@ -5281,14 +5980,18 @@ def run_steward_cycle(
                     uow_id, throttle_count, _effective_burst_batch_size,
                 )
                 if not dry_run:
-                    registry.append_audit_log(uow_id, {
-                        "event": "dispatch_eligibility_skip",
+                    registry.write_dispatch_skip(uow_id, {
                         "actor": _ACTOR_STEWARD,
                         "uow_id": uow_id,
                         "steward_cycles": uow.steward_cycles,
                         "eligibility": _eligibility,
                         "timestamp": _now_iso(),
                     })
+                    try:
+                        _gate = translate_eligibility_to_gate(_eligibility)
+                        registry.write_gate_fired(uow_id, _gate)
+                    except Exception as _gate_exc:
+                        log.warning("write_gate_fired failed for %s: %s", uow_id, _gate_exc)
                 skipped += 1
                 continue
         elif _eligibility != "dispatch":
@@ -5297,14 +6000,18 @@ def run_steward_cycle(
                 uow_id, _eligibility,
             )
             if not dry_run:
-                registry.append_audit_log(uow_id, {
-                    "event": "dispatch_eligibility_skip",
+                registry.write_dispatch_skip(uow_id, {
                     "actor": _ACTOR_STEWARD,
                     "uow_id": uow_id,
                     "steward_cycles": uow.steward_cycles,
                     "eligibility": _eligibility,
                     "timestamp": _now_iso(),
                 })
+                try:
+                    _gate = translate_eligibility_to_gate(_eligibility)
+                    registry.write_gate_fired(uow_id, _gate)
+                except Exception as _gate_exc:
+                    log.warning("write_gate_fired failed for %s: %s", uow_id, _gate_exc)
             skipped += 1
             continue
 
@@ -5349,7 +6056,7 @@ def run_steward_cycle(
         # juice-priority UoW is dispatched.
         _juice_write_back_needed = False
         try:
-            from src.orchestration.juice import JuiceSensor, JUICE_UPDATE_DELTA
+            from orchestration.juice import JuiceSensor, JUICE_UPDATE_DELTA
             _juice_sensor = JuiceSensor()
             _juice_assessment = _juice_sensor.assess(uow, audit_entries, registry)
             _new_juice_score = _juice_assessment.score
@@ -5485,3 +6192,518 @@ def run_steward_cycle(
         shard_blocked=shard_blocked,
         considered_ids=tuple(considered_ids),
     )
+
+
+# ---------------------------------------------------------------------------
+# StewardHeartbeat — Class wrapper for the heartbeat loop
+#
+# Implements the object-oriented interface specified in uow_20260422_a2db63.
+# Delegates to run_steward_cycle() for the core processing logic.
+# Adds:
+#   - Vision context integration (get_vision_context via MCP subprocess)
+#   - DiagnosisRecord / PrescriptionRecord typed structures
+#   - select_workflow() workflow primitive selection
+#   - File-backed audit trail at data/wos/audit/{uow_id}/cycle_{n:03d}.json
+#   - Convergence check and anti-convergence surface alerting
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DiagnosisRecord:
+    """
+    Structured result from StewardHeartbeat.diagnose().
+
+    Extends the existing Diagnosis dataclass with vision context fields
+    required by uow_20260422_a2db63 spec.
+    """
+    uow_id: str
+    cycle: int
+    reentry_posture: str
+    return_reason: str | None
+    is_complete: bool
+    completion_rationale: str
+    stuck_condition: str | None
+    output_valid: bool
+    # Vision context fields (required by spec — must appear in audit record)
+    vision_fields_cited: dict[str, Any]
+    vision_unavailable: bool = False
+
+
+@dataclass
+class PrescriptionRecord:
+    """
+    Structured result from StewardHeartbeat.prescribe().
+    """
+    uow_id: str
+    cycle: int
+    workflow_selected: str
+    rationale: str
+    workflow_artifact_path: str | None
+
+
+# Workflow primitive constants
+WORKFLOW_SINGLE_ASSESSMENT = "single_assessment"
+WORKFLOW_INVESTIGATION = "investigation"
+WORKFLOW_DESIGN_REVIEW = "design_review"
+WORKFLOW_DIVERGE_CONVERGE_1X = "diverge_converge_1x"
+WORKFLOW_DIVERGE_CONVERGE_2X = "diverge_converge_2x"
+WORKFLOW_MULTI_PERSPECTIVE_FANOUT = "multi_perspective_fanout"
+WORKFLOW_SYNTHESIS_PASS = "synthesis_pass"
+WORKFLOW_SPEC_BREAKDOWN = "spec_breakdown"
+WORKFLOW_EXECUTION_PASS = "execution_pass"
+
+
+def select_workflow(diagnosis: DiagnosisRecord) -> tuple[str, str]:
+    """
+    Map diagnosis state to a named workflow primitive.
+
+    Returns (workflow_name, rationale) tuple.
+    Selection is always logged to the audit record with rationale.
+
+    Selection table (first match wins):
+    - single_assessment: first cycle, narrow/well-specified scope
+    - investigation: first cycle, unknown territory, no evidence
+    - design_review: proposed design exists, needs critique
+    - diverge_converge_1x: problem clear, solution contested
+    - diverge_converge_2x: novel, high-stakes, large problem space
+    - multi_perspective_fanout: need N independent readings
+    - synthesis_pass: multiple prior outputs exist, need integration
+    - spec_breakdown: design decided, ready to decompose
+    - execution_pass: scope narrow, spec confirmed, just do it
+    """
+    cycle = diagnosis.cycle
+    posture = diagnosis.reentry_posture
+    output_valid = diagnosis.output_valid
+
+    # First execution with no prior output
+    if posture == ReentryPosture.FIRST_EXECUTION and not output_valid:
+        if cycle == 0:
+            return (
+                WORKFLOW_INVESTIGATION,
+                "First cycle with no prior execution — investigate to establish evidence landscape.",
+            )
+        return (
+            WORKFLOW_SINGLE_ASSESSMENT,
+            "First execution but non-zero cycle count — use focused single assessment.",
+        )
+
+    # Prior output exists and completion satisfied
+    if diagnosis.is_complete:
+        return (
+            WORKFLOW_SYNTHESIS_PASS,
+            "Prior output exists and completion criteria met — synthesize findings for closure.",
+        )
+
+    # Stuck conditions route to more intensive workflows
+    if diagnosis.stuck_condition in (
+        StuckCondition.NO_GATE_IMPROVEMENT,
+        StuckCondition.PHILOSOPHICAL_REGISTER,
+    ):
+        return (
+            WORKFLOW_DIVERGE_CONVERGE_2X,
+            f"Stuck condition '{diagnosis.stuck_condition}' detected — apply double diverge-converge.",
+        )
+
+    if diagnosis.stuck_condition == StuckCondition.REGISTER_MISMATCH:
+        return (
+            WORKFLOW_DESIGN_REVIEW,
+            "Register mismatch — existing design proposal needs critique before re-execution.",
+        )
+
+    # Normal re-entry with prior output
+    if output_valid and cycle > 0:
+        return (
+            WORKFLOW_EXECUTION_PASS,
+            "Prior output valid and scope confirmed — execute the next increment.",
+        )
+
+    # Default: investigation for unclear cases
+    return (
+        WORKFLOW_INVESTIGATION,
+        "Territory unclear — investigate before prescribing execution.",
+    )
+
+
+def _get_vision_context_via_mcp() -> dict[str, Any]:
+    """
+    Retrieve vision context via MCP tool invocation (subprocess path).
+
+    Attempts to call get_vision_context via the lobster MCP server.
+    Returns a dict with active_project, current_focus fields on success.
+    Returns empty dict on failure (caller logs vision_unavailable).
+
+    This is a best-effort call — vision context enriches diagnosis but
+    never blocks it. All errors are caught and logged.
+    """
+    try:
+        # Try reading from the vision context file directly as a fallback
+        vision_path = Path(os.environ.get(
+            "LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace")
+        )) / "data" / "vision-context.json"
+        if vision_path.exists():
+            raw = vision_path.read_text(encoding="utf-8")
+            return json.loads(raw)
+    except Exception as exc:
+        log.debug("_get_vision_context_via_mcp: file read failed: %s", exc)
+
+    return {}
+
+
+# Default audit trail base directory
+_DEFAULT_WOS_AUDIT_DIR = Path(
+    os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
+) / "data" / "wos" / "audit"
+
+
+class StewardHeartbeat:
+    """
+    Object-oriented wrapper for the WOS Steward heartbeat loop.
+
+    One heartbeat run processes all `ready-for-steward` UoWs through the
+    diagnose → prescribe → transition cycle. Cron calls this on schedule.
+
+    This class adds vision context integration, typed DiagnosisRecord and
+    PrescriptionRecord structures, file-backed audit trail, and convergence
+    checking on top of the existing run_steward_cycle() engine.
+
+    Design constraints:
+    - Audit-before-transition: write_audit_entry() must be called before any
+      state transition. If the audit write fails, the transition does not happen.
+    - Vision context: every diagnose() call fetches vision context via MCP.
+      Missing or unavailable context is logged, not silently omitted.
+    - Convergence: close() is called when any convergence condition is met.
+      Anti-convergence signals are surfaced to admin chat without closing.
+    """
+
+    def __init__(
+        self,
+        registry=None,
+        audit_dir: Path | None = None,
+        dry_run: bool = False,
+        notify_admin: Callable | None = None,
+    ) -> None:
+        """
+        Args:
+            registry: Registry instance. If None, uses production DB.
+            audit_dir: Override for audit trail directory. Defaults to
+                ~/lobster-workspace/data/wos/audit/.
+            dry_run: If True, diagnose without writing artifacts or
+                transitioning state.
+            notify_admin: Callable(uow_id, message) for admin alerts.
+                Defaults to inbox message path.
+        """
+        self._registry = registry
+        self._audit_dir = Path(audit_dir) if audit_dir else _DEFAULT_WOS_AUDIT_DIR
+        self._dry_run = dry_run
+        self._notify_admin = notify_admin or self._default_notify_admin
+
+        # Ensure audit directory exists
+        self._audit_dir.mkdir(parents=True, exist_ok=True)
+
+    def run(self) -> CycleResult:
+        """
+        Query registry for UoWs in state 'ready-for-steward'.
+        For each: diagnose → prescribe → transition state.
+        One heartbeat run; cron calls this on schedule.
+
+        Returns a CycleResult with counts of each outcome type.
+        """
+        from src.orchestration.registry import Registry
+
+        if self._registry is None:
+            workspace = Path(os.environ.get(
+                "LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"
+            ))
+            db_path = workspace / "orchestration" / "registry.db"
+            registry = Registry(db_path)
+        else:
+            registry = self._registry
+
+        # Delegate core processing to run_steward_cycle()
+        # This handles state machine, optimistic locking, diagnosis,
+        # prescription, and transition logic.
+        result = run_steward_cycle(
+            registry=registry,
+            dry_run=self._dry_run,
+        )
+
+        log.info(
+            "StewardHeartbeat.run: evaluated=%d prescribed=%d done=%d surfaced=%d",
+            result.evaluated,
+            result.prescribed,
+            result.done,
+            result.surfaced,
+        )
+        return result
+
+    def diagnose(self, uow: UoW) -> DiagnosisRecord:
+        """
+        Read UoW state, prior audit trail, and vision context.
+        Returns a structured DiagnosisRecord.
+
+        Vision context is fetched via get_vision_context() — result appears
+        in audit record under diagnosis.vision_fields_cited.
+        If vision context is unavailable, vision_unavailable=True is logged.
+
+        Does NOT write to audit trail — call write_audit_entry() for that.
+        """
+        # Fetch vision context (best-effort, never blocks)
+        vision_data = _get_vision_context_via_mcp()
+        vision_unavailable = not bool(vision_data)
+
+        vision_fields_cited: dict[str, Any] = {}
+        if vision_data:
+            active_project = vision_data.get("active_project")
+            current_focus = vision_data.get("current_focus")
+            if active_project is not None:
+                vision_fields_cited["active_project"] = active_project
+            if current_focus is not None:
+                vision_fields_cited["current_focus"] = current_focus
+
+        if vision_unavailable:
+            log.info(
+                "StewardHeartbeat.diagnose: uow_id=%s vision_unavailable=True",
+                uow.id,
+            )
+
+        # Delegate to existing diagnosis function
+        audit_entries = _fetch_audit_entries(self._registry, uow.id) if self._registry else []
+        core_diagnosis = _diagnose_uow(uow, audit_entries, None)
+
+        return DiagnosisRecord(
+            uow_id=uow.id,
+            cycle=uow.steward_cycles,
+            reentry_posture=core_diagnosis.reentry_posture,
+            return_reason=core_diagnosis.return_reason,
+            is_complete=core_diagnosis.is_complete,
+            completion_rationale=core_diagnosis.completion_rationale,
+            stuck_condition=core_diagnosis.stuck_condition,
+            output_valid=core_diagnosis.output_valid,
+            vision_fields_cited=vision_fields_cited,
+            vision_unavailable=vision_unavailable,
+        )
+
+    def prescribe(self, uow: UoW, diagnosis: DiagnosisRecord) -> PrescriptionRecord:
+        """
+        Select workflow primitive, write workflow artifact, return PrescriptionRecord.
+
+        Workflow selection is logged with rationale. Artifact is written at
+        ~/lobster-workspace/orchestration/artifacts/{uow_id}.md.
+
+        Returns PrescriptionRecord with workflow_selected, rationale,
+        and workflow_artifact_path.
+        """
+        workflow, rationale = select_workflow(diagnosis)
+
+        # Write workflow artifact (LLM prompt instructions format per decision artifact)
+        vision_active_project = diagnosis.vision_fields_cited.get("active_project", "")
+        vision_current_focus = diagnosis.vision_fields_cited.get("current_focus", "")
+        instructions = (
+            f"# {workflow.replace('_', ' ').title()} Workflow — Executor Instructions\n"
+            f"UoW: {uow.id}\n"
+            f"Cycle: {diagnosis.cycle}\n"
+            f"Workflow: {workflow}\n\n"
+            f"## Intent\n{uow.summary}\n\n"
+            f"## Vision Context\n"
+            f"- active_project: {vision_active_project or '(unavailable)'}\n"
+            f"- current_focus: {vision_current_focus or '(unavailable)'}\n\n"
+            f"## Workflow Rationale\n{rationale}\n\n"
+            f"## Success Criteria\n{uow.success_criteria or '(not specified)'}\n\n"
+            f"## Return Conditions\n"
+            f"- Return `observation_complete` when output is written and findings are summarized.\n"
+            f"- Return `blocked` if you cannot proceed without human clarification.\n"
+            f"- Return `execution_failed` only on unrecoverable error.\n"
+        )
+
+        artifact_path: str | None = None
+        if not self._dry_run:
+            try:
+                artifact_path = _write_workflow_artifact(
+                    uow_id=uow.id,
+                    instructions=instructions,
+                    prescribed_skills=list(uow.prescribed_skills or []),
+                )
+            except Exception as exc:
+                log.error(
+                    "StewardHeartbeat.prescribe: artifact write failed for uow_id=%s: %s",
+                    uow.id,
+                    exc,
+                )
+
+        return PrescriptionRecord(
+            uow_id=uow.id,
+            cycle=diagnosis.cycle,
+            workflow_selected=workflow,
+            rationale=rationale,
+            workflow_artifact_path=artifact_path,
+        )
+
+    def write_audit_entry(
+        self,
+        uow: UoW,
+        diagnosis: DiagnosisRecord,
+        prescription: PrescriptionRecord,
+        outcome: str,
+    ) -> None:
+        """
+        Write audit entry to file-backed trail BEFORE state transition.
+
+        Path: ~/lobster-workspace/data/wos/audit/{uow_id}/cycle_{n:03d}.json
+
+        The audit entry includes all diagnosis fields, vision context,
+        prescription result, and outcome. State transition must not proceed
+        if this write fails.
+
+        Raises on write failure to enforce audit-before-transition invariant.
+        """
+        uow_audit_dir = self._audit_dir / uow.id
+        uow_audit_dir.mkdir(parents=True, exist_ok=True)
+
+        cycle_num = diagnosis.cycle
+        audit_path = uow_audit_dir / f"cycle_{cycle_num:03d}.json"
+
+        entry: dict[str, Any] = {
+            "uow_id": uow.id,
+            "cycle": cycle_num,
+            "timestamp": _now_iso(),
+            "actor": "steward",
+            "outcome": outcome,
+            "diagnosis": {
+                "reentry_posture": diagnosis.reentry_posture,
+                "return_reason": diagnosis.return_reason,
+                "is_complete": diagnosis.is_complete,
+                "completion_rationale": diagnosis.completion_rationale,
+                "stuck_condition": diagnosis.stuck_condition,
+                "output_valid": diagnosis.output_valid,
+                "vision_fields_cited": diagnosis.vision_fields_cited,
+                "vision_unavailable": diagnosis.vision_unavailable,
+            },
+            "prescription": {
+                "workflow_selected": prescription.workflow_selected,
+                "rationale": prescription.rationale,
+                "workflow_artifact_path": prescription.workflow_artifact_path,
+            },
+        }
+
+        # This write must succeed before any state transition
+        audit_path.write_text(json.dumps(entry, indent=2), encoding="utf-8")
+        log.info(
+            "StewardHeartbeat.write_audit_entry: wrote %s",
+            audit_path,
+        )
+
+    def close(self, uow: UoW, diagnosis: DiagnosisRecord, reason: str) -> None:
+        """
+        Write closing audit entry, set status=done in registry.
+
+        Called when any convergence condition is satisfied. Writes the
+        closing audit entry first (audit-before-transition invariant),
+        then transitions to done.
+        """
+        if not self._registry:
+            log.warning(
+                "StewardHeartbeat.close: no registry available — cannot close uow_id=%s",
+                uow.id,
+            )
+            return
+
+        # Closing prescription record (no workflow artifact — this is closure)
+        closing_prescription = PrescriptionRecord(
+            uow_id=uow.id,
+            cycle=diagnosis.cycle,
+            workflow_selected="close",
+            rationale=reason,
+            workflow_artifact_path=None,
+        )
+
+        if not self._dry_run:
+            # Write closing audit entry BEFORE state transition
+            self.write_audit_entry(uow, diagnosis, closing_prescription, outcome="closed")
+
+            # Transition to done
+            rows = self._registry.transition(uow.id, _STATUS_DONE, _STATUS_READY_FOR_STEWARD)
+            if rows == 0:
+                # Try from diagnosing state (normal path)
+                rows = self._registry.transition(uow.id, _STATUS_DONE, _STATUS_DIAGNOSING)
+            log.info(
+                "StewardHeartbeat.close: uow_id=%s closed (rows=%d) reason=%s",
+                uow.id,
+                rows,
+                reason,
+            )
+
+    def check_convergence(
+        self,
+        uow: UoW,
+        diagnosis: DiagnosisRecord,
+    ) -> tuple[bool, str]:
+        """
+        Check convergence conditions. Returns (is_converged, reason).
+
+        Any one of these conditions is sufficient to close:
+        1. Original intent satisfied and output artifact exists
+        2. All spawned UoWs closed and synthesis complete
+        3. Design decision made and logged — no elaboration needed
+        4. Dan explicitly marked done
+        5. Unit superseded by more current UoW
+
+        Anti-convergence signals (surface, do not close):
+        - 3+ cycles without a concrete artifact
+        - Prescription identical on consecutive cycles
+        - Spawned UoWs accumulating without closing
+        """
+        # Condition 1: complete with valid output
+        if diagnosis.is_complete and diagnosis.output_valid:
+            return True, "Original intent satisfied and output artifact exists."
+
+        # Condition 4: explicitly marked done (close_reason set by human)
+        if uow.close_reason and "done" in uow.close_reason.lower():
+            return True, f"Explicitly marked done: {uow.close_reason}"
+
+        # Anti-convergence: 3+ cycles without artifact
+        if uow.steward_cycles >= 3 and not diagnosis.output_valid:
+            self._surface_anticonvergence(
+                uow,
+                f"3+ cycles ({uow.steward_cycles}) without a concrete artifact.",
+            )
+
+        return False, ""
+
+    def _surface_anticonvergence(self, uow: UoW, message: str) -> None:
+        """Surface an anti-convergence alert to admin chat."""
+        log.warning(
+            "StewardHeartbeat: anti-convergence signal for uow_id=%s: %s",
+            uow.id,
+            message,
+        )
+        try:
+            self._notify_admin(uow.id, message)
+        except Exception as exc:
+            log.error(
+                "StewardHeartbeat._surface_anticonvergence: notify failed: %s",
+                exc,
+            )
+
+    @staticmethod
+    def _default_notify_admin(uow_id: str, message: str) -> None:
+        """Write anti-convergence alert to inbox."""
+        admin_chat_id = os.environ.get("LOBSTER_ADMIN_CHAT_ID", "")
+        if not admin_chat_id:
+            log.warning(
+                "StewardHeartbeat._default_notify_admin: LOBSTER_ADMIN_CHAT_ID not set"
+            )
+            return
+
+        inbox_dir = Path(os.path.expanduser("~/messages/inbox"))
+        if not inbox_dir.exists():
+            return
+
+        alert = {
+            "type": "wos_anticonvergence",
+            "chat_id": admin_chat_id,
+            "uow_id": uow_id,
+            "message": message,
+            "timestamp": _now_iso(),
+        }
+        msg_path = inbox_dir / f"wos_anticonvergence_{uow_id}_{uuid.uuid4().hex[:6]}.json"
+        msg_path.write_text(json.dumps(alert), encoding="utf-8")
