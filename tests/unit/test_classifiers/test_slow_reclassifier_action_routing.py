@@ -4,6 +4,7 @@ Tests for threshold-gated action routing in slow_reclassifier.
 Covers:
 - compute_pattern_confidence returns correct confidence level
 - route_pattern_to_action creates task for design_session with HIGH confidence
+- task writes use LOBSTER_MESSAGES/tasks.json with canonical {"tasks": [...], "next_id": N} schema
 - route_pattern_to_action flags meta_thread for digest with HIGH confidence
 - Dedup: second call on same pattern_event_id is a no-op
 - MEDIUM confidence patterns produce no action
@@ -19,7 +20,7 @@ import pytest
 from src.classifiers.slow_reclassifier import (
     ACTION_CONFIDENCE_MINIMUM,
     DESIGN_SESSION_THRESHOLD,
-    LOBSTER_WORKSPACE,
+    LOBSTER_MESSAGES,
     META_THREAD_THRESHOLD,
     PatternObservation,
     compute_pattern_confidence,
@@ -108,7 +109,7 @@ class TestRoutePatternCreatesTask:
 
     def test_creates_task_file(self, db, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            "src.classifiers.slow_reclassifier.LOBSTER_WORKSPACE", tmp_path
+            "src.classifiers.slow_reclassifier.LOBSTER_MESSAGES", tmp_path
         )
         obs = _make_obs(
             pattern_type="design_session",
@@ -120,14 +121,21 @@ class TestRoutePatternCreatesTask:
 
         tasks_path = tmp_path / "tasks.json"
         assert tasks_path.exists()
-        tasks = json.loads(tasks_path.read_text())
+        data = json.loads(tasks_path.read_text())
+        # Verify canonical schema: {"tasks": [...], "next_id": N}
+        assert isinstance(data, dict), "tasks.json must use {tasks, next_id} schema"
+        assert "tasks" in data
+        assert "next_id" in data
+        tasks = data["tasks"]
         assert len(tasks) == 1
         assert tasks[0]["source"] == "slow-reclassifier"
         assert "Design Session" in tasks[0]["subject"]
+        assert tasks[0]["status"] == "pending"
+        assert isinstance(tasks[0]["id"], int)
 
     def test_records_action_in_db(self, db, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            "src.classifiers.slow_reclassifier.LOBSTER_WORKSPACE", tmp_path
+            "src.classifiers.slow_reclassifier.LOBSTER_MESSAGES", tmp_path
         )
         obs = _make_obs(
             pattern_type="design_session",
@@ -143,6 +151,30 @@ class TestRoutePatternCreatesTask:
         ).fetchone()
         assert row is not None
         assert row["action_type"] == "task"
+
+    def test_next_id_increments_on_second_write(self, db, tmp_path, monkeypatch):
+        """Each new task gets a monotonically-increasing integer id."""
+        monkeypatch.setattr(
+            "src.classifiers.slow_reclassifier.LOBSTER_MESSAGES", tmp_path
+        )
+        # First pattern event
+        obs1 = _make_obs(
+            pattern_type="design_session",
+            event_ids=list(range(DESIGN_SESSION_THRESHOLD * 2)),
+        )
+        route_pattern_to_action(db, obs1, pattern_event_id=110)
+        # Second pattern event with distinct event_ids so dedup does not block it
+        obs2 = _make_obs(
+            pattern_type="complex_request",
+            event_ids=list(range(10, 10 + DESIGN_SESSION_THRESHOLD * 2)),
+        )
+        route_pattern_to_action(db, obs2, pattern_event_id=111)
+
+        data = json.loads((tmp_path / "tasks.json").read_text())
+        assert len(data["tasks"]) == 2
+        ids = [t["id"] for t in data["tasks"]]
+        assert ids[0] != ids[1], "each task must have a unique id"
+        assert ids == sorted(ids), "task ids must be in ascending order"
 
 
 class TestRoutePatternFlagsDigest:
@@ -185,7 +217,7 @@ class TestDeduplication:
 
     def test_second_call_is_noop(self, db, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            "src.classifiers.slow_reclassifier.LOBSTER_WORKSPACE", tmp_path
+            "src.classifiers.slow_reclassifier.LOBSTER_MESSAGES", tmp_path
         )
         obs = _make_obs(
             pattern_type="design_session",
@@ -196,8 +228,8 @@ class TestDeduplication:
         route_pattern_to_action(db, obs, pattern_event_id)
         route_pattern_to_action(db, obs, pattern_event_id)
 
-        tasks = json.loads((tmp_path / "tasks.json").read_text())
-        assert len(tasks) == 1  # only one task created
+        data = json.loads((tmp_path / "tasks.json").read_text())
+        assert len(data["tasks"]) == 1  # only one task created
 
         count = db.execute(
             "SELECT COUNT(*) FROM pattern_actions WHERE pattern_event_id = ?",
@@ -211,7 +243,7 @@ class TestMediumConfidenceNoAction:
 
     def test_no_action_for_medium_confidence(self, db, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            "src.classifiers.slow_reclassifier.LOBSTER_WORKSPACE", tmp_path
+            "src.classifiers.slow_reclassifier.LOBSTER_MESSAGES", tmp_path
         )
         # Use fewer events than threshold * 2 to get MEDIUM
         obs = _make_obs(
@@ -222,7 +254,7 @@ class TestMediumConfidenceNoAction:
 
         route_pattern_to_action(db, obs, pattern_event_id)
 
-        # No task file created
+        # No task file created (LOBSTER_MESSAGES/tasks.json must not exist)
         tasks_path = tmp_path / "tasks.json"
         assert not tasks_path.exists()
 

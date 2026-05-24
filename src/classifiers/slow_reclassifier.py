@@ -83,6 +83,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 LOBSTER_WORKSPACE = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+LOBSTER_MESSAGES = Path(os.environ.get("LOBSTER_MESSAGES", Path.home() / "messages"))
 MEMORY_DB_PATH = LOBSTER_WORKSPACE / "data" / "memory.db"
 LOG_PATH = LOBSTER_WORKSPACE / "logs" / "classifier.log"
 CHECKPOINT_PATH = LOBSTER_WORKSPACE / "data" / "slow-reclassifier.checkpoint.json"
@@ -454,22 +455,31 @@ def already_acted(conn: sqlite3.Connection, pattern_event_id: int) -> bool:
 
 
 def create_task_for_pattern(obs: PatternObservation, pattern_event_id: int) -> str:
-    """Create a task entry in LOBSTER_WORKSPACE/tasks.json for a detected pattern."""
-    import uuid as _uuid
-    task_id = str(_uuid.uuid4())
+    """Create a task entry in LOBSTER_MESSAGES/tasks.json for a detected pattern.
+
+    Writes to ~/messages/tasks.json (resolved from LOBSTER_MESSAGES env var) using
+    the canonical {"tasks": [...], "next_id": N} schema expected by inbox_server.py
+    and dashboard/collectors.py.
+    """
     subject = (
         f"{obs.pattern_type.replace('_', ' ').title()} detected: "
         f"{len(obs.event_ids)} events from {obs.source}"
     )
-    tasks_path = LOBSTER_WORKSPACE / "tasks.json"
-    tasks: list[dict] = []
+    tasks_path = LOBSTER_MESSAGES / "tasks.json"
+    existing: dict = {"tasks": [], "next_id": 1}
     if tasks_path.exists():
         try:
-            tasks = json.loads(tasks_path.read_text())
+            raw = json.loads(tasks_path.read_text())
+            if isinstance(raw, dict) and "tasks" in raw:
+                existing = raw
+            else:
+                # Recover from a flat-list format written by an older version
+                existing = {"tasks": raw if isinstance(raw, list) else [], "next_id": 1}
         except Exception:
-            tasks = []
-    tasks.append({
-        "id": task_id,
+            existing = {"tasks": [], "next_id": 1}
+    next_id = existing.get("next_id", len(existing["tasks"]) + 1)
+    existing["tasks"].append({
+        "id": next_id,
         "subject": subject,
         "description": (
             f"Auto-created by slow-reclassifier.\n"
@@ -477,15 +487,14 @@ def create_task_for_pattern(obs: PatternObservation, pattern_event_id: int) -> s
             f"Contributing events: {obs.event_ids}\n"
             f"Detected at: {obs.detected_at.isoformat()}"
         ),
-        "status": "open",
+        "status": "pending",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source": "slow-reclassifier",
     })
-    tasks_path.write_text(json.dumps(tasks, indent=2))
+    existing["next_id"] = next_id + 1
+    tasks_path.write_text(json.dumps(existing, indent=2))
     log.info("Created task for pattern %s: %s", obs.pattern_type, subject)
     return subject
-
-
 def flag_for_digest(conn: sqlite3.Connection, obs: PatternObservation) -> int:
     """Insert a digest_flag event for nightly digest consumption."""
     content = (
