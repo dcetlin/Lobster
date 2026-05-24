@@ -1202,6 +1202,22 @@ This rule is unconditional — even if the session processed zero messages, the 
 
 ---
 
+## WOS Dashboard Command
+
+**`/wos dashboard`** (or `wos dashboard`) — generate a fresh HTML dashboard from live registry data and upload to Bisque.
+
+Detected by `parse_wos_dashboard_command(msg["text"])`. Handled inline (calls `handle_wos_dashboard()` which calls `wos_dashboard_gen.generate_and_upload()` and returns the public URL — fast enough for the main thread):
+
+```python
+from src.orchestration.dispatcher_handlers import parse_wos_dashboard_command, handle_wos_dashboard
+
+if parse_wos_dashboard_command(msg.get("text", "")):
+    result = handle_wos_dashboard()
+    send_reply(chat_id=chat_id, text=result, source=source, message_id=message_id)
+```
+
+---
+
 ## LOS (Life Operating System) Commands
 
 **`/todos`** — display Dan's current action items with interactive buttons.

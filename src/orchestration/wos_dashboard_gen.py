@@ -45,15 +45,6 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# Sonnet 4.6 pricing constants (USD per million tokens)
-# ---------------------------------------------------------------------------
-
-SONNET_4_6_INPUT_PER_MTK: float = 3.0
-SONNET_4_6_OUTPUT_PER_MTK: float = 15.0
-SONNET_4_6_CACHE_READ_PER_MTK: float = 0.30
-
-
-# ---------------------------------------------------------------------------
 # Path resolution — all through canonical sources, no inline derivation
 # ---------------------------------------------------------------------------
 
