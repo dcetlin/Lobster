@@ -1,3 +1,12 @@
+# Metabolic Taxonomy (Council Seed — Pending Deliberation)
+
+**Status:** seed — submitted for council deliberation, not yet canon  
+**Submitted:** 2026-05-24  
+**Source session:** 20260524-008 (Dan + dispatcher collaborative refinement)  
+**Deliberation question:** Does this 8-state taxonomy with the transition graph and seed→juice cycle accurately represent the metabolic flow? What refinements does the council propose?
+
+---
+
 ## metabolic-taxonomy
 
 **Committed:** 2026-05-24
