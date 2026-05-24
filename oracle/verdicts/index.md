@@ -1,7 +1,13 @@
+| 2026-05-24 | PR #1017 | Round 2 | APPROVED |
 | 2026-05-23 | PR #1240 | Round 1 | NEEDS_CHANGES |
 | 2026-05-23 | PR #834 | Round 3 | APPROVED — merged, verdict archived |
 | 2026-05-23 | PR #834 | Round 2 | NEEDS_CHANGES |
 | 2026-05-23 | PR #834 | Round 1 | NEEDS_CHANGES |
+| 2026-05-23 | PR #1016 | Round 1 | NEEDS_CHANGES |
+| 2026-05-23 | PR #1018 | Round 2 | APPROVED |
+| 2026-05-23 | PR #1018 | Round 1 | NEEDS_CHANGES |
+| 2026-05-23 | PR #1114 | Round 1 | NEEDS_CHANGES |
+| 2026-05-23 | PR #1017 | Round 1 | NEEDS_CHANGES |
 | 2026-05-23 | PR #1013 | Round 1 | APPROVED |
 | 2026-05-23 | PR #837 | Round 1 | APPROVED |
 | 2026-05-23 | PR #1012 | Round 1 | APPROVED |
