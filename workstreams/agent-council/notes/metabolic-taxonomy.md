@@ -65,3 +65,20 @@ Refined through council deliberation May 2026. Earlier versions conflated transm
 **Connections:**
 - `generative-vs-dissipative-resistance`: the resistance register is the fork determinant for transmutation — that entry defines what makes resistance generative vs. dissipative
 - `stiffness-toughness-tradeoff`: a material-science instantiation of the same underlying principle — systems tuned for resistance under static load fail under dynamic perturbation; transmutation toward pearl requires dynamic load-path coupling, not maximum rigidity
+
+---
+
+## Council Cross-references
+
+### Transmutation state → Threshold register (resistance registers lexicon)
+The transmutation state's fork condition (holds → pearl/seed vs. breaks → shit-produced) maps to the Threshold register in the resistance registers lexicon. The Threshold register is phase-transforming: it either transmutes under load or fails catastrophically. This is the same fork. The transmutation state IS the Threshold register in the metabolic lens.
+
+See: `canon/resistance-registers-lexicon.md` → Tier 1: Threshold (Phase-Transforming)
+
+### Void state → post-Threshold liminal space
+Void follows when the Threshold register fires: the old configuration has ended, the new one hasn't formed. The three-step void decomposition (void-event → scaffold → seed) describes how a system navigates the Threshold register's aftermath.
+
+See: `canon/resistance-registers-lexicon.md` → Tier 1: Threshold (Phase-Transforming)
+
+### Hormetic window characterization (open question, partially answered)
+The lexicon asks what characterizes the hormetic window. The metabolic taxonomy's transmutation fork is a structural answer: the hormetic window is the range where Threshold-register load produces transmutation rather than shit-produced. The fork determinant (holding structure integrity at moment of load) is the hormetic window boundary condition.

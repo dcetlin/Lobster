@@ -251,6 +251,25 @@ Measurements that span multiple registers. These are properties of systems or in
 
 ---
 
+## Council Cross-references
+
+### Hormetic window → Metabolic transmutation fork
+The Threshold register's defining question — what load range produces transformation rather than destruction — is answered by the metabolic taxonomy's transmutation fork. The fork condition (does the system absorb and reorganize the load, or does the holding structure break?) describes the same boundary the hormetic window concept points at. The transmutation fork is the hormetic window operationalized.
+
+See: `notes/metabolic-taxonomy.md` → Transmutation state, shit-produced fork
+
+### Measurement problem → Register-mismatch diagnostic
+Identifying which register is in play can be approached through failure: if correction attempts don't produce behavioral change, the feedback loop is severed at the register boundary. The register in play is the one whose failure mode matches observed symptoms. The canonical mismatch entries for each register are heuristics for this diagnostic.
+
+Principle: OODA register-mismatch severs the feedback loop — the correction signal cannot cross a register boundary it doesn't recognize.
+
+### Void state → Threshold register depletion
+The Threshold register fires a phase transformation when load exceeds its characteristic threshold. The metabolic Void state is what follows: the old phase has collapsed (transformation fired), the new phase hasn't stabilized. Void is the phenomenological name for post-Threshold liminal space.
+
+See: `notes/metabolic-taxonomy.md` → Void state, three-step void decomposition
+
+---
+
 ## Structural Notes
 
 The three-tier structure encodes a design logic:
