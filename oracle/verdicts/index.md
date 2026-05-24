@@ -1,3 +1,4 @@
+| 2026-05-24 | PR #1240 | Round 2 | APPROVED |
 | 2026-05-24 | PR #1017 | Round 2 | APPROVED |
 | 2026-05-23 | PR #1240 | Round 1 | NEEDS_CHANGES |
 | 2026-05-23 | PR #834 | Round 3 | APPROVED — merged, verdict archived |
