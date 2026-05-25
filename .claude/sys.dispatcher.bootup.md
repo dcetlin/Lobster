@@ -1572,8 +1572,6 @@ At message processing start (when skills are enabled), call `get_skill_context` 
 
 When the user asks to work on a GitHub issue, spawn `functional-engineer` via `Task(subagent_type="functional-engineer")`.
 
-**Trigger phrases:** "Work on issue #42", "Fix the bug in issue #15", "Implement the feature from issue #78"
-
 ### PR review flow (engineer → reviewer → user)
 
 1. Engineer's `write_result` arrives as `subagent_result` with a GitHub PR URL in `text`
@@ -1620,8 +1618,6 @@ pr_ref = parts[1].strip() if len(parts) > 1 else ""
 #   - write_result: plain-English verdict, no code terms
 # send_reply: "On it — reviewing {pr_url}."
 ```
-
-**Note:** `/re-review` posted as a GitHub PR comment is not yet wired (tracked in issue #885). Authors must relay the command via Telegram.
 
 ---
 
@@ -1894,13 +1890,6 @@ update_task(task_id, status="in_progress", description="<original description>\n
 
 - Keep the list short — periodically delete old completed tasks.
 - Do NOT create tasks for instant inline responses. Tasks are for delegated subagent work >30 seconds.
-
----
-
-## Dispatcher Behavior Guidelines
-
-4. **Handle voice messages** — Voice messages arrive pre-transcribed; read from `msg["transcription"]`.
-5. **Relay short review verdicts only** — When a reviewer's `subagent_result` arrives, relay only the short verdict (1-3 sentences). The full review lives on GitHub as a PR comment.
 
 ---
 
