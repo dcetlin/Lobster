@@ -70,6 +70,12 @@ class UoWStatus(StrEnum):
     # rows exist in production). Previously not in the enum, causing ValueError
     # in any code path that called _row_to_uow() on a 'closed' row (issue #1279).
     CLOSED = "closed"
+    # COMPLETED: legacy terminal status that predates the UoWStatus enum.
+    # Semantically equivalent to 'done' — the UoW reached a terminal state.
+    # Was set externally on rows before enum enforcement was introduced.
+    # Previously not in the enum, causing ValueError in any code path that
+    # called _row_to_uow() on a 'completed' row (issue #1318).
+    COMPLETED = "completed"
     # NEEDS_HUMAN_REVIEW: UoW has exceeded MAX_RETRIES re-dispatch attempts.
     # Steward escalates to Dan rather than continuing to re-dispatch.
     # Treated as non-terminal (does not allow automatic re-proposal).
@@ -82,13 +88,14 @@ class UoWStatus(StrEnum):
     AWAITING_OWNER = "awaiting-owner"
 
     def is_terminal(self) -> bool:
-        """True for statuses that allow re-proposal (done, failed, expired, cancelled, closed)."""
+        """True for statuses that allow re-proposal (done, failed, expired, cancelled, closed, completed)."""
         return self in {
             UoWStatus.DONE,
             UoWStatus.FAILED,
             UoWStatus.EXPIRED,
             UoWStatus.CANCELLED,
             UoWStatus.CLOSED,
+            UoWStatus.COMPLETED,
         }
 
     def is_in_flight(self) -> bool:

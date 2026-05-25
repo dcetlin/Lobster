@@ -197,6 +197,29 @@ class TestListCommand:
         assert "summary" in record
         assert "source" in record
 
+    def test_list_does_not_crash_on_completed_status_in_db(self, db_path):
+        """list command must not raise ValueError when DB contains rows with status='completed'.
+
+        'completed' is a legacy DB value that predates the UoWStatus enum.  Before the
+        fix, calling registry.list() on a DB with such rows crashed with:
+            ValueError: 'completed' is not a valid UoWStatus
+
+        After the fix, 'completed' is a recognised enum member and the row is returned
+        with status serialised as the plain string 'completed'.
+        """
+        today = datetime.now(timezone.utc).date().isoformat()
+        inserted = run_cli(db_path, "upsert", "--issue", "33", "--title", "Issue 33", "--sweep-date", today)
+        uow_id = inserted["id"]
+        _force_status(db_path, uow_id, "completed")
+
+        # Must not crash (previously raised ValueError: 'completed' is not a valid UoWStatus)
+        result = run_cli(db_path, "list")
+
+        assert isinstance(result, list)
+        matching = [r for r in result if r["id"] == uow_id]
+        assert len(matching) == 1
+        assert matching[0]["status"] == "completed"
+
 
 # ---------------------------------------------------------------------------
 # approve command
@@ -1189,219 +1212,11 @@ def _insert_failed_uow(db_path: Path, issue_number: int, register: str = "operat
         """,
         (uow_id, issue_number, datetime.now(timezone.utc).date().isoformat(),
          now, now, f"Issue #{issue_number}", register),
-# _compute_latency_stats unit tests
-# ---------------------------------------------------------------------------
+    )
+    conn.commit()
+    conn.close()
+    return uow_id
 
-class TestComputeLatencyStats:
-    """Unit tests for the pure _compute_latency_stats function."""
-
-    def _row(self, created_at: str, started_at: str | None, completed_at: str | None,
-             status: str = "done") -> dict:
-        return {
-            "created_at": created_at,
-            "started_at": started_at,
-            "completed_at": completed_at,
-            "status": status,
-        }
-
-    def test_empty_rows_returns_none_for_all_stats(self):
-        """No rows means no percentiles can be computed — all stat values are None."""
-        stats = _compute_latency_stats([])
-        assert stats["queue_wait"]["p50"] is None
-        assert stats["queue_wait"]["p90"] is None
-        assert stats["queue_wait"]["p99"] is None
-        assert stats["queue_wait"]["mean"] is None
-        assert stats["execution_time"]["p50"] is None
-        assert stats["execution_time"]["count"] == 0
-
-    def test_rows_without_started_at_excluded_from_queue_wait(self):
-        """UoWs with no started_at cannot contribute to queue_wait stats."""
-        rows = [
-            self._row("2026-01-01T10:00:00+00:00", None, None, status="proposed"),
-        ]
-        stats = _compute_latency_stats(rows)
-        assert stats["queue_wait"]["count"] == 0
-        assert stats["queue_wait"]["p50"] is None
-
-    def test_rows_without_completed_at_excluded_from_execution_time(self):
-        """UoWs with started_at but no completed_at cannot contribute to execution_time stats."""
-        rows = [
-            self._row("2026-01-01T10:00:00+00:00", "2026-01-01T10:05:00+00:00", None, status="active"),
-        ]
-        stats = _compute_latency_stats(rows)
-        # queue_wait is available (started_at is set)
-        assert stats["queue_wait"]["count"] == 1
-        assert stats["queue_wait"]["p50"] == 300  # 5 minutes in seconds
-        # execution_time is not available (no completed_at)
-        assert stats["execution_time"]["count"] == 0
-        assert stats["execution_time"]["p50"] is None
-
-    def test_queue_wait_computed_from_created_at_to_started_at(self):
-        """queue_wait = started_at - created_at in seconds."""
-        # 10 minutes queue wait
-        rows = [
-            self._row(
-                "2026-01-01T10:00:00+00:00",
-                "2026-01-01T10:10:00+00:00",
-                "2026-01-01T10:30:00+00:00",
-            )
-        ]
-        stats = _compute_latency_stats(rows)
-        assert stats["queue_wait"]["p50"] == 600   # 10 min = 600s
-        assert stats["queue_wait"]["count"] == 1
-
-    def test_execution_time_computed_from_started_at_to_completed_at(self):
-        """execution_time = completed_at - started_at in seconds."""
-        # 20 minutes execution
-        rows = [
-            self._row(
-                "2026-01-01T10:00:00+00:00",
-                "2026-01-01T10:10:00+00:00",
-                "2026-01-01T10:30:00+00:00",
-            )
-        ]
-        stats = _compute_latency_stats(rows)
-        assert stats["execution_time"]["p50"] == 1200  # 20 min = 1200s
-        assert stats["execution_time"]["count"] == 1
-
-    def test_percentiles_correct_for_known_dataset(self):
-        """p50, p90, p99, and mean are correct for a known set of queue_wait values."""
-        # 5 rows with queue_wait values: 100, 200, 300, 400, 500 seconds
-        # p50 = 300, p90 = 500 (or interpolated), mean = 300
-        rows = [
-            self._row(
-                f"2026-01-01T10:00:0{i}+00:00",
-                f"2026-01-01T10:0{1+i}:40+00:00" if False else None,  # use abs offsets below
-                None,
-            )
-            for i in range(5)
-        ]
-        # Build rows with controlled deltas
-        base_created = "2026-01-01T10:00:00+00:00"
-        queue_waits_s = [100, 200, 300, 400, 500]
-        rows = []
-        for qw in queue_waits_s:
-            from datetime import datetime, timezone, timedelta
-            created = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
-            started = created + timedelta(seconds=qw)
-            rows.append({
-                "created_at": created.isoformat(),
-                "started_at": started.isoformat(),
-                "completed_at": None,
-                "status": "active",
-            })
-
-        stats = _compute_latency_stats(rows)
-        assert stats["queue_wait"]["count"] == 5
-        assert stats["queue_wait"]["p50"] == 300
-        assert stats["queue_wait"]["mean"] == 300.0
-
-    def test_mean_rounds_to_one_decimal(self):
-        """Mean is a float (not truncated to int)."""
-        from datetime import datetime, timezone, timedelta
-        created = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
-        rows = [
-            {
-                "created_at": created.isoformat(),
-                "started_at": (created + timedelta(seconds=100)).isoformat(),
-                "completed_at": (created + timedelta(seconds=350)).isoformat(),
-                "status": "done",
-            },
-            {
-                "created_at": created.isoformat(),
-                "started_at": (created + timedelta(seconds=200)).isoformat(),
-                "completed_at": (created + timedelta(seconds=450)).isoformat(),
-                "status": "done",
-            },
-        ]
-        stats = _compute_latency_stats(rows)
-        # queue_wait mean = (100 + 200) / 2 = 150.0
-        assert stats["queue_wait"]["mean"] == 150.0
-        # execution_time: 250s and 250s → mean = 250.0
-        assert stats["execution_time"]["mean"] == 250.0
-
-    def test_malformed_timestamp_rows_are_skipped(self):
-        """Rows with unparseable timestamps do not crash — they are silently skipped."""
-        rows = [
-            {
-                "created_at": "not-a-timestamp",
-                "started_at": "also-invalid",
-                "completed_at": None,
-                "status": "active",
-            }
-        ]
-        # Must not raise; result should treat this row as having no usable data
-        stats = _compute_latency_stats(rows)
-        assert stats["queue_wait"]["count"] == 0
-
-
-# ---------------------------------------------------------------------------
-# _format_latency_report unit tests
-# ---------------------------------------------------------------------------
-
-class TestFormatLatencyReport:
-    """Unit tests for the pure _format_latency_report function."""
-
-    def _stats_with_data(self) -> dict:
-        return {
-            "queue_wait": {"count": 5, "p50": 120, "p90": 300, "p99": 600, "mean": 180.0},
-            "execution_time": {"count": 5, "p50": 900, "p90": 1800, "p99": 3600, "mean": 1200.0},
-        }
-
-    def _stats_empty(self) -> dict:
-        return {
-            "queue_wait": {"count": 0, "p50": None, "p90": None, "p99": None, "mean": None},
-            "execution_time": {"count": 0, "p50": None, "p90": None, "p99": None, "mean": None},
-        }
-
-    def test_report_header_always_present(self):
-        """The report always starts with a header line."""
-        output = _format_latency_report(self._stats_with_data(), since_hours=24.0, status_filter=None)
-        assert "Queue Latency" in output
-
-    def test_report_shows_queue_wait_section(self):
-        """Queue wait section is always present."""
-        output = _format_latency_report(self._stats_with_data(), since_hours=24.0, status_filter=None)
-        assert "Queue wait" in output or "queue_wait" in output.lower() or "Queue" in output
-
-    def test_report_shows_execution_time_section(self):
-        """Execution time section is always present."""
-        output = _format_latency_report(self._stats_with_data(), since_hours=24.0, status_filter=None)
-        assert "Execution" in output
-
-    def test_report_shows_p50_p90_p99(self):
-        """p50, p90, p99 labels appear in the report."""
-        output = _format_latency_report(self._stats_with_data(), since_hours=24.0, status_filter=None)
-        assert "p50" in output
-        assert "p90" in output
-        assert "p99" in output
-
-    def test_report_shows_mean(self):
-        """Mean appears in the report."""
-        output = _format_latency_report(self._stats_with_data(), since_hours=24.0, status_filter=None)
-        assert "mean" in output.lower()
-
-    def test_empty_stats_shows_no_data_message(self):
-        """When no UoWs have timing data, the report says so clearly."""
-        output = _format_latency_report(self._stats_empty(), since_hours=24.0, status_filter=None)
-        assert "no data" in output.lower() or "n/a" in output.lower() or "0" in output
-
-    def test_status_filter_appears_in_output_when_set(self):
-        """When --status is specified, the filter is visible in the report."""
-        output = _format_latency_report(self._stats_with_data(), since_hours=24.0, status_filter="done")
-        assert "done" in output
-
-    def test_no_markdown_tables(self):
-        """Output must not contain markdown table syntax (| characters used as column separators)."""
-        output = _format_latency_report(self._stats_with_data(), since_hours=24.0, status_filter=None)
-        # A markdown table line starts with | — check that no line uses this pattern
-        table_lines = [l for l in output.splitlines() if l.strip().startswith("|")]
-        assert len(table_lines) == 0, f"Markdown table lines found: {table_lines}"
-
-
-# ---------------------------------------------------------------------------
-# queue-latency command integration tests (subprocess, real DB)
-# ---------------------------------------------------------------------------
 
 def _seed_completed_uow(db_path: Path, issue_number: int,
                         queue_wait_s: int, execution_s: int,
@@ -1621,6 +1436,223 @@ class TestFailureBreakdownCommand:
         assert not lines_with_pipes, (
             f"Output must not use markdown table syntax. Found: {lines_with_pipes}"
         )
+
+
+# ---------------------------------------------------------------------------
+# _compute_latency_stats unit tests
+# ---------------------------------------------------------------------------
+
+class TestComputeLatencyStats:
+    """Unit tests for the pure _compute_latency_stats function."""
+
+    def _row(self, created_at: str, started_at: str | None, completed_at: str | None,
+             status: str = "done") -> dict:
+        return {
+            "created_at": created_at,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "status": status,
+        }
+
+    def test_empty_rows_returns_none_for_all_stats(self):
+        """No rows means no percentiles can be computed — all stat values are None."""
+        stats = _compute_latency_stats([])
+        assert stats["queue_wait"]["p50"] is None
+        assert stats["queue_wait"]["p90"] is None
+        assert stats["queue_wait"]["p99"] is None
+        assert stats["queue_wait"]["mean"] is None
+        assert stats["execution_time"]["p50"] is None
+        assert stats["execution_time"]["count"] == 0
+
+    def test_rows_without_started_at_excluded_from_queue_wait(self):
+        """UoWs with no started_at cannot contribute to queue_wait stats."""
+        rows = [
+            self._row("2026-01-01T10:00:00+00:00", None, None, status="proposed"),
+        ]
+        stats = _compute_latency_stats(rows)
+        assert stats["queue_wait"]["count"] == 0
+        assert stats["queue_wait"]["p50"] is None
+
+    def test_rows_without_completed_at_excluded_from_execution_time(self):
+        """UoWs with started_at but no completed_at cannot contribute to execution_time stats."""
+        rows = [
+            self._row("2026-01-01T10:00:00+00:00", "2026-01-01T10:05:00+00:00", None, status="active"),
+        ]
+        stats = _compute_latency_stats(rows)
+        # queue_wait is available (started_at is set)
+        assert stats["queue_wait"]["count"] == 1
+        assert stats["queue_wait"]["p50"] == 300  # 5 minutes in seconds
+        # execution_time is not available (no completed_at)
+        assert stats["execution_time"]["count"] == 0
+        assert stats["execution_time"]["p50"] is None
+
+    def test_queue_wait_computed_from_created_at_to_started_at(self):
+        """queue_wait = started_at - created_at in seconds."""
+        # 10 minutes queue wait
+        rows = [
+            self._row(
+                "2026-01-01T10:00:00+00:00",
+                "2026-01-01T10:10:00+00:00",
+                "2026-01-01T10:30:00+00:00",
+            )
+        ]
+        stats = _compute_latency_stats(rows)
+        assert stats["queue_wait"]["p50"] == 600   # 10 min = 600s
+        assert stats["queue_wait"]["count"] == 1
+
+    def test_execution_time_computed_from_started_at_to_completed_at(self):
+        """execution_time = completed_at - started_at in seconds."""
+        # 20 minutes execution
+        rows = [
+            self._row(
+                "2026-01-01T10:00:00+00:00",
+                "2026-01-01T10:10:00+00:00",
+                "2026-01-01T10:30:00+00:00",
+            )
+        ]
+        stats = _compute_latency_stats(rows)
+        assert stats["execution_time"]["p50"] == 1200  # 20 min = 1200s
+        assert stats["execution_time"]["count"] == 1
+
+    def test_percentiles_correct_for_known_dataset(self):
+        """p50, p90, p99, and mean are correct for a known set of queue_wait values."""
+        # 5 rows with queue_wait values: 100, 200, 300, 400, 500 seconds
+        # p50 = 300, p90 = 500 (or interpolated), mean = 300
+        rows = [
+            self._row(
+                f"2026-01-01T10:00:0{i}+00:00",
+                f"2026-01-01T10:0{1+i}:40+00:00" if False else None,  # use abs offsets below
+                None,
+            )
+            for i in range(5)
+        ]
+        # Build rows with controlled deltas
+        base_created = "2026-01-01T10:00:00+00:00"
+        queue_waits_s = [100, 200, 300, 400, 500]
+        rows = []
+        for qw in queue_waits_s:
+            from datetime import datetime, timezone, timedelta
+            created = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
+            started = created + timedelta(seconds=qw)
+            rows.append({
+                "created_at": created.isoformat(),
+                "started_at": started.isoformat(),
+                "completed_at": None,
+                "status": "active",
+            })
+
+        stats = _compute_latency_stats(rows)
+        assert stats["queue_wait"]["count"] == 5
+        assert stats["queue_wait"]["p50"] == 300
+        assert stats["queue_wait"]["mean"] == 300.0
+
+    def test_mean_rounds_to_one_decimal(self):
+        """Mean is a float (not truncated to int)."""
+        from datetime import datetime, timezone, timedelta
+        created = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
+        rows = [
+            {
+                "created_at": created.isoformat(),
+                "started_at": (created + timedelta(seconds=100)).isoformat(),
+                "completed_at": (created + timedelta(seconds=350)).isoformat(),
+                "status": "done",
+            },
+            {
+                "created_at": created.isoformat(),
+                "started_at": (created + timedelta(seconds=200)).isoformat(),
+                "completed_at": (created + timedelta(seconds=450)).isoformat(),
+                "status": "done",
+            },
+        ]
+        stats = _compute_latency_stats(rows)
+        # queue_wait mean = (100 + 200) / 2 = 150.0
+        assert stats["queue_wait"]["mean"] == 150.0
+        # execution_time: 250s and 250s → mean = 250.0
+        assert stats["execution_time"]["mean"] == 250.0
+
+    def test_malformed_timestamp_rows_are_skipped(self):
+        """Rows with unparseable timestamps do not crash — they are silently skipped."""
+        rows = [
+            {
+                "created_at": "not-a-timestamp",
+                "started_at": "also-invalid",
+                "completed_at": None,
+                "status": "active",
+            }
+        ]
+        # Must not raise; result should treat this row as having no usable data
+        stats = _compute_latency_stats(rows)
+        assert stats["queue_wait"]["count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# _format_latency_report unit tests
+# ---------------------------------------------------------------------------
+
+class TestFormatLatencyReport:
+    """Unit tests for the pure _format_latency_report function."""
+
+    def _stats_with_data(self) -> dict:
+        return {
+            "queue_wait": {"count": 5, "p50": 120, "p90": 300, "p99": 600, "mean": 180.0},
+            "execution_time": {"count": 5, "p50": 900, "p90": 1800, "p99": 3600, "mean": 1200.0},
+        }
+
+    def _stats_empty(self) -> dict:
+        return {
+            "queue_wait": {"count": 0, "p50": None, "p90": None, "p99": None, "mean": None},
+            "execution_time": {"count": 0, "p50": None, "p90": None, "p99": None, "mean": None},
+        }
+
+    def test_report_header_always_present(self):
+        """The report always starts with a header line."""
+        output = _format_latency_report(self._stats_with_data(), since_hours=24.0, status_filter=None)
+        assert "Queue Latency" in output
+
+    def test_report_shows_queue_wait_section(self):
+        """Queue wait section is always present."""
+        output = _format_latency_report(self._stats_with_data(), since_hours=24.0, status_filter=None)
+        assert "Queue wait" in output or "queue_wait" in output.lower() or "Queue" in output
+
+    def test_report_shows_execution_time_section(self):
+        """Execution time section is always present."""
+        output = _format_latency_report(self._stats_with_data(), since_hours=24.0, status_filter=None)
+        assert "Execution" in output
+
+    def test_report_shows_p50_p90_p99(self):
+        """p50, p90, p99 labels appear in the report."""
+        output = _format_latency_report(self._stats_with_data(), since_hours=24.0, status_filter=None)
+        assert "p50" in output
+        assert "p90" in output
+        assert "p99" in output
+
+    def test_report_shows_mean(self):
+        """Mean appears in the report."""
+        output = _format_latency_report(self._stats_with_data(), since_hours=24.0, status_filter=None)
+        assert "mean" in output.lower()
+
+    def test_empty_stats_shows_no_data_message(self):
+        """When no UoWs have timing data, the report says so clearly."""
+        output = _format_latency_report(self._stats_empty(), since_hours=24.0, status_filter=None)
+        assert "no data" in output.lower() or "n/a" in output.lower() or "0" in output
+
+    def test_status_filter_appears_in_output_when_set(self):
+        """When --status is specified, the filter is visible in the report."""
+        output = _format_latency_report(self._stats_with_data(), since_hours=24.0, status_filter="done")
+        assert "done" in output
+
+    def test_no_markdown_tables(self):
+        """Output must not contain markdown table syntax (| characters used as column separators)."""
+        output = _format_latency_report(self._stats_with_data(), since_hours=24.0, status_filter=None)
+        # A markdown table line starts with | — check that no line uses this pattern
+        table_lines = [l for l in output.splitlines() if l.strip().startswith("|")]
+        assert len(table_lines) == 0, f"Markdown table lines found: {table_lines}"
+
+
+# ---------------------------------------------------------------------------
+# queue-latency command integration tests (subprocess, real DB)
+# ---------------------------------------------------------------------------
+
 class TestQueueLatencyCommand:
     def test_queue_latency_exits_zero_on_empty_db(self, db_path):
         """queue-latency exits 0 even when no UoWs with timing data exist."""

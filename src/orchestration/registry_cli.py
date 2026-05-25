@@ -1095,7 +1095,10 @@ def _build_parser() -> argparse.ArgumentParser:
     # list
     p_list = subparsers.add_parser("list", help="List UoWs, optionally filtered by status")
     p_list.add_argument("--status", default=None,
-                        choices=["proposed", "pending", "active", "blocked", "done", "failed", "expired"],
+                        choices=["proposed", "pending", "active", "blocked", "done", "failed", "expired",
+                                 "completed", "closed", "cancelled", "needs-human-review",
+                                 "ready-for-steward", "ready-for-executor", "executing", "diagnosing",
+                                 "awaiting-owner"],
                         help="Filter by status")
 
     # approve
