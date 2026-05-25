@@ -1947,6 +1947,15 @@ async def list_tools() -> list[Tool]:
                             "even if the subagent forgets to pass sent_reply_to_user=True."
                         ),
                     },
+                    "proactive": {
+                        "type": "boolean",
+                        "description": (
+                            "Set to true for proactive/system sends that have no originating user message "
+                            "and therefore no reply_to_message_id to thread against. "
+                            "Bypasses the require-reply-to-message-id hook without corrupting chat_id. "
+                            "chat_id must still be the real recipient — do not pass chat_id=0."
+                        ),
+                    },
                 },
                 "required": ["chat_id", "text"],
             },

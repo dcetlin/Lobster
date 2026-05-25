@@ -8,7 +8,7 @@ but omit or set reply_to_message_id=0.
 
 Exemptions (always allowed):
   - Non-Telegram sources (slack, sms, whatsapp, bot-talk, system, ...)
-  - System/proactive sends where chat_id == 0 (no incoming message context)
+  - Proactive/system sends where proactive=True (no incoming message context)
   - Calls where reply_to_message_id is already set to a positive integer
 
 Exit codes:
@@ -42,13 +42,9 @@ def main() -> None:
     if source != "telegram":
         sys.exit(0)
 
-    # Exempt proactive/system sends: chat_id == 0 means no originating user message
-    chat_id = tool_input.get("chat_id")
-    try:
-        if int(chat_id) == 0:
-            sys.exit(0)
-    except (TypeError, ValueError):
-        # chat_id absent or non-numeric — cannot determine, allow
+    # Exempt proactive/system sends: proactive=True means no originating user message,
+    # so no reply_to_message_id is available or required.
+    if tool_input.get("proactive") is True:
         sys.exit(0)
 
     # Check reply_to_message_id: must be present and a positive integer
@@ -66,7 +62,8 @@ def main() -> None:
         "Telegram message ID shown in wait_for_messages output as\n"
         "'pass as reply_to_message_id') to thread the reply correctly.\n\n"
         "If this is a proactive/system send with no originating message,\n"
-        "pass chat_id=0 to exempt this check.",
+        "pass proactive=True (and keep chat_id set to the real recipient).\n"
+        "Do NOT pass chat_id=0 — the bot gate treats 0 as falsy and drops the message.",
         file=sys.stderr,
     )
     sys.exit(2)

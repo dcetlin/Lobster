@@ -7,7 +7,7 @@ Tests cover:
 - Telegram send_reply missing reply_to_message_id is blocked (exit 2)
 - Telegram send_reply with reply_to_message_id=0 is blocked (exit 2)
 - Non-Telegram source passes through (exit 0)
-- chat_id=0 (proactive/system send) passes through (exit 0)
+- proactive=True (proactive/system send) passes through (exit 0)
 - Absent source defaults to telegram enforcement (exit 2 when no reply_to_message_id)
 - Malformed input passes through (exit 0 fail-open)
 - Block message contains actionable text in stderr
@@ -103,14 +103,36 @@ class TestRequireReplyToMessageId:
         })
         assert rc == 0
 
-    def test_proactive_send_chat_id_zero_is_exempt(self):
-        """chat_id=0 means no originating message — proactive send is allowed."""
+    def test_proactive_send_flag_is_exempt(self):
+        """proactive=True means no originating message — proactive send is allowed."""
         rc, _, _ = _run({
+            "source": "telegram",
+            "chat_id": 123456,
+            "text": "Good morning!",
+            "proactive": True,
+        })
+        assert rc == 0
+
+    def test_proactive_false_does_not_exempt(self):
+        """proactive=False does not bypass the reply_to_message_id requirement."""
+        rc, _, stderr = _run({
+            "source": "telegram",
+            "chat_id": 123456,
+            "text": "Hello!",
+            "proactive": False,
+        })
+        assert rc == 2
+        assert "reply_to_message_id" in stderr
+
+    def test_chat_id_zero_is_no_longer_exempt(self):
+        """chat_id=0 alone no longer bypasses the hook — proactive=True is required."""
+        rc, _, stderr = _run({
             "source": "telegram",
             "chat_id": 0,
             "text": "Good morning!",
         })
-        assert rc == 0
+        assert rc == 2
+        assert "reply_to_message_id" in stderr
 
     def test_malformed_input_fails_open(self):
         """Unparseable JSON input allows the call rather than blocking it."""
@@ -140,4 +162,4 @@ class TestRequireReplyToMessageId:
             "text": "Hello!",
         })
         assert rc == 2
-        assert "chat_id=0" in stderr
+        assert "proactive=True" in stderr
