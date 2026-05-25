@@ -400,7 +400,9 @@ Lobster uses a tiered model strategy to balance cost and quality. Each subagent 
 |------|-------|---------|------|
 | **High** | `opus` | Complex coding, architecture, debugging | 1x (baseline) |
 | **Standard** | `sonnet` | Planning, research, execution, synthesis | 0.6x |
-| **Light** | `haiku` | Verification, plan-checking, integration checks | 0.2x |
+| **Light** | `haiku` (pinned: `claude-haiku-4-5-20251001`) | Verification, plan-checking, integration checks | 0.2x |
+
+> **Haiku pin note:** Haiku agents are currently pinned to `claude-haiku-4-5-20251001` rather than the shorthand `claude-haiku-4-5`, for release stability and cost predictability. When `claude-haiku-4-6` is confirmed available (consistent with the 4-6 naming pattern used by Opus and Sonnet), update both `lobster-ops.md` and `session-note-appender.md` frontmatter and remove this note.
 
 **Agent model assignments:**
 
