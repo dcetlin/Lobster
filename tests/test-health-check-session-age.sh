@@ -21,6 +21,7 @@
 #   9. Start file deleted after SIGTERM (prevents double-fire on next health check)
 #  10. Boot grace suppression: caller suppresses check during boot grace period
 #      (check_session_age itself does not implement boot grace — suppression is in main())
+#  11. No Telegram alert sent on SIGTERM (alert removed — routine rotation is not actionable)
 #
 # Usage: bash tests/test-health-check-session-age.sh
 #===============================================================================
@@ -215,8 +216,9 @@ echo "$past_start" > "$DISPATCHER_SESSION_START_FILE"
 check_session_age
 assert_exit $? 0
 
-# 11. Telegram alert is sent when SIGTERM fires
-begin_test "telegram_alert_sent_on_sigterm"
+# 11. No Telegram alert is sent when SIGTERM fires (alert removed — routine rotation
+#     is designed behavior that never correlated with an actionable condition)
+begin_test "no_telegram_alert_on_sigterm"
 reset_state
 sleep 600 &
 target_pid=$!
@@ -225,10 +227,10 @@ past_start=$(( $(date +%s) - SESSION_AGE_LIMIT_SECONDS - 60 ))
 echo "$past_start" > "$DISPATCHER_SESSION_START_FILE"
 check_session_age
 kill "$target_pid" 2>/dev/null || true
-if [[ -f "$TELEGRAM_ALERTS_FILE" ]] && grep -q "proactive-session-restart" "$TELEGRAM_ALERTS_FILE"; then
+if [[ ! -f "$TELEGRAM_ALERTS_FILE" ]] || ! grep -q "proactive-session-restart" "$TELEGRAM_ALERTS_FILE"; then
     pass
 else
-    fail "no Telegram alert with key 'proactive-session-restart' found after SIGTERM"
+    fail "unexpected Telegram alert fired — routine rotation should produce no Telegram alert"
 fi
 
 #===============================================================================

@@ -1577,8 +1577,10 @@ check_session_age() {
     # Send SIGTERM. The Stop hook fires, writes the tombstone, and claude-persistent.sh
     # restarts Claude. This is a graceful exit, not a crash.
     if kill -TERM "$dispatcher_pid" 2>/dev/null; then
-        log_warn "Session age: SIGTERM sent to dispatcher PID $dispatcher_pid"
-        send_telegram_alert_deduped "proactive-session-restart" "Session age test in progress (threshold: ${SESSION_AGE_LIMIT_SECONDS}s / $(( SESSION_AGE_LIMIT_SECONDS / 3600 ))h). This session has been running ${session_age}s — normally we'd have restarted at 7200s. Watching for: CC hard-kill at ~7440s (no Stop hook) = limit still exists; session survives past 7440s = limit removed or raised. Data basis: 2 observed hard-kills at ~7440s on 2026-05-09. No hard-kills observed since (every restart has been from SIGTERM at 7200s). Stop hook will fire cleanly; no context lost."
+        log_warn "Session age: SIGTERM sent to dispatcher PID $dispatcher_pid — graceful rotation initiated"
+        # No Telegram alert: proactive session rotation is designed behavior that
+        # fires every ~2h. The log entry above is sufficient internal evidence.
+        # Alert was removed because it never correlated with an actionable condition.
         # Delete the start timestamp so a subsequent health check run (within the
         # next 4 minutes) does not send a second SIGTERM before the restart completes.
         rm -f "$DISPATCHER_SESSION_START_FILE" 2>/dev/null || true
