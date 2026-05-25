@@ -527,6 +527,25 @@ def run_processor(config: dict, db_path: Path = DB_PATH_DEFAULT) -> bool:
         except Exception as e:
             log.error("Error processing annotations in %s: %s", scan_file, e)
 
+    # Step 5b: journal checkbox scan — extract - [ ] items from new/changed journal files
+    log.info("Step 5b: journal checkbox scan")
+    try:
+        from src.utils.jobs import is_job_enabled as _is_job_enabled
+        if _is_job_enabled("vault-journal-scanner"):
+            import importlib.util as _ilu
+            _scanner_path = _TASKS_DIR / "vault-journal-scanner.py"
+            _spec = _ilu.spec_from_file_location("vault_journal_scanner", _scanner_path)
+            _scanner = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_scanner)
+            _j_state = _scanner.load_scanner_state(_scanner.STATE_FILE_PATH)
+            _, _, _j_updated = _scanner.scan_vault(vault_path, db_path, _j_state)
+            _scanner.save_scanner_state(_scanner.STATE_FILE_PATH, _j_updated)
+            log.info("Step 5b: journal scan complete")
+        else:
+            log.debug("Step 5b: vault-journal-scanner disabled in jobs.json — skipping")
+    except Exception as _exc:
+        log.warning("Step 5b: journal scan failed (non-fatal): %s", _exc)
+
     # Step 6: git add annotation-cleared files
     if staging_files:
         log.info("Step 6: git add %d annotation-cleared files", len(staging_files))
