@@ -1963,6 +1963,72 @@ class Registry:
         finally:
             conn.close()
 
+    def record_agent_failed_kill(
+        self,
+        uow_id: str,
+        agent_task_id: str | None = None,
+    ) -> int:
+        """
+        Atomically write an agent_failed audit entry and transition an
+        executing UoW to ready-for-steward.
+
+        Called when the dispatcher processes an agent_failed inbox message
+        whose task_id has the 'wos-uow_' prefix — i.e. a WOS executor agent
+        that was killed by the reconciler.  Routing the UoW directly to
+        ready-for-steward avoids the 24h claimed_until expiry cycle that
+        previously let dead UoWs bypass the steward's orphan retry logic.
+
+        Optimistic lock: WHERE status = 'executing' prevents double-application.
+        Returns 1 on success, 0 if the UoW has already been transitioned (race).
+
+        Args:
+            uow_id: The UoW identifier (e.g. 'uow_20260519_3ab0bd').
+            agent_task_id: The task_id from the agent_failed inbox message
+                (e.g. 'wos-uow_20260519_3ab0bd'). Stored in the audit note
+                for traceability.
+        """
+        now = _now_iso()
+        note_json = json.dumps({
+            "event": "agent_failed",
+            "actor": "reconciler",
+            "agent_task_id": agent_task_id,
+            "uow_id": uow_id,
+            "timestamp": now,
+            "prior_status": "executing",
+        })
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            cursor = conn.execute(
+                """
+                UPDATE uow_registry
+                SET status = 'ready-for-steward', updated_at = ?
+                WHERE id = ? AND status = 'executing'
+                """,
+                (now, uow_id),
+            )
+            rows_affected = cursor.rowcount
+
+            if rows_affected == 1:
+                conn.execute(
+                    """
+                    INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                    VALUES (?, ?, 'agent_failed', 'executing', 'ready-for-steward', 'reconciler', ?)
+                    """,
+                    (now, uow_id, note_json),
+                )
+
+            conn.commit()
+            return rows_affected
+
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def record_startup_sweep_executing(
         self,
         uow_id: str,
@@ -2400,6 +2466,41 @@ class Registry:
                        orphan_retry_count = ?,
                        claimed_until = NULL,
                        updated_at = ?
+                   WHERE id = ?""",
+                (new_count, now, uow_id)
+            )
+            conn.execute("COMMIT")
+            return new_count
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def increment_orphan_retry_count(self, uow_id: str) -> int:
+        """
+        Increment orphan_retry_count for a UoW without changing its status.
+
+        Used by the spiral-detection guard in the Steward when an orphan-kill
+        re-queue path needs to count retries independently of the status transition
+        (the status change is handled separately via set_status_direct or transition).
+
+        Returns the new orphan_retry_count value.
+        """
+        now = _now_iso()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT orphan_retry_count FROM uow_registry WHERE id = ?",
+                (uow_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"UoW {uow_id} not found")
+            new_count = (row["orphan_retry_count"] or 0) + 1
+            conn.execute(
+                """UPDATE uow_registry
+                   SET orphan_retry_count = ?, updated_at = ?
                    WHERE id = ?""",
                 (new_count, now, uow_id)
             )

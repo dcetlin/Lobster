@@ -1243,6 +1243,12 @@ WOS_MESSAGE_TYPE_DISPATCH: dict[str, str] = {
     # before the spawn-gate; returns action="send_reply" to notify Dan directly.
     # No subagent spawn required.
     "wos_owner_required": "handle_wos_owner_required",
+    # Reconciler kill handler (issue #1253 secondary fix): written by inbox_server.py
+    # when the reconciler detects a dead agent and marks it failed. When task_id has
+    # the 'wos-uow_' prefix, the handler transitions the UoW directly from
+    # executing → ready-for-steward, eliminating the 24h claimed_until expiry
+    # cycle that previously bypassed the steward's orphan retry logic.
+    "agent_failed": "handle_agent_failed",
 }
 
 
@@ -2251,6 +2257,74 @@ def handle_wos_owner_required(msg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def handle_agent_failed(
+    msg: dict[str, Any],
+    registry: "Registry | None" = None,
+) -> dict[str, Any]:
+    """
+    Handle an agent_failed inbox message by transitioning the WOS UoW to ready-for-steward.
+
+    Called by route_wos_message when the dispatcher receives a message with
+    type="agent_failed". The reconciler writes these messages when it detects a
+    dead agent session.
+
+    If the task_id has the 'wos-uow_' prefix, the UoW is immediately transitioned
+    from executing → ready-for-steward via registry.record_agent_failed_kill().
+    This eliminates the 24h claimed_until expiry window that previously caused dead
+    WOS agents to cycle through claim_expired → ready-for-executor indefinitely,
+    bypassing the steward's orphan retry budget.
+
+    For non-WOS task_ids (ghost-mark-failed-* from agent-monitor, or system agents),
+    the message is acknowledged with no state change.
+
+    Returns action="mark_processed" in all cases — no subagent spawn, no user reply.
+
+    Args:
+        msg: The raw agent_failed inbox message dict.
+        registry: Optional Registry instance. If omitted, a default Registry() is
+            created. Pass an explicit instance in tests.
+
+    Returns:
+        {"action": "mark_processed", "message_type": "agent_failed"}
+    """
+    from .registry import Registry as _Registry
+
+    task_id: str = msg.get("task_id", "") or ""
+    agent_id: str = msg.get("agent_id", "") or ""
+
+    _WOS_UOW_PREFIX = "wos-uow_"
+    if task_id.startswith(_WOS_UOW_PREFIX):
+        uow_id = task_id[len("wos-"):]  # strips "wos-" → "uow_20260519_3ab0bd"
+        reg = registry if registry is not None else _Registry()
+        try:
+            rows = reg.record_agent_failed_kill(uow_id, agent_task_id=task_id)
+            if rows == 1:
+                _log.info(
+                    "handle_agent_failed: transitioned WOS UoW %s → ready-for-steward "
+                    "(task_id=%s, agent_id=%s)",
+                    uow_id, task_id, agent_id,
+                )
+            else:
+                _log.info(
+                    "handle_agent_failed: UoW %s already transitioned (rows=0, race) "
+                    "(task_id=%s)",
+                    uow_id, task_id,
+                )
+        except Exception as exc:
+            _log.error(
+                "handle_agent_failed: record_agent_failed_kill raised %s: %s "
+                "(uow_id=%s, task_id=%s) — message will be marked processed anyway",
+                type(exc).__name__, exc, uow_id, task_id,
+            )
+    else:
+        _log.debug(
+            "handle_agent_failed: non-WOS task_id %r (agent_id=%s) — no UoW transition",
+            task_id, agent_id,
+        )
+
+    return {"action": "mark_processed", "message_type": "agent_failed"}
+
+
 def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
     """
     Route an inbox message whose `type` is listed in WOS_MESSAGE_TYPE_DISPATCH.
@@ -2457,6 +2531,26 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
                 ),
                 "message_type": msg_type,
             }
+
+    # ---------------------------------------------------------------------------
+    # agent_failed fast-path: dispatched before the spawn-gate because this handler
+    # legitimately returns action="mark_processed" (not spawn_subagent).
+    # Transitions WOS UoWs from executing → ready-for-steward immediately on
+    # reconciler kill, bypassing the 24h claimed_until expiry cycle.
+    # ---------------------------------------------------------------------------
+    if msg_type == "agent_failed":
+        try:
+            result = handle_agent_failed(msg)
+            result["message_type"] = msg_type
+            return result
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).error(
+                "route_wos_message: handle_agent_failed raised %s: %s — "
+                "marking processed without state transition",
+                type(exc).__name__, exc,
+            )
+            return {"action": "mark_processed", "message_type": msg_type}
 
     # ---------------------------------------------------------------------------
     # Spawn-gate (issue #920): all WOS message types MUST produce action="spawn_subagent".
