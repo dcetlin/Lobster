@@ -33,7 +33,7 @@ def main() -> None:
     else:
         db_path_str = os.environ.get(
             "REGISTRY_DB_PATH",
-            str(Path.home() / "lobster-workspace" / "data" / "registry.db"),
+            str(Path.home() / "lobster-workspace" / "orchestration" / "registry.db"),
         )
 
     db_path = Path(db_path_str).expanduser()
