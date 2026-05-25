@@ -53,8 +53,11 @@ from orchestration.vision_routing import resolve_vision_route
 from src.ooda.fast_thorough_selector import select_path as _ooda_select_path, cite_basis as _ooda_cite_basis
 from orchestration.gate_fired import translate_eligibility_to_gate
 from orchestration.wos_completion_notifier import notify_uow_done, notify_uow_failed
+from orchestration.prescription_metrics import PrescriptionMetricsLogger
 
 log = logging.getLogger("steward")
+
+_prescription_metrics = PrescriptionMetricsLogger()
 
 
 # ---------------------------------------------------------------------------
@@ -1071,6 +1074,9 @@ def _determine_reentry_posture(
     - 'crashed_no_output': crash with no usable output
     - 'execution_failed': executor failure
     - 'executor_orphan': executor never ran
+    - 'diagnosing_orphan': Steward crashed mid-diagnosis
+    - 'trace_gate_dwell': UoW held intentionally in diagnosing by WaitForTrace gate
+    - 'executing_orphan': subagent dispatched but write_result never received
     - 'first_execution': no prior execution cycle (steward_cycles == 0)
     """
     # Explicit return_reason values that map 1:1 to a posture always win,
@@ -1127,6 +1133,8 @@ def _determine_reentry_posture(
                 return "executor_orphan"
             elif clf == "diagnosing_orphan":
                 return "diagnosing_orphan"
+            elif clf == "trace_gate_dwell":
+                return "trace_gate_dwell"
             elif clf == "executing_orphan":
                 return "executing_orphan"
             elif clf in ("orphan_kill_before_start", "orphan_kill_during_execution"):
@@ -1345,6 +1353,8 @@ def _posture_rationale(diagnosis: Diagnosis, cycles: int, trace_posture: str | N
             return "UoW stuck in ready-for-executor beyond threshold — executor never claimed."
         case "diagnosing_orphan":
             return "Steward crashed mid-diagnosis — re-diagnosing from current state."
+        case "trace_gate_dwell":
+            return "UoW was intentionally held in diagnosing by WaitForTrace gate — re-diagnosing from current state."
         case "executing_orphan":
             return "UoW stuck in executing — subagent dispatched but write_result never received (#858)."
         case "orphan_kill_before_start":
@@ -1458,6 +1468,7 @@ def _determine_trace_posture(diagnosis: Diagnosis) -> str:
         "execution_failed",
         "executor_orphan",
         "diagnosing_orphan",
+        "trace_gate_dwell",
         "executing_orphan",
         "stall_detected",
     ):
@@ -3284,6 +3295,7 @@ def _build_deterministic_prescription_instructions(
         "execution_failed": "Previous execution failed. Diagnose the failure and re-execute.",
         "executor_orphan": "Executor never ran on this UoW. Execute fresh.",
         "diagnosing_orphan": "Steward crashed mid-diagnosis. Re-diagnosing from current state.",
+        "trace_gate_dwell": "UoW was intentionally held in diagnosing by WaitForTrace gate. Re-diagnosing now that trace gate dwell has cleared.",
         "executing_orphan": "Subagent was dispatched but never called write_result (crashed or lost context). Re-execute fresh.",
         "orphan_kill_before_start": "Subagent was dispatched but killed before writing any heartbeat — no work was started. Re-execute fresh.",
         "orphan_kill_during_execution": "Subagent was dispatched, wrote heartbeats (was actively working), then was killed before write_result. Re-execute fresh.",
@@ -4981,6 +4993,14 @@ def _process_uow(
                         uow_id,
                     )
 
+        # Emit structured closure metric (wos-metrics.db — structural signals only)
+        _prescription_metrics.log_uow_closed(
+            uow_id=uow_id,
+            total_cycles=cycles,
+            closure_outcome="success",
+            final_prescription_cycle=cycles,
+        )
+
         _append_cycle_trace(
             uow_id=uow_id,
             cycle_num=cycles,
@@ -5648,6 +5668,20 @@ def _process_uow(
             "boundary_present": "Boundary:" in instructions,
             "timestamp": _now_iso(),
         })
+
+        # Emit structured prescription metric (wos-metrics.db — structural signals only)
+        _prescription_metrics.log_prescription_generated(
+            uow_id=uow_id,
+            cycle=new_cycles,
+            executor_type=selected_executor_type,
+            has_minimum_viable_output="Minimum viable output" in instructions,
+            has_boundary="Boundary:" in instructions,
+            has_success_criteria_check=bool(uow.success_criteria and uow.success_criteria.strip()),
+            estimated_cycles=new_cycles,
+            word_count=len(instructions.split()),
+            step_count=instructions.count("\n## "),
+            source_issue=getattr(uow, "issue_url", None) or getattr(uow, "source", None),
+        )
 
         # Transition status to ready-for-executor
         registry.transition(uow_id, _STATUS_READY_FOR_EXECUTOR, _STATUS_DIAGNOSING)

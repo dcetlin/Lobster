@@ -705,3 +705,20 @@ class TestReentryPostureForNewClassifications:
         # Both should map to the orphan classification bucket
         assert _RETURN_REASON_CLASSIFICATIONS["orphan_kill_before_start"] == "orphan"
         assert _RETURN_REASON_CLASSIFICATIONS["orphan_kill_during_execution"] == "orphan"
+
+    def test_trace_gate_dwell_returns_correct_posture(self) -> None:
+        """
+        _determine_reentry_posture must return 'trace_gate_dwell' when the most
+        recent startup_sweep audit note has classification='trace_gate_dwell'.
+
+        This distinguishes intentional WaitForTrace dwells from crash-recovery
+        diagnosing_orphan cases, so downstream consumers can tell the two origins apart.
+        """
+        from src.orchestration.steward import _determine_reentry_posture
+        entries = self._make_audit_entries_with_sweep("trace_gate_dwell")
+        posture = _determine_reentry_posture(entries, return_reason=None)
+        assert posture == "trace_gate_dwell", (
+            "A startup_sweep audit entry with classification='trace_gate_dwell' must "
+            "produce reentry posture 'trace_gate_dwell', not 'diagnosing_orphan' or "
+            "'first_execution'. Gap 1 from oracle verdict pr-1305.md."
+        )
