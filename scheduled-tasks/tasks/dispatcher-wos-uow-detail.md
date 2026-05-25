@@ -99,7 +99,8 @@ def fmt_ts(ts):
         return "—"
     try:
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        tz_name = os.environ.get("LOBSTER_USER_TZ", "America/New_York")
+        from src.utils.timezone import get_owner_tz_name
+        tz_name = get_owner_tz_name()
         local_dt = dt.astimezone(ZoneInfo(tz_name))
         return local_dt.strftime("%Y-%m-%d %H:%M %Z")
     except Exception:

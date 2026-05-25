@@ -695,11 +695,17 @@ _HARD_CAP_CYCLES = 9
 MAX_RETRIES: int = 3
 
 # Orphan kill retry budget: number of times a UoW may be requeued after an
-# orphan_kill_during_execution event before permanent failure.
+# orphan_kill_during_execution event before spiral-detection escalation.
 # Context compaction kills are environmental interruptions, not subagent bugs —
 # permanently failing on the first kill discards valid work.
 # orphan_kill_before_start is excluded: before-start means no partial work exists.
-ORPHAN_KILL_RETRY_BUDGET: int = 2
+ORPHAN_KILL_RETRY_BUDGET: int = 2  # legacy alias; prefer MAX_ORPHAN_RETRIES
+
+# Spiral-detection cap: when orphan_retry_count reaches this value the UoW is
+# escalated to needs-human-review instead of being re-queued again.  The spiral
+# that triggered issue #976 saw 30+ consecutive orphan-kill → re-queue cycles on
+# the same UoW; this constant caps that at 3 confirmed retries.
+MAX_ORPHAN_RETRIES: int = 3
 
 # Return reasons that represent infrastructure kill events, not confirmed executions.
 # When return_reason is in this set, execution_attempts must NOT be incremented and
@@ -5045,13 +5051,50 @@ def _process_uow(
         "orphan_kill_before_start",
         "orphan_kill_during_execution",
     ):
-        # Retry-budget gate for orphan_kill_during_execution.
+        # Spiral-detection guard for orphan_kill_during_execution.
         # Context compaction kills are environmental interruptions — requeue rather than
-        # permanently fail until the budget (ORPHAN_KILL_RETRY_BUDGET) is exhausted.
+        # permanently fail until MAX_ORPHAN_RETRIES is reached.  Once reached, escalate to
+        # needs-human-review instead of looping indefinitely (spiral detection, issue #976).
         # orphan_kill_before_start has no partial work to retry; fall through unconditionally.
         if reentry_posture == "orphan_kill_during_execution":
             current_retry_count = uow.orphan_retry_count or 0
-            if current_retry_count < ORPHAN_KILL_RETRY_BUDGET:
+            if current_retry_count >= MAX_ORPHAN_RETRIES:
+                # Spiral detected: cap reached — escalate to needs-human-review.
+                spiral_log_entry = {
+                    "event": "orphan_spiral_detected",
+                    "uow_id": uow_id,
+                    "kill_classification": reentry_posture,
+                    "orphan_retry_count": current_retry_count,
+                    "max_orphan_retries": MAX_ORPHAN_RETRIES,
+                    "timestamp": _now_iso(),
+                }
+                current_log_str = _append_steward_log_entry(
+                    registry, uow_id, current_log_str, spiral_log_entry
+                )
+                if not dry_run:
+                    _write_steward_fields(registry, uow_id, steward_log=current_log_str)
+                    registry.append_audit_log(uow_id, {
+                        "event": "orphan_spiral_detected",
+                        "actor": _ACTOR_STEWARD,
+                        "uow_id": uow_id,
+                        "orphan_retry_count": current_retry_count,
+                        "max_orphan_retries": MAX_ORPHAN_RETRIES,
+                        "reason": (
+                            f"Spiral detected: {current_retry_count} consecutive orphan-kills. "
+                            f"Auto-transitioned to needs-human-review. "
+                            f"Investigate root cause before manually requeueing."
+                        ),
+                        "timestamp": _now_iso(),
+                    })
+                    registry.transition(uow_id, _STATUS_NEEDS_HUMAN_REVIEW, _STATUS_DIAGNOSING)
+                    log.warning(
+                        "_process_uow: UoW %s orphan spiral detected (%d/%d kills) — "
+                        "escalated to needs-human-review",
+                        uow_id, current_retry_count, MAX_ORPHAN_RETRIES,
+                    )
+                return Surfaced(uow_id=uow_id, condition="orphan_spiral_detected")
+            else:
+                # Under cap — increment count and requeue for another attempt.
                 if not dry_run:
                     new_count = registry.retry_orphan_kill(uow_id)
                     orphan_retry_log = {
@@ -5059,7 +5102,7 @@ def _process_uow(
                         "uow_id": uow_id,
                         "kill_classification": reentry_posture,
                         "orphan_retry_count": new_count,
-                        "retry_budget": ORPHAN_KILL_RETRY_BUDGET,
+                        "max_orphan_retries": MAX_ORPHAN_RETRIES,
                         "ts": _now_iso(),
                     }
                     current_log_str = _append_steward_log_entry(
@@ -5068,10 +5111,9 @@ def _process_uow(
                     _write_steward_fields(registry, uow_id, steward_log=current_log_str)
                     log.info(
                         "_process_uow: UoW %s orphan_kill_during_execution retry %d/%d — requeued as pending",
-                        uow_id, new_count, ORPHAN_KILL_RETRY_BUDGET,
+                        uow_id, new_count, MAX_ORPHAN_RETRIES,
                     )
                 return Surfaced(uow_id=uow_id, condition="orphan_retry_scheduled")
-            # Budget exhausted — fall through to permanent failure below.
 
         surface_condition = reentry_posture  # preserve precise kill classification
         orphan_reason = f"{reentry_posture}: subagent exited without calling write_result"
