@@ -258,6 +258,61 @@ class TestClearingFalsePositiveRegression:
 
 
 # ---------------------------------------------------------------------------
+# Gate 3: co-occurrence scoring — "register" disambiguation
+# ---------------------------------------------------------------------------
+
+class TestGate3CoOccurrenceScoring:
+    """
+    Regression guard: "register" near technical co-terms must NOT fire Gate 3.
+    "register" near philosophical co-terms must fire Gate 3.
+
+    This covers the known false-positive case where issues about register field
+    mismatch, register classification, or dispatch routing were misrouted to
+    philosophical because "register" appeared anywhere in the text.
+    """
+
+    def test_register_in_technical_context_is_not_philosophical(self):
+        """'register' surrounded by technical co-terms must not trigger Gate 3."""
+        from src.orchestration.germinator import classify_register
+        result = classify_register(
+            title="Fix register field mismatch gate",
+            body=(
+                "The register field mismatch gate fires when the executor schema "
+                "classification doesn't match the dispatch queue routing."
+            ),
+            success_criteria="Gate fires correctly.",
+        )
+        assert result.register != "philosophical", (
+            f"'register' in technical context must not be classified as philosophical. "
+            f"Got register={result.register!r}, gate={result.gate_matched!r}"
+        )
+
+    def test_register_in_philosophical_context_fires_gate3(self):
+        """'register' near philosophical co-terms must fire Gate 3."""
+        from src.orchestration.germinator import classify_register
+        result = classify_register(
+            title="Multi-register dynamics and attunement",
+            body=(
+                "The developmental register of attunement surfaces in multi-register "
+                "dynamics when phenomenological coherence is achieved."
+            ),
+            success_criteria="Synthesis written.",
+        )
+        assert result.register == "philosophical"
+        assert result.gate_matched == "3"
+
+    def test_register_alone_does_not_fire_gate3(self):
+        """'register' with no co-terms (neither philosophical nor technical) must not fire."""
+        from src.orchestration.germinator import classify_register
+        result = classify_register(
+            title="Update the register",
+            body="The register needs to be updated with the new value.",
+            success_criteria="Register updated.",
+        )
+        assert result.register != "philosophical"
+
+
+# ---------------------------------------------------------------------------
 # Gate 4: human-judgment signal in success_criteria
 # ---------------------------------------------------------------------------
 
