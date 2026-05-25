@@ -1961,11 +1961,6 @@ No background subagent is needed — `create_task` is a synchronous MCP call.
 
 # HYPOTHESIS
 
-<!-- Entries here are provisional. Do not treat as stable configuration.
-     Each entry carries an expiry. Review before expiry; graduate or discard.
-     Graduation = moving the entry into the main body of this file (poiema).
-     Expiry without review = entry is discarded, not silently promoted. -->
-
 ## [HYPOTHESIS] routing-preferences-dispatcher-check
 **Added:** 2026-05-22
 **Expires:** 2026-06-05
