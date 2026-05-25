@@ -41,8 +41,11 @@ Algorithm (ordered; first matching gate wins):
 
 3. Does the UoW originate from a philosophy session, frontier doc, or contain
    vocabulary from Dan's phenomenological register?
-   (keywords: poiesis, register, attunement, phenomenology, frontier, pearl,
-    aletheia, thrownness, clearing, givenness, dwelling, presencing, autopoiesis)
+   Unambiguous terms (poiesis, attunement, phenomenology, frontier, aletheia,
+   thrownness, lichtung, givenness, dwelling, presencing, autopoiesis, etc.)
+   contribute a fixed weight. Ambiguous terms (e.g. "register") only contribute
+   weight when philosophical co-terms outnumber technical co-terms in a context
+   window around the occurrence. Gate fires when the aggregated score >= 0.3.
    YES → philosophical
    NO  → continue
 
@@ -177,24 +180,88 @@ _PHILOSOPHICAL_ORIGIN_RE = re.compile(
 )
 
 
-def _is_philosophical(title: str, body: str) -> bool:
-    """Return True if the UoW originates from philosophical/phenomenological register."""
-    combined = (title + " " + body).lower()
-    # Check for phenomenological vocabulary (at least one strong term).
-    # Single-word terms are matched via word-token intersection; multi-word phrases
-    # (e.g. "ontological clearing") are matched via substring search against the
-    # lowercased combined text to preserve their identity as compounds.
+# ---------------------------------------------------------------------------
+# Gate 3 scoring — co-occurrence disambiguation
+# ---------------------------------------------------------------------------
+
+# Score threshold for Gate 3. An unambiguous term alone (weight 0.3) meets it.
+# Ambiguous terms require co-occurrence evidence to reach the threshold.
+GATE3_THRESHOLD: float = 0.3
+_PHILOSOPHICAL_TERM_WEIGHT: float = 0.3  # each unambiguous term fires Gate 3 alone
+_AMBIGUOUS_TERM_WEIGHT: float = 0.15     # per philosophical co-term hit for ambiguous terms
+
+# Terms that appear in both philosophical and technical/operational prose.
+# They do not contribute directly — they require co-occurrence with
+# _PHILOSOPHICAL_CO_TERMS outnumbering _TECHNICAL_CO_TERMS in a context window.
+_AMBIGUOUS_TERMS: frozenset[str] = frozenset({
+    "register",   # philosophical: "developmental register", "attentional register"
+                  # technical:     "register field", "register mismatch gate"
+})
+
+# Words that signal a philosophical context near an ambiguous term.
+_PHILOSOPHICAL_CO_TERMS: frozenset[str] = frozenset({
+    "attunement", "poiesis", "poiema", "frontier", "developmental",
+    "phenomenological", "phenomenology", "embodiment", "negentropic",
+    "discernment", "coherence", "proprioceptive", "ontological", "epistemic",
+    "somatic", "intersubjective", "liminal", "aletheia", "thrownness",
+    "givenness", "dwelling", "presencing", "autopoiesis", "dasein",
+    "noema", "noesis", "logos", "weltanschauung",
+})
+
+# Words that signal a technical context near an ambiguous term.
+_TECHNICAL_CO_TERMS: frozenset[str] = frozenset({
+    "field", "schema", "gate", "mismatch", "classification",
+    "germination", "routing", "dispatch", "executor", "payload",
+    "parser", "queue", "json", "yaml", "api", "endpoint",
+    "migration", "cron", "scheduler",
+})
+
+# Words on each side of an ambiguous term to scan for co-occurrence.
+_CO_OCCURRENCE_WINDOW: int = 40
+
+
+def _philosophical_score(title: str, body: str) -> float:
+    """
+    Return a confidence score [0.0, 1.0] for philosophical register classification.
+
+    Unambiguous terms from _PHILOSOPHICAL_TERMS each contribute
+    _PHILOSOPHICAL_TERM_WEIGHT. Ambiguous terms from _AMBIGUOUS_TERMS
+    contribute _AMBIGUOUS_TERM_WEIGHT per philosophical co-term found in a
+    context window, but only when philosophical co-term hits outnumber
+    technical co-term hits. Origin signals (philosophy session, frontier doc)
+    return 1.0 immediately.
+    """
+    combined_raw = title + " " + body
+    if bool(_PHILOSOPHICAL_ORIGIN_RE.search(combined_raw)):
+        return 1.0
+
+    combined = combined_raw.lower()
+    words = re.findall(r"\b\w+\b", combined)
+    word_set = set(words)
+    score = 0.0
+
     single_word_terms = frozenset(t for t in _PHILOSOPHICAL_TERMS if " " not in t)
-    multi_word_terms  = frozenset(t for t in _PHILOSOPHICAL_TERMS if " " in t)
+    multi_word_terms = frozenset(t for t in _PHILOSOPHICAL_TERMS if " " in t)
 
-    word_tokens = set(re.findall(r"\b\w+\b", combined))
-    single_word_hit = bool(word_tokens & single_word_terms)
-    multi_word_hit  = any(phrase in combined for phrase in multi_word_terms)
-    vocab_hit = single_word_hit or multi_word_hit
+    for term in single_word_terms:
+        if term in word_set:
+            score += _PHILOSOPHICAL_TERM_WEIGHT
 
-    # Check for structural origin signals
-    origin_hit = bool(_PHILOSOPHICAL_ORIGIN_RE.search(title + " " + body))
-    return vocab_hit or origin_hit
+    for phrase in multi_word_terms:
+        if phrase in combined:
+            score += _PHILOSOPHICAL_TERM_WEIGHT
+
+    for i, word in enumerate(words):
+        if word in _AMBIGUOUS_TERMS:
+            window_start = max(0, i - _CO_OCCURRENCE_WINDOW)
+            window_end = min(len(words), i + _CO_OCCURRENCE_WINDOW)
+            window = set(words[window_start:window_end])
+            phil_hits = len(window & _PHILOSOPHICAL_CO_TERMS)
+            tech_hits = len(window & _TECHNICAL_CO_TERMS)
+            if phil_hits > tech_hits:
+                score += _AMBIGUOUS_TERM_WEIGHT * phil_hits
+
+    return min(score, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -311,15 +378,15 @@ def classify_register(
             ),
         )
 
-    # Gate 3: philosophical register vocabulary
-    if _is_philosophical(title, body):
+    # Gate 3: philosophical register vocabulary (co-occurrence scored)
+    if _philosophical_score(title, body) >= GATE3_THRESHOLD:
         return RegisterClassification(
             register="philosophical",
             gate_matched="3",
             confidence="medium",
             rationale=(
-                "Issue title or body contains phenomenological vocabulary or "
-                "a philosophical origin signal."
+                "Issue title or body scored at or above the philosophical threshold — "
+                "contains phenomenological vocabulary or a philosophical origin signal."
             ),
         )
 
