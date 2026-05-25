@@ -52,6 +52,17 @@ When reviewing a document that has a prior verdict in `oracle/verdicts/`, enumer
 
 ---
 
+## Mode Detection
+
+Before entering Stage 1, classify the review target:
+
+- **Verification mode**: the artifact has an external adjudicator (test suite, type checker, linter, schema). Ground truth is separable from oracle judgment. Failing tests, lint violations, and type errors are external standards — the oracle's role is to locate and name the violation, not to substitute its judgment for it. These protocols can approach automation: the test suite itself increasingly embodies the standard.
+- **Validation mode**: the artifact has no external adjudicator (design docs, specs, bootup files, prescriptions, UoW documents). The oracle's attending is the primary mechanism for surfacing what the document occludes — what it presupposes without stating, defers without naming, or resolves prematurely. A vague NEEDS_CHANGES in validation mode is an oracle failure, not a document failure. Genuine attunement is required; checklists cannot substitute for it.
+
+State your mode classification at the top of every verdict file, immediately after the VERDICT line, before any other content.
+
+---
+
 ## Stage 1: Vision alignment
 
 Before seeing any implementation, ask:
@@ -68,6 +79,10 @@ Write Stage 1 findings explicitly before proceeding to Stage 2. These findings m
 ---
 
 ## Stage 2: Quality review
+
+**In verification mode:** Stage 2 checks structural correctness, coverage of edge cases, and completeness of the external-standard citations. For any NEEDS_CHANGES finding, name the specific failing check (test name, lint rule, type error location). The question is "does this pass the external standard?"
+
+**In validation mode:** Stage 2 asks "what does this document not say that it needs to say?" — this is the attunement question, not a checklist. For any NEEDS_CHANGES finding, articulate the specific attending observation: what the document presupposes without stating, defers without naming, or resolves prematurely. Each observation must be a complete sentence naming the specific gap. The question is "what does this document make invisible?"
 
 Read the implementation (diff, code, output). Evaluate:
 
@@ -99,13 +114,20 @@ oracle_date: <YYYY-MM-DD>
 
 ```markdown
 VERDICT: APPROVED
+MODE: VERIFICATION | VALIDATION
 PR: {number}
 Round: N
+
+[For VERIFICATION/NEEDS_CHANGES: cite the specific failing check — test name, rule ID, type error location. One item per line. No narrative required.]
+
+[For VALIDATION/NEEDS_CHANGES: articulate the specific attending observation — what the document presupposes without stating, defers without naming, or resolves prematurely. Each observation must be a complete sentence naming the specific gap, not a quality judgment.]
+
+[For APPROVED in either mode: brief confirmation of what was checked and why it passes.]
 
 [Full prose findings — Stage 1 and Stage 2 — below this line]
 ```
 
-The first line MUST be exactly `VERDICT: APPROVED` or `VERDICT: NEEDS_CHANGES` (no other text on that line). The dispatcher reads this file and checks the first line — no grepping, no parsing. When writing Round 2+, keep all previous round content below a `## Round N — [YYYY-MM-DD]` header and prepend the new round at the top.
+The first line MUST be exactly `VERDICT: APPROVED` or `VERDICT: NEEDS_CHANGES` (no other text on that line). The dispatcher reads this file and checks the first line — no grepping, no parsing. `MODE:` is the second line; it is for human reviewers and the oracle itself, not for the dispatcher. When writing Round 2+, keep all previous round content below a `## Round N — [YYYY-MM-DD]` header and prepend the new round at the top.
 
 **Append one line** to `~/lobster/oracle/verdicts/index.md`:
 
