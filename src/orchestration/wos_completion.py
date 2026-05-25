@@ -47,21 +47,16 @@ log = logging.getLogger("wos_completion")
 # don't have a real gh CLI available.
 _lifecycle_imported = False
 _stamp_issue_complete_fn = None
-_stamp_issue_unverifiable_fn = None
 
 
 def _import_lifecycle() -> None:
     """Import wos_issue_lifecycle functions on first use (lazy, non-blocking)."""
-    global _lifecycle_imported, _stamp_issue_complete_fn, _stamp_issue_unverifiable_fn
+    global _lifecycle_imported, _stamp_issue_complete_fn
     if _lifecycle_imported:
         return
     try:
-        from orchestration.wos_issue_lifecycle import (
-            stamp_issue_complete as _sic,
-            stamp_issue_unverifiable as _siu,
-        )
+        from orchestration.wos_issue_lifecycle import stamp_issue_complete as _sic
         _stamp_issue_complete_fn = _sic
-        _stamp_issue_unverifiable_fn = _siu
     except ImportError as exc:
         log.debug("wos_completion: could not import wos_issue_lifecycle — %s", exc)
     finally:
