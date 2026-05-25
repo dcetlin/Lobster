@@ -64,6 +64,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from src.utils.jobs import is_job_enabled  # noqa: E402
+from src.orchestration.analytics import waste_state_signal  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -492,6 +493,19 @@ def format_digest(
             stall_line += f" (+{len(stalled) - 5} more)"
         lines.append(stall_line)
 
+    # Waste-state signal (suppress when data_gap — sparse data adds noise)
+    if waste_state and not waste_state.get("data_gap"):
+        wr = waste_state.get("waste_ratio")
+        trend = waste_state.get("trend", "n/a")
+        if wr is not None:
+            waste_line = f"Waste     : ratio={wr:.1f} ({trend})"
+        else:
+            acc = waste_state.get("accumulation_count", 0)
+            waste_line = f"Waste     : no throughput signal (accumulation={acc})"
+        if waste_state.get("escalation_flag"):
+            waste_line += " [ESCALATING]"
+        lines.append(waste_line)
+
     return "\n".join(lines)
 
 
@@ -559,8 +573,17 @@ def run_digest(db_path: Path, lookback_hours: int, dry_run: bool = False) -> dic
     if stalled:
         log.warning("Still running >%dh: %d", STALL_THRESHOLD_HOURS, len(stalled))
 
+    # Waste-state signal (7-day rolling window, independent of lookback_hours)
+    waste_state = waste_state_signal(db_path, window_days=7)
+    log.info(
+        "Waste state: ratio=%s trend=%s escalating=%s",
+        waste_state.get("waste_ratio"),
+        waste_state.get("trend"),
+        waste_state.get("escalation_flag"),
+    )
+
     # Format digest (may return None for idle days)
-    digest_text = format_digest(groups, stalled, lookback_hours, now_dt, seeds_total)
+    digest_text = format_digest(groups, stalled, lookback_hours, now_dt, seeds_total, waste_state)
 
     if digest_text is None:
         log.info("No UoWs completed in last %dh — suppressing idle-day digest", lookback_hours)
@@ -589,6 +612,7 @@ def run_digest(db_path: Path, lookback_hours: int, dry_run: bool = False) -> dic
         "suppressed": digest_text is None,
         "dry_run": dry_run,
         "digest_text": digest_text,
+        "waste_state": waste_state,
     }
 
 

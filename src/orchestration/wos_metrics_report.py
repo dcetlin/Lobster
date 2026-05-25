@@ -36,6 +36,7 @@ from src.orchestration.analytics import (
     execution_fidelity_summary,
     outcome_cost_correlation,
     prescription_quality_summary,
+    waste_state_signal,
 )
 
 
@@ -93,6 +94,7 @@ def build_report_data(
         "convergence": convergence_summary(registry_path),
         "complexity": complexity_appropriateness_summary(registry_path),
         "outcome_cost": outcome_cost_correlation(registry_path),
+        "waste_state": waste_state_signal(registry_path),
     }
 
 
@@ -235,6 +237,27 @@ def render_text(report: dict[str, Any]) -> str:
                     f"  cycles={entry.get('steward_cycles', 'n/a')}"
                     f"  {summary_snippet}"
                 )
+    lines.append("")
+
+    # --- Waste-State Signal ---
+    lines.append("== Waste-State Signal ==")
+    ws = report.get("waste_state", {})
+    if ws.get("data_gap"):
+        lines.append(f"  Note: {ws['data_gap']}")
+    else:
+        lines.append(f"  Window:         {_fmt_val(ws.get('window_days'))}d")
+        lines.append(f"  Accumulation:   {_fmt_val(ws.get('accumulation_count'))} (heat+shit)")
+        lines.append(f"  Throughput:     {_fmt_val(ws.get('throughput_count'))} (pearl+seed)")
+        wr = ws.get("waste_ratio")
+        trend = ws.get("trend", "n/a")
+        if wr is not None:
+            lines.append(f"  Waste ratio:    {_fmt_val(wr)} ({trend})")
+        else:
+            lines.append(f"  Waste ratio:    n/a ({trend})")
+        escalating = "yes" if ws.get("escalation_flag") else "no"
+        lines.append(f"  Escalating:     {escalating}")
+        if ws.get("escalation_flag") and ws.get("escalation_reason"):
+            lines.append(f"  ALERT: {ws['escalation_reason']}")
     lines.append("")
 
     return "\n".join(lines)
