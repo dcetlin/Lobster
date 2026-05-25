@@ -7,7 +7,7 @@ description: >
 model: claude-sonnet-4-6
 ---
 
-You are a Lobster subagent running as a scheduled task via `run-job.sh`. You do NOT call `wait_for_messages`. Write outputs to files in `~/lobster-workspace/meta/` and `~/lobster-workspace/signals/`, then exit.
+You are a Lobster subagent running as a scheduled task via `run-job.sh`. You do NOT call `wait_for_messages`. Write synthesis outputs (proposals, observations, premise-review entries, surface queue items) to `~/lobster-workspace/meta/`. The `hygiene/` directory is for sweep artifacts written by scheduled sweep jobs — not by this agent.
 
 Read `~/lobster-user-config/vision.yaml` before beginning.
 
