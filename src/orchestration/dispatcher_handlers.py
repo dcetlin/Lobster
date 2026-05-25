@@ -2569,6 +2569,8 @@ CALLBACK_DATA_HANDLERS: frozenset[str] = frozenset({
     "decide_close:",
     "vision_accept:",
     "vision_decline:",
+    "routing_pref_confirm:",
+    "routing_pref_reject:",
 })
 
 
@@ -2585,6 +2587,8 @@ def route_callback_message(msg: dict[str, Any], *, registry: "Registry | None" =
     - ``decide_close:<uow_id>`` — close a blocked UoW (calls ``handle_decide_close``)
     - ``vision_accept:<field_path>:<hash>`` — accept a vision proposal
     - ``vision_decline:<field_path>:<hash>`` — decline a vision proposal
+    - ``routing_pref_confirm:<payload_b64>`` — confirm a routing preference proposal
+    - ``routing_pref_reject:<payload_b64>`` — reject a routing preference proposal
 
     All other callback_data values fall through to ``handled=False``, which lets
     the dispatcher handle other callback types (job-confirm, delete-confirm, etc.)
@@ -2651,6 +2655,11 @@ def route_callback_message(msg: dict[str, Any], *, registry: "Registry | None" =
             text = f"Unknown vision callback: {data}"
         return {"action": "send_reply", "text": text, "chat_id": chat_id, "handled": True}
 
+    if data.startswith("routing_pref_confirm:") or data.startswith("routing_pref_reject:"):
+        effective_chat_id = int(chat_id) if chat_id is not None else int(os.environ.get("LOBSTER_ADMIN_CHAT_ID", "8075091586"))
+        text = handle_routing_pref_callback(data, chat_id=effective_chat_id)
+        return {"action": "send_reply", "text": text, "chat_id": chat_id, "handled": True}
+
     # Not a known callback — signal the dispatcher to use its own handling
     return {"action": "send_reply", "text": f"Unknown callback: {data}", "chat_id": chat_id, "handled": False}
 
@@ -2695,6 +2704,168 @@ def handle_vision_callback(
         return "vision_inlet module unavailable — cannot process vision callback."
 
     return _vi_callback(callback_data, chat_id=chat_id)
+
+
+# ---------------------------------------------------------------------------
+# Routing preference callback handler — routing_pref_confirm / routing_pref_reject
+# ---------------------------------------------------------------------------
+
+# Module-level routing-preferences cache.  Populated on first load and refreshed
+# every _ROUTING_PREFS_RELOAD_INTERVAL messages (or after a routing_pref_confirm).
+_cached_routing_prefs: list[dict] = []
+_routing_prefs_message_counter: int = 0
+_ROUTING_PREFS_RELOAD_INTERVAL: int = 10
+
+_ROUTING_PREFS_PATH = Path.home() / "lobster-user-config" / "routing-preferences.yaml"
+_PENDING_PROPOSALS_PATH = Path.home() / "lobster-workspace" / "data" / "pending-routing-proposals.json"
+
+
+def reload_routing_preferences() -> list[dict]:
+    """Load (or reload) routing preferences from disk. Updates module-level cache."""
+    global _cached_routing_prefs
+    try:
+        from src.routing.preferences import load_routing_preferences
+        _cached_routing_prefs = load_routing_preferences(_ROUTING_PREFS_PATH)
+    except Exception as exc:
+        _log.warning("routing_prefs: failed to load: %s", exc)
+        _cached_routing_prefs = []
+    return _cached_routing_prefs
+
+
+def maybe_annotate_routing_hint(message: dict) -> dict:
+    """Check cached routing preferences against message; annotate with routing_hint if matched.
+
+    Reloads preferences from disk every _ROUTING_PREFS_RELOAD_INTERVAL calls so
+    newly confirmed preferences take effect without a dispatcher restart.
+    Returns the (possibly annotated) message dict — caller owns the returned value.
+    """
+    global _routing_prefs_message_counter
+    _routing_prefs_message_counter += 1
+    if _routing_prefs_message_counter % _ROUTING_PREFS_RELOAD_INTERVAL == 1:
+        reload_routing_preferences()
+
+    if not _cached_routing_prefs:
+        return message
+
+    try:
+        from src.routing.preferences import match_routing_preference
+        rule = match_routing_preference(message, _cached_routing_prefs)
+    except Exception as exc:
+        _log.warning("routing_prefs: match failed: %s", exc)
+        return message
+
+    if rule:
+        _log.info("routing_pref_match: rule=%s condition=%s", rule.get("id"), rule.get("condition"))
+        message = dict(message)
+        message["routing_hint"] = rule.get("route_to")
+    return message
+
+
+def handle_routing_pref_callback(callback_data: str, chat_id: int) -> str:
+    """Handle ``routing_pref_confirm:<payload_b64>`` and ``routing_pref_reject:<payload_b64>``.
+
+    On confirm: decodes the base64 JSON payload, derives a stable rule id,
+                appends the rule to ``~/lobster-user-config/routing-preferences.yaml``,
+                records the accepted proposal in ``pending-routing-proposals.json``,
+                and refreshes the in-memory preferences cache immediately.
+    On reject:  records the rejected proposal and returns a dismissal message.
+
+    The payload format matches what morning-briefing.md specifies::
+
+        {
+          "condition": "<observation text, trimmed to 80 chars>",
+          "agent_hint": "<agent name>",
+          "source_event_ids": ["<id>", ...],
+          "proposed_at": "<ISO timestamp>"
+        }
+
+    Returns a reply string suitable for sending directly to the user.
+    """
+    import base64
+    import json as _json
+    import uuid as _uuid
+    from datetime import datetime, timezone
+    import yaml
+
+    is_accept = callback_data.startswith("routing_pref_confirm:")
+    prefix = "routing_pref_confirm:" if is_accept else "routing_pref_reject:"
+    payload_b64 = callback_data[len(prefix):]
+
+    try:
+        payload = _json.loads(base64.b64decode(payload_b64).decode())
+    except Exception as exc:
+        return f"routing_pref: could not decode payload — {exc}"
+
+    condition = payload.get("condition", "unknown")[:80]
+    agent_hint = payload.get("agent_hint", "general-purpose")
+
+    # Update pending proposals file — keyed by first 16 chars of b64 for stability.
+    proposals: dict = {}
+    if _PENDING_PROPOSALS_PATH.exists():
+        try:
+            proposals = _json.loads(_PENDING_PROPOSALS_PATH.read_text())
+        except Exception:
+            proposals = {}
+
+    proposal_id = payload_b64[:16]
+    decision_status = "accepted" if is_accept else "rejected"
+    if proposal_id in proposals:
+        proposals[proposal_id]["status"] = decision_status
+    else:
+        proposals[proposal_id] = {**payload, "status": decision_status}
+
+    try:
+        _PENDING_PROPOSALS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _PENDING_PROPOSALS_PATH.write_text(_json.dumps(proposals, indent=2))
+    except Exception as exc:
+        _log.warning("routing_pref: could not write proposals file: %s", exc)
+
+    if not is_accept:
+        return f"Skipped. Routing suggestion for '{condition}' discarded."
+
+    # Append rule to routing-preferences.yaml
+    try:
+        raw = yaml.safe_load(_ROUTING_PREFS_PATH.read_text()) if _ROUTING_PREFS_PATH.exists() else {}
+    except Exception:
+        raw = {}
+
+    raw = raw or {}
+    rules: list = raw.get("rules") or raw.get("preferences") or []
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    rule_id = f"rule_{datetime.now(timezone.utc).strftime('%Y%m%d')}_{_uuid.uuid4().hex[:6]}"
+
+    new_rule = {
+        "id": rule_id,
+        "condition": condition,
+        "route_to": agent_hint,
+        "confidence": float(payload.get("confidence", 0.0)),
+        "observation_count": 1,
+        "confirmed_by": "dan",
+        "confirmed_at": now_iso,
+        "active": True,
+    }
+    rules.append(new_rule)
+
+    raw["rules"] = rules
+    raw.pop("preferences", None)  # normalise to "rules" key
+    raw["last_updated"] = now_iso
+
+    try:
+        _ROUTING_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _ROUTING_PREFS_PATH.write_text(
+            "# Routing preferences — managed by Lobster HITL loop\n"
+            "# Each entry is a rule confirmed by Dan via Telegram\n"
+            "# managed_by: pattern-obs-routing-loop\n"
+            + yaml.dump(raw, default_flow_style=False, allow_unicode=True)
+        )
+    except Exception as exc:
+        return f"routing_pref: rule decoded but could not write YAML — {exc}"
+
+    # Refresh in-memory cache immediately so new rule takes effect in this session.
+    reload_routing_preferences()
+
+    return f"Routing preference saved: '{condition}' -> '{agent_hint}'"
 
 
 # ---------------------------------------------------------------------------
