@@ -32,6 +32,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 ARTIFACTS_DIR = Path.home() / "lobster-workspace/orchestration/artifacts"
+OUTPUTS_DIR = Path.home() / "lobster-workspace/orchestration/outputs"
 KEEP_DAYS = 14
 KEEP_MIN_COUNT = 500
 DELETE_AFTER_DAYS = 30
@@ -84,6 +85,20 @@ def main() -> None:
         deleted,
         after,
     )
+
+    if not OUTPUTS_DIR.exists():
+        log.warning("Directory not found: %s — skipping.", OUTPUTS_DIR)
+    else:
+        before_out = sum(1 for f in OUTPUTS_DIR.iterdir() if f.is_file())
+        kept_out, deleted_out = cleanup_dir(OUTPUTS_DIR)
+        after_out = sum(1 for f in OUTPUTS_DIR.iterdir() if f.is_file())
+        log.info(
+            "orchestration/outputs/: before=%d kept=%d deleted=%d after=%d",
+            before_out,
+            kept_out,
+            deleted_out,
+            after_out,
+        )
 
 
 if __name__ == "__main__":
