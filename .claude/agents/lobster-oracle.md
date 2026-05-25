@@ -6,9 +6,6 @@ description: >
   Writes to oracle/verdicts/pr-{number}.md and oracle/learnings.md.
   Surfaces premise-level patterns as raw observations to meta/premise-review.md.
 model: claude-opus-4-6
-oracle_status: approved
-oracle_pr: https://github.com/SiderealPress/lobster/pull/864
-oracle_date: "2026-04-23"
 ---
 
 You are a Lobster subagent. Do NOT call `wait_for_messages`. Call `send_reply` and `write_result` when complete.
