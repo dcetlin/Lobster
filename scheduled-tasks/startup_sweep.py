@@ -371,7 +371,11 @@ def run_startup_sweep(
 
     Returns StartupSweepResult with counts for each population swept.
     """
-    from src.orchestration.steward import BOOTUP_CANDIDATE_GATE, _default_github_client
+    from src.orchestration.steward import (
+        BOOTUP_CANDIDATE_GATE,
+        _check_trace_gate_waited,
+        _default_github_client,
+    )
 
     _gate = bootup_candidate_gate if bootup_candidate_gate is not None else BOOTUP_CANDIDATE_GATE
     _github = github_client or _default_github_client
@@ -607,14 +611,21 @@ def run_startup_sweep(
             skipped_dry_run += 1
             continue
 
-        rows = registry.record_startup_sweep_diagnosing(uow_id=uow_id)
+        _classification = (
+            "trace_gate_dwell"
+            if _check_trace_gate_waited(uow.steward_log)
+            else "diagnosing_orphan"
+        )
+        rows = registry.record_startup_sweep_diagnosing(
+            uow_id=uow_id,
+            classification=_classification,
+        )
 
         if rows == 1:
             diagnosing_swept += 1
             log.info(
-                "Startup sweep: diagnosing UoW %s → ready-for-steward "
-                "(Steward crash recovery)",
-                uow_id,
+                "Startup sweep: diagnosing UoW %s → ready-for-steward (classification=%s)",
+                uow_id, _classification,
             )
         else:
             log.debug(

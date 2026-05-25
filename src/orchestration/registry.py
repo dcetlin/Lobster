@@ -1898,6 +1898,7 @@ class Registry:
     def record_startup_sweep_diagnosing(
         self,
         uow_id: str,
+        classification: str = "diagnosing_orphan",
     ) -> int:
         """
         Atomically write a startup_sweep audit entry and transition a
@@ -1906,13 +1907,16 @@ class Registry:
         Used when the Steward crashed mid-diagnosis. The next heartbeat
         re-diagnoses cleanly from ready-for-steward.
 
+        classification: 'diagnosing_orphan' for a genuine crash recovery,
+            'trace_gate_dwell' for an intentional WaitForTrace dwell.
+
         Returns 1 on success, 0 if another process already advanced this UoW.
         """
         now = _now_iso()
         note_json = json.dumps({
             "event": "startup_sweep",
             "actor": "steward",
-            "classification": "diagnosing_orphan",
+            "classification": classification,
             "output_ref": None,
             "uow_id": uow_id,
             "timestamp": now,

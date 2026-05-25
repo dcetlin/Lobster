@@ -735,6 +735,40 @@ class TestDiagnosingUow:
         assert note["prior_status"] == "diagnosing"
         assert note["actor"] == "steward"
 
+    def test_diagnosing_uow_with_trace_gate_waited_gets_trace_gate_dwell_classification(
+        self, registry, tmp_db
+    ):
+        """
+        A diagnosing UoW that has a trace_gate_waited steward_log entry is an
+        intentional WaitForTrace dwell, not a crash. The audit record must use
+        classification='trace_gate_dwell', not 'diagnosing_orphan'.
+        """
+        conn = _open_conn(tmp_db)
+        uow_id = _make_uow(conn, status="diagnosing")
+        # Write a steward_log with a trace_gate_waited entry — same format written
+        # by _process_uow in steward.py when WaitForTrace fires.
+        steward_log = json.dumps({"event": "trace_gate_waited", "uow_id": uow_id, "timestamp": _now_iso()})
+        conn.execute(
+            "UPDATE uow_registry SET steward_log = ? WHERE id = ?",
+            (steward_log, uow_id),
+        )
+        conn.commit()
+        conn.close()
+
+        result = run_startup_sweep(registry)
+
+        assert result.diagnosing_swept == 1
+        assert _get_status(tmp_db, uow_id) == "ready-for-steward"
+
+        entries = _audit_entries(tmp_db, uow_id)
+        assert len(entries) == 1
+        note = json.loads(entries[0]["note"])
+        assert note["classification"] == "trace_gate_dwell", (
+            "A diagnosing UoW with trace_gate_waited steward_log must produce "
+            "classification='trace_gate_dwell', not 'diagnosing_orphan'"
+        )
+        assert note["prior_status"] == "diagnosing"
+
 
 class TestConcurrency:
     def test_double_sweep_active_uow_produces_exactly_one_transition(
