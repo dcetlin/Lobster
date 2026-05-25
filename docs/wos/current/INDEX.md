@@ -11,6 +11,14 @@ documents.
 
 ---
 
+## Acronym Reference
+
+**WOS** — Work Orchestration System
+
+The system that classifies, routes, and executes Units of Work (UoWs) through a structured pipeline from observation to completion. All WOS-prefixed components, schemas, and configuration keys refer to this system.
+
+---
+
 ## Component Map
 
 ### Germinator (`src/orchestration/germinator.py`)
