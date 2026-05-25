@@ -46,17 +46,20 @@ if dashboard_path.exists():
 # Build pipeline summary lines, ordered by relevance
 STATUS_ORDER = [
     "active",
+    "executing",
+    "ready-for-executor",
     "ready-for-steward",
+    "diagnosing",
     "needs-human-review",
+    "awaiting-owner",
     "blocked",
     "pending",
     "proposed",
-    "executing",
-    "paused",
-    "completed",
+    "failed",
     "done",
     "expired",
     "cancelled",
+    "closed",
 ]
 
 active_count = status_counts.get("active", 0)
