@@ -399,6 +399,7 @@ def format_digest(
     lookback_hours: int,
     now_dt: datetime,
     seeds_total: int,
+    waste_state: dict | None = None,
 ) -> str | None:
     """
     Format the metabolic digest as a Telegram message.
@@ -412,6 +413,8 @@ def format_digest(
         lookback_hours: The window used for the digest.
         now_dt:         Current datetime (UTC) for the report header.
         seeds_total:    Total seeds surfaced count.
+        waste_state:    Optional waste-state signal dict from waste_state_signal().
+                        When None or when data_gap is set, the Waste line is suppressed.
     """
     pearl_count = len(groups[OUTCOME_PEARL])
     heat_count = len(groups[OUTCOME_HEAT])
