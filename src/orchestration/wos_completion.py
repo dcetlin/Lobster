@@ -980,3 +980,75 @@ def maybe_complete_wos_uow(
             type(exc).__name__,
             exc,
         )
+
+
+def maybe_fail_wos_uow(task_id: str, reason: str) -> None:
+    """
+    Transition a WOS UoW from 'executing' to 'failed' when its subagent exits
+    without calling write_result.
+
+    Called by the SubagentStop hook (require-write-result.py) after MAX_HOOK_FIRES
+    exhaustion to convert a silent orphan into an explicit failure the steward can
+    handle immediately, rather than waiting for TTL orphan sweep (10–600 min).
+
+    Conditions required to fire:
+    - task_id starts with "wos-uow_" (executor dispatch task_ids only; excludes
+      wos-diagnose-*, wos-surface-*, and other non-executor wos- prefixed tasks)
+    - UoW exists in the registry with status == "executing"
+
+    A UoW not in 'executing' status is skipped silently (already recovered or
+    the TTL sweep fired first).
+
+    Errors are logged and swallowed — must never block the hook's exit path.
+
+    Args:
+        task_id: The task_id extracted from the transcript (format: "wos-uow_<id>").
+        reason:  Short failure reason string written to the audit log (e.g. "orphan_exit").
+    """
+    _WOS_UOW_EXECUTOR_PREFIX = "wos-uow_"
+    if not task_id.startswith(_WOS_UOW_EXECUTOR_PREFIX):
+        return
+
+    uow_id = task_id[len(WOS_TASK_ID_PREFIX):]  # strips "wos-", leaving "uow_<id>"
+    try:
+        from orchestration.registry import Registry, UoWStatus
+        from orchestration.paths import REGISTRY_DB
+
+        db_path = REGISTRY_DB
+        if not db_path.exists():
+            log.debug(
+                "maybe_fail_wos_uow: registry DB not found at %s — skipping",
+                db_path,
+            )
+            return
+
+        registry = Registry()
+        uow = registry.get(uow_id)
+        if uow is None:
+            log.debug(
+                "maybe_fail_wos_uow: UoW %r not found in registry — skipping",
+                uow_id,
+            )
+            return
+
+        if uow.status != UoWStatus.EXECUTING:
+            log.debug(
+                "maybe_fail_wos_uow: UoW %r is in status %r (expected 'executing') — "
+                "skipping (already recovered by TTL sweep or duplicate call)",
+                uow_id,
+                uow.status,
+            )
+            return
+
+        registry.fail_uow(uow_id, reason=reason)
+        log.info(
+            "maybe_fail_wos_uow: UoW %r transitioned executing → failed "
+            "(orphan exit detected by SubagentStop hook, reason=%r)",
+            uow_id,
+            reason,
+        )
+    except Exception as exc:
+        log.warning(
+            "maybe_fail_wos_uow: failed for UoW %r — %s: %s",
+            uow_id, type(exc).__name__, exc,
+        )

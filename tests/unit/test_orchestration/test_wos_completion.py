@@ -45,6 +45,7 @@ from orchestration.wos_completion import (
     _write_steward_trigger,
     classify_uow_output,
     maybe_complete_wos_uow,
+    maybe_fail_wos_uow,
 )
 from orchestration.registry import Registry, UoWStatus, UpsertInserted
 
@@ -1776,3 +1777,94 @@ class TestTokenUsageInResultJson:
             f"Pre-existing token_usage=5000 must not be overwritten. "
             f"Got {payload.get(TOKEN_USAGE_FIELD)!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# maybe_fail_wos_uow — orphan exit explicit failure path
+# ---------------------------------------------------------------------------
+
+class TestMaybeFailWosUow:
+    """Behavioral tests for maybe_fail_wos_uow."""
+
+    def test_maybe_fail_wos_uow_transitions_executing_to_failed(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        Core behavior: a UoW in 'executing' status is transitioned to 'failed'
+        when maybe_fail_wos_uow is called with the matching task_id.
+        """
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = _seed_uow_at_status(registry, "executing", output_dir)
+        task_id = f"wos-{uow_id}"  # "wos-uow_<id>" format
+
+        with patch.dict(os.environ, {"REGISTRY_DB_PATH": str(db_path)}):
+            maybe_fail_wos_uow(task_id, reason="orphan_exit")
+
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.status == UoWStatus.FAILED, (
+            f"Executing UoW must be transitioned to 'failed' by maybe_fail_wos_uow, "
+            f"got {uow.status}"
+        )
+
+    def test_maybe_fail_wos_uow_skips_non_executor_prefix(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        task_id "wos-diagnose-abc123" does not start with "wos-uow_" so
+        fail_uow must not be called.
+        """
+        db_path = tmp_path / "registry.db"
+        Registry(db_path)  # Initialize schema only
+
+        with patch.dict(os.environ, {"REGISTRY_DB_PATH": str(db_path)}):
+            # Must not raise and must not touch any UoW
+            maybe_fail_wos_uow("wos-diagnose-abc123", reason="orphan_exit")
+
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        count = conn.execute("SELECT COUNT(*) FROM uow_registry").fetchone()[0]
+        conn.close()
+        assert count == 0, "Non-executor task_id prefix must not create or modify any UoW records"
+
+    def test_maybe_fail_wos_uow_skips_non_executing_status(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A UoW already in 'failed' status must not be re-transitioned.
+        """
+        db_path = tmp_path / "registry.db"
+        output_dir = tmp_path / "outputs"
+        output_dir.mkdir()
+        registry = Registry(db_path)
+
+        uow_id = _seed_uow_at_status(registry, "executing", output_dir)
+        registry.set_status_direct(uow_id, "failed")
+
+        task_id = f"wos-{uow_id}"
+
+        with patch.dict(os.environ, {"REGISTRY_DB_PATH": str(db_path)}):
+            # Must not raise, status must remain 'failed'
+            maybe_fail_wos_uow(task_id, reason="orphan_exit")
+
+        uow = registry.get(uow_id)
+        assert uow is not None
+        assert uow.status == UoWStatus.FAILED, (
+            f"A UoW in 'failed' status must not be retransitioned; got {uow.status}"
+        )
+
+    def test_maybe_fail_wos_uow_skips_missing_db(self, tmp_path: Path) -> None:
+        """
+        When REGISTRY_DB does not exist, maybe_fail_wos_uow must return silently
+        without raising an exception.
+        """
+        nonexistent_db = tmp_path / "no_such.db"
+        task_id = "wos-uow_20260522_cf8707"
+
+        with patch.dict(os.environ, {"REGISTRY_DB_PATH": str(nonexistent_db)}):
+            # Must not raise
+            maybe_fail_wos_uow(task_id, reason="orphan_exit")
