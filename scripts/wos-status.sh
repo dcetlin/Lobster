@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-DB_PATH="${1:-${REGISTRY_DB_PATH:-${HOME}/lobster-workspace/data/registry.db}}"
+DB_PATH="${1:-${REGISTRY_DB_PATH:-${HOME}/lobster-workspace/orchestration/registry.db}}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
