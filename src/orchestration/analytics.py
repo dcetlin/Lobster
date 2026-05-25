@@ -6,7 +6,7 @@ Steward decision point. Prescription events carry a ``prescription_path``
 field that records whether the LLM or deterministic fallback path was used.
 Trace injection events carry a ``gate_score`` dict with a convergence score.
 
-This module exposes eight public functions:
+This module exposes nine public functions:
 
     prescription_quality_summary(registry_path?) -> dict
     convergence_metrics(registry_path?) -> dict
@@ -16,9 +16,10 @@ This module exposes eight public functions:
     convergence_summary(registry_path?) -> dict
     complexity_appropriateness_summary(registry_path?) -> dict
     outcome_cost_correlation(registry_path?) -> dict
+    waste_state_signal(registry_path?, window_days?) -> dict
 
 And a CLI entry point (``main()``) that accepts subcommands:
-    quality, convergence, diagnostic, outcome_cost, all
+    quality, convergence, diagnostic, outcome_cost, waste_state, all
 
 Design notes:
 - Pure function composition: each concern (connect, query, parse, aggregate)
@@ -35,7 +36,7 @@ import os
 import sqlite3
 import statistics
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1279,6 +1280,204 @@ def outcome_cost_correlation(
 
 
 # ---------------------------------------------------------------------------
+# waste_state_signal — internal helpers
+# ---------------------------------------------------------------------------
+
+# Provisional thresholds — tune based on observed pipeline behaviour.
+_WASTE_ESCALATION_RATIO = 2.0
+_WASTE_MIN_SAMPLE = 3
+
+
+def _fetch_waste_window_rows(
+    conn: sqlite3.Connection,
+    cutoff_start: str,
+    cutoff_end: str,
+) -> list[dict]:
+    """
+    Return UoW rows that completed within [cutoff_start, cutoff_end).
+
+    Uses completed_at with fallback to closed_at then updated_at. Defensive
+    column introspection mirrors the pattern in wos-metabolic-digest.py.
+    """
+    col_info = conn.execute("PRAGMA table_info(uow_registry)").fetchall()
+    col_names = {row[1] for row in col_info}
+
+    ts_parts = []
+    for col in ("completed_at", "closed_at", "updated_at"):
+        if col in col_names:
+            ts_parts.append(col)
+    if not ts_parts:
+        return []
+
+    ts_expr = ts_parts[0]
+    for col in ts_parts[1:]:
+        ts_expr = f"COALESCE({ts_expr}, {col})"
+
+    rows = conn.execute(
+        f"""
+        SELECT id, status, outcome_category,
+               {ts_expr} AS ts
+        FROM uow_registry
+        WHERE ({ts_expr}) >= ?
+          AND ({ts_expr}) < ?
+        """,
+        (cutoff_start, cutoff_end),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _classify_waste_row(row: dict) -> str:
+    """Return 'accumulation' or 'throughput' for a UoW row."""
+    status = (row.get("status") or "").lower()
+    cat = (row.get("outcome_category") or "").lower()
+
+    if status in ("failed", "expired", "cancelled"):
+        return "accumulation"
+    if cat in ("heat", "shit"):
+        return "accumulation"
+    if cat in ("pearl", "seed") and status == "done":
+        return "throughput"
+    return "accumulation"
+
+
+def _compute_waste_ratio(rows: list[dict]) -> tuple[int, int, float | None]:
+    """Return (accumulation_count, throughput_count, waste_ratio)."""
+    acc = sum(1 for r in rows if _classify_waste_row(r) == "accumulation")
+    thr = sum(1 for r in rows if _classify_waste_row(r) == "throughput")
+    ratio = acc / thr if thr > 0 else None
+    return acc, thr, ratio
+
+
+# ---------------------------------------------------------------------------
+# Public API — waste_state_signal
+# ---------------------------------------------------------------------------
+
+def waste_state_signal(
+    registry_path: Path | None = None,
+    window_days: int = 7,
+) -> dict[str, Any]:
+    """
+    Derive the waste-state health signal from the OODA protocol.
+
+    Over a rolling window of ``window_days`` days ending now, computes:
+    - accumulation_count: UoWs classified as waste (heat+shit or failed/expired/cancelled)
+    - throughput_count:   UoWs classified as composted (pearl+seed, done)
+    - waste_ratio:        accumulation / throughput (None if throughput == 0)
+    - trend:              comparison of current window ratio to prior window ratio
+    - escalation_flag:    True if waste_ratio > _WASTE_ESCALATION_RATIO and
+                          total_count >= _WASTE_MIN_SAMPLE
+    - escalation_reason:  human-readable string when escalation_flag is True
+    - data_gap:           note when < _WASTE_MIN_SAMPLE UoWs in the window
+    - window_days:        the window duration used
+
+    Parameters
+    ----------
+    registry_path:
+        Path to the registry SQLite DB. Defaults to canonical path.
+    window_days:
+        Rolling window length in days (default: 7).
+
+    Returns
+    -------
+    dict with keys: window_days, accumulation_count, throughput_count,
+    total_count, waste_ratio, trend, escalation_flag, escalation_reason, data_gap
+    """
+    path = registry_path if registry_path is not None else _default_registry_path()
+
+    now = datetime.now(timezone.utc)
+    window_start = (now - timedelta(days=window_days)).isoformat()
+    prior_start = (now - timedelta(days=2 * window_days)).isoformat()
+    now_iso = now.isoformat()
+
+    empty: dict[str, Any] = {
+        "window_days": window_days,
+        "accumulation_count": 0,
+        "throughput_count": 0,
+        "total_count": 0,
+        "waste_ratio": None,
+        "trend": "insufficient_data",
+        "escalation_flag": False,
+        "escalation_reason": None,
+        "data_gap": None,
+    }
+
+    if not path.exists():
+        empty["data_gap"] = (
+            f"Registry DB not found at {path}. "
+            "Run the WOS steward at least once to create the database."
+        )
+        return empty
+
+    try:
+        conn = _connect_ro(path)
+    except sqlite3.OperationalError as exc:
+        empty["data_gap"] = f"Could not open registry DB: {exc}"
+        return empty
+
+    try:
+        current_rows = _fetch_waste_window_rows(conn, window_start, now_iso)
+        prior_rows = _fetch_waste_window_rows(conn, prior_start, window_start)
+    except sqlite3.OperationalError as exc:
+        conn.close()
+        empty["data_gap"] = f"Could not query uow_registry: {exc}"
+        return empty
+    finally:
+        conn.close()
+
+    acc, thr, ratio = _compute_waste_ratio(current_rows)
+    total = acc + thr
+
+    data_gap: str | None = None
+    if total < _WASTE_MIN_SAMPLE:
+        data_gap = (
+            f"Only {total} UoW(s) completed in the last {window_days} days — "
+            f"need at least {_WASTE_MIN_SAMPLE} for a meaningful signal."
+        )
+
+    prior_acc, prior_thr, prior_ratio = _compute_waste_ratio(prior_rows)
+    prior_total = prior_acc + prior_thr
+
+    if total < _WASTE_MIN_SAMPLE or prior_total < _WASTE_MIN_SAMPLE:
+        trend = "insufficient_data"
+    elif ratio is None and prior_ratio is None:
+        trend = "stable"
+    elif ratio is None:
+        trend = "worsening"
+    elif prior_ratio is None:
+        trend = "improving"
+    elif ratio > prior_ratio:
+        trend = "worsening"
+    elif ratio < prior_ratio:
+        trend = "improving"
+    else:
+        trend = "stable"
+
+    escalation_flag = (
+        ratio is not None
+        and ratio > _WASTE_ESCALATION_RATIO
+        and total >= _WASTE_MIN_SAMPLE
+    )
+    escalation_reason: str | None = None
+    if escalation_flag:
+        escalation_reason = (
+            f"Waste ratio {ratio:.2f} exceeds threshold {_WASTE_ESCALATION_RATIO} "
+            f"({acc} accumulation vs {thr} throughput over {window_days}d)"
+        )
+
+    return {
+        "window_days": window_days,
+        "accumulation_count": acc,
+        "throughput_count": thr,
+        "total_count": total,
+        "waste_ratio": round(ratio, 4) if ratio is not None else None,
+        "trend": trend,
+        "escalation_flag": escalation_flag,
+        "escalation_reason": escalation_reason,
+        "data_gap": data_gap,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -1291,6 +1490,7 @@ def main() -> None:
         convergence   convergence_metrics()
         diagnostic    diagnostic_accuracy()
         outcome_cost  outcome_cost_correlation()
+        waste_state   waste_state_signal()
         all           all metrics under their respective keys (default)
 
     Options:
@@ -1303,7 +1503,7 @@ def main() -> None:
     parser.add_argument(
         "subcommand",
         nargs="?",
-        choices=["quality", "convergence", "diagnostic", "outcome_cost", "all"],
+        choices=["quality", "convergence", "diagnostic", "outcome_cost", "waste_state", "all"],
         default="all",
         help="Which metrics to report (default: all)",
     )
@@ -1324,12 +1524,15 @@ def main() -> None:
         result = diagnostic_accuracy(db_path)
     elif args.subcommand == "outcome_cost":
         result = outcome_cost_correlation(db_path)
+    elif args.subcommand == "waste_state":
+        result = waste_state_signal(db_path)
     else:  # "all"
         result = {
             "quality": prescription_quality_summary(db_path),
             "convergence": convergence_metrics(db_path),
             "diagnostic": diagnostic_accuracy(db_path),
             "outcome_cost": outcome_cost_correlation(db_path),
+            "waste_state": waste_state_signal(db_path),
         }
 
     print(json.dumps(result, indent=2))
