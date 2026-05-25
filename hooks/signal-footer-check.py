@@ -18,8 +18,11 @@ Exit codes:
 """
 
 import json
+import os
 import re
+import sqlite3
 import sys
+from datetime import datetime, timezone
 
 
 # Match a side-effects code block with the canonical label.
@@ -56,6 +59,15 @@ WRONG_NULL_PATTERNS = [
     re.compile(r"^(signals|effects|side_effects):\s*none\s*$", re.MULTILINE | re.IGNORECASE),
 ]
 
+# Extracts content inside a side-effects block.
+SIDE_EFFECTS_CONTENT_RE = re.compile(r"```side-effects:\s*\n(.*?)```", re.DOTALL)
+
+# Matches "decided" (optionally preceded by ⚖️ and whitespace) at the start of a trimmed line.
+DECIDED_LINE_RE = re.compile(r"^(?:⚖️\s*)?decided\b", re.IGNORECASE)
+
+DB_PATH = os.environ.get("DECIDED_DB_PATH", os.path.expanduser("~/lobster-workspace/data/memory.db"))
+DECISIONS_LEDGER_PATH = os.environ.get("DECIDED_LEDGER_PATH", os.path.expanduser("~/lobster-workspace/data/decisions-ledger.md"))
+
 
 def has_side_effects_none(text: str) -> bool:
     """Returns True if the message contains a banned 'side-effects: none' in any form."""
@@ -85,6 +97,65 @@ def detect_wrong_label(text: str) -> str | None:
             return m.group(1) + ": none"
 
     return None
+
+
+def route_decided(text: str, task_id: str | None = None) -> None:
+    """
+    If the message's side-effects block contains a 'decided' signal line,
+    write the decision to memory.db and append a dated entry to decisions-ledger.md.
+    Failures are swallowed — routing must not block the send_reply.
+    """
+    m = SIDE_EFFECTS_CONTENT_RE.search(text)
+    if not m:
+        return
+
+    description = None
+    for raw_line in m.group(1).splitlines():
+        line = raw_line.strip()
+        if DECIDED_LINE_RE.match(line):
+            description = DECIDED_LINE_RE.sub("", line).strip() or "decision reached"
+            break
+
+    if description is None:
+        return
+
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS decisions (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date       TEXT NOT NULL,
+                    category   TEXT,
+                    task_id    TEXT,
+                    summary    TEXT NOT NULL,
+                    source     TEXT,
+                    created_at TEXT DEFAULT (datetime('now'))
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_dedup
+                    ON decisions(date, summary);
+                CREATE INDEX IF NOT EXISTS idx_decisions_category
+                    ON decisions(category);
+                CREATE INDEX IF NOT EXISTS idx_decisions_task_id
+                    ON decisions(task_id);
+                CREATE INDEX IF NOT EXISTS idx_decisions_date
+                    ON decisions(date);
+            """)
+            conn.execute(
+                "INSERT OR IGNORE INTO decisions (date, category, task_id, summary, source) VALUES (?, ?, ?, ?, ?)",
+                (date_str, "decision", task_id, description, "decided-signal"),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+    try:
+        entry = f"\n---\n**{date_str}** — {description}\n"
+        with open(DECISIONS_LEDGER_PATH, "a", encoding="utf-8") as f:
+            f.write(entry)
+    except Exception:
+        pass
 
 
 def main():
@@ -130,6 +201,9 @@ def main():
                 file=sys.stderr,
             )
             sys.exit(2)
+
+    # Route any 'decided' signal found in the side-effects block.
+    route_decided(text, tool_input.get("task_id"))
 
     sys.exit(0)
 
