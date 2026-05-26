@@ -66,6 +66,11 @@ def _import_lifecycle() -> None:
 #: Prefix used by route_wos_message to form the task_id for wos_execute dispatches.
 WOS_TASK_ID_PREFIX = "wos-"
 
+#: Narrower prefix identifying executor-dispatched UoWs specifically (excludes
+#: wos-diagnose-*, wos-surface-*, and other non-executor wos- prefixed tasks).
+#: Used by maybe_fail_wos_uow to guard against failing non-executor UoWs.
+_WOS_UOW_EXECUTOR_PREFIX = "wos-uow_"
+
 #: write_result status value that signals successful subagent completion.
 WRITE_RESULT_SUCCESS_STATUS = "success"
 
@@ -1005,7 +1010,6 @@ def maybe_fail_wos_uow(task_id: str, reason: str) -> None:
         task_id: The task_id extracted from the transcript (format: "wos-uow_<id>").
         reason:  Short failure reason string written to the audit log (e.g. "orphan_exit").
     """
-    _WOS_UOW_EXECUTOR_PREFIX = "wos-uow_"
     if not task_id.startswith(_WOS_UOW_EXECUTOR_PREFIX):
         return
 
