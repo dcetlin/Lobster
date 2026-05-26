@@ -14,6 +14,14 @@ and issue #849:
 - Long-running in-flight UoWs (>hc.ALERT_THRESHOLD_HOURS) trigger alert logic.
 - Executor heartbeat liveness check returns is_stale=True when log absent.
 - jobs.json enabled gate: job skips when disabled.
+
+Phase 3 monitors (added per oracle verdict on PR #1331):
+- check_dark_pipeline: returns None when audit_log has recent entries; returns alert
+  string when audit_log is stale or empty.
+- check_ready_queue_drain: returns None when drain events exist; returns alert when
+  queue grows with zero drains.
+- check_issue_rate_trend: returns None when ratio is below threshold; returns alert
+  when open/close ratio exceeds threshold; returns None when gh CLI is unavailable.
 """
 
 from __future__ import annotations
@@ -24,6 +32,7 @@ import sqlite3
 import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 
 import pytest
 
@@ -119,6 +128,32 @@ def _insert_uow(
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (uow_id, status, summary, _hours_ago(created_hours_ago), started, heartbeat_at, heartbeat_ttl),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _insert_audit_entry(
+    db: Path,
+    uow_id: str,
+    event: str,
+    from_status: str | None = None,
+    to_status: str | None = None,
+    hours_ago: float = 0.0,
+    minutes_ago: float | None = None,
+) -> None:
+    """Insert an audit_log entry at a specified time offset from now."""
+    conn = sqlite3.connect(str(db))
+    if minutes_ago is not None:
+        ts = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+    else:
+        ts = _hours_ago(hours_ago)
+    conn.execute(
+        """
+        INSERT INTO audit_log (ts, uow_id, event, from_status, to_status)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (ts, uow_id, event, from_status, to_status),
     )
     conn.commit()
     conn.close()
@@ -306,3 +341,241 @@ class TestLongRunningAlert:
         results = hc.query_long_running_in_flight(db_path, hc.ALERT_THRESHOLD_HOURS)
         ids = [r["id"] for r in results]
         assert "uow-recent" not in ids
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: check_dark_pipeline
+# ---------------------------------------------------------------------------
+
+class TestCheckDarkPipeline:
+    """Dark pipeline detection: alert when audit_log is silent for >threshold days."""
+
+    def test_healthy_returns_none_when_recent_audit_entries_exist(self, db_path):
+        """Audit entries within the threshold window → healthy (returns None)."""
+        _insert_audit_entry(db_path, "uow-1", "status_change", hours_ago=1)
+        result = hc.check_dark_pipeline(db_path, threshold_days=hc.DARK_PIPELINE_THRESHOLD_DAYS)
+        assert result is None
+
+    def test_alert_when_audit_log_is_stale_beyond_threshold(self, db_path):
+        """Last audit entry older than threshold → returns alert string."""
+        stale_hours = (hc.DARK_PIPELINE_THRESHOLD_DAYS + 1) * 24
+        _insert_audit_entry(db_path, "uow-old", "status_change", hours_ago=stale_hours)
+        result = hc.check_dark_pipeline(db_path, threshold_days=hc.DARK_PIPELINE_THRESHOLD_DAYS)
+        assert result is not None
+        assert "Dark pipeline" in result
+        assert str(hc.DARK_PIPELINE_THRESHOLD_DAYS) in result
+
+    def test_alert_when_audit_log_is_empty(self, db_path):
+        """No audit entries at all → returns alert string about empty log."""
+        result = hc.check_dark_pipeline(db_path, threshold_days=hc.DARK_PIPELINE_THRESHOLD_DAYS)
+        assert result is not None
+        assert "empty" in result.lower()
+
+    def test_returns_none_when_db_absent(self, tmp_path):
+        """Missing database file → healthy (returns None, not an error)."""
+        result = hc.check_dark_pipeline(tmp_path / "nonexistent.db")
+        assert result is None
+
+    def test_healthy_at_exact_threshold_boundary(self, db_path):
+        """Audit entry at exactly 1 hour before the threshold → healthy."""
+        just_within_hours = (hc.DARK_PIPELINE_THRESHOLD_DAYS * 24) - 1
+        _insert_audit_entry(db_path, "uow-boundary", "status_change", hours_ago=just_within_hours)
+        result = hc.check_dark_pipeline(db_path, threshold_days=hc.DARK_PIPELINE_THRESHOLD_DAYS)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: check_ready_queue_drain
+# ---------------------------------------------------------------------------
+
+class TestCheckReadyQueueDrain:
+    """Ready-queue growth without drain: alert when UoWs enter ready-for-executor
+    but none transition out within the observation window."""
+
+    def test_healthy_returns_none_when_drain_events_exist(self, db_path):
+        """Queue growth + drain events within window → healthy (returns None)."""
+        # UoW in ready-for-executor state
+        _insert_uow(db_path, "uow-ready", "ready-for-executor", created_hours_ago=0.5)
+        # Transition INTO ready-for-executor (growth)
+        _insert_audit_entry(
+            db_path, "uow-ready", "status_change",
+            to_status="ready-for-executor", minutes_ago=30,
+        )
+        # Transition OUT OF ready-for-executor (drain)
+        _insert_audit_entry(
+            db_path, "uow-other", "status_change",
+            from_status="ready-for-executor", to_status="executing", minutes_ago=20,
+        )
+        result = hc.check_ready_queue_drain(
+            db_path, window_minutes=hc.READY_QUEUE_DRAIN_WINDOW_MINUTES,
+        )
+        assert result is None
+
+    def test_alert_when_queue_grows_with_no_drain(self, db_path):
+        """Queue growth + zero drain events within window → returns alert string."""
+        _insert_uow(db_path, "uow-stuck", "ready-for-executor", created_hours_ago=0.5)
+        # Transition INTO ready-for-executor (growth) — but no drain
+        _insert_audit_entry(
+            db_path, "uow-stuck", "status_change",
+            to_status="ready-for-executor", minutes_ago=30,
+        )
+        result = hc.check_ready_queue_drain(
+            db_path, window_minutes=hc.READY_QUEUE_DRAIN_WINDOW_MINUTES,
+        )
+        assert result is not None
+        assert "Ready-queue growth without drain" in result
+        assert "1 UoW(s)" in result
+
+    def test_healthy_returns_none_when_no_new_ready_entries(self, db_path):
+        """No entries transitioned into ready-for-executor within window → healthy."""
+        # A UoW sits in the queue, but it entered before the observation window
+        _insert_uow(db_path, "uow-old-ready", "ready-for-executor", created_hours_ago=5)
+        result = hc.check_ready_queue_drain(
+            db_path, window_minutes=hc.READY_QUEUE_DRAIN_WINDOW_MINUTES,
+        )
+        assert result is None
+
+    def test_returns_none_when_db_absent(self, tmp_path):
+        """Missing database file → healthy (returns None)."""
+        result = hc.check_ready_queue_drain(tmp_path / "nonexistent.db")
+        assert result is None
+
+    def test_alert_includes_queue_depth(self, db_path):
+        """Alert message includes current queue depth for observability."""
+        _insert_uow(db_path, "uow-q1", "ready-for-executor", created_hours_ago=0.5)
+        _insert_uow(db_path, "uow-q2", "ready-for-executor", created_hours_ago=0.5)
+        _insert_audit_entry(
+            db_path, "uow-q1", "status_change",
+            to_status="ready-for-executor", minutes_ago=10,
+        )
+        result = hc.check_ready_queue_drain(
+            db_path, window_minutes=hc.READY_QUEUE_DRAIN_WINDOW_MINUTES,
+        )
+        assert result is not None
+        assert "queue depth: 2" in result
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: check_issue_rate_trend
+# ---------------------------------------------------------------------------
+
+class TestCheckIssueRateTrend:
+    """Issue open/close rate trend: alert when open rate exceeds close rate by >threshold."""
+
+    def _mock_gh_result(self, lines: list[str]) -> MagicMock:
+        """Build a mock subprocess.run result with the given output lines."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "\n".join(lines) + "\n" if lines else ""
+        mock_result.stderr = ""
+        return mock_result
+
+    def test_healthy_returns_none_when_ratio_below_threshold(self):
+        """open/close ratio below ISSUE_RATE_ALERT_RATIO → healthy (returns None)."""
+        # 3 opened, 3 closed → ratio 1.0 < 1.5 threshold
+        opened_lines = ["1\topen\ttitle1", "2\topen\ttitle2", "3\topen\ttitle3"]
+        closed_lines = ["4\tclosed\ttitle4", "5\tclosed\ttitle5", "6\tclosed\ttitle6"]
+
+        def side_effect(*args, **kwargs):
+            cmd = args[0]
+            if "--state" in cmd:
+                idx = cmd.index("--state")
+                state = cmd[idx + 1]
+                if state == "open":
+                    return self._mock_gh_result(opened_lines)
+                elif state == "closed":
+                    return self._mock_gh_result(closed_lines)
+            return self._mock_gh_result([])
+
+        with patch("subprocess.run", side_effect=side_effect):
+            result = hc.check_issue_rate_trend(
+                repo="test/repo",
+                window_days=hc.ISSUE_RATE_WINDOW_DAYS,
+                alert_ratio=hc.ISSUE_RATE_ALERT_RATIO,
+            )
+        assert result is None
+
+    def test_alert_when_ratio_exceeds_threshold(self):
+        """open/close ratio exceeds ISSUE_RATE_ALERT_RATIO → returns alert string."""
+        # 8 opened, 3 closed → ratio 2.67 > 1.5 threshold
+        opened_lines = [f"{i}\topen\ttitle{i}" for i in range(8)]
+        closed_lines = [f"{i}\tclosed\ttitle{i}" for i in range(3)]
+
+        def side_effect(*args, **kwargs):
+            cmd = args[0]
+            if "--state" in cmd:
+                idx = cmd.index("--state")
+                state = cmd[idx + 1]
+                if state == "open":
+                    return self._mock_gh_result(opened_lines)
+                elif state == "closed":
+                    return self._mock_gh_result(closed_lines)
+            return self._mock_gh_result([])
+
+        with patch("subprocess.run", side_effect=side_effect):
+            result = hc.check_issue_rate_trend(
+                repo="test/repo",
+                window_days=hc.ISSUE_RATE_WINDOW_DAYS,
+                alert_ratio=hc.ISSUE_RATE_ALERT_RATIO,
+            )
+        assert result is not None
+        assert "Issue rate trend" in result
+        assert "test/repo" in result
+
+    def test_alert_when_opened_nonzero_and_closed_zero(self):
+        """Issues opened with zero closures → returns alert string."""
+        opened_lines = ["1\topen\ttitle1", "2\topen\ttitle2"]
+
+        def side_effect(*args, **kwargs):
+            cmd = args[0]
+            if "--state" in cmd:
+                idx = cmd.index("--state")
+                state = cmd[idx + 1]
+                if state == "open":
+                    return self._mock_gh_result(opened_lines)
+                elif state == "closed":
+                    return self._mock_gh_result([])
+            return self._mock_gh_result([])
+
+        with patch("subprocess.run", side_effect=side_effect):
+            result = hc.check_issue_rate_trend(
+                repo="test/repo",
+                window_days=hc.ISSUE_RATE_WINDOW_DAYS,
+                alert_ratio=hc.ISSUE_RATE_ALERT_RATIO,
+            )
+        assert result is not None
+        assert "2 issue(s) opened, 0 closed" in result
+
+    def test_healthy_returns_none_when_both_counts_zero(self):
+        """No issues opened or closed in the window → healthy (returns None)."""
+        def side_effect(*args, **kwargs):
+            return self._mock_gh_result([])
+
+        with patch("subprocess.run", side_effect=side_effect):
+            result = hc.check_issue_rate_trend(
+                repo="test/repo",
+                window_days=hc.ISSUE_RATE_WINDOW_DAYS,
+                alert_ratio=hc.ISSUE_RATE_ALERT_RATIO,
+            )
+        assert result is None
+
+    def test_returns_none_when_gh_cli_unavailable(self):
+        """gh CLI not found → returns None (graceful degradation)."""
+        with patch("subprocess.run", side_effect=FileNotFoundError("gh not found")):
+            result = hc.check_issue_rate_trend(
+                repo="test/repo",
+                window_days=hc.ISSUE_RATE_WINDOW_DAYS,
+                alert_ratio=hc.ISSUE_RATE_ALERT_RATIO,
+            )
+        assert result is None
+
+    def test_returns_none_when_gh_cli_times_out(self):
+        """gh CLI times out → returns None (graceful degradation)."""
+        import subprocess as sp
+        with patch("subprocess.run", side_effect=sp.TimeoutExpired(cmd="gh", timeout=30)):
+            result = hc.check_issue_rate_trend(
+                repo="test/repo",
+                window_days=hc.ISSUE_RATE_WINDOW_DAYS,
+                alert_ratio=hc.ISSUE_RATE_ALERT_RATIO,
+            )
+        assert result is None
