@@ -9,31 +9,85 @@ events for downstream analysis:
 - log_uow_closed: emitted when a UoW transitions to Done/Failed and the
   steward records total lifecycle metrics.
 
-Current implementation: no-op logger (events are emitted at DEBUG level only).
-The intended backing store is wos-metrics.db (separate from the registry DB
-to avoid write contention), but the DB schema and writer have not yet been
-implemented. This stub was created to unblock executor-heartbeat after
-PR #1305 introduced the import without providing the module.
+Backing store: wos-metrics.db (separate from the registry DB to avoid write
+contention). Tables are created lazily on first write. DB path is derived from
+LOBSTER_WORKSPACE env var (default: ~/lobster-workspace/orchestration/wos-metrics.db).
 
-When the full implementation is added, the DB schema and writer should be
-introduced here; the method signatures are stable.
+All methods are non-fatal: exceptions are caught and logged at WARNING level
+so the steward main loop is never interrupted by metrics collection failures.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import sqlite3
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("prescription_metrics")
+
+_SCHEMA_SQL = """
+PRAGMA journal_mode=WAL;
+
+CREATE TABLE IF NOT EXISTS prescription_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at TEXT NOT NULL,
+    uow_id TEXT NOT NULL,
+    cycle INTEGER NOT NULL,
+    executor_type TEXT,
+    has_minimum_viable_output INTEGER,
+    has_boundary INTEGER,
+    has_success_criteria_check INTEGER,
+    estimated_cycles INTEGER,
+    word_count INTEGER,
+    step_count INTEGER,
+    source_issue TEXT
+);
+
+CREATE TABLE IF NOT EXISTS closure_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at TEXT NOT NULL,
+    uow_id TEXT NOT NULL,
+    total_cycles INTEGER NOT NULL,
+    closure_outcome TEXT NOT NULL,
+    final_prescription_cycle INTEGER
+);
+"""
 
 
 class PrescriptionMetricsLogger:
     """Logs prescription and closure events for WOS structural analysis.
 
-    All methods are non-fatal: if logging fails (e.g. future DB write),
-    the exception is caught and logged at WARNING level so the steward
-    main loop is never interrupted by metrics collection failures.
+    All methods are non-fatal: if logging fails the exception is caught and
+    logged at WARNING level so the steward main loop is never interrupted.
     """
+
+    def __init__(self) -> None:
+        self._db_path: Path | None = None
+        self._initialized = False
+        self._lock = threading.Lock()
+
+    def _db(self) -> Path:
+        if self._db_path is None:
+            workspace = os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
+            self._db_path = Path(workspace) / "orchestration" / "wos-metrics.db"
+        return self._db_path
+
+    def _ensure_schema(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(_SCHEMA_SQL)
+        conn.commit()
+
+    def _connect(self) -> sqlite3.Connection:
+        db_path = self._db()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path), timeout=10.0)
+        if not self._initialized:
+            self._ensure_schema(conn)
+            self._initialized = True
+        return conn
 
     def log_prescription_generated(
         self,
@@ -67,17 +121,36 @@ class PrescriptionMetricsLogger:
             **kwargs: Reserved for future fields — accepted and ignored to allow
                 call-site additions without breaking this signature.
         """
-        log.debug(
-            "prescription_generated uow_id=%s cycle=%d executor_type=%s "
-            "has_mvo=%s has_boundary=%s words=%s steps=%s",
-            uow_id,
-            cycle,
-            executor_type,
-            has_minimum_viable_output,
-            has_boundary,
-            word_count,
-            step_count,
-        )
+        try:
+            with self._lock:
+                conn = self._connect()
+                conn.execute(
+                    """
+                    INSERT INTO prescription_events (
+                        recorded_at, uow_id, cycle, executor_type,
+                        has_minimum_viable_output, has_boundary,
+                        has_success_criteria_check, estimated_cycles,
+                        word_count, step_count, source_issue
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        datetime.now(tz=timezone.utc).isoformat(),
+                        uow_id,
+                        cycle,
+                        executor_type,
+                        1 if has_minimum_viable_output else 0,
+                        1 if has_boundary else 0,
+                        1 if has_success_criteria_check else 0,
+                        estimated_cycles,
+                        word_count,
+                        step_count,
+                        source_issue,
+                    ),
+                )
+                conn.commit()
+                conn.close()
+        except Exception as exc:
+            log.warning("prescription_metrics write failed (prescription_events): %s", exc)
 
     def log_uow_closed(
         self,
@@ -98,10 +171,25 @@ class PrescriptionMetricsLogger:
                 prescription, if available.
             **kwargs: Reserved for future fields — accepted and ignored.
         """
-        log.debug(
-            "uow_closed uow_id=%s total_cycles=%d outcome=%s final_prescription_cycle=%s",
-            uow_id,
-            total_cycles,
-            closure_outcome,
-            final_prescription_cycle,
-        )
+        try:
+            with self._lock:
+                conn = self._connect()
+                conn.execute(
+                    """
+                    INSERT INTO closure_events (
+                        recorded_at, uow_id, total_cycles,
+                        closure_outcome, final_prescription_cycle
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        datetime.now(tz=timezone.utc).isoformat(),
+                        uow_id,
+                        total_cycles,
+                        closure_outcome,
+                        final_prescription_cycle,
+                    ),
+                )
+                conn.commit()
+                conn.close()
+        except Exception as exc:
+            log.warning("prescription_metrics write failed (closure_events): %s", exc)
