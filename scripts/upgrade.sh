@@ -4558,6 +4558,63 @@ PY127
         substep "Migration 127: LOBSTER-VAULT-JOURNAL-SCANNER cron entry already present — skipping"
     fi
 
+    # Migration 128: Register local-session-parser in jobs.json and add cron entry.
+    # Cookie-free token usage tracker that reads ~/.claude/projects/*.jsonl files
+    # and writes per-day token counts to cc-usage.json and a token_usage section
+    # to ~/.claude/cc-budget/state.json (issue #740).
+    local LOCAL_SESSION_PARSER_MARKER="# LOBSTER-LOCAL-SESSION-PARSER"
+    if [ -f "$_JOBS_FILE" ]; then
+        if ! uv run python3 -c "import json,sys; d=json.load(open('$_JOBS_FILE')); sys.exit(0 if 'local-session-parser' in d.get('jobs',{}) else 1)" 2>/dev/null; then
+            substep "Migration 128: adding local-session-parser to jobs.json"
+            local _m128_tmp
+            _m128_tmp=$(mktemp)
+            uv run python3 - <<'PY128' "$_JOBS_FILE" "$_m128_tmp"
+import json, sys
+from datetime import datetime, timezone
+jobs_path, tmp_path = sys.argv[1], sys.argv[2]
+with open(jobs_path) as f:
+    data = json.load(f)
+data.setdefault("jobs", {})["local-session-parser"] = {
+    "name": "local-session-parser",
+    "type": "B",
+    "dispatch": "cron-direct",
+    "schedule": "15,45 * * * *",
+    "schedule_human": "Every 30 minutes (offset)",
+    "task_file": None,
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+    "enabled": True,
+    "last_run": None,
+    "last_status": None,
+    "description": "Every 30 min: parse local Claude Code session JSONL files and write token usage to cc-usage.json and state.json (cookie-free fallback for cc-usage-poller)",
+}
+with open(tmp_path, "w") as f:
+    json.dump(data, f, indent=2, default=str)
+print("OK")
+PY128
+            if [ -s "$_m128_tmp" ]; then
+                mv "$_m128_tmp" "$_JOBS_FILE"
+                substep "Migration 128: local-session-parser added to jobs.json"
+                migrated=$((migrated + 1))
+            else
+                rm -f "$_m128_tmp"
+                warn "Migration 128: failed to update jobs.json — add local-session-parser manually"
+            fi
+        else
+            substep "Migration 128: local-session-parser already in jobs.json — skipping"
+        fi
+    fi
+
+    if ! crontab -l 2>/dev/null | grep -qF "$LOCAL_SESSION_PARSER_MARKER"; then
+        local LOCAL_SESSION_PARSER_ENTRY="15,45 * * * * cd $LOBSTER_DIR && uv run scheduled-tasks/local-session-parser.py >> $WORKSPACE_DIR/scheduled-jobs/logs/local-session-parser.log 2>&1 $LOCAL_SESSION_PARSER_MARKER"
+        (crontab -l 2>/dev/null; echo "$LOCAL_SESSION_PARSER_ENTRY") | crontab - && {
+            substep "Migration 128: added LOBSTER-LOCAL-SESSION-PARSER cron entry (every 30 min, offset)"
+            migrated=$((migrated + 1))
+        } || warn "Could not add LOBSTER-LOCAL-SESSION-PARSER cron entry — add manually"
+    else
+        substep "Migration 128: LOBSTER-LOCAL-SESSION-PARSER cron entry already present — skipping"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

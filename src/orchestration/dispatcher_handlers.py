@@ -3062,8 +3062,11 @@ def read_quota_state(state_path: Path | None = None) -> dict | None:
     try:
         text = resolved.read_text(encoding="utf-8")
         data = json.loads(text)
-        # Require the rate_limits key written by cc-usage-poller (v2 schema).
-        if "rate_limits" not in data:
+        # Accept state that has either:
+        # - ``rate_limits`` (written by cc-usage-poller / cc-usage-collect.sh — v2 schema)
+        # - ``token_usage`` (written by local-session-parser — cookie-free fallback)
+        # Require at least one to ensure we have meaningful data, not a bare empty dict.
+        if "rate_limits" not in data and "token_usage" not in data:
             return None
         return data
     except Exception:
@@ -3090,16 +3093,56 @@ def _is_quota_state_stale(state: dict) -> bool:
         return False
 
 
+def _format_token_usage_fallback(token_usage: dict) -> str:
+    """Format a CC usage string from local-session-parser token counts.
+
+    Called when rate_limits percentage data is unavailable (poller cookie
+    expired) but local token counts from the session-file parser are present.
+
+    Format:
+        CC usage (local): today 269M tokens | week 1.2B tokens | 5h 42M tokens
+        [cookie expired — no % available]
+
+    Pure function: no side effects. All inputs are arguments.
+    """
+    def _fmt_tokens(n: int) -> str:
+        """Format a raw token count as a human-readable abbreviated string."""
+        if n >= 1_000_000_000:
+            return f"{n / 1_000_000_000:.1f}B"
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.0f}M"
+        if n >= 1_000:
+            return f"{n / 1_000:.0f}K"
+        return str(n)
+
+    today = _fmt_tokens(token_usage.get("tokens_today", 0))
+    week = _fmt_tokens(token_usage.get("tokens_this_week", 0))
+    five_h = _fmt_tokens(token_usage.get("five_hour_tokens", 0))
+    return (
+        f"CC usage (local): today {today} | week {week} | 5h {five_h} tokens\n"
+        f"[cookie expired — quota % unavailable]"
+    )
+
+
 def format_quota_message(state: dict | None) -> str:
     """Format a CC usage string from the cc-budget state dict.
 
+    Data source priority:
+    1. ``rate_limits`` with non-None pct values (poller or statusLine hook) — full % format.
+    2. ``token_usage`` from local-session-parser — token counts format when % unavailable.
+    3. "unavailable" string — when neither source has fresh data.
+
     Returns the unavailable message when:
     - ``state`` is None (file missing/unreadable)
-    - ``state`` is stale (older than QUOTA_STALE_THRESHOLD_HOURS)
-    - ``rate_limits`` keys are missing or malformed
+    - ``state`` is stale (older than QUOTA_STALE_THRESHOLD_HOURS) AND has no token_usage
+    - ``rate_limits`` pct values are None and ``token_usage`` is absent or stale
 
-    Format when data is available:
+    Format when poller data is available:
         CC usage: 5h 42% | 7d 15%. Resets 5h: May 15 4:10 PM ET / 7d: May 22 11:00 AM ET.
+
+    Format when only local token counts are available (cookie expired):
+        CC usage (local): today 269M | week 1.2B | 5h 42M tokens
+        [cookie expired — quota % unavailable]
 
     Pure function: no side effects. All inputs are arguments.
     """
@@ -3108,32 +3151,58 @@ def format_quota_message(state: dict | None) -> str:
     if state is None:
         return _UNAVAILABLE
 
-    if _is_quota_state_stale(state):
-        return _UNAVAILABLE
-
+    # Try rate_limits (poller / hook data) first — requires non-None pct values.
     try:
-        rl = state["rate_limits"]
-        five_pct = rl["five_hour"]["pct"]
-        seven_pct = rl["seven_day"]["pct"]
-        five_resets_at = rl["five_hour"]["resets_at"]
-        seven_resets_at = rl["seven_day"]["resets_at"]
-    except (KeyError, TypeError):
-        return _UNAVAILABLE
+        rl = state.get("rate_limits", {})
+        five_pct = rl.get("five_hour", {}).get("pct")
+        seven_pct = rl.get("seven_day", {}).get("pct")
+        five_resets_at = rl.get("five_hour", {}).get("resets_at")
+        seven_resets_at = rl.get("seven_day", {}).get("resets_at")
+        has_pct = five_pct is not None and seven_pct is not None
+    except (KeyError, TypeError, AttributeError):
+        has_pct = False
 
-    def _fmt_reset(iso: str) -> str:
-        """Format an ISO reset timestamp in the owner's configured timezone."""
-        try:
-            return _format_iso_for_user(iso, fmt="%b %-d %-I:%M %p %Z")
-        except Exception:
-            return iso[:16]  # fallback: truncated ISO
+    if has_pct:
+        # Staleness check only applies to the percentage-based path.
+        if _is_quota_state_stale(state):
+            has_pct = False  # fall through to token_usage check below
+        else:
+            def _fmt_reset(iso: str | None) -> str:
+                """Format an ISO reset timestamp in the owner's configured timezone."""
+                if not iso:
+                    return "unknown"
+                try:
+                    return _format_iso_for_user(iso, fmt="%b %-d %-I:%M %p %Z")
+                except Exception:
+                    return iso[:16]  # fallback: truncated ISO
 
-    five_reset_str = _fmt_reset(five_resets_at)
-    seven_reset_str = _fmt_reset(seven_resets_at)
+            five_reset_str = _fmt_reset(five_resets_at)
+            seven_reset_str = _fmt_reset(seven_resets_at)
+            return (
+                f"CC usage: 5h {five_pct:.0f}% | 7d {seven_pct:.0f}%. "
+                f"Resets — 5h: {five_reset_str} / 7d: {seven_reset_str}."
+            )
 
-    return (
-        f"CC usage: 5h {five_pct:.0f}% | 7d {seven_pct:.0f}%. "
-        f"Resets — 5h: {five_reset_str} / 7d: {seven_reset_str}."
-    )
+    # Fallback: local token counts from session-file parser.
+    # These use their own last_updated timestamp inside token_usage, independent
+    # of the top-level state last_updated (which may be stale from the poller).
+    token_usage = state.get("token_usage")
+    if token_usage:
+        token_last_updated = token_usage.get("last_updated")
+        token_fresh = False
+        if token_last_updated:
+            try:
+                from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+                ts = _dt.fromisoformat(token_last_updated.replace("Z", "+00:00"))
+                age = _dt.now(_tz.utc) - ts
+                token_fresh = age <= _td(hours=QUOTA_STALE_THRESHOLD_HOURS)
+            except Exception:
+                token_fresh = True  # unparseable → assume fresh
+
+        if token_fresh:
+            return _format_token_usage_fallback(token_usage)
+
+    return _UNAVAILABLE
 
 
 def format_status_message(

@@ -114,12 +114,36 @@ class TestReadQuotaState:
         result = read_quota_state(state_path=p)
         assert result is None
 
-    def test_returns_none_for_missing_rate_limits_key(self, tmp_path: Path) -> None:
-        """Returns None when 'rate_limits' key is absent from state.json."""
+    def test_returns_none_when_neither_rate_limits_nor_token_usage(self, tmp_path: Path) -> None:
+        """Returns None when neither 'rate_limits' nor 'token_usage' key is present."""
         p = tmp_path / "state.json"
         p.write_text(json.dumps({"v": 1, "ts": 1234567890}))
         result = read_quota_state(state_path=p)
         assert result is None
+
+    def test_returns_dict_when_only_token_usage_present(self, tmp_path: Path) -> None:
+        """Returns the dict when 'token_usage' is present even without 'rate_limits'.
+
+        This supports the local-session-parser cookie-free fallback path where
+        the parser writes token counts but no quota percentages.
+        """
+        state = {
+            "v": 1,
+            "ts": int(datetime.now(timezone.utc).timestamp()),
+            "token_usage": {
+                "tokens_today": 100_000,
+                "tokens_this_week": 500_000,
+                "five_hour_tokens": 20_000,
+                "week_start": "2026-05-19",
+                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "source": "local-session-parser",
+            },
+        }
+        p = tmp_path / "state.json"
+        p.write_text(json.dumps(state))
+        result = read_quota_state(state_path=p)
+        assert result is not None
+        assert result["token_usage"]["tokens_today"] == 100_000
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +192,57 @@ class TestFormatQuotaMessage:
         state = read_quota_state(state_path=fresh_state)
         msg = format_quota_message(state)
         assert "CC usage" in msg or "cc usage" in msg.lower()
+
+    def test_token_usage_fallback_when_pct_none(self, tmp_path: Path) -> None:
+        """When rate_limits.pct is None but token_usage is present, show token counts."""
+        from datetime import timedelta
+        state = {
+            "v": 1,
+            "ts": int(datetime.now(timezone.utc).timestamp()),
+            "rate_limits": {
+                "five_hour": {"pct": None, "resets_at": None},
+                "seven_day": {"pct": None, "resets_at": None},
+            },
+            "token_usage": {
+                "tokens_today": 269_000_000,
+                "tokens_this_week": 1_200_000_000,
+                "five_hour_tokens": 42_000_000,
+                "week_start": "2026-05-19",
+                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "source": "local-session-parser",
+            },
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "source": "local-session-parser",
+        }
+        p = tmp_path / "state.json"
+        p.write_text(json.dumps(state))
+        loaded = read_quota_state(state_path=p)
+        msg = format_quota_message(loaded)
+        # Must show token counts in the local fallback format — not the generic
+        # "unavailable" string that indicates no data at all.
+        assert "token" in msg.lower() or "today" in msg.lower()
+        # The local format includes "quota % unavailable" within a context note,
+        # but must NOT be the bare "CC usage data unavailable" no-data message.
+        assert "CC usage data unavailable" not in msg
+        assert "CC usage (local)" in msg
+
+    def test_unavailable_when_pct_none_and_no_token_usage(self, tmp_path: Path) -> None:
+        """When rate_limits.pct is None and no token_usage, return unavailable."""
+        state = {
+            "v": 1,
+            "ts": int(datetime.now(timezone.utc).timestamp()),
+            "rate_limits": {
+                "five_hour": {"pct": None, "resets_at": None},
+                "seven_day": {"pct": None, "resets_at": None},
+            },
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "source": "local-session-parser",
+        }
+        p = tmp_path / "state.json"
+        p.write_text(json.dumps(state))
+        loaded = read_quota_state(state_path=p)
+        msg = format_quota_message(loaded)
+        assert "unavailable" in msg.lower()
 
 
 # ---------------------------------------------------------------------------
