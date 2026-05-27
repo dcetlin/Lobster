@@ -3,9 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="doc-version" content="2.4">
+<meta name="doc-version" content="2.5">
 <meta name="doc-updated" content="2026-05-27T21:00:00-04:00">
-<title>Tania Ads Playbook v2.4 — TikTok — The Jewels Jar</title>
+<title>Tania Ads Playbook v2.5 — TikTok — The Jewels Jar</title>
 <style>
 :root {
   --bg:#0b0d14; --surface:#141720; --surface2:#1c2030; --surface3:#232840;
@@ -347,6 +347,33 @@ body.light-mode .brief-card-label { background: var(--bg); }
   resize: vertical; outline: none; line-height: 1.5;
 }
 .reflection-zone textarea:focus { border-color: var(--accent); }
+
+/* Global Document Notes box */
+.global-notes-section {
+  margin: 48px 0 40px;
+  border: 2px solid var(--accent2);
+  border-radius: 10px;
+  padding: 24px 28px;
+  background: rgba(167,139,250,.05);
+}
+.global-notes-title {
+  font-size: 13px; font-weight: 700; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--accent2); margin-bottom: 6px;
+  display: flex; align-items: center; gap: 8px;
+}
+.global-notes-title::before { content: "✦"; font-size: 11px; }
+.global-notes-desc {
+  font-size: 12.5px; color: var(--text2); margin-bottom: 14px; line-height: 1.5;
+}
+.global-notes-section textarea {
+  width: 100%; min-height: 80px; padding: 9px 12px;
+  font-family: inherit; font-size: 14px;
+  border-radius: 6px; border: 1px solid var(--accent2);
+  background: var(--surface2); color: var(--text);
+  resize: vertical; outline: none; line-height: 1.6;
+  transition: border-color .15s;
+}
+.global-notes-section textarea:focus { border-color: var(--accent); }
 
 /* Copy All Reflections button — fixed */
 #copy-all-reflections-btn {
@@ -1624,6 +1651,14 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
 </div>
 
 
+<!-- ══ Global Document Notes ════════════════════════════════════════ -->
+<div class="global-notes-section" id="global-notes">
+  <div class="global-notes-title">Overall Document Notes</div>
+  <div class="global-notes-desc">Overall comments, themes, priorities, or notes for the next version — anything that applies across sections rather than to one specific area.</div>
+  <textarea data-section="global" data-field="overall" placeholder="Overall comments, themes, priorities, or notes for the next version..."></textarea>
+</div>
+
+
 <!-- ══ §9 ══════════════════════════════════════════════════════════════ -->
 <div class="section" id="s9">
   <div class="section-header">
@@ -1710,7 +1745,7 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
 <div id="copy-all-reflections-toast">Copied!</div>
 
 <footer class="doc-footer">
-  v2.4 · May 2026 · TikTok focus · US market · Instagram content preserved in v1 (tania-ads-playbook.html)
+  v2.5 · May 2026 · TikTok focus · US market · Instagram content preserved in v1 (tania-ads-playbook.html)
 </footer>
 
 </div><!-- /wrap -->
@@ -1831,6 +1866,13 @@ function copyAllReflections() {
   });
   if (q8Lines.length) {
     parts.push('[§8 Open Questions]\n' + q8Lines.join('\n'));
+  }
+
+  // Append global document notes (if non-empty)
+  var globalTa = document.querySelector('.global-notes-section textarea[data-section="global"][data-field="overall"]');
+  var globalVal = globalTa ? globalTa.value.trim() : '';
+  if (globalVal) {
+    parts.push('---\nOverall Document Notes:\n' + globalVal);
   }
 
   if (!parts.length) {
