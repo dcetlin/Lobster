@@ -3,9 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="doc-version" content="2.2">
-<meta name="doc-updated" content="2026-05-27T17:30:00-04:00">
-<title>Tania Ads Playbook v2.2 — TikTok — The Jewels Jar</title>
+<meta name="doc-version" content="2.3">
+<meta name="doc-updated" content="2026-05-27T20:00:00-04:00">
+<title>Tania Ads Playbook v2.3 — TikTok — The Jewels Jar</title>
 <style>
 :root {
   --bg:#0b0d14; --surface:#141720; --surface2:#1c2030; --surface3:#232840;
@@ -316,21 +316,47 @@ body.light-mode .brief-card-label { background: var(--bg); }
 /* Reflection zone (inline) */
 .reflection-zone {
   border: 1px dashed var(--border2);
-  border-radius: 6px; padding: 10px 14px;
+  border-radius: 6px; padding: 12px 14px;
   margin: 12px 0; background: transparent;
 }
 .reflection-zone .rz-label {
   font-size: 10px; font-weight: 700; letter-spacing: .1em;
-  text-transform: uppercase; color: var(--text3); margin-bottom: 6px;
+  text-transform: uppercase; color: var(--text3); margin-bottom: 10px;
+}
+.rz-fields { display: flex; flex-direction: column; gap: 8px; }
+.rz-field { display: flex; flex-direction: column; gap: 3px; }
+.rz-field-label {
+  font-size: 10px; font-weight: 700; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--text3); opacity: .7;
 }
 .reflection-zone textarea {
-  width: 100%; min-height: 48px; padding: 6px 8px;
+  width: 100%; min-height: 40px; padding: 5px 8px;
   font-family: inherit; font-size: 13px;
   border-radius: 4px; border: 1px solid var(--border2);
   background: var(--surface2); color: var(--text);
-  resize: vertical; outline: none;
+  resize: vertical; outline: none; line-height: 1.5;
 }
 .reflection-zone textarea:focus { border-color: var(--accent); }
+
+/* Copy All Reflections button — fixed */
+#copy-all-reflections-btn {
+  position: fixed; bottom: 20px; right: 20px; z-index: 500;
+  background: var(--accent); color: #fff;
+  border: none; border-radius: 8px;
+  padding: 10px 18px; font-size: 12px; font-weight: 700;
+  cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.4);
+  transition: opacity .15s, transform .1s;
+}
+#copy-all-reflections-btn:hover { opacity: .88; transform: translateY(-1px); }
+#copy-all-reflections-toast {
+  position: fixed; bottom: 62px; right: 20px; z-index: 501;
+  background: var(--accent3); color: #000;
+  border-radius: 6px; padding: 6px 14px;
+  font-size: 11px; font-weight: 700;
+  opacity: 0; pointer-events: none;
+  transition: opacity .2s;
+}
+#copy-all-reflections-toast.visible { opacity: 1; }
 
 /* Tooltip / glossary term */
 .term {
@@ -403,34 +429,6 @@ body.light-mode .term::after {
   font-size: 11px; color: var(--text3); text-align: center;
 }
 
-/* Comment widget */
-.comment-widget {
-  margin-top: 48px; padding: 20px 24px;
-  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-}
-.comment-widget-title {
-  font-size: 11px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: .09em; color: var(--text3); margin-bottom: 14px;
-}
-.comment-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
-.comment-label {
-  font-size: 11px; font-weight: 700; font-family: monospace;
-  color: var(--text3); min-width: 40px; flex-shrink: 0;
-}
-.comment-input {
-  flex: 1; background: var(--surface2); border: 1px solid var(--border);
-  border-radius: 6px; padding: 6px 10px; font-size: 12px;
-  color: var(--text); outline: none;
-}
-.comment-input:focus { border-color: var(--accent); }
-.copy-comments-btn {
-  margin-top: 12px; padding: 8px 18px;
-  background: var(--accent); color: #fff; border: none;
-  border-radius: 6px; font-size: 12px; font-weight: 700;
-  cursor: pointer; transition: opacity .15s;
-}
-.copy-comments-btn:hover { opacity: .85; }
-.copy-feedback { margin-top: 8px; font-size: 11px; color: var(--accent3); min-height: 16px; }
 
 @media (max-width: 600px) {
   body { font-size: 14px; }
@@ -468,10 +466,10 @@ body.light-mode .term::after {
 
 <!-- Header -->
 <div class="doc-header">
-  <div class="doc-eyebrow">Working Reference · May 2026 · Version 2.2</div>
+  <div class="doc-eyebrow">Working Reference · May 2026 · Version 2.3</div>
   <div class="doc-title">
     Tania Ads Playbook
-    <span class="doc-version-badge">v2.2 · TikTok Focus</span>
+    <span class="doc-version-badge">v2.3 · TikTok Focus</span>
   </div>
   <div class="doc-subtitle">How Tania should think about TikTok ads for The Jewels Jar — a framework for understanding the platform, building creative, structuring campaigns, and knowing when and how to spend.</div>
   <div class="doc-meta">
@@ -527,7 +525,20 @@ body.light-mode .term::after {
     </div>
     <div class="reflection-zone">
       <div class="rz-label">Tania's reflection [§1.1]</div>
-      <textarea placeholder="Does this match my experience with organic posts? Which posts have surprised me with their reach?"></textarea>
+      <div class="rz-fields">
+        <div class="rz-field">
+          <div class="rz-field-label">Comments</div>
+          <textarea data-section="§1.1" data-field="comments" placeholder="Comments..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Questions</div>
+          <textarea data-section="§1.1" data-field="questions" placeholder="Questions..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Doc Refinements</div>
+          <textarea data-section="§1.1" data-field="refinements" placeholder="Doc refinements..."></textarea>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -563,7 +574,20 @@ body.light-mode .term::after {
     </ul>
     <div class="reflection-zone">
       <div class="rz-label">Tania's reflection [§1.3]</div>
-      <textarea placeholder="Which of my recent TikTok posts felt native vs. which felt like 'content I had to post'?"></textarea>
+      <div class="rz-fields">
+        <div class="rz-field">
+          <div class="rz-field-label">Comments</div>
+          <textarea data-section="§1.3" data-field="comments" placeholder="Comments..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Questions</div>
+          <textarea data-section="§1.3" data-field="questions" placeholder="Questions..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Doc Refinements</div>
+          <textarea data-section="§1.3" data-field="refinements" placeholder="Doc refinements..."></textarea>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -662,7 +686,20 @@ body.light-mode .term::after {
     </div>
     <div class="reflection-zone">
       <div class="rz-label">Tania's reflection [§2.2]</div>
-      <textarea placeholder="Is the TikTok Pixel currently installed and firing events on the Jewels Jar site?"></textarea>
+      <div class="rz-fields">
+        <div class="rz-field">
+          <div class="rz-field-label">Comments</div>
+          <textarea data-section="§2.2" data-field="comments" placeholder="Comments..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Questions</div>
+          <textarea data-section="§2.2" data-field="questions" placeholder="Questions..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Doc Refinements</div>
+          <textarea data-section="§2.2" data-field="refinements" placeholder="Doc refinements..."></textarea>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -768,7 +805,20 @@ body.light-mode .term::after {
     </div>
     <div class="reflection-zone">
       <div class="rz-label">Tania's reflection [§2.5]</div>
-      <textarea placeholder="Has the TikTok Pixel been installed via the Shopify app? Are the events showing in TikTok Events Manager?"></textarea>
+      <div class="rz-fields">
+        <div class="rz-field">
+          <div class="rz-field-label">Comments</div>
+          <textarea data-section="§2.5" data-field="comments" placeholder="Comments..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Questions</div>
+          <textarea data-section="§2.5" data-field="questions" placeholder="Questions..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Doc Refinements</div>
+          <textarea data-section="§2.5" data-field="refinements" placeholder="Doc refinements..."></textarea>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -826,7 +876,20 @@ body.light-mode .term::after {
     </div>
     <div class="reflection-zone">
       <div class="rz-label">Tania's reflection [§3.1]</div>
-      <textarea placeholder="Which of the hook types above feel authentic to how Tania and Ashley currently shoot content? Which feel foreign?"></textarea>
+      <div class="rz-fields">
+        <div class="rz-field">
+          <div class="rz-field-label">Comments</div>
+          <textarea data-section="§3.1" data-field="comments" placeholder="Comments..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Questions</div>
+          <textarea data-section="§3.1" data-field="questions" placeholder="Questions..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Doc Refinements</div>
+          <textarea data-section="§3.1" data-field="refinements" placeholder="Doc refinements..."></textarea>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -884,7 +947,20 @@ body.light-mode .term::after {
     </div>
     <div class="reflection-zone">
       <div class="rz-label">Tania's reflection [§3.3]</div>
-      <textarea placeholder="How comfortable is Tania with founder-led content? Is Ashley a capable enough on-camera presence for UGC? What does Amira's content currently look like?"></textarea>
+      <div class="rz-fields">
+        <div class="rz-field">
+          <div class="rz-field-label">Comments</div>
+          <textarea data-section="§3.3" data-field="comments" placeholder="Comments..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Questions</div>
+          <textarea data-section="§3.3" data-field="questions" placeholder="Questions..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Doc Refinements</div>
+          <textarea data-section="§3.3" data-field="refinements" placeholder="Doc refinements..."></textarea>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -984,7 +1060,20 @@ Captions:      Always on</pre>
     </div>
     <div class="reflection-zone">
       <div class="rz-label">Tania's reflection [§4.1]</div>
-      <textarea placeholder="Does Jewels Jar have a US email customer list yet? Any US TikTok followers who could seed a custom audience?"></textarea>
+      <div class="rz-fields">
+        <div class="rz-field">
+          <div class="rz-field-label">Comments</div>
+          <textarea data-section="§4.1" data-field="comments" placeholder="Comments..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Questions</div>
+          <textarea data-section="§4.1" data-field="questions" placeholder="Questions..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Doc Refinements</div>
+          <textarea data-section="§4.1" data-field="refinements" placeholder="Doc refinements..."></textarea>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1269,7 +1358,20 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
     </div>
     <div class="reflection-zone">
       <div class="rz-label">Tania's reflection [§6.2]</div>
-      <textarea placeholder="How active is each person in content creation right now? What's the bottleneck — time, comfort on camera, production quality?"></textarea>
+      <div class="rz-fields">
+        <div class="rz-field">
+          <div class="rz-field-label">Comments</div>
+          <textarea data-section="§6.2" data-field="comments" placeholder="Comments..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Questions</div>
+          <textarea data-section="§6.2" data-field="questions" placeholder="Questions..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Doc Refinements</div>
+          <textarea data-section="§6.2" data-field="refinements" placeholder="Doc refinements..."></textarea>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1302,7 +1404,20 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
     </div>
     <div class="reflection-zone">
       <div class="rz-label">Tania's reflection [§6.3]</div>
-      <textarea placeholder="How would Tania describe what Jewels Jar offers that Mejuri doesn't? What's the one-sentence differentiation that's honest and specific?"></textarea>
+      <div class="rz-fields">
+        <div class="rz-field">
+          <div class="rz-field-label">Comments</div>
+          <textarea data-section="§6.3" data-field="comments" placeholder="Comments..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Questions</div>
+          <textarea data-section="§6.3" data-field="questions" placeholder="Questions..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Doc Refinements</div>
+          <textarea data-section="§6.3" data-field="refinements" placeholder="Doc refinements..."></textarea>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1324,7 +1439,20 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
     </div>
     <div class="reflection-zone">
       <div class="rz-label">Tania's reflection [§6.4]</div>
-      <textarea placeholder="What's the current US shipping cost and delivery time? Is US fulfillment being explored?"></textarea>
+      <div class="rz-fields">
+        <div class="rz-field">
+          <div class="rz-field-label">Comments</div>
+          <textarea data-section="§6.4" data-field="comments" placeholder="Comments..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Questions</div>
+          <textarea data-section="§6.4" data-field="questions" placeholder="Questions..."></textarea>
+        </div>
+        <div class="rz-field">
+          <div class="rz-field-label">Doc Refinements</div>
+          <textarea data-section="§6.4" data-field="refinements" placeholder="Doc refinements..."></textarea>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1508,16 +1636,6 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
     </div>
   </div>
 
-  <div class="subsection" id="s8-2">
-    <div class="subsection-header">
-      <span class="subsection-id">§8.2</span>
-      Global reflection space
-    </div>
-    <div class="reflection-zone" style="margin-top: 0;">
-      <div class="rz-label">Tania's overall notes [§8.2]</div>
-      <textarea style="min-height: 100px;" placeholder="Any reactions to this playbook overall? What resonates, what feels off, what's missing?"></textarea>
-    </div>
-  </div>
 </div>
 
 
@@ -1602,16 +1720,12 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
 </div>
 
 
-<!-- COMMENT WIDGET -->
-<div class="comment-widget" id="comment-widget">
-  <div class="comment-widget-title">Section Comments</div>
-  <div class="comment-inputs" id="comment-inputs"></div>
-  <button class="copy-comments-btn" onclick="copyComments()">Copy comments</button>
-  <div class="copy-feedback" id="copy-feedback"></div>
-</div>
+<!-- Copy All Reflections button (fixed) -->
+<button id="copy-all-reflections-btn" onclick="copyAllReflections()">Copy All Reflections</button>
+<div id="copy-all-reflections-toast">Copied!</div>
 
 <footer class="doc-footer">
-  v2.2 · May 2026 · TikTok focus · US market · Instagram content preserved in v1 (tania-ads-playbook.html)
+  v2.3 · May 2026 · TikTok focus · US market · Instagram content preserved in v1 (tania-ads-playbook.html)
 </footer>
 
 </div><!-- /wrap -->
@@ -1667,70 +1781,57 @@ function copyBrief() {
   });
 }
 
-// Comment widget
-const sections = [
-  { id: 's1',   label: '§1' },
-  { id: 's2',   label: '§2' },
-  { id: 's3',   label: '§3' },
-  { id: 's4',   label: '§4' },
-  { id: 's5',   label: '§5' },
-  { id: 's6',   label: '§6' },
-  { id: 's7',   label: '§7' },
-  { id: 's8',   label: '§8' },
-  { id: 's9',   label: '§9' },
-  { id: 's1-1', label: '§1.1' },
-  { id: 's1-3', label: '§1.3' },
-  { id: 's2-2', label: '§2.2' },
-  { id: 's2-5', label: '§2.5' },
-  { id: 's3-1',  label: '§3.1' },
-  { id: 's3-3',  label: '§3.3' },
-  { id: 's3-35', label: '§3.3.5' },
-  { id: 's6-3', label: '§6.3' },
-  { id: 's4-1', label: '§4.1' },
-  { id: 's6-2', label: '§6.2' },
-  { id: 's6-4', label: '§6.4' },
-];
-
-(function buildCommentWidget() {
-  const container = document.getElementById('comment-inputs');
-  if (!container) return;
-  sections.forEach(function(s) {
-    const row = document.createElement('div');
-    row.className = 'comment-row';
-    row.innerHTML =
-      '<span class="comment-label">' + s.label + '</span>' +
-      '<input class="comment-input" type="text" id="ci-' + s.id +
-      '" placeholder="Comment on ' + s.label + '…">';
-    container.appendChild(row);
+// Copy All Reflections
+function copyAllReflections() {
+  var textareas = document.querySelectorAll('.reflection-zone textarea[data-section]');
+  // Group by section (preserving document order)
+  var sectionMap = {};
+  var sectionOrder = [];
+  textareas.forEach(function(ta) {
+    var sec = ta.getAttribute('data-section');
+    var field = ta.getAttribute('data-field');
+    var val = ta.value.trim();
+    if (!sectionMap[sec]) {
+      sectionMap[sec] = { comments: '', questions: '', refinements: '' };
+      sectionOrder.push(sec);
+    }
+    if (field === 'comments') sectionMap[sec].comments = val;
+    else if (field === 'questions') sectionMap[sec].questions = val;
+    else if (field === 'refinements') sectionMap[sec].refinements = val;
   });
-})();
-
-function copyComments() {
-  const parts = sections.map(function(s) {
-    const el = document.getElementById('ci-' + s.id);
-    const val = el ? el.value.trim() : '';
-    return val ? '[' + s.label + '] ' + val : null;
-  }).filter(Boolean);
+  var parts = [];
+  sectionOrder.forEach(function(sec) {
+    var d = sectionMap[sec];
+    if (!d.comments && !d.questions && !d.refinements) return;
+    var lines = ['[' + sec + ']'];
+    if (d.comments)    lines.push('Comments: ' + d.comments);
+    if (d.questions)   lines.push('Questions: ' + d.questions);
+    if (d.refinements) lines.push('Doc Refinements: ' + d.refinements);
+    parts.push(lines.join('\n'));
+  });
   if (!parts.length) {
-    document.getElementById('copy-feedback').textContent = 'Nothing to copy.';
+    var toast = document.getElementById('copy-all-reflections-toast');
+    toast.textContent = 'Nothing to copy.';
+    toast.classList.add('visible');
+    setTimeout(function() { toast.classList.remove('visible'); }, 2000);
     return;
   }
-  navigator.clipboard.writeText(parts.join(' | ')).then(function() {
-    document.getElementById('copy-feedback').textContent = 'Copied to clipboard.';
-    setTimeout(function() {
-      document.getElementById('copy-feedback').textContent = '';
-    }, 2500);
+  var text = parts.join('\n\n');
+  var toast = document.getElementById('copy-all-reflections-toast');
+  navigator.clipboard.writeText(text).then(function() {
+    toast.textContent = 'Copied!';
+    toast.classList.add('visible');
+    setTimeout(function() { toast.classList.remove('visible'); }, 2500);
   }).catch(function() {
-    const ta = document.createElement('textarea');
-    ta.value = parts.join(' | ');
-    ta.style.position = 'fixed';
-    ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.select();
-    try { document.execCommand('copy'); document.getElementById('copy-feedback').textContent = 'Copied.'; }
-    catch(e) { document.getElementById('copy-feedback').textContent = 'Copy failed — try selecting and copying manually.'; }
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); toast.textContent = 'Copied!'; }
+    catch(e) { toast.textContent = 'Copy failed.'; }
     document.body.removeChild(ta);
-    setTimeout(function() { document.getElementById('copy-feedback').textContent = ''; }, 2500);
+    toast.classList.add('visible');
+    setTimeout(function() { toast.classList.remove('visible'); }, 2500);
   });
 }
 </script>
