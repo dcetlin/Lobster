@@ -3,9 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="doc-version" content="2.1">
+<meta name="doc-version" content="2.2">
 <meta name="doc-updated" content="2026-05-27T17:30:00-04:00">
-<title>Tania Ads Playbook v2 — TikTok — The Jewels Jar</title>
+<title>Tania Ads Playbook v2.2 — TikTok — The Jewels Jar</title>
 <style>
 :root {
   --bg:#0b0d14; --surface:#141720; --surface2:#1c2030; --surface3:#232840;
@@ -64,6 +64,29 @@ body {
 .doc-subtitle { font-size: 14px; color: var(--text3); line-height: 1.6; margin-bottom: 12px; }
 .doc-meta { font-size: 12px; color: var(--text3); }
 .doc-meta span + span::before { content: " · "; }
+.doc-updated { font-size: 11px; color: var(--text3); margin-top: 8px; }
+
+/* Start Here card */
+.start-here {
+  background: linear-gradient(135deg, rgba(110,168,254,.08) 0%, rgba(52,211,153,.06) 100%);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 20px 24px;
+  margin-bottom: 40px;
+}
+.start-here-title {
+  font-size: 11px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .12em; color: var(--accent); margin-bottom: 14px;
+  display: flex; align-items: center; gap: 8px;
+}
+.start-here-title::before { content: "▶"; font-size: 9px; }
+.start-here ol { padding-left: 20px; }
+.start-here ol li {
+  font-size: 13.5px; font-weight: 600; margin-bottom: 10px; color: var(--text);
+}
+.start-here ol li span {
+  font-weight: 400; color: var(--text2); font-size: 12.5px; display: block; margin-top: 2px;
+}
 
 /* Table of Contents */
 .toc {
@@ -160,6 +183,25 @@ li > p { margin-bottom: 4px; }
   text-transform: uppercase; color: var(--text3); margin-bottom: 6px;
 }
 
+/* Decision callout boxes */
+.decision-box {
+  border-radius: 8px; padding: 14px 18px; margin: 10px 0;
+  font-size: 13.5px;
+}
+.decision-box.yes {
+  background: rgba(52,211,153,.08); border: 1px solid rgba(52,211,153,.3);
+}
+.decision-box.no {
+  background: rgba(251,146,60,.08); border: 1px solid rgba(251,146,60,.3);
+}
+.decision-box .decision-label {
+  font-size: 10px; font-weight: 700; letter-spacing: .1em;
+  text-transform: uppercase; margin-bottom: 6px;
+}
+.decision-box.yes .decision-label { color: var(--accent3); }
+.decision-box.no  .decision-label { color: var(--warn); }
+.decision-box p:last-child { margin-bottom: 0; }
+
 /* Tables */
 .table-wrap {
   overflow-x: auto; margin: 16px 0;
@@ -194,6 +236,37 @@ code {
   background: var(--surface2); border: 1px solid var(--border);
   border-radius: 3px; padding: 1px 5px;
 }
+
+/* Creative brief card */
+.brief-card {
+  background: var(--surface);
+  border: 2px solid var(--tt-gold);
+  border-radius: 10px;
+  padding: 20px 24px;
+  margin: 20px 0;
+  position: relative;
+}
+.brief-card-label {
+  position: absolute; top: -10px; left: 16px;
+  background: var(--bg); padding: 0 8px;
+  font-size: 10px; font-weight: 700; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--tt-gold);
+}
+body.light-mode .brief-card-label { background: var(--bg); }
+.brief-card pre {
+  background: transparent; border: none; padding: 0; margin: 0;
+  font-size: 12.5px; line-height: 1.7; white-space: pre-wrap;
+}
+.brief-card-actions {
+  margin-top: 14px; display: flex; gap: 8px; align-items: center;
+}
+.brief-copy-btn {
+  padding: 6px 14px; background: var(--tt-gold); color: #000;
+  border: none; border-radius: 6px; font-size: 11px; font-weight: 700;
+  cursor: pointer; transition: opacity .15s;
+}
+.brief-copy-btn:hover { opacity: .85; }
+.brief-copy-feedback { font-size: 11px; color: var(--accent3); min-height: 16px; }
 
 /* Budget card grid */
 .budget-grid {
@@ -259,6 +332,70 @@ code {
 }
 .reflection-zone textarea:focus { border-color: var(--accent); }
 
+/* Tooltip / glossary term */
+.term {
+  border-bottom: 1px dotted var(--accent);
+  cursor: help;
+  position: relative;
+  display: inline-block;
+}
+.term::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1a1d2e;
+  color: #e4e6f0;
+  border: 1px solid #363d5a;
+  border-radius: 6px;
+  padding: 7px 11px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: normal;
+  width: 260px;
+  max-width: 80vw;
+  z-index: 100;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .15s;
+  text-align: left;
+  font-weight: 400;
+  font-style: normal;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  box-shadow: 0 4px 16px rgba(0,0,0,.5);
+}
+.term:hover::after,
+.term.tip-active::after {
+  opacity: 1;
+}
+body.light-mode .term::after {
+  background: #1a1d2e;
+  color: #e4e6f0;
+}
+
+/* Glossary section */
+.glossary-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px 24px;
+  margin: 16px 0;
+}
+@media (max-width: 540px) { .glossary-grid { grid-template-columns: 1fr; } }
+.glossary-entry {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 12px 14px;
+}
+.glossary-term {
+  font-size: 12px; font-weight: 700; color: var(--accent);
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  text-transform: uppercase; letter-spacing: .05em;
+  margin-bottom: 4px;
+}
+.glossary-def { font-size: 13px; color: var(--text2); line-height: 1.5; margin: 0; }
+
 /* Footer */
 .doc-footer {
   margin-top: 56px; padding-top: 20px;
@@ -307,20 +444,43 @@ code {
 <button id="theme-toggle" onclick="toggleTheme()">&#9788; Light</button>
 <div class="wrap">
 
+<!-- Start Here card -->
+<div class="start-here">
+  <div class="start-here-title">Start Here — Your First Week</div>
+  <ol>
+    <li>Install the TikTok Pixel
+      <span>Use the TikTok Sales Channel app in Shopify. Verify that ViewContent, AddToCart, and CompletePayment events fire before spending anything. See §2.5.</span>
+    </li>
+    <li>Produce 3–5 video assets with Ashley
+      <span>Brief her with specific hooks (not "just be natural"). One visual-reveal hook, one contrast hook, one stack/collection hook. See §3.1 and §3.4.</span>
+    </li>
+    <li>Decide your shipping story
+      <span>US buyers expect free or cheap fast shipping. Resolve this before scaling spend — it is the top conversion leak. See §6.4.</span>
+    </li>
+    <li>Set up your first campaign (Traffic objective, $30–50/day per creative, 5–7 days)
+      <span>3 ad groups, 3 different hooks, US national women 22–38, interest + behavioral (jewelry/fashion). Do not optimize for ROAS yet. See §7.2.</span>
+    </li>
+    <li>Read thumb-stop rate after 5–7 days, then act
+      <span>Kill the bottom-performing creative. Scale the winner by 20%. Use §5.2's diagnostic reading order if results are confusing.</span>
+    </li>
+  </ol>
+</div>
+
 <!-- Header -->
 <div class="doc-header">
-  <div class="doc-eyebrow">Working Reference · May 2026 · Version 2</div>
+  <div class="doc-eyebrow">Working Reference · May 2026 · Version 2.2</div>
   <div class="doc-title">
     Tania Ads Playbook
-    <span class="doc-version-badge">v2 · TikTok Focus</span>
+    <span class="doc-version-badge">v2.2 · TikTok Focus</span>
   </div>
   <div class="doc-subtitle">How Tania should think about TikTok ads for The Jewels Jar — a framework for understanding the platform, building creative, structuring campaigns, and knowing when and how to spend.</div>
   <div class="doc-meta">
     <span>The Jewels Jar</span>
-    <span>US market expansion</span>
+    <span>US market</span>
     <span>Workstream: the-jewels-jar</span>
     <span>Instagram content preserved in v1</span>
   </div>
+  <div class="doc-updated">Last updated: May 27, 2026</div>
 </div>
 
 <!-- Table of Contents -->
@@ -335,6 +495,7 @@ code {
     <li><a href="#s6">§6 The Jewels Jar on TikTok — Specific Guidance</a></li>
     <li><a href="#s7">§7 Decision Map</a></li>
     <li><a href="#s8">§8 Open Questions &amp; Reflections</a></li>
+    <li><a href="#s9">§9 Glossary</a></li>
   </ol>
 </nav>
 
@@ -358,7 +519,7 @@ code {
     <ul>
       <li>A Jewels Jar post with zero followers can reach 50,000 people if the first 100 viewers watch it to the end</li>
       <li>An account with 100,000 followers will get suppressed distribution if its videos are swiped past in the first two seconds</li>
-      <li>The paid ads layer sits on top of this same organic distribution system — Spark Ads (boosted organic posts) benefit from the organic performance signal directly</li>
+      <li>The paid ads layer sits on top of this same organic distribution system — <span class="term" data-tooltip="Spark Ads: TikTok's format for boosting organic creator content as a paid ad. The post retains its original view/like count. Requires creator authorization (30–365 days).">Spark Ads</span> (boosted organic posts) benefit from the organic performance signal directly</li>
     </ul>
     <div class="callout tt">
       <div class="callout-label">TikTok First Principle</div>
@@ -412,12 +573,12 @@ code {
       US TikTok context for a jewelry brand in 2026
       <span class="tag decision">US-specific</span>
     </div>
-    <p>The US TikTok landscape in 2026 has several features that matter for a jewelry brand launching from Dubai:</p>
+    <p>The US TikTok landscape in 2026 has several features that matter for a jewelry brand:</p>
     <ul>
       <li><strong>TikTok Shop is live in the US</strong> and growing. This is a direct in-app commerce channel where users can purchase without leaving TikTok. It changes the conversion funnel — for some brands, TikTok Shop has a shorter path from ad to purchase than any website. Worth evaluating as a sales channel alongside direct Shopify traffic.</li>
       <li><strong>Gen Z and Millennial women are the primary self-purchase jewelry buyers on TikTok.</strong> The platform skews younger than Instagram, and the purchase occasions are self-gifting and "I deserve this" frames more than gifting to others.</li>
-      <li><strong>Creator economy is robust.</strong> The right creator partnership for a jewelry brand can generate organic content that performs better as a Spark Ad than any brand-produced creative — and the creator's existing audience is part of the asset.</li>
-      <li><strong>Dubai content needs US recalibration.</strong> What resonates in UAE aesthetics, occasion framing, and cultural context does not transfer directly. US buyers will respond to different triggers: casual styling, "fits any outfit" versatility, "treat yourself" or milestone framing rather than formal occasion or luxury positioning.</li>
+      <li><strong>Creator economy is robust.</strong> The right creator partnership for a jewelry brand can generate organic content that performs better as a <span class="term" data-tooltip="Spark Ads: TikTok's format for boosting organic creator content as a paid ad. The post retains its original view/like count. Requires creator authorization (30–365 days).">Spark Ad</span> than any brand-produced creative — and the creator's existing audience is part of the asset.</li>
+      <li><strong>US content requires US framing.</strong> US buyers respond to different triggers than other markets: casual styling, "fits any outfit" versatility, "treat yourself" or milestone framing are more effective than formal occasion or heavy luxury positioning.</li>
     </ul>
   </div>
 </div>
@@ -465,7 +626,7 @@ code {
         <tbody>
           <tr>
             <td>Reach</td>
-            <td>Maximum unique viewers at lowest CPM</td>
+            <td>Maximum unique viewers at lowest <span class="term" data-tooltip="CPM: Cost Per Mille — cost per 1,000 impressions. A lower CPM means you reach more people per dollar spent.">CPM</span></td>
             <td>Pure brand awareness; rarely right for DTC jewelry</td>
           </tr>
           <tr>
@@ -481,7 +642,7 @@ code {
           <tr>
             <td><strong>Conversions</strong></td>
             <td>Purchase events (or add-to-cart, checkout starts)</td>
-            <td><strong>Primary objective for jewelry DTC — requires Pixel firing purchase events</strong></td>
+            <td><strong>Primary objective for jewelry DTC — requires <span class="term" data-tooltip="TikTok Pixel: A JavaScript tracking code installed on your website. It fires events (page views, add-to-cart, purchases) back to TikTok so ads can be optimized and attributed correctly.">Pixel</span> firing purchase events</strong></td>
           </tr>
           <tr>
             <td>Catalog Sales</td>
@@ -497,7 +658,7 @@ code {
       </table>
     </div>
     <div class="callout warn">
-      <p><strong>The sequencing trap:</strong> Conversions is the right end-state objective, but it requires the TikTok Pixel to have fired enough purchase events (ideally 50+) before the algorithm can optimize delivery well. Before that threshold, Traffic or Video Views campaigns generate data that warms the algorithm. Starting with Conversions from day zero with a fresh Pixel means the algorithm is essentially guessing who to show the ad to.</p>
+      <p><strong>The sequencing trap:</strong> Conversions is the right end-state objective, but it requires the <span class="term" data-tooltip="TikTok Pixel: A JavaScript tracking code installed on your website. It fires events (page views, add-to-cart, purchases) back to TikTok so ads can be optimized and attributed correctly.">TikTok Pixel</span> to have fired enough purchase events (ideally 50+) before the algorithm can optimize delivery well. Before that threshold, Traffic or Video Views campaigns generate data that warms the algorithm. Starting with Conversions from day zero with a fresh Pixel means the algorithm is essentially guessing who to show the ad to.</p>
     </div>
     <div class="reflection-zone">
       <div class="rz-label">Tania's reflection [§2.2]</div>
@@ -515,7 +676,7 @@ code {
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th></th><th>Spark Ads</th><th>In-Feed Ads</th></tr>
+          <tr><th></th><th><span class="term" data-tooltip="Spark Ads: TikTok's format for boosting organic creator content as a paid ad. The post retains its original view/like count. Requires creator authorization (30–365 days).">Spark Ads</span></th><th><span class="term" data-tooltip="In-Feed Ads: Standard TikTok ads that appear natively in the For You feed, uploaded directly in Ads Manager. Start with zero social proof.">In-Feed Ads</span></th></tr>
         </thead>
         <tbody>
           <tr>
@@ -535,11 +696,11 @@ code {
           </tr>
           <tr>
             <td><strong>Performance lift</strong></td>
-            <td><span class="metric">+142%</span> engagement vs In-Feed<br><span class="metric">+64%</span> CTR vs In-Feed<br><span class="metric">+134%</span> completion rate vs In-Feed</td>
+            <td><span class="metric">+142%</span> engagement vs In-Feed<br><span class="metric">+64%</span> <span class="term" data-tooltip="CTR: Click-Through Rate — the percentage of people who saw your ad and clicked on it. Higher CTR means the creative and CTA are working.">CTR</span> vs In-Feed<br><span class="metric">+134%</span> completion rate vs In-Feed</td>
             <td>Baseline</td>
           </tr>
           <tr>
-            <td><strong>CPM</strong></td>
+            <td><strong><span class="term" data-tooltip="CPM: Cost Per Mille — cost per 1,000 impressions. A lower CPM means you reach more people per dollar spent.">CPM</span></strong></td>
             <td>Roughly <span class="metric warn">+40%</span> higher than In-Feed (you pay for the social proof premium)</td>
             <td>Lower CPM</td>
           </tr>
@@ -568,7 +729,7 @@ code {
       Smart+ Campaigns vs Manual — the automation question
       <span class="tag defer">defer until later</span>
     </div>
-    <p>TikTok's Smart+ is the platform's AI-managed campaign layer — similar to Meta's Advantage+. You hand control of targeting, bidding, and audience selection to TikTok's algorithm, and it optimizes toward your objective.</p>
+    <p><span class="term" data-tooltip="Smart+: TikTok's AI-powered automated campaign type. You hand targeting, bidding, and audience selection to TikTok's algorithm. Works best after 100+ purchase events and with 5+ creative assets.">Smart+</span> is TikTok's AI-managed campaign layer — similar to Meta's Advantage+. You hand control of targeting, bidding, and audience selection to TikTok's algorithm, and it optimizes toward your objective.</p>
     <p><strong>When Smart+ makes sense:</strong></p>
     <ul>
       <li>Pixel has accumulated purchase event history (100+ events)</li>
@@ -587,7 +748,7 @@ code {
       TikTok Pixel — what it is and why it's required
       <span class="tag build">technical prerequisite</span>
     </div>
-    <p>The TikTok Pixel is a piece of JavaScript code installed on the Jewels Jar website. It fires events back to TikTok when visitors take specific actions, allowing TikTok to:</p>
+    <p>The <span class="term" data-tooltip="TikTok Pixel: A JavaScript tracking code installed on your website. It fires events (page views, add-to-cart, purchases) back to TikTok so ads can be optimized and attributed correctly.">TikTok Pixel</span> is a piece of JavaScript code installed on the Jewels Jar website. It fires events back to TikTok when visitors take specific actions, allowing TikTok to:</p>
     <ol>
       <li><strong>Attribute purchases to ads</strong> — which ad did this buyer see before purchasing?</li>
       <li><strong>Optimize delivery</strong> — show the ad to more people who look like buyers</li>
@@ -622,13 +783,13 @@ code {
     <ul>
       <li>Removes the friction of "tap the link in bio → go to website → add to cart → checkout" — each step loses buyers</li>
       <li>TikTok Shop products appear organically in the TikTok feed when creators tag them — it's discoverability without ads</li>
-      <li>Shop Ads (a TikTok ad format specifically for Shop products) have lower CPCs than standard In-Feed ads in the current early-market period</li>
+      <li>Shop Ads (a TikTok ad format specifically for Shop products) have lower <span class="term" data-tooltip="CPC: Cost Per Click — the amount you pay each time someone clicks on your ad. Lower CPC = more site traffic per dollar.">CPCs</span> than standard In-Feed ads in the current early-market period</li>
     </ul>
     <p><strong>Trade-offs to evaluate:</strong></p>
     <ul>
       <li>TikTok Shop takes a commission (currently 6–8% in the US)</li>
       <li>Shopify integration exists but requires setup and SKU management across two catalogs</li>
-      <li>US shipping from Dubai adds logistics complexity that TikTok Shop doesn't solve by itself</li>
+      <li>US shipping logistics complexity is not resolved by TikTok Shop by itself</li>
     </ul>
     <div class="callout warn">
       <p>TikTok Shop is not a prerequisite for running TikTok ads. It's an additional channel to evaluate. Don't let evaluating it block running standard campaigns.</p>
@@ -651,7 +812,7 @@ code {
       The hook problem — the first 2 seconds decide everything
       <span class="tag build">creative core</span>
     </div>
-    <p>The TikTok hook is the single most leveraged creative decision. The algorithm reads the percentage of viewers who watched past the 3-second mark (called thumb-stop rate or hook rate) as a primary signal. A video with a strong hook gets pushed to more people. A video where 60% of viewers swipe in the first 2 seconds gets suppressed.</p>
+    <p>The TikTok hook is the single most leveraged creative decision. The algorithm reads the percentage of viewers who watched past the 3-second mark (called thumb-stop rate or <span class="term" data-tooltip="Hook rate: The percentage of viewers who watch past the first 2–3 seconds of a video. TikTok's primary signal for whether a creative is worth distributing further. Target: 25%+.">hook rate</span>) as a primary signal. A video with a strong hook gets pushed to more people. A video where 60% of viewers swipe in the first 2 seconds gets suppressed.</p>
     <p><strong>Hook patterns that work for jewelry:</strong></p>
     <ul>
       <li><strong>Visual reveal hook</strong> — Start close-up on something else, then jewelry comes into frame dramatically. Or open with the jewelry already in motion (swinging earring, spinning ring in someone's hand).</li>
@@ -701,8 +862,8 @@ code {
         </thead>
         <tbody>
           <tr>
-            <td><strong>UGC / Creator-style</strong><br><em>(phone camera, casual, authentic)</em></td>
-            <td>Matches the native content format of TikTok. Triggers less ad-resistance. Social proof if from a real person. 48% higher CTR and 26% lower CPA vs polished creative.</td>
+            <td><strong><span class="term" data-tooltip="UGC: User-Generated Content — content made by real customers or creators, not the brand. It looks authentic, triggers less ad-resistance, and typically outperforms polished brand creative in cold prospecting.">UGC</span> / Creator-style</strong><br><em>(phone camera, casual, authentic)</em></td>
+            <td>Matches the native content format of TikTok. Triggers less ad-resistance. Social proof if from a real person. 48% higher <span class="term" data-tooltip="CTR: Click-Through Rate — the percentage of people who saw your ad and clicked on it. Higher CTR means the creative and CTA are working.">CTR</span> and 26% lower <span class="term" data-tooltip="CPA: Cost Per Acquisition — the total ad spend cost to acquire one paying customer. Must be below (AOV × gross margin) to be profitable.">CPA</span> vs polished creative.</td>
             <td>Cold prospecting campaigns. Ashley creating "this is what I'm wearing today" style content. Creator Spark Ads from Amira.</td>
           </tr>
           <tr>
@@ -733,7 +894,7 @@ code {
       Trending sounds — the TikTok-specific distribution lever
       <span class="tag build">TikTok-specific</span>
     </div>
-    <p>TikTok's algorithm gives mild organic distribution boosts to content using sounds that are currently trending on the platform. For paid ads, this matters for Spark Ads (which run the organic post including its chosen sound) but not for In-Feed Ads (which overlay their own audio). The mechanic is worth understanding:</p>
+    <p>TikTok's algorithm gives mild organic distribution boosts to content using sounds that are currently trending on the platform. For paid ads, this matters for <span class="term" data-tooltip="Spark Ads: TikTok's format for boosting organic creator content as a paid ad. The post retains its original view/like count. Requires creator authorization (30–365 days).">Spark Ads</span> (which run the organic post including its chosen sound) but not for <span class="term" data-tooltip="In-Feed Ads: Standard TikTok ads that appear natively in the For You feed, uploaded directly in Ads Manager. Start with zero social proof.">In-Feed Ads</span> (which overlay their own audio). The mechanic is worth understanding:</p>
     <ul>
       <li><strong>How to find trending sounds:</strong> TikTok's Creative Center (ads.tiktok.com/creative-center) has a "Trending" tab showing sounds by industry and region. Filter for "Beauty &amp; Personal Care" or "Fashion" in the US to find sounds already performing in adjacent categories.</li>
       <li><strong>The fit test:</strong> Only use a trending sound if the content can authentically use it — forced alignment with a trending sound looks artificial and damages the native feel that's the whole point. A sound that fits naturally is a distribution bonus; a sound that's forced is a liability.</li>
@@ -752,19 +913,26 @@ code {
       <span class="tag build">operations</span>
     </div>
     <p>When briefing Ashley, Amira, or any creator for TikTok ad content, the brief should be specific enough to control the hook and CTA while leaving room for authentic delivery. Overly scripted content reads as scripted.</p>
-    <p><strong>A working brief format:</strong></p>
-    <div class="mono-block">Platform: TikTok (vertical video, sound on, 15–30 seconds)
-Hook: [specify the first visual or first line — be exact]
-  e.g. "Start with the [earring name] in your hand,
-       close-up, turning it to catch the light"
-Product: [specific SKU name + any key detail to mention]
-One message: [single most important thing viewers should take away]
-  e.g. "everyday jewelry that doesn't look basic"
-CTA: "Tap to shop / link in bio"
-Tone reference: [link to 2–3 examples of TikTok content in this register]
-Sound: [trending sound suggestion OR "creator's choice — aesthetic/soft, not hype"]
-What to avoid: [any specific no-goes]
-Captions: Always on</div>
+    <p><strong>Copy, fill in, and send this brief for every piece of ad content:</strong></p>
+    <div class="brief-card">
+      <div class="brief-card-label">Creative Brief — Copy &amp; Fill In</div>
+      <pre id="brief-template">Platform:      TikTok (vertical video, sound on, 15–30 seconds)
+Hook:          [specify the first visual or first line — be exact]
+               e.g. "Start with the [earring name] in your hand,
+                    close-up, turning it to catch the light"
+Product:       [specific SKU name + any key detail to mention]
+One message:   [single most important thing viewers should take away]
+               e.g. "everyday jewelry that doesn't look basic"
+CTA:           "Tap to shop / link in bio"
+Tone ref:      [link to 2–3 TikTok examples in this register]
+Sound:         [trending sound suggestion OR "aesthetic/soft, not hype"]
+Avoid:         [any specific no-goes]
+Captions:      Always on</pre>
+      <div class="brief-card-actions">
+        <button class="brief-copy-btn" onclick="copyBrief()">Copy brief</button>
+        <span class="brief-copy-feedback" id="brief-copy-feedback"></span>
+      </div>
+    </div>
     <div class="callout warn">
       <p>Don't brief with "just be natural" and no other guidance. That produces content aligned with what the creator thinks is good, not what converts on paid distribution. The hook especially needs to be specified — it's the one variable the brand should control.</p>
     </div>
@@ -779,8 +947,8 @@ Captions: Always on</div>
     <p><strong>Signs of creative fatigue on TikTok:</strong></p>
     <ul>
       <li>Thumb-stop rate (3-second view %) declining while budget stays constant</li>
-      <li>CTR declining week-over-week without audience changes</li>
-      <li>ROAS declining without landing page or pricing changes</li>
+      <li><span class="term" data-tooltip="CTR: Click-Through Rate — the percentage of people who saw your ad and clicked on it. Higher CTR means the creative and CTA are working.">CTR</span> declining week-over-week without audience changes</li>
+      <li><span class="term" data-tooltip="ROAS: Return on Ad Spend — revenue generated per dollar spent on ads. 3x ROAS means $3 in revenue for every $1 in ad spend. Break-even ROAS = 1 ÷ gross margin %.">ROAS</span> declining without landing page or pricing changes</li>
     </ul>
     <p><strong>Refresh cadence at typical starting budget ($50–100/day):</strong> Expect to introduce new creative every <strong>4–6 weeks</strong>. TikTok creative fatigues faster than Meta because the same audience sees content more repeatedly in a smaller feed environment.</p>
     <p><strong>What a creative refresh actually means:</strong> Not re-shooting the same content with different lighting. The hook needs to be structurally different. New angle, new pattern interrupt, new first line. The product and CTA can remain consistent — the attention-capture mechanism needs to change.</p>
@@ -844,7 +1012,7 @@ Captions: Always on</div>
       </div>
       <div class="budget-card">
         <div class="amount">10% → Hot</div>
-        <div class="approach">Recovering abandoners. Highest ROAS but smallest audience at launch.</div>
+        <div class="approach">Recovering abandoners. Highest <span class="term" data-tooltip="ROAS: Return on Ad Spend — revenue generated per dollar spent on ads. 3x ROAS means $3 in revenue for every $1 in ad spend. Break-even ROAS = 1 ÷ gross margin %.">ROAS</span> but smallest audience at launch.</div>
       </div>
     </div>
   </div>
@@ -862,16 +1030,16 @@ Captions: Always on</div>
       <li>Ad group level: <strong>$20/day minimum</strong></li>
       <li>Per-ad budget (for micro-testing): <strong>$20–50/day</strong> per creative</li>
     </ul>
-    <p>To exit the learning phase and get reliable data: TikTok recommends <strong>50 optimization events per ad group per week</strong>. For a Conversions campaign optimizing for Purchase, that means 50 purchases/week from that ad group — which requires significant spend at typical CPA rates. For a Traffic campaign optimizing for clicks, the threshold is easier to reach.</p>
+    <p>To exit the learning phase and get reliable data: TikTok recommends <strong>50 optimization events per ad group per week</strong>. For a Conversions campaign optimizing for Purchase, that means 50 purchases/week from that ad group — which requires significant spend at typical <span class="term" data-tooltip="CPA: Cost Per Acquisition — the total ad spend cost to acquire one paying customer. Must be below (AOV × gross margin) to be profitable.">CPA</span> rates. For a Traffic campaign optimizing for clicks, the threshold is easier to reach.</p>
     <div class="callout warn">
-      <p><strong>Implication:</strong> At launch, if purchase CPA is unknown and high, start with a Traffic campaign objective to generate site visit data more affordably. Once you have click-to-purchase conversion rate data from Shopify, you can calculate the budget required to exit learning phase on a Conversions campaign.</p>
+      <p><strong>Implication:</strong> At launch, if purchase <span class="term" data-tooltip="CPA: Cost Per Acquisition — the total ad spend cost to acquire one paying customer. Must be below (AOV × gross margin) to be profitable.">CPA</span> is unknown and high, start with a Traffic campaign objective to generate site visit data more affordably. Once you have click-to-purchase conversion rate data from Shopify, you can calculate the budget required to exit learning phase on a Conversions campaign.</p>
     </div>
 
     <p><strong>Total budget for a meaningful US TikTok test (first 30 days):</strong></p>
     <ul>
       <li>Minimum to get real signal: <strong>$1,500</strong></li>
       <li>Comfortable learning budget: <strong>$2,000–$3,000</strong></li>
-      <li>This is not "optimize for ROAS" spend — it is signal-generation spend. Expecting 3x+ ROAS in the first 30 days sets up disappointment.</li>
+      <li>This is not "optimize for <span class="term" data-tooltip="ROAS: Return on Ad Spend — revenue generated per dollar spent on ads. 3x ROAS means $3 in revenue for every $1 in ad spend. Break-even ROAS = 1 ÷ gross margin %.">ROAS</span>" spend — it is signal-generation spend. Expecting 3x+ ROAS in the first 30 days sets up disappointment.</li>
     </ul>
   </div>
 
@@ -905,15 +1073,15 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
         <tbody>
           <tr>
             <td>
-              ROAS above target for 7+ consecutive days<br>
-              CPA below your maximum CPA<br>
+              <span class="term" data-tooltip="ROAS: Return on Ad Spend — revenue generated per dollar spent on ads. 3x ROAS means $3 in revenue for every $1 in ad spend. Break-even ROAS = 1 ÷ gross margin %.">ROAS</span> above target for 7+ consecutive days<br>
+              <span class="term" data-tooltip="CPA: Cost Per Acquisition — the total ad spend cost to acquire one paying customer. Must be below (AOV × gross margin) to be profitable.">CPA</span> below your maximum CPA<br>
               Frequency under 3<br>
               Thumb-stop rate stable or improving
             </td>
             <td>
               CPA exceeds ceiling for 7+ days, no improvement<br>
               Frequency above 4–5 (audience exhausted)<br>
-              CTR declining week-over-week without budget change<br>
+              <span class="term" data-tooltip="CTR: Click-Through Rate — the percentage of people who saw your ad and clicked on it. Higher CTR means the creative and CTA are working.">CTR</span> declining week-over-week without budget change<br>
               Thumb-stop rate declining (creative fatigue)
             </td>
           </tr>
@@ -946,7 +1114,7 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
         </thead>
         <tbody>
           <tr>
-            <td><strong>Thumb-stop rate</strong><br><em>(3-second view rate)</em></td>
+            <td><strong><span class="term" data-tooltip="Hook rate: The percentage of viewers who watch past the first 2–3 seconds of a video. TikTok's primary signal for whether a creative is worth distributing further. Target: 25%+.">Thumb-stop rate</span></strong><br><em>(3-second view rate)</em></td>
             <td>% of viewers who watched past the first 3 seconds. This is TikTok's primary creative quality signal.</td>
             <td>Target: <span class="metric">25–30%+</span>. Below 15%: creative hook problem.</td>
           </tr>
@@ -956,27 +1124,27 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
             <td>Target: <span class="metric">15–25%</span> for 15–30 sec ads. Above 30%: exceptional creative.</td>
           </tr>
           <tr>
-            <td><strong>CPM</strong></td>
+            <td><strong><span class="term" data-tooltip="CPM: Cost Per Mille — cost per 1,000 impressions. A lower CPM means you reach more people per dollar spent.">CPM</span></strong></td>
             <td>Cost to reach 1,000 people. TikTok CPMs are typically lower than Meta in the US in 2026.</td>
             <td>Jewelry category: approximately <span class="metric">$8–15</span>. Higher during peak seasons.</td>
           </tr>
           <tr>
-            <td><strong>CTR (click-through rate)</strong></td>
+            <td><strong><span class="term" data-tooltip="CTR: Click-Through Rate — the percentage of people who saw your ad and clicked on it. Higher CTR means the creative and CTA are working.">CTR</span> (click-through rate)</strong></td>
             <td>% of impressions that result in a click to the site or shop.</td>
             <td>Good: <span class="metric">1.5–3%+</span>. Below 0.8%: creative not converting interest to action.</td>
           </tr>
           <tr>
-            <td><strong>CPC</strong></td>
+            <td><strong><span class="term" data-tooltip="CPC: Cost Per Click — the amount you pay each time someone clicks on your ad. Lower CPC = more site traffic per dollar.">CPC</span></strong></td>
             <td>Cost per click. Derived from CPM ÷ CTR. Tells you how much you pay per site visitor.</td>
             <td>Varies by targeting and creative quality.</td>
           </tr>
           <tr>
-            <td><strong>CPA</strong></td>
+            <td><strong><span class="term" data-tooltip="CPA: Cost Per Acquisition — the total ad spend cost to acquire one paying customer. Must be below (AOV × gross margin) to be profitable.">CPA</span></strong></td>
             <td>Cost per acquisition (per purchase). The north-star conversion metric.</td>
             <td>Must be below (AOV × gross margin) to be profitable.</td>
           </tr>
           <tr>
-            <td><strong>ROAS</strong></td>
+            <td><strong><span class="term" data-tooltip="ROAS: Return on Ad Spend — revenue generated per dollar spent on ads. 3x ROAS means $3 in revenue for every $1 in ad spend. Break-even ROAS = 1 ÷ gross margin %.">ROAS</span></strong></td>
             <td>Revenue per dollar of ad spend. Overall campaign profitability signal.</td>
             <td>Break-even: 1 ÷ gross margin %. Target for scaling: <span class="metric">3–4x</span>. Exceptional: 5x+.</td>
           </tr>
@@ -989,7 +1157,7 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
       </table>
     </div>
     <div class="callout insight">
-      <p><strong>Break-even ROAS formula:</strong> 1 ÷ gross margin %. If Jewels Jar's margin is 60%, break-even ROAS = 1.67x. At 3x ROAS, every $1 of ad spend generates $1.33 in margin over break-even. At 5x, it's $2.33. Know your margin before interpreting ROAS.</p>
+      <p><strong>Break-even <span class="term" data-tooltip="ROAS: Return on Ad Spend — revenue generated per dollar spent on ads. 3x ROAS means $3 in revenue for every $1 in ad spend. Break-even ROAS = 1 ÷ gross margin %.">ROAS</span> formula:</strong> 1 ÷ gross margin %. If Jewels Jar's margin is 60%, break-even ROAS = 1.67x. At 3x ROAS, every $1 of ad spend generates $1.33 in margin over break-even. At 5x, it's $2.33. Know your margin before interpreting ROAS.</p>
     </div>
   </div>
 
@@ -999,15 +1167,15 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
       The diagnostic reading order
       <span class="tag build">analysis framework</span>
     </div>
-    <p>When a campaign is underperforming, diagnose in sequence — don't jump straight to ROAS:</p>
+    <p>When a campaign is underperforming, diagnose in sequence — don't jump straight to <span class="term" data-tooltip="ROAS: Return on Ad Spend — revenue generated per dollar spent on ads. 3x ROAS means $3 in revenue for every $1 in ad spend. Break-even ROAS = 1 ÷ gross margin %.">ROAS</span>:</p>
     <ol>
       <li>Check <strong>Impressions and delivery</strong> — Is the ad running? Are bids competitive enough to win placement?</li>
       <li>Check <strong>Thumb-stop rate</strong> — Is the hook working? (below 20% = creative problem, fix the hook)</li>
       <li>Check <strong>Completion rate</strong> — Is the body of the video holding attention? (if hook rate is OK but completion is low, the hook attracted the wrong audience or the content didn't deliver)</li>
-      <li>Check <strong>CTR</strong> — Are viewers clicking? (if completion is OK but CTR is low, the CTA is failing or the product isn't compelling enough at this price)</li>
+      <li>Check <strong><span class="term" data-tooltip="CTR: Click-Through Rate — the percentage of people who saw your ad and clicked on it. Higher CTR means the creative and CTA are working.">CTR</span></strong> — Are viewers clicking? (if completion is OK but CTR is low, the CTA is failing or the product isn't compelling enough at this price)</li>
       <li>Check <strong>Add-to-cart rate in Shopify</strong> — Are clickers interested? (low ATC = landing page or product page problem, not the ad)</li>
       <li>Check <strong>Checkout conversion in Shopify</strong> — Are cart-adders completing? (low checkout = friction, often shipping cost)</li>
-      <li>Finally check <strong>ROAS and CPA</strong> — Is the full system profitable?</li>
+      <li>Finally check <strong>ROAS and <span class="term" data-tooltip="CPA: Cost Per Acquisition — the total ad spend cost to acquire one paying customer. Must be below (AOV × gross margin) to be profitable.">CPA</span></strong> — Is the full system profitable?</li>
     </ol>
     <div class="callout warn">
       <p>TikTok's attribution and Shopify's attribution will disagree — this is normal. TikTok claims credit for purchases that Shopify may attribute to organic or direct traffic, because of view-through attribution and cross-device behavior. Use 7-day click attribution in TikTok for the most conservative read. Treat a 15–20% discrepancy as expected.</p>
@@ -1055,19 +1223,19 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
   <div class="subsection" id="s6-1">
     <div class="subsection-header">
       <span class="subsection-id">§6.1</span>
-      The cold-start reality for a Dubai brand entering US TikTok
+      The cold-start reality for a new brand entering US TikTok
       <span class="tag decision">orientation</span>
     </div>
-    <p>The most important strategic framing: <strong>The Jewels Jar is starting from zero in this market.</strong> Dubai organic performance has no predictive value for US TikTok behavior. The aesthetics, purchase triggers, creator landscape, and consumer psychology of US TikTok jewelry buyers are categorically different from UAE buyers.</p>
+    <p>The most important strategic framing: <strong>The Jewels Jar is starting from zero in this market.</strong> Prior organic performance on other platforms has no predictive value for US TikTok behavior. The aesthetics, purchase triggers, creator landscape, and consumer psychology of US TikTok jewelry buyers require fresh calibration.</p>
     <p>This means:</p>
     <ul>
       <li>The first 30 days of ad spend is signal-generation, not revenue optimization. You are paying to find out what works here.</li>
-      <li>Bringing Dubai-created content without US calibration will likely underperform — not because the content is bad, but because the framing, context, and purchase triggers are different.</li>
+      <li>Content made without US cultural framing will likely underperform — not because the content is bad, but because the framing, context, and purchase triggers are different.</li>
       <li>The fastest path to effective US TikTok content is US-based creators (Ashley, US micro-influencers) creating with US framing, even if Tania needs to brief the key messages.</li>
     </ul>
     <div class="callout tt">
       <div class="callout-label">One exception worth testing</div>
-      <p>If any existing Dubai-created content is: (a) in English, (b) shows the jewelry in a way that focuses on the piece rather than cultural context, and (c) has had meaningful engagement from international (non-UAE-specific) followers — that is the one thin signal worth testing as ad creative before investing in new US production. Run it with small spend ($30/day for 7 days) to establish a benchmark, then compare to US-created content.</p>
+      <p>If any existing content is: (a) in English, (b) shows the jewelry in a way that focuses on the piece rather than cultural context, and (c) has had meaningful engagement from international followers — that is worth testing as ad creative before investing in new US production. Run it with small spend ($30/day for 7 days) to establish a benchmark, then compare to US-created content.</p>
     </div>
   </div>
 
@@ -1083,8 +1251,8 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
         <tbody>
           <tr>
             <td><strong>Ashley</strong> (intern, US-based)</td>
-            <td>UGC creator for The Jewels Jar. Native TikTok voice. Her content should feel like a regular TikTok user talking about jewelry she loves — not a brand representative.</td>
-            <td>Primary source of cold prospecting creative. Brief her with specific hooks; let her deliver in her own voice. Her content as In-Feed Ads or Spark Ads from the brand account (requires brand authorization flow).</td>
+            <td><span class="term" data-tooltip="UGC: User-Generated Content — content made by real customers or creators, not the brand. It looks authentic, triggers less ad-resistance, and typically outperforms polished brand creative in cold prospecting.">UGC</span> creator for The Jewels Jar. Native TikTok voice. Her content should feel like a regular TikTok user talking about jewelry she loves — not a brand representative.</td>
+            <td>Primary source of cold prospecting creative. Brief her with specific hooks; let her deliver in her own voice. Her content as <span class="term" data-tooltip="In-Feed Ads: Standard TikTok ads that appear natively in the For You feed, uploaded directly in Ads Manager. Start with zero social proof.">In-Feed Ads</span> or <span class="term" data-tooltip="Spark Ads: TikTok's format for boosting organic creator content as a paid ad. The post retains its original view/like count. Requires creator authorization (30–365 days).">Spark Ads</span> from the brand account (requires brand authorization flow).</td>
           </tr>
           <tr>
             <td><strong>Amira</strong> (creator, existing audience)</td>
@@ -1111,7 +1279,7 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
       US purchase triggers for jewelry — what to say and what frame to use
       <span class="tag build">messaging strategy</span>
     </div>
-    <p>US TikTok jewelry buyers respond differently from Dubai buyers. Key messaging frames that work:</p>
+    <p>US TikTok jewelry buyers respond to specific frames. What works:</p>
     <ul>
       <li><strong>"Everyday jewelry that doesn't look basic"</strong> — US buyers, especially 22–35 women, are saturated with mass-market options (Mejuri, Kendra Scott). Distinctiveness-without-effort is a strong motivator.</li>
       <li><strong>Self-gifting / "treat yourself" frame</strong> — Gen Z normalizes self-purchase. "You don't need an occasion" and "this is for you" perform well. The luxury positioning can be present but shouldn't be the lead.</li>
@@ -1120,12 +1288,12 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
       <li><strong>Craft and origin story</strong> — There is appetite for "not mass-produced" storytelling on TikTok. "Every piece is [made/sourced/designed by someone with a vision]" resonates if delivered authentically, not as marketing copy.</li>
     </ul>
     <div class="callout warn">
-      <p><strong>Frames to avoid or de-emphasize for cold US prospecting:</strong> Dubai luxury connotations (US buyers may not connect with Dubai as a luxury origin story the way they do with Paris or Italy). Formal occasion framing (US casual jewelry market is where TikTok buyers live). Price-led messaging ("buy now, sale ends soon") as the primary hook — it signals commodity and undercuts premium positioning.</p>
+      <p><strong>Frames to avoid or de-emphasize for cold US prospecting:</strong> Formal occasion framing (US casual jewelry market is where TikTok buyers live). Price-led messaging ("buy now, sale ends soon") as the primary hook — it signals commodity and undercuts premium positioning.</p>
     </div>
 
     <div class="callout insight">
       <div class="callout-label">Competing against Mejuri, Gorjana, Kendra Scott</div>
-      <p>These brands dominate the $75–200 US jewelry DTC market and will be in the same TikTok interest targeting pool. Jewels Jar cannot out-awareness them — they have years of US Pixel data and larger creative budgets. The competitive position should not be "we're like Mejuri but from Dubai." It should lean into what they don't offer:</p>
+      <p>These brands dominate the $75–200 US jewelry DTC market and will be in the same TikTok interest targeting pool. Jewels Jar cannot out-awareness them — they have years of US Pixel data and larger creative budgets. The competitive position should lean into what they don't offer:</p>
       <ul style="margin-top: 8px; margin-bottom: 0;">
         <li>Distinctiveness and non-mass identity — Mejuri is beautiful but everyone has it. Jewels Jar can be the answer for "I want something no one else is wearing."</li>
         <li>Founder-vision authenticity — Tania as a human presence behind the brand is something Mejuri and Kendra Scott's scale prevents them from replicating.</li>
@@ -1144,19 +1312,19 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
       Shipping reality and how it affects ad strategy
       <span class="tag decision">constraint</span>
     </div>
-    <p>US consumers expect free shipping at a threshold (typically $50–75) and delivery within 5–7 business days. Shipping from Dubai means 2–3 week delivery and likely visible international shipping fees at checkout.</p>
+    <p>US consumers expect free shipping at a threshold (typically $50–75) and delivery within 5–7 business days. International shipping means longer delivery windows and potentially visible international shipping fees at checkout.</p>
     <p>This creates a real conversion problem that ad optimization cannot fix. The options:</p>
     <ul>
       <li><strong>US fulfillment partner</strong> (ShipBob, Amazon FBA, a 3PL) — invest in inventory held in the US. Enables fast shipping. Requires capital investment and logistics setup.</li>
-      <li><strong>Transparent delayed-shipping positioning</strong> — Acknowledge shipping time explicitly and frame it as part of the brand story ("ships from our studio in Dubai — made to last, worth the wait"). Reduces checkout abandonment from surprise but limits the audience willing to wait.</li>
+      <li><strong>Transparent delayed-shipping positioning</strong> — Acknowledge shipping time explicitly and frame it as part of the brand story ("ships from our studio — made to last, worth the wait"). Reduces checkout abandonment from surprise but limits the audience willing to wait.</li>
       <li><strong>Free shipping threshold build-in</strong> — Include shipping cost in product pricing so the stated price includes shipping. "Free shipping on all US orders" is a conversion driver even if the price point adjusts to account for it.</li>
     </ul>
     <div class="callout warn">
-      <p><strong>Before scaling ad spend significantly:</strong> resolve the shipping story. This is the single biggest conversion leak for international DTC brands entering the US market. Great ads pointing to a checkout that surprises buyers with shipping cost will have ROAS ceilings that can't be solved by better targeting or creative.</p>
+      <p><strong>Before scaling ad spend significantly:</strong> resolve the shipping story. This is the single biggest conversion leak for international DTC brands entering the US market. Great ads pointing to a checkout that surprises buyers with shipping cost will have <span class="term" data-tooltip="ROAS: Return on Ad Spend — revenue generated per dollar spent on ads. 3x ROAS means $3 in revenue for every $1 in ad spend. Break-even ROAS = 1 ÷ gross margin %.">ROAS</span> ceilings that can't be solved by better targeting or creative.</p>
     </div>
     <div class="reflection-zone">
       <div class="rz-label">Tania's reflection [§6.4]</div>
-      <textarea placeholder="What's the current US shipping cost and delivery time from Dubai? Is US fulfillment being explored?"></textarea>
+      <textarea placeholder="What's the current US shipping cost and delivery time? Is US fulfillment being explored?"></textarea>
     </div>
   </div>
 
@@ -1175,23 +1343,23 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
             <td><strong>Phase 0 (pre-launch)</strong><br><em>~2 weeks</em></td>
             <td>Technical setup</td>
             <td>$0</td>
-            <td>Install TikTok Pixel, verify events fire, connect product catalog, set UTM convention. Do not spend before Pixel events are confirmed working.</td>
+            <td>Install <span class="term" data-tooltip="TikTok Pixel: A JavaScript tracking code installed on your website. It fires events (page views, add-to-cart, purchases) back to TikTok so ads can be optimized and attributed correctly.">TikTok Pixel</span>, verify events fire, connect product catalog, set UTM convention. Do not spend before Pixel events are confirmed working.</td>
           </tr>
           <tr>
             <td><strong>Phase 1 (signal generation)</strong><br><em>Days 1–30</em></td>
             <td>Find what hooks US buyers</td>
             <td>$50–75/day<br>~$1,500–2,000</td>
-            <td>Run 3–4 creative variants (different hooks, 1–2 from Ashley, 1 Spark Ad from Amira if available). Traffic or Video Views objective. Interest + behavioral targeting. Don't optimize for ROAS yet — optimize for thumb-stop and completion rate signals.</td>
+            <td>Run 3–4 creative variants (different hooks, 1–2 from Ashley, 1 <span class="term" data-tooltip="Spark Ads: TikTok's format for boosting organic creator content as a paid ad. The post retains its original view/like count. Requires creator authorization (30–365 days).">Spark Ad</span> from Amira if available). Traffic or Video Views objective. Interest + behavioral targeting. Don't optimize for <span class="term" data-tooltip="ROAS: Return on Ad Spend — revenue generated per dollar spent on ads. 3x ROAS means $3 in revenue for every $1 in ad spend. Break-even ROAS = 1 ÷ gross margin %.">ROAS</span> yet — optimize for thumb-stop and completion rate signals.</td>
           </tr>
           <tr>
             <td><strong>Phase 2 (conversion testing)</strong><br><em>Days 31–60</em></td>
             <td>Learn cost-to-acquire</td>
             <td>$75–100/day<br>~$2,000–3,000</td>
-            <td>Switch winning creatives to Conversions objective. Build first warm retargeting audience from Phase 1 site visitors. Kill low-performing creatives and test 2 new hooks informed by Phase 1 learnings. Establish baseline CPA.</td>
+            <td>Switch winning creatives to Conversions objective. Build first warm retargeting audience from Phase 1 site visitors. Kill low-performing creatives and test 2 new hooks informed by Phase 1 learnings. Establish baseline <span class="term" data-tooltip="CPA: Cost Per Acquisition — the total ad spend cost to acquire one paying customer. Must be below (AOV × gross margin) to be profitable.">CPA</span>.</td>
           </tr>
           <tr>
             <td><strong>Phase 3 (optimization)</strong><br><em>Days 61–90</em></td>
-            <td>Improve ROAS</td>
+            <td>Improve <span class="term" data-tooltip="ROAS: Return on Ad Spend — revenue generated per dollar spent on ads. 3x ROAS means $3 in revenue for every $1 in ad spend. Break-even ROAS = 1 ÷ gross margin %.">ROAS</span></td>
             <td>$100+/day based on CPA data</td>
             <td>Scale winners 20% every 3 days. Build lookalike audiences from first purchasers. Launch hot retargeting for add-to-cart abandoners. Introduce founder content for warm audiences. Evaluate TikTok Shop if logistics permit.</td>
           </tr>
@@ -1217,16 +1385,45 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
       <span class="tag build">prerequisites</span>
     </div>
     <ul class="checklist">
-      <li>TikTok Pixel installed via Shopify app and events verified in Events Manager</li>
+      <li><span class="term" data-tooltip="TikTok Pixel: A JavaScript tracking code installed on your website. It fires events (page views, add-to-cart, purchases) back to TikTok so ads can be optimized and attributed correctly.">TikTok Pixel</span> installed via Shopify app and events verified in Events Manager</li>
       <li>TikTok Business Account created and Ads Manager access confirmed</li>
       <li>Product catalog connected to TikTok (via Shopify TikTok Sales Channel)</li>
       <li>US shipping policy established and stated clearly on product pages</li>
       <li>Product prices in USD</li>
       <li>Creative library assembled: minimum 3–5 video assets ready for testing</li>
       <li>UTM convention decided and applied to all ad destination URLs</li>
-      <li>Brand TikTok account live with at least 5–10 organic posts (Spark Ads need an account history)</li>
+      <li>Brand TikTok account live with at least 5–10 organic posts (<span class="term" data-tooltip="Spark Ads: TikTok's format for boosting organic creator content as a paid ad. The post retains its original view/like count. Requires creator authorization (30–365 days).">Spark Ads</span> need an account history)</li>
       <li>Amira (or other creators) briefed and Spark Ad authorization initiated if using creator content</li>
     </ul>
+
+    <p style="margin-top: 20px;"><strong>Key decision gates — navigate these before and during launch:</strong></p>
+
+    <div class="decision-box yes">
+      <div class="decision-label">YES → Pixel is installed and firing events</div>
+      <p>Proceed to Campaign setup. You can run Conversions objective once you have 50+ purchase events. Until then, use Traffic.</p>
+    </div>
+    <div class="decision-box no">
+      <div class="decision-label">NO → Pixel is not installed yet</div>
+      <p>Stop. Complete Phase 0 setup first. Running campaigns without Pixel means no attribution, no retargeting audiences, no conversion optimization. It's the equivalent of driving with no gauges.</p>
+    </div>
+
+    <div class="decision-box yes" style="margin-top: 16px;">
+      <div class="decision-label">YES → You have 3+ creative assets ready</div>
+      <p>Start Phase 1. Test 3 different hooks with equal budget. Read results after 5–7 days before making changes.</p>
+    </div>
+    <div class="decision-box no">
+      <div class="decision-label">NO → You have fewer than 3 creative assets</div>
+      <p>Brief Ashley before launching campaigns. Testing with 1 creative gives you no comparison data — you won't know if a bad result is the hook, the audience, or the offer.</p>
+    </div>
+
+    <div class="decision-box yes" style="margin-top: 16px;">
+      <div class="decision-label">YES → Shipping story is resolved (fast US shipping or transparent policy)</div>
+      <p>Proceed with scaling once Phase 1 signals are positive. Your checkout friction is manageable.</p>
+    </div>
+    <div class="decision-box no">
+      <div class="decision-label">NO → Shipping cost/time is unclear or unaddressed on product pages</div>
+      <p>Fix checkout friction before scaling above $75/day. You can test at low spend, but don't pour budget into a leaky funnel. See §6.4.</p>
+    </div>
   </div>
 
   <div class="subsection" id="s7-2">
@@ -1238,7 +1435,7 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
     <p>The first $500 is data, not revenue. You are buying answers to:</p>
     <ul>
       <li>Which creative hook gets 25%+ thumb-stop rate with US jewelry audiences?</li>
-      <li>What is our baseline CTR from TikTok cold traffic?</li>
+      <li>What is our baseline <span class="term" data-tooltip="CTR: Click-Through Rate — the percentage of people who saw your ad and clicked on it. Higher CTR means the creative and CTA are working.">CTR</span> from TikTok cold traffic?</li>
       <li>What's the site visit-to-add-to-cart rate from TikTok visitors (vs our general site average)?</li>
     </ul>
     <p><strong>How to spend the first $500:</strong></p>
@@ -1246,7 +1443,7 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
       <li>Create 1 campaign, Traffic objective, US national, women 22–38, interest + behavioral (jewelry/fashion)</li>
       <li>Run 3 ad groups — 3 different creative hooks. Same audience and budget per group.</li>
       <li>$30–50/day per ad group for 5–7 days. Do not touch campaigns during this window.</li>
-      <li>After 5–7 days: read thumb-stop rate and CTR. Kill the bottom performer. Scale the top performer by 20%.</li>
+      <li>After 5–7 days: read thumb-stop rate and <span class="term" data-tooltip="CTR: Click-Through Rate — the percentage of people who saw your ad and clicked on it. Higher CTR means the creative and CTA are working.">CTR</span>. Kill the bottom performer. Scale the top performer by 20%.</li>
     </ul>
   </div>
 
@@ -1291,19 +1488,19 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
     </div>
     <div class="open-q">
       <div class="q-label">Open question — AOV</div>
-      <p>What is The Jewels Jar's average order value in USD for US market pricing? This is required to calculate target CPA and break-even ROAS. A $150 AOV at 60% margin means break-even CPA is $90. A $75 AOV at the same margin means break-even CPA is $45 — half the tolerance for ad spend.</p>
+      <p>What is The Jewels Jar's average order value in USD for US market pricing? This is required to calculate target <span class="term" data-tooltip="CPA: Cost Per Acquisition — the total ad spend cost to acquire one paying customer. Must be below (AOV × gross margin) to be profitable.">CPA</span> and break-even <span class="term" data-tooltip="ROAS: Return on Ad Spend — revenue generated per dollar spent on ads. 3x ROAS means $3 in revenue for every $1 in ad spend. Break-even ROAS = 1 ÷ gross margin %.">ROAS</span>. A $150 AOV at 60% margin means break-even CPA is $90. A $75 AOV at the same margin means break-even CPA is $45 — half the tolerance for ad spend.</p>
     </div>
     <div class="open-q">
       <div class="q-label">Open question — US fulfillment</div>
-      <p>Is there a US fulfillment solution in place or planned? If shipping from Dubai, what is the current cost and delivery window? This is the single most impactful conversion variable outside of the ad itself. The ad strategy differs materially depending on whether fast US shipping is available.</p>
+      <p>Is there a US fulfillment solution in place or planned? What is the current shipping cost and delivery window? This is the single most impactful conversion variable outside of the ad itself. The ad strategy differs materially depending on whether fast US shipping is available.</p>
     </div>
     <div class="open-q">
       <div class="q-label">Open question — TikTok Pixel status</div>
-      <p>Is the TikTok Pixel currently installed and firing events on the Jewels Jar Shopify store? If not, Phase 0 setup work needs to happen before any ad spend. If yes, how many purchase events have been recorded to date?</p>
+      <p>Is the <span class="term" data-tooltip="TikTok Pixel: A JavaScript tracking code installed on your website. It fires events (page views, add-to-cart, purchases) back to TikTok so ads can be optimized and attributed correctly.">TikTok Pixel</span> currently installed and firing events on the Jewels Jar Shopify store? If not, Phase 0 setup work needs to happen before any ad spend. If yes, how many purchase events have been recorded to date?</p>
     </div>
     <div class="open-q">
       <div class="q-label">Open question — Ashley's content cadence</div>
-      <p>How consistently is Ashley creating TikTok content? Knowing her output rhythm determines whether the "weekly creative velocity" model from the original playbook is feasible yet, or whether we're still in "produce 3–5 assets and test" mode.</p>
+      <p>How consistently is Ashley creating TikTok content? Knowing her output rhythm determines whether the "weekly creative velocity" model is feasible yet, or whether we're still in "produce 3–5 assets and test" mode.</p>
     </div>
     <div class="open-q">
       <div class="q-label">Open question — first-month budget</div>
@@ -1324,6 +1521,87 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
 </div>
 
 
+<!-- ══ §9 ══════════════════════════════════════════════════════════════ -->
+<div class="section" id="s9">
+  <div class="section-header">
+    <span class="section-id">§9</span>
+    <span class="section-title-text">Glossary</span>
+  </div>
+  <h2>Term definitions — hover any underlined term in the document for a quick definition</h2>
+
+  <div class="glossary-grid">
+    <div class="glossary-entry">
+      <div class="glossary-term">BOFU</div>
+      <p class="glossary-def">Bottom of Funnel — the purchase-ready stage of the customer journey. Hot retargeting audiences (add-to-cart, checkout abandoners). Highest intent, smallest pool.</p>
+    </div>
+    <div class="glossary-entry">
+      <div class="glossary-term">CPA</div>
+      <p class="glossary-def">Cost Per Acquisition — total ad spend to acquire one paying customer. Must be below (AOV × gross margin) to be profitable. Your north-star conversion metric.</p>
+    </div>
+    <div class="glossary-entry">
+      <div class="glossary-term">CPC</div>
+      <p class="glossary-def">Cost Per Click — the amount you pay each time someone clicks on your ad. Derived from CPM ÷ CTR. Lower CPC = more site traffic per dollar.</p>
+    </div>
+    <div class="glossary-entry">
+      <div class="glossary-term">CPM</div>
+      <p class="glossary-def">Cost Per Mille — cost per 1,000 impressions. The baseline cost to reach your audience. TikTok CPMs in the US jewelry category: approximately $8–15.</p>
+    </div>
+    <div class="glossary-entry">
+      <div class="glossary-term">CPP</div>
+      <p class="glossary-def">Cost Per Purchase — equivalent to CPA in TikTok's Ads Manager reporting. The cost to generate one completed purchase event from your ads.</p>
+    </div>
+    <div class="glossary-entry">
+      <div class="glossary-term">CPV</div>
+      <p class="glossary-def">Cost Per View — the cost each time someone watches a meaningful portion of your video (definition varies by platform; TikTok typically counts 6-second views). Useful for benchmarking video-objective campaigns.</p>
+    </div>
+    <div class="glossary-entry">
+      <div class="glossary-term">CTR</div>
+      <p class="glossary-def">Click-Through Rate — percentage of people who saw the ad and clicked. Good TikTok jewelry CTR: 1.5–3%+. Below 0.8% signals a CTA or product-fit problem.</p>
+    </div>
+    <div class="glossary-entry">
+      <div class="glossary-term">Hook Rate</div>
+      <p class="glossary-def">The percentage of viewers who watch past the first 2–3 seconds of a video. TikTok's primary signal for whether a creative is worth distributing further. Target: 25%+. Also called thumb-stop rate.</p>
+    </div>
+    <div class="glossary-entry">
+      <div class="glossary-term">In-Feed Ads</div>
+      <p class="glossary-def">Standard TikTok ads that appear natively in the For You feed, uploaded directly in Ads Manager. They start with zero social proof (no view/like count) but have lower CPMs than Spark Ads.</p>
+    </div>
+    <div class="glossary-entry">
+      <div class="glossary-term">LTV</div>
+      <p class="glossary-def">Lifetime Value — total revenue expected from a customer over their full relationship with the brand. Higher LTV justifies higher CPA. A repeat jewelry buyer is worth more than a one-time purchase.</p>
+    </div>
+    <div class="glossary-entry">
+      <div class="glossary-term">MOFU</div>
+      <p class="glossary-def">Middle of Funnel — the consideration stage. Warm audiences: site visitors, video viewers (50%+), TikTok engagers. Creative should be product-forward with offer specificity.</p>
+    </div>
+    <div class="glossary-entry">
+      <div class="glossary-term">ROAS</div>
+      <p class="glossary-def">Return on Ad Spend — revenue generated per dollar spent on ads. 3x ROAS = $3 revenue per $1 ad spend. Break-even ROAS = 1 ÷ gross margin %. Target for scaling: 3–4x.</p>
+    </div>
+    <div class="glossary-entry">
+      <div class="glossary-term">Smart+</div>
+      <p class="glossary-def">TikTok's AI-powered automated campaign type. Hands targeting, bidding, and audience selection to TikTok's algorithm. Works best after 100+ purchase events and with 5+ creative assets. Defer until you're profitable manually.</p>
+    </div>
+    <div class="glossary-entry">
+      <div class="glossary-term">Spark Ads</div>
+      <p class="glossary-def">TikTok's format for boosting an existing organic post (yours or a creator's) as a paid ad. Retains the original view/like count. Requires creator authorization (30–365 day window). Outperforms In-Feed Ads on engagement and completion rate.</p>
+    </div>
+    <div class="glossary-entry">
+      <div class="glossary-term">TikTok Pixel</div>
+      <p class="glossary-def">JavaScript code installed on your website. Fires events (PageView, AddToCart, CompletePayment) back to TikTok. Required for purchase attribution, retargeting audiences, and Conversions campaign optimization. Install via Shopify's TikTok Sales Channel app.</p>
+    </div>
+    <div class="glossary-entry">
+      <div class="glossary-term">TOFU</div>
+      <p class="glossary-def">Top of Funnel — the awareness stage. Cold audiences who don't know the brand. Creative should be hook-first and entertaining. Objectives: Traffic or Video Views. Budget: 60–70% of total at launch.</p>
+    </div>
+    <div class="glossary-entry">
+      <div class="glossary-term">UGC</div>
+      <p class="glossary-def">User-Generated Content — content made by real customers or creators, not the brand. Looks authentic, triggers less ad-resistance. 48% higher CTR and 26% lower CPA vs. polished creative in cold prospecting.</p>
+    </div>
+  </div>
+</div>
+
+
 <!-- COMMENT WIDGET -->
 <div class="comment-widget" id="comment-widget">
   <div class="comment-widget-title">Section Comments</div>
@@ -1333,7 +1611,7 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
 </div>
 
 <footer class="doc-footer">
-  v2.0 · May 2026 · TikTok focus · Instagram content preserved in v1 (tania-ads-playbook.html)
+  v2.2 · May 2026 · TikTok focus · US market · Instagram content preserved in v1 (tania-ads-playbook.html)
 </footer>
 
 </div><!-- /wrap -->
@@ -1352,6 +1630,43 @@ function toggleTheme() {
   }
 })();
 
+// Tooltip tap toggle for mobile
+document.addEventListener('click', function(e) {
+  const t = e.target.closest('.term');
+  if (t) {
+    e.preventDefault();
+    const wasActive = t.classList.contains('tip-active');
+    document.querySelectorAll('.term.tip-active').forEach(function(el) {
+      el.classList.remove('tip-active');
+    });
+    if (!wasActive) t.classList.add('tip-active');
+  } else {
+    document.querySelectorAll('.term.tip-active').forEach(function(el) {
+      el.classList.remove('tip-active');
+    });
+  }
+});
+
+// Brief copy button
+function copyBrief() {
+  const el = document.getElementById('brief-template');
+  const text = el ? el.textContent : '';
+  const fb = document.getElementById('brief-copy-feedback');
+  navigator.clipboard.writeText(text).then(function() {
+    fb.textContent = 'Copied to clipboard.';
+    setTimeout(function() { fb.textContent = ''; }, 2500);
+  }).catch(function() {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); fb.textContent = 'Copied.'; }
+    catch(e) { fb.textContent = 'Copy failed.'; }
+    document.body.removeChild(ta);
+    setTimeout(function() { fb.textContent = ''; }, 2500);
+  });
+}
+
 // Comment widget
 const sections = [
   { id: 's1',   label: '§1' },
@@ -1362,6 +1677,7 @@ const sections = [
   { id: 's6',   label: '§6' },
   { id: 's7',   label: '§7' },
   { id: 's8',   label: '§8' },
+  { id: 's9',   label: '§9' },
   { id: 's1-1', label: '§1.1' },
   { id: 's1-3', label: '§1.3' },
   { id: 's2-2', label: '§2.2' },
