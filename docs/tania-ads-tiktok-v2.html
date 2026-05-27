@@ -3,9 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="doc-version" content="2.3">
-<meta name="doc-updated" content="2026-05-27T20:00:00-04:00">
-<title>Tania Ads Playbook v2.3 — TikTok — The Jewels Jar</title>
+<meta name="doc-version" content="2.4">
+<meta name="doc-updated" content="2026-05-27T21:00:00-04:00">
+<title>Tania Ads Playbook v2.4 — TikTok — The Jewels Jar</title>
 <style>
 :root {
   --bg:#0b0d14; --surface:#141720; --surface2:#1c2030; --surface3:#232840;
@@ -313,6 +313,16 @@ body.light-mode .brief-card-label { background: var(--bg); }
 }
 .open-q p { font-size: 14px; margin-bottom: 0; }
 
+/* Open question answer textarea */
+.open-q textarea {
+  width: 100%; min-height: 36px; padding: 5px 8px;
+  font-family: inherit; font-size: 13px;
+  border-radius: 4px; border: 1px solid var(--border2);
+  background: var(--surface2); color: var(--text);
+  resize: vertical; outline: none; line-height: 1.5;
+}
+.open-q textarea:focus { border-color: var(--accent); }
+
 /* Reflection zone (inline) */
 .reflection-zone {
   border: 1px dashed var(--border2);
@@ -466,10 +476,10 @@ body.light-mode .term::after {
 
 <!-- Header -->
 <div class="doc-header">
-  <div class="doc-eyebrow">Working Reference · May 2026 · Version 2.3</div>
+  <div class="doc-eyebrow">Working Reference · May 2026 · Version 2.4</div>
   <div class="doc-title">
     Tania Ads Playbook
-    <span class="doc-version-badge">v2.3 · TikTok Focus</span>
+    <span class="doc-version-badge">v2.4 · TikTok Focus</span>
   </div>
   <div class="doc-subtitle">How Tania should think about TikTok ads for The Jewels Jar — a framework for understanding the platform, building creative, structuring campaigns, and knowing when and how to spend.</div>
   <div class="doc-meta">
@@ -527,16 +537,12 @@ body.light-mode .term::after {
       <div class="rz-label">Tania's reflection [§1.1]</div>
       <div class="rz-fields">
         <div class="rz-field">
-          <div class="rz-field-label">Comments</div>
-          <textarea data-section="§1.1" data-field="comments" placeholder="Comments..."></textarea>
-        </div>
-        <div class="rz-field">
-          <div class="rz-field-label">Questions</div>
-          <textarea data-section="§1.1" data-field="questions" placeholder="Questions..."></textarea>
+          <div class="rz-field-label">Questions / Comments</div>
+          <textarea data-section="§1.1" data-field="questions-comments" placeholder="Questions or comments on this section..."></textarea>
         </div>
         <div class="rz-field">
           <div class="rz-field-label">Doc Refinements</div>
-          <textarea data-section="§1.1" data-field="refinements" placeholder="Doc refinements..."></textarea>
+          <textarea data-section="§1.1" data-field="doc-refinements" placeholder="remove section · modify presentation · rewrite example · add detail..."></textarea>
         </div>
       </div>
     </div>
@@ -576,16 +582,12 @@ body.light-mode .term::after {
       <div class="rz-label">Tania's reflection [§1.3]</div>
       <div class="rz-fields">
         <div class="rz-field">
-          <div class="rz-field-label">Comments</div>
-          <textarea data-section="§1.3" data-field="comments" placeholder="Comments..."></textarea>
-        </div>
-        <div class="rz-field">
-          <div class="rz-field-label">Questions</div>
-          <textarea data-section="§1.3" data-field="questions" placeholder="Questions..."></textarea>
+          <div class="rz-field-label">Questions / Comments</div>
+          <textarea data-section="§1.3" data-field="questions-comments" placeholder="Questions or comments on this section..."></textarea>
         </div>
         <div class="rz-field">
           <div class="rz-field-label">Doc Refinements</div>
-          <textarea data-section="§1.3" data-field="refinements" placeholder="Doc refinements..."></textarea>
+          <textarea data-section="§1.3" data-field="doc-refinements" placeholder="remove section · modify presentation · rewrite example · add detail..."></textarea>
         </div>
       </div>
     </div>
@@ -688,16 +690,12 @@ body.light-mode .term::after {
       <div class="rz-label">Tania's reflection [§2.2]</div>
       <div class="rz-fields">
         <div class="rz-field">
-          <div class="rz-field-label">Comments</div>
-          <textarea data-section="§2.2" data-field="comments" placeholder="Comments..."></textarea>
-        </div>
-        <div class="rz-field">
-          <div class="rz-field-label">Questions</div>
-          <textarea data-section="§2.2" data-field="questions" placeholder="Questions..."></textarea>
+          <div class="rz-field-label">Questions / Comments</div>
+          <textarea data-section="§2.2" data-field="questions-comments" placeholder="Questions or comments on this section..."></textarea>
         </div>
         <div class="rz-field">
           <div class="rz-field-label">Doc Refinements</div>
-          <textarea data-section="§2.2" data-field="refinements" placeholder="Doc refinements..."></textarea>
+          <textarea data-section="§2.2" data-field="doc-refinements" placeholder="remove section · modify presentation · rewrite example · add detail..."></textarea>
         </div>
       </div>
     </div>
@@ -807,16 +805,12 @@ body.light-mode .term::after {
       <div class="rz-label">Tania's reflection [§2.5]</div>
       <div class="rz-fields">
         <div class="rz-field">
-          <div class="rz-field-label">Comments</div>
-          <textarea data-section="§2.5" data-field="comments" placeholder="Comments..."></textarea>
-        </div>
-        <div class="rz-field">
-          <div class="rz-field-label">Questions</div>
-          <textarea data-section="§2.5" data-field="questions" placeholder="Questions..."></textarea>
+          <div class="rz-field-label">Questions / Comments</div>
+          <textarea data-section="§2.5" data-field="questions-comments" placeholder="Questions or comments on this section..."></textarea>
         </div>
         <div class="rz-field">
           <div class="rz-field-label">Doc Refinements</div>
-          <textarea data-section="§2.5" data-field="refinements" placeholder="Doc refinements..."></textarea>
+          <textarea data-section="§2.5" data-field="doc-refinements" placeholder="remove section · modify presentation · rewrite example · add detail..."></textarea>
         </div>
       </div>
     </div>
@@ -878,16 +872,12 @@ body.light-mode .term::after {
       <div class="rz-label">Tania's reflection [§3.1]</div>
       <div class="rz-fields">
         <div class="rz-field">
-          <div class="rz-field-label">Comments</div>
-          <textarea data-section="§3.1" data-field="comments" placeholder="Comments..."></textarea>
-        </div>
-        <div class="rz-field">
-          <div class="rz-field-label">Questions</div>
-          <textarea data-section="§3.1" data-field="questions" placeholder="Questions..."></textarea>
+          <div class="rz-field-label">Questions / Comments</div>
+          <textarea data-section="§3.1" data-field="questions-comments" placeholder="Questions or comments on this section..."></textarea>
         </div>
         <div class="rz-field">
           <div class="rz-field-label">Doc Refinements</div>
-          <textarea data-section="§3.1" data-field="refinements" placeholder="Doc refinements..."></textarea>
+          <textarea data-section="§3.1" data-field="doc-refinements" placeholder="remove section · modify presentation · rewrite example · add detail..."></textarea>
         </div>
       </div>
     </div>
@@ -949,16 +939,12 @@ body.light-mode .term::after {
       <div class="rz-label">Tania's reflection [§3.3]</div>
       <div class="rz-fields">
         <div class="rz-field">
-          <div class="rz-field-label">Comments</div>
-          <textarea data-section="§3.3" data-field="comments" placeholder="Comments..."></textarea>
-        </div>
-        <div class="rz-field">
-          <div class="rz-field-label">Questions</div>
-          <textarea data-section="§3.3" data-field="questions" placeholder="Questions..."></textarea>
+          <div class="rz-field-label">Questions / Comments</div>
+          <textarea data-section="§3.3" data-field="questions-comments" placeholder="Questions or comments on this section..."></textarea>
         </div>
         <div class="rz-field">
           <div class="rz-field-label">Doc Refinements</div>
-          <textarea data-section="§3.3" data-field="refinements" placeholder="Doc refinements..."></textarea>
+          <textarea data-section="§3.3" data-field="doc-refinements" placeholder="remove section · modify presentation · rewrite example · add detail..."></textarea>
         </div>
       </div>
     </div>
@@ -1062,16 +1048,12 @@ Captions:      Always on</pre>
       <div class="rz-label">Tania's reflection [§4.1]</div>
       <div class="rz-fields">
         <div class="rz-field">
-          <div class="rz-field-label">Comments</div>
-          <textarea data-section="§4.1" data-field="comments" placeholder="Comments..."></textarea>
-        </div>
-        <div class="rz-field">
-          <div class="rz-field-label">Questions</div>
-          <textarea data-section="§4.1" data-field="questions" placeholder="Questions..."></textarea>
+          <div class="rz-field-label">Questions / Comments</div>
+          <textarea data-section="§4.1" data-field="questions-comments" placeholder="Questions or comments on this section..."></textarea>
         </div>
         <div class="rz-field">
           <div class="rz-field-label">Doc Refinements</div>
-          <textarea data-section="§4.1" data-field="refinements" placeholder="Doc refinements..."></textarea>
+          <textarea data-section="§4.1" data-field="doc-refinements" placeholder="remove section · modify presentation · rewrite example · add detail..."></textarea>
         </div>
       </div>
     </div>
@@ -1360,16 +1342,12 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
       <div class="rz-label">Tania's reflection [§6.2]</div>
       <div class="rz-fields">
         <div class="rz-field">
-          <div class="rz-field-label">Comments</div>
-          <textarea data-section="§6.2" data-field="comments" placeholder="Comments..."></textarea>
-        </div>
-        <div class="rz-field">
-          <div class="rz-field-label">Questions</div>
-          <textarea data-section="§6.2" data-field="questions" placeholder="Questions..."></textarea>
+          <div class="rz-field-label">Questions / Comments</div>
+          <textarea data-section="§6.2" data-field="questions-comments" placeholder="Questions or comments on this section..."></textarea>
         </div>
         <div class="rz-field">
           <div class="rz-field-label">Doc Refinements</div>
-          <textarea data-section="§6.2" data-field="refinements" placeholder="Doc refinements..."></textarea>
+          <textarea data-section="§6.2" data-field="doc-refinements" placeholder="remove section · modify presentation · rewrite example · add detail..."></textarea>
         </div>
       </div>
     </div>
@@ -1406,16 +1384,12 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
       <div class="rz-label">Tania's reflection [§6.3]</div>
       <div class="rz-fields">
         <div class="rz-field">
-          <div class="rz-field-label">Comments</div>
-          <textarea data-section="§6.3" data-field="comments" placeholder="Comments..."></textarea>
-        </div>
-        <div class="rz-field">
-          <div class="rz-field-label">Questions</div>
-          <textarea data-section="§6.3" data-field="questions" placeholder="Questions..."></textarea>
+          <div class="rz-field-label">Questions / Comments</div>
+          <textarea data-section="§6.3" data-field="questions-comments" placeholder="Questions or comments on this section..."></textarea>
         </div>
         <div class="rz-field">
           <div class="rz-field-label">Doc Refinements</div>
-          <textarea data-section="§6.3" data-field="refinements" placeholder="Doc refinements..."></textarea>
+          <textarea data-section="§6.3" data-field="doc-refinements" placeholder="remove section · modify presentation · rewrite example · add detail..."></textarea>
         </div>
       </div>
     </div>
@@ -1441,16 +1415,12 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
       <div class="rz-label">Tania's reflection [§6.4]</div>
       <div class="rz-fields">
         <div class="rz-field">
-          <div class="rz-field-label">Comments</div>
-          <textarea data-section="§6.4" data-field="comments" placeholder="Comments..."></textarea>
-        </div>
-        <div class="rz-field">
-          <div class="rz-field-label">Questions</div>
-          <textarea data-section="§6.4" data-field="questions" placeholder="Questions..."></textarea>
+          <div class="rz-field-label">Questions / Comments</div>
+          <textarea data-section="§6.4" data-field="questions-comments" placeholder="Questions or comments on this section..."></textarea>
         </div>
         <div class="rz-field">
           <div class="rz-field-label">Doc Refinements</div>
-          <textarea data-section="§6.4" data-field="refinements" placeholder="Doc refinements..."></textarea>
+          <textarea data-section="§6.4" data-field="doc-refinements" placeholder="remove section · modify presentation · rewrite example · add detail..."></textarea>
         </div>
       </div>
     </div>
@@ -1615,24 +1585,39 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
       Structural unknowns that affect the strategy
     </div>
     <div class="open-q">
-      <div class="q-label">Open question — AOV</div>
+      <div class="q-label">Open question Q1 — AOV</div>
       <p>What is The Jewels Jar's average order value in USD for US market pricing? This is required to calculate target <span class="term" data-tooltip="CPA: Cost Per Acquisition — the total ad spend cost to acquire one paying customer. Must be below (AOV × gross margin) to be profitable.">CPA</span> and break-even <span class="term" data-tooltip="ROAS: Return on Ad Spend — revenue generated per dollar spent on ads. 3x ROAS means $3 in revenue for every $1 in ad spend. Break-even ROAS = 1 ÷ gross margin %.">ROAS</span>. A $150 AOV at 60% margin means break-even CPA is $90. A $75 AOV at the same margin means break-even CPA is $45 — half the tolerance for ad spend.</p>
+      <div class="rz-field" style="margin-top:8px;">
+        <textarea data-section="§8-q1" data-field="answer" placeholder="Your answer..." style="min-height:36px;"></textarea>
+      </div>
     </div>
     <div class="open-q">
-      <div class="q-label">Open question — US fulfillment</div>
+      <div class="q-label">Open question Q2 — US fulfillment</div>
       <p>Is there a US fulfillment solution in place or planned? What is the current shipping cost and delivery window? This is the single most impactful conversion variable outside of the ad itself. The ad strategy differs materially depending on whether fast US shipping is available.</p>
+      <div class="rz-field" style="margin-top:8px;">
+        <textarea data-section="§8-q2" data-field="answer" placeholder="Your answer..." style="min-height:36px;"></textarea>
+      </div>
     </div>
     <div class="open-q">
-      <div class="q-label">Open question — TikTok Pixel status</div>
+      <div class="q-label">Open question Q3 — TikTok Pixel status</div>
       <p>Is the <span class="term" data-tooltip="TikTok Pixel: A JavaScript tracking code installed on your website. It fires events (page views, add-to-cart, purchases) back to TikTok so ads can be optimized and attributed correctly.">TikTok Pixel</span> currently installed and firing events on the Jewels Jar Shopify store? If not, Phase 0 setup work needs to happen before any ad spend. If yes, how many purchase events have been recorded to date?</p>
+      <div class="rz-field" style="margin-top:8px;">
+        <textarea data-section="§8-q3" data-field="answer" placeholder="Your answer..." style="min-height:36px;"></textarea>
+      </div>
     </div>
     <div class="open-q">
-      <div class="q-label">Open question — Ashley's content cadence</div>
+      <div class="q-label">Open question Q4 — Ashley's content cadence</div>
       <p>How consistently is Ashley creating TikTok content? Knowing her output rhythm determines whether the "weekly creative velocity" model is feasible yet, or whether we're still in "produce 3–5 assets and test" mode.</p>
+      <div class="rz-field" style="margin-top:8px;">
+        <textarea data-section="§8-q4" data-field="answer" placeholder="Your answer..." style="min-height:36px;"></textarea>
+      </div>
     </div>
     <div class="open-q">
-      <div class="q-label">Open question — first-month budget</div>
+      <div class="q-label">Open question Q5 — first-month budget</div>
       <p>What's the confirmed US TikTok budget for the first 30 days? Below $1,500 and results will be too noisy to conclude much. At $2,000–$3,000, Phase 1 can generate real signal.</p>
+      <div class="rz-field" style="margin-top:8px;">
+        <textarea data-section="§8-q5" data-field="answer" placeholder="Your answer..." style="min-height:36px;"></textarea>
+      </div>
     </div>
   </div>
 
@@ -1725,7 +1710,7 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
 <div id="copy-all-reflections-toast">Copied!</div>
 
 <footer class="doc-footer">
-  v2.3 · May 2026 · TikTok focus · US market · Instagram content preserved in v1 (tania-ads-playbook.html)
+  v2.4 · May 2026 · TikTok focus · US market · Instagram content preserved in v1 (tania-ads-playbook.html)
 </footer>
 
 </div><!-- /wrap -->
@@ -1783,32 +1768,71 @@ function copyBrief() {
 
 // Copy All Reflections
 function copyAllReflections() {
-  var textareas = document.querySelectorAll('.reflection-zone textarea[data-section]');
-  // Group by section (preserving document order)
+  // Section label map for display names
+  var sectionLabels = {
+    '§1.1': '§1.1 How TikTok Actually Works',
+    '§1.3': '§1.3 Sound-on, Full-screen Environment',
+    '§2.2': '§2.2 Campaign Objectives',
+    '§2.5': '§2.5 TikTok Pixel',
+    '§3.1': '§3.1 The Hook Problem',
+    '§3.3': '§3.3 UGC vs Founder vs Polished',
+    '§4.1': '§4.1 Audience Targeting',
+    '§6.2': '§6.2 Content Team Roles',
+    '§6.3': '§6.3 US Purchase Triggers',
+    '§6.4': '§6.4 Shipping Reality'
+  };
+
+  // Collect section reflection zones (two-box format)
+  var rzTextareas = document.querySelectorAll('.reflection-zone textarea[data-section]');
   var sectionMap = {};
   var sectionOrder = [];
-  textareas.forEach(function(ta) {
+  rzTextareas.forEach(function(ta) {
     var sec = ta.getAttribute('data-section');
     var field = ta.getAttribute('data-field');
     var val = ta.value.trim();
     if (!sectionMap[sec]) {
-      sectionMap[sec] = { comments: '', questions: '', refinements: '' };
+      sectionMap[sec] = { 'questions-comments': '', 'doc-refinements': '' };
       sectionOrder.push(sec);
     }
-    if (field === 'comments') sectionMap[sec].comments = val;
-    else if (field === 'questions') sectionMap[sec].questions = val;
-    else if (field === 'refinements') sectionMap[sec].refinements = val;
+    if (field === 'questions-comments') sectionMap[sec]['questions-comments'] = val;
+    else if (field === 'doc-refinements') sectionMap[sec]['doc-refinements'] = val;
   });
+
   var parts = [];
+
   sectionOrder.forEach(function(sec) {
     var d = sectionMap[sec];
-    if (!d.comments && !d.questions && !d.refinements) return;
-    var lines = ['[' + sec + ']'];
-    if (d.comments)    lines.push('Comments: ' + d.comments);
-    if (d.questions)   lines.push('Questions: ' + d.questions);
-    if (d.refinements) lines.push('Doc Refinements: ' + d.refinements);
+    var qc = d['questions-comments'];
+    var dr = d['doc-refinements'];
+    if (!qc && !dr) return;
+    var label = sectionLabels[sec] || sec;
+    var lines = ['[' + label + ']'];
+    if (qc) lines.push('Questions / Comments: ' + qc);
+    if (dr) lines.push('Doc Refinements: ' + dr);
     parts.push(lines.join('\n'));
   });
+
+  // Collect §8 open question answers
+  var q8Textareas = document.querySelectorAll('.open-q textarea[data-section]');
+  var q8Lines = [];
+  var q8Labels = {
+    '§8-q1': 'Q1: What is your average order value (AOV) in USD?',
+    '§8-q2': 'Q2: US fulfillment — solution in place or planned?',
+    '§8-q3': 'Q3: TikTok Pixel — installed and firing events?',
+    '§8-q4': 'Q4: How consistently is Ashley creating TikTok content?',
+    '§8-q5': 'Q5: Confirmed US TikTok budget for the first 30 days?'
+  };
+  q8Textareas.forEach(function(ta) {
+    var sec = ta.getAttribute('data-section');
+    var val = ta.value.trim();
+    if (!val) return;
+    var label = q8Labels[sec] || sec;
+    q8Lines.push(label + '\nAnswer: ' + val);
+  });
+  if (q8Lines.length) {
+    parts.push('[§8 Open Questions]\n' + q8Lines.join('\n'));
+  }
+
   if (!parts.length) {
     var toast = document.getElementById('copy-all-reflections-toast');
     toast.textContent = 'Nothing to copy.';
