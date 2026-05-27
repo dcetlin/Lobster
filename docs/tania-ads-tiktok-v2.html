@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="doc-version" content="2.5">
 <meta name="doc-updated" content="2026-05-27T21:00:00-04:00">
-<title>Tania Ads Playbook v2.5 — TikTok — The Jewels Jar</title>
+<title>Tania Ads Playbook v2.6 — TikTok — The Jewels Jar</title>
 <style>
 :root {
   --bg:#0b0d14; --surface:#141720; --surface2:#1c2030; --surface3:#232840;
@@ -506,7 +506,7 @@ body.light-mode .term::after {
   <div class="doc-eyebrow">Working Reference · May 2026 · Version 2.4</div>
   <div class="doc-title">
     Tania Ads Playbook
-    <span class="doc-version-badge">v2.4 · TikTok Focus</span>
+    <span class="doc-version-badge">v2.6 · TikTok Focus</span>
   </div>
   <div class="doc-subtitle">How Tania should think about TikTok ads for The Jewels Jar — a framework for understanding the platform, building creative, structuring campaigns, and knowing when and how to spend.</div>
   <div class="doc-meta">
@@ -1745,7 +1745,7 @@ TKTK - TRAF  - Cold-Interest   - UGC-Founder   - 2026-06</pre>
 <div id="copy-all-reflections-toast">Copied!</div>
 
 <footer class="doc-footer">
-  v2.5 · May 2026 · TikTok focus · US market · Instagram content preserved in v1 (tania-ads-playbook.html)
+  v2.6 · May 2026 · TikTok focus · US market · Instagram content preserved in v1 (tania-ads-playbook.html)
 </footer>
 
 </div><!-- /wrap -->
@@ -1781,22 +1781,37 @@ document.addEventListener('click', function(e) {
   }
 });
 
+// HTTP-safe clipboard helper — works on plain HTTP servers
+function copyToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text);
+  }
+  // HTTP fallback — works without HTTPS
+  var ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try {
+    document.execCommand('copy');
+  } finally {
+    document.body.removeChild(ta);
+  }
+  return Promise.resolve();
+}
+
 // Brief copy button
 function copyBrief() {
   const el = document.getElementById('brief-template');
   const text = el ? el.textContent : '';
   const fb = document.getElementById('brief-copy-feedback');
-  navigator.clipboard.writeText(text).then(function() {
+  copyToClipboard(text).then(function() {
     fb.textContent = 'Copied to clipboard.';
     setTimeout(function() { fb.textContent = ''; }, 2500);
   }).catch(function() {
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.position = 'fixed'; ta.style.opacity = '0';
-    document.body.appendChild(ta); ta.select();
-    try { document.execCommand('copy'); fb.textContent = 'Copied.'; }
-    catch(e) { fb.textContent = 'Copy failed.'; }
-    document.body.removeChild(ta);
+    fb.textContent = 'Copy failed.';
     setTimeout(function() { fb.textContent = ''; }, 2500);
   });
 }
@@ -1884,18 +1899,12 @@ function copyAllReflections() {
   }
   var text = parts.join('\n\n');
   var toast = document.getElementById('copy-all-reflections-toast');
-  navigator.clipboard.writeText(text).then(function() {
+  copyToClipboard(text).then(function() {
     toast.textContent = 'Copied!';
     toast.classList.add('visible');
     setTimeout(function() { toast.classList.remove('visible'); }, 2500);
   }).catch(function() {
-    var ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.position = 'fixed'; ta.style.opacity = '0';
-    document.body.appendChild(ta); ta.select();
-    try { document.execCommand('copy'); toast.textContent = 'Copied!'; }
-    catch(e) { toast.textContent = 'Copy failed.'; }
-    document.body.removeChild(ta);
+    toast.textContent = 'Copy failed.';
     toast.classList.add('visible');
     setTimeout(function() { toast.classList.remove('visible'); }, 2500);
   });
