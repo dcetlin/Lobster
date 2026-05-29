@@ -280,13 +280,7 @@
     opacity: 0.85;
   }
 
-  /* ── Section comment toggle (end-of-section) ── */
-  .section-comment-toggle {
-    margin: 1rem 0 0.25rem;
-    text-align: right;
-  }
-
-  /* ── Comment button (end-of-section toggle) ── */
+  /* ── Comment button (inline with headings) ── */
   .comment-btn {
     cursor: pointer;
     font-size: 0.78em;
@@ -376,7 +370,7 @@
 
 <h1>WOS Evolution Spec</h1>
 <div class="meta">Design and Implementation Sequencing &mdash; 2026-05-29 &nbsp;|&nbsp; Status: Design Spec &nbsp;|&nbsp; Sections: &sect;1&ndash;&sect;11</div>
-<div class="version-stamp">v1.2 &middot; Updated: 2026-05-29T20:30Z</div>
+<div class="version-stamp">v1.3 &middot; Updated: 2026-05-29T22:00Z &middot; Fork 1=C, Fork 2 recommendation added, Fork 3=B</div>
 
 <div class="toc">
 <h3>Table of Contents</h3>
@@ -410,13 +404,15 @@
 </div>
 
 <!-- §1 END STATE DEFINITION -->
-<h2 id="s1">&sect;1 End State Definition</h2>
+<h2 id="s1">&sect;1 End State Definition <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h2>
+<div class="comment-area"><textarea placeholder="[§1] "></textarea></div>
 
 <p>The end state is a <strong>self-orienting, self-amending, distributed task execution system</strong> in which Dan's cognitive role is reviewer and orientation-setter rather than prescriber and debugger. The system maintains a learning ledger of its own diagnostic accuracy across registers, responds to work events within seconds rather than polling on a 3-minute clock, routes tasks across a typed mesh of execution contexts with different capability profiles, proposes its own behavioral amendments in bounded authority classes, and maintains an ongoing portfolio prescription that aligns its workload with an explicit telos rather than processing whatever the backlog contains.</p>
 
 <p>This is what "autopoietic task execution" means concretely: the system's metabolism &mdash; cultivation of issues, germination into UoWs, prescription by the steward, execution by the executor mesh, closure, and metabolic output classification &mdash; operates as a self-renewing loop that improves without requiring Dan to author each improvement. Dan's role at full build-out is: set orientation (the Governor layer), approve or reject the system's own amendment proposals (Class B Self-Amendment), and handle the residual human-judgment register UoWs that the system correctly surfaces.</p>
 
-<h3>Observable Signals of the End State</h3>
+<h3>Observable Signals of the End State <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[§1 — Observable Signals] "></textarea></div>
 <ul>
   <li><code>verdict_accumulator</code> table contains at minimum 50 scored prescription hypothesis outcomes per register, with Prescriber accuracy trending upward.</li>
   <li>Mean time from issue-open to germination: <strong>under 60 seconds</strong> (event-driven path active).</li>
@@ -426,66 +422,104 @@
   <li>Portfolio prescription visible as a readable, auditable document.</li>
   <li>Register classification accuracy above 90% (mismatch rate below 10% on 30-day rolling window).</li>
 </ul>
-
-
-<div class="section-comment-toggle" data-section="§1 — Observable Signals">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§1 — Observable Signals] "></textarea></div>
-<div class="section-comment-toggle" data-section="§1">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§1] "></textarea></div>
 <hr>
 
 <!-- §2 ARCHITECTURE DIAGRAMS -->
-<h2 id="s2">&sect;2 Architecture Diagrams</h2>
+<h2 id="s2">&sect;2 Architecture Diagrams <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h2>
+<div class="comment-area"><textarea placeholder="[§2] "></textarea></div>
 
 <h3>Current Architecture</h3>
-<div class="mermaid-wrapper">
-  <div class="mermaid">
-flowchart TD
-    A([GitHub Issues]) -->|every 15 min — GardenCaretaker\ndaily — github-issue-cultivator| B[Cultivator\npromotes issues → uow_registry]
-    B -->|auto-advance| C[Germinator\nclassify_register\noperational / iterative-convergent\nphilosophical / human-judgment]
-    C -->|ready-for-steward| D[Steward Heartbeat\nevery 3 min\nPhase 0: Stale agent cleanup\nPhase 1: Startup sweep orphan\nPhase 2: Observation loop\nPhase 3: LLM prescription\nPhase 4: GitHub sync]
-    D --> E[Executor Heartbeat\nevery 3 min\nexecution_enabled + scaling_governor\n→ wos_execute inbox message]
-    E --> F[Claude Subagent\n→ Oracle Gate\n→ write_result]
-    F --> G[Metabolic Classification\npearl / seed / heat / shit]
-    G --> H[Steward closes or re-prescribes]
-    I[(SQLite wos.db\nuow_registry\naudit_log\ndispatch_skip_log)]
-    J[(SQLite wos-metrics.db\nprescription_events\nclosure_events)]
-    style A fill:#e8f5e9
-    style I fill:#e3f2fd
-    style J fill:#e3f2fd
-  </div>
-</div>
+<pre>CLOCK-DRIVEN POLLING LOOP (current)
+
+  GitHub Issues
+       │
+       ▼ (every 15 min — GardenCaretaker / daily — github-issue-cultivator)
+  ┌─────────────────┐
+  │   Cultivator    │  promotes GitHub issues → uow_registry (proposed)
+  └────────┬────────┘
+           │ auto-advance
+           ▼
+  ┌─────────────────┐
+  │   Germinator    │  classify_register() — 4-gate ordered algorithm
+  │                 │  register: operational | iterative-convergent |
+  │                 │            philosophical | human-judgment
+  └────────┬────────┘
+           │ → ready-for-steward
+           ▼
+  ┌─────────────────────────────────────────┐
+  │       STEWARD HEARTBEAT (every 3 min)   │
+  │  Phase 0: Stale agent cleanup           │
+  │  Phase 1: Startup sweep (orphan)        │
+  │  Phase 2: Observation loop + stall      │
+  │  Phase 3: LLM prescription (Sonnet/Opus)│
+  │  Phase 4: Post-completion GitHub sync   │
+  └────────┬────────────────────────────────┘
+           ▼
+  ┌──────────────────────────────────────────┐
+  │       EXECUTOR HEARTBEAT (every 3 min)   │
+  │  execution_enabled + scaling_governor    │
+  │  → wos_execute inbox message             │
+  │  → Lobster dispatcher spawns subagent    │
+  └────────┬─────────────────────────────────┘
+           ▼
+  Claude Subagent → Oracle Gate → write_result()
+  → Metabolic Classification (pearl/seed/heat/shit)
+  → Steward closes or re-prescribes
+
+REGISTRY: SQLite (wos.db) — uow_registry, audit_log, dispatch_skip_log
+METRICS:  SQLite (wos-metrics.db) — prescription_events, closure_events</pre>
 
 <h3>Target Architecture (All Five Layers)</h3>
-<div class="mermaid-wrapper">
-  <div class="mermaid">
-flowchart TD
-    A([GitHub Webhooks\n30s delta poller]) -->|wos_issue_created| B[Governor\nOrientation Layer\nReads: workstreams health priorities\nWrites: portfolio_prescription\ngermination_bias\nPaired: Socratic advisor no directives]
-    B -->|germination_bias| C[Adaptive Germinator\n+ Adaptive Steward\nPrescriber → PrescriptionObject\nSelector → verdict_accumulator top-5\nVerdicts: n_successes n_failures n_partial]
-    C -->|wos_uow_completed| D[Executor Mesh\nTier 1: Local Claude subagents ephemeral\nTier 2: Persistent specialized agents\nTier 3: External executor contract\nwos_capacity_available on slot free]
-    D --> E[Self-Amendment Component\nClass A: IFTTT rule changes auto-apply\nClass B: Dan approval required\nGUARD: Class A cannot modify amendment logic]
-    F[(New Tables\nverdict_accumulator\nprescription_hypothesis_log\namendment_log executor_registry\nevent_log portfolio_prescription\ngermination_bias)]
-    G[Event Bus\ntyped inbox messages\nfile-based protocol extended]
-    style A fill:#e8f5e9
-    style F fill:#e3f2fd
-    style G fill:#fff3e0
-  </div>
-</div>
+<pre>EVENT-NATIVE SELF-ORIENTING MESH (target)
 
-<div class="section-comment-toggle" data-section="§2">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§2] "></textarea></div>
+  GitHub Webhooks / 30s delta poller
+       │ wos_issue_created (typed inbox event)
+       ▼
+  ┌───────────────────────────────────────────┐
+  │         GOVERNOR (Orientation Layer)      │
+  │  Reads: workstreams, health, priorities   │
+  │  Writes: portfolio_prescription           │
+  │          germination_bias                 │
+  │  Paired: Socratic advisor (no directives) │
+  └─────────────┬─────────────────────────────┘
+                │ germination_bias
+                ▼
+  ┌──────────────────────────────────────────────────┐
+  │       ADAPTIVE GERMINATOR + ADAPTIVE STEWARD     │
+  │  Prescriber → PrescriptionObject (typed)         │
+  │  Selector → reads verdict_accumulator top-5      │
+  │  Verdict Accumulator → (register, hypothesis)    │
+  │             → (n_successes, n_failures, n_partial)│
+  └─────────────┬────────────────────────────────────┘
+                │ wos_uow_completed (typed event)
+                ▼
+  ┌──────────────────────────────────────────────────┐
+  │              EXECUTOR MESH                        │
+  │  Tier 1: Local Claude subagents (ephemeral)      │
+  │  Tier 2: Persistent specialized agents           │
+  │  Tier 3: External executor contract protocol     │
+  │  wos_capacity_available event on slot free       │
+  └─────────────┬────────────────────────────────────┘
+                ▼
+  ┌──────────────────────────────────────────────────┐
+  │           SELF-AMENDMENT COMPONENT                │
+  │  Class A: IFTTT rule changes (auto-apply)        │
+  │  Class B: Dan approval required                  │
+  │  GUARD: Class A cannot modify amendment logic    │
+  └──────────────────────────────────────────────────┘
+
+NEW TABLES: verdict_accumulator, prescription_hypothesis_log,
+            amendment_log, executor_registry, event_log,
+            portfolio_prescription, germination_bias
+EVENT BUS: typed inbox messages (file-based, existing protocol extended)</pre>
 <hr>
 
 <!-- §3 SPINE LAYER DESIGN -->
-<h2 id="s3">&sect;3 Spine Layer Design</h2>
+<h2 id="s3">&sect;3 Spine Layer Design <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h2>
+<div class="comment-area"><textarea placeholder="[§3] "></textarea></div>
 
-<h3 id="s3-i">I. Adaptive Steward (Priority 1)</h3>
+<h3 id="s3-i">I. Adaptive Steward (Priority 1) <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[§3 — Adaptive Steward] "></textarea></div>
 
 <p><strong>New typed output: PrescriptionObject</strong></p>
 <pre><code>@dataclass(frozen=True)
@@ -525,14 +559,10 @@ CREATE TABLE IF NOT EXISTS prescription_hypothesis_log (
 <p><strong>Verdict hook:</strong> <code>score_prescription_hypothesis(uow_id, outcome)</code> called in <code>_close_uow</code>. Idempotent (checks <code>scored_at IS NULL</code>). Non-fatal on DB error.</p>
 <p><strong>Test harness (no LLM required):</strong> Unit tests for accumulator upsert, Selector retrieval query, PrescriptionObject serialization. Integration test: close UoW &rarr; assert n_successes incremented.</p>
 <p><strong>Key files:</strong> <code>src/orchestration/steward.py</code>, <code>src/orchestration/schema.sql</code>, <code>src/orchestration/registry.py</code>, <code>src/orchestration/prescription_metrics.py</code>, <code>scripts/upgrade.sh</code>.</p>
-
-<div class="section-comment-toggle" data-section="§3 — Adaptive Steward">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§3 — Adaptive Steward] "></textarea></div>
 <hr>
 
-<h3 id="s3-ii">II. Event-Native Nervous System (Priority 3, parallel with Stage 1 — Adaptive Steward)</h3>
+<h3 id="s3-ii">II. Event-Native Nervous System (Priority 3, parallel with Stage 1 — Adaptive Steward) <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[§3 — Event-Native Nervous System] "></textarea></div>
 
 <p><strong>Three new typed inbox message types:</strong></p>
 <pre>wos_issue_created:    issue_number, issue_url, title, labels, triggered_at
@@ -544,14 +574,10 @@ wos_capacity_available: freed_uow_id, freed_at, current_active_count, max_parall
 <p><strong>Heartbeat demotion:</strong> Behind <code>event_native_active: true</code> feature flag in <code>wos-config.json</code>. Steward heartbeat: <code>*/3</code> &rarr; <code>*/5</code> (orphan recovery only). Executor heartbeat: unchanged. GardenCaretaker: retained as reconciliation backstop.</p>
 <p><strong>New schema:</strong> <code>event_log</code> table.</p>
 <p><strong>Key files:</strong> <code>src/orchestration/wos_events.py</code> (new), <code>scheduled-tasks/wos-issue-delta-poller.py</code> (new), <code>src/orchestration/dispatcher_handlers.py</code>, <code>src/orchestration/result_writer.py</code>, <code>src/orchestration/executor.py</code>.</p>
-
-<div class="section-comment-toggle" data-section="§3 — Event-Native Nervous System">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§3 — Event-Native Nervous System] "></textarea></div>
 <hr>
 
-<h3 id="s3-iii">III. Executor Mesh (Priority 4, after learning layer)</h3>
+<h3 id="s3-iii">III. Executor Mesh (Priority 4, after learning layer) <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[§3 — Executor Mesh] "></textarea></div>
 
 <p><strong>Claim Protocol:</strong></p>
 <pre><code>@dataclass(frozen=True)
@@ -573,14 +599,10 @@ class ClaimResponse:
 <p><strong>Tier 3:</strong> Publish-subscribe on existing inbox protocol. UoW appears in <code>wos-proposals/</code> directory. First valid claim within 10-second window wins (optimistic lock).</p>
 <p><strong>New schema:</strong> <code>executor_registry</code> table.</p>
 <p><strong>New module:</strong> <code>src/orchestration/executor_mesh.py</code>.</p>
-
-<div class="section-comment-toggle" data-section="§3 — Executor Mesh">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§3 — Executor Mesh] "></textarea></div>
 <hr>
 
-<h3 id="s3-iv">IV. Closed-Loop Self-Amendment (Priority 2)</h3>
+<h3 id="s3-iv">IV. Closed-Loop Self-Amendment (Priority 2) <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[§3 — Closed-Loop Self-Amendment] "></textarea></div>
 
 <p><strong>Amendment classes:</strong></p>
 <ul>
@@ -595,34 +617,21 @@ class ClaimResponse:
 </ol>
 <p><strong>New schema:</strong> <code>amendment_log</code> table.</p>
 <p><strong>New modules:</strong> <code>src/orchestration/self_amendment.py</code>, <code>scheduled-tasks/self-amendment-generator.py</code> (weekly cron).</p>
-
-<div class="section-comment-toggle" data-section="§3 — Closed-Loop Self-Amendment">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§3 — Closed-Loop Self-Amendment] "></textarea></div>
 <hr>
 
-<h3 id="s3-v">V. Orientation Layer (Priority 5, last)</h3>
+<h3 id="s3-v">V. Orientation Layer (Priority 5, last) <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[§3 — Orientation Layer] "></textarea></div>
 
 <p><strong>Governor output:</strong> <code>PortfolioPrescription</code> &mdash; workstream emphasis weights, register targets, suppressed workstreams, Socratic exchange record.</p>
 <p><strong>Socratic advisor:</strong> Question-only session (Haiku). Structurally prevented from issuing directives (system prompt constraint + optional output validation). Must pose minimum 3 questions before Governor finalizes prescription.</p>
 <p><strong>Germination bias:</strong> <code>GerminationBias</code> per workstream (0.1 = suppressed, 1.0 = neutral, 2.0 = accelerated). Applied by Germinator at issue promotion time.</p>
 <p><strong>New schema:</strong> <code>portfolio_prescription</code>, <code>germination_bias</code> tables.</p>
 <p><strong>New modules:</strong> <code>src/orchestration/governor.py</code>, <code>src/orchestration/socratic_advisor.py</code>, <code>scheduled-tasks/governor-weekly.py</code> (weekly LLM task).</p>
-
-
-<div class="section-comment-toggle" data-section="§3 — Orientation Layer">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§3 — Orientation Layer] "></textarea></div>
-<div class="section-comment-toggle" data-section="§3">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§3] "></textarea></div>
 <hr>
 
 <!-- §4 LOAD-BEARING ABSTRACTIONS -->
-<h2 id="s4">&sect;4 Load-Bearing Abstractions</h2>
+<h2 id="s4">&sect;4 Load-Bearing Abstractions <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h2>
+<div class="comment-area"><textarea placeholder="[§4] "></textarea></div>
 
 <table>
   <thead>
@@ -643,15 +652,11 @@ class ClaimResponse:
     <tr><td><strong>Coupled Goodhart</strong></td><td>Failure mode where Prescriber and Executor optimize against same verdict context (Nash equilibrium, not true improvement)</td></tr>
   </tbody>
 </table>
-
-<div class="section-comment-toggle" data-section="§4">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§4] "></textarea></div>
 <hr>
 
 <!-- §5 IMPLEMENTATION SEQUENCING -->
-<h2 id="s5">&sect;5 Implementation Sequencing</h2>
+<h2 id="s5">&sect;5 Implementation Sequencing <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h2>
+<div class="comment-area"><textarea placeholder="[§5] "></textarea></div>
 
 <table>
   <thead>
@@ -665,20 +670,17 @@ class ClaimResponse:
     <tr><td>5 — Orientation Layer</td><td>Orientation Layer</td><td>All prior + 90d verdict data</td><td>5&ndash;7 days</td><td>First portfolio prescription reviewed and approved by Dan</td></tr>
   </tbody>
 </table>
-
-<div class="section-comment-toggle" data-section="§5">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§5] "></textarea></div>
 <hr>
 
 <!-- §6 DESIGN DECISION FORKS -->
-<h2 id="s6">&sect;6 Design Decision Forks</h2>
+<h2 id="s6">&sect;6 Design Decision Forks <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h2>
+<div class="comment-area"><textarea placeholder="[§6 — general] "></textarea></div>
 
 <p>Three blocking forks require Dan's input. Two non-blocking forks are decided by the implementation team.</p>
 
 <!-- FORK 1 -->
-<h3 id="fork1">Fork 1 &mdash; Verdict Matching Strategy <span class="tag tag-ic">BLOCKING</span></h3>
+<h3 id="fork1">Fork 1 &mdash; Verdict Matching Strategy <span class="tag tag-ic">BLOCKING</span> <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[Fork 1 — Verdict Matching] "></textarea></div>
 
 <div class="spinal-preface">
   <div class="spinal-label">Structurally Spinal Preface</div>
@@ -701,14 +703,17 @@ class ClaimResponse:
   <p><strong>Question:</strong> Start with exact match (A) and migrate to embedding clustering (B) when fragmentation is observed, or build B now so the ledger starts clean?</p>
 </div>
 
-<div class="section-comment-toggle" data-section="Fork 1 — Verdict Matching">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
+<div style="background:#e8f5e9; border-left:4px solid #2e7d32; border-radius:0 8px 8px 0; padding:1rem 1.25rem; margin:1.25rem 0;">
+  <h4 style="color:#2e7d32; margin-top:0; font-size:1rem; font-weight:700; text-transform:none; letter-spacing:0;">&#10003; Dan's Decision — LOCKED: Option C</h4>
+  <p><strong>Decision: C — LLM-assisted normalization (Haiku) at verdict-scoring time.</strong></p>
+  <p><em>"I think C is correct as long as we have good observability — excellent observability and rollup."</em></p>
+  <p><strong>Structural implication:</strong> At UoW closure, a Haiku call normalizes the hypothesis string before upserting into <code>verdict_accumulator</code>. This prevents synonym fragmentation from day one. Observability requirement: the normalization call must be logged with both original and normalized form so drift or overcollapse in normalization behavior is visible. A rollup dashboard showing normalization clustering health (distinct normalized hypotheses vs. raw hypotheses per register) is required before Stage 1 ships.</p>
 </div>
-<div class="comment-area"><textarea placeholder="[Fork 1 — Verdict Matching] "></textarea></div>
 <hr>
 
 <!-- FORK 2 -->
-<h3 id="fork2">Fork 2 &mdash; Tier 2 Agent State Persistence <span class="tag tag-ic">BLOCKING</span></h3>
+<h3 id="fork2">Fork 2 &mdash; Tier 2 Agent State Persistence <span class="tag tag-ic">BLOCKING</span> <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[Fork 2 — Tier 2 State Persistence] "></textarea></div>
 
 <div class="spinal-preface">
   <div class="spinal-label">Structurally Spinal Preface</div>
@@ -731,14 +736,19 @@ class ClaimResponse:
   <p><strong>Question:</strong> Should Tier 2 domain knowledge be accessible to the dispatcher and other agents (Option B) or strictly isolated to the Tier 2 agent (Option A)?</p>
 </div>
 
-<div class="section-comment-toggle" data-section="Fork 2 — Tier 2 State Persistence">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
+<div style="background:#fff8e1; border-left:4px solid #f57f17; border-radius:0 8px 8px 0; padding:1rem 1.25rem; margin:1.25rem 0;">
+  <h4 style="color:#e65100; margin-top:0; font-size:1rem; font-weight:700; text-transform:none; letter-spacing:0;">&#8987; Recommendation — PENDING Dan's Confirmation: Option A</h4>
+  <p><strong>Recommendation: A — Isolated state file (JSON per domain).</strong></p>
+  <p><strong>Case for A:</strong> The lobster-codebase Tier 2 agent's value comes from curated, domain-specific architectural memory. Sharing memory.db means transient agents (cultivator, steward, dispatcher) write to the same space, diluting the signal. Isolated JSON means the Tier 2 agent owns its context completely. In concurrent scenarios (two Tier 2 agents on overlapping code), isolated files keep each agent's context coherent within its scope.</p>
+  <p><strong>Case against B:</strong> Cross-pollination only has value when domains genuinely overlap and agents can act on each other's knowledge. Currently there is one Tier 2 domain. The cross-domain benefit doesn't exist yet; the context pollution risk is real now.</p>
+  <p><strong>Case against C:</strong> Option C is Option A plus a migration cost. The isolation it provides is conceptually identical to Option A's JSON file. Not justified unless there's a specific DB query requirement flat JSON cannot satisfy.</p>
+  <p><strong>Condition for change:</strong> If multiple Tier 2 agents with genuinely overlapping domains are running simultaneously and there's evidence that cross-reading their contexts improves output quality, Option B becomes correct. Start with A; migrate when there's evidence of actual cross-domain benefit.</p>
 </div>
-<div class="comment-area"><textarea placeholder="[Fork 2 — Tier 2 State Persistence] "></textarea></div>
 <hr>
 
 <!-- FORK 3 -->
-<h3 id="fork3">Fork 3 &mdash; Governor Authority Model <span class="tag tag-ic">BLOCKING</span></h3>
+<h3 id="fork3">Fork 3 &mdash; Governor Authority Model <span class="tag tag-ic">BLOCKING</span> <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[Fork 3 — Governor Authority Model] "></textarea></div>
 
 <div class="spinal-preface">
   <div class="spinal-label">Structurally Spinal Preface</div>
@@ -762,10 +772,12 @@ class ClaimResponse:
   <p><strong>Question:</strong> This is the most philosophically load-bearing decision in the spec. How much autonomous authority should the Governor have over work prioritization? Recommend starting with Option A and expanding authority as trust develops &mdash; but this requires your explicit input.</p>
 </div>
 
-<div class="section-comment-toggle" data-section="Fork 3 — Governor Authority Model">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
+<div style="background:#e8f5e9; border-left:4px solid #2e7d32; border-radius:0 8px 8px 0; padding:1rem 1.25rem; margin:1.25rem 0;">
+  <h4 style="color:#2e7d32; margin-top:0; font-size:1rem; font-weight:700; text-transform:none; letter-spacing:0;">&#10003; Dan's Decision — LOCKED: Option B</h4>
+  <p><strong>Decision: B — Full bias authority (Governor can both promote and suppress, within defined bounds).</strong></p>
+  <p><em>"B — let her rip."</em></p>
+  <p><strong>Structural implication:</strong> Governor has full <code>germination_bias</code> authority from Stage 5 launch (range 0.1–2.0 per workstream). Structural safeguards remain: weekly cadence, Socratic advisor minimum-3-questions requirement. Defined bounds on what Governor cannot do: cannot suppress all workstreams simultaneously (minimum 1 at neutral or above), cannot set bias outside 0.1–2.0, cannot modify its own authority class. Telos drift remains a Class B failure mode requiring periodic human review.</p>
 </div>
-<div class="comment-area"><textarea placeholder="[Fork 3 — Governor Authority Model] "></textarea></div>
 <hr>
 
 <!-- NON-BLOCKING FORKS -->
@@ -774,16 +786,11 @@ class ClaimResponse:
 
 <h3>Fork 5 &mdash; Socratic Advisor Constraint Enforcement (Non-blocking)</h3>
 <p><strong>Decision:</strong> System prompt constraint only (Option A) with output validation (Option B) added if constraint breaks in practice.</p>
-
-
-<div class="section-comment-toggle" data-section="§6 — general">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§6 — general] "></textarea></div>
 <hr>
 
 <!-- §7 CLAUDE API AND MODEL USAGE DESIGN -->
-<h2 id="s7">&sect;7 Claude API and Model Usage Design</h2>
+<h2 id="s7">&sect;7 Claude API and Model Usage Design <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h2>
+<div class="comment-area"><textarea placeholder="[§7] "></textarea></div>
 
 <table>
   <thead>
@@ -827,15 +834,11 @@ class ClaimResponse:
     "socratic_advisor_model": "haiku",
     "amendment_generator_model": "sonnet"
 }</code></pre>
-
-<div class="section-comment-toggle" data-section="§7">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§7] "></textarea></div>
 <hr>
 
 <!-- WHAT IS NEEDED FROM DAN -->
-<h2>&sect; What Is Needed From Dan Before Implementation</h2>
+<h2>&sect; What Is Needed From Dan Before Implementation <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h2>
+<div class="comment-area"><textarea placeholder="[Dan's inputs] "></textarea></div>
 
 <div class="stage">
   <h4>Adaptive Steward, Event-Native Nervous System, and Self-Amendment (Stages 1–3) can begin immediately &mdash; no blocking forks apply</h4>
@@ -846,15 +849,11 @@ class ClaimResponse:
     <li><strong><a href="#fork3">Governor Authority Model</a></strong>: promote-only, full bias, or advisory? (needed before Orientation Layer — Stage 5 &mdash; this is the most important)</li>
   </ol>
 </div>
-
-<div class="section-comment-toggle" data-section="Dan's inputs">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[Dan's inputs] "></textarea></div>
 <hr>
 
 <!-- §8 TOKEN ERGONOMICS -->
-<h2 id="s8">&sect;8 Token Ergonomics and Metabolic Observability</h2>
+<h2 id="s8">&sect;8 Token Ergonomics and Metabolic Observability <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h2>
+<div class="comment-area"><textarea placeholder="[§8] "></textarea></div>
 
 <p><em>Full section: <code>~/lobster-workspace/workstreams/wos-evolution-spec/token-ergonomics.md</code>. Key findings condensed here.</em></p>
 
@@ -862,7 +861,8 @@ class ClaimResponse:
 
 <p><strong>Metabolic taxonomy extensions:</strong> Pearl from Adaptive Steward = hypothesis with &gt;0.7 success rate after 5+ observations. Heat from Adaptive Steward = hypothesis that churns (equal success/failure, never converges). Heat from Event-Native = events that trigger germination but produce no executed UoW (queue-filling without execution). Heat from Governor = a PortfolioPrescription that changes germination biases but not the actual metabolic output distribution. Shit from Self-Amendment = a Class A amendment that Dan manually reverts.</p>
 
-<h3>Five New Heat-Generating Attractors</h3>
+<h3>Five New Heat-Generating Attractors <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[§8 — heat attractors] "></textarea></div>
 
 <ol>
   <li><strong>Churn Basin</strong> (Adaptive Steward): Semantic variation in hypothesis strings fills the verdict_accumulator with low-observation-count rows that never converge. Detection: &gt;100 distinct hypotheses per register with mean observations &lt;5. Remediation: Verdict Matching Strategy resolution (embedding clustering).</li>
@@ -876,26 +876,18 @@ class ClaimResponse:
 <p>Call volume week-over-week change | Outcome yield (pearl+seed vs. heat+shit ratio, heat target &lt;30%, shit target &lt;5%) | Verdict accumulator health (hypotheses-per-register vs. mean-observations-per-hypothesis) | Germination queue depth (queue / max_parallel ratio) | Governor effectiveness (germination_bias L1 change + prescribed-vs-actual KL divergence) | Amendment rate (Class A applied per week + Class B unanswered count).</p>
 
 <p><strong>Spine-first invariant:</strong> Every LLM-consuming component has a fully testable non-LLM path. The LLM contribution is the gap between mock-LLM scaffold output and live output. If that gap cannot be measured, the component is not metabolically observable. All five evolved components satisfy this invariant as specified.</p>
-
-
-<div class="section-comment-toggle" data-section="§8 — heat attractors">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§8 — heat attractors] "></textarea></div>
-<div class="section-comment-toggle" data-section="§8">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§8] "></textarea></div>
 <hr>
 
 <!-- §9 FAILURE MODE TAXONOMY -->
-<h2 id="s9">&sect;9 Failure Mode Taxonomy and Self-Healing Design</h2>
+<h2 id="s9">&sect;9 Failure Mode Taxonomy and Self-Healing Design <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h2>
+<div class="comment-area"><textarea placeholder="[§9] "></textarea></div>
 
 <p><em>Full section: <code>~/lobster-workspace/workstreams/wos-evolution-spec/failure-modes.md</code>. Key taxonomy and escalation chain condensed here.</em></p>
 
 <p><strong>Failure class definitions:</strong> Class A = system-diagnosable, automatable recovery, no human needed. Class B = system-detectable, requires human decision before recovery. Class C = requires human diagnosis, system cannot determine root cause.</p>
 
-<h3>Failure Mode Taxonomy by Evolution Direction</h3>
+<h3>Failure Mode Taxonomy by Evolution Direction <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[§9 — failure modes] "></textarea></div>
 
 <table>
   <thead>
@@ -925,49 +917,30 @@ class ClaimResponse:
 </div>
 
 <h3>Escalation Chain</h3>
-<div class="mermaid-wrapper">
-  <div class="mermaid">
-flowchart TD
-    A[Class A detected] --> B[Automated recovery]
-    B -->|success| C[Log and continue]
-    B -->|timeout / retry exhausted| D[Escalate to Class B]
-    D --> E[Class B surfaced to Dan]
-    E -->|Dan approves proposed action| F[Execute + log]
-    E -->|Dan rejects or cannot determine| G[Escalate to Class C]
-    G --> H[System writes diagnosis artifact]
-    H --> I[Wait — human diagnoses and applies fix]
-    I -->|Human confirms resolution| J[Log: human_resolved = True]
-    J --> K([No further automated attempts. No Class D.])
-    style A fill:#fff3e0
-    style D fill:#fff3e0
-    style G fill:#ffebee
-    style K fill:#e8f5e9
-  </div>
-</div>
+<pre>Class A detected → automated recovery → success: log and continue
+                                      → timeout/retry exhausted → Class B
+
+Class B surfaced to Dan → Dan approves proposed action → execute + log
+                        → Dan rejects or cannot determine → Class C
+
+Class C → system writes diagnosis artifact → waits → human diagnoses and applies fix
+       → human confirms resolution → log with human_resolved = True
+       [No further automated attempts. No Class D.]</pre>
 
 <p><strong>Class B timeout:</strong> Dan non-response at 48h &rarr; reminder. At 96h &rarr; escalate to Class C, write diagnosis artifact. System does not act autonomously on unacknowledged Class B.</p>
 <p><strong>Class C minimum artifact</strong> (written to <code>~/lobster-workspace/assessments/wos-failures/class-c-&lt;timestamp&gt;.md</code>): observable symptoms, what recovery was attempted, complete state snapshot (relevant DB rows, config values, recent audit_log), system's best hypothesis (may be empty), and explicit list of what a human needs to read to diagnose. Self-contained &mdash; no additional query tools required.</p>
 <p><strong>Key design invariants:</strong> No silent state mutation. Amendment gate closed during recovery windows. Escalation is bounded. Class C artifacts are self-contained. Substrate instability is surfaced, not worked around. The amendment logic cannot amend itself (Class A cannot modify <code>CLASS_A_ALLOWED_COMPONENTS</code>).</p>
-
-
-<div class="section-comment-toggle" data-section="§9 — failure modes">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§9 — failure modes] "></textarea></div>
-<div class="section-comment-toggle" data-section="§9">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§9] "></textarea></div>
 <hr>
 
 <!-- §10 WORKED EXAMPLES -->
-<h2 id="s10">&sect;10 Worked Examples &mdash; Canonical Scenarios</h2>
+<h2 id="s10">&sect;10 Worked Examples &mdash; Canonical Scenarios <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h2>
+<div class="comment-area"><textarea placeholder="[§10 — general] "></textarea></div>
 
 <p>Four scenarios chosen for register divergence. Each exposes a different face of the architecture. The synthesis section at the end finds what only becomes visible when you look across all four.</p>
-
 <hr>
 
-<h3>Scenario A: Paper/Book Consumption &rarr; First-Principles Learning Partner</h3>
+<h3>Scenario A: Paper/Book Consumption &rarr; First-Principles Learning Partner <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[Scenario A] "></textarea></div>
 
 <p>Dan pastes the text of a dense academic paper on distributed systems consensus. No explicit ask &mdash; just the text, arriving as a Telegram message.</p>
 <h4>Signal arrival and dispatch path</h4>
@@ -988,14 +961,10 @@ flowchart TD
 <p>The executor produces: a taxonomy of the paper's conceptual structure, a relationship map of its key claims, the one-sentence spine, and an explicit annotation of what the paper does not address (the productive gaps). It surfaces this to Dan with a single message: "Spine reconstructed. What do you want to pull on first?"</p>
 <h4>Distinguishing insight</h4>
 <p>This scenario reveals that the human-judgment register requires a fundamentally different success metric than the other registers. There is no oracle gate here &mdash; there is no correct output to approve. Success is Dan's productive engagement. The verdict accumulator must score against a qualitative criterion (did the artifact support first-principles reasoning?) rather than a binary outcome (did the PR merge?). This is the scenario that most clearly demands the Prescriptor include an explicit <code>counterfactual_question</code> field &mdash; not as documentation, but as the scoring instrument.</p>
-
-<div class="section-comment-toggle" data-section="Scenario A">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[Scenario A] "></textarea></div>
 <hr>
 
-<h3>Scenario B: Multi-Register Product Feature Reasoning</h3>
+<h3>Scenario B: Multi-Register Product Feature Reasoning <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[Scenario B] "></textarea></div>
 
 <p>Dan asks: "Should we add real-time collaboration to the Bisque editor? I want to reason through the full picture before deciding."</p>
 <h4>Signal arrival and dispatch path</h4>
@@ -1004,13 +973,10 @@ flowchart TD
 <p>The Selector finds prior hypotheses tagged <code>multi-register-product-reasoning</code>. The highest-scoring one: "Decompose into three explicit register traces before synthesizing. Technical trace first (implementation surface and constraints), product trace second (UX, edge cases, real user scenarios), strategic trace third (directional alignment, opportunity cost, what this forecloses). Synthesis only after all three traces complete." Success rate: 0.74 across 6 observations.</p>
 <h4>Distinguishing insight</h4>
 <p>This scenario is the one that reveals the mismatch between the UoW register classification system (designed for single-register routing) and the reality of Dan's most important decisions (which span registers). The scenario exposes that register is a routing attribute, not a description of the work. Multi-register work cannot be correctly classified as any single register &mdash; the current four-gate classifier will collapse it to iterative-convergent and lose the human-judgment texture. The architecture needs a <code>multi_register</code> flag or an explicit multi-register routing mode.</p>
-<div class="section-comment-toggle" data-section="Scenario B">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[Scenario B] "></textarea></div>
 <hr>
 
-<h3>Scenario C: GitHub Repo Audit</h3>
+<h3>Scenario C: GitHub Repo Audit <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[Scenario C] "></textarea></div>
 
 <p>Dan provides a GitHub repo URL: a small open-source system for managing structured notes with CLI and sync features.</p>
 <h4>Signal arrival and dispatch path</h4>
@@ -1019,14 +985,10 @@ flowchart TD
 <p>The Selector finds prior hypotheses for <code>register=iterative-convergent, domain_hint=repo-audit</code>. The highest-scoring cluster: "Audit in the multi-registered language developed for Lobster architecture. Spine-first: what is this system's load-bearing idea? Then: what patterns parallel Lobster's architecture, where would they integrate, what would need to change? Surface things Dan isn't thinking about &mdash; not confirmation of what he already suspects." Success rate: 0.86 across 4 observations.</p>
 <h4>Distinguishing insight</h4>
 <p>This scenario is the one that reveals the difference between Tier 1 and Tier 2 value in the most concrete terms. The parallel assessment requires genuine architectural memory &mdash; it cannot be done well from a cold start on every invocation. This scenario makes visible why persistent domain agents are not just an efficiency optimization (fewer tokens re-read) but a qualitative capability upgrade: the comparison between two architectures is only as good as the depth of knowledge about each.</p>
-
-<div class="section-comment-toggle" data-section="Scenario C">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[Scenario C] "></textarea></div>
 <hr>
 
-<h3>Scenario D: Website Iteration with Visual Pattern Language Development</h3>
+<h3>Scenario D: Website Iteration with Visual Pattern Language Development <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[Scenario D] "></textarea></div>
 
 <p>Dan wants to iterate the dancetlin.com homepage toward a cleaner visual identity. He has a strong artistic sensibility but does not yet have explicit vocabulary for what he's going for.</p>
 <h4>Signal arrival and dispatch path</h4>
@@ -1035,14 +997,10 @@ flowchart TD
 <p>The Selector finds prior hypotheses for <code>register=human-judgment, domain_hint=visual-design</code>. The hypothesis pool is thin &mdash; this register-domain combination has low observation count. The Selector surfaces a low-confidence cluster: "High-ambiguity aesthetic work: do not produce outputs before building vocabulary. Pose specific questions about reference points, then articulate back what you heard before generating options." Confidence: 0.62, n_observations=3.</p>
 <h4>Distinguishing insight</h4>
 <p>This scenario reveals the hardest edge of the architecture: what does "prescription" mean when there is no domain truth to verify against, only Dan's response? The verdict accumulator scores outcomes &mdash; but in aesthetic work, the outcome is entirely subjective. The architecture handles this by maintaining low confidence scores for aesthetic-domain hypotheses and keeping the Prescriptor's autonomy low &mdash; not because the system has failed, but because the correct epistemic posture for this domain is humility about prior accuracy.</p>
-
-<div class="section-comment-toggle" data-section="Scenario D">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[Scenario D] "></textarea></div>
 <hr>
 
-<h3>Synthesis: What Four Scenarios Show Together</h3>
+<h3>Synthesis: What Four Scenarios Show Together <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[Synthesis] "></textarea></div>
 
 <p>Three structural principles become visible only across all four scenarios. No single scenario surfaces any of them.</p>
 <ol>
@@ -1050,24 +1008,16 @@ flowchart TD
   <li><strong>The verdict accumulator's most valuable signal is what it cannot score.</strong> In Scenarios A (First-Principles Learning Partner) and D (Website Iteration), the success criterion is Dan's qualitative engagement &mdash; not a binary outcome. The accumulator can record n_successes or n_failures, but the hypothesis it is scoring captures a qualitative test. The numbers are downstream of the question. A well-formed counterfactual question in the hypothesis text is worth more than a high observation count under a poorly-formed one.</li>
   <li><strong>Autonomy is register-specific, not a single dial.</strong> Scenario A (First-Principles Learning Partner) can close without Dan if he engages productively. Scenario B (Multi-Register Product Feature Reasoning) cannot close without Dan's decision. Scenario C (GitHub Repo Audit) can close autonomously if the audit artifact meets the counterfactual test. Scenario D (Website Iteration) cannot close without Dan's approval at every phase. The architecture's handling of autonomy is an emergent property of register, domain, and the specific prescription &mdash; not a configurable global setting.</li>
 </ol>
-
-
-<div class="section-comment-toggle" data-section="Synthesis">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[Synthesis] "></textarea></div>
 <hr>
-<div class="section-comment-toggle" data-section="§10 — general">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§10 — general] "></textarea></div>
 
 <!-- §11 EVENT-NATIVE MESH TOPOLOGY -->
-<h2 id="s11">&sect;11 Event-Native Mesh Topology</h2>
+<h2 id="s11">&sect;11 Event-Native Mesh Topology <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h2>
+<div class="comment-area"><textarea placeholder="[§11 — general] "></textarea></div>
 
 <p><em>Full topology analysis, event consumer model, and clustering analysis: <code>~/lobster-workspace/workstreams/wos-evolution-spec/topology.md</code>. The four key routing patterns are reproduced here.</em></p>
 
-<h3>Pattern 1: Single-Executor Happy Path</h3>
+<h3>Pattern 1: Single-Executor Happy Path <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[Pattern 1] "></textarea></div>
 <p>A well-understood UoW with a high-confidence hypothesis and dense verdict accumulator coverage flows through the mesh without escalation.</p>
 <div class="mermaid-wrapper">
   <div class="mermaid">
@@ -1094,14 +1044,10 @@ flowchart TD
   </div>
 </div>
 <p><strong>Key insight:</strong> The inner loop (claim to execute to close to re-dispatch) closes in under 15 seconds. The Selector's retrieval of matching priors means well-understood problem types benefit from accumulated wisdom without additional LLM cost.</p>
-
-<div class="section-comment-toggle" data-section="Pattern 1">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[Pattern 1] "></textarea></div>
 <hr>
 
-<h3>Pattern 2: Multi-Tier Routing (Executor Mesh Escalation)</h3>
+<h3>Pattern 2: Multi-Tier Routing (Executor Mesh Escalation) <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[Pattern 2] "></textarea></div>
 <p>A UoW requiring specialized domain context routes past Tier 1 to a persistent Tier 2 domain agent.</p>
 <div class="mermaid-wrapper">
   <div class="mermaid">
@@ -1125,13 +1071,10 @@ flowchart TD
   </div>
 </div>
 <p><strong>Key insight:</strong> The mesh routes by capability profile, not by load alone. Tier 2 agents accumulate domain knowledge across tasks &mdash; the persistent context state file grows richer with each execution. Over time, their verdict_accumulator success rates outpace Tier 1 for their domain.</p>
-<div class="section-comment-toggle" data-section="Pattern 2">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[Pattern 2] "></textarea></div>
 <hr>
 
-<h3>Pattern 3: Self-Amendment Cycle</h3>
+<h3>Pattern 3: Self-Amendment Cycle <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[Pattern 3] "></textarea></div>
 <p>A recurring failure pattern with the same hypothesis triggers a Class A amendment. Subsequent UoWs succeed under the amended configuration.</p>
 <div class="mermaid-wrapper">
   <div class="mermaid">
@@ -1160,14 +1103,10 @@ flowchart TD
   </div>
 </div>
 <p><strong>Key insight:</strong> The system closes the improvement loop without Dan. The structural guard (Class A bounded to <code>{"ifttt_rule", "routing_config"}</code>) prevents the amendment logic from modifying itself &mdash; that recursive case always requires Class B approval.</p>
-
-<div class="section-comment-toggle" data-section="Pattern 3">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[Pattern 3] "></textarea></div>
 <hr>
 
-<h3>Pattern 4: Governor Reorientation</h3>
+<h3>Pattern 4: Governor Reorientation <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[Pattern 4] "></textarea></div>
 <p>The Orientation Layer detects metabolic drift, generates a new portfolio prescription via Socratic dialogue, and shifts germination biases. The UoW mix reorients over subsequent weeks.</p>
 <div class="mermaid-wrapper">
   <div class="mermaid">
@@ -1202,14 +1141,10 @@ flowchart TD
   </div>
 </div>
 <p><strong>Key insight:</strong> The Governor operates at portfolio granularity, not UoW granularity. It shifts the probability distribution over what gets worked on. The Socratic advisor structure ensures no prescription finalizes before at least three questions have been posed.</p>
-
-<div class="section-comment-toggle" data-section="Pattern 4">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[Pattern 4] "></textarea></div>
 <hr>
 
-<h3>Clock-Driven vs. Event-Native: Side-by-Side</h3>
+<h3>Clock-Driven vs. Event-Native: Side-by-Side <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h3>
+<div class="comment-area"><textarea placeholder="[Clock vs Event-Native] "></textarea></div>
 <div class="mermaid-wrapper">
   <div class="mermaid">
 flowchart TD
@@ -1241,17 +1176,8 @@ flowchart TD
   </div>
 </div>
 <p><strong>Wall-clock comparison:</strong> Today: 6&ndash;27 minutes, coupled to clock not to work. Evolved: 1&ndash;3 minutes, driven by events. The event-native mesh exposes the coupling between dispatch latency and learning rate that the clock-driven loop obscures &mdash; removing the heartbeat floor makes the Adaptive Steward's verdict accumulation substantively more powerful by tightening the feedback loop between UoW completion and next prescription.</p>
-
-<div class="section-comment-toggle" data-section="Clock vs Event-Native">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[Clock vs Event-Native] "></textarea></div>
 <hr>
 
-<div class="section-comment-toggle" data-section="§11 — general">
-  <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button>
-</div>
-<div class="comment-area"><textarea placeholder="[§11 — general] "></textarea></div>
 <!-- GLOBAL COMMENT + COPY BUTTON -->
 <div class="global-comment-section">
   <label>Global comment</label>
@@ -1281,9 +1207,8 @@ function toggleTheme() {
 
 // ── Per-heading comment toggle ──
 function toggleComment(btn) {
-  // Button lives inside .section-comment-toggle; comment-area is its next sibling
-  var toggle = btn.closest('.section-comment-toggle') || btn.parentElement;
-  var area = toggle.nextElementSibling;
+  var parent = btn.closest('h1, h2, h3, h4, h5, p, li, .spinal-preface, .decision, .stage, .warn') || btn.parentElement;
+  var area = parent.nextElementSibling;
   if (!area || !area.classList.contains('comment-area')) {
     area = btn.parentElement.nextElementSibling;
   }
@@ -1309,40 +1234,28 @@ function copyAllComments() {
   var globalText = (document.getElementById('global-comment') || {}).value || '';
   globalText = globalText.trim();
   if (globalText) lines.push('[global] ' + globalText);
-  var btn = document.getElementById('copy-btn');
   if (!lines.length) {
+    var btn = document.getElementById('copy-btn');
     btn.textContent = 'No comments yet';
     setTimeout(function() { btn.textContent = 'Copy all comments'; }, 1500);
     return;
   }
-  var text = lines.join('\n');
-  if (navigator.clipboard && window.isSecureContext) {
-    navigator.clipboard.writeText(text).then(function() {
-      btn.textContent = 'Copied!';
-      setTimeout(function() { btn.textContent = 'Copy all comments'; }, 1500);
-    }).catch(function() { fallbackCopy(text, btn); });
-  } else {
-    fallbackCopy(text, btn);
-  }
-}
-function fallbackCopy(text, btn) {
-  var ta = document.createElement('textarea');
-  ta.value = text;
-  ta.style.position = 'fixed';
-  ta.style.opacity = '0';
-  document.body.appendChild(ta);
-  ta.focus();
-  ta.select();
-  try {
-    document.execCommand('copy');
+  var btn = document.getElementById('copy-btn');
+  navigator.clipboard.writeText(lines.join('\n')).then(function() {
     btn.textContent = 'Copied!';
     setTimeout(function() { btn.textContent = 'Copy all comments'; }, 1500);
-  } catch(e) {
+  }).catch(function() {
+    var ta = document.createElement('textarea');
+    ta.value = lines.join('\n');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); btn.textContent = 'Copied!'; }
+    catch(e) { btn.textContent = 'Copy failed'; }
     document.body.removeChild(ta);
-    alert('Copy failed — your browser may not support clipboard access over HTTP. Comments:\n\n' + text);
-    return;
-  }
-  document.body.removeChild(ta);
+    setTimeout(function() { btn.textContent = 'Copy all comments'; }, 1500);
+  });
 }
 
 // ── Mermaid init ──
