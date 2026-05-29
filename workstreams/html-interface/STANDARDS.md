@@ -313,6 +313,24 @@ const sections = [
   });
 })();
 
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).catch(function() { fallbackCopy(text); });
+  } else {
+    fallbackCopy(text);
+  }
+}
+function fallbackCopy(text) {
+  var el = document.createElement('textarea');
+  el.value = text;
+  el.style.position = 'fixed'; el.style.opacity = '0';
+  document.body.appendChild(el);
+  el.focus(); el.select();
+  try { document.execCommand('copy'); }
+  catch(e) { alert('Copy failed — paste manually:\n\n' + text); }
+  document.body.removeChild(el);
+}
+
 function copyComments() {
   const parts = sections
     .map(function(s) {
@@ -324,12 +342,11 @@ function copyComments() {
     document.getElementById('copy-feedback').textContent = 'Nothing to copy.';
     return;
   }
-  navigator.clipboard.writeText(parts.join(' | ')).then(function() {
-    document.getElementById('copy-feedback').textContent = 'Copied to clipboard.';
-    setTimeout(function() {
-      document.getElementById('copy-feedback').textContent = '';
-    }, 2500);
-  });
+  copyText(parts.join(' | '));
+  document.getElementById('copy-feedback').textContent = 'Copied to clipboard.';
+  setTimeout(function() {
+    document.getElementById('copy-feedback').textContent = '';
+  }, 2500);
 }
 ```
 
@@ -839,16 +856,32 @@ const sections = [
     container.appendChild(row);
   });
 })();
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).catch(function() { fallbackCopy(text); });
+  } else {
+    fallbackCopy(text);
+  }
+}
+function fallbackCopy(text) {
+  var el = document.createElement('textarea');
+  el.value = text;
+  el.style.position = 'fixed'; el.style.opacity = '0';
+  document.body.appendChild(el);
+  el.focus(); el.select();
+  try { document.execCommand('copy'); }
+  catch(e) { alert('Copy failed — paste manually:\n\n' + text); }
+  document.body.removeChild(el);
+}
 function copyComments() {
   const parts = sections.map(function(s) {
     const val = (document.getElementById('ci-' + s.id) || {}).value || '';
     return val.trim() ? '[' + s.label + '] ' + val.trim() : null;
   }).filter(Boolean);
   if (!parts.length) { document.getElementById('copy-feedback').textContent = 'Nothing to copy.'; return; }
-  navigator.clipboard.writeText(parts.join(' | ')).then(function() {
-    document.getElementById('copy-feedback').textContent = 'Copied to clipboard.';
-    setTimeout(function() { document.getElementById('copy-feedback').textContent = ''; }, 2500);
-  });
+  copyText(parts.join(' | '));
+  document.getElementById('copy-feedback').textContent = 'Copied to clipboard.';
+  setTimeout(function() { document.getElementById('copy-feedback').textContent = ''; }, 2500);
 }
 </script>
 </body>
@@ -887,6 +920,7 @@ Before finalizing any HTML artifact, confirm:
 - [ ] Bisque URL in send_reply; local path not sent to Dan
 - [ ] For dashboard-class: filter bar, status badges, action buttons tested
 - [ ] Telegram send_reply states version: "Updated to vN.N (Updated: YYYY-MM-DDTHH:MMZ)"
+- [ ] All browser API calls verified against plain HTTP (Bisque) context — navigator.clipboard, Notification API, etc.
 
 ---
 
@@ -934,3 +968,49 @@ Updated to vN.N (Updated: YYYY-MM-DDTHH:MMZ)
 ```
 
 This allows Dan to distinguish browser cache issues from real delivery failures.
+
+---
+
+## 13. Browser API Requirements — Plain HTTP (Bisque) Context
+
+Bisque (`http://5.78.201.64:9101`) is served over plain HTTP, not HTTPS. This means `window.isSecureContext` is `false` and secure-context-only browser APIs (notably the Clipboard API) are unavailable. All HTML delivered to Bisque must be tested against this constraint.
+
+### Clipboard API — canonical HTTP-safe pattern
+
+Never call `navigator.clipboard.writeText()` unconditionally — it is `undefined` on plain HTTP (non-localhost). Always guard with `navigator.clipboard && window.isSecureContext`, and always provide a `fallbackCopy` function using `document.execCommand('copy')` via a temporary textarea. If `execCommand` also fails, show an alert so the text is never silently lost.
+
+**Reference implementation — use this pattern verbatim in all future HTML:**
+
+```js
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).catch(function() { fallbackCopy(text); });
+  } else {
+    fallbackCopy(text);
+  }
+}
+function fallbackCopy(text) {
+  var el = document.createElement('textarea');
+  el.value = text;
+  el.style.position = 'fixed'; el.style.opacity = '0';
+  document.body.appendChild(el);
+  el.focus(); el.select();
+  try { document.execCommand('copy'); }
+  catch(e) { alert('Copy failed — paste manually:\n\n' + text); }
+  document.body.removeChild(el);
+}
+```
+
+All clipboard operations (comment widget `copyComments`, action-copy buttons, any other "copy to clipboard" feature) must delegate to `copyText(text)` rather than calling `navigator.clipboard` directly.
+
+### Other secure-context APIs to avoid without fallbacks
+
+- **Notification API** (`Notification.requestPermission()`) — unavailable on plain HTTP
+- **Web Crypto API** (`crypto.subtle.*`) — unavailable on plain HTTP
+- **Service Workers** — unavailable on plain HTTP
+
+When any of these are needed, guard with `window.isSecureContext` and provide a graceful degradation path.
+
+### Discovery note
+
+This standard was encoded following the v1.2 fix to the copy-comments widget, where `navigator.clipboard` being `undefined` on Bisque caused silent copy failures. The `fallbackCopy` pattern using `execCommand` is the established workaround for this deployment context.
