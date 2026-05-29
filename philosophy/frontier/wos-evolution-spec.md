@@ -585,3 +585,198 @@ after pattern shows 5 diagnostic cycles requiring same observation gap workaroun
 ```
 
 *Full trace including failure modes, verdict accumulation details, and Closed-Loop Self-Amendment flows: `~/lobster-workspace/workstreams/wos-evolution-spec/worked-examples.md`*
+
+---
+
+## §11 Event-Native Mesh Topology
+
+*Full topology analysis, event consumer model, and clustering analysis: `~/lobster-workspace/workstreams/wos-evolution-spec/topology.md`. The four key routing patterns are reproduced here.*
+
+### Pattern 1: Single-Executor Happy Path
+
+A well-understood UoW with a high-confidence hypothesis and dense verdict accumulator coverage flows through the mesh without escalation.
+
+```mermaid
+flowchart TD
+    A([GitHub Issue Created]) --> B[Delta Poller\n30s cron]
+    B -->|wos_issue_created| C{Germinator}
+    C -->|register: operational\nbias: 1.0 neutral| D[Prescriber]
+    D -->|reads verdict_accumulator\ntop-5 priors| E[Selector]
+    E -->|injects high-confidence prior\ninto prescription prompt| D
+    D -->|PrescriptionObject\nconfidence: 0.85| F[Executor Mesh Router]
+    F -->|wos_claim_issued| G[Tier 1: Local Subagent]
+    G -->|wos_uow_executing| H[Steward\nObservation loop]
+    G -->|write_result\noutcome: success| I[Steward Close Path]
+    I -->|Oracle gate: APPROVED| J[Metabolic Classifier]
+    J -->|classification: pearl| K[GitHub Sync]
+    K --> L[score_prescription_hypothesis\nn_successes++]
+    L -->|wos_verdict_scored| M[(verdict_accumulator\nupsert)]
+    L -->|wos_capacity_available| F
+    F -->|next queued UoW| N([Next Dispatch Cycle])
+
+    style A fill:#e8f5e9
+    style N fill:#e8f5e9
+    style M fill:#e3f2fd
+    style G fill:#fff3e0
+```
+
+**Key insight:** The inner loop (claim to execute to close to re-dispatch) closes in under 15 seconds. The Selector's retrieval of matching priors means well-understood problem types benefit from accumulated wisdom without additional LLM cost.
+
+---
+
+### Pattern 2: Multi-Tier Routing (Executor Mesh Escalation)
+
+A UoW requiring specialized domain context routes past Tier 1 to a persistent Tier 2 domain agent.
+
+```mermaid
+flowchart TD
+    A([UoW: Refactor lobster\ncodebase module]) --> B[Prescriber]
+    B -->|capability_tags:\ncodebase-architecture\nregister: iterative-convergent| C[Executor Mesh Router]
+
+    C -->|Attempt Tier 1 claim| D{Tier 1 Subagent\nCapability Check}
+    D -->|capability mismatch:\ncodebase-architecture\nnot in Tier 1 profile| E[Claim rejected\nreason: insufficient domain context]
+
+    C -->|Attempt Tier 2 claim| F{Tier 2 Domain Agent\nCapability Check}
+    F -->|codebase-architecture: match\nmax_concurrent: 1| G[Claim accepted\nClaimResponse.accepted=True]
+
+    G --> H[Tier 2 Agent\nlobster-codebase domain\npersistent context loaded]
+    H -->|reads domain state file\naccumulated arch patterns| I[Task execution\nwith full codebase context]
+    I -->|write_result\noutcome: success| J[Steward Close Path]
+    J -->|wos_capacity_available| K[Executor Mesh Router]
+    J -->|wos_verdict_scored| L[(verdict_accumulator\nTier 2 accuracy tracked separately)]
+
+    K -->|Tier 2 slot freed| M([Next Tier 2 eligible UoW])
+
+    note1[Tier 2 agent writes\nupdated domain state file\nafter each task] -.->|persistent context grows| H
+
+    style A fill:#e8f5e9
+    style M fill:#e8f5e9
+    style L fill:#e3f2fd
+    style H fill:#f3e5f5
+    style note1 fill:#fffde7,stroke:#f9a825
+```
+
+**Key insight:** The mesh routes by capability profile, not by load alone. Tier 2 agents accumulate domain knowledge across tasks — the persistent context state file grows richer with each execution. Over time, their verdict_accumulator success rates outpace Tier 1 for their domain.
+
+---
+
+### Pattern 3: Self-Amendment Cycle
+
+A recurring failure pattern with the same hypothesis triggers a Class A amendment. Subsequent UoWs succeed under the amended configuration.
+
+```mermaid
+flowchart TD
+    subgraph "Failure Pattern 3+ consecutive"
+        A1[UoW: operational register] --> B1[Prescriber\nhypothesis: H-42]
+        B1 --> C1[Executor] --> D1[write_result: failure]
+        D1 --> E1[verdict_accumulator\nH-42: n_failures++]
+
+        A2[Similar UoW] --> B2[Prescriber\nhypothesis: H-42 again\nhigh prior weight] --> C2[Executor] --> D2[write_result: failure]
+        D2 --> E2[verdict_accumulator\nH-42: n_failures++ again]
+
+        A3[Similar UoW] --> B3[Prescriber\nhypothesis: H-42 again] --> C3[Executor] --> D3[write_result: failure]
+        D3 --> E3[verdict_accumulator\nH-42: 0 success / 3 failure]
+    end
+
+    E3 --> F{Self-Amendment\nDetector\nweekly cron}
+    F -->|pattern: same hypothesis\n3+ consecutive failures| G[Amendment Proposal\nClass A: update routing_config\nsuppress H-42 in Selector]
+
+    G -->|auto-apply\nno Dan approval required| H[amendment_log\nrecorded + retroactive digest]
+
+    H --> I[Amended system config\nH-42 suppressed in Selector]
+
+    subgraph "Post-Amendment Success"
+        J[Next similar UoW] --> K[Prescriber\nSelector skips H-42] --> L[New hypothesis H-71\nhigher confidence] --> M[Executor] --> N[write_result: success]
+        N --> O[verdict_accumulator\nH-71: n_successes++]
+    end
+
+    I --> J
+
+    style G fill:#fff3e0
+    style H fill:#e8f5e9
+    style I fill:#e3f2fd
+```
+
+**Key insight:** The system closes the improvement loop without Dan. The structural guard (Class A bounded to `{"ifttt_rule", "routing_config"}`) prevents the amendment logic from modifying itself — that recursive case always requires Class B approval.
+
+---
+
+### Pattern 4: Governor Reorientation
+
+The Orientation Layer detects metabolic drift, generates a new portfolio prescription via Socratic dialogue, and shifts germination biases. The UoW mix reorients over subsequent weeks.
+
+```mermaid
+flowchart TD
+    A[Governor Weekly Run] --> B[Read metabolic composition\nlast 30 days]
+    B --> C{Composition analysis}
+    C -->|pearl: 18% seed: 8%\nheat: 61% shit: 13%| D[Target drift detected\nseed rate too low\nheat rate too high]
+
+    D --> E[Socratic Advisor\nHaiku model]
+    E -->|Q1: Which workstreams\nare generating heat?| F[Governor]
+    F -->|Analysis| E
+    E -->|Q2: Are heat UoWs failing\ndue to prescription mismatch\nor executor mismatch?| F
+    F -->|Analysis| E
+    E -->|Q3: What workstream if seeded\nwould most expand future capacity?| F
+    F -->|Prescription justified| G[Portfolio Prescription\nfinalizes]
+
+    G -->|wos_portfolio_prescription_updated| H[germination_bias table\nupdated]
+
+    H --> I[workstream:lobster-core: 2.0\naccelerate germination]
+    H --> J[workstream:tania-ads: 0.3\nsuppress germination]
+
+    subgraph "Effect on Germinator weeks 1-4"
+        L[New GitHub Issues] -->|wos_issue_created| M{Germinator}
+        I -.->|bias applied| M
+        J -.->|bias applied| M
+        M -->|lobster-core: promoted fast| N[Steward]
+        M -->|tania-ads: queued slow| O[Deprioritized]
+    end
+
+    subgraph "Metabolic shift 4 weeks later"
+        P[Governor next run] -->|pearl: 24% seed: 19%\nheat: 48% shit: 9%| Q[Drift corrected\nPrescription validated]
+    end
+
+    N --> P
+
+    style A fill:#e8f5e9
+    style G fill:#f3e5f5
+    style Q fill:#e8f5e9
+```
+
+**Key insight:** The Governor operates at portfolio granularity, not UoW granularity. It shifts the probability distribution over what gets worked on. The Socratic advisor structure ensures no prescription finalizes before at least three questions have been posed.
+
+---
+
+### Clock-Driven vs. Event-Native: Side-by-Side
+
+```mermaid
+flowchart TD
+    subgraph TODAY["TODAY: Clock-Driven 3-minute polling"]
+        direction TB
+        T1([Issue created]) --> T2[Wait for\nGardenCaretaker\n0-15 min]
+        T2 --> T3[Cultivator promotes]
+        T3 --> T4[Wait for steward\nheartbeat 0-3 min]
+        T4 --> T5[Steward prescribes]
+        T5 --> T6[Wait for executor\nheartbeat 0-3 min]
+        T6 --> T7[wos_execute dispatched]
+        T7 --> T8[Subagent executes]
+        T8 --> T9[write_result]
+        T9 --> T10[Wait for steward\nheartbeat 0-3 min]
+        T10 --> T11[Steward closes UoW]
+        T11 --> T12[Wait for executor\nheartbeat 0-3 min]
+        T12 --> T13([Next UoW dispatched])
+    end
+
+    subgraph EVOLVED["EVOLVED: Event-Native"]
+        direction TB
+        E1([Issue created]) --> E2[Delta poller\nwithin 30 sec]
+        E2 -->|wos_issue_created| E3[Germinator\nimmediately]
+        E3 -->|wos_uow_germinated| E4[Prescriber\nSelector reads priors]
+        E4 -->|wos_prescription_ready| E5[Executor Mesh\nclaims immediately]
+        E5 --> E6[Subagent executes]
+        E6 -->|wos_uow_completed| E7[Close path\nimmediately]
+        E7 -->|wos_capacity_available| E8([Next UoW dispatched\nwithin 15 sec])
+    end
+```
+
+**Wall-clock comparison:** Today: 6-27 minutes, coupled to clock not to work. Evolved: 1-3 minutes, driven by events. The event-native mesh exposes the coupling between dispatch latency and learning rate that the clock-driven loop obscures — removing the heartbeat floor makes the Adaptive Steward's verdict accumulation substantively more powerful by tightening the feedback loop between UoW completion and next prescription.
