@@ -391,3 +391,29 @@ messages = [{
 ---
 
 *Design spec complete. No implementation changes to production WOS. Bisque URL: http://5.78.201.64:9101/files/wos-evolution-spec.html*
+
+---
+
+## §8 Token Ergonomics and Metabolic Observability
+
+*Full section: `~/lobster-workspace/workstreams/wos-evolution-spec/token-ergonomics.md`. Key findings condensed here.*
+
+**Per-component call accounting:** The evolved system adds six LLM-consuming components. Three add zero net calls (Event-Native event handlers, verdict scoring, germination bias writes). Adaptive Steward adds 0 calls under Fork 1 Option A (exact match) or Haiku-tier calls under Option C. Executor Mesh Tier 2 is call-neutral per UoW (same as Tier 1, higher cache rate). Closed-Loop Self-Amendment adds 0–1 Sonnet call per weekly run. Orientation Layer Governor adds 1 Sonnet + 3–5 Haiku calls per weekly run. The call budget of the evolved system scales primarily with UoW throughput, not with component count.
+
+**Metabolic taxonomy extensions:** Pearl from Adaptive Steward = hypothesis with > 0.7 success rate after 5+ observations. Heat from Adaptive Steward = hypothesis that churns (equal success/failure, never converges). Heat from Event-Native = events that trigger germination but produce no executed UoW (queue-filling without execution). Heat from Governor = a PortfolioPrescription that changes germination biases but not the actual metabolic output distribution. Shit from Self-Amendment = a Class A amendment that Dan manually reverts.
+
+**Five new heat-generating attractors (not present in current system):**
+
+1. **Churn Basin** (Adaptive Steward): Semantic variation in hypothesis strings fills the verdict_accumulator with low-observation-count rows that never converge. Detection: > 100 distinct hypotheses per register with mean observations < 5. Remediation: Fork 1 resolution (embedding clustering).
+
+2. **Excitable Germinator** (Event-Native): Issue bursts drive germination faster than execution capacity. Pending queue exceeds 5x max_parallel, generating observation-loop calls against a stale queue. Detection: queue-depth ratio > 5x for > 30 minutes. Remediation: germination rate cap at `max_parallel * 3` per 30-second window.
+
+3. **Philosophical Flywheel** (Orientation Layer Governor): Well-formed portfolio prescriptions that change germination_bias vectors but produce no measurable shift in metabolic output distribution. Detection: KL divergence between prescribed and actual germination distribution > 0.3 across 2 consecutive runs. Remediation: increase Socratic advisor minimum questions; require at least one question challenging the prior prescription's outcomes.
+
+4. **Rulemaker's Loop** (Closed-Loop Self-Amendment): Amendment generator proposes multiple Class A changes per week, producing an unstable IFTTT rule set that changes routing behavior, which generates new verdict patterns, which generates new proposals. Detection: > 3 Class A amendments auto-applied in one weekly run. Remediation: hard cap of 2 Class A amendments per weekly run; excess queued for next cycle.
+
+5. **Knowledgeable Stranger** (Executor Mesh Tier 2): Persistent domain agent accumulates stale context. Outputs are domain-confident but based on outdated architectural state. Detection: state_file_age_days > 45 on failure or partial outcome. Remediation: mandatory context refresh step for any Tier 2 activation with state file age > 14 days.
+
+**Observability dashboard (6 metrics):** Call volume week-over-week change | Outcome yield (pearl+seed vs. heat+shit ratio, heat target < 30%, shit target < 5%) | Verdict accumulator health (hypotheses-per-register vs. mean-observations-per-hypothesis) | Germination queue depth (queue / max_parallel ratio) | Governor effectiveness (germination_bias L1 change + prescribed-vs-actual KL divergence) | Amendment rate (Class A applied per week + Class B unanswered count).
+
+**Spine-first invariant:** Every LLM-consuming component has a fully testable non-LLM path. The LLM contribution is the gap between mock-LLM scaffold output and live output. If that gap cannot be measured, the component is not metabolically observable. All five evolved components satisfy this invariant as specified.
