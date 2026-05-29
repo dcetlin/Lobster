@@ -467,3 +467,121 @@ Class C → system writes diagnosis artifact → waits → human diagnoses and a
 **Class C minimum artifact** (written to `~/lobster-workspace/assessments/wos-failures/class-c-<timestamp>.md`): observable symptoms, what recovery was attempted, complete state snapshot (relevant DB rows, config values, recent audit_log), system's best hypothesis (may be empty), and explicit list of what a human needs to read to diagnose. Self-contained — no additional query tools required.
 
 **Key design invariants:** No silent state mutation. Amendment gate closed during recovery windows. Escalation is bounded. Class C artifacts are self-contained. Substrate instability is surfaced, not worked around. The amendment logic cannot amend itself (Class A cannot modify `CLASS_A_ALLOWED_COMPONENTS`).
+
+---
+
+## §10 Worked Examples — Flow Traces
+
+*Full examples with failure modes: `~/lobster-workspace/workstreams/wos-evolution-spec/worked-examples.md`. Happy-path flow traces condensed here.*
+
+### Example 1: Implement the Adaptive Steward Verdict Accumulation Schema (self-improvement)
+
+```
+1. GitHub issue #1401 opened ("verdict_accumulator schema + scoring hook")
+   → delta poller detects within 30s → emits wos_issue_created event
+
+2. Governor reads portfolio_prescription: workstream:wos weight=1.8 (accelerated)
+   → writes germination_bias(issue=1401, multiplier=1.8)
+   → Germinator promotes immediately (not at next 15-min window)
+
+3. Germinator: classify_register → iterative-convergent
+   (bounded output, concrete artifact, convergent spec target)
+   → uow_registry INSERT: uow_20260529_verdict_schema
+
+4. Adaptive Steward: Selector queries verdict_accumulator for register=iterative-convergent
+   → top prior: "Schema migration task: provide full SQL + upgrade.sh step" (success_rate=1.00)
+   → PrescriptionObject generated (Sonnet, confidence=0.88)
+   → diagnosis_hypothesis injected from prior → 8 concrete steps
+   → prescription_hypothesis_log INSERT
+
+5. wos_capacity_available event (prior slot freed) → Tier 1 executor dispatched
+   → subagent: reads schema.sql, writes verdict_accumulator + prescription_hypothesis_log tables,
+     upgrade.sh migration step, score_prescription_hypothesis(), _close_uow hook, unit tests
+   → PR #1402 opened → write_result()
+
+6. Oracle: VERDICT: APPROVED → merge agent merges PR #1402
+
+7. _close_uow(outcome='success') → score_prescription_hypothesis() called
+   → verdict_accumulator UPSERT: n_successes +1 for the schema migration hypothesis
+   → Selector now has stronger prior for future schema tasks
+
+Dan saw: nothing. PR merged autonomously in ~35 minutes from issue creation.
+```
+
+### Example 2: Write and publish "What autopoietic task execution actually means for a solo builder"
+
+```
+1. Dan messages Lobster: "i want to write up a piece on autopoietic task execution..."
+   → dispatcher classifies: human-judgment register (creative, open-ended, requires Dan's voice)
+   → uow_registry INSERT: uow_20260529_autopoiesis_essay
+
+2. Governor: workstream:writing weight=1.2 (elevated)
+   → germination_bias applied
+
+3. Adaptive Steward: Selector queries human-judgment register
+   → top prior: "Creative writing: extract Dan's existing vocabulary before drafting" (rate=0.75)
+   → PrescriptionObject: confidence=0.70 (creative register has higher variance)
+   → proposed_steps include: vocabulary extraction → structure outline → surface for approval
+     → draft on approval → surface for review → publish on approval
+
+4. Tier 1 executor dispatched:
+   → searches user.base.context.md + writing-style-distillation workstream
+   → extracts Dan's vocabulary: "underlying pattern", "poiesis/poiema", "form the concept requires"
+   → produces 200-word vocabulary digest + proposed 5-section structure
+
+5. Executor surfaces structure to Dan via Telegram (human-judgment checkpoint)
+   Dan replies: "yes, section 3 is the heart — start there"
+
+6. Executor produces ~900-word draft in Dan's register
+   → surfaces to Dan for review → Dan edits and approves
+
+7. Publisher pipeline posts to dancetlin.com
+
+8. UoW closes outcome='success'
+   → verdict_accumulator: vocabulary-extraction hypothesis n_successes +1
+
+Dan saw: structure proposal (approved), draft (approved). Everything else autonomous.
+```
+
+### Example 3: Diagnose why 33+ dispatcher restarts occurred without root cause
+
+```
+1. Health monitor detects 5 new restarts in 24h → promotes GitHub issue #1398
+   → wos_issue_created event emitted
+
+2. Governor: lobster-core weight=1.0 but health_flags=[restart_total=33, prior_diagnoses=4]
+   → effective germination_bias elevated to 1.6 (health flag override)
+
+3. Germinator: iterative-convergent with annotation diagnostic_complexity=high
+   (four prior failures → not standard operational)
+
+4. Adaptive Steward: Selector queries verdict_accumulator for diagnostic hypothesis types
+   → all prior diagnostic hypotheses have success_rate < 0.40
+   → Selector surfaces failure pattern as signal: "prior approaches have low success rates"
+   → Prescriber (Opus, cycle 2+): adopts meta-diagnostic approach
+   → PrescriptionObject: confidence=0.52, hypothesis="Meta-diagnostic: enumerate prior
+     hypotheses and their specific failure modes before generating new hypothesis"
+   → proposed_steps include: read all prior attempts, map specific failure modes,
+     build differential table, surface to Dan — do NOT close autonomously
+
+5. Tier 1 executor: reads crash-rootcause workstream, maps 4 prior failure modes,
+   identifies evidence gap (no stack trace at restart time),
+   produces differential table with 6 candidate causes
+
+6. Executor surfaces differential table to Dan: "which hypothesis should we instrument?"
+   Dan replies: "add stack capture + look at steward-heartbeat correlation"
+
+7. Stack capture added → next restart produces trace → root cause identified:
+   dispatcher dies in wait_for_messages when MCP restarts under it
+
+8. UoW closes outcome='partial' (required human-judgment checkpoint)
+   → verdict_accumulator: meta-diagnostic hypothesis n_partial +1
+   → Selector learns: for high-failure-count diagnostics, meta-diagnostic approach
+     outperforms direct hypothesis generation
+
+Dan saw: differential table (directed next step), root cause notification when found.
+Self-amendment: persistent dispatcher-restart-observer cron job proposed and approved
+after pattern shows 5 diagnostic cycles requiring same observation gap workaround.
+```
+
+*Full trace including failure modes, verdict accumulation details, and Closed-Loop Self-Amendment flows: `~/lobster-workspace/workstreams/wos-evolution-spec/worked-examples.md`*
