@@ -417,3 +417,53 @@ messages = [{
 **Observability dashboard (6 metrics):** Call volume week-over-week change | Outcome yield (pearl+seed vs. heat+shit ratio, heat target < 30%, shit target < 5%) | Verdict accumulator health (hypotheses-per-register vs. mean-observations-per-hypothesis) | Germination queue depth (queue / max_parallel ratio) | Governor effectiveness (germination_bias L1 change + prescribed-vs-actual KL divergence) | Amendment rate (Class A applied per week + Class B unanswered count).
 
 **Spine-first invariant:** Every LLM-consuming component has a fully testable non-LLM path. The LLM contribution is the gap between mock-LLM scaffold output and live output. If that gap cannot be measured, the component is not metabolically observable. All five evolved components satisfy this invariant as specified.
+
+---
+
+## §9 Failure Mode Taxonomy and Self-Healing Design
+
+*Full section: `~/lobster-workspace/workstreams/wos-evolution-spec/failure-modes.md`. Key taxonomy and escalation chain condensed here.*
+
+**Failure class definitions:** Class A = system-diagnosable, automatable recovery, no human needed. Class B = system-detectable, requires human decision before recovery. Class C = requires human diagnosis, system cannot determine root cause.
+
+**Failure mode taxonomy by evolution direction (selected high-consequence modes):**
+
+| Evolution Direction | Failure Mode | Class | Recovery Signal |
+|---|---|---|---|
+| Adaptive Steward | Accumulator stale — scoring hook not called on UoW close | A | Daily integrity check; backfill job |
+| Adaptive Steward | Coupled Goodhart — Prescriber+Executor optimize same signal | B | Outcome yield metric degrades while verdict scores rise |
+| Adaptive Steward | Register drift — UoW reclassified mid-execution | B | Mismatch between prescription register and closure register |
+| Event-Native | Delta poller crash — since-cursor not advanced | A | Heartbeat file monitor; restart + dedup via event_log |
+| Event-Native | Heartbeat backstop disabled while event pipeline fails silently | B | No steward activity for >6 min with event_native_active=true |
+| Event-Native | Inbox saturation — event burst delays user messages | B | Queue depth threshold alert |
+| Executor Mesh | Claim race — duplicate execution | A | Atomic DB UPDATE; losing executor aborts cleanly |
+| Executor Mesh | Claim timeout — executor claimed but did not execute | A | Orphan sweep with claim_ttl; escalate after 3 timeouts |
+| Executor Mesh | Tier 2 context drift — domain agent holds stale architectural context | B | State file age check at Tier 2 activation |
+| Self-Amendment | Scope escape — amendment targets non-allowed component | A | PermissionError guard; immediate Class B escalation |
+| Self-Amendment | Amendment loop — runaway cycle of proposals and applications | A | >3 amendments in 60s → cooldown; second loop → Class B |
+| Self-Amendment | Recovery window intersection — two mutations to same config scope | A | in_progress flag check before amendment application |
+| Orientation Layer | Governor prescription staleness — weekly run failed | B | generated_at age check; >14 days → neutral bias reset + alert |
+| Orientation Layer | Telos drift — portfolio prescription drifts from Dan's actual priorities | B | No automated detection; requires periodic human review |
+| Orientation Layer | Socratic constraint break — advisor issues directive | B | Output validator; question count enforcement |
+
+**Substrate concern — 33+ undiagnosed dispatcher restarts:** An unstable substrate amplifies every layer. The highest-consequence intersection is Closed-Loop Self-Amendment: a restart mid-amendment can leave config partially modified. Design requirements: (1) all Class A recovery actions must be re-entrant and idempotent; (2) recovery state is persisted before action is taken; (3) self-amendment is gated from firing during active recovery windows (`recovery_in_progress` flag in `wos-config.json`); (4) substrate instability is itself a Class B failure mode tracked by restart frequency. **Recommendation: do not enable Class A self-amendment until dispatcher restart rate is below 1 per 7 days over a 30-day window.**
+
+**Escalation chain (bounded — every path terminates):**
+
+```
+Class A detected → automated recovery → success: log and continue
+                                      → timeout/retry exhausted → Class B
+
+Class B surfaced to Dan → Dan approves proposed action → execute + log
+                        → Dan rejects or cannot determine → Class C
+
+Class C → system writes diagnosis artifact → waits → human diagnoses and applies fix
+       → human confirms resolution → log with human_resolved = True
+       [No further automated attempts. No Class D.]
+```
+
+**Class B timeout:** Dan non-response at 48h → reminder. At 96h → escalate to Class C, write diagnosis artifact. System does not act autonomously on unacknowledged Class B.
+
+**Class C minimum artifact** (written to `~/lobster-workspace/assessments/wos-failures/class-c-<timestamp>.md`): observable symptoms, what recovery was attempted, complete state snapshot (relevant DB rows, config values, recent audit_log), system's best hypothesis (may be empty), and explicit list of what a human needs to read to diagnose. Self-contained — no additional query tools required.
+
+**Key design invariants:** No silent state mutation. Amendment gate closed during recovery windows. Escalation is bounded. Class C artifacts are self-contained. Substrate instability is surfaced, not worked around. The amendment logic cannot amend itself (Class A cannot modify `CLASS_A_ALLOWED_COMPONENTS`).
