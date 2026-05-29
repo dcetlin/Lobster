@@ -446,7 +446,7 @@ messages = [{
 | Orientation Layer | Telos drift — portfolio prescription drifts from Dan's actual priorities | B | No automated detection; requires periodic human review |
 | Orientation Layer | Socratic constraint break — advisor issues directive | B | Output validator; question count enforcement |
 
-**Substrate concern — 33+ undiagnosed dispatcher restarts:** An unstable substrate amplifies every layer. The highest-consequence intersection is Closed-Loop Self-Amendment: a restart mid-amendment can leave config partially modified. Design requirements: (1) all Class A recovery actions must be re-entrant and idempotent; (2) recovery state is persisted before action is taken; (3) self-amendment is gated from firing during active recovery windows (`recovery_in_progress` flag in `wos-config.json`); (4) substrate instability is itself a Class B failure mode tracked by restart frequency. **Recommendation: do not enable Class A self-amendment until dispatcher restart rate is below 1 per 7 days over a 30-day window.**
+**Substrate concern — 33+ undiagnosed dispatcher restarts:** An unstable substrate amplifies every layer. The highest-consequence intersection is Closed-Loop Self-Amendment: a restart mid-amendment can leave config partially modified. Design requirements: (1) all Class A recovery actions must be re-entrant and idempotent; (2) recovery state is persisted before action is taken; (3) self-amendment is gated from firing during active recovery windows (`recovery_in_progress` flag in `wos-config.json`); (4) substrate instability is itself a Class B failure mode tracked by restart frequency. **Class A self-amendment is disabled by default. Activation requires an explicit operator decision that the dispatcher substrate is stable — this is a judgment call, not a checkable condition. There is no metric threshold that confers readiness; the ordering constraint (substrate stability before self-amendment) is load-bearing, but the determination of stability belongs to the operator, not to an algorithm.**
 
 **Escalation chain (bounded — every path terminates):**
 
@@ -470,121 +470,216 @@ Class C → system writes diagnosis artifact → waits → human diagnoses and a
 
 ---
 
-## §10 Worked Examples — Flow Traces
+## §10 Worked Examples — Canonical Scenarios
 
-*Full examples with failure modes: `~/lobster-workspace/workstreams/wos-evolution-spec/worked-examples.md`. Happy-path flow traces condensed here.*
+Four scenarios chosen for register divergence. Each exposes a different face of the architecture. The synthesis section at the end finds what only becomes visible when you look across all four.
 
-### Example 1: Implement the Adaptive Steward Verdict Accumulation Schema (self-improvement)
+---
 
-```
-1. GitHub issue #1401 opened ("verdict_accumulator schema + scoring hook")
-   → delta poller detects within 30s → emits wos_issue_created event
+### Scenario A: Paper/Book Consumption → First-Principles Learning Partner
 
-2. Governor reads portfolio_prescription: workstream:wos weight=1.8 (accelerated)
-   → writes germination_bias(issue=1401, multiplier=1.8)
-   → Germinator promotes immediately (not at next 15-min window)
+Dan pastes the text of a dense academic paper on distributed systems consensus. No explicit ask — just the text, arriving as a Telegram message.
 
-3. Germinator: classify_register → iterative-convergent
-   (bounded output, concrete artifact, convergent spec target)
-   → uow_registry INSERT: uow_20260529_verdict_schema
+**Signal arrival and dispatch path**
 
-4. Adaptive Steward: Selector queries verdict_accumulator for register=iterative-convergent
-   → top prior: "Schema migration task: provide full SQL + upgrade.sh step" (success_rate=1.00)
-   → PrescriptionObject generated (Sonnet, confidence=0.88)
-   → diagnosis_hypothesis injected from prior → 8 concrete steps
-   → prescription_hypothesis_log INSERT
+The dispatcher classifies this as a human-judgment UoW: open-ended input, no bounded output artifact, requires Dan's voice and cognitive engagement to have value. It is not iterative-convergent (there is no correct answer to converge toward) and not operational (no system artifact is being produced). A UoW is registered with `register=human-judgment`, `domain_hint=academic-ingestion`.
 
-5. wos_capacity_available event (prior slot freed) → Tier 1 executor dispatched
-   → subagent: reads schema.sql, writes verdict_accumulator + prescription_hypothesis_log tables,
-     upgrade.sh migration step, score_prescription_hypothesis(), _close_uow hook, unit tests
-   → PR #1402 opened → write_result()
+The Governor's active portfolio prescription has `workstream:learning weight=1.4` (Dan recently expressed intent to engage more with first-principles material). `germination_bias` elevates the UoW to immediate steward attention.
 
-6. Oracle: VERDICT: APPROVED → merge agent merges PR #1402
+**Adaptive Steward: Selector and Prescriptor**
 
-7. _close_uow(outcome='success') → score_prescription_hypothesis() called
-   → verdict_accumulator UPSERT: n_successes +1 for the schema migration hypothesis
-   → Selector now has stronger prior for future schema tasks
+The Selector queries `verdict_accumulator` filtered to `register=human-judgment` and `domain_hint=academic-ingestion`. It finds a prior hypothesis cluster: "Do not summarize. Reconstruct the conceptual spine — relationships, taxonomies, and the one load-bearing claim — then build a query surface for interactive exploration." Success rate: 0.81 across 11 observations. Confidence is meaningfully high for a human-judgment register, which typically shows higher variance.
 
-Dan saw: nothing. PR merged autonomously in ~35 minutes from issue creation.
-```
+The Prescriptor generates a PrescriptionObject with `confidence=0.78`. The proposed steps do not produce a summary. They produce:
+1. Adaptive chunking by conceptual density (not page count or token count)
+2. Taxonomy and relationship reconstruction — what does the paper assume, what does it establish, how do these relate
+3. One-sentence spine: the load-bearing claim the entire structure depends on
+4. Query-optimized foundation — a structured artifact Dan can interrogate, not read
 
-### Example 2: Write and publish "What autopoietic task execution actually means for a solo builder"
+The PrescriptionObject includes `counterfactual_question`: "What would it mean for this prescription to fail? If Dan asks a follow-up question and the answer requires re-reading the paper rather than consulting the constructed artifact, the prescription failed."
 
-```
-1. Dan messages Lobster: "i want to write up a piece on autopoietic task execution..."
-   → dispatcher classifies: human-judgment register (creative, open-ended, requires Dan's voice)
-   → uow_registry INSERT: uow_20260529_autopoiesis_essay
+**Executor Mesh tier**
 
-2. Governor: workstream:writing weight=1.2 (elevated)
-   → germination_bias applied
+Tier 1 local subagent handles chunking and reconstruction. This is pure cognitive work with no specialized codebase context required. A Tier 2 agent is not invoked.
 
-3. Adaptive Steward: Selector queries human-judgment register
-   → top prior: "Creative writing: extract Dan's existing vocabulary before drafting" (rate=0.75)
-   → PrescriptionObject: confidence=0.70 (creative register has higher variance)
-   → proposed_steps include: vocabulary extraction → structure outline → surface for approval
-     → draft on approval → surface for review → publish on approval
+The executor produces: a taxonomy of the paper's conceptual structure, a relationship map of its key claims, the one-sentence spine, and an explicit annotation of what the paper does not address (the productive gaps). It surfaces this to Dan with a single message: "Spine reconstructed. What do you want to pull on first?"
 
-4. Tier 1 executor dispatched:
-   → searches user.base.context.md + writing-style-distillation workstream
-   → extracts Dan's vocabulary: "underlying pattern", "poiesis/poiema", "form the concept requires"
-   → produces 200-word vocabulary digest + proposed 5-section structure
+**Failure surface for this scenario**
 
-5. Executor surfaces structure to Dan via Telegram (human-judgment checkpoint)
-   Dan replies: "yes, section 3 is the heart — start there"
+The failure mode specific to academic ingestion is hypothesis echo: the executor produces a reorganized summary that uses the paper's own vocabulary, which feels like a reconstruction but is actually paraphrase. Detection signal: Dan's follow-up questions can be answered by quoting the paper rather than by reasoning from the constructed structure. The verdict scoring hook would record this as `outcome=partial` — technically complete but failing the counterfactual test.
 
-6. Executor produces ~900-word draft in Dan's register
-   → surfaces to Dan for review → Dan edits and approves
+**Escalation path**
 
-7. Publisher pipeline posts to dancetlin.com
+If the reconstruction produces something Dan finds useless ("this is just a summary with extra steps"), he says so. The UoW is not re-dispatched immediately — this is a human-judgment register where escalation is informational, not prescriptive. The Prescriptor notes the failure, generates a revised hypothesis, and surfaces it to Dan: "The spine reconstruction approach failed here. Next attempt would use X instead — should I try again?" Dan decides.
 
-8. UoW closes outcome='success'
-   → verdict_accumulator: vocabulary-extraction hypothesis n_successes +1
+**Verdict accumulation**
 
-Dan saw: structure proposal (approved), draft (approved). Everything else autonomous.
-```
+`prescription_hypothesis_log` records the hypothesis. On close (whether Dan engages productively or signals failure), `score_prescription_hypothesis` is called. A successful interactive exchange where Dan's follow-up questions are answered without re-reading increments `n_successes`. A paraphrase outcome increments `n_partial`. Over time, the Selector learns to inject the counterfactual test into the prescription prompt automatically, not as an afterthought.
 
-### Example 3: Diagnose why 33+ dispatcher restarts occurred without root cause
+**Distinguishing insight**
 
-```
-1. Health monitor detects 5 new restarts in 24h → promotes GitHub issue #1398
-   → wos_issue_created event emitted
+This scenario reveals that the human-judgment register requires a fundamentally different success metric than the other registers. There is no oracle gate here — there is no correct output to approve. Success is Dan's productive engagement. The verdict accumulator must score against a qualitative criterion (did the artifact support first-principles reasoning?) rather than a binary outcome (did the PR merge?). This is the scenario that most clearly demands the Prescriptor include an explicit `counterfactual_question` field — not as documentation, but as the scoring instrument.
 
-2. Governor: lobster-core weight=1.0 but health_flags=[restart_total=33, prior_diagnoses=4]
-   → effective germination_bias elevated to 1.6 (health flag override)
+---
 
-3. Germinator: iterative-convergent with annotation diagnostic_complexity=high
-   (four prior failures → not standard operational)
+### Scenario B: Multi-Register Product Feature Reasoning
 
-4. Adaptive Steward: Selector queries verdict_accumulator for diagnostic hypothesis types
-   → all prior diagnostic hypotheses have success_rate < 0.40
-   → Selector surfaces failure pattern as signal: "prior approaches have low success rates"
-   → Prescriber (Opus, cycle 2+): adopts meta-diagnostic approach
-   → PrescriptionObject: confidence=0.52, hypothesis="Meta-diagnostic: enumerate prior
-     hypotheses and their specific failure modes before generating new hypothesis"
-   → proposed_steps include: read all prior attempts, map specific failure modes,
-     build differential table, surface to Dan — do NOT close autonomously
+Dan asks: "Should we add real-time collaboration to the Bisque editor? I want to reason through the full picture before deciding."
 
-5. Tier 1 executor: reads crash-rootcause workstream, maps 4 prior failure modes,
-   identifies evidence gap (no stack trace at restart time),
-   produces differential table with 6 candidate causes
+**Signal arrival and dispatch path**
 
-6. Executor surfaces differential table to Dan: "which hypothesis should we instrument?"
-   Dan replies: "add stack capture + look at steward-heartbeat correlation"
+The dispatcher immediately sees multi-register texture: "full picture" signals Dan wants technical, product, and strategic reasoning simultaneously. This is not a bounded implementation task (no artifact to produce), not a diagnostic task, and not creative writing. It sits at the intersection of iterative-convergent (there is a decision to converge toward) and human-judgment (the decision is Dan's, not the system's). The UoW is registered as `register=iterative-convergent` with `domain_hint=product-reasoning` and an annotation that flags multi-register requirement.
 
-7. Stack capture added → next restart produces trace → root cause identified:
-   dispatcher dies in wait_for_messages when MCP restarts under it
+**Adaptive Steward: Selector and Prescriptor**
 
-8. UoW closes outcome='partial' (required human-judgment checkpoint)
-   → verdict_accumulator: meta-diagnostic hypothesis n_partial +1
-   → Selector learns: for high-failure-count diagnostics, meta-diagnostic approach
-     outperforms direct hypothesis generation
+The Selector finds prior hypotheses tagged `multi-register-product-reasoning`. The highest-scoring one: "Decompose into three explicit register traces before synthesizing. Technical trace first (implementation surface and constraints), product trace second (UX, edge cases, real user scenarios), strategic trace third (directional alignment, opportunity cost, what this forecloses). Synthesis only after all three traces complete." Success rate: 0.74 across 6 observations.
 
-Dan saw: differential table (directed next step), root cause notification when found.
-Self-amendment: persistent dispatcher-restart-observer cron job proposed and approved
-after pattern shows 5 diagnostic cycles requiring same observation gap workaround.
-```
+The Prescriptor generates a PrescriptionObject with `confidence=0.71`. The three register traces are not optional stages to work through sequentially — they are genuinely different reasoning contexts that must each be run to completion before synthesis. The PrescriptionObject names the specific questions for each register:
 
-*Full trace including failure modes, verdict accumulation details, and Closed-Loop Self-Amendment flows: `~/lobster-workspace/workstreams/wos-evolution-spec/worked-examples.md`*
+- Technical: What is the implementation surface? What does real-time collaboration require at the infrastructure level? What breaks if this is added incrementally vs. designed in?
+- Product: What does a user actually experience when a feature is "collaborative"? What are the failure modes that only appear with two users? What problems does this solve that users currently work around?
+- Strategic: Does this open a capability that accelerates other planned work, or does it fork the architecture? What does this foreclose? Is the timing right for the current user base?
+
+**Executor Mesh tier**
+
+Tier 1 handles the initial register traces — no persistent domain context is needed for reasoning about a product decision. However, if the Bisque codebase has a Tier 2 domain agent with accumulated architectural context, the technical trace is routed there first. The Tier 2 agent can answer "what breaks at the infrastructure level" with specificity that a Tier 1 agent cannot — it has seen the architecture across multiple tasks.
+
+If no Tier 2 agent is active, the Tier 1 executor reads the relevant codebase sections and produces the technical trace from first principles. Lower fidelity, but still valid.
+
+The three traces are surfaced to Dan as a single structured artifact, not as three separate messages. Dan sees: technical constraints (3-4 bullet points), product texture (2-3 scenarios including edge cases), strategic alignment assessment. Then: "Where do you want to go deeper?"
+
+**Failure surface for this scenario**
+
+The failure specific to multi-register reasoning is register collapse: the executor produces a technically-framed answer that borrows product and strategic vocabulary but reasons only from implementation constraints. The product and strategic registers are present as labels but absent as genuine reasoning frames. Detection: Dan's follow-up probes the product register and gets technical reasoning in response. Verdict: `outcome=partial`, hypothesis flagged for review.
+
+**Escalation path**
+
+If Dan signals that a register was missed ("you didn't actually reason about the UX, you just said it's complex"), the UoW is not closed. The executor returns with a corrected trace for that register. This is not a failure escalation — it is an in-flight correction within the human-judgment interaction loop.
+
+**Verdict accumulation**
+
+The verdict accumulates per hypothesis per register. A multi-register scenario generates a richer verdict signal than single-register scenarios: the scoring hook can record which registers were successful and which collapsed. Over time, the Selector learns to weight the register-decomposition hypothesis more heavily for product-reasoning requests.
+
+**Distinguishing insight**
+
+This scenario is the one that reveals the mismatch between the UoW register classification system (designed for single-register routing) and the reality of Dan's most important decisions (which span registers). The scenario exposes that register is a routing attribute, not a description of the work. Multi-register work cannot be correctly classified as any single register — the current four-gate classifier will collapse it to iterative-convergent and lose the human-judgment texture. The architecture needs a `multi_register` flag or an explicit multi-register routing mode. This is the design gap that only becomes visible in this scenario.
+
+---
+
+### Scenario C: GitHub Repo Audit
+
+Dan provides a GitHub repo URL: a small open-source system for managing structured notes with CLI and sync features.
+
+**Signal arrival and dispatch path**
+
+The dispatcher recognizes this as an iterative-convergent UoW: there is a bounded output artifact (an audit report), a concrete starting state (the repo), and a convergent target (a set of findings). The UoW is registered with `register=iterative-convergent`, `domain_hint=repo-audit`, `input_ref=github.com/example/structured-notes`.
+
+No GitHub issue exists — this was a direct message from Dan. The Germinator creates the UoW directly without a cultivation phase.
+
+**Adaptive Steward: Selector and Prescriptor**
+
+The Selector finds prior hypotheses for `register=iterative-convergent, domain_hint=repo-audit`. The highest-scoring cluster: "Audit in the multi-registered language developed for Lobster architecture. Spine-first: what is this system's load-bearing idea? Then: what patterns parallel Lobster's architecture, where would they integrate, what would need to change? Surface things Dan isn't thinking about — not confirmation of what he already suspects." Success rate: 0.86 across 4 observations.
+
+The PrescriptionObject structures the audit into four explicit traces:
+1. Spine extraction: the one load-bearing architectural idea the system is organized around
+2. Internal pattern extraction: data structures, execution model, state management patterns, any novel approaches
+3. Parallel assessment: where does this overlap with Lobster's architecture? Where does it diverge in interesting ways?
+4. High-leverage candidates: specific implementation ideas or patterns that could accelerate Lobster's directional trajectory — ranked by leverage, not by complexity
+
+The PrescriptionObject's `counterfactual_question`: "If the output is a list of features Dan could have discovered by reading the README, the prescription failed. The audit must surface structure the README does not make visible."
+
+**Executor Mesh tier**
+
+This is a strong Tier 2 candidate if a `lobster-codebase` domain agent exists. The parallel assessment (trace 3) requires genuine knowledge of Lobster's current architecture — a Tier 1 agent must read the architecture from scratch on each invocation. A Tier 2 agent with accumulated codebase context can assess parallels with the specificity and depth that makes the audit genuinely useful.
+
+If Tier 2 is active: the Tier 2 agent claims the UoW, loads its domain state file (accumulated architectural patterns from prior tasks), reads the target repo, and runs all four traces with architectural grounding. If Tier 2 is not active: Tier 1 reads the lobster codebase first, which costs additional compute but produces a valid result.
+
+The output is a structured audit artifact, not a prose report. Dan sees a section for each trace, with specific file-level references where relevant, and a ranked list of high-leverage candidates with one-sentence rationale each.
+
+**Failure surface for this scenario**
+
+The failure specific to repo audits is surface reading: the executor lists the repo's features, describes what it does, and labels this an audit. The spine is not extracted, the architectural patterns are described in isolation rather than assessed for parallel value, and the high-leverage candidates are the obvious ones Dan already knows from the README. Detection: the `counterfactual_question` test fails — the output could have been produced by reading the README. Verdict: `n_failures` incremented, hypothesis flagged.
+
+A second failure mode is stale Tier 2 context: the domain agent has accumulated Lobster architecture patterns from six weeks ago, before a significant refactor. Its parallel assessment references modules that no longer exist in their prior form. Detection: state file age at Tier 2 activation. If `state_file_age_days > 14`, the Tier 2 agent runs a mandatory context refresh before proceeding.
+
+**Escalation path**
+
+If the audit surfaces a pattern that has significant integration implications — something that would require architectural changes to Lobster rather than additive implementation — the executor flags this as a human-judgment escalation point and surfaces it explicitly before completing the audit artifact. Dan decides whether to pursue it before the audit continues.
+
+**Verdict accumulation**
+
+The audit hypothesis scores particularly well on the `counterfactual_question` criterion. If Dan's response is "I didn't know about the state management pattern in X — that's directly applicable," the verdict is `n_successes`. If Dan says "this is just a feature list," the verdict is `n_failures`. Over time, the Selector learns that the `counterfactual_question` formulation is load-bearing for repo-audit hypotheses — it prevents surface-reading outputs from scoring as success.
+
+**Distinguishing insight**
+
+This scenario is the one that reveals the difference between Tier 1 and Tier 2 value in the most concrete terms. The parallel assessment requires genuine architectural memory — it cannot be done well from a cold start on every invocation. This scenario makes visible why persistent domain agents are not just an efficiency optimization (fewer tokens re-read) but a qualitative capability upgrade: the comparison between two architectures is only as good as the depth of knowledge about each. The Executor Mesh's tier routing decision has first-order effects on output quality, not just latency.
+
+---
+
+### Scenario D: Website Iteration with Visual Pattern Language Development
+
+Dan wants to iterate the dancetlin.com homepage toward a cleaner visual identity. He has a strong artistic sensibility but does not yet have explicit vocabulary for what he's going for.
+
+**Signal arrival and dispatch path**
+
+The dispatcher sees open-ended aesthetic work with high ambiguity. No bounded output artifact can be stated from the message alone. This is human-judgment register: the domain is aesthetic, the success criterion is qualitative approval, and the system cannot close this UoW autonomously. The UoW is registered with `register=human-judgment`, `domain_hint=visual-design-iteration`, `ambiguity=high`.
+
+The Governor's portfolio prescription has `workstream:dan-site weight=0.9` (neutral, no special acceleration). Germination proceeds at baseline.
+
+**Adaptive Steward: Selector and Prescriptor**
+
+The Selector finds prior hypotheses for `register=human-judgment, domain_hint=visual-design`. The hypothesis pool is thin — this register-domain combination has low observation count. The Selector surfaces a low-confidence cluster: "High-ambiguity aesthetic work: do not produce outputs before building vocabulary. Pose specific questions about reference points, then articulate back what you heard before generating options." Confidence: 0.62, n_observations=3.
+
+The PrescriptionObject reflects this uncertainty explicitly: `confidence=0.58`, `counterfactual_question`: "If Dan sees the first options and says 'not quite, but I can't explain why,' the vocabulary phase failed. The test is whether Dan can use the vocabulary we built together to articulate what's wrong."
+
+The prescribed steps:
+1. Vocabulary phase: ask Dan about reference points (specific sites, images, objects) — not "what style do you like" but "what does this site make you feel, and what else makes you feel that?" Articulate back what you heard in a compact vocabulary (5-7 terms).
+2. Dan confirms or corrects the vocabulary
+3. Generate 3 wireframe-level options using the confirmed vocabulary as explicit design criteria
+4. For each option, name which vocabulary term it is optimizing for — making the design reasoning transparent
+5. Dan selects or hybrid-combines; iteration proceeds from there
+
+**Executor Mesh tier**
+
+Tier 1 handles the vocabulary phase and wireframe generation. No specialized codebase context is required. Wireframes are produced as structured text descriptions (since the executor cannot generate images directly) or as HTML/CSS scaffolds that approximate the visual direction.
+
+If external visual generation tooling is available as a Tier 3 executor (image generation via contract protocol), the wireframe step routes there. The Tier 3 executor accepts the vocabulary terms as structured input and returns visual options. The claim protocol governs the handoff: the UoW's vocabulary artifact is passed as `input_ref`; the Tier 3 executor returns an `output_ref` pointing to generated images.
+
+**Failure surface for this scenario**
+
+The failure specific to visual design iteration is vocabulary shortcut: the executor skips the vocabulary phase and produces options based on its own aesthetic judgment, framed as responsive to what Dan said. Dan sees options he didn't ask for, expressed in design language he didn't generate. He can't explain what's wrong with them because he has no vocabulary to do so — which is exactly what the vocabulary phase was meant to prevent. Detection: Dan's feedback is in the form of "I don't know, it's just not right." Verdict: `n_failures`, vocabulary phase flagged as load-bearing.
+
+A second failure mode: vocabulary overcapture. The executor produces a vocabulary that is too abstract ("this site has energy" / "that site feels grounded") and cannot function as a design criterion. The wireframes cannot be evaluated against it because it is not actionable. Detection: Dan approves the vocabulary but cannot use it to choose between options. Verdict: `n_partial`.
+
+**Escalation path**
+
+This scenario is the most likely to require multiple human checkpoints before the UoW can close. The human-judgment register inherently cannot be closed without Dan's explicit approval at each phase. The escalation path is not a failure path — it is the designed interaction loop. The system surfaces vocabulary, waits, surfaces options, waits, iterates. Autonomy here is defined differently: not "closes without Dan" but "does not require Dan to manage the process."
+
+**Verdict accumulation**
+
+The verdict accumulates per hypothesis phase. The vocabulary-phase hypothesis is scored separately from the wireframe-generation hypothesis. This scenario generates the most granular verdict signal of the four — each phase is a distinct prescription that can succeed or fail independently. Over time, the Selector learns that the vocabulary phase is not optional for aesthetic work, regardless of how quickly Dan seems to want to see options.
+
+**Distinguishing insight**
+
+This scenario reveals the hardest edge of the architecture: what does "prescription" mean when there is no domain truth to verify against, only Dan's response? The verdict accumulator scores outcomes — but in aesthetic work, the outcome is entirely subjective. This is the scenario that most directly challenges the Selector's assumption that prior success rates are predictive of future success. A vocabulary-building approach that worked for one visual project may be entirely wrong for another, because the domain knowledge (Dan's aesthetic sensibility in a particular context) is not transferable the way code patterns or diagnostic hypotheses are. The architecture handles this by maintaining low confidence scores for aesthetic-domain hypotheses and keeping the Prescriptor's autonomy low — not because the system has failed, but because the correct epistemic posture for this domain is humility about prior accuracy.
+
+---
+
+### Synthesis: What Four Scenarios Show Together
+
+Three structural principles become visible only across all four scenarios. No single scenario surfaces any of them.
+
+**1. Register is a routing heuristic, not a description of the work**
+
+Scenario B (product feature reasoning) sits simultaneously in iterative-convergent and human-judgment. Scenario C (repo audit) is iterative-convergent in structure but human-judgment in value criterion. Scenario D (visual design) appears human-judgment throughout but has iterative-convergent sub-phases (vocabulary building has a convergent target). The register system routes UoWs into the right rough territory, but the Prescriptor's work is to discover the actual texture of the UoW within that territory. The four scenarios together show that register classification is the beginning of prescription, not the substance of it. A system that treats register as the full prescription is not yet prescribing.
+
+**2. The verdict accumulator's most valuable signal is what it cannot score**
+
+In Scenario A (paper ingestion), the success criterion is Dan's productive engagement — not a binary outcome. In Scenario D (visual design), the success criterion is Dan's ability to use vocabulary the system helped build — a meta-criterion about the interaction itself. In both cases, the verdict accumulator can record `n_successes` or `n_failures`, but the hypothesis it is scoring captures a qualitative test (`counterfactual_question`), not a checkable condition. The four scenarios together reveal that the accumulator's structure — which looks like a frequency table — is actually a carrier for qualitative hypothesis formulations. The numbers are downstream of the question. A well-formed counterfactual question in the hypothesis text is worth more than a high observation count under a poorly-formed one. The Selector's retrieval logic should weight hypothesis quality, not just success rate.
+
+**3. Autonomy is register-specific, not a single dial**
+
+Scenario A can close without Dan if he engages productively with the constructed artifact. Scenario B cannot close without Dan's decision. Scenario C can close autonomously if the audit artifact meets the counterfactual test. Scenario D cannot close without Dan's approval at every phase. The architecture's handling of autonomy is not a global setting — it is an emergent property of register, domain, and the specific prescription generated for each UoW. Looking across all four: the system is most autonomous in iterative-convergent work with dense verdict coverage, least autonomous in human-judgment aesthetic work where the success criterion is a qualitative response. The Orientation Layer's Governor cannot set a single "autonomy level" — it can only shift the distribution of what work gets taken on, which shifts the distribution of autonomy implicitly. This is the most architecturally significant insight across the four scenarios: autonomy is a consequence of work composition, not a configurable property.
 
 ---
 
