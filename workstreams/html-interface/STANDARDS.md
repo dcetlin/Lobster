@@ -17,6 +17,7 @@ Before applying specific patterns, understand what Dan values in an HTML artifac
 5. **Interactive vocabulary/concept graphs.** When a document introduces a taxonomy or vocabulary system (concepts with relationships), a D3.js force-directed network is the canonical way to render it. This is established form — not a novelty to be justified each time.
 6. **Self-contained.** No external fonts, no CDN dependencies except D3.js (from `https://d3js.org/d3.v7.min.js`). All CSS and JS inline.
 7. **Version metadata.** Include `<meta name="doc-version" content="X.Y">` and `<meta name="doc-updated" content="ISO8601 timestamp">` in the head.
+8. **Visible version stamp.** Every HTML file must include a visible `<div class="version-stamp">` in the page header area (below the title) showing the version and updated timestamp. See §12 below.
 
 ---
 
@@ -878,9 +879,58 @@ Before finalizing any HTML artifact, confirm:
 - [ ] Dark/light palette tokens applied (`--bg`, `--surface`, `--text`, `--accent` family)
 - [ ] Light mode overrides use higher-contrast accent values (`#2563eb` not `#6ea8fe`)
 - [ ] Version meta tags present (`doc-version`, `doc-updated`)
+- [ ] Visible version stamp present in page header (`<div class="version-stamp">vN.N · Updated: YYYY-MM-DDTHH:MMZ</div>`)
 - [ ] Section IDs are taxonomic (§1, §2, §1.1) not technical slugs
 - [ ] For document-class: clipboard comment widget present and sections[] matches actual sections
 - [ ] For document-class with taxonomy: D3.js network present (not a static diagram)
 - [ ] All JS is inline; no external CSS except D3 CDN link
 - [ ] Bisque URL in send_reply; local path not sent to Dan
 - [ ] For dashboard-class: filter bar, status badges, action buttons tested
+- [ ] Telegram send_reply states version: "Updated to vN.N (Updated: YYYY-MM-DDTHH:MMZ)"
+
+---
+
+## 12. Version + Timestamp Standard
+
+Every HTML file delivered to Dan MUST include in the visible page:
+- A version number in `vN.N` format (increment minor on each update, major on structural changes)
+- An "Updated at" timestamp in ISO format (UTC), e.g. `2026-05-29T18:51Z`
+- Location: visible at the top of the page, in the header area below the title
+
+### CSS
+
+```css
+.version-stamp {
+  font-size: 0.78rem;
+  color: var(--muted, var(--text3));
+  text-align: right;
+  margin-bottom: 1.5rem;
+  opacity: 0.7;
+}
+```
+
+### HTML placement
+
+```html
+<h1>Document Title</h1>
+<div class="version-stamp">v1.0 &middot; Updated: 2026-05-29T18:51Z</div>
+```
+
+Or for the dark-theme skeleton with `.doc-header`:
+
+```html
+<div class="doc-header">
+  <div class="doc-title">Document Title</div>
+  <div class="doc-subtitle">One-sentence summary.</div>
+  <div class="version-stamp">v1.0 &middot; Updated: 2026-05-29T18:51Z</div>
+</div>
+```
+
+### Telegram reporting convention
+
+When sending a Telegram reply about a delivered HTML update, always state:
+```
+Updated to vN.N (Updated: YYYY-MM-DDTHH:MMZ)
+```
+
+This allows Dan to distinguish browser cache issues from real delivery failures.
