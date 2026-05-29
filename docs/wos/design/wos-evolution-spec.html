@@ -376,7 +376,7 @@
 
 <h1>WOS Evolution Spec</h1>
 <div class="meta">Design and Implementation Sequencing &mdash; 2026-05-29 &nbsp;|&nbsp; Status: Design Spec &nbsp;|&nbsp; Sections: &sect;1&ndash;&sect;11</div>
-<div class="version-stamp">v1.1 &middot; Updated: 2026-05-29T19:29Z</div>
+<div class="version-stamp">v1.2 &middot; Updated: 2026-05-29T20:30Z</div>
 
 <div class="toc">
 <h3>Table of Contents</h3>
@@ -1309,28 +1309,40 @@ function copyAllComments() {
   var globalText = (document.getElementById('global-comment') || {}).value || '';
   globalText = globalText.trim();
   if (globalText) lines.push('[global] ' + globalText);
+  var btn = document.getElementById('copy-btn');
   if (!lines.length) {
-    var btn = document.getElementById('copy-btn');
     btn.textContent = 'No comments yet';
     setTimeout(function() { btn.textContent = 'Copy all comments'; }, 1500);
     return;
   }
-  var btn = document.getElementById('copy-btn');
-  navigator.clipboard.writeText(lines.join('\n')).then(function() {
+  var text = lines.join('\n');
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(function() {
+      btn.textContent = 'Copied!';
+      setTimeout(function() { btn.textContent = 'Copy all comments'; }, 1500);
+    }).catch(function() { fallbackCopy(text, btn); });
+  } else {
+    fallbackCopy(text, btn);
+  }
+}
+function fallbackCopy(text, btn) {
+  var ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try {
+    document.execCommand('copy');
     btn.textContent = 'Copied!';
     setTimeout(function() { btn.textContent = 'Copy all comments'; }, 1500);
-  }).catch(function() {
-    var ta = document.createElement('textarea');
-    ta.value = lines.join('\n');
-    ta.style.position = 'fixed';
-    ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.select();
-    try { document.execCommand('copy'); btn.textContent = 'Copied!'; }
-    catch(e) { btn.textContent = 'Copy failed'; }
+  } catch(e) {
     document.body.removeChild(ta);
-    setTimeout(function() { btn.textContent = 'Copy all comments'; }, 1500);
-  });
+    alert('Copy failed — your browser may not support clipboard access over HTTP. Comments:\n\n' + text);
+    return;
+  }
+  document.body.removeChild(ta);
 }
 
 // ── Mermaid init ──
