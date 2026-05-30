@@ -4615,6 +4615,28 @@ PY128
         substep "Migration 128: LOBSTER-LOCAL-SESSION-PARSER cron entry already present — skipping"
     fi
 
+    # Migration 129: Add LOBSTER-GH-TOKEN-REFRESH cron entry.
+    # refresh-gh-token.sh generates a fresh GitHub App installation token every 50
+    # minutes using the RSA private key at ~/lobster-config/github-app.pem.
+    # Installation tokens expire after 60 minutes; the 50-minute interval provides
+    # a 10-minute safety window. The token is written to ~/lobster-config/github-app-token
+    # and loaded into the environment by the existing shell lines at the end of config.env.
+    local GH_TOKEN_REFRESH_MARKER="# LOBSTER-GH-TOKEN-REFRESH"
+    local GH_TOKEN_REFRESH_SCRIPT="$LOBSTER_DIR/scripts/refresh-gh-token.sh"
+    if [ -f "$GH_TOKEN_REFRESH_SCRIPT" ]; then
+        chmod +x "$GH_TOKEN_REFRESH_SCRIPT" 2>/dev/null || true
+        if ! crontab -l 2>/dev/null | grep -qF "$GH_TOKEN_REFRESH_MARKER"; then
+            (crontab -l 2>/dev/null; echo "*/50 * * * * $GH_TOKEN_REFRESH_SCRIPT >> ${WORKSPACE_DIR:-$HOME/lobster-workspace}/logs/gh-token-refresh.log 2>&1 $GH_TOKEN_REFRESH_MARKER") | crontab - && {
+                substep "Added LOBSTER-GH-TOKEN-REFRESH cron entry (refresh-gh-token.sh, every 50 min)"
+                migrated=$((migrated + 1))
+            } || warn "Could not add LOBSTER-GH-TOKEN-REFRESH cron entry — check cron-manage.sh"
+        else
+            substep "LOBSTER-GH-TOKEN-REFRESH cron entry already present — skipping"
+        fi
+    else
+        warn "refresh-gh-token.sh not found at $GH_TOKEN_REFRESH_SCRIPT — skipping Migration 129"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
