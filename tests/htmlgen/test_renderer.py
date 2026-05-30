@@ -1,7 +1,7 @@
 """
 tests/html/test_renderer.py
 
-Integration tests for src/html/renderer.py — full compilation pipeline.
+Integration tests for src/htmlgen/renderer.py — full compilation pipeline.
 
 Run with: uv run pytest tests/html/test_renderer.py -v
 
@@ -22,7 +22,7 @@ from unittest.mock import patch
 
 import pytest
 
-from src.html.renderer import (
+from src.htmlgen.renderer import (
     ValidationError,
     load_content_manifest,
     render,
@@ -366,9 +366,9 @@ class TestRenderAndUpload:
         self, manifest_file: Path, tmp_path: Path
     ):
         # Patch the uploads dir to use tmp_path
-        with patch("src.html.renderer._uploads_dir", return_value=tmp_path):
+        with patch("src.htmlgen.renderer._uploads_dir", return_value=tmp_path):
             with patch(
-                "src.html.renderer._bisque_base_url",
+                "src.htmlgen.renderer._bisque_base_url",
                 return_value="http://5.78.201.64:9101",
             ):
                 url = render_and_upload(manifest_file, "document-class", "test-doc.html")
@@ -379,9 +379,9 @@ class TestRenderAndUpload:
     def test_render_and_upload_writes_file(
         self, manifest_file: Path, tmp_path: Path
     ):
-        with patch("src.html.renderer._uploads_dir", return_value=tmp_path):
+        with patch("src.htmlgen.renderer._uploads_dir", return_value=tmp_path):
             with patch(
-                "src.html.renderer._bisque_base_url",
+                "src.htmlgen.renderer._bisque_base_url",
                 return_value="http://5.78.201.64:9101",
             ):
                 render_and_upload(manifest_file, "document-class", "test-doc.html")
@@ -391,9 +391,9 @@ class TestRenderAndUpload:
     def test_render_and_upload_url_format(
         self, manifest_file: Path, tmp_path: Path
     ):
-        with patch("src.html.renderer._uploads_dir", return_value=tmp_path):
+        with patch("src.htmlgen.renderer._uploads_dir", return_value=tmp_path):
             with patch(
-                "src.html.renderer._bisque_base_url",
+                "src.htmlgen.renderer._bisque_base_url",
                 return_value="http://5.78.201.64:9101",
             ):
                 url = render_and_upload(manifest_file, "document-class", "my-doc.html")
@@ -411,7 +411,7 @@ class TestRendererCLI:
         output = tmp_path / "cli-output.html"
         result = subprocess.run(
             [
-                sys.executable, "-m", "src.html.renderer",
+                sys.executable, "-m", "src.htmlgen.renderer",
                 "--content", str(manifest_file),
                 "--template", "document-class",
                 "--output", str(output),
@@ -428,7 +428,7 @@ class TestRendererCLI:
         output = tmp_path / "cli-html.html"
         subprocess.run(
             [
-                sys.executable, "-m", "src.html.renderer",
+                sys.executable, "-m", "src.htmlgen.renderer",
                 "--content", str(manifest_file),
                 "--template", "document-class",
                 "--output", str(output),
@@ -443,7 +443,7 @@ class TestRendererCLI:
 
     def test_cli_missing_required_arg_fails(self):
         result = subprocess.run(
-            [sys.executable, "-m", "src.html.renderer", "--content", "/tmp/x.json"],
+            [sys.executable, "-m", "src.htmlgen.renderer", "--content", "/tmp/x.json"],
             capture_output=True,
             text=True,
             cwd=Path(__file__).parent.parent.parent,
@@ -454,7 +454,7 @@ class TestRendererCLI:
         output = tmp_path / "out.html"
         result = subprocess.run(
             [
-                sys.executable, "-m", "src.html.renderer",
+                sys.executable, "-m", "src.htmlgen.renderer",
                 "--content", "/nonexistent/manifest.json",
                 "--template", "document-class",
                 "--output", str(output),

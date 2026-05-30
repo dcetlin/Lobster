@@ -24,13 +24,13 @@ import pytest
 # Import all four layers — confirms no circular imports or namespace collisions
 # ---------------------------------------------------------------------------
 
-from src.html.conventions import load_conventions, get_color_token, build_css_custom_properties
-from src.html.templates.registry import load_registry, get_template
-from src.html.components import COMPONENTS, get_component
-from src.html.renderer import render, render_and_upload, validate_html, ValidationError
+from src.htmlgen.conventions import load_conventions, get_color_token, build_css_custom_properties
+from src.htmlgen.templates.registry import load_registry, get_template
+from src.htmlgen.components import COMPONENTS, get_component
+from src.htmlgen.renderer import render, render_and_upload, validate_html, ValidationError
 
 # Layer A — individual module imports
-from src.html.conventions import (
+from src.htmlgen.conventions import (
     get_all_color_tokens,
     get_typography,
     get_layout,
@@ -39,10 +39,10 @@ from src.html.conventions import (
 )
 
 # Layer B — template modules
-from src.html.templates import registry as template_registry_mod
+from src.htmlgen.templates import registry as template_registry_mod
 
 # Layer C — component modules
-from src.html.components import (
+from src.htmlgen.components import (
     theme_toggle,
     clipboard_copy_widget,
     d3_vocabulary_network,
@@ -271,7 +271,7 @@ class TestExistingGeneratorsUnmodified:
     def test_wos_uow_detail_gen_importable(self):
         """wos_uow_detail_gen must be importable without errors.
 
-        Uses subprocess to avoid the conftest.py sys.path issue where src/html/
+        Uses subprocess to avoid the conftest.py sys.path issue where src/htmlgen/
         shadows the stdlib html package, which breaks markdown's internal htmlparser.
         This is a known pre-existing environment issue (documented in task notes);
         the module is confirmed importable outside the conftest-modified sys.path.
@@ -313,7 +313,7 @@ class TestExistingGeneratorsUnmodified:
         upload_before = dash_before.upload_html
 
         # Import renderer
-        import src.html.renderer  # noqa: F401
+        import src.htmlgen.renderer  # noqa: F401
 
         import src.orchestration.wos_dashboard as dash_after
         assert dash_after.upload_html is upload_before, \

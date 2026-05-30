@@ -1,15 +1,15 @@
 """
 tests/html/test_conventions.py
 
-Tests for src/html/conventions.py — loader and query API.
+Tests for src/htmlgen/conventions.py — loader and query API.
 Run with: uv run pytest tests/html/test_conventions.py -v
 """
 
 import pytest
 
 # Reset the lru_cache between test runs so file mutations don't bleed
-from src.html import conventions as conv_module
-from src.html.conventions import (
+from src.htmlgen import conventions as conv_module
+from src.htmlgen.conventions import (
     build_css_custom_properties,
     get_all_color_tokens,
     get_color_token,

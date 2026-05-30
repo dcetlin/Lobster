@@ -9,10 +9,10 @@ Wires together:
 Produces a single self-contained .html file from a JSON content manifest.
 
 CLI usage:
-    uv run src/html/renderer.py --content <path> --template <template-id> --output <path>
+    uv run src/htmlgen/renderer.py --content <path> --template <template-id> --output <path>
 
 Python API:
-    from src.html.renderer import render_and_upload
+    from src.htmlgen.renderer import render_and_upload
     url = render_and_upload(content_path, template_id, output_filename)
 
 Phase 1 scope: JSON content format only. Markdown support is Phase 2.
@@ -34,22 +34,22 @@ from typing import Any
 # Path setup — allow running as a script (not just as an imported module)
 # ---------------------------------------------------------------------------
 
-# The repo root (parent of src/) must be on sys.path for `from src.html.*` imports
+# The repo root (parent of src/) must be on sys.path for `from src.htmlgen.*` imports
 # to resolve. When run via pytest, conftest.py already handles this. When run
-# directly via `uv run src/html/renderer.py`, we add it here.
-_REPO_ROOT = Path(__file__).parent.parent.parent  # src/html/renderer.py -> repo root
+# directly via `uv run src/htmlgen/renderer.py`, we add it here.
+_REPO_ROOT = Path(__file__).parent.parent.parent  # src/htmlgen/renderer.py -> repo root
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from src.html.conventions import (  # noqa: E402  (import after sys.path setup)
+from src.htmlgen.conventions import (  # noqa: E402  (import after sys.path setup)
     load_conventions,
     get_all_color_tokens,
     get_typography,
     get_layout,
     build_css_custom_properties,
 )
-from src.html.templates.registry import get_template  # noqa: E402
-from src.html.components import get_component  # noqa: E402
+from src.htmlgen.templates.registry import get_template  # noqa: E402
+from src.htmlgen.components import get_component  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -585,8 +585,8 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  uv run src/html/renderer.py --content manifest.json --template document-class --output out.html
-  uv run src/html/renderer.py --content manifest.json --template spec-document --output /tmp/spec.html
+  uv run src/htmlgen/renderer.py --content manifest.json --template document-class --output out.html
+  uv run src/htmlgen/renderer.py --content manifest.json --template spec-document --output /tmp/spec.html
         """,
     )
     parser.add_argument("--content", required=True, help="Path to JSON content manifest")

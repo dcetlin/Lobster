@@ -1,7 +1,7 @@
 """
 tests/html/test_components.py
 
-Tests for src/html/components/ — theme toggle, clipboard widget, D3 network.
+Tests for src/htmlgen/components/ — theme toggle, clipboard widget, D3 network.
 Run with: uv run pytest tests/html/test_components.py -v
 
 Note: We use Python's stdlib html.parser (via xml.etree.ElementTree on wrapped
@@ -12,7 +12,7 @@ shadows the stdlib html package and breaks bs4's import of html.entities.
 import re
 import pytest
 
-from src.html.components import (
+from src.htmlgen.components import (
     COMPONENTS,
     get_component,
     clipboard_copy_widget,

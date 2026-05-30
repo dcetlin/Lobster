@@ -9,7 +9,7 @@ Verifies:
 
 import pytest
 
-from src.html.templates.registry import (
+from src.htmlgen.templates.registry import (
     get_template,
     list_templates,
     load_registry,
