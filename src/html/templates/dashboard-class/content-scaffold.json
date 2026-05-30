@@ -1,0 +1,44 @@
+{
+  "doc_id": "{{doc_id}}",
+  "title": "{{title}}",
+  "version": "1.0",
+  "updated_at": "{{updated_at}}",
+  "template_id": "dashboard-class",
+  "sections": [
+    {
+      "id": "s1",
+      "label": "§1",
+      "title": "Status",
+      "addressed": true,
+      "tags": ["status", "primary"],
+      "content": "{{status_content}}"
+    },
+    {
+      "id": "s2",
+      "label": "§2",
+      "title": "Details",
+      "addressed": true,
+      "tags": ["details"],
+      "content": "{{details_content}}"
+    }
+  ],
+  "components": [
+    {
+      "id": "dashboard-filter-bar",
+      "config": {
+        "statuses": ["active", "stalled", "completed", "blocked"],
+        "default_filter": "active"
+      }
+    },
+    {
+      "id": "theme-toggle",
+      "config": {
+        "mode": "media-query"
+      }
+    }
+  ],
+  "metadata": {
+    "generated_at": "{{generated_at}}",
+    "generator": "{{generator}}"
+  }
+}

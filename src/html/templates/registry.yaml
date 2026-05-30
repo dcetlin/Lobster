@@ -1,0 +1,31 @@
+templates:
+  - id: document-class
+    name: Document (narrative)
+    description: Design docs, proposals, audits, synthesis. Narrative-primary.
+    content_format: markdown
+    components:
+      - clipboard-copy-widget
+      - theme-toggle
+    conventions_overrides: {}
+    scaffold: content-scaffold.md
+
+  - id: dashboard-class
+    name: Dashboard (data-driven)
+    description: WOS dashboard, status pages, interactive tools with live data.
+    content_format: json
+    components:
+      - dashboard-filter-bar
+      - theme-toggle
+    conventions_overrides:
+      theme_toggle_mode: media-query  # use @media prefers-color-scheme, not JS toggle
+    scaffold: content-scaffold.json
+
+  - id: spec-document
+    name: Spec (structured, versioned)
+    description: Long-lived specs edited across many sessions. Section tracking, comment threads.
+    content_format: json
+    components:
+      - clipboard-copy-widget
+      - theme-toggle
+    conventions_overrides: {}
+    scaffold: content-scaffold.json

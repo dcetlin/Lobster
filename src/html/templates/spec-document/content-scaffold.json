@@ -1,0 +1,60 @@
+{
+  "doc_id": "{{doc_id}}",
+  "title": "{{title}}",
+  "version": "1.0",
+  "updated_at": "{{updated_at}}",
+  "template_id": "spec-document",
+  "sections": [
+    {
+      "id": "s1",
+      "label": "§1",
+      "title": "Overview",
+      "addressed": false,
+      "tags": ["overview"],
+      "content": "{{s1_overview}}"
+    },
+    {
+      "id": "s2",
+      "label": "§2",
+      "title": "Background",
+      "addressed": false,
+      "tags": ["background"],
+      "content": "{{s2_background}}"
+    },
+    {
+      "id": "s3",
+      "label": "§3",
+      "title": "Specification",
+      "addressed": false,
+      "tags": ["specification"],
+      "content": "{{s3_spec}}"
+    },
+    {
+      "id": "s4",
+      "label": "§4",
+      "title": "Open Questions",
+      "addressed": false,
+      "tags": ["open-questions"],
+      "content": "{{s4_open_questions}}"
+    }
+  ],
+  "components": [
+    {
+      "id": "clipboard-copy-widget",
+      "config": {
+        "sections": [
+          {"id": "s1", "label": "§1"},
+          {"id": "s2", "label": "§2"},
+          {"id": "s3", "label": "§3"},
+          {"id": "s4", "label": "§4"}
+        ]
+      }
+    },
+    {
+      "id": "theme-toggle",
+      "config": {
+        "mode": "js-toggle"
+      }
+    }
+  ]
+}
