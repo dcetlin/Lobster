@@ -22,10 +22,9 @@ templates:
 
   - id: spec-document
     name: Spec (structured, versioned)
-    description: Long-lived specs edited across many sessions. Section tracking, comment threads.
+    description: Long-lived specs edited across many sessions. Section tracking, inline comment threads.
     content_format: json
     components:
-      - clipboard-copy-widget
       - theme-toggle
     conventions_overrides: {}
     scaffold: content-scaffold.json

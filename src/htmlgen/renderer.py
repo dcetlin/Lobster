@@ -283,6 +283,228 @@ em {{ color: var(--text2); }}
 
 
 # ---------------------------------------------------------------------------
+# Mermaid post-processor
+# ---------------------------------------------------------------------------
+
+def _convert_mermaid_blocks(html: str) -> str:
+    """Convert <pre><code class="language-mermaid">...</code></pre> blocks
+    into mermaid.js-compatible <div class="mermaid-wrapper"> blocks.
+
+    The Python markdown fenced_code extension renders ```mermaid fences as:
+        <pre><code class="language-mermaid">DIAGRAM_CODE</code></pre>
+    We replace those with:
+        <div class="mermaid-wrapper"><div class="mermaid">DIAGRAM_CODE</div></div>
+
+    This also handles <code class="mermaid"> (no "language-" prefix).
+    """
+    # Match <pre><code class="language-mermaid">...</code></pre>
+    # The re.DOTALL flag lets . match newlines inside the diagram code.
+    pattern = re.compile(
+        r'<pre><code class="language-mermaid">(.*?)</code></pre>',
+        re.DOTALL,
+    )
+
+    def _replace(m: re.Match) -> str:
+        code = m.group(1)
+        # html.unescape — the markdown lib HTML-escapes code content
+        import html as _html
+        code = _html.unescape(code)
+        # Strip leading/trailing blank lines but preserve internal indentation
+        code = code.strip("\n")
+        return (
+            '<div class="mermaid-wrapper">\n'
+            f'  <div class="mermaid">\n{code}\n  </div>\n'
+            '</div>'
+        )
+
+    return pattern.sub(_replace, html)
+
+
+_MERMAID_CSS = """
+  .mermaid-wrapper {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 20px;
+    margin: 16px 0;
+    overflow-x: auto;
+    text-align: center;
+  }
+  .mermaid { display: inline-block; min-width: 200px; }
+"""
+
+_MERMAID_INIT_JS = """
+mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+"""
+
+_MERMAID_CDN_SCRIPT = '<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>'
+
+
+# ---------------------------------------------------------------------------
+# Three-level comment system (v1.3 feature parity)
+# ---------------------------------------------------------------------------
+
+_COMMENT_SYSTEM_CSS = """
+  /* ── Inline comment toggle button (per heading) ── */
+  .comment-btn {
+    cursor: pointer;
+    font-size: 0.78em;
+    opacity: 0.35;
+    margin-left: 0.4em;
+    background: none;
+    border: none;
+    vertical-align: middle;
+    transition: opacity 0.15s;
+    padding: 0;
+    line-height: 1;
+    color: inherit;
+  }
+  .comment-btn:hover { opacity: 1; }
+  /* ── Inline comment area (per heading) ── */
+  .comment-area {
+    display: none;
+    margin: 0.3rem 0 0.8rem;
+  }
+  .comment-area.open { display: block; }
+  .comment-area textarea {
+    width: 100%;
+    min-height: 52px;
+    padding: 0.4rem 0.6rem;
+    font-family: inherit;
+    font-size: 0.84rem;
+    border-radius: 4px;
+    border: 1px solid var(--border2);
+    background: var(--surface2);
+    color: var(--text);
+    resize: vertical;
+    outline: none;
+  }
+  .comment-area textarea:focus { border-color: var(--accent); }
+  /* ── Global comment section ── */
+  .global-comment-section {
+    margin: 2.5rem 0 0.75rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+  }
+  .global-comment-section label {
+    font-size: 0.8rem;
+    opacity: 0.6;
+    display: block;
+    margin-bottom: 0.4rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--text3);
+  }
+  .global-comment-section textarea {
+    width: 100%;
+    min-height: 72px;
+    padding: 0.5rem 0.7rem;
+    font-family: inherit;
+    font-size: 0.85rem;
+    border-radius: 4px;
+    border: 1px solid var(--border2);
+    background: var(--surface2);
+    color: var(--text);
+    resize: vertical;
+    outline: none;
+  }
+  .global-comment-section textarea:focus { border-color: var(--accent); }
+  /* ── Copy all comments button ── */
+  .copy-all-btn-wrapper { text-align: center; margin: 1.25rem 0 2rem; }
+  #copy-all-btn {
+    padding: 0.5rem 1.75rem;
+    cursor: pointer;
+    font-size: 0.9rem;
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    transition: opacity 0.15s;
+  }
+  #copy-all-btn:hover { opacity: 0.88; }
+"""
+
+_COMMENT_SYSTEM_JS = """
+// ── Per-heading comment toggle ──
+function toggleComment(btn) {
+  var parent = btn.closest('h1, h2, h3, h4, h5') || btn.parentElement;
+  var area = parent ? parent.nextElementSibling : null;
+  if (area && area.classList.contains('comment-area')) {
+    area.classList.toggle('open');
+    if (area.classList.contains('open')) {
+      var ta = area.querySelector('textarea');
+      if (ta) ta.focus();
+    }
+  }
+}
+
+// ── Copy all inline + global comments ──
+function copyAllComments() {
+  var lines = [];
+  document.querySelectorAll('.comment-area textarea').forEach(function(ta) {
+    var text = ta.value.trim();
+    if (!text) return;
+    var placeholder = ta.placeholder || '';
+    var label = placeholder.replace(/\\.\\.\\.?$/, '').trim();
+    lines.push(label + ' ' + text);
+  });
+  var globalEl = document.getElementById('global-comment');
+  var globalText = globalEl ? globalEl.value.trim() : '';
+  if (globalText) lines.push('[global] ' + globalText);
+  if (!lines.length) {
+    var btn = document.getElementById('copy-all-btn');
+    btn.textContent = 'No comments yet';
+    setTimeout(function() { btn.textContent = 'Copy all comments'; }, 1500);
+    return;
+  }
+  var btn = document.getElementById('copy-all-btn');
+  var text = lines.join('\\n');
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(function() {
+      btn.textContent = 'Copied!';
+      setTimeout(function() { btn.textContent = 'Copy all comments'; }, 1500);
+    }).catch(function() { _fallbackCopy(text, btn); });
+  } else {
+    _fallbackCopy(text, btn);
+  }
+}
+function _fallbackCopy(text, btn) {
+  var ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  try {
+    document.execCommand('copy');
+    btn.textContent = 'Copied!';
+  } catch(e) {
+    btn.textContent = 'Copy failed';
+  }
+  document.body.removeChild(ta);
+  setTimeout(function() { btn.textContent = 'Copy all comments'; }, 1500);
+}
+"""
+
+_COMMENT_SYSTEM_GLOBAL_HTML = """<!-- Global comment + copy all -->
+<div class="global-comment-section">
+  <label>Global comment</label>
+  <textarea id="global-comment" placeholder="[global] "></textarea>
+</div>
+<div class="copy-all-btn-wrapper">
+  <button id="copy-all-btn" onclick="copyAllComments()">Copy all comments</button>
+</div>"""
+
+
+def _has_mermaid_content(html: str) -> bool:
+    """Return True if the assembled HTML contains any mermaid diagram divs."""
+    return 'class="mermaid"' in html
+
+
+# ---------------------------------------------------------------------------
 # Section rendering
 # ---------------------------------------------------------------------------
 
@@ -319,6 +541,11 @@ def _render_section(section: dict[str, Any], manifest: dict[str, Any]) -> str:
                 content,
                 extensions=["tables", "fenced_code", "nl2br"],
             )
+            # Post-process: convert mermaid fenced code blocks into mermaid divs.
+            # The fenced_code extension renders ```mermaid blocks as:
+            #   <pre><code class="language-mermaid">...</code></pre>
+            # We transform those into the mermaid.js-compatible form.
+            content_html = _convert_mermaid_blocks(content_html)
         else:
             # Fallback: split on double newlines for paragraphs
             paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
@@ -328,12 +555,21 @@ def _render_section(section: dict[str, Any], manifest: dict[str, Any]) -> str:
                 content_html = f"<p>{content}</p>"
 
     label_html = f'<div class="section-label">{label}</div>' if label else ""
-    title_html = f"<h2>{title}</h2>" if title else ""
+    # Section title with inline 💬 comment toggle button (v1.3 three-level comment system)
+    title_html = (
+        f'<h2>{title} <button class="comment-btn" onclick="toggleComment(this)">&#128172;</button></h2>'
+        if title else ""
+    )
+    comment_area_html = (
+        f'<div class="comment-area"><textarea placeholder="[{label or sid}] "></textarea></div>'
+        if title else ""
+    )
     id_attr = f' id="{sid}"' if sid else ""
 
     return f"""<div class="section"{id_attr}>
   {label_html}
   {title_html}
+  {comment_area_html}
   {content_html}
 </div>"""
 
@@ -447,6 +683,20 @@ def _assemble_html(
         _render_section(s, manifest) for s in manifest.get("sections", [])
     )
 
+    # --- Detect mermaid content (must happen after section rendering) ---
+    needs_mermaid = _has_mermaid_content(sections_html)
+
+    # --- Three-level comment system (v1.3 feature parity) ---
+    # Always injected for spec-document template and any document with sections.
+    # If manifest explicitly opts out via "comment_system": false, skip.
+    enable_comment_system = manifest.get("comment_system", True)
+    comment_system_extra_css = _COMMENT_SYSTEM_CSS if enable_comment_system else ""
+    comment_system_global_html = _COMMENT_SYSTEM_GLOBAL_HTML if enable_comment_system else ""
+    comment_system_js = f"<script>{_COMMENT_SYSTEM_JS}</script>" if enable_comment_system else ""
+
+    # --- Mermaid CSS injection ---
+    mermaid_extra_css = _MERMAID_CSS if needs_mermaid else ""
+
     # --- Doc header ---
     subtitle_html = f'<p class="doc-subtitle">{subtitle}</p>' if subtitle else ""
     doc_header = f"""<header class="doc-header">
@@ -469,6 +719,10 @@ def _assemble_html(
     if needs_d3:
         d3_script_tag = '<script src="https://d3js.org/d3.v7.min.js"></script>'
 
+    # --- Mermaid CDN script tag (must appear before mermaid.initialize call) ---
+    mermaid_script_tag = _MERMAID_CDN_SCRIPT if needs_mermaid else ""
+    mermaid_init_script = f"<script>{_MERMAID_INIT_JS}</script>" if needs_mermaid else ""
+
     # --- Assemble <head> ---
     head = f"""<head>
   <meta charset="UTF-8">
@@ -477,8 +731,11 @@ def _assemble_html(
   <meta name="doc-updated" content="{render_timestamp}">
   <meta name="lobster-components" content="{lobster_components_content}">
   <title>{title}</title>
+  {mermaid_script_tag}
   <style>
 {global_css}
+{comment_system_extra_css}
+{mermaid_extra_css}
   </style>
 </head>"""
 
@@ -489,10 +746,13 @@ def _assemble_html(
 <div class="wrap">
   {doc_header}
   {sections_html}
+  {comment_system_global_html}
   {other_fragments_html}
   {footer}
 </div>
 {d3_script_tag}
+{mermaid_init_script}
+{comment_system_js}
 </body>"""
 
     return f"""<!DOCTYPE html>
