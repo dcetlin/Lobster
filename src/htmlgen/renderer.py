@@ -1,5 +1,5 @@
 """
-renderer.py — Lobster HTML compilation pipeline (Phase 1)
+renderer.py — Lobster HTML compilation pipeline (Phase 1 + Phase 2)
 
 Wires together:
   - Layer 3: conventions.py (design tokens, layout rules)
@@ -15,7 +15,13 @@ Python API:
     from src.htmlgen.renderer import render_and_upload
     url = render_and_upload(content_path, template_id, output_filename)
 
-Phase 1 scope: JSON content format only. Markdown support is Phase 2.
+Phase 1 scope: JSON content format (section content as plain text or Markdown strings).
+Phase 2 addition: Markdown rendering in section content via the Python `markdown` library.
+  - Section content is rendered as Markdown when the manifest includes
+    `"content_format": "markdown"` at the top level, or when the section
+    includes `"content_format": "markdown"`.
+  - Plain text content is passed through Markdown rendering too
+    (Markdown is a superset of plain text).
 """
 
 from __future__ import annotations
@@ -29,6 +35,12 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+try:
+    import markdown as _markdown_lib
+    _MARKDOWN_AVAILABLE = True
+except ImportError:
+    _MARKDOWN_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Path setup — allow running as a script (not just as an imported module)
@@ -253,6 +265,20 @@ a {{ color: var(--accent); text-decoration: none; }}
 a:hover {{ text-decoration: underline; }}
 .doc-footer {{ margin-top: 64px; padding-top: 20px; border-top: 1px solid var(--border);
   font-size: 11px; color: var(--text3); display: flex; justify-content: space-between; }}
+pre {{ background: var(--surface2); border: 1px solid var(--border); border-radius: 6px;
+  padding: 16px; overflow-x: auto; margin: 16px 0; }}
+pre code {{ background: none; border: none; padding: 0; font-size: 13px; color: var(--text2); }}
+code {{ background: var(--surface2); border-radius: 4px; padding: 2px 6px;
+  font-size: 13px; color: var(--accent2); }}
+blockquote {{ border-left: 3px solid var(--accent); margin: 16px 0; padding: 8px 16px;
+  background: var(--surface2); color: var(--text2); border-radius: 0 4px 4px 0; }}
+table {{ border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 14px; }}
+th {{ background: var(--surface2); color: var(--text); font-weight: 600;
+  padding: 10px 14px; text-align: left; border-bottom: 2px solid var(--border); }}
+td {{ padding: 8px 14px; border-bottom: 1px solid var(--border); color: var(--text2); }}
+tr:last-child td {{ border-bottom: none; }}
+strong {{ color: var(--text); font-weight: 600; }}
+em {{ color: var(--text2); }}
 """.strip()
 
 
@@ -276,15 +302,30 @@ def _render_section(section: dict[str, Any], manifest: dict[str, Any]) -> str:
             if not title:
                 title = section_data.get("title", title)
 
-    # Render content — simple text paragraphs (Phase 1: no Markdown)
+    # Render content — Markdown (Phase 2) or plain text paragraphs (fallback)
     content_html = ""
     if content:
-        # Split on double newlines for paragraphs; single newlines become line breaks
-        paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
-        if paragraphs:
-            content_html = "\n".join(f"<p>{p.replace(chr(10), '<br>')}</p>" for p in paragraphs)
+        # Determine rendering mode: check section then manifest top-level
+        section_fmt = section.get("content_format", "")
+        manifest_fmt = manifest.get("content_format", "")
+        use_markdown = (
+            section_fmt == "markdown"
+            or manifest_fmt == "markdown"
+            or (section_fmt == "" and manifest_fmt == "" and _MARKDOWN_AVAILABLE)
+        )
+
+        if use_markdown and _MARKDOWN_AVAILABLE:
+            content_html = _markdown_lib.markdown(
+                content,
+                extensions=["tables", "fenced_code", "nl2br"],
+            )
         else:
-            content_html = f"<p>{content}</p>"
+            # Fallback: split on double newlines for paragraphs
+            paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+            if paragraphs:
+                content_html = "\n".join(f"<p>{p.replace(chr(10), '<br>')}</p>" for p in paragraphs)
+            else:
+                content_html = f"<p>{content}</p>"
 
     label_html = f'<div class="section-label">{label}</div>' if label else ""
     title_html = f"<h2>{title}</h2>" if title else ""
