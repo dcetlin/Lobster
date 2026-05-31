@@ -1,6 +1,6 @@
-# WOS Open Research Questions
+# Sensibility Ergonomics Research Threads (active-juice)
 
-Live research questions for the WOS workstream — questions that require WOS-specific context to investigate and don't belong in the general ergonomics framework document.
+Lobster-instance research threads surfaced during the Sensibility Stack v3 synthesis pass. These require WOS-specific context to investigate and do not belong in the general ergonomics framework document. Placed in `active-juice/` for future subagent pickup.
 
 See also: `open-threads.md` for blocked UoWs, pending implementations, and GitHub issues.
 
