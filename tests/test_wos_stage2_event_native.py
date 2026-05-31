@@ -70,7 +70,7 @@ if str(_REPO_ROOT / "src") not in sys.path:
 
 def _make_event_log_schema() -> str:
     """Return the event_log migration SQL."""
-    migration_path = _REPO_ROOT / "src" / "orchestration" / "migrations" / "0029_event_log.sql"
+    migration_path = _REPO_ROOT / "src" / "orchestration" / "migrations" / "0030_event_log.sql"
     return migration_path.read_text()
 
 

@@ -1,4 +1,4 @@
--- Migration 0029: Create event_log table for WOS Event-Native Nervous System.
+-- Migration 0030: Create event_log table for WOS Event-Native Nervous System.
 --
 -- The event_log records typed events emitted by the WOS event pipeline:
 --   wos_issue_created    — emitted when a GitHub issue with label wos:uow is created
