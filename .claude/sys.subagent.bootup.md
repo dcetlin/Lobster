@@ -505,6 +505,30 @@ Before declaring any integration or manual test PASS:
   The `patch.multiple` module target for inbox_server tests is always
   `"src.mcp.inbox_server"` (not `"inbox_server"` or `"mcp.inbox_server"`).
 
+## HTML Generation Layer
+
+When working with HTML documents (WOS spec, design docs, bisque artifacts):
+- **Edit existing docs** via `src/htmlgen/editor.py` — never rewrite from scratch; use `list_section_ids` first, then `apply_edit` or `apply_edits`
+- **Generate new docs** via `src/htmlgen/renderer.py` with conventions loaded from `src/htmlgen/conventions.py`
+- **Load conventions first** — `load_conventions()` before any render or edit call
+- Source of truth: `~/lobster-workspace/workstreams/html-interface/`
+
+**Explicit skill loading (required for complex document tasks):** If your task prompt includes `Skill context required: html-generation`, call `get_skill_context(skill_name="html-generation")` before any render or edit call. Do not assume skill context is loaded automatically.
+
+**Document production staging gate:**
+
+The default pattern for producing a document-class HTML artifact is **always staged** (md synthesis → HTML gen → polish). Single-pass "render only" is the explicit exception.
+
+- **Staged (default):** you should have been dispatched as one of three agents in sequence, with a `synthesis.md` input file already written by the previous agent. If you are the synthesis agent (Agent 1), produce only structured markdown — do NOT render HTML. If you are the htmlgen agent (Agent 2), take `synthesis.md` as sole input and render. If you are the polish agent (Agent 3), apply canon-standard review and deliver the final bisque URL.
+- **Single-pass ("render only"):** only when the dispatch prompt is explicitly labeled "render only". If you were dispatched as a single-pass agent without that label for any document-class HTML task, stop — write `synthesis.md` to the workstream directory first, then render from it. Never synthesize and render in the same cognitive pass — the rendering constraints crowd out synthesis quality.
+
+**Checklist before delivering any HTML artifact:**
+- [ ] Conventions loaded before renderer call
+- [ ] All canon standards applied (dark-first palette, taxonomic section IDs, comment widget, version metadata)
+- [ ] Document uploaded to bisque; bisque URL in reply (never a filesystem path)
+- [ ] Version metadata present (`doc-version`, `doc-updated`)
+- [ ] For document-class with taxonomy: D3.js force-directed network included (not a static diagram)
+
 ## WOS Subagent Contract
 
 When you are dispatched to execute a **Unit of Work (UoW)** by the WOS Executor, your task prompt will contain an `output_ref` path and a `uow_id`. Before you exit — success or failure — you **must** write a result.json file at that path. The Steward reads this file on its next heartbeat cycle to determine whether the UoW is complete, failed, or needs re-diagnosis. Without it, the Steward cannot distinguish a successful silent exit from a crash and will eventually mark the UoW failed via TTL expiry.

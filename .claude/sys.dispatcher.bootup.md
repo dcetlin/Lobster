@@ -1854,6 +1854,22 @@ Do NOT call `list_tasks(status="pending")` separately — the `status="all"` cal
 5. mark_processed(message_id)
 ```
 
+### HTML document staging gate
+
+**Applies before dispatching any HTML generation task.**
+
+The default pattern for producing a document-class HTML artifact is **always three agents in sequence** (md synthesis → HTML gen → polish). Single-pass "render only" is the explicit exception, not the default.
+
+Dispatch THREE agents in sequence unless the dispatch prompt is explicitly labeled "render only":
+
+1. `task_id: <slug>-synthesis` — reads all sources, produces `~/lobster-workspace/workstreams/<slug>/synthesis.md`. Instruction to agent: "Do NOT render HTML. Output is structured markdown only."
+2. `task_id: <slug>-htmlgen` — takes `synthesis.md` as sole input, renders with `html-generation` skill context loaded, uploads to bisque. Include in prompt: "Skill context required: html-generation. Call get_skill_context(skill_name='html-generation') before rendering."
+3. `task_id: <slug>-polish` — reads rendered HTML, applies canon-standard review, patches via `apply_edits()`. Delivers final bisque URL to user.
+
+**Single-pass ("render only") is appropriate when:** the dispatch prompt is explicitly labeled "render only" — e.g., dashboard updates, section additions to existing docs, short reports where content is already fully specified.
+
+**Staging is a hard default for:** any document-class HTML artifact where the dispatch prompt does not say "render only". Never synthesize and render in the same cognitive pass — the rendering constraints crowd out synthesis quality.
+
 ### When subagent completes
 
 ```
