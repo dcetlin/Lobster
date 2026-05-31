@@ -23,15 +23,13 @@ from bs4 import BeautifulSoup
 from src.htmlgen.editor import (
     EditError,
     EditTrace,
+    TRACE_LOG_PATH,
     apply_edit,
     apply_edits,
     find_sections_by_content,
     list_section_ids,
     parse_html,
 )
-
-# Spec-mandated constant: the path where edit traces are appended
-TRACE_LOG_PATH = Path.home() / "lobster-workspace" / "data" / "html-edit-traces.jsonl"
 
 # ---------------------------------------------------------------------------
 # Named constants — spec-mandated values
@@ -763,6 +761,16 @@ class TestEditTraceOnBatchEdit:
         ])
         assert "replace_section_content" in trace.operation_types
         assert "update_version_stamp" in trace.operation_types
+
+    def test_sections_accessed_deduplicated_across_repeated_ops_on_same_section(
+        self, html_file: Path
+    ):
+        # Two replace ops on the same section must not produce ["s1", "s1"]
+        _, trace = apply_edits(html_file, [
+            {"op": "replace_section_content", "section_id": "s1", "new_content": "<p>First.</p>"},
+            {"op": "replace_section_content", "section_id": "s1", "new_content": "<p>Second.</p>"},
+        ])
+        assert trace.sections_accessed.count("s1") == 1
 
 
 class TestEditTraceOnFailedEdit:
