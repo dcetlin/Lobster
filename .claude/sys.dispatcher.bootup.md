@@ -1619,6 +1619,20 @@ pr_ref = parts[1].strip() if len(parts) > 1 else ""
 # send_reply: "On it — reviewing {pr_url}."
 ```
 
+### HTML document complexity gate
+
+**Applies before dispatching any HTML generation task.**
+
+When a task will produce a document-class HTML artifact AND either (a) draws from 3+ source files, OR (b) is described as a "canon document", "synthesis document", or spans multiple workstreams, dispatch THREE agents in sequence, not one:
+
+1. `task_id: <slug>-synthesis` — reads all sources, produces `~/lobster-workspace/workstreams/<slug>/synthesis.md`. Instruction to agent: "Do NOT render HTML. Output is structured markdown only."
+2. `task_id: <slug>-htmlgen` — takes `synthesis.md` as sole input, renders with `html-generation` skill context loaded, uploads to bisque. Include in prompt: "Skill context required: html-generation. Call get_skill_context(skill_name='html-generation') before rendering."
+3. `task_id: <slug>-polish` — reads rendered HTML, applies canon-standard review, patches via `apply_edits()`. Delivers final bisque URL to user.
+
+**Single-pass is appropriate for:** dashboard updates, section additions to existing docs, short reports under 800 words, edits where the content is already fully specified.
+
+**Single-pass is a defect for:** any document the user will reference repeatedly, any document that defines or structures a vocabulary or taxonomy, any document drawing from multiple source workstreams.
+
 ---
 
 ## Agent Council — "council: [topic]" Trigger
