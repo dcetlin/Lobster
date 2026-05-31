@@ -269,7 +269,8 @@ code, pre, kbd {{
 .section-label {{ font-size: 11px; font-weight: 700; color: var(--text3); text-transform: uppercase;
   letter-spacing: .08em; margin-bottom: 6px; }}
 .section h2 {{ font-size: 19px; font-weight: 700; color: var(--text); margin: 0 0 16px; }}
-.section h3 {{ font-size: 16px; font-weight: 600; color: var(--text); margin: 20px 0 12px; }}
+.section h3 {{ font-size: 16px; font-weight: 700; color: var(--text); margin: 32px 0 6px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }}
+.section h3:first-of-type {{ margin-top: 20px; }}
 .section p {{ color: var(--text2); margin: 0 0 14px; }}
 .section ul, .section ol {{ color: var(--text2); padding-left: 24px; }}
 .section li {{ margin-bottom: 6px; }}
@@ -350,6 +351,27 @@ mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
 """
 
 _MERMAID_CDN_SCRIPT = '<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>'
+
+
+# ---------------------------------------------------------------------------
+# Section content visual improvements (§2 typographic hierarchy)
+# ---------------------------------------------------------------------------
+
+_SECTION_CONTENT_CSS = """
+  .section > hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 28px 0;
+    opacity: 0.5;
+  }
+  /* Register mapping lists — tighter and visually distinct */
+  .section ul li {
+    margin-bottom: 4px;
+    padding-left: 4px;
+  }
+  /* Good/Bad/Heuristic runs — keep them visually grouped */
+  .section p + ul { margin-top: -6px; }
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -706,6 +728,20 @@ def _assemble_html(
     comment_system_global_html = _COMMENT_SYSTEM_GLOBAL_HTML if enable_comment_system else ""
     comment_system_js = f"<script>{_COMMENT_SYSTEM_JS}</script>" if enable_comment_system else ""
 
+    # --- Vocab tooltip auto-injection ---
+    # When the manifest includes a "vocab" dict, the vocab-tooltip component is
+    # auto-injected regardless of the template's component list.  This keeps the
+    # vocab feature fully data-driven: drop a "vocab" key into any manifest and
+    # the tooltip + index panel appear automatically.
+    vocab_fragment = ""
+    vocab = manifest.get("vocab", {})
+    if vocab and isinstance(vocab, dict):
+        try:
+            vocab_mod = get_component("vocab-tooltip")
+            vocab_fragment = vocab_mod.render({"vocab": vocab})
+        except ValueError:
+            pass  # vocab-tooltip not registered — skip silently
+
     # --- Mermaid CSS injection ---
     mermaid_extra_css = _MERMAID_CSS if needs_mermaid else ""
 
@@ -746,6 +782,7 @@ def _assemble_html(
   {mermaid_script_tag}
   <style>
 {global_css}
+{_SECTION_CONTENT_CSS}
 {comment_system_extra_css}
 {mermaid_extra_css}
   </style>
@@ -759,6 +796,7 @@ def _assemble_html(
   {doc_header}
   {sections_html}
   {comment_system_global_html}
+  {vocab_fragment}
   {other_fragments_html}
   {footer}
 </div>

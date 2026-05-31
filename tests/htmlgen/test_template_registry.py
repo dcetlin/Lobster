@@ -55,21 +55,23 @@ class TestLoadRegistry:
         spec = next(t for t in templates if t["id"] == "spec-document")
         assert spec["content_format"] == "json"
 
-    def test_document_class_has_clipboard_widget(self):
+    def test_document_class_does_not_have_clipboard_widget(self):
+        """clipboard-copy-widget was removed — Section Comments panel is redundant."""
         templates = load_registry()
         doc_class = next(t for t in templates if t["id"] == "document-class")
         component_ids = [c if isinstance(c, str) else c for c in doc_class["components"]]
-        assert "clipboard-copy-widget" in component_ids
+        assert "clipboard-copy-widget" not in component_ids
 
     def test_document_class_has_theme_toggle(self):
         templates = load_registry()
         doc_class = next(t for t in templates if t["id"] == "document-class")
         assert "theme-toggle" in doc_class["components"]
 
-    def test_spec_document_has_clipboard_widget(self):
+    def test_spec_document_does_not_have_clipboard_widget(self):
+        """clipboard-copy-widget was removed — Section Comments panel is redundant."""
         templates = load_registry()
         spec = next(t for t in templates if t["id"] == "spec-document")
-        assert "clipboard-copy-widget" in spec["components"]
+        assert "clipboard-copy-widget" not in spec["components"]
 
     def test_dashboard_class_has_theme_toggle(self):
         templates = load_registry()
