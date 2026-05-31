@@ -361,7 +361,8 @@ def _apply_instruction(
     if op == "replace_section_content":
         _require_fields(instruction, ["section_id", "new_content"])
         sid = instruction["section_id"]
-        sections_accessed.append(sid)
+        if sid not in sections_accessed:
+            sections_accessed.append(sid)
         _op_replace_section_content(
             soup,
             section_id=sid,
@@ -388,7 +389,8 @@ def _apply_instruction(
     elif op == "remove_section":
         _require_fields(instruction, ["section_id"])
         sid = instruction["section_id"]
-        sections_accessed.append(sid)
+        if sid not in sections_accessed:
+            sections_accessed.append(sid)
         _op_remove_section(soup, section_id=sid)
 
     elif op == "update_version_stamp":
