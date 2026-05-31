@@ -208,7 +208,13 @@ def validate_html(html: str, manifest: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 def _build_global_css(conventions: dict[str, Any]) -> str:
-    """Build the global CSS block from conventions: custom properties + base styles."""
+    """Build the global CSS block from conventions: custom properties + base styles.
+
+    Embeds a /* lobster-html-primitives vX.Y */ version stamp before the :root block
+    so CSS consumers can identify which conventions version was in effect at render time.
+    The version is read from conventions['conventions_version'] and stays in sync
+    automatically when conventions.yaml is bumped.
+    """
     dark_tokens = get_all_color_tokens("dark")
     light_tokens = get_all_color_tokens("light")
     typography = get_typography()
@@ -224,7 +230,13 @@ def _build_global_css(conventions: dict[str, Any]) -> str:
     wrap_max = layout.get("wrap_max_width", "820px")
     wrap_padding = layout.get("wrap_padding", "56px 28px 120px")
 
+    # CSS version stamp — identifies which conventions version produced these tokens.
+    # Allows stale documents to be detected when the palette or component set changes.
+    primitives_version = conventions.get("conventions_version", "?")
+    css_version_comment = f"/* lobster-html-primitives v{primitives_version} */"
+
     return f"""
+{css_version_comment}
 :root {{
 {dark_props}
 }}

@@ -334,6 +334,117 @@ class TestRender:
         placeholders = re.findall(r"\{\{[^}]+\}\}", result)
         assert not placeholders, f"Unresolved placeholders: {placeholders}"
 
+    def test_render_css_contains_primitives_version_comment(
+        self, manifest_file: Path, output_file: Path
+    ):
+        """CSS output must include /* lobster-html-primitives vX.Y */ version stamp."""
+        result = render(manifest_file, "document-class", output_file)
+        assert re.search(r"/\* lobster-html-primitives v[\d.]+ \*/", result), (
+            "Expected CSS version comment '/* lobster-html-primitives vX.Y */' in rendered HTML"
+        )
+
+    def test_render_css_version_comment_matches_conventions_version(
+        self, manifest_file: Path, output_file: Path
+    ):
+        """The CSS version stamp must match conventions.yaml conventions_version."""
+        from src.htmlgen.conventions import get_conventions_version
+        result = render(manifest_file, "document-class", output_file)
+        version = get_conventions_version()
+        expected_comment = f"/* lobster-html-primitives v{version} */"
+        assert expected_comment in result, (
+            f"Expected '{expected_comment}' in rendered HTML, "
+            f"but it was absent. conventions_version={version!r}"
+        )
+
+    def test_render_css_version_comment_is_in_root_block(
+        self, manifest_file: Path, output_file: Path
+    ):
+        """The version comment must appear in (or immediately before) the :root block."""
+        result = render(manifest_file, "document-class", output_file)
+        # Find the :root block and the comment — the comment should precede :root {
+        root_pos = result.find(":root {")
+        comment_pos = result.find("/* lobster-html-primitives v")
+        assert comment_pos != -1, "Version comment not found"
+        assert root_pos != -1, ":root block not found"
+        # Comment must appear before the :root { open-brace (within 120 chars)
+        assert comment_pos < root_pos, "Version comment must precede :root { block"
+        assert (root_pos - comment_pos) < 120, (
+            "Version comment is too far from :root block"
+        )
+
+
+# ---------------------------------------------------------------------------
+# CSS versioning tests (unit-level: _build_global_css)
+# ---------------------------------------------------------------------------
+
+
+class TestCssVersioning:
+    """CSS primitives version stamp is embedded in the global CSS block.
+
+    Spec from open-threads.md item 2:
+      Add /* lobster-html-primitives v1 */ to the :root block.
+    The version is read from conventions.yaml `conventions_version` so it
+    stays in sync automatically when conventions are bumped.
+    """
+
+    CSS_PRIMITIVES_VERSION_COMMENT_PATTERN = re.compile(
+        r"/\* lobster-html-primitives v[\d.]+ \*/"
+    )
+
+    def test_build_global_css_contains_primitives_comment(self):
+        """_build_global_css must include the version comment."""
+        from src.htmlgen.conventions import load_conventions
+        from src.htmlgen.renderer import _build_global_css
+        conventions = load_conventions()
+        css = _build_global_css(conventions)
+        assert self.CSS_PRIMITIVES_VERSION_COMMENT_PATTERN.search(css), (
+            "Expected '/* lobster-html-primitives vX.Y */' in _build_global_css output"
+        )
+
+    def test_build_global_css_version_matches_conventions_version(self):
+        """Version in the CSS comment must equal conventions.yaml conventions_version."""
+        from src.htmlgen.conventions import get_conventions_version, load_conventions
+        from src.htmlgen.renderer import _build_global_css
+        conventions = load_conventions()
+        css = _build_global_css(conventions)
+        version = get_conventions_version()
+        expected = f"/* lobster-html-primitives v{version} */"
+        assert expected in css, (
+            f"CSS must contain '{expected}' but got CSS starting with: {css[:200]}"
+        )
+
+    def test_build_global_css_comment_precedes_root_block(self):
+        """Version comment must appear before :root { in the CSS."""
+        from src.htmlgen.conventions import load_conventions
+        from src.htmlgen.renderer import _build_global_css
+        conventions = load_conventions()
+        css = _build_global_css(conventions)
+        comment_pos = css.find("/* lobster-html-primitives v")
+        root_pos = css.find(":root {")
+        assert comment_pos != -1, "Version comment not found in CSS"
+        assert root_pos != -1, ":root block not found in CSS"
+        assert comment_pos < root_pos, (
+            "Version comment must appear before :root { in the CSS output"
+        )
+
+    def test_build_global_css_still_contains_color_tokens(self):
+        """Adding the version comment must not break existing color token output."""
+        from src.htmlgen.conventions import load_conventions
+        from src.htmlgen.renderer import _build_global_css
+        conventions = load_conventions()
+        css = _build_global_css(conventions)
+        assert "--bg:" in css
+        assert "--accent:" in css
+        assert "#0b0d14" in css  # dark bg from conventions.yaml
+
+    def test_build_global_css_version_is_v1_point_0(self):
+        """conventions_version is '1.0', so the comment must read v1.0."""
+        from src.htmlgen.conventions import load_conventions
+        from src.htmlgen.renderer import _build_global_css
+        conventions = load_conventions()
+        css = _build_global_css(conventions)
+        assert "/* lobster-html-primitives v1.0 */" in css
+
 
 class TestRenderValidationEnforcement:
     """Tests that post-render validation correctly rejects malformed output."""
