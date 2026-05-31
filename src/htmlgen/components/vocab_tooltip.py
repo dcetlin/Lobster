@@ -286,7 +286,7 @@ _JS_TEMPLATE = r"""
       // Centre relative to viewport rather than the term
       var centreLeft = (vw / 2) - (tipRect.width / 2);
       // Convert viewport-relative centreLeft to position relative to termEl's offset parent
-      var offsetLeft = centreLeft - termRect.left + (termRect.width / 2);
+      var offsetLeft = centreLeft - termRect.left;
       tip.style.left = offsetLeft + 'px';
       tip.style.transform = 'none';
     } else {
@@ -362,12 +362,6 @@ _JS_TEMPLATE = r"""
   // ---------------------------------------------------------------------------
   // Mobile tap-to-toggle: wire touch/pointer events after terms are wrapped.
   // ---------------------------------------------------------------------------
-  var isTouchDevice = (
-    'ontouchstart' in window ||
-    navigator.maxTouchPoints > 0 ||
-    window.matchMedia('(pointer: coarse)').matches
-  );
-
   // Delegate touch events from the document root to avoid stale-reference issues
   // after innerHTML replacement during term wrapping.
   document.addEventListener('touchstart', function(e) {
