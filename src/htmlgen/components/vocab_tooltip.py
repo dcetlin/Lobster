@@ -38,7 +38,7 @@ import json
 import re
 
 COMPONENT_ID = "vocab-tooltip"
-COMPONENT_VERSION = "1.0.0"
+COMPONENT_VERSION = "1.1.0"
 
 CONFIG_SCHEMA = {
     "type": "object",
@@ -78,6 +78,7 @@ _CSS = """
   border-radius: 8px;
   padding: 10px 14px;
   width: 260px;
+  max-width: min(320px, 90vw);
   font-size: 12px;
   line-height: 1.55;
   color: var(--text);
@@ -95,10 +96,29 @@ _CSS = """
   border: 6px solid transparent;
   border-top-color: var(--border2);
 }
+/* flip-below variant: caret moves to bottom of card pointing up */
+.vocab-term .vocab-tip.vocab-tip-below {
+  bottom: auto;
+  top: calc(100% + 6px);
+}
+.vocab-term .vocab-tip.vocab-tip-below::after {
+  top: auto;
+  bottom: 100%;
+  border-top-color: transparent;
+  border-bottom-color: var(--border2);
+}
+/* Desktop: hover/focus shows tooltip */
 .vocab-term:hover .vocab-tip,
 .vocab-term:focus .vocab-tip {
   visibility: visible;
   opacity: 1;
+  pointer-events: auto;
+}
+/* Mobile: JS adds vocab-tip-open class to show tooltip */
+.vocab-term.vocab-tip-open .vocab-tip {
+  visibility: visible;
+  opacity: 1;
+  pointer-events: auto;
 }
 .vocab-tip-term {
   font-weight: 700;
@@ -109,6 +129,21 @@ _CSS = """
   display: block;
   margin-bottom: 5px;
 }
+/* ── Close button (top-right of tooltip card) ── */
+.vocab-tip-close {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--text3);
+  padding: 2px 4px;
+  opacity: 0.7;
+}
+.vocab-tip-close:hover { opacity: 1; }
 
 /* ── Vocab index panel ── */
 .vocab-index {
@@ -175,6 +210,9 @@ _JS_TEMPLATE = r"""
 (function() {
   var vocab = {vocab_json};
 
+  // Narrow-screen threshold: below this width, center tooltip relative to viewport.
+  var NARROW_SCREEN_THRESHOLD = 400;
+
   // Sort terms longest-first to avoid partial matches swallowing longer terms.
   var terms = Object.keys(vocab).sort(function(a, b) { return b.length - a.length; });
 
@@ -182,6 +220,98 @@ _JS_TEMPLATE = r"""
     return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
+  // ---------------------------------------------------------------------------
+  // Close all open tooltips (enforces one-at-a-time invariant).
+  // ---------------------------------------------------------------------------
+  function closeAll() {
+    var open = document.querySelectorAll('.vocab-tip-open');
+    for (var i = 0; i < open.length; i++) {
+      open[i].classList.remove('vocab-tip-open');
+      // Reset any inline positioning applied by repositionTip()
+      var tip = open[i].querySelector('.vocab-tip');
+      if (tip) {
+        tip.style.left = '';
+        tip.style.right = '';
+        tip.style.top = '';
+        tip.style.bottom = '';
+        tip.style.transform = '';
+        tip.style.position = '';
+        tip.classList.remove('vocab-tip-below');
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Viewport-aware positioning: shift/flip so the tooltip card stays on-screen.
+  // Runs after the tooltip is made visible so getBoundingClientRect() is accurate.
+  // ---------------------------------------------------------------------------
+  function repositionTip(termEl) {
+    var tip = termEl.querySelector('.vocab-tip');
+    if (!tip) return;
+
+    var termRect = termEl.getBoundingClientRect();
+    var tipRect = tip.getBoundingClientRect();
+    var vw = window.innerWidth || document.documentElement.clientWidth;
+    var vh = window.innerHeight || document.documentElement.clientHeight;
+
+    // Reset to default (above, centred on term)
+    tip.classList.remove('vocab-tip-below');
+    tip.style.left = '';
+    tip.style.right = '';
+    tip.style.top = '';
+    tip.style.bottom = '';
+    tip.style.transform = '';
+    tip.style.position = 'absolute';
+
+    // Re-read rect after reset
+    tipRect = tip.getBoundingClientRect();
+
+    // ── Vertical: flip below if top goes off-screen ──
+    if (tipRect.top < 0) {
+      tip.classList.add('vocab-tip-below');
+      tipRect = tip.getBoundingClientRect();
+    }
+
+    // ── Vertical: flip above if bottom goes off-screen (and above fits) ──
+    if (tipRect.bottom > vh && tip.classList.contains('vocab-tip-below')) {
+      // Both positions overflow — prefer above if it has more room
+      if (termRect.top > vh - termRect.bottom) {
+        tip.classList.remove('vocab-tip-below');
+        tipRect = tip.getBoundingClientRect();
+      }
+    }
+
+    // ── Horizontal: narrow-screen centering ──
+    if (vw < NARROW_SCREEN_THRESHOLD) {
+      // Centre relative to viewport rather than the term
+      var centreLeft = (vw / 2) - (tipRect.width / 2);
+      // Convert viewport-relative centreLeft to position relative to termEl's offset parent
+      var offsetLeft = centreLeft - termRect.left + (termRect.width / 2);
+      tip.style.left = offsetLeft + 'px';
+      tip.style.transform = 'none';
+    } else {
+      // Normal screens: adjust for right-edge overflow
+      tipRect = tip.getBoundingClientRect();
+      if (tipRect.right > vw) {
+        var shiftLeft = tipRect.right - vw + 8;
+        var currentLeft = parseFloat(tip.style.left) || 0;
+        tip.style.left = (currentLeft - shiftLeft) + 'px';
+        tip.style.transform = 'none';
+        tipRect = tip.getBoundingClientRect();
+      }
+      // Clamp so tip never goes past the left edge
+      if (tipRect.left < 0) {
+        var shiftRight = -tipRect.left + 8;
+        var currentLeft2 = parseFloat(tip.style.left) || 0;
+        tip.style.left = (currentLeft2 + shiftRight) + 'px';
+        tip.style.transform = 'none';
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Term wrapping — inject tooltip markup including the × close button.
+  // ---------------------------------------------------------------------------
   function wrapTermsInNode(node) {
     if (!node) return;
     if (node.nodeType === Node.TEXT_NODE) {
@@ -199,7 +329,9 @@ _JS_TEMPLATE = r"""
           .replace(/\$/g, '$$$$');  // escape $ to prevent .replace() backreference interpretation
         var newHtml = html.replace(re,
           '<span class="vocab-term" tabindex="0">' +
-          '<span class="vocab-tip"><span class="vocab-tip-term">' + term + '</span>' + def + '</span>' +
+          '<span class="vocab-tip">' +
+          '<button class="vocab-tip-close" aria-label="Close" tabindex="0">×</button>' +
+          '<span class="vocab-tip-term">' + term + '</span>' + def + '</span>' +
           '$1</span>'
         );
         if (newHtml !== html) {
@@ -226,6 +358,64 @@ _JS_TEMPLATE = r"""
   // Run after DOM is ready (we're deferred to end of body)
   var sections = document.querySelectorAll('.section');
   sections.forEach(function(el) { wrapTermsInNode(el); });
+
+  // ---------------------------------------------------------------------------
+  // Mobile tap-to-toggle: wire touch/pointer events after terms are wrapped.
+  // ---------------------------------------------------------------------------
+  var isTouchDevice = (
+    'ontouchstart' in window ||
+    navigator.maxTouchPoints > 0 ||
+    window.matchMedia('(pointer: coarse)').matches
+  );
+
+  // Delegate touch events from the document root to avoid stale-reference issues
+  // after innerHTML replacement during term wrapping.
+  document.addEventListener('touchstart', function(e) {
+    var termEl = e.target.closest('.vocab-term');
+    var closeBtn = e.target.closest('.vocab-tip-close');
+
+    if (closeBtn) {
+      // × button: close the containing term's tooltip
+      e.preventDefault();
+      var parentTerm = closeBtn.closest('.vocab-term');
+      if (parentTerm) parentTerm.classList.remove('vocab-tip-open');
+      return;
+    }
+
+    if (termEl) {
+      // Tapping a term: toggle its tooltip; close all others first
+      e.preventDefault();
+      var wasOpen = termEl.classList.contains('vocab-tip-open');
+      closeAll();
+      if (!wasOpen) {
+        termEl.classList.add('vocab-tip-open');
+        repositionTip(termEl);
+      }
+      return;
+    }
+
+    // Tapping outside any term or tooltip: close all
+    var tipEl = e.target.closest('.vocab-tip');
+    if (!tipEl) {
+      closeAll();
+    }
+  }, { passive: false });
+
+  // Document-level click listener handles outside-tap on non-touch devices too
+  document.addEventListener('click', function(e) {
+    var termEl = e.target.closest('.vocab-term');
+    var tipEl = e.target.closest('.vocab-tip');
+    if (!termEl && !tipEl) {
+      closeAll();
+    }
+  });
+
+  // Escape key closes any open tooltip
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' || e.keyCode === 27) {
+      closeAll();
+    }
+  });
 })();
 
 function toggleVocabIndex() {
