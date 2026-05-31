@@ -9,10 +9,12 @@ and verify the contract between LLM-expressed intent and deterministic DOM mutat
 Named constants for spec-mandated values:
     SECTION_CLASS = "section"  — the class all sections carry
     COMMENT_BTN_HTML = the emoji button pattern in headings
+    TRACE_LOG_PATH = ~/lobster-workspace/data/html-edit-traces.jsonl
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -20,11 +22,16 @@ from bs4 import BeautifulSoup
 
 from src.htmlgen.editor import (
     EditError,
+    EditTrace,
     apply_edit,
     apply_edits,
+    find_sections_by_content,
     list_section_ids,
     parse_html,
 )
+
+# Spec-mandated constant: the path where edit traces are appended
+TRACE_LOG_PATH = Path.home() / "lobster-workspace" / "data" / "html-edit-traces.jsonl"
 
 # ---------------------------------------------------------------------------
 # Named constants — spec-mandated values
@@ -566,3 +573,285 @@ class TestUnknownOp:
         with pytest.raises(EditError):
             apply_edit(html_file, {"op": "replace_section_content", "section_id": "s1"})
             # missing new_content
+
+
+# ---------------------------------------------------------------------------
+# find_sections_by_content tests
+# ---------------------------------------------------------------------------
+
+
+class TestFindSectionsByContent:
+    """find_sections_by_content locates sections by text or CSS without modifying the doc."""
+
+    def test_text_mode_returns_section_id_for_matching_content(self, html_file: Path):
+        ids = find_sections_by_content(html_file, "Original content")
+        assert "s1" in ids
+
+    def test_text_mode_match_is_case_insensitive(self, html_file: Path):
+        ids = find_sections_by_content(html_file, "ORIGINAL CONTENT")
+        assert "s1" in ids
+
+    def test_text_mode_returns_empty_list_when_no_match(self, html_file: Path):
+        ids = find_sections_by_content(html_file, "xyzzy-no-such-text")
+        assert ids == []
+
+    def test_text_mode_returns_only_matching_sections(self, html_file: Path):
+        # "Background content" is in s2 only
+        ids = find_sections_by_content(html_file, "Background content")
+        assert "s2" in ids
+        assert "s1" not in ids
+
+    def test_text_mode_returns_multiple_sections_when_pattern_matches_several(
+        self, tmp_path: Path
+    ):
+        p = tmp_path / "multi.html"
+        p.write_text(
+            _minimal_html(sections=[
+                {"id": "s1", "label": "§1", "title": "Alpha", "content": "<p>shared keyword here</p>"},
+                {"id": "s2", "label": "§2", "title": "Beta", "content": "<p>shared keyword here too</p>"},
+                {"id": "s3", "label": "§3", "title": "Gamma", "content": "<p>no match</p>"},
+            ]),
+            encoding="utf-8",
+        )
+        ids = find_sections_by_content(p, "shared keyword")
+        assert "s1" in ids
+        assert "s2" in ids
+        assert "s3" not in ids
+
+    def test_css_mode_returns_section_containing_matching_element(self, html_file: Path):
+        # Both sections contain <h2> elements
+        ids = find_sections_by_content(html_file, "h2", mode="css")
+        assert "s1" in ids
+        assert "s2" in ids
+
+    def test_css_mode_returns_empty_list_when_selector_matches_nothing(self, html_file: Path):
+        ids = find_sections_by_content(html_file, "div.nonexistent-class", mode="css")
+        assert ids == []
+
+    def test_document_with_no_sections_returns_empty_list(self, tmp_path: Path):
+        p = tmp_path / "no-sections.html"
+        p.write_text("<html><body><p>No sections here.</p></body></html>", encoding="utf-8")
+        assert find_sections_by_content(p, "No sections") == []
+
+    def test_does_not_modify_document(self, html_file: Path):
+        original = html_file.read_text()
+        find_sections_by_content(html_file, "Original content")
+        assert html_file.read_text() == original
+
+    def test_returns_ids_in_document_order(self, tmp_path: Path):
+        p = tmp_path / "ordered.html"
+        p.write_text(
+            _minimal_html(sections=[
+                {"id": "s1", "label": "§1", "title": "A", "content": "<p>match</p>"},
+                {"id": "s2", "label": "§2", "title": "B", "content": "<p>match</p>"},
+                {"id": "s3", "label": "§3", "title": "C", "content": "<p>match</p>"},
+            ]),
+            encoding="utf-8",
+        )
+        ids = find_sections_by_content(p, "match")
+        assert ids == ["s1", "s2", "s3"]
+
+
+# ---------------------------------------------------------------------------
+# EditTrace dataclass tests
+# ---------------------------------------------------------------------------
+
+
+class TestEditTraceOnSuccessfulEdit:
+    """EditTrace fields are populated correctly after a successful single-section edit."""
+
+    def test_edit_trace_returned_from_apply_edit(self, html_file: Path):
+        result, trace = apply_edit(html_file, {
+            "op": "replace_section_content",
+            "section_id": "s1",
+            "new_content": "<p>Updated.</p>",
+        })
+        assert isinstance(trace, EditTrace)
+
+    def test_edit_trace_doc_path_matches_input(self, html_file: Path):
+        _, trace = apply_edit(html_file, {
+            "op": "replace_section_content",
+            "section_id": "s1",
+            "new_content": "<p>Updated.</p>",
+        })
+        assert trace.doc_path == str(html_file)
+
+    def test_edit_trace_sections_total_reflects_document(self, html_file: Path):
+        _, trace = apply_edit(html_file, {
+            "op": "replace_section_content",
+            "section_id": "s1",
+            "new_content": "<p>Updated.</p>",
+        })
+        # html_file has 2 sections
+        assert trace.sections_total == 2
+
+    def test_edit_trace_sections_accessed_contains_targeted_section(self, html_file: Path):
+        _, trace = apply_edit(html_file, {
+            "op": "replace_section_content",
+            "section_id": "s1",
+            "new_content": "<p>Updated.</p>",
+        })
+        assert "s1" in trace.sections_accessed
+
+    def test_edit_trace_operations_attempted_matches_instruction_count(self, html_file: Path):
+        _, trace = apply_edit(html_file, {
+            "op": "replace_section_content",
+            "section_id": "s1",
+            "new_content": "<p>Updated.</p>",
+        })
+        assert trace.operations_attempted == 1
+
+    def test_edit_trace_operations_succeeded_matches_on_success(self, html_file: Path):
+        _, trace = apply_edit(html_file, {
+            "op": "replace_section_content",
+            "section_id": "s1",
+            "new_content": "<p>Updated.</p>",
+        })
+        assert trace.operations_succeeded == 1
+
+    def test_edit_trace_write_succeeded_true_on_success(self, html_file: Path):
+        _, trace = apply_edit(html_file, {
+            "op": "replace_section_content",
+            "section_id": "s1",
+            "new_content": "<p>Updated.</p>",
+        })
+        assert trace.write_succeeded is True
+
+    def test_edit_trace_operation_types_contains_op_name(self, html_file: Path):
+        _, trace = apply_edit(html_file, {
+            "op": "replace_section_content",
+            "section_id": "s1",
+            "new_content": "<p>Updated.</p>",
+        })
+        assert "replace_section_content" in trace.operation_types
+
+    def test_edit_trace_doc_size_bytes_positive(self, html_file: Path):
+        _, trace = apply_edit(html_file, {
+            "op": "replace_section_content",
+            "section_id": "s1",
+            "new_content": "<p>Updated.</p>",
+        })
+        assert trace.doc_size_bytes > 0
+
+
+class TestEditTraceOnBatchEdit:
+    """EditTrace fields are correct after a batch operation touching multiple sections."""
+
+    def test_batch_trace_sections_accessed_contains_all_targeted_sections(
+        self, html_file: Path
+    ):
+        _, trace = apply_edits(html_file, [
+            {"op": "replace_section_content", "section_id": "s1", "new_content": "<p>A.</p>"},
+            {"op": "replace_section_content", "section_id": "s2", "new_content": "<p>B.</p>"},
+        ])
+        assert "s1" in trace.sections_accessed
+        assert "s2" in trace.sections_accessed
+
+    def test_batch_trace_operations_attempted_matches_instruction_count(
+        self, html_file: Path
+    ):
+        _, trace = apply_edits(html_file, [
+            {"op": "replace_section_content", "section_id": "s1", "new_content": "<p>A.</p>"},
+            {"op": "update_version_stamp", "version": "1.1"},
+        ])
+        assert trace.operations_attempted == 2
+
+    def test_batch_trace_operation_types_contains_all_op_names(self, html_file: Path):
+        _, trace = apply_edits(html_file, [
+            {"op": "replace_section_content", "section_id": "s1", "new_content": "<p>A.</p>"},
+            {"op": "update_version_stamp", "version": "1.1"},
+        ])
+        assert "replace_section_content" in trace.operation_types
+        assert "update_version_stamp" in trace.operation_types
+
+
+class TestEditTraceOnFailedEdit:
+    """EditTrace.write_succeeded is False when an edit errors out."""
+
+    def test_failed_edit_raises_edit_error(self, html_file: Path):
+        with pytest.raises(EditError):
+            apply_edit(html_file, {
+                "op": "replace_section_content",
+                "section_id": "s99",  # doesn't exist
+                "new_content": "<p>x</p>",
+            })
+
+    def test_apply_edits_still_returns_html_string_as_first_element(
+        self, html_file: Path
+    ):
+        result, trace = apply_edits(html_file, [
+            {"op": "replace_section_content", "section_id": "s1", "new_content": "<p>OK.</p>"},
+        ])
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+
+# ---------------------------------------------------------------------------
+# JSONL trace log tests
+# ---------------------------------------------------------------------------
+
+
+class TestJsonlTraceLog:
+    """After every apply_edit / apply_edits call, a trace is appended to the JSONL log."""
+
+    def test_jsonl_file_created_after_edit(self, html_file: Path, tmp_path: Path, monkeypatch):
+        log_path = tmp_path / "traces.jsonl"
+        monkeypatch.setattr("src.htmlgen.editor.TRACE_LOG_PATH", log_path)
+        apply_edit(html_file, {
+            "op": "replace_section_content",
+            "section_id": "s1",
+            "new_content": "<p>Traced.</p>",
+        })
+        assert log_path.exists()
+
+    def test_jsonl_entry_is_valid_json(self, html_file: Path, tmp_path: Path, monkeypatch):
+        log_path = tmp_path / "traces.jsonl"
+        monkeypatch.setattr("src.htmlgen.editor.TRACE_LOG_PATH", log_path)
+        apply_edit(html_file, {
+            "op": "replace_section_content",
+            "section_id": "s1",
+            "new_content": "<p>Traced.</p>",
+        })
+        line = log_path.read_text().strip()
+        entry = json.loads(line)
+        assert isinstance(entry, dict)
+
+    def test_jsonl_entry_contains_timestamp(self, html_file: Path, tmp_path: Path, monkeypatch):
+        log_path = tmp_path / "traces.jsonl"
+        monkeypatch.setattr("src.htmlgen.editor.TRACE_LOG_PATH", log_path)
+        apply_edit(html_file, {
+            "op": "replace_section_content",
+            "section_id": "s1",
+            "new_content": "<p>Traced.</p>",
+        })
+        entry = json.loads(log_path.read_text().strip())
+        assert "timestamp" in entry
+
+    def test_jsonl_entry_contains_trace_fields(self, html_file: Path, tmp_path: Path, monkeypatch):
+        log_path = tmp_path / "traces.jsonl"
+        monkeypatch.setattr("src.htmlgen.editor.TRACE_LOG_PATH", log_path)
+        apply_edit(html_file, {
+            "op": "replace_section_content",
+            "section_id": "s1",
+            "new_content": "<p>Traced.</p>",
+        })
+        entry = json.loads(log_path.read_text().strip())
+        assert "doc_path" in entry
+        assert "write_succeeded" in entry
+        assert "operations_attempted" in entry
+
+    def test_jsonl_appends_on_subsequent_calls(self, html_file: Path, tmp_path: Path, monkeypatch):
+        log_path = tmp_path / "traces.jsonl"
+        monkeypatch.setattr("src.htmlgen.editor.TRACE_LOG_PATH", log_path)
+        apply_edit(html_file, {
+            "op": "replace_section_content",
+            "section_id": "s1",
+            "new_content": "<p>First.</p>",
+        })
+        apply_edit(html_file, {
+            "op": "replace_section_content",
+            "section_id": "s2",
+            "new_content": "<p>Second.</p>",
+        })
+        lines = [l for l in log_path.read_text().strip().splitlines() if l.strip()]
+        assert len(lines) == 2
