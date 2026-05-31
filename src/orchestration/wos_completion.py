@@ -784,6 +784,68 @@ def _stamp_issue_on_completion(
 
 
 # ---------------------------------------------------------------------------
+# Adaptive Steward scoring hook — §3-I wos-evolution-spec.md
+# ---------------------------------------------------------------------------
+
+def _score_verdict_for_uow(
+    uow_id: str,
+    uow: object,
+    outcome: str,
+) -> None:
+    """
+    Normalize the UoW hypothesis and upsert a scored verdict into verdict_accumulator.
+
+    Called at UoW closure (success or failure) to feed the Adaptive Steward
+    learning layer. Non-fatal: all exceptions are caught and logged at WARNING
+    level so UoW transitions are never blocked.
+
+    Hypothesis source priority:
+    1. prescription_hypothesis_log (written by Steward at prescription time)
+    2. uow.summary (fallback for UoWs created before the Adaptive Steward)
+
+    Args:
+        uow_id: The WOS unit-of-work ID.
+        uow: The UoW object (must have .summary and .register attributes).
+        outcome: One of "pass", "fail", or "partial".
+    """
+    try:
+        from orchestration.verdict_normalization import (
+            get_hypothesis_for_uow,
+            score_and_normalize_verdict,
+        )
+        from orchestration.prescription_object import hypothesis_from_uow_summary
+
+        # Try prescription_hypothesis_log first; fall back to summary.
+        hypothesis = get_hypothesis_for_uow(uow_id)
+        if not hypothesis:
+            summary = getattr(uow, "summary", None) or ""
+            hypothesis = hypothesis_from_uow_summary(summary)
+
+        if not hypothesis:
+            log.debug(
+                "_score_verdict_for_uow: no hypothesis available for UoW %r — skipping",
+                uow_id,
+            )
+            return
+
+        register = str(getattr(uow, "register", "operational") or "operational")
+
+        score_and_normalize_verdict(
+            uow_id=uow_id,
+            register=register,
+            hypothesis_raw=hypothesis,
+            outcome=outcome,  # type: ignore[arg-type]
+        )
+    except Exception as exc:
+        log.warning(
+            "_score_verdict_for_uow: failed for UoW %r — %s: %s",
+            uow_id,
+            type(exc).__name__,
+            exc,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main entry point — called by inbox_server.py on every write_result
 # ---------------------------------------------------------------------------
 
@@ -978,6 +1040,11 @@ def maybe_complete_wos_uow(
             gh_bin=gh_bin,
         )
 
+        # Adaptive Steward scoring hook (§3-I, wos-evolution-spec.md).
+        # Normalize the hypothesis and upsert into verdict_accumulator.
+        # Non-fatal: must never block the UoW transition.
+        _score_verdict_for_uow(uow_id=uow_id, uow=uow, outcome="pass")
+
     except Exception as exc:
         log.warning(
             "maybe_complete_wos_uow: failed to complete UoW %r — %s: %s",
@@ -1051,6 +1118,12 @@ def maybe_fail_wos_uow(task_id: str, reason: str) -> None:
             uow_id,
             reason,
         )
+
+        # Adaptive Steward scoring hook (§3-I, wos-evolution-spec.md).
+        # Record a "fail" verdict for this UoW's hypothesis.
+        # Non-fatal: must never block the hook's exit path.
+        _score_verdict_for_uow(uow_id=uow_id, uow=uow, outcome="fail")
+
     except Exception as exc:
         log.warning(
             "maybe_fail_wos_uow: failed for UoW %r — %s: %s",
