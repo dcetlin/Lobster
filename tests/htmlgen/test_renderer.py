@@ -704,10 +704,6 @@ class TestVocabTooltipComponent:
         manifest_path = self._make_vocab_manifest(tmp_path)
         out = tmp_path / "vocab-out.html"
         result = render(manifest_path, "document-class", out)
-        # Find positions of each term in the output
-        positions = {
-            term: result.find(f'class="vocab-entry"') for term in VOCAB_MANIFEST_TERMS
-        }
         # Find where each term appears in the vocab panel section
         vocab_panel_start = result.find("vocab-index")
         if vocab_panel_start == -1:

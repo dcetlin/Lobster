@@ -189,16 +189,22 @@ _JS_TEMPLATE = r"""
       var html = text;
       var matched = false;
       terms.forEach(function(term) {
-        // Match whole word only, case-sensitive.
+        // Match case-sensitive (no word-boundary anchors — terms may appear mid-word).
         var re = new RegExp('(' + escapeRegex(term) + ')', 'g');
-        if (re.test(html)) {
+        var def = vocab[term]
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/\$/g, '$$$$');  // escape $ to prevent .replace() backreference interpretation
+        var newHtml = html.replace(re,
+          '<span class="vocab-term" tabindex="0">' +
+          '<span class="vocab-tip"><span class="vocab-tip-term">' + term + '</span>' + def + '</span>' +
+          '$1</span>'
+        );
+        if (newHtml !== html) {
           matched = true;
-          var def = vocab[term].replace(/"/g, '&quot;');
-          html = html.replace(re,
-            '<span class="vocab-term" tabindex="0">' +
-            '<span class="vocab-tip"><span class="vocab-tip-term">' + term + '</span>' + vocab[term] + '</span>' +
-            '$1</span>'
-          );
+          html = newHtml;
         }
       });
       if (matched) {

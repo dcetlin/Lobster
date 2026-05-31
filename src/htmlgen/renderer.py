@@ -269,7 +269,8 @@ code, pre, kbd {{
 .section-label {{ font-size: 11px; font-weight: 700; color: var(--text3); text-transform: uppercase;
   letter-spacing: .08em; margin-bottom: 6px; }}
 .section h2 {{ font-size: 19px; font-weight: 700; color: var(--text); margin: 0 0 16px; }}
-.section h3 {{ font-size: 16px; font-weight: 600; color: var(--text); margin: 20px 0 12px; }}
+.section h3 {{ font-size: 16px; font-weight: 700; color: var(--text); margin: 32px 0 6px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }}
+.section h3:first-of-type {{ margin-top: 20px; }}
 .section p {{ color: var(--text2); margin: 0 0 14px; }}
 .section ul, .section ol {{ color: var(--text2); padding-left: 24px; }}
 .section li {{ margin-bottom: 6px; }}
@@ -357,17 +358,6 @@ _MERMAID_CDN_SCRIPT = '<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist
 # ---------------------------------------------------------------------------
 
 _SECTION_CONTENT_CSS = """
-  /* ── Material quality entries (§2-style h3 sections) ── */
-  .section h3 {
-    font-size: 16px;
-    font-weight: 700;
-    color: var(--text);
-    margin: 32px 0 6px;
-    padding-bottom: 6px;
-    border-bottom: 1px solid var(--border);
-  }
-  /* First h3 in a section — no top margin to avoid double gap after section h2 */
-  .section h3:first-of-type { margin-top: 20px; }
   .section > hr {
     border: none;
     border-top: 1px solid var(--border);
