@@ -3,8 +3,6 @@ name: Document (narrative)
 description: Design docs, proposals, audits, synthesis. Narrative-primary.
 content_format: markdown
 components:
-  - id: clipboard-copy-widget
-    config: {}  # auto-populated from section list at render time
   - id: theme-toggle
     config:
       mode: js-toggle
@@ -45,6 +43,6 @@ optional_sections:
 # Rendering parameters
 render_params:
   inject_section_labels: true
-  auto_populate_clipboard_sections: true  # derive sections list from manifest
+  auto_populate_clipboard_sections: false  # clipboard-copy-widget removed
   header_pattern: doc-header  # doc-header with doc-title + doc-subtitle
   footer: true

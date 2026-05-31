@@ -11,11 +11,13 @@ Each component module exports:
 from . import clipboard_copy_widget
 from . import d3_vocabulary_network
 from . import theme_toggle
+from . import vocab_tooltip
 
 COMPONENTS: dict = {
     "theme-toggle": theme_toggle,
     "clipboard-copy-widget": clipboard_copy_widget,
     "d3-vocabulary-network": d3_vocabulary_network,
+    "vocab-tooltip": vocab_tooltip,
 }
 
 
@@ -38,4 +40,5 @@ __all__ = [
     "theme_toggle",
     "clipboard_copy_widget",
     "d3_vocabulary_network",
+    "vocab_tooltip",
 ]

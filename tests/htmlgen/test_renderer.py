@@ -263,18 +263,16 @@ class TestRender:
         result = render(manifest_file, "document-class", output_file)
         assert 'id="theme-toggle"' in result
 
-    def test_render_has_clipboard_widget_component(self, manifest_file: Path, output_file: Path):
-        """document-class template requires clipboard-copy-widget component."""
-        result = render(manifest_file, "document-class", output_file)
-        assert 'id="comment-widget"' in result
+    def test_render_section_comments_widget_absent(self, manifest_file: Path, output_file: Path):
+        """Section Comments widget (clipboard-copy-widget) must NOT appear in document-class output.
 
-    def test_render_clipboard_widget_has_all_section_inputs(
-        self, manifest_file: Path, output_file: Path
-    ):
-        """Clipboard widget must reference all sections from the manifest."""
+        Dan confirmed this panel is redundant — inline comment buttons and the
+        'Copy all comments' button already provide this functionality.
+        """
         result = render(manifest_file, "document-class", output_file)
-        assert '"id": "s1"' in result or '"id":"s1"' in result.replace(" ", "")
-        assert '"id": "s2"' in result or '"id":"s2"' in result.replace(" ", "")
+        assert 'id="comment-widget"' not in result
+        assert "Section Comments" not in result
+        assert "comment-widget-title" not in result
 
     def test_render_title_in_output(self, manifest_file: Path, output_file: Path):
         result = render(manifest_file, "document-class", output_file)
@@ -622,3 +620,104 @@ class TestD3ComponentInjection:
         assert "d3js.org" not in result, (
             "D3 CDN script must not be present when d3 component is not used"
         )
+
+
+# ---------------------------------------------------------------------------
+# Vocab tooltip component tests
+# ---------------------------------------------------------------------------
+
+
+VOCAB_MANIFEST_TERMS = {
+    "Stiffness": "Resistance to deformation; preserves geometry under load.",
+    "Elasticity": "Deformation with return; receives perturbation without losing yourself.",
+    "Damping": "Absorbs vibration; prevents irrelevant oscillation from propagating.",
+}
+
+
+class TestVocabTooltipComponent:
+    """Tests for the vocab tooltip system (Task 3 — vocab index).
+
+    The vocab field in the manifest drives both:
+    1. Inline hover tooltips on term occurrences in section text.
+    2. A collapsible vocab index panel listing all terms alphabetically with definitions.
+    """
+
+    def _make_vocab_manifest(self, tmp_path: Path) -> Path:
+        manifest = dict(MINIMAL_MANIFEST)
+        manifest["sections"] = [
+            {
+                "id": "s1",
+                "label": "§1",
+                "title": "Concepts",
+                "content": "Stiffness is key. Elasticity enables return. Damping prevents noise.",
+            }
+        ]
+        manifest["vocab"] = VOCAB_MANIFEST_TERMS
+        p = tmp_path / "vocab-manifest.json"
+        p.write_text(json.dumps(manifest), encoding="utf-8")
+        return p
+
+    def test_vocab_panel_present_when_vocab_field_in_manifest(self, tmp_path: Path):
+        """When manifest includes vocab field, a vocab index panel must appear in the output."""
+        manifest_path = self._make_vocab_manifest(tmp_path)
+        out = tmp_path / "vocab-out.html"
+        result = render(manifest_path, "document-class", out)
+        assert "vocab-index" in result or "vocab-panel" in result, (
+            "Vocab index panel must appear when manifest has vocab field"
+        )
+
+    def test_vocab_terms_appear_in_panel(self, tmp_path: Path):
+        """Each vocab term must appear in the vocab index panel."""
+        manifest_path = self._make_vocab_manifest(tmp_path)
+        out = tmp_path / "vocab-out.html"
+        result = render(manifest_path, "document-class", out)
+        for term in VOCAB_MANIFEST_TERMS:
+            assert term in result, f"Vocab term '{term}' missing from rendered output"
+
+    def test_vocab_definitions_appear_in_panel(self, tmp_path: Path):
+        """Each vocab definition must appear in the rendered output."""
+        manifest_path = self._make_vocab_manifest(tmp_path)
+        out = tmp_path / "vocab-out.html"
+        result = render(manifest_path, "document-class", out)
+        for _term, defn in VOCAB_MANIFEST_TERMS.items():
+            # Definition text must be present somewhere in the output
+            assert defn[:40] in result, f"Definition '{defn[:40]}...' missing from rendered output"
+
+    def test_vocab_tooltip_markup_present(self, tmp_path: Path):
+        """Tooltip markup (vocab-term class or data-def attribute) must be present."""
+        manifest_path = self._make_vocab_manifest(tmp_path)
+        out = tmp_path / "vocab-out.html"
+        result = render(manifest_path, "document-class", out)
+        assert "vocab-term" in result, (
+            "vocab-term CSS class must be used to mark tooltip-enhanced terms"
+        )
+
+    def test_no_vocab_panel_without_vocab_field(self, manifest_file: Path, output_file: Path):
+        """When manifest has no vocab field, no vocab panel must appear."""
+        result = render(manifest_file, "document-class", output_file)
+        assert "vocab-index" not in result and "vocab-panel" not in result, (
+            "Vocab panel must not appear when manifest has no vocab field"
+        )
+
+    def test_vocab_panel_alphabetically_sorted(self, tmp_path: Path):
+        """Terms in the vocab index panel must appear in alphabetical order."""
+        manifest_path = self._make_vocab_manifest(tmp_path)
+        out = tmp_path / "vocab-out.html"
+        result = render(manifest_path, "document-class", out)
+        # Find positions of each term in the output
+        positions = {
+            term: result.find(f'class="vocab-entry"') for term in VOCAB_MANIFEST_TERMS
+        }
+        # Find where each term appears in the vocab panel section
+        vocab_panel_start = result.find("vocab-index")
+        if vocab_panel_start == -1:
+            vocab_panel_start = result.find("vocab-panel")
+        panel_section = result[vocab_panel_start:] if vocab_panel_start != -1 else result
+        sorted_terms = sorted(VOCAB_MANIFEST_TERMS.keys())
+        prev_pos = 0
+        for term in sorted_terms:
+            pos = panel_section.find(term, prev_pos)
+            assert pos >= prev_pos, (
+                f"Term '{term}' is out of alphabetical order in vocab panel"
+            )
+            prev_pos = pos

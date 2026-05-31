@@ -121,8 +121,9 @@ class TestLayerImports:
 
     def test_components_importable(self):
         assert "theme-toggle" in COMPONENTS
-        assert "clipboard-copy-widget" in COMPONENTS
+        assert "clipboard-copy-widget" in COMPONENTS  # still in registry; not in templates
         assert "d3-vocabulary-network" in COMPONENTS
+        assert "vocab-tooltip" in COMPONENTS
 
     def test_renderer_importable(self):
         # Just confirm the key functions are callable
@@ -209,22 +210,16 @@ class TestEndToEndRender:
         result = render(smoke_manifest_file, "spec-document", out)
         assert 'id="theme-toggle"' in result
 
-    def test_render_includes_clipboard_widget(self, smoke_manifest_file: Path, tmp_path: Path):
-        out = tmp_path / "spec.html"
-        result = render(smoke_manifest_file, "spec-document", out)
-        assert 'id="comment-widget"' in result
+    def test_render_section_comments_absent(self, smoke_manifest_file: Path, tmp_path: Path):
+        """Section Comments widget (clipboard-copy-widget) must not appear in spec-document output.
 
-    def test_render_clipboard_sections_match_manifest(
-        self, smoke_manifest_file: Path, tmp_path: Path
-    ):
-        """Clipboard widget sections must match manifest sections."""
+        Dan confirmed this panel is redundant — the inline comment buttons and
+        'Copy all comments' button already provide this functionality.
+        """
         out = tmp_path / "spec.html"
         result = render(smoke_manifest_file, "spec-document", out)
-        # All section IDs should appear in the clipboard widget JS
-        for sid in ["s1", "s2", "s2-1", "s2-2"]:
-            assert f'"id": "{sid}"' in result or f'"id":"{sid}"' in result.replace(" ", ""), (
-                f"Section {sid} missing from clipboard widget"
-            )
+        assert 'id="comment-widget"' not in result
+        assert "Section Comments" not in result
 
     def test_render_passes_post_render_validation(
         self, smoke_manifest_file: Path, tmp_path: Path

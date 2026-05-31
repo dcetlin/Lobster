@@ -3,8 +3,6 @@ name: Spec (structured, versioned)
 description: Long-lived specs edited across many sessions. Section tracking, comment threads.
 content_format: json
 components:
-  - id: clipboard-copy-widget
-    config: {}  # auto-populated from section list at render time
   - id: theme-toggle
     config:
       mode: js-toggle
@@ -34,7 +32,7 @@ required_sections:
 # Rendering parameters
 render_params:
   inject_section_labels: true
-  auto_populate_clipboard_sections: true  # derive sections list from manifest
+  auto_populate_clipboard_sections: false  # clipboard-copy-widget removed
   header_pattern: doc-header  # doc-header with doc-title + doc-subtitle
   footer: true
   # Section ID stability: IDs in the manifest are permanent. Never renumber.

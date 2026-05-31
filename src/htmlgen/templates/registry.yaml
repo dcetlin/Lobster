@@ -4,7 +4,6 @@ templates:
     description: Design docs, proposals, audits, synthesis. Narrative-primary.
     content_format: markdown
     components:
-      - clipboard-copy-widget
       - theme-toggle
     conventions_overrides: {}
     scaffold: content-scaffold.md
@@ -25,7 +24,6 @@ templates:
     description: Long-lived specs edited across many sessions. Section tracking, inline comment threads.
     content_format: json
     components:
-      - clipboard-copy-widget
       - theme-toggle
     conventions_overrides: {}
     scaffold: content-scaffold.json
