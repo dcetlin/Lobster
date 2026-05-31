@@ -4707,6 +4707,79 @@ except Exception:
         migrated=$((migrated + m130_count))
     fi
 
+    # Migration 131: Register wos-event-poller in jobs.json and add two cron entries
+    # for 30-second polling (one per-minute entry + one with 30s sleep offset).
+    # wos-event-poller.py is the Stage 2 Event-Native delta poller (issue #1351).
+    # It starts disabled so it does not fire until explicitly enabled with `wos start`.
+    local WOS_EVENT_POLLER_MARKER="# LOBSTER-WOS-EVENT-POLLER"
+    local WOS_EVENT_POLLER_30S_MARKER="# LOBSTER-WOS-EVENT-POLLER-30S"
+    if [ -f "$_JOBS_FILE" ]; then
+        if ! uv run python3 -c "import json,sys; d=json.load(open('$_JOBS_FILE')); sys.exit(0 if 'wos-event-poller' in d.get('jobs',{}) else 1)" 2>/dev/null; then
+            substep "Migration 131: adding wos-event-poller to jobs.json"
+            local _m131_tmp
+            _m131_tmp=$(mktemp)
+            uv run python3 - <<'PY131' "$_JOBS_FILE" "$_m131_tmp"
+import json, sys
+from datetime import datetime, timezone
+jobs_path, tmp_path = sys.argv[1], sys.argv[2]
+with open(jobs_path) as f:
+    data = json.load(f)
+data.setdefault("jobs", {})["wos-event-poller"] = {
+    "name": "wos-event-poller",
+    "type": "B",
+    "dispatch": "cron-direct",
+    "schedule": "* * * * *",
+    "schedule_human": "Every 30 seconds (two cron entries)",
+    "task_file": None,
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+    "enabled": False,
+    "last_run": None,
+    "last_status": None,
+    "wos_core": True,
+    "description": "Every 30s: detect new wos:uow GitHub issues and terminal UoW transitions; emit typed inbox events for Event-Native pipeline (Stage 2, issue #1351). Starts disabled.",
+}
+with open(tmp_path, "w") as f:
+    json.dump(data, f, indent=2, default=str)
+print("OK")
+PY131
+            if [ -s "$_m131_tmp" ]; then
+                mv "$_m131_tmp" "$_JOBS_FILE"
+                substep "Migration 131: wos-event-poller added to jobs.json (disabled)"
+                migrated=$((migrated + 1))
+            else
+                rm -f "$_m131_tmp"
+                warn "Migration 131: failed to update jobs.json — add wos-event-poller manually"
+            fi
+        else
+            substep "Migration 131: wos-event-poller already in jobs.json — skipping"
+        fi
+    fi
+
+    local WOS_EVENT_POLLER_SCRIPT="$LOBSTER_DIR/scheduled-tasks/wos-event-poller.py"
+    if [ -f "$WOS_EVENT_POLLER_SCRIPT" ]; then
+        if ! crontab -l 2>/dev/null | grep -qF "$WOS_EVENT_POLLER_MARKER"; then
+            local WOS_EVENT_POLLER_ENTRY="* * * * * cd $LOBSTER_DIR && uv run scheduled-tasks/wos-event-poller.py >> $WORKSPACE_DIR/scheduled-jobs/logs/wos-event-poller.log 2>&1 $WOS_EVENT_POLLER_MARKER"
+            (crontab -l 2>/dev/null; echo "$WOS_EVENT_POLLER_ENTRY") | crontab - && {
+                substep "Migration 131: added LOBSTER-WOS-EVENT-POLLER cron entry (every minute)"
+                migrated=$((migrated + 1))
+            } || warn "Could not add LOBSTER-WOS-EVENT-POLLER cron entry — add manually"
+        else
+            substep "Migration 131: LOBSTER-WOS-EVENT-POLLER cron entry already present — skipping"
+        fi
+        if ! crontab -l 2>/dev/null | grep -qF "$WOS_EVENT_POLLER_30S_MARKER"; then
+            local WOS_EVENT_POLLER_30S_ENTRY="* * * * * sleep 30 && cd $LOBSTER_DIR && uv run scheduled-tasks/wos-event-poller.py >> $WORKSPACE_DIR/scheduled-jobs/logs/wos-event-poller.log 2>&1 $WOS_EVENT_POLLER_30S_MARKER"
+            (crontab -l 2>/dev/null; echo "$WOS_EVENT_POLLER_30S_ENTRY") | crontab - && {
+                substep "Migration 131: added LOBSTER-WOS-EVENT-POLLER-30S cron entry (30s offset)"
+                migrated=$((migrated + 1))
+            } || warn "Could not add LOBSTER-WOS-EVENT-POLLER-30S cron entry — add manually"
+        else
+            substep "Migration 131: LOBSTER-WOS-EVENT-POLLER-30S cron entry already present — skipping"
+        fi
+    else
+        warn "wos-event-poller.py not found at $WOS_EVENT_POLLER_SCRIPT — skipping Migration 131 cron entries"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

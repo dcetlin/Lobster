@@ -1249,6 +1249,23 @@ WOS_MESSAGE_TYPE_DISPATCH: dict[str, str] = {
     # executing → ready-for-steward, eliminating the 24h claimed_until expiry
     # cycle that previously bypassed the steward's orphan retry logic.
     "agent_failed": "handle_agent_failed",
+    # Stage 2 Event-Native Nervous System (issue #1351): three typed event message types
+    # emitted by wos-event-poller.py (30s Type B cron). All three are fast-path handlers
+    # (dispatched before the spawn-gate) that return action="mark_processed" — they update
+    # event_log.consumed_at and log the event; no subagent spawn is required.
+    #
+    # wos_issue_created: emitted by delta poller when a GitHub issue with wos:uow label
+    # is detected. Handler logs the event and marks it consumed. Germination is still
+    # handled by the existing issue-sweeper job; this event is observability + future hook.
+    "wos_issue_created": "handle_wos_issue_created",
+    # wos_uow_completed: emitted by delta poller when a UoW transitions to done/failed.
+    # Handler marks the event consumed and logs it. Downstream capacity signaling is
+    # carried by wos_capacity_available (separate event per slot freed).
+    "wos_uow_completed": "handle_wos_uow_completed",
+    # wos_capacity_available: emitted by delta poller when executor has free slots
+    # (running < max_parallel). Handler marks the event consumed and logs it.
+    # Future use: signal the germinator to promote pending UoWs faster.
+    "wos_capacity_available": "handle_wos_capacity_available",
 }
 
 
@@ -2325,6 +2342,161 @@ def handle_agent_failed(
     return {"action": "mark_processed", "message_type": "agent_failed"}
 
 
+# ---------------------------------------------------------------------------
+# Stage 2 Event-Native Nervous System handlers (issue #1351)
+#
+# Three typed event message types emitted by wos-event-poller.py (30s Type B
+# cron). All three are fast-path handlers: they mark the event consumed in
+# event_log and return action="mark_processed". No subagent spawn required.
+#
+# route_wos_message dispatches these before the spawn-gate because they
+# legitimately return action="mark_processed" rather than "spawn_subagent".
+# ---------------------------------------------------------------------------
+
+
+def handle_wos_issue_created(msg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Handle a ``wos_issue_created`` typed inbox event (Stage 2, issue #1351).
+
+    Emitted by wos-event-poller.py when a new GitHub issue with label ``wos:uow``
+    is detected via the 30s delta poller. Records the event in event_log as
+    consumed and logs it for observability.
+
+    Germination is still handled by the existing issue-sweeper job; this handler
+    is primarily an observability hook and a foundation for future Stage 2 routing.
+
+    Pure function — no blocking I/O beyond the event_log update.
+
+    Args:
+        msg: The raw inbox message dict. Expected fields:
+            ``event_id`` (str): UUID of the event_log row.
+            ``issue_number`` (int): GitHub issue number.
+            ``issue_url`` (str): Full GitHub issue URL.
+            ``title`` (str): Issue title.
+            ``labels`` (list[str]): Label names on the issue.
+            ``triggered_at`` (str): ISO-8601 timestamp of detection.
+
+    Returns:
+        ``{"action": "mark_processed", "message_type": "wos_issue_created"}``
+    """
+    event_id: str = msg.get("event_id", "")
+    issue_number: int = msg.get("issue_number", 0)
+    issue_url: str = msg.get("issue_url", "")
+    title: str = msg.get("title", "")
+
+    _log.info(
+        "handle_wos_issue_created: issue #%d %r (%s) event_id=%s",
+        issue_number, title, issue_url, event_id,
+    )
+
+    if event_id:
+        try:
+            from .wos_events import mark_event_consumed as _mark_consumed  # noqa: PLC0415
+            _mark_consumed(event_id, consumer_task_id="dispatcher-wos_issue_created")
+        except Exception as exc:
+            _log.warning(
+                "handle_wos_issue_created: mark_event_consumed failed for %s: %s",
+                event_id, exc,
+            )
+
+    return {"action": "mark_processed", "message_type": "wos_issue_created"}
+
+
+def handle_wos_uow_completed(msg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Handle a ``wos_uow_completed`` typed inbox event (Stage 2, issue #1351).
+
+    Emitted by wos-event-poller.py when it detects a UoW that has transitioned
+    to ``done`` or ``failed`` state since the last poll. Records the event as
+    consumed in event_log.
+
+    Downstream capacity signaling is carried by ``wos_capacity_available``
+    (a separate event emitted alongside this one when a slot is freed).
+
+    Pure function — no blocking I/O beyond the event_log update.
+
+    Args:
+        msg: The raw inbox message dict. Expected fields:
+            ``event_id`` (str): UUID of the event_log row.
+            ``uow_id`` (str): The completed UoW identifier.
+            ``outcome`` (str): Terminal outcome — ``"done"`` or ``"failed"``.
+            ``register`` (str): Register the UoW was assigned to.
+            ``output_ref`` (str | None): Path to the output artifact.
+            ``triggered_at`` (str): ISO-8601 timestamp of the transition.
+
+    Returns:
+        ``{"action": "mark_processed", "message_type": "wos_uow_completed"}``
+    """
+    event_id: str = msg.get("event_id", "")
+    uow_id: str = msg.get("uow_id", "")
+    outcome: str = msg.get("outcome", "")
+
+    _log.info(
+        "handle_wos_uow_completed: UoW %r outcome=%s event_id=%s",
+        uow_id, outcome, event_id,
+    )
+
+    if event_id:
+        try:
+            from .wos_events import mark_event_consumed as _mark_consumed  # noqa: PLC0415
+            _mark_consumed(event_id, consumer_task_id="dispatcher-wos_uow_completed")
+        except Exception as exc:
+            _log.warning(
+                "handle_wos_uow_completed: mark_event_consumed failed for %s: %s",
+                event_id, exc,
+            )
+
+    return {"action": "mark_processed", "message_type": "wos_uow_completed"}
+
+
+def handle_wos_capacity_available(msg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Handle a ``wos_capacity_available`` typed inbox event (Stage 2, issue #1351).
+
+    Emitted by wos-event-poller.py when the executor has free slots
+    (running < max_parallel). Signals that the germinator can promote pending
+    UoWs to ready-for-executor state without violating the parallel cap.
+
+    Records the event as consumed in event_log and logs capacity state for
+    observability. Future use: trigger germination without waiting for the
+    next steward-heartbeat cron tick.
+
+    Pure function — no blocking I/O beyond the event_log update.
+
+    Args:
+        msg: The raw inbox message dict. Expected fields:
+            ``event_id`` (str): UUID of the event_log row.
+            ``freed_uow_id`` (str): UoW whose completion freed the slot.
+            ``freed_at`` (str): ISO-8601 timestamp when the slot was freed.
+            ``current_active_count`` (int): Active UoWs after the slot freed.
+            ``max_parallel`` (int): Maximum allowed concurrent UoWs.
+
+    Returns:
+        ``{"action": "mark_processed", "message_type": "wos_capacity_available"}``
+    """
+    event_id: str = msg.get("event_id", "")
+    freed_uow_id: str = msg.get("freed_uow_id", "")
+    current_active_count: int = msg.get("current_active_count", -1)
+    max_parallel: int = msg.get("max_parallel", -1)
+
+    _log.info(
+        "handle_wos_capacity_available: freed_uow_id=%r active=%d/%d event_id=%s",
+        freed_uow_id, current_active_count, max_parallel, event_id,
+    )
+
+    if event_id:
+        try:
+            from .wos_events import mark_event_consumed as _mark_consumed  # noqa: PLC0415
+            _mark_consumed(event_id, consumer_task_id="dispatcher-wos_capacity_available")
+        except Exception as exc:
+            _log.warning(
+                "handle_wos_capacity_available: mark_event_consumed failed for %s: %s",
+                event_id, exc,
+            )
+
+    return {"action": "mark_processed", "message_type": "wos_capacity_available"}
+
+
 def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
     """
     Route an inbox message whose `type` is listed in WOS_MESSAGE_TYPE_DISPATCH.
@@ -2548,6 +2720,53 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
             _logging.getLogger(__name__).error(
                 "route_wos_message: handle_agent_failed raised %s: %s — "
                 "marking processed without state transition",
+                type(exc).__name__, exc,
+            )
+            return {"action": "mark_processed", "message_type": msg_type}
+
+    # ---------------------------------------------------------------------------
+    # Stage 2 Event-Native fast-paths (issue #1351): all three event types return
+    # action="mark_processed" — they record event_log consumption and log the event.
+    # Dispatched before the spawn-gate because they legitimately do not spawn subagents.
+    # ---------------------------------------------------------------------------
+    if msg_type == "wos_issue_created":
+        try:
+            result = handle_wos_issue_created(msg)
+            result["message_type"] = msg_type
+            return result
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).error(
+                "route_wos_message: handle_wos_issue_created raised %s: %s — "
+                "marking processed",
+                type(exc).__name__, exc,
+            )
+            return {"action": "mark_processed", "message_type": msg_type}
+
+    if msg_type == "wos_uow_completed":
+        try:
+            result = handle_wos_uow_completed(msg)
+            result["message_type"] = msg_type
+            return result
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).error(
+                "route_wos_message: handle_wos_uow_completed raised %s: %s — "
+                "marking processed",
+                type(exc).__name__, exc,
+            )
+            return {"action": "mark_processed", "message_type": msg_type}
+
+    if msg_type == "wos_capacity_available":
+        try:
+            result = handle_wos_capacity_available(msg)
+            result["message_type"] = msg_type
+            return result
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).error(
+                "route_wos_message: handle_wos_capacity_available raised %s: %s — "
+                "marking processed",
                 type(exc).__name__, exc,
             )
             return {"action": "mark_processed", "message_type": msg_type}
