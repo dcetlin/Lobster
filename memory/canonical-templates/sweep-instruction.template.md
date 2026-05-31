@@ -144,6 +144,31 @@ Required sections in output:
 - Detection pass findings (dissonance / golden patterns)
 - Prescription pass (actions / escalations)
 - Refactor pass (autonomous actions taken, with rationale)
+- Pings (two-ping protocol compliance record — see below)
+
+**Pings section (required):** After the two-ping protocol fires (see sweep-context.md), append a `## Pings` section to the sweep output file recording compliance:
+
+```markdown
+## Pings
+
+ping_1_sent: true
+ping_1_content: [one-sentence summary of what was included: domain, counts, pressure point]
+
+ping_2_sent: true
+ping_2_content: [one-sentence summary of the process-reflection theme]
+```
+
+If either ping was not sent, document why:
+
+```markdown
+ping_1_sent: false
+ping_1_reason: [why it was skipped, e.g., gh auth failure caused early abort]
+
+ping_2_sent: false
+ping_2_reason: [why it was skipped]
+```
+
+Both fields are required on every run. An absent `## Pings` section is a sweep protocol violation (issue #1335).
 
 ---
 
