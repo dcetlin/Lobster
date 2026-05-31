@@ -31,11 +31,11 @@ patch_js_block(block_id, new_code)
 
 Usage
 -----
-    from src.htmlgen.editor import apply_edit, apply_edits
+    from src.htmlgen.editor import apply_edit, apply_edits, find_sections_by_content
     from pathlib import Path
 
-    # Single edit
-    apply_edit(
+    # Single edit — returns (modified_html, EditTrace)
+    html, trace = apply_edit(
         html_path=Path("path/to/file.html"),
         instruction={
             "op": "replace_section_content",
@@ -44,14 +44,18 @@ Usage
         },
     )
 
-    # Batch edits
-    apply_edits(
+    # Batch edits — returns (modified_html, EditTrace)
+    html, trace = apply_edits(
         html_path=Path("path/to/file.html"),
         instructions=[
             {"op": "replace_section_content", "section_id": "s3", "new_content": "..."},
             {"op": "update_version_stamp", "version": "1.4", "timestamp": "2026-05-31T00:00:00Z"},
         ],
     )
+
+    # Discover sections by content — read-only, returns list of section IDs
+    ids = find_sections_by_content(Path("path/to/file.html"), "search term")
+    ids = find_sections_by_content(Path("path/to/file.html"), "p.highlight", mode="css")
 
 Edit instruction format
 -----------------------
@@ -103,11 +107,18 @@ the file is not written (atomic on success, no partial-write on error).
 
 from __future__ import annotations
 
+import json
 import re
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from bs4 import BeautifulSoup, Tag
+
+# Path where edit traces are appended as JSONL.
+# Exposed as a module-level constant so tests can monkeypatch it.
+TRACE_LOG_PATH = Path.home() / "lobster-workspace" / "data" / "html-edit-traces.jsonl"
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +127,27 @@ from bs4 import BeautifulSoup, Tag
 
 class EditError(Exception):
     """Raised when an edit instruction cannot be applied."""
+
+
+# ---------------------------------------------------------------------------
+# EditTrace — lightweight record of what an edit call accessed and changed
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class EditTrace:
+    """Immutable record of what a single apply_edit / apply_edits call did.
+
+    Returned as the second element of the tuple from apply_edit and apply_edits,
+    and appended to TRACE_LOG_PATH as a JSONL entry.
+    """
+    doc_path: str
+    doc_size_bytes: int
+    sections_total: int           # total sections in the document after the edit
+    sections_accessed: list[str]  # section IDs that were read or targeted
+    operations_attempted: int
+    operations_succeeded: int
+    write_succeeded: bool
+    operation_types: list[str]    # op names attempted, e.g. ["replace_section_content"]
 
 
 # ---------------------------------------------------------------------------
@@ -312,26 +344,42 @@ def _build_section_html(
 # Instruction dispatcher — pure mapping from instruction dict to op function
 # ---------------------------------------------------------------------------
 
-def _apply_instruction(soup: BeautifulSoup, instruction: dict[str, Any]) -> None:
-    """Dispatch a single edit instruction to its operation function."""
+def _apply_instruction(
+    soup: BeautifulSoup,
+    instruction: dict[str, Any],
+    sections_accessed: list[str],
+) -> None:
+    """Dispatch a single edit instruction to its operation function.
+
+    Mutates sections_accessed in place: appends any section_id that the
+    instruction targets so the caller can build an EditTrace.
+    """
     op = instruction.get("op")
     if not op:
         raise EditError("Instruction missing required 'op' field.")
 
     if op == "replace_section_content":
         _require_fields(instruction, ["section_id", "new_content"])
+        sid = instruction["section_id"]
+        sections_accessed.append(sid)
         _op_replace_section_content(
             soup,
-            section_id=instruction["section_id"],
+            section_id=sid,
             new_content=instruction["new_content"],
         )
 
     elif op == "add_section":
         _require_fields(instruction, ["section_id", "after_id", "title", "label"])
+        sid = instruction["section_id"]
+        after_id = instruction["after_id"]
+        if sid not in sections_accessed:
+            sections_accessed.append(sid)
+        if after_id not in sections_accessed:
+            sections_accessed.append(after_id)
         _op_add_section(
             soup,
-            section_id=instruction["section_id"],
-            after_id=instruction["after_id"],
+            section_id=sid,
+            after_id=after_id,
             title=instruction["title"],
             label=instruction["label"],
             content=instruction.get("content", ""),
@@ -339,7 +387,9 @@ def _apply_instruction(soup: BeautifulSoup, instruction: dict[str, Any]) -> None
 
     elif op == "remove_section":
         _require_fields(instruction, ["section_id"])
-        _op_remove_section(soup, section_id=instruction["section_id"])
+        sid = instruction["section_id"]
+        sections_accessed.append(sid)
+        _op_remove_section(soup, section_id=sid)
 
     elif op == "update_version_stamp":
         _op_update_version_stamp(
@@ -375,24 +425,72 @@ def _require_fields(instruction: dict[str, Any], fields: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Trace helpers — pure functions for building and persisting EditTrace
+# ---------------------------------------------------------------------------
+
+def _build_trace(
+    html_path: Path,
+    soup: BeautifulSoup,
+    sections_accessed: list[str],
+    operations_attempted: int,
+    operations_succeeded: int,
+    write_succeeded: bool,
+    operation_types: list[str],
+    doc_size_bytes: int,
+) -> EditTrace:
+    """Construct an EditTrace from the post-edit soup tree and accumulated metrics."""
+    sections_total = len(soup.find_all("div", class_="section"))
+    return EditTrace(
+        doc_path=str(html_path),
+        doc_size_bytes=doc_size_bytes,
+        sections_total=sections_total,
+        sections_accessed=list(sections_accessed),
+        operations_attempted=operations_attempted,
+        operations_succeeded=operations_succeeded,
+        write_succeeded=write_succeeded,
+        operation_types=list(operation_types),
+    )
+
+
+def _append_trace(trace: EditTrace) -> None:
+    """Append an EditTrace as a JSONL entry to TRACE_LOG_PATH.
+
+    Creates the file and parent directories if they do not exist.
+    The entry includes an ISO-8601 UTC timestamp field alongside the trace fields.
+    Errors during append are swallowed to avoid masking edit results.
+    """
+    try:
+        TRACE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+            **asdict(trace),
+        }
+        with TRACE_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except Exception:  # noqa: BLE001
+        pass  # trace logging must never break the edit pipeline
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def apply_edit(
     html_path: Path | str,
     instruction: dict[str, Any],
-) -> str:
+) -> tuple[str, EditTrace]:
     """Apply a single edit instruction to an HTML file.
 
-    Reads the file, applies the instruction, validates the result, and writes
-    the file back. Returns the modified HTML string.
+    Reads the file, applies the instruction, writes the file back, and appends
+    an EditTrace entry to TRACE_LOG_PATH.
 
     Args:
         html_path: Path to the HTML file to modify.
         instruction: A single edit instruction dict (see module docstring).
 
     Returns:
-        The full modified HTML as a string.
+        A tuple (modified_html, trace) where modified_html is the full HTML
+        string after the edit and trace is an EditTrace capturing what was done.
 
     Raises:
         FileNotFoundError: If html_path does not exist.
@@ -404,19 +502,21 @@ def apply_edit(
 def apply_edits(
     html_path: Path | str,
     instructions: list[dict[str, Any]],
-) -> str:
+) -> tuple[str, EditTrace]:
     """Apply a batch of edit instructions to an HTML file.
 
     All instructions are applied to the same soup tree in order. If any
     instruction raises EditError, the batch stops and the file is NOT written
-    (atomic on success, no partial-write on error).
+    (atomic on success, no partial-write on error). An EditTrace is built and
+    appended to TRACE_LOG_PATH regardless of success or failure.
 
     Args:
         html_path: Path to the HTML file to modify.
         instructions: Ordered list of edit instruction dicts.
 
     Returns:
-        The full modified HTML as a string.
+        A tuple (modified_html, trace) where modified_html is the full HTML
+        string after the edit and trace is an EditTrace capturing what was done.
 
     Raises:
         FileNotFoundError: If html_path does not exist.
@@ -427,19 +527,97 @@ def apply_edits(
         raise FileNotFoundError(f"HTML file not found: {html_path}")
 
     original = html_path.read_text(encoding="utf-8")
+    doc_size_bytes = len(original.encode("utf-8"))
     soup = _parse(original)
 
+    sections_accessed: list[str] = []
+    operation_types: list[str] = []
+    operations_succeeded = 0
+
     for i, instruction in enumerate(instructions):
+        op = instruction.get("op", "")
+        operation_types.append(op)
         try:
-            _apply_instruction(soup, instruction)
+            _apply_instruction(soup, instruction, sections_accessed)
+            operations_succeeded += 1
         except EditError as exc:
+            trace = _build_trace(
+                html_path=html_path,
+                soup=soup,
+                sections_accessed=sections_accessed,
+                operations_attempted=len(instructions),
+                operations_succeeded=operations_succeeded,
+                write_succeeded=False,
+                operation_types=operation_types,
+                doc_size_bytes=doc_size_bytes,
+            )
+            _append_trace(trace)
             raise EditError(
                 f"Instruction {i} (op={instruction.get('op')!r}) failed: {exc}"
             ) from exc
 
     modified = str(soup)
     html_path.write_text(modified, encoding="utf-8")
-    return modified
+
+    trace = _build_trace(
+        html_path=html_path,
+        soup=soup,
+        sections_accessed=sections_accessed,
+        operations_attempted=len(instructions),
+        operations_succeeded=operations_succeeded,
+        write_succeeded=True,
+        operation_types=operation_types,
+        doc_size_bytes=doc_size_bytes,
+    )
+    _append_trace(trace)
+    return modified, trace
+
+
+def find_sections_by_content(
+    html_path: Path | str,
+    pattern: str,
+    mode: str = "text",
+) -> list[str]:
+    """Return section IDs for sections whose content matches the given pattern.
+
+    This is a read-only operation — the document is not modified.
+
+    Args:
+        html_path: Path to the HTML file to search.
+        pattern: The search pattern. In text mode, a case-insensitive substring
+            to look for in each section's text content. In CSS mode, a CSS
+            selector evaluated within each section element.
+        mode: "text" (default) searches section text content for a
+            case-insensitive substring match. "css" applies pattern as a CSS
+            selector within each section element.
+
+    Returns:
+        List of section ID strings (in document order) for sections that
+        contain a match. Returns an empty list if no sections match or if the
+        document has no sections.
+
+    Raises:
+        FileNotFoundError: If html_path does not exist.
+    """
+    soup = parse_html(html_path)
+    sections = soup.find_all("div", class_="section")
+    matched: list[str] = []
+
+    for section in sections:
+        sid = section.get("id")
+        if not sid:
+            continue
+        sid = str(sid)
+
+        if mode == "css":
+            if section.select(pattern):
+                matched.append(sid)
+        else:
+            # text mode: case-insensitive substring match on the section's full text
+            if pattern.lower() in section.get_text().lower():
+                matched.append(sid)
+
+    return matched
 
 
 def parse_html(html_path: Path | str) -> BeautifulSoup:
