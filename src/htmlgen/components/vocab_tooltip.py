@@ -38,7 +38,7 @@ import json
 import re
 
 COMPONENT_ID = "vocab-tooltip"
-COMPONENT_VERSION = "1.1.0"
+COMPONENT_VERSION = "1.2.0"
 
 CONFIG_SCHEMA = {
     "type": "object",
@@ -311,6 +311,15 @@ _JS_TEMPLATE = r"""
 
   // ---------------------------------------------------------------------------
   // Term wrapping — inject tooltip markup including the × close button.
+  //
+  // To prevent nested tooltip markup inside definition text, this function
+  // uses a two-pass approach:
+  //   Pass 1 (terms loop): replace each term occurrence with a placeholder
+  //           token __TTIP_N__ and store the full tooltip span HTML in defns[].
+  //           Subsequent term regexes operate on a string that contains only
+  //           placeholders for already-wrapped terms — never raw definition text.
+  //   Pass 2 (restore): replace each __TTIP_N__ placeholder with its stored
+  //           tooltip HTML to produce the final markup string.
   // ---------------------------------------------------------------------------
   function wrapTermsInNode(node) {
     if (!node) return;
@@ -318,6 +327,7 @@ _JS_TEMPLATE = r"""
       var text = node.textContent;
       var html = text;
       var matched = false;
+      var defns = [];  // stores full tooltip span HTML indexed by placeholder id
       terms.forEach(function(term) {
         // Match case-sensitive (no word-boundary anchors — terms may appear mid-word).
         var re = new RegExp('(' + escapeRegex(term) + ')', 'g');
@@ -325,21 +335,29 @@ _JS_TEMPLATE = r"""
           .replace(/&/g, '&amp;')
           .replace(/</g, '&lt;')
           .replace(/>/g, '&gt;')
-          .replace(/"/g, '&quot;')
-          .replace(/\$/g, '$$$$');  // escape $ to prevent .replace() backreference interpretation
-        var newHtml = html.replace(re,
-          '<span class="vocab-term" tabindex="0">' +
-          '<span class="vocab-tip">' +
-          '<button class="vocab-tip-close" aria-label="Close" tabindex="0">×</button>' +
-          '<span class="vocab-tip-term">' + term + '</span>' + def + '</span>' +
-          '$1</span>'
-        );
+          .replace(/"/g, '&quot;');
+        var newHtml = html.replace(re, function(match, captured) {
+          // Build full tooltip span and store it; substitute a placeholder.
+          var tipHtml =
+            '<span class="vocab-term" tabindex="0">' +
+            '<span class="vocab-tip">' +
+            '<button class="vocab-tip-close" aria-label="Close" tabindex="0">×</button>' +
+            '<span class="vocab-tip-term">' + term + '</span>' + def + '</span>' +
+            captured + '</span>';
+          var idx = defns.length;
+          defns.push(tipHtml);
+          return '__TTIP_' + idx + '__';
+        });
         if (newHtml !== html) {
           matched = true;
           html = newHtml;
         }
       });
       if (matched) {
+        // Pass 2: restore placeholders to their stored tooltip HTML.
+        for (var i = 0; i < defns.length; i++) {
+          html = html.split('__TTIP_' + i + '__').join(defns[i]);
+        }
         var span = document.createElement('span');
         span.innerHTML = html;
         node.parentNode.replaceChild(span, node);
