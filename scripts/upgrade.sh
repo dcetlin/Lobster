@@ -4637,6 +4637,76 @@ PY128
         warn "refresh-gh-token.sh not found at $GH_TOKEN_REFRESH_SCRIPT — skipping Migration 129"
     fi
 
+    # Migration 130: Remove three stale empty DB files from data/:
+    #   - data/wos-registry.db  — legacy registry path (superseded by orchestration/registry.db);
+    #                             Migration 86 handles the non-empty case; this step removes the
+    #                             common 0-UoW variant that Migration 86 misses when the DB exists
+    #                             but its uow_registry table is empty (per issues #1071 and #1112).
+    #   - data/wos.db           — 0-byte stub, never populated, unrelated to the canonical registry.
+    #   - data/registry.db      — 0-byte stub, never populated, unrelated to orchestration/registry.db.
+    # All three are safe to remove: each is either 0 bytes or has 0 rows in uow_registry.
+    # Idempotent: skips each file if already absent.
+    local m130_count=0
+    local data_dir="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/data"
+
+    # wos-registry.db: only remove if uow_registry table has 0 rows (guard against data loss).
+    local wos_reg_db="$data_dir/wos-registry.db"
+    if [ -f "$wos_reg_db" ]; then
+        local wos_reg_uow_count
+        wos_reg_uow_count=$(uv run python3 -c "
+import sqlite3, sys
+try:
+    conn = sqlite3.connect('$wos_reg_db')
+    n = conn.execute('SELECT COUNT(*) FROM uow_registry').fetchone()[0]
+    print(n)
+except Exception:
+    print(-1)
+" 2>/dev/null)
+        if [ "$wos_reg_uow_count" = "0" ]; then
+            rm -f "$wos_reg_db"
+            substep "Migration 130: removed empty data/wos-registry.db (0 UoWs, issues #1071/#1112)"
+            m130_count=$((m130_count + 1))
+        elif [ "$wos_reg_uow_count" = "-1" ]; then
+            substep "Migration 130: could not read data/wos-registry.db — skipping (manual inspection required)"
+        else
+            substep "Migration 130: data/wos-registry.db has $wos_reg_uow_count UoWs — skipping to avoid data loss (inspect manually)"
+        fi
+    else
+        substep "Migration 130: data/wos-registry.db not present — skipping"
+    fi
+
+    # wos.db: remove only if 0 bytes (never populated stub).
+    local wos_db="$data_dir/wos.db"
+    if [ -f "$wos_db" ]; then
+        if [ ! -s "$wos_db" ]; then
+            rm -f "$wos_db"
+            substep "Migration 130: removed 0-byte stub data/wos.db"
+            m130_count=$((m130_count + 1))
+        else
+            substep "Migration 130: data/wos.db is non-empty — skipping (manual inspection required)"
+        fi
+    else
+        substep "Migration 130: data/wos.db not present — skipping"
+    fi
+
+    # registry.db: remove only if 0 bytes (never populated stub; canonical is orchestration/registry.db).
+    local reg_db="$data_dir/registry.db"
+    if [ -f "$reg_db" ]; then
+        if [ ! -s "$reg_db" ]; then
+            rm -f "$reg_db"
+            substep "Migration 130: removed 0-byte stub data/registry.db"
+            m130_count=$((m130_count + 1))
+        else
+            substep "Migration 130: data/registry.db is non-empty — skipping (manual inspection required)"
+        fi
+    else
+        substep "Migration 130: data/registry.db not present — skipping"
+    fi
+
+    if [ "$m130_count" -gt 0 ]; then
+        migrated=$((migrated + m130_count))
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
