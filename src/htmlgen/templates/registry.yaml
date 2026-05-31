@@ -25,6 +25,7 @@ templates:
     description: Long-lived specs edited across many sessions. Section tracking, inline comment threads.
     content_format: json
     components:
+      - clipboard-copy-widget
       - theme-toggle
     conventions_overrides: {}
     scaffold: content-scaffold.json
