@@ -117,6 +117,11 @@ CREATE TABLE IF NOT EXISTS uow_registry (
     --   next executor-heartbeat cycle — no separate recovery job needed.
     claimed_until TEXT NULL,
 
+    -- checkpoint_ref: path to the most recently written checkpoint.json for this UoW.
+    --   Written by write_checkpoint() in checkpoint.py. NULL until a checkpoint is written.
+    --   Infrastructure only — no gating logic.
+    checkpoint_ref TEXT DEFAULT NULL,
+
     UNIQUE(source_issue_number, sweep_date)
 );
 -- vision_ref: JSON {layer, field, statement, anchored_at}
@@ -149,7 +154,7 @@ SELECT
     source_issue_number, summary,
     workflow_artifact, success_criteria, prescribed_skills,
     steward_cycles, timeout_at, estimated_runtime,
-    issue_url, token_usage
+    issue_url, token_usage, checkpoint_ref
 FROM uow_registry
 WHERE status = 'ready-for-executor';
 -- steward_agenda: Steward-private, excluded from executor_uow_view.
