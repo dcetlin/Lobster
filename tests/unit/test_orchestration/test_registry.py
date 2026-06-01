@@ -1721,3 +1721,65 @@ class TestClosedStatus:
         assert isinstance(result, UpsertInserted), (
             f"Expected UpsertInserted (re-proposal after closed), got {type(result).__name__}: {result!r}"
         )
+
+
+class TestOperationalPosture:
+    """
+    'operational' is a DB posture value present on existing UoWs that was missing
+    from the UoWPosture enum. Before the fix, any code path that called _row_to_uow()
+    on a row with posture='operational' raised ValueError.
+    """
+
+    def _insert_operational_posture_row(self, db_path: Path, issue_number: int = 7777) -> str:
+        """Insert a row with posture='operational' directly via SQL, bypassing enum validation."""
+        import uuid
+        uow_id = str(uuid.uuid4())
+        conn = _open_db(db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO uow_registry
+                    (id, status, summary, source, created_at, updated_at,
+                     type, posture, register, steward_cycles, lifetime_cycles,
+                     heartbeat_ttl, retry_count, execution_attempts, orphan_retry_count,
+                     source_issue_number)
+                VALUES
+                    (?, 'proposed', 'UoW with operational posture', 'test', datetime('now'), datetime('now'),
+                     'executable', 'operational', 'operational', 0, 0,
+                     300, 0, 0, 0,
+                     ?)
+                """,
+                (uow_id, issue_number),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return uow_id
+
+    def test_operational_is_valid_uow_posture(self):
+        """UoWPosture('operational') must not raise ValueError."""
+        from src.orchestration.registry import UoWPosture
+        posture = UoWPosture("operational")
+        assert posture == UoWPosture.OPERATIONAL
+
+    def test_registry_list_does_not_raise_on_operational_posture_row(self, registry, db_path):
+        """
+        Registry.list() must not raise ValueError when the DB contains a
+        row with posture='operational'. This was the root cause reported in the
+        fix-uow-posture-enum issue.
+        """
+        self._insert_operational_posture_row(db_path)
+        # Must not raise ValueError
+        results = registry.list()
+        operational_uows = [u for u in results if u.posture == "operational"]
+        assert len(operational_uows) == 1
+
+    def test_registry_get_does_not_raise_on_operational_posture_row(self, registry, db_path):
+        """
+        Registry.get(uow_id) must not raise ValueError for a row with posture='operational'.
+        """
+        uow_id = self._insert_operational_posture_row(db_path)
+        uow = registry.get(uow_id)
+        assert uow is not None
+        from src.orchestration.registry import UoWPosture
+        assert uow.posture == UoWPosture.OPERATIONAL
