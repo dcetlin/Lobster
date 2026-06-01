@@ -8,6 +8,10 @@ heartbeat signal to distinguish two kill scenarios:
   - orphan_kill_during_execution: agent wrote heartbeats after dispatch
     (was actively working before being killed)
 
+Issue #1324: Add checkpoint-aware classification:
+  - orphan_kill_during_execution_with_checkpoint: agent was working when killed
+    AND a valid checkpoint exists with next_step_index > 0 (resume context available)
+
 Coverage:
 - DISPATCH_WINDOW_SECONDS constant: positive integer
 - classify_executing_orphan_kill_type:
@@ -16,6 +20,9 @@ Coverage:
     heartbeat exists after dispatch + DISPATCH_WINDOW_SECONDS → orphan_kill_during_execution
     heartbeat is non-parseable → orphan_kill_before_start (safe default)
     dispatch timestamp is None (no executor_dispatch audit) → orphan_kill_before_start
+    checkpoint with next_step_index > 0 → orphan_kill_during_execution_with_checkpoint
+    checkpoint with next_step_index == 0 → orphan_kill_during_execution (no upgrade)
+    checkpoint file missing → orphan_kill_during_execution (no upgrade)
 - registry.get_executor_dispatch_timestamp:
     returns None when no audit_log entries exist
     returns None when no executor_dispatch entry exists
@@ -35,8 +42,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sqlite3
 import sys
+import tempfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -115,6 +124,8 @@ CREATE TABLE IF NOT EXISTS uow_registry (
     estimated_runtime   INTEGER NULL,
     steward_agenda      TEXT    NULL,
     steward_log         TEXT    NULL,
+    heartbeat_at        TEXT    NULL,
+    heartbeat_ttl       INTEGER NULL,
     UNIQUE(source_issue_number, sweep_date)
 );
 
@@ -268,37 +279,43 @@ class TestClassifyExecutingOrphanKillType:
     """
     Pure function tests for kill classification.
 
-    classify_executing_orphan_kill_type(dispatch_ts, heartbeat_at) -> str
+    classify_executing_orphan_kill_type(dispatch_ts, heartbeat_at, checkpoint_ref=None)
+        -> tuple[str, dict | None]
 
     Returns:
-    - 'orphan_kill_before_start': no evidence of heartbeat after dispatch
-    - 'orphan_kill_during_execution': heartbeat exists after dispatch window
+    - ('orphan_kill_before_start', None): no evidence of heartbeat after dispatch
+    - ('orphan_kill_during_execution', None): heartbeat exists after dispatch window, no valid checkpoint
+    - ('orphan_kill_during_execution_with_checkpoint', dict): heartbeat exists after dispatch window
+      AND checkpoint with next_step_index > 0
     """
 
     def test_no_heartbeat_null_is_kill_before_start(self) -> None:
         """NULL heartbeat_at → agent never wrote a heartbeat → kill-before-start."""
         dispatch_ts = _iso_ago(1800)
-        result = _classify_executing_orphan_kill_type(
+        clf, data = _classify_executing_orphan_kill_type(
             dispatch_ts=dispatch_ts,
             heartbeat_at=None,
         )
-        assert result == "orphan_kill_before_start"
+        assert clf == "orphan_kill_before_start"
+        assert data is None
 
     def test_no_dispatch_timestamp_is_kill_before_start(self) -> None:
         """No executor_dispatch audit entry → cannot confirm work started → kill-before-start."""
-        result = _classify_executing_orphan_kill_type(
+        clf, data = _classify_executing_orphan_kill_type(
             dispatch_ts=None,
             heartbeat_at=_iso_ago(1200),
         )
-        assert result == "orphan_kill_before_start"
+        assert clf == "orphan_kill_before_start"
+        assert data is None
 
     def test_both_none_is_kill_before_start(self) -> None:
         """Both None → kill-before-start (safe default)."""
-        result = _classify_executing_orphan_kill_type(
+        clf, data = _classify_executing_orphan_kill_type(
             dispatch_ts=None,
             heartbeat_at=None,
         )
-        assert result == "orphan_kill_before_start"
+        assert clf == "orphan_kill_before_start"
+        assert data is None
 
     def test_heartbeat_before_dispatch_is_kill_before_start(self) -> None:
         """
@@ -310,20 +327,22 @@ class TestClassifyExecutingOrphanKillType:
         dispatch_ts = _iso_ago(1800)
         # Heartbeat written 10 seconds BEFORE dispatch (initial set_heartbeat_ttl)
         heartbeat_before_dispatch = _iso_ago(1810)
-        result = _classify_executing_orphan_kill_type(
+        clf, data = _classify_executing_orphan_kill_type(
             dispatch_ts=dispatch_ts,
             heartbeat_at=heartbeat_before_dispatch,
         )
-        assert result == "orphan_kill_before_start"
+        assert clf == "orphan_kill_before_start"
+        assert data is None
 
     def test_heartbeat_at_exact_dispatch_time_is_kill_before_start(self) -> None:
         """Heartbeat at exactly dispatch time → within window → kill-before-start."""
         dispatch_ts = _iso_ago(1800)
-        result = _classify_executing_orphan_kill_type(
+        clf, data = _classify_executing_orphan_kill_type(
             dispatch_ts=dispatch_ts,
             heartbeat_at=dispatch_ts,  # Same timestamp
         )
-        assert result == "orphan_kill_before_start"
+        assert clf == "orphan_kill_before_start"
+        assert data is None
 
     def test_heartbeat_within_dispatch_window_is_kill_before_start(self) -> None:
         """
@@ -333,11 +352,12 @@ class TestClassifyExecutingOrphanKillType:
         dispatch_ts = _iso_ago(1800)
         # Heartbeat written 30 seconds after dispatch (within window)
         heartbeat_just_after = _iso_ago(1800 - 30)
-        result = _classify_executing_orphan_kill_type(
+        clf, data = _classify_executing_orphan_kill_type(
             dispatch_ts=dispatch_ts,
             heartbeat_at=heartbeat_just_after,
         )
-        assert result == "orphan_kill_before_start"
+        assert clf == "orphan_kill_before_start"
+        assert data is None
 
     def test_heartbeat_after_dispatch_window_is_kill_during_execution(self) -> None:
         """
@@ -347,38 +367,42 @@ class TestClassifyExecutingOrphanKillType:
         dispatch_ts = _iso_ago(1800)
         # Heartbeat written DISPATCH_WINDOW_SECONDS + 60 after dispatch (clearly working)
         heartbeat_after_window = _iso_ago(1800 - _sweep_mod.DISPATCH_WINDOW_SECONDS - 60)
-        result = _classify_executing_orphan_kill_type(
+        clf, data = _classify_executing_orphan_kill_type(
             dispatch_ts=dispatch_ts,
             heartbeat_at=heartbeat_after_window,
         )
-        assert result == "orphan_kill_during_execution"
+        assert clf == "orphan_kill_during_execution"
+        assert data is None
 
     def test_recent_heartbeat_is_kill_during_execution(self) -> None:
         """A very recent heartbeat (agent was actively working) → kill-during-execution."""
         dispatch_ts = _iso_ago(600)
         heartbeat_recent = _iso_ago(30)  # 30 seconds ago — agent was running
-        result = _classify_executing_orphan_kill_type(
+        clf, data = _classify_executing_orphan_kill_type(
             dispatch_ts=dispatch_ts,
             heartbeat_at=heartbeat_recent,
         )
-        assert result == "orphan_kill_during_execution"
+        assert clf == "orphan_kill_during_execution"
+        assert data is None
 
     def test_unparseable_heartbeat_is_kill_before_start(self) -> None:
         """Unparseable heartbeat_at → cannot confirm work started → kill-before-start (safe default)."""
         dispatch_ts = _iso_ago(1800)
-        result = _classify_executing_orphan_kill_type(
+        clf, data = _classify_executing_orphan_kill_type(
             dispatch_ts=dispatch_ts,
             heartbeat_at="not-a-timestamp",
         )
-        assert result == "orphan_kill_before_start"
+        assert clf == "orphan_kill_before_start"
+        assert data is None
 
     def test_unparseable_dispatch_ts_is_kill_before_start(self) -> None:
         """Unparseable dispatch_ts → cannot compare → kill-before-start (safe default)."""
-        result = _classify_executing_orphan_kill_type(
+        clf, data = _classify_executing_orphan_kill_type(
             dispatch_ts="not-a-timestamp",
             heartbeat_at=_iso_ago(600),
         )
-        assert result == "orphan_kill_before_start"
+        assert clf == "orphan_kill_before_start"
+        assert data is None
 
 
 # ---------------------------------------------------------------------------
@@ -722,3 +746,125 @@ class TestReentryPostureForNewClassifications:
             "produce reentry posture 'trace_gate_dwell', not 'diagnosing_orphan' or "
             "'first_execution'. Gap 1 from oracle verdict pr-1305.md."
         )
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+def _write_checkpoint(tmp_dir: str, data: dict) -> str:
+    """Write a checkpoint.json file to tmp_dir and return its path."""
+    p = os.path.join(tmp_dir, "checkpoint.json")
+    with open(p, "w") as f:
+        json.dump(data, f)
+    return p
+
+
+# ---------------------------------------------------------------------------
+# TestCheckpointClassification — issue #1324
+# ---------------------------------------------------------------------------
+
+class TestCheckpointClassification:
+    """
+    Tests for checkpoint-aware orphan kill classification (issue #1324).
+
+    When a valid checkpoint.json exists with next_step_index > 0, the
+    classification is upgraded to 'orphan_kill_during_execution_with_checkpoint'
+    and the checkpoint dict is returned as the second element of the tuple.
+    """
+
+    def test_checkpoint_next_step_gt_0_returns_with_checkpoint(self, tmp_path: Path) -> None:
+        """Checkpoint with next_step_index > 0 → orphan_kill_during_execution_with_checkpoint."""
+        cp_path = _write_checkpoint(str(tmp_path), {"next_step_index": 2, "next_step_name": "implement"})
+        dispatch_ts = "2026-01-01T12:00:00Z"
+        # heartbeat > dispatch + window → orphan_kill_during_execution base
+        heartbeat_ts = "2026-01-01T12:10:00Z"
+        clf, data = _classify_executing_orphan_kill_type(dispatch_ts, heartbeat_ts, cp_path)
+        assert clf == "orphan_kill_during_execution_with_checkpoint"
+        assert data is not None
+        assert data["next_step_index"] == 2
+
+    def test_checkpoint_next_step_0_returns_standard_during_execution(self, tmp_path: Path) -> None:
+        """Checkpoint with next_step_index == 0 → no upgrade, returns orphan_kill_during_execution."""
+        cp_path = _write_checkpoint(str(tmp_path), {"next_step_index": 0})
+        dispatch_ts = "2026-01-01T12:00:00Z"
+        heartbeat_ts = "2026-01-01T12:10:00Z"
+        clf, data = _classify_executing_orphan_kill_type(dispatch_ts, heartbeat_ts, cp_path)
+        assert clf == "orphan_kill_during_execution"
+        assert data is None
+
+    def test_checkpoint_file_missing_returns_standard_during_execution(self) -> None:
+        """Missing checkpoint file → no upgrade, returns orphan_kill_during_execution."""
+        dispatch_ts = "2026-01-01T12:00:00Z"
+        heartbeat_ts = "2026-01-01T12:10:00Z"
+        clf, data = _classify_executing_orphan_kill_type(
+            dispatch_ts, heartbeat_ts, "/nonexistent/checkpoint.json"
+        )
+        assert clf == "orphan_kill_during_execution"
+        assert data is None
+
+    def test_no_checkpoint_ref_no_change(self) -> None:
+        """No checkpoint_ref → standard orphan_kill_during_execution."""
+        dispatch_ts = "2026-01-01T12:00:00Z"
+        heartbeat_ts = "2026-01-01T12:10:00Z"
+        clf, data = _classify_executing_orphan_kill_type(dispatch_ts, heartbeat_ts)
+        assert clf == "orphan_kill_during_execution"
+        assert data is None
+
+    def test_kill_before_start_returns_none_data(self) -> None:
+        """kill-before-start always returns None checkpoint data."""
+        clf, data = _classify_executing_orphan_kill_type(None, None)
+        assert clf == "orphan_kill_before_start"
+        assert data is None
+
+    def test_checkpoint_data_in_registry_audit_note(self, tmp_path: Path) -> None:
+        """
+        When a checkpoint is detected, record_startup_sweep_executing writes
+        checkpoint_next_step_index and related fields into the audit note JSON.
+        """
+        import sqlite3 as _sqlite3
+
+        # Build a DB using the full _SCHEMA (which includes heartbeat_at via
+        # the _make_executing_uow helper fixture)
+        db_path = tmp_path / "cp_test.db"
+        conn = _sqlite3.connect(str(db_path))
+        conn.executescript(_SCHEMA)
+        started_at = _iso_ago(1800)
+        _make_executing_uow(conn, uow_id="uow-cp-audit-001", started_at=started_at)
+        conn.close()
+
+        from src.orchestration.registry import Registry
+        reg = Registry(db_path)
+
+        checkpoint_data = {
+            "next_step_index": 3,
+            "next_step_name": "open_pr",
+            "completion_fraction": 0.75,
+            "notes": "implemented changes",
+            "written_at": _iso_ago(30),
+        }
+        reg.record_startup_sweep_executing(
+            uow_id="uow-cp-audit-001",
+            started_at=started_at,
+            age_seconds=1800,
+            threshold_seconds=600,
+            kill_classification="orphan_kill_during_execution_with_checkpoint",
+            checkpoint_data=checkpoint_data,
+            verified_artifacts=[("impl", "branch", "fix/foo")],
+            missing_artifacts=[],
+        )
+
+        conn2 = _sqlite3.connect(str(db_path))
+        row = conn2.execute(
+            "SELECT note FROM audit_log WHERE uow_id = ? AND event = 'startup_sweep'",
+            ("uow-cp-audit-001",),
+        ).fetchone()
+        conn2.close()
+
+        assert row is not None
+        note = json.loads(row[0])
+        assert note["checkpoint_next_step_index"] == 3
+        assert note["checkpoint_next_step_name"] == "open_pr"
+        assert note["checkpoint_completion_fraction"] == 0.75
+        assert note["verified_artifacts"] == [["impl", "branch", "fix/foo"]]
+        assert note["missing_artifacts"] == []
