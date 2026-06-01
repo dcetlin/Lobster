@@ -1783,3 +1783,66 @@ class TestOperationalPosture:
         assert uow is not None
         from src.orchestration.registry import UoWPosture
         assert uow.posture == UoWPosture.OPERATIONAL
+
+
+class TestExecutionCompletePosture:
+    """
+    'execution_complete' is a DB posture value present on legacy done UoWs that was
+    missing from UoWPosture. Before the fix, registry.list('done') raised ValueError
+    when it encountered any row with posture='execution_complete'.
+    """
+
+    def _insert_execution_complete_posture_row(self, db_path: Path, issue_number: int = 8888) -> str:
+        """Insert a row with posture='execution_complete' directly via SQL."""
+        import uuid
+        uow_id = str(uuid.uuid4())
+        conn = _open_db(db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO uow_registry
+                    (id, status, summary, source, created_at, updated_at,
+                     type, posture, register, steward_cycles, lifetime_cycles,
+                     heartbeat_ttl, retry_count, execution_attempts, orphan_retry_count,
+                     source_issue_number)
+                VALUES
+                    (?, 'done', 'UoW with execution_complete posture', 'test', datetime('now'), datetime('now'),
+                     'executable', 'execution_complete', 'operational', 0, 0,
+                     300, 0, 0, 0,
+                     ?)
+                """,
+                (uow_id, issue_number),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return uow_id
+
+    def test_execution_complete_is_valid_uow_posture(self):
+        """UoWPosture('execution_complete') must not raise ValueError."""
+        from src.orchestration.registry import UoWPosture
+        posture = UoWPosture("execution_complete")
+        assert posture == UoWPosture.EXECUTION_COMPLETE
+
+    def test_registry_list_does_not_raise_on_execution_complete_posture_row(self, registry, db_path):
+        """
+        Registry.list('done') must not raise ValueError when the DB contains a
+        row with posture='execution_complete'. This was the crash in the wos-queue-fix-r2
+        cleanup — one legacy done UoW had posture='execution_complete' outside the enum.
+        """
+        self._insert_execution_complete_posture_row(db_path)
+        # Must not raise ValueError
+        results = registry.list(status="done")
+        ec_uows = [u for u in results if u.posture == "execution_complete"]
+        assert len(ec_uows) == 1
+
+    def test_registry_get_does_not_raise_on_execution_complete_posture_row(self, registry, db_path):
+        """
+        Registry.get(uow_id) must not raise ValueError for a row with
+        posture='execution_complete'.
+        """
+        uow_id = self._insert_execution_complete_posture_row(db_path)
+        uow = registry.get(uow_id)
+        assert uow is not None
+        from src.orchestration.registry import UoWPosture
+        assert uow.posture == UoWPosture.EXECUTION_COMPLETE

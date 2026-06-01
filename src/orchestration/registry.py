@@ -126,6 +126,7 @@ class UoWPosture(StrEnum):
     REVIEW_LOOP = "review-loop"
     FAN_OUT = "fan-out"
     OPERATIONAL = "operational"
+    EXECUTION_COMPLETE = "execution_complete"
 
 
 class UoWRegister(StrEnum):
