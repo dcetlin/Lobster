@@ -1783,3 +1783,193 @@ class TestOperationalPosture:
         assert uow is not None
         from src.orchestration.registry import UoWPosture
         assert uow.posture == UoWPosture.OPERATIONAL
+
+
+class TestExecutionCompletePosture:
+    """
+    'execution_complete' is a DB posture value present on done UoWs that was missing
+    from the UoWPosture enum. Before the fix (PR #1379), any code path that called
+    _row_to_uow() on a row with posture='execution_complete' raised ValueError,
+    crashing registry.list('done') for any environment with such a row.
+    """
+
+    def _insert_execution_complete_posture_row(
+        self, db_path: Path, issue_number: int = 8888
+    ) -> str:
+        """Insert a done row with posture='execution_complete' directly via SQL."""
+        import uuid
+        uow_id = str(uuid.uuid4())
+        conn = _open_db(db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO uow_registry
+                    (id, status, summary, source, created_at, updated_at,
+                     type, posture, register, steward_cycles, lifetime_cycles,
+                     heartbeat_ttl, retry_count, execution_attempts, orphan_retry_count,
+                     source_issue_number)
+                VALUES
+                    (?, 'done', 'UoW with execution_complete posture', 'test',
+                     datetime('now'), datetime('now'),
+                     'executable', 'execution_complete', 'operational', 1, 1,
+                     300, 0, 1, 0,
+                     ?)
+                """,
+                (uow_id, issue_number),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return uow_id
+
+    def test_execution_complete_is_valid_uow_posture(self):
+        """UoWPosture('execution_complete') must not raise ValueError."""
+        from src.orchestration.registry import UoWPosture
+        posture = UoWPosture("execution_complete")
+        assert posture == UoWPosture.EXECUTION_COMPLETE
+
+    def test_registry_list_does_not_raise_on_execution_complete_posture_row(
+        self, registry, db_path
+    ):
+        """
+        Registry.list() must not raise ValueError when the DB contains a done row
+        with posture='execution_complete'. This was BLOCKER 3 in PR #1379:
+        registry.list('done') crashed for any environment with such a row.
+        """
+        self._insert_execution_complete_posture_row(db_path)
+        # Must not raise ValueError
+        results = registry.list(status="done")
+        execution_complete_uows = [
+            u for u in results if u.posture == "execution_complete"
+        ]
+        assert len(execution_complete_uows) == 1
+
+    def test_registry_get_does_not_raise_on_execution_complete_posture_row(
+        self, registry, db_path
+    ):
+        """
+        Registry.get(uow_id) must not raise ValueError for a done row with
+        posture='execution_complete'.
+        """
+        uow_id = self._insert_execution_complete_posture_row(db_path)
+        uow = registry.get(uow_id)
+        assert uow is not None
+        from src.orchestration.registry import UoWPosture
+        assert uow.posture == UoWPosture.EXECUTION_COMPLETE
+
+
+class TestReadyForStewardFIFOOrdering:
+    """
+    PR #1379 changed ready-for-steward ordering from LIFO (created_at DESC) to
+    FIFO (created_at ASC) within each juice-quality tier. These tests assert:
+    1. Oldest UoWs are returned first within the same juice tier.
+    2. Juice UoWs still sort before non-juice UoWs regardless of age.
+
+    Without these tests the LIFO regression could be silently reintroduced.
+    """
+
+    def _insert_ready_for_steward(
+        self,
+        db_path: Path,
+        issue_number: int,
+        created_at: str,
+        juice_quality: str | None = None,
+    ) -> str:
+        """Insert a ready-for-steward UoW with an explicit created_at timestamp."""
+        import uuid
+        uow_id = str(uuid.uuid4())
+        conn = _open_db(db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO uow_registry
+                    (id, status, summary, source, created_at, updated_at,
+                     type, posture, register, steward_cycles, lifetime_cycles,
+                     heartbeat_ttl, retry_count, execution_attempts, orphan_retry_count,
+                     source_issue_number, juice_quality)
+                VALUES
+                    (?, 'ready-for-steward', 'test UoW', 'test', ?, datetime('now'),
+                     'executable', 'operational', 'operational', 0, 0,
+                     300, 0, 0, 0,
+                     ?, ?)
+                """,
+                (uow_id, created_at, issue_number, juice_quality),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return uow_id
+
+    def test_oldest_non_juice_uow_is_returned_first(self, registry, db_path):
+        """
+        Among non-juice ready-for-steward UoWs, the oldest (smallest created_at)
+        must be first. FIFO ordering within the non-juice tier.
+        """
+        oldest_id = self._insert_ready_for_steward(
+            db_path, issue_number=9001, created_at="2026-05-22 00:00:00"
+        )
+        _middle_id = self._insert_ready_for_steward(
+            db_path, issue_number=9002, created_at="2026-05-30 00:00:00"
+        )
+        _newest_id = self._insert_ready_for_steward(
+            db_path, issue_number=9003, created_at="2026-06-01 00:00:00"
+        )
+        results = registry.list(status="ready-for-steward")
+        rfs = [u for u in results if u.id in {oldest_id, _middle_id, _newest_id}]
+        assert len(rfs) == 3, f"Expected 3 ready-for-steward UoWs, got {len(rfs)}"
+        assert rfs[0].id == oldest_id, (
+            f"Oldest UoW must be first (FIFO). Got {rfs[0].id!r} instead of {oldest_id!r}. "
+            f"Order: {[u.id for u in rfs]}"
+        )
+
+    def test_juice_uow_precedes_non_juice_regardless_of_age(self, registry, db_path):
+        """
+        A newer juice UoW must sort before an older non-juice UoW.
+        Juice-priority tier ordering is preserved across the LIFO→FIFO change.
+        """
+        old_non_juice_id = self._insert_ready_for_steward(
+            db_path,
+            issue_number=9010,
+            created_at="2026-05-22 00:00:00",
+            juice_quality=None,
+        )
+        new_juice_id = self._insert_ready_for_steward(
+            db_path,
+            issue_number=9011,
+            created_at="2026-06-01 00:00:00",
+            juice_quality="juice",
+        )
+        results = registry.list(status="ready-for-steward")
+        rfs = [u for u in results if u.id in {old_non_juice_id, new_juice_id}]
+        assert len(rfs) == 2
+        assert rfs[0].id == new_juice_id, (
+            f"Juice UoW must sort before non-juice regardless of age. "
+            f"Got {rfs[0].id!r} first; expected juice UoW {new_juice_id!r}."
+        )
+
+    def test_oldest_juice_uow_is_returned_first_within_juice_tier(
+        self, registry, db_path
+    ):
+        """
+        Among juice-quality ready-for-steward UoWs, the oldest must be first.
+        FIFO ordering applies within the juice tier as well as the non-juice tier.
+        """
+        old_juice_id = self._insert_ready_for_steward(
+            db_path,
+            issue_number=9020,
+            created_at="2026-05-22 00:00:00",
+            juice_quality="juice",
+        )
+        new_juice_id = self._insert_ready_for_steward(
+            db_path,
+            issue_number=9021,
+            created_at="2026-06-01 00:00:00",
+            juice_quality="juice",
+        )
+        results = registry.list(status="ready-for-steward")
+        rfs = [u for u in results if u.id in {old_juice_id, new_juice_id}]
+        assert len(rfs) == 2
+        assert rfs[0].id == old_juice_id, (
+            f"Oldest juice UoW must be first within juice tier (FIFO). "
+            f"Got {rfs[0].id!r} first; expected {old_juice_id!r}."
+        )
