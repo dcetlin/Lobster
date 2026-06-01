@@ -332,6 +332,55 @@ def _validate_result_json_written(uow_id: str, output_ref: str) -> None:
         )
 
 
+def _write_chain_columns(
+    db_path: Path,
+    uow_id: str,
+    chain_type: str,
+    artifact: WorkflowArtifact,
+) -> None:
+    """
+    Write chain-queryability columns to uow_registry after chain dispatch.
+
+    These columns are Steward-private (excluded from executor_uow_view) and
+    exist solely for Steward-side inspection of fan_out/diverge_converge UoWs.
+    The Executor reads chain_type from the workflow_artifact JSON — not from
+    these columns. A failure here is logged but does not block the UoW transition.
+    """
+    import sqlite3
+    from orchestration.chain_dispatch import CHAIN_FAN_OUT, CHAIN_DIVERGE_CONVERGE
+
+    try:
+        perspectives = artifact.get("perspectives") if chain_type == CHAIN_FAN_OUT else None
+        approaches = artifact.get("approaches") if chain_type == CHAIN_DIVERGE_CONVERGE else None
+
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            conn.execute(
+                """
+                UPDATE uow_registry
+                SET chain_perspectives = ?,
+                    chain_approaches = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(perspectives) if perspectives is not None else None,
+                    json.dumps(approaches) if approaches is not None else None,
+                    uow_id,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.warning(
+            "Executor: failed to write chain-queryability columns for UoW %s — %s",
+            uow_id,
+            exc,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Executor
 # ---------------------------------------------------------------------------
@@ -872,6 +921,9 @@ class Executor:
             fallback_artifact = dict(artifact)
             fallback_artifact.pop("chain_type", None)
             return self._run_execution(uow_id, output_ref, fallback_artifact, register)  # type: ignore[arg-type]
+
+        # Write chain-queryability columns to DB for Steward inspection.
+        _write_chain_columns(self.registry.db_path, uow_id, chain_type, artifact)
 
         outcome = ExecutorOutcome(chain_result.outcome)
         _write_output_ref_content(output_ref, chain_result.output_text)

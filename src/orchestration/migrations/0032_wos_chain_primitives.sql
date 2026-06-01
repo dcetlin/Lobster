@@ -6,16 +6,18 @@
 -- perspectives_outputs: JSON dict keyed by perspective name, storing the
 --   executor_id for each dispatched perspective subagent. NULL until a
 --   fan_out chain dispatch fires for this UoW.
---   Executor-accessible (included in executor_uow_view).
+--   Steward-private (excluded from executor_uow_view). Queryability column
+--   for fan_out UoW inspection; chain_type is carried in workflow_artifact JSON
+--   and is the Executor's read path for dispatch routing.
 --
 -- chain_perspectives: JSON array of perspective names for fan_out UoWs.
 --   Mirrors the perspectives field in WorkflowArtifact for queryability.
 --   NULL for non-fan-out UoWs.
---   Executor-accessible (included in executor_uow_view).
+--   Steward-private (excluded from executor_uow_view).
 --
 -- chain_approaches: JSON array of approach names for diverge_converge UoWs.
 --   NULL for non-diverge-converge UoWs.
---   Executor-accessible (included in executor_uow_view).
+--   Steward-private (excluded from executor_uow_view).
 --
 -- WOS-UoW: uow_20260601_424433
 

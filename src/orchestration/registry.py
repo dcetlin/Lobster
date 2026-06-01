@@ -91,7 +91,7 @@ class UoWStatus(StrEnum):
     # creates child UoW records. The UoW resumes (→ ready-for-steward) when the
     # observation loop detects all children are in terminal states.
     # Treated as non-terminal (does not allow automatic re-proposal).
-    AWAITING_CHILDREN = "awaiting_children"
+    AWAITING_CHILDREN = "awaiting-children"
 
     def is_terminal(self) -> bool:
         """True for statuses that allow re-proposal (done, failed, expired, cancelled, closed, completed)."""
@@ -105,7 +105,7 @@ class UoWStatus(StrEnum):
         }
 
     def is_in_flight(self) -> bool:
-        """True for statuses that block re-proposal (active, executing, pending, ready-for-steward, ready-for-executor, diagnosing, awaiting-owner, awaiting_children)."""
+        """True for statuses that block re-proposal (active, executing, pending, ready-for-steward, ready-for-executor, diagnosing, awaiting-owner, awaiting-children)."""
         return self in {
             UoWStatus.ACTIVE,
             UoWStatus.EXECUTING,

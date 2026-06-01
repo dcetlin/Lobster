@@ -319,12 +319,12 @@ def _mark_awaiting_children(registry: "Registry", uow_id: str) -> None:
         conn.execute(
             """
             INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
-            VALUES (?, ?, 'awaiting_children', 'active', 'awaiting_children', 'chain_dispatch', ?)
+            VALUES (?, ?, 'awaiting_children', 'active', 'awaiting-children', 'chain_dispatch', ?)
             """,
             (now, uow_id, json.dumps({"reason": "spec_breakdown dispatched"})),
         )
         conn.execute(
-            "UPDATE uow_registry SET status = 'awaiting_children', updated_at = ? WHERE id = ?",
+            "UPDATE uow_registry SET status = 'awaiting-children', updated_at = ? WHERE id = ?",
             (now, uow_id),
         )
         conn.commit()
