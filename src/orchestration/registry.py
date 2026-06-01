@@ -334,6 +334,9 @@ class UoW:
     #   Permanent failure is deferred until this reaches ORPHAN_KILL_RETRY_BUDGET.
     #   orphan_kill_before_start and non-orphan failures are unaffected.
     orphan_retry_count: int = 0
+    # checkpoint_ref: path to the most recently written checkpoint.json (migration 0031).
+    #   NULL until a checkpoint is written. Executor-accessible.
+    checkpoint_ref: str | None = None
 
 
 def _now_iso() -> str:
@@ -531,6 +534,7 @@ class Registry:
             retry_count=d.get("retry_count") or 0,
             execution_attempts=d.get("execution_attempts") or 0,
             orphan_retry_count=d.get("orphan_retry_count") or 0,
+            checkpoint_ref=d.get("checkpoint_ref"),
             artifacts=_deserialize_json(d.get("artifacts")) if d.get("artifacts") else None,
             file_scope=_deserialize_json(d.get("file_scope")) if d.get("file_scope") else None,
             shard_id=d.get("shard_id"),
