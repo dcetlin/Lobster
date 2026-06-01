@@ -122,6 +122,23 @@ CREATE TABLE IF NOT EXISTS uow_registry (
     --   Infrastructure only — no gating logic.
     checkpoint_ref TEXT DEFAULT NULL,
 
+    -- perspectives_outputs: JSON dict keyed by perspective name, storing the
+    --   executor_id for each dispatched perspective subagent. Written by
+    --   run_fan_out after dispatch. NULL for non-fan-out UoWs.
+    --   Steward-private (excluded from executor_uow_view). Queryability column only.
+    perspectives_outputs TEXT DEFAULT NULL,
+
+    -- chain_perspectives: JSON array of perspective names for fan_out UoWs.
+    --   Mirrors the perspectives field in WorkflowArtifact for queryability.
+    --   NULL for non-fan-out UoWs.
+    --   Steward-private (excluded from executor_uow_view).
+    chain_perspectives TEXT DEFAULT NULL,
+
+    -- chain_approaches: JSON array of approach names for diverge_converge UoWs.
+    --   NULL for non-diverge-converge UoWs.
+    --   Steward-private (excluded from executor_uow_view).
+    chain_approaches TEXT DEFAULT NULL,
+
     UNIQUE(source_issue_number, sweep_date)
 );
 -- vision_ref: JSON {layer, field, statement, anchored_at}
