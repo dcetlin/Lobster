@@ -741,13 +741,22 @@ class Executor:
         """
         Inner execution: activate skills, dispatch subagent, write results.
         Returns ExecutorResult. Callers must catch exceptions.
+
+        Chain primitives: when artifact["chain_type"] is set, routes to the
+        appropriate chain dispatch function instead of the single-subagent path.
+        Fallback (chain_type absent/None/unrecognized) uses the existing path.
         """
         # Step 1: Activate prescribed skills
         prescribed_skills: list[str] = artifact.get("prescribed_skills") or []
         for skill_id in prescribed_skills:
             self._skill_activator(skill_id)
 
-        # Step 2: Dispatch LLM subagent via register-appropriate dispatcher.
+        # Step 2: Check for chain primitives — route before single-dispatch path.
+        chain_type = artifact.get("chain_type")
+        if chain_type:
+            return self._run_chain_execution(uow_id, output_ref, artifact, register, chain_type)
+
+        # Step 3: Dispatch LLM subagent via register-appropriate dispatcher.
         # Build the WOS context block (UoW ID + artifact stamping instructions, issue #868)
         # and inject it into every dispatched prompt regardless of dispatcher path.
         #
@@ -767,10 +776,10 @@ class Executor:
             dispatcher = _resolve_dispatcher(executor_type)
             executor_id = dispatcher(instructions, uow_id)
 
-        # Step 3: Write output_ref content (signal that execution produced output)
+        # Step 4: Write output_ref content (signal that execution produced output)
         _write_output_ref_content(output_ref, f"execution dispatched: task_id={executor_id}")
 
-        # Step 4: Build result
+        # Step 5: Build result
         result = ExecutorResult(
             uow_id=uow_id,
             outcome=ExecutorOutcome.COMPLETE,
@@ -778,11 +787,11 @@ class Executor:
             executor_id=executor_id or None,
         )
 
-        # Step 5: Write result.json (executor-contract.md: required at every intentional exit)
+        # Step 6: Write result.json (executor-contract.md: required at every intentional exit)
         _write_result_json(output_ref, result)
         _validate_result_json_written(uow_id, output_ref)
 
-        # Step 5b: Write trace.json (V3 corrective trace contract — required alongside result.json)
+        # Step 6b: Write trace.json (V3 corrective trace contract — required alongside result.json)
         trace = _build_trace(
             uow_id=uow_id,
             register=register,
@@ -795,7 +804,7 @@ class Executor:
         _write_trace_json(output_ref, trace)
         _insert_corrective_trace(self.registry.db_path, trace)
 
-        # Step 6: Status transition — depends on dispatch path.
+        # Step 7: Status transition — depends on dispatch path.
         #
         # Async (inbox) dispatchers: write wos_execute to inbox and return immediately.
         # The subagent has NOT yet done any work — calling complete_uow here would produce
@@ -815,6 +824,88 @@ class Executor:
             _stamp_executing_if_github(self.registry, uow_id)
         else:
             self.registry.complete_uow(uow_id, output_ref)
+
+        return result
+
+    def _run_chain_execution(
+        self,
+        uow_id: str,
+        output_ref: str,
+        artifact: WorkflowArtifact,
+        register: str,
+        chain_type: str,
+    ) -> ExecutorResult:
+        """
+        Route to the appropriate chain dispatch primitive.
+
+        Falls back to the existing single-subagent path for unrecognized chain_type
+        values, ensuring the fallback is always reachable.
+        """
+        from orchestration.chain_dispatch import (
+            CHAIN_FAN_OUT, CHAIN_SPEC_BREAKDOWN, CHAIN_DIVERGE_CONVERGE,
+            run_fan_out, run_spec_breakdown, run_diverge_converge,
+        )
+
+        # Resolve the dispatcher to use for chain primitives.
+        # Use override if injected (test/CI path); otherwise use the dispatch table.
+        if self._dispatcher_override is not None:
+            dispatcher = self._dispatcher_override
+        else:
+            executor_type = artifact.get("executor_type", "functional-engineer")
+            dispatcher = _resolve_dispatcher(executor_type)
+
+        if chain_type == CHAIN_FAN_OUT:
+            chain_result = run_fan_out(uow_id, output_ref, artifact, dispatcher)
+        elif chain_type == CHAIN_SPEC_BREAKDOWN:
+            chain_result = run_spec_breakdown(uow_id, output_ref, artifact, dispatcher, self.registry)
+        elif chain_type == CHAIN_DIVERGE_CONVERGE:
+            chain_result = run_diverge_converge(uow_id, output_ref, artifact, dispatcher)
+        else:
+            # Unrecognized chain_type — fall back to single-subagent path.
+            log.warning(
+                "Executor: unrecognized chain_type %r for UoW %s — falling back to single-subagent dispatch",
+                chain_type, uow_id,
+            )
+            # Clear chain_type and recurse into the standard path.
+            # Create a copy without chain_type to avoid infinite recursion.
+            from orchestration.workflow_artifact import WorkflowArtifact as WA
+            fallback_artifact = dict(artifact)
+            fallback_artifact.pop("chain_type", None)
+            return self._run_execution(uow_id, output_ref, fallback_artifact, register)  # type: ignore[arg-type]
+
+        outcome = ExecutorOutcome(chain_result.outcome)
+        _write_output_ref_content(output_ref, chain_result.output_text)
+
+        result = ExecutorResult(
+            uow_id=uow_id,
+            outcome=outcome,
+            success=chain_result.success,
+            reason=chain_result.reason,
+        )
+        _write_result_json(output_ref, result)
+        _validate_result_json_written(uow_id, output_ref)
+
+        trace = _build_trace(
+            uow_id=uow_id,
+            register=register,
+            outcome=outcome,
+            execution_summary=f"chain_type={chain_type}: {chain_result.reason or 'dispatched'}",
+            surprises=[],
+            prescription_delta=f"chain_type={chain_type}",
+        )
+        _write_trace_json(output_ref, trace)
+        _insert_corrective_trace(self.registry.db_path, trace)
+
+        # spec_breakdown transitions to awaiting_children (handled in run_spec_breakdown).
+        # fan_out and diverge_converge transition to executing or complete.
+        if chain_type != CHAIN_SPEC_BREAKDOWN:
+            executor_type = artifact.get("executor_type", "functional-engineer")
+            if _dispatcher_is_async(self._dispatcher_override, executor_type):
+                # Use the chain_type as the executor_id for audit correlation.
+                self.registry.transition_to_executing(uow_id, chain_type)
+                _stamp_executing_if_github(self.registry, uow_id)
+            else:
+                self.registry.complete_uow(uow_id, output_ref)
 
         return result
 

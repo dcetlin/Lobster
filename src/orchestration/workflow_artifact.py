@@ -43,7 +43,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 
 # ---------------------------------------------------------------------------
@@ -60,38 +60,61 @@ EXECUTOR_TYPE_GENERAL = "general"
 # All fields that must be present in a valid WorkflowArtifact.
 _REQUIRED_FIELDS = frozenset({"uow_id", "executor_type", "constraints", "prescribed_skills", "instructions"})
 
+# Optional chain-primitive fields — present only when chain_type is set.
+_CHAIN_FIELDS = frozenset({
+    "chain_type",
+    "perspectives",
+    "decomposition_prompt",
+    "approaches",
+    "synthesis_prompt",
+})
+
 
 # ---------------------------------------------------------------------------
 # Struct
 # ---------------------------------------------------------------------------
 
-class WorkflowArtifact(TypedDict):
+class WorkflowArtifact(TypedDict, total=False):
     """
     The Steward→Executor contract.
 
-    Fields
-    ------
-    uow_id : str
-        Links to the UoWRegistry entry this artifact was produced for.
-    executor_type : str
-        Which Executor handles this UoW. Currently only 'general' is valid.
-    constraints : list[str]
-        Hard constraints on execution (e.g. 'no-network-access').
-        Use [] for no constraints.
-    prescribed_skills : list[str]
-        Skill IDs to activate at task start.
-        None (NULL in registry) = Steward did not prescribe; use active skills.
-        [] = Steward explicitly prescribes no skills; deactivate contextual skills.
-        Both None and [] are treated as "no skill activation required".
-    instructions : str
-        Natural language guidance for the Executor's LLM dispatch.
+    Required fields (always present):
+    uow_id, executor_type, constraints, prescribed_skills, instructions
+
+    Optional chain-primitive fields (present only when chain_type is set):
+    chain_type : str | None
+        Dispatch routing key. Values:
+          "fan_out"          — dispatch N perspective subagents, collect outputs
+          "spec_breakdown"   — decompose into child UoWs via a decomposition agent
+          "diverge_converge" — dispatch N approach agents then synthesize
+        When absent or None, falls back to the existing single-subagent path.
+    perspectives : list[str] | None
+        Required when chain_type="fan_out". Named viewpoints (e.g. ["security",
+        "performance"]) — one subagent dispatched per perspective.
+    decomposition_prompt : str | None
+        Required when chain_type="spec_breakdown". Instructions for the
+        decomposition agent — must return a JSON array of child UoW specs.
+    approaches : list[str] | None
+        Required when chain_type="diverge_converge". Named approaches (e.g.
+        ["approach_a", "approach_b"]) — one subagent dispatched per approach.
+    synthesis_prompt : str | None
+        Required when chain_type="diverge_converge". Prompt injected into the
+        synthesis agent alongside all approach outputs.
     """
 
+    # Required fields
     uow_id: str
     executor_type: str
-    constraints: list[str]
-    prescribed_skills: list[str]
+    constraints: list
+    prescribed_skills: list
     instructions: str
+
+    # Chain-primitive fields (optional)
+    chain_type: NotRequired[str | None]
+    perspectives: NotRequired[list[str] | None]
+    decomposition_prompt: NotRequired[str | None]
+    approaches: NotRequired[list[str] | None]
+    synthesis_prompt: NotRequired[str | None]
 
 
 # ---------------------------------------------------------------------------
@@ -126,8 +149,9 @@ def from_json(json_str: str) -> WorkflowArtifact:
     if missing:
         raise ValueError(f"WorkflowArtifact missing required fields: {missing}")
 
-    # Reconstruct using only the known fields — ignores unknown keys.
-    return WorkflowArtifact(**{k: v for k, v in data.items() if k in _REQUIRED_FIELDS})
+    # Reconstruct required fields, then layer in any chain-primitive fields present.
+    known = _REQUIRED_FIELDS | _CHAIN_FIELDS
+    return WorkflowArtifact(**{k: v for k, v in data.items() if k in known})
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +188,9 @@ _FRONTMATTER_CLOSER = "---"
 # Fields included in the JSON envelope (everything except instructions).
 _ENVELOPE_FIELDS = ("uow_id", "executor_type", "constraints", "prescribed_skills")
 
+# Optional chain fields included in the envelope when present.
+_CHAIN_ENVELOPE_FIELDS = ("chain_type", "perspectives", "decomposition_prompt", "approaches", "synthesis_prompt")
+
 
 def to_frontmatter(artifact: WorkflowArtifact) -> str:
     """
@@ -183,6 +210,9 @@ def to_frontmatter(artifact: WorkflowArtifact) -> str:
     Pure function — no side effects.
     """
     envelope = {k: artifact[k] for k in _ENVELOPE_FIELDS}  # type: ignore[literal-required]
+    for k in _CHAIN_ENVELOPE_FIELDS:
+        if k in artifact and artifact.get(k) is not None:  # type: ignore[literal-required]
+            envelope[k] = artifact[k]  # type: ignore[literal-required]
     envelope_line = json.dumps(envelope, separators=(",", ":"))
     return f"{_FRONTMATTER_OPENER}\n{envelope_line}\n{_FRONTMATTER_CLOSER}\n{artifact['instructions']}"
 
@@ -280,10 +310,15 @@ def from_frontmatter(text: str) -> WorkflowArtifact:
     if instructions.startswith("\n"):
         instructions = instructions[1:]
 
-    return WorkflowArtifact(
+    artifact = WorkflowArtifact(
         uow_id=uow_id,
         executor_type=executor_type,
         constraints=envelope.get("constraints", []),
         prescribed_skills=envelope.get("prescribed_skills", []),
         instructions=instructions,
     )
+    # Include any chain-primitive fields present in the envelope.
+    for k in _CHAIN_ENVELOPE_FIELDS:
+        if k in envelope:
+            artifact[k] = envelope[k]  # type: ignore[literal-required]
+    return artifact
