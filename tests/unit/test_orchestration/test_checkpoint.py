@@ -6,7 +6,8 @@ Covers:
 2. _read_checkpoint returns None when file does not exist
 3. _read_checkpoint returns the written data after write_checkpoint
 4. write_checkpoint is atomic: second call replaces (not appends)
-5. write_checkpoint with artifacts=None stores {} (not null)
+5. write_checkpoint with empty steps stores [] (not null)
+6. Schema compatibility: next_step_index and steps[] are readable by startup_sweep reader
 """
 from __future__ import annotations
 
@@ -27,42 +28,98 @@ def tmp_checkpoints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return checkpoints_dir
 
 
+def _make_step(index: int, name: str, status: str = "complete", artifacts: dict | None = None) -> dict:
+    """Helper to build a StepRecord-compatible dict."""
+    return {
+        "index": index,
+        "name": name,
+        "status": status,
+        "completed_at": "2026-01-01T00:00:00+00:00",
+        "artifacts": artifacts or {},
+    }
+
+
 # ---------------------------------------------------------------------------
 # 1. write_checkpoint creates file at correct path with correct schema keys
 # ---------------------------------------------------------------------------
 
 class TestWriteCheckpointSchema:
     def test_file_created_at_correct_path(self, tmp_checkpoints: Path) -> None:
-        result = write_checkpoint("uow_abc123", "step1", "in_progress")
+        result = write_checkpoint("uow_abc123", steps=[], next_step_index=1)
         expected = tmp_checkpoints / "uow_abc123" / "checkpoint.json"
         assert result == expected
         assert expected.exists()
 
     def test_schema_keys_present(self, tmp_checkpoints: Path) -> None:
-        write_checkpoint("uow_abc123", "step1", "in_progress", artifacts={"pr": 42})
+        steps = [_make_step(0, "step1", artifacts={"pr": 42})]
+        write_checkpoint("uow_abc123", steps=steps, next_step_index=1)
         path = tmp_checkpoints / "uow_abc123" / "checkpoint.json"
         data = json.loads(path.read_text())
-        assert set(data.keys()) == {"step_name", "status", "artifacts", "written_at"}
+        assert set(data.keys()) == {
+            "uow_id", "checkpoint_version", "written_at",
+            "steps", "next_step_index", "next_step_name",
+            "completion_fraction", "notes",
+        }
 
-    def test_step_name_and_status_written(self, tmp_checkpoints: Path) -> None:
-        write_checkpoint("uow_abc123", "my_step", "done")
+    def test_uow_id_written(self, tmp_checkpoints: Path) -> None:
+        write_checkpoint("uow_abc123", steps=[], next_step_index=0)
         path = tmp_checkpoints / "uow_abc123" / "checkpoint.json"
         data = json.loads(path.read_text())
-        assert data["step_name"] == "my_step"
-        assert data["status"] == "done"
+        assert data["uow_id"] == "uow_abc123"
 
-    def test_artifacts_written(self, tmp_checkpoints: Path) -> None:
-        write_checkpoint("uow_abc123", "step1", "in_progress", artifacts={"pr": 99, "file": "foo.py"})
+    def test_checkpoint_version_is_1(self, tmp_checkpoints: Path) -> None:
+        write_checkpoint("uow_abc123", steps=[], next_step_index=0)
         path = tmp_checkpoints / "uow_abc123" / "checkpoint.json"
         data = json.loads(path.read_text())
-        assert data["artifacts"] == {"pr": 99, "file": "foo.py"}
+        assert data["checkpoint_version"] == 1
+
+    def test_next_step_index_written(self, tmp_checkpoints: Path) -> None:
+        write_checkpoint("uow_abc123", steps=[], next_step_index=3)
+        path = tmp_checkpoints / "uow_abc123" / "checkpoint.json"
+        data = json.loads(path.read_text())
+        assert data["next_step_index"] == 3
+
+    def test_steps_array_written(self, tmp_checkpoints: Path) -> None:
+        steps = [
+            _make_step(0, "impl", artifacts={"pr": 99}),
+            _make_step(1, "tests", status="in_progress"),
+        ]
+        write_checkpoint("uow_abc123", steps=steps, next_step_index=1)
+        path = tmp_checkpoints / "uow_abc123" / "checkpoint.json"
+        data = json.loads(path.read_text())
+        assert len(data["steps"]) == 2
+        assert data["steps"][0]["name"] == "impl"
+        assert data["steps"][0]["artifacts"] == {"pr": 99}
 
     def test_written_at_is_iso_timestamp(self, tmp_checkpoints: Path) -> None:
-        write_checkpoint("uow_abc123", "step1", "in_progress")
+        write_checkpoint("uow_abc123", steps=[], next_step_index=0)
         path = tmp_checkpoints / "uow_abc123" / "checkpoint.json"
         data = json.loads(path.read_text())
         assert "T" in data["written_at"]  # ISO-8601 format
         assert "+" in data["written_at"] or "Z" in data["written_at"] or data["written_at"].endswith("+00:00")
+
+    def test_optional_fields_default(self, tmp_checkpoints: Path) -> None:
+        write_checkpoint("uow_abc123", steps=[], next_step_index=0)
+        path = tmp_checkpoints / "uow_abc123" / "checkpoint.json"
+        data = json.loads(path.read_text())
+        assert data["next_step_name"] == ""
+        assert data["completion_fraction"] == 0.0
+        assert data["notes"] == ""
+
+    def test_optional_fields_set(self, tmp_checkpoints: Path) -> None:
+        write_checkpoint(
+            "uow_abc123",
+            steps=[],
+            next_step_index=2,
+            next_step_name="finalize",
+            completion_fraction=0.5,
+            notes="halfway done",
+        )
+        path = tmp_checkpoints / "uow_abc123" / "checkpoint.json"
+        data = json.loads(path.read_text())
+        assert data["next_step_name"] == "finalize"
+        assert data["completion_fraction"] == 0.5
+        assert data["notes"] == "halfway done"
 
 
 # ---------------------------------------------------------------------------
@@ -86,18 +143,22 @@ class TestReadCheckpointMissing:
 
 class TestReadCheckpointRoundtrip:
     def test_read_returns_written_data(self, tmp_checkpoints: Path) -> None:
-        write_checkpoint("uow_xyz", "post_impl", "complete", artifacts={"pr_url": "https://github.com/x/y/pull/1"})
+        steps = [_make_step(0, "post_impl", artifacts={"pr_url": "https://github.com/x/y/pull/1"})]
+        write_checkpoint("uow_xyz", steps=steps, next_step_index=1)
         data = _read_checkpoint("uow_xyz")
         assert data is not None
-        assert data["step_name"] == "post_impl"
-        assert data["status"] == "complete"
-        assert data["artifacts"] == {"pr_url": "https://github.com/x/y/pull/1"}
+        assert data["uow_id"] == "uow_xyz"
+        assert data["next_step_index"] == 1
+        assert len(data["steps"]) == 1
+        assert data["steps"][0]["name"] == "post_impl"
+        assert data["steps"][0]["artifacts"] == {"pr_url": "https://github.com/x/y/pull/1"}
 
     def test_read_preserves_all_fields(self, tmp_checkpoints: Path) -> None:
-        write_checkpoint("uow_xyz", "startup", "running")
+        write_checkpoint("uow_xyz", steps=[], next_step_index=0)
         data = _read_checkpoint("uow_xyz")
         assert data is not None
         assert "written_at" in data
+        assert "checkpoint_version" in data
 
 
 # ---------------------------------------------------------------------------
@@ -106,36 +167,61 @@ class TestReadCheckpointRoundtrip:
 
 class TestWriteCheckpointReplaces:
     def test_second_write_replaces_first(self, tmp_checkpoints: Path) -> None:
-        write_checkpoint("uow_replace", "step1", "in_progress", artifacts={"a": 1})
-        write_checkpoint("uow_replace", "step2", "complete", artifacts={"b": 2})
+        step1 = _make_step(0, "step1", artifacts={"a": 1})
+        write_checkpoint("uow_replace", steps=[step1], next_step_index=1)
+        step2 = _make_step(0, "step1", artifacts={"a": 1})
+        write_checkpoint("uow_replace", steps=[step2], next_step_index=2, completion_fraction=0.5)
         data = _read_checkpoint("uow_replace")
         assert data is not None
-        assert data["step_name"] == "step2"
-        assert data["status"] == "complete"
-        assert data["artifacts"] == {"b": 2}
+        assert data["next_step_index"] == 2
+        assert data["completion_fraction"] == 0.5
 
     def test_no_residual_tmp_file_after_write(self, tmp_checkpoints: Path) -> None:
-        write_checkpoint("uow_replace", "step1", "in_progress")
+        write_checkpoint("uow_replace", steps=[], next_step_index=0)
         tmp_file = tmp_checkpoints / "uow_replace" / "checkpoint.tmp"
         assert not tmp_file.exists()
 
 
 # ---------------------------------------------------------------------------
-# 5. write_checkpoint with artifacts=None stores {} (not null)
+# 5. write_checkpoint with empty steps stores [] (not null)
 # ---------------------------------------------------------------------------
 
-class TestWriteCheckpointNullArtifacts:
-    def test_none_artifacts_stored_as_empty_dict(self, tmp_checkpoints: Path) -> None:
-        write_checkpoint("uow_noartifacts", "step1", "done", artifacts=None)
-        data = _read_checkpoint("uow_noartifacts")
+class TestWriteCheckpointEmptySteps:
+    def test_empty_steps_stored_as_list(self, tmp_checkpoints: Path) -> None:
+        write_checkpoint("uow_nosteps", steps=[], next_step_index=0)
+        data = _read_checkpoint("uow_nosteps")
         assert data is not None
-        assert data["artifacts"] == {}
-        # Confirm it is actually a dict, not None/null
-        assert isinstance(data["artifacts"], dict)
+        assert data["steps"] == []
+        assert isinstance(data["steps"], list)
 
-    def test_default_artifacts_stored_as_empty_dict(self, tmp_checkpoints: Path) -> None:
-        # Calling without artifacts= kwarg uses the default (None -> {})
-        write_checkpoint("uow_default", "step1", "done")
-        data = _read_checkpoint("uow_default")
+
+# ---------------------------------------------------------------------------
+# 6. Schema compatibility: next_step_index and steps[] readable by startup_sweep
+# ---------------------------------------------------------------------------
+
+class TestStartupSweepCompatibility:
+    def test_next_step_index_nonzero_triggers_checkpoint_classification(
+        self, tmp_checkpoints: Path
+    ) -> None:
+        """A checkpoint with next_step_index > 0 satisfies the startup_sweep
+        classification condition: checkpoint.get("next_step_index", 0) > 0."""
+        step = _make_step(0, "impl", artifacts={"branch": "feat/my-feature"})
+        write_checkpoint("uow_compat", steps=[step], next_step_index=1)
+        data = _read_checkpoint("uow_compat")
         assert data is not None
-        assert data["artifacts"] == {}
+        assert data.get("next_step_index", 0) > 0
+
+    def test_steps_array_iterable_by_startup_sweep(self, tmp_checkpoints: Path) -> None:
+        """startup_sweep iterates steps: for step in checkpoint_data.get('steps', [])."""
+        steps = [
+            _make_step(0, "impl", artifacts={"worktree_path": "/tmp/fake"}),
+            _make_step(1, "tests", status="in_progress"),
+        ]
+        write_checkpoint("uow_compat", steps=steps, next_step_index=2)
+        data = _read_checkpoint("uow_compat")
+        assert data is not None
+        collected_steps = data.get("steps", [])
+        assert len(collected_steps) == 2
+        # Step 0 is complete and has artifacts
+        assert collected_steps[0]["status"] == "complete"
+        assert "worktree_path" in collected_steps[0]["artifacts"]
