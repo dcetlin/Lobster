@@ -126,6 +126,7 @@ class UoWPosture(StrEnum):
     REVIEW_LOOP = "review-loop"
     FAN_OUT = "fan-out"
     OPERATIONAL = "operational"
+    EXECUTION_COMPLETE = "execution_complete"
 
 
 class UoWRegister(StrEnum):
@@ -868,29 +869,32 @@ class Registry:
         """Return all UoW records, optionally filtered by status.
 
         When filtering by status='ready-for-steward', results are ordered so
-        that juice-quality UoWs ('juice') sort first among candidates:
+        that juice-quality UoWs ('juice') sort first, then by FIFO (oldest
+        first) among same-juice-status candidates:
 
             ORDER BY
               CASE WHEN juice_quality = 'juice' THEN 0 ELSE 1 END ASC,
-              created_at DESC
+              created_at ASC
 
-        This implements the dispatch priority signal from the juice integration
-        spec: high-juice UoWs bubble to the front of the steward's selection
-        queue while preserving LIFO ordering among same-juice-status candidates.
+        Juice-priority UoWs bubble to the front. Within each priority tier,
+        FIFO ordering ensures oldest unprocessed UoWs are dispatched before
+        newly-arrived ones — preventing starvation of large cohorts when the
+        burst throttle limits slots to N per cycle (LIFO would permanently
+        starve old UoWs when new ones keep arriving).
 
         For all other status filters, ordering remains created_at DESC (LIFO).
         """
         conn = self._connect()
         try:
             if status == "ready-for-steward":
-                # Juice-priority ordering: juice UoWs first, then LIFO.
+                # Juice-priority ordering: juice UoWs first, then FIFO (oldest first).
                 rows = conn.execute(
                     """
                     SELECT * FROM uow_registry
                     WHERE status = 'ready-for-steward'
                     ORDER BY
                       CASE WHEN juice_quality = 'juice' THEN 0 ELSE 1 END ASC,
-                      created_at DESC
+                      created_at ASC
                     """,
                 ).fetchall()
             elif status:
