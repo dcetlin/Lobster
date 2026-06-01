@@ -2037,6 +2037,9 @@ class Registry:
         age_seconds: float,
         threshold_seconds: int,
         kill_classification: str = "orphan_kill_before_start",
+        checkpoint_data: dict | None = None,
+        verified_artifacts: list | None = None,
+        missing_artifacts: list | None = None,
     ) -> int:
         """
         Atomically write a startup_sweep audit entry and transition an
@@ -2063,12 +2066,24 @@ class Registry:
                     — agent killed before establishing working state.
                 'orphan_kill_during_execution': heartbeat written after dispatch
                     — agent was actively working when killed.
+                'orphan_kill_during_execution_with_checkpoint': agent was actively
+                    working when killed AND a valid checkpoint exists with progress
+                    past step 0 — resume context is available in checkpoint_data.
                 Defaults to 'orphan_kill_before_start' (safe default when
                 heartbeat evidence is absent or the registry method is not
                 available).
+            checkpoint_data: Parsed checkpoint dict when classification is
+                'orphan_kill_during_execution_with_checkpoint', None otherwise.
+                Key fields included in the audit note when present:
+                next_step_index, next_step_name, completion_fraction, notes,
+                written_at.
+            verified_artifacts: List of (step_name, artifact_key, path) tuples
+                for checkpoint artifacts that were verified to exist on disk.
+            missing_artifacts: List of (step_name, artifact_key, path) tuples
+                for checkpoint artifacts that were NOT found on disk.
         """
         now = _now_iso()
-        note_json = json.dumps({
+        note = {
             "event": "startup_sweep",
             "actor": "steward",
             "classification": kill_classification,
@@ -2080,7 +2095,18 @@ class Registry:
             "started_at": started_at,
             "age_seconds": age_seconds,
             "threshold_seconds": threshold_seconds,
-        })
+        }
+        if checkpoint_data is not None:
+            note["checkpoint_next_step_index"] = checkpoint_data.get("next_step_index")
+            note["checkpoint_next_step_name"] = checkpoint_data.get("next_step_name")
+            note["checkpoint_completion_fraction"] = checkpoint_data.get("completion_fraction")
+            note["checkpoint_notes"] = checkpoint_data.get("notes")
+            note["checkpoint_written_at"] = checkpoint_data.get("written_at")
+        if verified_artifacts is not None:
+            note["verified_artifacts"] = verified_artifacts
+        if missing_artifacts is not None:
+            note["missing_artifacts"] = missing_artifacts
+        note_json = json.dumps(note)
 
         conn = self._connect()
         try:

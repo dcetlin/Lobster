@@ -19,6 +19,7 @@ Phase 2 dependency: requires schema migration to have been applied:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -128,10 +129,29 @@ class StartupSweepResult:
 # Phase 1: Startup sweep — crash recovery (#307)
 # ---------------------------------------------------------------------------
 
+def _read_checkpoint(checkpoint_ref: str | None) -> dict | None:
+    """
+    Read and parse checkpoint.json at the given path.
+
+    Returns the parsed dict, or None if checkpoint_ref is None, the file does
+    not exist, or the file is not valid JSON. Pure function: no side effects.
+    """
+    if not checkpoint_ref:
+        return None
+    p = Path(checkpoint_ref)
+    try:
+        if not p.exists():
+            return None
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+
 def _classify_executing_orphan_kill_type(
     dispatch_ts: str | None,
     heartbeat_at: str | None,
-) -> str:
+    checkpoint_ref: str | None = None,
+) -> tuple[str, dict | None]:
     """
     Classify the kill type of an `executing` orphan UoW using the heartbeat signal.
 
@@ -143,8 +163,17 @@ def _classify_executing_orphan_kill_type(
             the inbox-dispatch path was added).
         heartbeat_at: ISO timestamp of the most recent heartbeat_at value on the
             UoW, or None if heartbeat_at was never written.
+        checkpoint_ref: Optional path to a checkpoint.json file written by the
+            agent during execution. When present and valid with next_step_index > 0,
+            the classification is upgraded to 'orphan_kill_during_execution_with_checkpoint'
+            and the checkpoint dict is returned as the second element.
+            Defensive: read via getattr since this field is inert until issue #1322
+            merges the DB schema migration.
 
     Returns:
+        A tuple (classification, checkpoint_data) where:
+
+        classification is one of:
         'orphan_kill_before_start': No evidence of agent working after dispatch.
             Either heartbeat_at is None, or it does not exceed
             dispatch_ts + DISPATCH_WINDOW_SECONDS.
@@ -152,22 +181,31 @@ def _classify_executing_orphan_kill_type(
 
         'orphan_kill_during_execution': Agent wrote a heartbeat after the
             dispatch window, confirming it had started processing before being
-            killed.
+            killed, but no valid checkpoint exists with progress.
             Re-entry strategy: note partial execution evidence for diagnosis.
 
-    Safe default: returns 'orphan_kill_before_start' whenever the classification
-    cannot be determined (None inputs, unparseable timestamps, missing dispatch
-    audit). This is conservative — treating an ambiguous kill as kill-before-start
-    avoids over-claiming partial execution evidence that may not exist.
+        'orphan_kill_during_execution_with_checkpoint': Agent wrote a heartbeat
+            after the dispatch window AND a valid checkpoint file exists with
+            next_step_index > 0, providing resume context.
+            Re-entry strategy: use checkpoint_data to resume from last known step.
+
+        checkpoint_data is the parsed checkpoint dict when classification is
+        'orphan_kill_during_execution_with_checkpoint', None otherwise.
+
+    Safe default: returns ('orphan_kill_before_start', None) whenever the
+    classification cannot be determined (None inputs, unparseable timestamps,
+    missing dispatch audit). This is conservative — treating an ambiguous kill
+    as kill-before-start avoids over-claiming partial execution evidence that
+    may not exist.
     """
     # No dispatch timestamp → cannot determine if heartbeat was post-dispatch.
     # Safe default: kill_before_start.
     if dispatch_ts is None:
-        return "orphan_kill_before_start"
+        return "orphan_kill_before_start", None
 
     # No heartbeat → agent never wrote one → kill-before-start.
     if heartbeat_at is None:
-        return "orphan_kill_before_start"
+        return "orphan_kill_before_start", None
 
     # Parse both timestamps for comparison.
     try:
@@ -175,14 +213,14 @@ def _classify_executing_orphan_kill_type(
         if dispatch_dt.tzinfo is None:
             dispatch_dt = dispatch_dt.replace(tzinfo=timezone.utc)
     except (ValueError, TypeError, AttributeError):
-        return "orphan_kill_before_start"
+        return "orphan_kill_before_start", None
 
     try:
         heartbeat_dt = datetime.fromisoformat(heartbeat_at.replace("Z", "+00:00"))
         if heartbeat_dt.tzinfo is None:
             heartbeat_dt = heartbeat_dt.replace(tzinfo=timezone.utc)
     except (ValueError, TypeError, AttributeError):
-        return "orphan_kill_before_start"
+        return "orphan_kill_before_start", None
 
     # heartbeat_at must be strictly after dispatch_ts + DISPATCH_WINDOW_SECONDS.
     # This absorbs startup jitter: even if the agent wrote a heartbeat quickly,
@@ -190,9 +228,15 @@ def _classify_executing_orphan_kill_type(
     from datetime import timedelta
     threshold_dt = dispatch_dt + timedelta(seconds=DISPATCH_WINDOW_SECONDS)
     if heartbeat_dt > threshold_dt:
-        return "orphan_kill_during_execution"
+        # Checkpoint detection (issue #1324): if a valid checkpoint exists with
+        # progress past step 0, surface richer classification so the Steward can
+        # use resume context.
+        checkpoint = _read_checkpoint(checkpoint_ref)
+        if checkpoint and checkpoint.get("next_step_index", 0) > 0:
+            return "orphan_kill_during_execution_with_checkpoint", checkpoint
+        return "orphan_kill_during_execution", None
 
-    return "orphan_kill_before_start"
+    return "orphan_kill_before_start", None
 
 
 def _is_heartbeat_recent(
@@ -714,10 +758,46 @@ def run_startup_sweep(
                 "(defaulting to orphan_kill_before_start)",
                 uow_id, _exc,
             )
-        kill_classification = _classify_executing_orphan_kill_type(
+        checkpoint_ref: str | None = getattr(uow, "checkpoint_ref", None)
+        kill_classification, checkpoint_data = _classify_executing_orphan_kill_type(
             dispatch_ts=dispatch_ts,
             heartbeat_at=heartbeat_at,
+            checkpoint_ref=checkpoint_ref,
         )
+
+        # Shallow artifact verification: check that artifacts mentioned in the
+        # checkpoint actually exist on disk.
+        verified_artifacts: list = []
+        missing_artifacts: list = []
+        if checkpoint_data:
+            from pathlib import Path as _Path
+            for step in checkpoint_data.get("steps", []):
+                if step.get("status") != "complete":
+                    continue
+                for key, val in step.get("artifacts", {}).items():
+                    if key == "worktree_path":
+                        exists = _Path(val).exists()
+                        (verified_artifacts if exists else missing_artifacts).append(
+                            (step["name"], key, val)
+                        )
+                    elif key == "files_modified":
+                        targets = [val] if isinstance(val, str) else val
+                        for f in targets:
+                            exists = _Path(f).exists()
+                            (verified_artifacts if exists else missing_artifacts).append(
+                                (step["name"], key, f)
+                            )
+                    elif key == "branch":
+                        import subprocess
+                        result = subprocess.run(
+                            ["git", "-C", str(_Path.home() / "lobster-workspace/projects"),
+                             "branch", "--list", val],
+                            capture_output=True, text=True,
+                        )
+                        exists = bool(result.stdout.strip())
+                        (verified_artifacts if exists else missing_artifacts).append(
+                            (step["name"], key, val)
+                        )
 
         if dry_run:
             log.info(
@@ -734,6 +814,9 @@ def run_startup_sweep(
             age_seconds=age_seconds,
             threshold_seconds=executing_orphan_threshold_seconds,
             kill_classification=kill_classification,
+            checkpoint_data=checkpoint_data,
+            verified_artifacts=verified_artifacts,
+            missing_artifacts=missing_artifacts,
         )
 
         if rows == 1:
