@@ -337,6 +337,7 @@ def _write_chain_columns(
     uow_id: str,
     chain_type: str,
     artifact: WorkflowArtifact,
+    chain_result: "ChainResult",
 ) -> None:
     """
     Write chain-queryability columns to uow_registry after chain dispatch.
@@ -353,6 +354,15 @@ def _write_chain_columns(
         perspectives = artifact.get("perspectives") if chain_type == CHAIN_FAN_OUT else None
         approaches = artifact.get("approaches") if chain_type == CHAIN_DIVERGE_CONVERGE else None
 
+        # Extract perspectives_outputs (per-perspective executor IDs) from output_text JSON.
+        perspectives_outputs: dict | None = None
+        if chain_type == CHAIN_FAN_OUT and chain_result.output_text:
+            try:
+                parsed = json.loads(chain_result.output_text)
+                perspectives_outputs = parsed.get("outputs")
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
         conn = sqlite3.connect(str(db_path), timeout=5.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
@@ -361,12 +371,14 @@ def _write_chain_columns(
                 """
                 UPDATE uow_registry
                 SET chain_perspectives = ?,
-                    chain_approaches = ?
+                    chain_approaches = ?,
+                    perspectives_outputs = ?
                 WHERE id = ?
                 """,
                 (
                     json.dumps(perspectives) if perspectives is not None else None,
                     json.dumps(approaches) if approaches is not None else None,
+                    json.dumps(perspectives_outputs) if perspectives_outputs is not None else None,
                     uow_id,
                 ),
             )
@@ -923,7 +935,7 @@ class Executor:
             return self._run_execution(uow_id, output_ref, fallback_artifact, register)  # type: ignore[arg-type]
 
         # Write chain-queryability columns to DB for Steward inspection.
-        _write_chain_columns(self.registry.db_path, uow_id, chain_type, artifact)
+        _write_chain_columns(self.registry.db_path, uow_id, chain_type, artifact, chain_result)
 
         outcome = ExecutorOutcome(chain_result.outcome)
         _write_output_ref_content(output_ref, chain_result.output_text)
