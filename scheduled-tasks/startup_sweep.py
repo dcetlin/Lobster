@@ -875,7 +875,6 @@ def run_startup_sweep(
             continue
 
         try:
-            from datetime import datetime, timezone as _tz
             updated_at = datetime.fromisoformat(updated_at_str.replace("Z", "+00:00"))
             age_seconds = (now - updated_at).total_seconds()
         except (ValueError, TypeError):
