@@ -15,10 +15,10 @@ Design principles:
   (modulo network I/O) — it does not write to any DB.
 - Idempotency: verdict_accumulator upsert uses INSERT OR REPLACE with
   n_successes/n_failures/n_partial increments so duplicate calls are safe.
-- Prompt caching: the system prompt is marked with cache_control so repeated
-  calls on the same model session benefit from cache hits.
+- LLM dispatch: uses `claude -p` subprocess via _build_claude_env() from steward,
+  matching the WOS codebase standard (CLAUDE_CODE_OAUTH_TOKEN, no ANTHROPIC_API_KEY).
 
-Model: claude-haiku-4-5-20251001 (HAIKU_MODEL constant).
+Model: claude-haiku-4-5 (overridable via LOBSTER_HAIKU_MODEL env var).
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -37,14 +38,21 @@ log = logging.getLogger("verdict_normalization")
 # ---------------------------------------------------------------------------
 
 #: Haiku model ID for normalization calls (spec §3-I, Fork 1 Option C).
-HAIKU_MODEL: str = "claude-haiku-4-5-20251001"
+#: Overridable via LOBSTER_HAIKU_MODEL env var.
+HAIKU_MODEL: str = os.environ.get("LOBSTER_HAIKU_MODEL", "claude-haiku-4-5")
+
+#: claude binary name — must be on PATH (ensured by _build_claude_env).
+_CLAUDE_BIN: str = "claude"
+
+#: Timeout for the claude -p normalization subprocess in seconds.
+_NORMALIZATION_TIMEOUT_SECS: int = 30
 
 #: Outcome labels accepted by the accumulator upsert.
 VerdictOutcome = Literal["pass", "fail", "partial"]
 
-#: Normalization system prompt — static text eligible for prompt caching.
+#: Normalization system prompt sent to claude -p.
 _NORMALIZATION_SYSTEM_PROMPT: str = (
-    "You are a hypothesis normalization assistant for a software engineering workflow system.\n"
+    "You are a hypothesis normalization assistant for a software engineering workflow system. "
     "Given a raw hypothesis string describing what a system believes is the root cause of a problem "
     "and how it plans to fix it, produce a canonical normalized form that:\n"
     "1. Removes implementation-specific details that would prevent matching across similar hypotheses.\n"
@@ -130,69 +138,103 @@ def normalize_hypothesis_text(
     raw: str,
     *,
     model: str = HAIKU_MODEL,
-    anthropic_client=None,  # type: ignore[assignment]
+    anthropic_client=None,  # kept for test injection; preferred path is claude -p subprocess
 ) -> str:
     """
-    Normalize *raw* hypothesis string via a Haiku call.
+    Normalize *raw* hypothesis string via a claude -p subprocess call.
 
-    The normalization prompt is sent with cache_control on the system prompt
-    so repeated calls on the same session benefit from cache hits.
+    Uses _build_claude_env() from steward to ensure CLAUDE_CODE_OAUTH_TOKEN is
+    present, matching the standard WOS codebase auth pattern. No ANTHROPIC_API_KEY
+    is required.
 
     Args:
         raw: The raw hypothesis string (will be truncated to 140 chars if the
              model returns something longer).
-        model: The model ID to use. Defaults to HAIKU_MODEL.
-        anthropic_client: An already-constructed `anthropic.Anthropic` instance.
-            When None, a new client is created using the ANTHROPIC_API_KEY env var.
-            Inject a mock in tests.
+        model: The model ID to use. Defaults to HAIKU_MODEL (overridable via
+               LOBSTER_HAIKU_MODEL env var).
+        anthropic_client: Deprecated. When provided, falls back to the legacy
+            Anthropic SDK path for test injection. In production this should be
+            None (uses claude -p subprocess).
 
     Returns:
         Normalized hypothesis string (≤140 chars).
 
     Raises:
-        RuntimeError: If the Anthropic API call fails or returns an empty response.
+        RuntimeError: If the claude -p call fails or returns an empty response.
     """
-    if anthropic_client is None:
-        import anthropic
-        anthropic_client = anthropic.Anthropic()
+    # Legacy test-injection path: if an anthropic_client mock is explicitly
+    # provided (e.g. in unit tests), use the SDK call directly.
+    if anthropic_client is not None:
+        response = anthropic_client.messages.create(
+            model=model,
+            max_tokens=200,
+            system=[
+                {
+                    "type": "text",
+                    "text": _NORMALIZATION_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Normalize this hypothesis:\n\n{raw}",
+                }
+            ],
+        )
+        if not response.content:
+            raise RuntimeError(
+                f"Haiku normalization returned empty content for hypothesis: {raw!r}"
+            )
+        text_blocks = [
+            block.text for block in response.content
+            if hasattr(block, "text")
+        ]
+        if not text_blocks:
+            raise RuntimeError(
+                f"Haiku normalization returned no text content for hypothesis: {raw!r}"
+            )
+        normalized = text_blocks[0].strip()[:_HYPOTHESIS_MAX_CHARS]
+        if not normalized:
+            raise RuntimeError(
+                f"Haiku normalization returned empty string for hypothesis: {raw!r}"
+            )
+        return normalized
 
-    response = anthropic_client.messages.create(
-        model=model,
-        max_tokens=200,
-        system=[
-            {
-                "type": "text",
-                "text": _NORMALIZATION_SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[
-            {
-                "role": "user",
-                "content": f"Normalize this hypothesis:\n\n{raw}",
-            }
-        ],
-    )
+    # Production path: claude -p subprocess using CLAUDE_CODE_OAUTH_TOKEN.
+    # Importing here to avoid a circular import (steward imports nothing from
+    # verdict_normalization, but verdict_normalization only needs _build_claude_env).
+    from orchestration.steward import _build_claude_env
 
-    # Extract text from the first content block
-    if not response.content:
+    prompt = f"{_NORMALIZATION_SYSTEM_PROMPT}\n\nNormalize this hypothesis:\n\n{raw}"
+    command = [_CLAUDE_BIN, "-p", prompt, "--output-format", "text", "--model", model]
+    claude_env = _build_claude_env()
+
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=_NORMALIZATION_TIMEOUT_SECS,
+            check=False,
+            env=claude_env,
+        )
+    except subprocess.TimeoutExpired:
         raise RuntimeError(
-            f"Haiku normalization returned empty content for hypothesis: {raw!r}"
+            f"claude -p normalization timed out after {_NORMALIZATION_TIMEOUT_SECS}s "
+            f"for hypothesis: {raw!r}"
         )
 
-    text_blocks = [
-        block.text for block in response.content
-        if hasattr(block, "text")
-    ]
-    if not text_blocks:
+    if proc.returncode != 0:
         raise RuntimeError(
-            f"Haiku normalization returned no text content for hypothesis: {raw!r}"
+            f"claude -p normalization exited {proc.returncode} for hypothesis: {raw!r} "
+            f"— stderr: {proc.stderr.strip()[:200]!r}"
         )
 
-    normalized = text_blocks[0].strip()[:_HYPOTHESIS_MAX_CHARS]
+    normalized = (proc.stdout or "").strip()[:_HYPOTHESIS_MAX_CHARS]
     if not normalized:
         raise RuntimeError(
-            f"Haiku normalization returned empty string for hypothesis: {raw!r}"
+            f"claude -p normalization returned empty output for hypothesis: {raw!r}"
         )
 
     return normalized
@@ -303,18 +345,18 @@ def score_and_normalize_verdict(
     outcome: VerdictOutcome,
     *,
     model: str = HAIKU_MODEL,
-    anthropic_client=None,  # type: ignore[assignment]
+    anthropic_client=None,  # kept for test injection only; production uses claude -p subprocess
     db_path: Path | None = None,
 ) -> None:
     """
-    Normalize *hypothesis_raw* via Haiku and upsert the scored verdict.
+    Normalize *hypothesis_raw* via claude -p subprocess and upsert the scored verdict.
 
     Called at UoW closure by `maybe_complete_wos_uow` and the failure path.
     Non-fatal: all exceptions are caught and logged at WARNING level so that
     UoW closure is never blocked.
 
     Steps:
-    1. Normalize the raw hypothesis via `normalize_hypothesis_text` (Haiku call).
+    1. Normalize the raw hypothesis via `normalize_hypothesis_text` (claude -p subprocess).
     2. Write one row to `normalization_log` (raw + normalized + model + ts).
     3. Upsert into `verdict_accumulator` (increment appropriate counter).
     4. Mark the `prescription_hypothesis_log` row as scored (idempotent).
