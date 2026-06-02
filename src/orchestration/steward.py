@@ -489,7 +489,26 @@ class WaitForTrace:
     uow_id: str
 
 
-StewardOutcome = Prescribed | Done | Surfaced | RaceSkipped | WaitForTrace
+@dataclass(frozen=True)
+class PrescribingQueued:
+    """
+    Returned when the steward has written a ``wos_prescribe`` inbox message and
+    transitioned the UoW to ``prescribing``.
+
+    The blocking LLM call that previously happened inside the heartbeat has been
+    offloaded to a dispatcher-routed prescription subagent.  The heartbeat returns
+    immediately; the subagent writes the WorkflowArtifact and transitions the UoW
+    to ``ready-for-executor`` when done.
+
+    TTL recovery: if the UoW remains in ``prescribing`` beyond
+    LOBSTER_LLM_PRESCRIPTION_TIMEOUT_SECS + 60 s, startup_sweep resets it to
+    ``ready-for-steward`` (Population 5 in startup_sweep.py).
+    """
+    uow_id: str
+    cycles: int
+
+
+StewardOutcome = Prescribed | Done | Surfaced | RaceSkipped | WaitForTrace | PrescribingQueued
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +647,10 @@ class CycleResult:
     # dispatch gate blocked them (file_scope conflict, shard serialization, or
     # max_parallel cap). They will be retried on the next heartbeat.
     shard_blocked: int = 0
+    # prescribing_queued: UoWs for which an async wos_prescribe inbox message was
+    # written this cycle. The UoW is now in 'prescribing' state; the prescription
+    # subagent will complete the WorkflowArtifact and transition to ready-for-executor.
+    prescribing_queued: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         """Convert to dict for backward compatibility with callers expecting dict."""
@@ -640,6 +663,7 @@ class CycleResult:
             "race_skipped": self.race_skipped,
             "wait_for_trace": self.wait_for_trace,
             "shard_blocked": self.shard_blocked,
+            "prescribing_queued": self.prescribing_queued,
             "considered_ids": list(self.considered_ids),
         }
 
@@ -673,6 +697,7 @@ BOOTUP_CANDIDATE_GATE: bool = is_bootup_candidate_gate_active()
 _STATUS_READY_FOR_STEWARD = UoWStatus.READY_FOR_STEWARD
 _STATUS_DIAGNOSING = UoWStatus.DIAGNOSING
 _STATUS_READY_FOR_EXECUTOR = UoWStatus.READY_FOR_EXECUTOR
+_STATUS_PRESCRIBING = UoWStatus.PRESCRIBING
 _STATUS_DONE = UoWStatus.DONE
 _STATUS_BLOCKED = UoWStatus.BLOCKED
 _STATUS_NEEDS_HUMAN_REVIEW = UoWStatus.NEEDS_HUMAN_REVIEW
@@ -3398,6 +3423,96 @@ def _build_prescription_instructions(
 
 
 # ---------------------------------------------------------------------------
+# Async prescription request — write wos_prescribe inbox message
+# ---------------------------------------------------------------------------
+
+def _write_prescription_request(
+    uow: "UoW",
+    reentry_posture: str,
+    completion_gap: str,
+    issue_body: str,
+    cycles: int,
+    new_cycles: int,
+    selected_executor_type: str,
+    prescribed_skills: list[str],
+    diagnosis_section: dict,
+    vision_orientation: str,
+    dan_register: str,
+    now_iso: str,
+) -> str:
+    """
+    Write a ``wos_prescribe`` inbox message and return the generated message ID.
+
+    This replaces the synchronous LLM call path in the heartbeat.  Instead of
+    blocking the cron process for up to 600 s while waiting for claude -p, the
+    steward writes an inbox message with all the prescription inputs and returns
+    immediately.  The dispatcher routes the message to a prescription subagent
+    that runs the claude -p call asynchronously.
+
+    The UoW must already be in ``diagnosing`` state when this is called.
+    The caller is responsible for transitioning the UoW to ``prescribing``
+    after this write succeeds.
+
+    Args:
+        uow: The Unit of Work being prescribed.
+        reentry_posture: Categorized executor state from diagnosis.
+        completion_gap: Human-readable rationale for why work is incomplete.
+        issue_body: Raw GitHub issue body text.
+        cycles: Current steward_cycles value (pre-increment).
+        new_cycles: Post-increment steward_cycles value.
+        selected_executor_type: Executor type string (e.g. "functional-engineer").
+        prescribed_skills: List of skill names selected for this prescription.
+        diagnosis_section: Dict from _build_diagnosis_section (for v2 path).
+        vision_orientation: Vision context string for the prescription agent.
+        dan_register: Dan's developmental register excerpt.
+        now_iso: Current UTC timestamp in ISO 8601 format.
+
+    Returns:
+        The message ID (str) written to the inbox.
+
+    Raises:
+        OSError: If the inbox write fails.
+    """
+    msg_id = str(uuid.uuid4())
+
+    msg: dict[str, Any] = {
+        "id": msg_id,
+        "type": "wos_prescribe",
+        "source": "system",
+        "chat_id": 0,
+        "timestamp": time.time(),
+        "uow_id": uow.id,
+        "uow_summary": uow.summary or "",
+        "uow_type": str(uow.type) if uow.type else "",
+        "uow_source": uow.source or "telegram",
+        "success_criteria": uow.success_criteria or "",
+        "reentry_posture": reentry_posture,
+        "completion_gap": completion_gap,
+        "issue_body": issue_body,
+        "cycles": cycles,
+        "new_cycles": new_cycles,
+        "selected_executor_type": selected_executor_type,
+        "prescribed_skills": prescribed_skills,
+        "diagnosis_section": diagnosis_section,
+        "vision_orientation": vision_orientation,
+        "dan_register": dan_register,
+        "steward_log": uow.steward_log or "",
+        "now_iso": now_iso,
+    }
+
+    _INBOX_DIR_PATH.mkdir(parents=True, exist_ok=True)
+    (_INBOX_DIR_PATH / f"{msg_id}.json").write_text(
+        json.dumps(msg, indent=2), encoding="utf-8"
+    )
+    log.info(
+        "_write_prescription_request: wos_prescribe message written to inbox "
+        "(uow_id=%s, msg_id=%s, cycles=%d)",
+        uow.id, msg_id, cycles,
+    )
+    return msg_id
+
+
+# ---------------------------------------------------------------------------
 # Registry write helpers (steward-private field updates)
 # ---------------------------------------------------------------------------
 
@@ -5546,6 +5661,160 @@ def _process_uow(
         else []
     )
 
+    # ---------------------------------------------------------------------------
+    # Async prescription path (production): write wos_prescribe inbox message
+    # and return PrescribingQueued immediately.
+    #
+    # When llm_prescriber is not None (production default), we offload the
+    # blocking claude -p call to a dispatcher-routed prescription subagent.
+    # The heartbeat returns immediately; the subagent writes the WorkflowArtifact
+    # and transitions the UoW to ready-for-executor when done.
+    #
+    # When llm_prescriber is None (test path), fall through to the synchronous
+    # deterministic prescription path below (backward compat for tests).
+    # ---------------------------------------------------------------------------
+    if llm_prescriber is _llm_prescribe and not dry_run:
+        # Build diagnosis_section for the prescription subagent (mirrors generate_v2_prescription).
+        _executor_outcome_value = diagnosis.executor_outcome
+        _async_diagnosis_section: dict[str, Any] = {
+            "signal": (
+                f"UoW {uow_id} entered ready-for-steward"
+                + (" on first execution" if cycles == 0 else f" on cycle {cycles}")
+                + (f"; source is {uow.source}" if uow.source else "")
+                + (f"; {uow.summary}" if uow.summary else "")
+                + "."
+            ),
+            "reentry_posture": reentry_posture,
+            "completion_gap": "" if reentry_posture == "first_execution" else completion_gap_for_prescription,
+            "executor_outcome": _executor_outcome_value,
+            "prior_cycle_count": cycles,
+        }
+        if reentry_posture == "execution_failed":
+            _async_diagnosis_section = dict(_async_diagnosis_section, corrective_intent=True)
+
+        # Load vision orientation and Dan's register for the subagent.
+        _async_vision_orientation = ""
+        if uow.vision_ref and isinstance(uow.vision_ref, dict):
+            try:
+                _vr = resolve_vision_route(uow, log_fallback=False)
+                _async_vision_orientation = _vr.route_reason if _vr.anchored else ""
+            except Exception:
+                _async_vision_orientation = ""
+
+        _async_dan_register = _load_dan_register_excerpt()
+        _async_now_iso = _now_iso()
+
+        # Write the prescription_queued log entry (mirrors prescription_log_entry below).
+        prescribing_log_entry = {
+            "event": "prescription_queued",
+            "uow_id": uow_id,
+            "steward_cycles": cycles,
+            "return_reason": return_reason,
+            "completion_assessment": completion_rationale,
+            "prescription_path": "async_inbox",
+            "next_posture_rationale": route_reason,
+        }
+        current_log_str = _append_steward_log_entry(
+            registry, uow_id, current_log_str, prescribing_log_entry
+        )
+
+        # Update agenda to reflect that prescription is queued.
+        updated_agenda_prescribing = _mark_current_agenda_node_prescribed(trace_agenda)
+        _write_steward_fields(
+            registry, uow_id,
+            steward_agenda=json.dumps(updated_agenda_prescribing),
+            steward_log=current_log_str,
+            prescribed_skills=json.dumps(prescribed_skills),
+            route_reason=route_reason,
+            steward_cycles=new_cycles,
+        )
+
+        # Write audit entry before state transition.
+        registry.append_audit_log(uow_id, {
+            "event": "prescription_queued",
+            "actor": _ACTOR_STEWARD,
+            "uow_id": uow_id,
+            "steward_cycles": new_cycles,
+            "workflow_primitive": selected_executor_type,
+            "prescribed_skills": prescribed_skills,
+            "prescription_path": "async_inbox",
+            "timestamp": _async_now_iso,
+        })
+
+        # Write the wos_prescribe inbox message (may raise OSError).
+        try:
+            _msg_id = _write_prescription_request(
+                uow=uow,
+                reentry_posture=reentry_posture,
+                completion_gap=completion_gap_for_prescription,
+                issue_body=issue_body,
+                cycles=cycles,
+                new_cycles=new_cycles,
+                selected_executor_type=selected_executor_type,
+                prescribed_skills=prescribed_skills,
+                diagnosis_section=_async_diagnosis_section,
+                vision_orientation=_async_vision_orientation,
+                dan_register=_async_dan_register,
+                now_iso=_async_now_iso,
+            )
+        except OSError as _inbox_err:
+            log.error(
+                "_process_uow: wos_prescribe inbox write failed for %s — %s: %s — "
+                "transitioning back to ready-for-steward",
+                uow_id, type(_inbox_err).__name__, _inbox_err,
+            )
+            registry.append_audit_log(uow_id, {
+                "event": "prescription_queue_failed",
+                "actor": _ACTOR_STEWARD,
+                "uow_id": uow_id,
+                "steward_cycles": cycles,
+                "error": str(_inbox_err),
+                "timestamp": _async_now_iso,
+            })
+            registry.transition(uow_id, _STATUS_READY_FOR_STEWARD, _STATUS_DIAGNOSING)
+            return Surfaced(uow_id=uow_id, condition="prescription_queue_failed")
+
+        # Transition: diagnosing → prescribing (optimistic lock).
+        rows = registry.transition(uow_id, _STATUS_PRESCRIBING, _STATUS_DIAGNOSING)
+        if rows == 0:
+            log.warning(
+                "_process_uow: prescribing transition race for %s — "
+                "another process already advanced this UoW",
+                uow_id,
+            )
+            return RaceSkipped(uow_id=uow_id)
+
+        log.info(
+            "_process_uow: prescription queued async for %s "
+            "(msg_id=%s, cycles=%d→%d, executor=%s)",
+            uow_id, _msg_id, cycles, new_cycles, selected_executor_type,
+        )
+
+        # Early warning: fire when cumulative cycles crosses _EARLY_WARNING_CYCLES.
+        # Mirrors the same check in the sync path so early warnings are not lost
+        # when the async path is active. Fires regardless of the UoW's final status.
+        _cumulative_current = uow.lifetime_cycles + new_cycles
+        _cumulative_previous = uow.lifetime_cycles + cycles  # cycles == new_cycles - 1
+        if _cumulative_current >= _EARLY_WARNING_CYCLES and _cumulative_previous < _EARLY_WARNING_CYCLES:
+            _notify_early = notify_dan_early_warning or _default_notify_dan_early_warning
+            _notify_early(uow, return_reason, new_cycles)
+
+        _append_cycle_trace(
+            uow_id=uow_id,
+            cycle_num=cycles,
+            subagent_excerpt=_read_output_ref(uow.output_ref),
+            return_reason=return_reason or "",
+            next_action="prescribing_queued",
+            artifact_dir=artifact_dir,
+        )
+        return PrescribingQueued(uow_id=uow_id, cycles=new_cycles)
+
+    # ---------------------------------------------------------------------------
+    # Synchronous prescription path (test/dry-run/stub path):
+    # Used when llm_prescriber is None (test injection of deterministic template)
+    # or dry_run=True.
+    # ---------------------------------------------------------------------------
+
     # Wrap llm_prescriber to capture which path was taken (llm vs fallback).
     # The sentinel records a non-None return, indicating the LLM path succeeded.
     _llm_path_taken: list[bool] = [False]
@@ -5896,6 +6165,7 @@ def run_steward_cycle(
     skipped = 0
     race_skipped = 0
     wait_for_trace = 0
+    prescribing_queued = 0
     throttle_count = 0
     shard_blocked = 0
     considered_ids = []
@@ -6226,6 +6496,11 @@ def run_steward_cycle(
                 # One-cycle temporal gate fired — UoW stays in diagnosing;
                 # startup_sweep resets it to ready-for-steward next heartbeat.
                 wait_for_trace += 1
+            case PrescribingQueued():
+                # Async prescription queued — UoW is now in 'prescribing' state.
+                # The prescription subagent will complete the WorkflowArtifact
+                # and transition to ready-for-executor.
+                prescribing_queued += 1
             case _:
                 skipped += 1
 
@@ -6265,6 +6540,7 @@ def run_steward_cycle(
         skipped=skipped,
         race_skipped=race_skipped,
         wait_for_trace=wait_for_trace,
+        prescribing_queued=prescribing_queued,
         shard_blocked=shard_blocked,
         considered_ids=tuple(considered_ids),
     )

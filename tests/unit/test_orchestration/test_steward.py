@@ -802,8 +802,9 @@ class TestCrashRecovery:
         )
 
         uow = _get_uow(db_path, uow_id)
-        assert uow["status"] == "ready-for-executor", (
-            "crashed_no_output with cycles < 2 should prescribe another pass"
+        assert uow["status"] in ("ready-for-executor", "prescribing"), (
+            "crashed_no_output with cycles < 2 should prescribe another pass "
+            f"(either sync ready-for-executor or async prescribing). Got: {uow['status']}"
         )
         assert uow["steward_cycles"] == 2, "steward_cycles must be incremented"
 
@@ -1476,8 +1477,9 @@ class TestExecutorOrphan:
             f"executor_orphan must not apply crash threshold. Notifications: {notifications}"
         )
         uow = _get_uow(db_path, uow_id)
-        assert uow["status"] == "ready-for-executor", (
-            "executor_orphan should result in a clean first-execution prescription"
+        assert uow["status"] in ("ready-for-executor", "prescribing"), (
+            "executor_orphan should result in a clean first-execution prescription "
+            f"(either sync ready-for-executor or async prescribing). Got: {uow['status']}"
         )
 
 
@@ -2036,9 +2038,10 @@ class TestEarlyWarningAt4:
         )
 
         uow = _get_uow(db_path, uow_id)
-        # Must have been prescribed (status ready-for-executor, cycles=4)
-        assert uow["status"] == "ready-for-executor", (
-            "UoW at cycle 3 with no output should be prescribed (status=ready-for-executor)"
+        # Must have been prescribed (status ready-for-executor or prescribing, cycles=4)
+        assert uow["status"] in ("ready-for-executor", "prescribing"), (
+            "UoW at cycle 3 with no output should be prescribed "
+            f"(ready-for-executor or async prescribing). Got: {uow['status']}"
         )
         assert uow["steward_cycles"] == 4, "steward_cycles must be 4 after prescription"
         assert len(early_warnings) == 1, (
@@ -2094,8 +2097,8 @@ class TestEarlyWarningAt4:
         )
 
         uow = _get_uow(db_path, uow_id)
-        assert uow["status"] == "ready-for-executor", (
-            "UoW should be prescribed (status=ready-for-executor)"
+        assert uow["status"] in ("ready-for-executor", "prescribing"), (
+            f"UoW should be prescribed (ready-for-executor or async prescribing). Got: {uow['status']}"
         )
         assert len(early_warnings) == 1, (
             f"Early warning must fire when lifetime_cycles(2) + new_cycles(2) == 4, got: {early_warnings}"
@@ -2636,6 +2639,7 @@ class TestBackpressureSkipsRePrescription:
             dry_run=False,
             github_client=_mock_github_client_open,
             artifact_dir=tmp_path / "artifacts",
+            llm_prescriber=None,  # force deterministic path so test doesn't trigger async prescription
         )
 
         # UoW must not be prescribed: status stays ready-for-steward
@@ -2721,6 +2725,7 @@ class TestBackpressureSkipsRePrescription:
             dry_run=False,
             github_client=_mock_github_client_open,
             artifact_dir=tmp_path / "artifacts",
+            llm_prescriber=None,  # force deterministic path for predictable test behavior
         )
 
         orphan_uow = _get_uow(db_path, orphan_id)
@@ -2730,7 +2735,8 @@ class TestBackpressureSkipsRePrescription:
             "executor_orphan UoW must stay ready-for-steward (backpressure skip)"
         )
         assert normal_uow["status"] == "ready-for-executor", (
-            f"Normal UoW must be prescribed (ready-for-executor). Got: {normal_uow['status']}"
+            f"Normal UoW must be prescribed (ready-for-executor with deterministic path). "
+            f"Got: {normal_uow['status']}"
         )
 
     def test_backpressure_event_written_to_audit_log(self, db_path, registry, tmp_path, monkeypatch):
@@ -2759,6 +2765,7 @@ class TestBackpressureSkipsRePrescription:
             dry_run=False,
             github_client=_mock_github_client_open,
             artifact_dir=tmp_path / "artifacts",
+            llm_prescriber=None,  # force deterministic path for predictable test behavior
         )
 
         entries = _audit_entries(db_path, uow_id)

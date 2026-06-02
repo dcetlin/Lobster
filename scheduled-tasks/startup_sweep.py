@@ -53,6 +53,7 @@ _STATUS_ACTIVE = "active"
 _STATUS_READY_FOR_EXECUTOR = "ready-for-executor"
 _STATUS_DIAGNOSING = "diagnosing"
 _STATUS_EXECUTING = "executing"
+_STATUS_PRESCRIBING = "prescribing"
 _STARTUP_SWEEP_ACTOR = "steward_startup"
 _EXECUTOR_ORPHAN_THRESHOLD_SECONDS = 3600  # 1 hour: ready-for-executor age threshold
 
@@ -109,6 +110,11 @@ _ACTIVE_SWEEP_THRESHOLD_SECONDS = 300
 # Issue #992: this closes the loop opened by PR #989 (write_wos_heartbeat).
 HEARTBEAT_SKIP_THRESHOLD_SECONDS: int = 120
 
+# TTL (seconds) after which a `prescribing` UoW is reset to `ready-for-steward`.
+# Set to LOBSTER_LLM_PRESCRIPTION_TIMEOUT_SECS default (600) + 60 s grace.
+# Can be overridden in tests.
+_PRESCRIBING_ORPHAN_THRESHOLD_SECONDS: int = 660
+
 
 # ---------------------------------------------------------------------------
 # Startup sweep result type
@@ -123,6 +129,9 @@ class StartupSweepResult:
     executing_swept: int
     skipped_dry_run: int
     skipped_heartbeat_alive: int = 0
+    # prescribing_swept: UoWs reset from 'prescribing' → 'ready-for-steward'
+    # because the prescription subagent timed out or died (Population 5).
+    prescribing_swept: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +354,7 @@ def run_startup_sweep(
     active_sweep_threshold_seconds: int = _ACTIVE_SWEEP_THRESHOLD_SECONDS,
     executing_orphan_threshold_seconds: int = _EXECUTING_ORPHAN_THRESHOLD_SECONDS,
     heartbeat_skip_threshold_seconds: int = HEARTBEAT_SKIP_THRESHOLD_SECONDS,
+    prescribing_orphan_threshold_seconds: int = _PRESCRIBING_ORPHAN_THRESHOLD_SECONDS,
     bootup_candidate_gate: bool | None = None,
     github_client: Callable[[int], dict[str, Any]] | None = None,
 ) -> StartupSweepResult:
@@ -352,7 +362,7 @@ def run_startup_sweep(
     Startup sweep — crash recovery for orphaned UoWs (#307, #858).
 
     Runs on every heartbeat invocation (step 1 of 3, before Observation Loop
-    and Steward main loop). Scans four populations:
+    and Steward main loop). Scans five populations:
 
     1. `active` UoWs: Executors that may have crashed mid-execution.
        Classified by output_ref state and surfaced to ready-for-steward.
@@ -385,13 +395,20 @@ def run_startup_sweep(
        the agent is alive — skip the kill and log. Only UoWs with a NULL or
        stale heartbeat are killed.
 
+    5. `prescribing` UoWs older than prescribing_orphan_threshold_seconds:
+       Prescription subagents that timed out or died without writing the
+       WorkflowArtifact. Reset to ready-for-steward so the steward can
+       re-queue a fresh prescription request.
+       TTL: prescribing_orphan_threshold_seconds (default: 660 s —
+       LOBSTER_LLM_PRESCRIPTION_TIMEOUT_SECS default of 600 + 60 s grace).
+
     Each transition uses the optimistic-lock + audit pattern (Principle 1):
     - Audit entry written in same transaction as status UPDATE.
     - If rows_affected == 0: another process won the race — skip silently.
     - In dry_run mode: classify but do not write or transition.
 
     BOOTUP_CANDIDATE_GATE (#342): when True, UoWs whose GitHub issue carries
-    the `bootup-candidate` label are skipped in all four populations,
+    the `bootup-candidate` label are skipped in all five populations,
     consistent with the gate applied in run_steward_cycle.
 
     active_sweep_threshold_seconds: fallback minimum age (seconds) when
@@ -406,6 +423,8 @@ def run_startup_sweep(
         before a heartbeat is considered stale. Default: 120 s. UoWs with a
         heartbeat younger than this are skipped (agent is alive). Pass 0 to
         disable the gate entirely (original behaviour before #992).
+    prescribing_orphan_threshold_seconds: minimum age before a `prescribing` UoW
+        is reset to ready-for-steward. Default: 660 s (600 + 60 grace).
     bootup_candidate_gate: override for BOOTUP_CANDIDATE_GATE module constant.
     github_client: callable(issue_number) → {labels, ...}. Defaults to the
         production gh CLI client from steward.py.
@@ -459,11 +478,18 @@ def run_startup_sweep(
         log.warning("Startup sweep: failed to query executing UoWs — %s", e)
         executing_uows = []
 
+    try:
+        prescribing_uows = registry.list(status=_STATUS_PRESCRIBING)
+    except Exception as e:
+        log.warning("Startup sweep: failed to query prescribing UoWs — %s", e)
+        prescribing_uows = []
+
     now = datetime.now(timezone.utc)
     active_swept = 0
     executor_orphans_swept = 0
     diagnosing_swept = 0
     executing_swept = 0
+    prescribing_swept = 0
     skipped_dry_run = 0
     skipped_heartbeat_alive = 0
 
@@ -833,17 +859,78 @@ def run_startup_sweep(
                 uow_id,
             )
 
+    # ---------------------------------------------------------------------------
+    # Population 5: `prescribing` UoWs — prescription subagent timed out or died.
+    # ---------------------------------------------------------------------------
+    for uow in prescribing_uows:
+        uow_id = uow.id
+
+        if _is_bootup_candidate_gated(uow):
+            log.debug("Startup sweep: skipping prescribing UoW %s — bootup-candidate gate", uow_id)
+            continue
+
+        updated_at_str = getattr(uow, "updated_at", None)
+        if not updated_at_str:
+            log.debug("Startup sweep: prescribing UoW %s has no updated_at — skipping", uow_id)
+            continue
+
+        try:
+            from datetime import datetime, timezone as _tz
+            updated_at = datetime.fromisoformat(updated_at_str.replace("Z", "+00:00"))
+            age_seconds = (now - updated_at).total_seconds()
+        except (ValueError, TypeError):
+            log.debug(
+                "Startup sweep: prescribing UoW %s has unparseable updated_at %r — skipping",
+                uow_id, updated_at_str,
+            )
+            continue
+
+        if age_seconds < prescribing_orphan_threshold_seconds:
+            log.debug(
+                "Startup sweep: prescribing UoW %s is %.0fs old — under threshold %ds, skipping",
+                uow_id, age_seconds, prescribing_orphan_threshold_seconds,
+            )
+            continue
+
+        log.info(
+            "Startup sweep: prescribing UoW %s is %.0fs old (threshold=%ds) — "
+            "prescription subagent timed out, resetting to ready-for-steward",
+            uow_id, age_seconds, prescribing_orphan_threshold_seconds,
+        )
+
+        if dry_run:
+            skipped_dry_run += 1
+            continue
+
+        rows = registry.record_startup_sweep_prescribing(
+            uow_id=uow_id,
+            timeout_secs=prescribing_orphan_threshold_seconds,
+        )
+        if rows == 1:
+            prescribing_swept += 1
+            log.info(
+                "Startup sweep: reset prescribing UoW %s → ready-for-steward "
+                "(age=%.0fs, threshold=%ds)",
+                uow_id, age_seconds, prescribing_orphan_threshold_seconds,
+            )
+        else:
+            log.debug(
+                "Startup sweep: race on prescribing UoW %s — another component "
+                "already advanced it (rows_affected=0)",
+                uow_id,
+            )
+
     total = (
         active_swept + executor_orphans_swept + diagnosing_swept
-        + executing_swept + skipped_dry_run + skipped_heartbeat_alive
+        + executing_swept + prescribing_swept + skipped_dry_run + skipped_heartbeat_alive
     )
     if total > 0:
         log.info(
             "Startup sweep complete: %d active swept, %d executor_orphans swept, "
-            "%d diagnosing swept, %d executing_orphans swept, "
+            "%d diagnosing swept, %d executing_orphans swept, %d prescribing_orphans swept, "
             "%d skipped (dry-run), %d skipped (heartbeat alive)",
             active_swept, executor_orphans_swept, diagnosing_swept, executing_swept,
-            skipped_dry_run, skipped_heartbeat_alive,
+            prescribing_swept, skipped_dry_run, skipped_heartbeat_alive,
         )
 
     return StartupSweepResult(
@@ -851,6 +938,7 @@ def run_startup_sweep(
         executor_orphans_swept=executor_orphans_swept,
         diagnosing_swept=diagnosing_swept,
         executing_swept=executing_swept,
+        prescribing_swept=prescribing_swept,
         skipped_dry_run=skipped_dry_run,
         skipped_heartbeat_alive=skipped_heartbeat_alive,
     )
