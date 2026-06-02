@@ -508,7 +508,22 @@ class PrescribingQueued:
     cycles: int
 
 
-StewardOutcome = Prescribed | Done | Surfaced | RaceSkipped | WaitForTrace | PrescribingQueued
+@dataclass
+class PrescriptionDeferred:
+    """
+    Returned when prescription is skipped because ``MAX_CONCURRENT_PRESCRIPTIONS``
+    is already reached.
+
+    The UoW is transitioned back to ``ready-for-steward`` so that the next
+    heartbeat cycle can attempt prescription once in-flight slots free up.
+    """
+    uow_id: str
+
+
+StewardOutcome = (
+    Prescribed | Done | Surfaced | RaceSkipped | WaitForTrace
+    | PrescribingQueued | PrescriptionDeferred
+)
 
 
 # ---------------------------------------------------------------------------
@@ -3068,6 +3083,20 @@ def _dynamic_burst_batch_size(queue_depth: int) -> int:
 # Source: oracle/patterns.md §burst — hard lower bound comment
 BURST_BASELINE_QUEUE_DEPTH: int = 6
 
+# Prescription concurrency cap: maximum number of UoWs that may be in the
+# ``prescribing`` state simultaneously (across all cycles, not just the current
+# one).  When the cap is reached, new prescription dispatches are deferred to
+# the next heartbeat cycle rather than flooding the API with concurrent
+# ``claude -p`` calls that will all hit the 600 s LLM timeout.
+#
+# Root cause context: ``_dynamic_burst_batch_size`` returns 15 when queue_depth
+# > 50.  With 60+ UoWs in ``ready-for-steward``, each heartbeat dispatches 15
+# wos_prescribe inbox messages → 15 concurrent claude -p calls.  All time out
+# at 600 s; startup_sweep resets them at 660 s; next heartbeat repeats.
+# A cap of 5 means at most 5 prescription subagents run concurrently, so
+# completions can keep up with the rate.
+MAX_CONCURRENT_PRESCRIPTIONS: int = 5
+
 
 def _count_oracle_passes(audit_entries: list[dict]) -> int:
     """Count oracle_approved events in the audit log for a UoW.
@@ -4823,11 +4852,13 @@ def _process_uow(
     llm_prescriber: Callable[..., LLMPrescription | None] | None = _llm_prescribe,
     inline_executor: Callable[[str], Any] | None = None,
     escalation_notifier: Callable[[UoW], None] | None = None,
+    prescription_slots_available: int = MAX_CONCURRENT_PRESCRIPTIONS,
 ) -> StewardOutcome:
     """
     Process a single UoW through the full diagnosis + prescribe/close/surface cycle.
 
-    Returns a StewardOutcome: Prescribed | Done | Surfaced | RaceSkipped | WaitForTrace.
+    Returns a StewardOutcome: Prescribed | Done | Surfaced | RaceSkipped | WaitForTrace
+    | PrescribingQueued | PrescriptionDeferred.
 
     Args:
         issue_info: Typed IssueInfo from GitHub API (or None if no issue).
@@ -4843,6 +4874,13 @@ def _process_uow(
             Defaults to _send_escalation_notification (immediate individual notification).
             run_steward_cycle injects a collector that accumulates escalations for
             end-of-cycle consolidation. Tests may inject a no-op or a recorder.
+        prescription_slots_available: Number of prescription dispatch slots remaining
+            this cycle (MAX_CONCURRENT_PRESCRIPTIONS - already_in_flight -
+            dispatched_this_cycle).  When 0, the async prescription path is skipped and
+            PrescriptionDeferred is returned; the UoW is transitioned back to
+            ready-for-steward for the next heartbeat.  Defaults to
+            MAX_CONCURRENT_PRESCRIPTIONS (uncapped — backward-compat for tests that
+            do not pass this argument).
     """
     uow_id = uow.id
     cycles = uow.steward_cycles
@@ -5674,6 +5712,22 @@ def _process_uow(
     # deterministic prescription path below (backward compat for tests).
     # ---------------------------------------------------------------------------
     if llm_prescriber is _llm_prescribe and not dry_run:
+        # Prescription concurrency gate: defer if no slots are available.
+        # prescription_slots_available is passed by run_steward_cycle and reflects
+        # MAX_CONCURRENT_PRESCRIPTIONS - already_in_flight - dispatched_this_cycle.
+        # When 0, we undo the diagnosing transition and return PrescriptionDeferred
+        # so the UoW is retried on the next heartbeat (once in-flight slots free up).
+        if prescription_slots_available <= 0:
+            log.info(
+                "_process_uow: prescription cap reached — deferring %s "
+                "(MAX_CONCURRENT_PRESCRIPTIONS=%d)",
+                uow_id, MAX_CONCURRENT_PRESCRIPTIONS,
+            )
+            if not dry_run:
+                # Transition back: diagnosing → ready-for-steward
+                registry.transition(uow_id, _STATUS_READY_FOR_STEWARD, _STATUS_DIAGNOSING)
+            return PrescriptionDeferred(uow_id=uow_id)
+
         # Build diagnosis_section for the prescription subagent (mirrors generate_v2_prescription).
         _executor_outcome_value = diagnosis.executor_outcome
         _async_diagnosis_section: dict[str, Any] = {
@@ -6055,6 +6109,30 @@ def _process_uow(
 
 
 # ---------------------------------------------------------------------------
+# Prescription in-flight count
+# ---------------------------------------------------------------------------
+
+def _count_prescribing_in_flight(registry) -> int:
+    """Return the number of UoWs currently in ``prescribing`` state.
+
+    Pure read — no side effects.  Used by ``run_steward_cycle`` to enforce
+    ``MAX_CONCURRENT_PRESCRIPTIONS`` before dispatching new wos_prescribe
+    inbox messages.
+
+    ``prescribing`` UoWs represent active (or recently timed-out) prescription
+    subagent invocations.  Counting them before each new dispatch prevents
+    flooding the API with more concurrent ``claude -p`` calls than can complete
+    within the 600 s LLM timeout.
+    """
+    try:
+        in_flight = registry.list(status=str(_STATUS_PRESCRIBING))
+        return len(in_flight)
+    except Exception:
+        # If the query fails, return 0 — better to allow dispatch than deadlock.
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # Main steward cycle (entry point for tests and heartbeat script)
 # ---------------------------------------------------------------------------
 
@@ -6157,6 +6235,20 @@ def run_steward_cycle(
             "Steward cycle: dynamic burst batch size=%d (queue_depth=%d, default=%d)",
             _effective_burst_batch_size, _queue_depth, BURST_BATCH_SIZE,
         )
+
+    # Prescription concurrency gate: count UoWs already in 'prescribing' state.
+    # This snapshot is taken once before the loop.  The per-UoW prescription
+    # path increments _prescribing_dispatched_this_cycle for every new
+    # wos_prescribe message written this cycle so that later UoWs in the same
+    # cycle see the updated count.  Together they enforce MAX_CONCURRENT_PRESCRIPTIONS.
+    _prescribing_in_flight = _count_prescribing_in_flight(registry)
+    if _prescribing_in_flight > 0:
+        log.info(
+            "Steward cycle: prescription gate: %d UoWs already in prescribing state "
+            "(cap=%d)",
+            _prescribing_in_flight, MAX_CONCURRENT_PRESCRIPTIONS,
+        )
+    _prescribing_dispatched_this_cycle = 0
 
     evaluated = 0
     prescribed = 0
@@ -6457,6 +6549,10 @@ def run_steward_cycle(
             )
 
         evaluated += 1
+        _prescription_slots = max(
+            0,
+            MAX_CONCURRENT_PRESCRIPTIONS - _prescribing_in_flight - _prescribing_dispatched_this_cycle,
+        )
         try:
             result = _process_uow(
                 uow=uow,
@@ -6470,6 +6566,7 @@ def run_steward_cycle(
                 llm_prescriber=llm_prescriber,
                 inline_executor=inline_executor,
                 escalation_notifier=None if dry_run else _collect_escalation,
+                prescription_slots_available=_prescription_slots,
             )
         except Exception:
             log.exception("Steward: unhandled error processing UoW %s — skipping", uow_id)
@@ -6501,6 +6598,14 @@ def run_steward_cycle(
                 # The prescription subagent will complete the WorkflowArtifact
                 # and transition to ready-for-executor.
                 prescribing_queued += 1
+                # Increment cycle-local counter so subsequent UoWs see the
+                # updated in-flight total when their prescription_slots_available
+                # is computed.
+                _prescribing_dispatched_this_cycle += 1
+            case PrescriptionDeferred():
+                # Prescription cap hit — UoW transitioned back to ready-for-steward.
+                # Will be retried on the next heartbeat cycle.
+                skipped += 1
             case _:
                 skipped += 1
 
