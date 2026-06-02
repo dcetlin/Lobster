@@ -4977,6 +4977,13 @@ main() {
     update_systemd_services   # 8. Systemd updates
     restart_services          # 7. Service restarts
     run_migrations            # 9. Migrations
+
+    # Instance-specific migrations (user-update.sh, if present)
+    USER_UPDATE="$LOBSTER_DIR/scripts/user-update.sh"
+    if [ -f "$USER_UPDATE" ]; then
+        source "$USER_UPDATE"
+    fi
+
     health_check              # 10. Health check
 
     local elapsed=$(( $(date +%s) - start_time ))
