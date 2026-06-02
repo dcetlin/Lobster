@@ -300,3 +300,4 @@
 | 2026-06-01 | PR #1375 | Round 2 | APPROVED |
 | [2026-06-01] | PR #1377 | Round 1 | NEEDS_CHANGES |
 | [2026-06-01] | PR #1377 | Round 2 | APPROVED |
+| [2026-06-02] | PR #1380 | Round 1 | NEEDS_CHANGES |
