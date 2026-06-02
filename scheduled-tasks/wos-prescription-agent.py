@@ -146,7 +146,6 @@ def main() -> int:
             _write_steward_fields,
             LLMPrescriptionError,
         )
-        from orchestration.paths import ORCHESTRATION_ARTIFACTS_DIR
     except ImportError as exc:
         log.error(
             "prescription-agent: failed to import steward modules — %s: %s",
