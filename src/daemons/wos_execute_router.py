@@ -16,7 +16,8 @@ The daemon is a persistent systemd service.  On each poll cycle it:
    b. Calls ``route_wos_message()`` — a pure function that returns a routing
       decision dict without spawning anything.
    c. If the decision is ``action == "spawn_subagent"``, dispatches via
-      ``_dispatch_via_claude_p()`` from ``executor.py``.
+      ``_dispatch_via_inbox()`` from ``executor.py`` (the canonical inbox
+      dispatch path).
    d. Moves the message from processing/ to processed/ (mark_processed).
    e. On hard error: writes a system alert to inbox/ via inbox_write.py and
       moves the message to failed/.
@@ -34,7 +35,7 @@ Awareness path
 --------------
 The daemon does NOT send a notification for every individual ``wos_execute``
 processed.  It writes a ``subagent_result`` inbox message only for:
-- Exception alerts (routing failure, claim failure, subprocess failure).
+- Exception alerts (routing failure, claim failure, dispatch failure).
 - ``send_reply`` actions returned by the spawn-gate circuit-breaker in
   ``route_wos_message``.
 
@@ -52,10 +53,8 @@ import logging
 import os
 import shutil
 import signal
-import subprocess
 import sys
 import time
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -76,6 +75,7 @@ for _p in [str(_REPO_ROOT), str(_SRC_ROOT)]:
 # ---------------------------------------------------------------------------
 
 from orchestration.dispatcher_handlers import route_wos_message, read_wos_config  # noqa: E402
+from orchestration.executor import _dispatch_via_inbox  # noqa: E402
 from agents.session_store import get_active_sessions  # noqa: E402
 from utils.inbox_write import write_inbox_message  # noqa: E402
 
@@ -317,121 +317,48 @@ def _write_send_reply_alert(text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Non-blocking subprocess dispatch
+# Dispatch
 # ---------------------------------------------------------------------------
 
-#: claude binary — resolved from PATH at call time.
-_CLAUDE_BIN: str = "claude"
+# _dispatch_via_inbox is imported from orchestration.executor at the top of
+# this module.  It writes a wos_execute message to ~/messages/inbox/ and
+# returns immediately (fire-and-forget).  The Lobster dispatcher picks it up
+# on its next cycle and spawns a background subagent via the Task tool.
+#
+# agent_type is extracted from the routing decision returned by
+# route_wos_message and forwarded so the dispatcher can spawn the correct
+# subagent type.  Defaults to "functional-engineer" when absent.
 
-#: Maximum turns for a dispatched claude -p agent.
-_MAX_TURNS: int = 40
-
-#: Directory for per-execution subprocess log files (stdout + stderr combined).
-#: Created on first use.  Each file is named ``<run_id>.log``.
-_SUBPROCESS_LOG_DIR: Path = (
-    Path.home() / "lobster-workspace" / "orchestration" / "logs"
-)
-
-
-def _dispatch_via_popen(
+def _dispatch(
     instructions: str,
     uow_id: str,
-    registry: object = None,
+    agent_type: str = "functional-engineer",
 ) -> str:
     """
-    Dispatch a functional-engineer subagent via ``claude -p`` without blocking.
+    Dispatch a subagent via the canonical inbox path.
 
-    Uses ``subprocess.Popen`` with ``start_new_session=True`` so the child
-    process runs in its own process group and is NOT killed when systemd sends
-    SIGTERM to this daemon.
+    Delegates to ``_dispatch_via_inbox`` from ``orchestration.executor``,
+    which writes a ``wos_execute`` JSON message to ``~/messages/inbox/``
+    and returns a message_id for audit correlation.  The Lobster dispatcher
+    (main Claude loop) picks up the message and spawns the subagent via the
+    Task tool — no subprocess is spawned here.
 
-    The child process runs independently.  The daemon does NOT wait for it
-    to complete — the subagent's handoff mechanism is ``write_result``
-    (called at agent completion), not the subprocess return code.
+    The ``agent_type`` parameter is forwarded to ``_dispatch_via_inbox`` so
+    the dispatcher can select the correct subagent type (e.g.
+    ``"lobster-meta"`` for philosophical UoWs,
+    ``"functional-engineer"`` for implementation tasks).
 
-    When ``registry`` is provided, the child's PID is written to
-    ``executor_pid`` in the UoW row immediately after ``Popen`` succeeds.
-    This enables ``wos abort <uow_id>`` to send SIGTERM to the process group.
-    PID write is best-effort — any failure is logged at WARNING level and does
-    not block dispatch.
+    Returns the inbox message_id (a UUID string) for audit correlation.
 
-    Returns a ``run_id`` string for audit correlation (``uow_id`` + timestamp).
-
-    Raises ``FileNotFoundError`` if the claude binary is not on PATH.
-    Raises ``OSError`` for other process creation errors.
-
-    This replaces the synchronous ``_dispatch_via_claude_p`` call pattern in
-    the router.  The synchronous path (``executor._dispatch_via_claude_p``)
-    is intentionally retained for the executor-heartbeat path (CI / recovery
-    scenarios where blocking is acceptable).
-
-    Design note: ``start_new_session=True`` creates a new Unix session (and
-    therefore a new process group) for the child.  This is the minimal
-    isolation required: the child is no longer in the daemon's process group,
-    so a SIGTERM or SIGKILL targeting the daemon's group does not propagate.
-    ``close_fds=True`` (the Python default) ensures the daemon's open file
-    descriptors are not inherited by the child.
+    Raises ``OSError`` if the inbox directory cannot be created or the
+    message file cannot be written.
     """
-    run_id = f"{uow_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
-
-    command = [
-        _CLAUDE_BIN,
-        "-p",
-        "--dangerously-skip-permissions",
-        "--max-turns", str(_MAX_TURNS),
-        "--",   # end-of-options sentinel: prevents prompts starting with '---'
-                # from being parsed as CLI flags
-        instructions,
-    ]
-
-    # Pass an explicit env so CLAUDE_CODE_OAUTH_TOKEN is present even when
-    # this daemon was started by systemd with a stripped environment.
-    try:
-        from orchestration.steward import _build_claude_env
-        env = _build_claude_env()
-    except Exception:
-        env = None  # Fall back to inheriting the current environment
-
-    # Redirect child stdout+stderr to a per-execution log file so that silent
-    # exits (OOM kills, unhandled exceptions, Claude binary crashes) leave
-    # forensic evidence.  Without this, DEVNULL swallows all exit context and
-    # post-mortem analysis is impossible.
-    _SUBPROCESS_LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = _SUBPROCESS_LOG_DIR / f"{run_id}.log"
-
-    with open(log_path, "w") as log_fh:
-        proc = subprocess.Popen(
-            command,
-            start_new_session=True,  # Insulates child from SIGTERM sent to daemon
-            stdin=subprocess.DEVNULL,
-            stdout=log_fh,
-            stderr=log_fh,
-            close_fds=True,
-            env=env,
-        )
-
-    # Write PID to registry so `wos abort` can send SIGTERM to the process group.
-    # Best-effort: any failure is logged but does not abort the dispatch.
-    if registry is not None:
-        try:
-            registry.set_executor_pid(uow_id, proc.pid)
-            log.info(
-                "dispatch: stored executor_pid=%d for uow_id=%s",
-                proc.pid, uow_id,
-            )
-        except Exception as exc:
-            log.warning(
-                "dispatch: failed to store executor_pid for uow_id=%s — %s: %s "
-                "(wos abort will not work for this UoW)",
-                uow_id, type(exc).__name__, exc,
-            )
-
+    msg_id = _dispatch_via_inbox(instructions, uow_id, agent_type=agent_type)
     log.info(
-        "dispatch: spawned claude -p for uow_id=%s run_id=%s (non-blocking, new session) "
-        "log=%s",
-        uow_id, run_id, log_path,
+        "dispatch: wrote wos_execute to inbox for uow_id=%s msg_id=%s agent_type=%s",
+        uow_id, msg_id, agent_type,
     )
-    return run_id
+    return msg_id
 
 
 # ---------------------------------------------------------------------------
@@ -477,36 +404,20 @@ def _route_single_message(msg: dict) -> None:
     if action == "spawn_subagent":
         task_id: str = decision.get("task_id", f"wos-{uow_id}")
         prompt: str = decision.get("prompt", "")
+        agent_type: str = decision.get("agent_type", "functional-engineer")
         # route_wos_message returns task_id as "wos-{uow_id}"; strip prefix
-        # to get the bare uow_id expected by _dispatch_via_popen
+        # to get the bare uow_id expected by _dispatch_via_inbox
         bare_uow_id = task_id.removeprefix("wos-")
 
-        # Resolve registry for PID tracking (best-effort: None if unavailable).
-        # PID tracking enables `wos abort <uow_id>` to SIGTERM the process group.
-        # Lazily imported to avoid pulling orchestration.registry into the module
-        # namespace at load time (the router tests mock orchestration at import).
-        _registry = None
+        log.info("route: dispatching subagent for uow_id=%s task_id=%s agent_type=%s", uow_id, task_id, agent_type)
         try:
-            from orchestration.registry import Registry as _Registry
-            from orchestration.paths import REGISTRY_DB
-            if REGISTRY_DB.exists():
-                _registry = _Registry(REGISTRY_DB)
-        except Exception as _exc:
-            log.warning(
-                "route: could not open registry for PID tracking (uow_id=%s) — %s: %s "
-                "(wos abort will not work for this UoW)",
-                uow_id, type(_exc).__name__, _exc,
-            )
-
-        log.info("route: dispatching subagent for uow_id=%s task_id=%s", uow_id, task_id)
-        try:
-            run_id = _dispatch_via_popen(instructions=prompt, uow_id=bare_uow_id, registry=_registry)
-            log.info("route: dispatch succeeded run_id=%s uow_id=%s", run_id, uow_id)
+            msg_id = _dispatch(instructions=prompt, uow_id=bare_uow_id, agent_type=agent_type)
+            log.info("route: dispatch succeeded msg_id=%s uow_id=%s", msg_id, uow_id)
         except Exception as exc:
-            log.error("route: _dispatch_via_popen raised for %s: %s", uow_id, exc)
+            log.error("route: _dispatch raised for %s: %s", uow_id, exc)
             _release_message_failed(message_id)
             _write_alert(
-                f"wos-execute-router: subprocess dispatch failed for "
+                f"wos-execute-router: inbox dispatch failed for "
                 f"message_id={message_id} uow_id={uow_id}: {type(exc).__name__}: {exc}"
             )
             return
