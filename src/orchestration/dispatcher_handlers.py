@@ -1266,6 +1266,12 @@ WOS_MESSAGE_TYPE_DISPATCH: dict[str, str] = {
     # (running < max_parallel). Handler marks the event consumed and logs it.
     # Future use: signal the germinator to promote pending UoWs faster.
     "wos_capacity_available": "handle_wos_capacity_available",
+    # Async prescription request (Path 1 migration): written by steward._process_uow when
+    # the heartbeat offloads the blocking claude -p call to a background subagent.
+    # The UoW is in 'prescribing' state while waiting. The prescription subagent runs
+    # the LLM call, writes the WorkflowArtifact, and transitions to ready-for-executor.
+    # Always returns action="spawn_subagent".
+    "wos_prescribe": "handle_wos_prescribe",
 }
 
 
@@ -1313,6 +1319,103 @@ def handle_steward_trigger(uow_id: str) -> dict[str, Any]:
             f"Minimum viable output: steward heartbeat completed.\n"
             f"Boundary: do not modify any UoW status directly."
         ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# wos_prescribe handler — async prescription dispatch (Path 1 migration)
+#
+# Called when the dispatcher receives a message with type="wos_prescribe".
+# The message was written by steward._process_uow when the heartbeat offloaded
+# the blocking claude -p prescription call to a background subagent.
+#
+# The prescription subagent:
+# 1. Calls the prescription script with the embedded inputs
+# 2. Writes the WorkflowArtifact to disk
+# 3. Transitions the UoW from 'prescribing' → 'ready-for-executor'
+# 4. Calls write_result to signal completion
+#
+# Always returns action="spawn_subagent".
+# ---------------------------------------------------------------------------
+
+def handle_wos_prescribe(msg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Handle a wos_prescribe inbox message by spawning a prescription subagent.
+
+    Called by route_wos_message when the dispatcher receives a message with
+    type="wos_prescribe". This is the async prescription dispatch path
+    (Path 1 migration): the steward heartbeat wrote this message after
+    offloading the blocking LLM call to avoid tying up the 3-minute cron.
+
+    The prescription subagent runs the claude -p call, writes the
+    WorkflowArtifact, and transitions the UoW to ready-for-executor.
+
+    Args:
+        msg: The wos_prescribe inbox message dict. Required fields:
+            uow_id, uow_summary, reentry_posture, completion_gap, issue_body,
+            cycles, new_cycles, selected_executor_type, prescribed_skills,
+            vision_orientation, dan_register, steward_log, now_iso.
+
+    Returns:
+        A dict with action="spawn_subagent" containing task_id, agent_type,
+        and prompt for the dispatcher to pass to the background Task call.
+    """
+    uow_id: str = msg["uow_id"]
+    task_id = f"wos-prescribe-{uow_id[:8]}"
+
+    # Embed the full wos_prescribe payload into the subagent prompt so it has
+    # all context needed to run the prescription and write the artifact.
+    import json as _json_mod
+    payload_json = _json_mod.dumps(msg, ensure_ascii=False)
+
+    prescription_script = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__), '..', '..', 'scheduled-tasks',
+            'wos-prescription-agent.py',
+        )
+    )
+
+    prompt = (
+        f"---\n"
+        f"task_id: {task_id}\n"
+        f"chat_id: 0\n"
+        f"source: system\n"
+        f"---\n\n"
+        f"Run the WOS prescription agent for UoW {uow_id}.\n\n"
+        f"This UoW is in 'prescribing' state. Your task:\n"
+        f"1. Run the prescription script below with the embedded payload\n"
+        f"2. The script calls claude -p, writes the WorkflowArtifact, and transitions "
+        f"the UoW to ready-for-executor\n"
+        f"3. Call write_result to signal completion\n\n"
+        f"```bash\n"
+        f"cd ~/lobster && uv run {prescription_script} --payload-stdin <<'PAYLOAD_EOF'\n"
+        f"{payload_json}\n"
+        f"PAYLOAD_EOF\n"
+        f"```\n\n"
+        f"If the script succeeds (exit 0), the UoW is already transitioned. "
+        f"If it fails, log the error and transition the UoW back to ready-for-steward "
+        f"so the steward can retry:\n\n"
+        f"```bash\n"
+        f"cd ~/lobster && uv run python -c \"\n"
+        f"import sys\n"
+        f"sys.path.insert(0, 'src')\n"
+        f"from orchestration.registry import Registry, UoWStatus\n"
+        f"r = Registry()\n"
+        f"r.transition('{uow_id}', UoWStatus.READY_FOR_STEWARD, UoWStatus.PRESCRIBING)\n"
+        f"print('UoW {uow_id} reset to ready-for-steward')\n"
+        f"\"\n"
+        f"```\n\n"
+        f"Minimum viable output: UoW {uow_id} transitioned to ready-for-executor "
+        f"(or reset to ready-for-steward on failure).\n"
+        f"Boundary: do not modify the UoW's steward_agenda, steward_log, or "
+        f"steward_cycles fields — those are managed by the steward heartbeat."
+    )
+
+    return {
+        "action": "spawn_subagent",
+        "task_id": task_id,
+        "agent_type": "lobster-generalist",
+        "prompt": prompt,
     }
 
 
@@ -2813,6 +2916,10 @@ def route_wos_message(msg: dict[str, Any]) -> dict[str, Any]:
 
         elif msg_type == "wos_diagnose":
             result = handle_wos_diagnose(msg)
+            result["message_type"] = msg_type
+
+        elif msg_type == "wos_prescribe":
+            result = handle_wos_prescribe(msg)
             result["message_type"] = msg_type
 
         else:

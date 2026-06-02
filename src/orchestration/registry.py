@@ -92,6 +92,14 @@ class UoWStatus(StrEnum):
     # observation loop detects all children are in terminal states.
     # Treated as non-terminal (does not allow automatic re-proposal).
     AWAITING_CHILDREN = "awaiting-children"
+    # PRESCRIBING: steward has queued an async LLM prescription via a wos_prescribe
+    # inbox message and returned immediately. The UoW waits here until the prescription
+    # subagent completes and writes the WorkflowArtifact, then transitions to
+    # ready-for-executor. TTL recovery: any UoW stuck in prescribing beyond
+    # LOBSTER_LLM_PRESCRIPTION_TIMEOUT_SECS + 60s is reset to ready-for-steward by
+    # the startup_sweep so the steward can re-attempt (Population 5).
+    # Treated as non-terminal (does not allow automatic re-proposal).
+    PRESCRIBING = "prescribing"
 
     def is_terminal(self) -> bool:
         """True for statuses that allow re-proposal (done, failed, expired, cancelled, closed, completed)."""
@@ -105,7 +113,7 @@ class UoWStatus(StrEnum):
         }
 
     def is_in_flight(self) -> bool:
-        """True for statuses that block re-proposal (active, executing, pending, ready-for-steward, ready-for-executor, diagnosing, awaiting-owner, awaiting-children)."""
+        """True for statuses that block re-proposal (active, executing, pending, ready-for-steward, ready-for-executor, diagnosing, awaiting-owner, awaiting-children, prescribing)."""
         return self in {
             UoWStatus.ACTIVE,
             UoWStatus.EXECUTING,
@@ -115,6 +123,7 @@ class UoWStatus(StrEnum):
             UoWStatus.DIAGNOSING,
             UoWStatus.AWAITING_OWNER,
             UoWStatus.AWAITING_CHILDREN,
+            UoWStatus.PRESCRIBING,
         }
 
 
@@ -1965,6 +1974,71 @@ class Registry:
                     """
                     INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
                     VALUES (?, ?, 'startup_sweep', 'diagnosing', 'ready-for-steward',
+                            'steward', ?)
+                    """,
+                    (now, uow_id, note_json),
+                )
+
+            conn.commit()
+            return rows_affected
+
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def record_startup_sweep_prescribing(
+        self,
+        uow_id: str,
+        timeout_secs: int = 660,
+    ) -> int:
+        """
+        Atomically write a startup_sweep audit entry and transition a
+        `prescribing` UoW back to `ready-for-steward`.
+
+        Used when a prescription subagent timed out or died without writing
+        the WorkflowArtifact. The next steward heartbeat re-queues the
+        prescription as a fresh async request.
+
+        timeout_secs: the TTL (seconds) after which a prescribing UoW is
+            considered stale. Callers compare updated_at against this value
+            before calling. Default 660 s (LOBSTER_LLM_PRESCRIPTION_TIMEOUT_SECS
+            default of 600 s + 60 s grace).
+
+        Returns 1 on success, 0 if another process already advanced this UoW.
+        """
+        now = _now_iso()
+        note_json = json.dumps({
+            "event": "startup_sweep",
+            "actor": "steward",
+            "classification": "prescribing_orphan",
+            "output_ref": None,
+            "uow_id": uow_id,
+            "timestamp": now,
+            "prior_status": "prescribing",
+            "timeout_secs": timeout_secs,
+        })
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            cursor = conn.execute(
+                """
+                UPDATE uow_registry
+                SET status = 'ready-for-steward', updated_at = ?
+                WHERE id = ? AND status = 'prescribing'
+                """,
+                (now, uow_id),
+            )
+            rows_affected = cursor.rowcount
+
+            if rows_affected == 1:
+                conn.execute(
+                    """
+                    INSERT INTO audit_log (ts, uow_id, event, from_status, to_status, agent, note)
+                    VALUES (?, ?, 'startup_sweep', 'prescribing', 'ready-for-steward',
                             'steward', ?)
                     """,
                     (now, uow_id, note_json),
