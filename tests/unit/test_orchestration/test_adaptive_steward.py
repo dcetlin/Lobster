@@ -816,5 +816,5 @@ class TestConstants:
         assert PEARL_MIN_OBSERVATIONS == 5
 
     def test_haiku_model_id(self) -> None:
-        """HAIKU_MODEL must use the claude-haiku-4-5-20251001 model."""
-        assert HAIKU_MODEL == "claude-haiku-4-5-20251001"
+        """HAIKU_MODEL must use the claude-haiku-4-5 model."""
+        assert HAIKU_MODEL == "claude-haiku-4-5"
