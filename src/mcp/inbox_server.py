@@ -5301,6 +5301,10 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
         if msg_type == "wos_execute":
             _uow_id = msg.get("uow_id", "?")
             text = f"wos_execute: uow_id={_uow_id}"
+        elif msg_type == "wos_prescribe":
+            _uow_id = msg.get("uow_id", "?")
+            _summary = str(msg.get("uow_summary", "?"))[:60]
+            text = f"wos_prescribe: uow_id={_uow_id}, summary={_summary}"
         else:
             text = msg.get("text", "(no text)")
 
@@ -5341,6 +5345,9 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
         elif msg_type == "wos_execute":
             uow_id = msg.get("uow_id", "?")
             output += f"🔧 **[WOS EXECUTE]** uow_id=`{uow_id}`\n"
+        elif msg_type == "wos_prescribe":
+            uow_id = msg.get("uow_id", "?")
+            output += f"📋 **[WOS PRESCRIBE]** uow_id=`{uow_id}`\n"
         elif msg_type == "reaction":
             emoji = msg.get("emoji", "?")
             reacted_to_text = msg.get("reacted_to_text", "")
@@ -5363,6 +5370,13 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
         if msg_type == "wos_execute":
             uow_id = msg.get("uow_id", "?")
             output += f"dispatcher_hint: WOS_EXECUTE — call route_wos_message(msg) from src/orchestration/dispatcher_handlers.py. uow_id={uow_id}. Do not read prose — use the structural route.\n"
+        if msg_type == "wos_prescribe":
+            _uow_id = msg.get("uow_id", "?")
+            output += (
+                f"dispatcher_hint: WOS_PRESCRIBE — call route_wos_message(msg) from "
+                f"src/orchestration/dispatcher_handlers.py. uow_id={_uow_id}. "
+                f"Spawns prescription subagent.\n"
+            )
         _has_file = msg_type in ("voice", "photo", "document") or bool(
             msg.get("image_file") or msg.get("image_files") or
             msg.get("file_path") or msg.get("audio_file")
