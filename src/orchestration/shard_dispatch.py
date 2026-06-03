@@ -50,9 +50,25 @@ class PathSelection(StrEnum):
     FAST = "fast"
     THOROUGH = "thorough"
 
-# Default cap: two non-overlapping UoWs may run in parallel before any
-# Attunement evidence exists at higher concurrency.
-DEFAULT_MAX_PARALLEL: int = 2
+# Default cap: five non-overlapping UoWs may run in parallel.
+#
+# Rationale for 5 (raised from 2 on 2026-06-03):
+# - The original value of 2 was intentionally conservative — set when the
+#   shard-stream feature shipped (PR #904, April 2026) with no Attunement
+#   evidence at higher concurrency.
+# - Production observation: with 5 UoWs in executing state simultaneously
+#   (observed 2026-06-03), system stability was not degraded. The
+#   ScalingGovernor, CC quota gate, GitHub rate limit gate, and context
+#   pressure threshold (20 active sessions) remain as independent throttles.
+# - The value 2 caused UoWs to queue behind long-running peers for entire
+#   days (e.g. uow_20260522_fa2150: blocked 34 cycles before shard slots
+#   freed). The constraint is file-scope conflict, not global serialization.
+# - Set to match MAX_CONCURRENT_PRESCRIPTIONS=5 (steward-side cap, PR #1391)
+#   so that execution parallelism is consistent with prescription parallelism.
+# - Override at runtime via wos-config.json "max_parallel" key without
+#   restart. The ScalingGovernor still applies its own progressive cap on top
+#   of this value when Attunement evidence at scale is absent.
+DEFAULT_MAX_PARALLEL: int = 5
 
 
 # ---------------------------------------------------------------------------

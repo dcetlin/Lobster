@@ -7,7 +7,7 @@ Design:
   verify, not the mechanism.
 
 Named constants used (from shard_dispatch.py):
-  DEFAULT_MAX_PARALLEL = 2
+  DEFAULT_MAX_PARALLEL = 5
 
 Behaviors verified (issue #912 semantics — null file_scope = independent):
 - No in-flight UoWs: any candidate is allowed (regardless of scope)
@@ -159,22 +159,22 @@ class TestMaxParallelCap:
     def test_at_max_parallel_blocks_dispatch(self):
         """When executing count equals max_parallel, candidate is blocked."""
         executing = [
-            _stub("uow_a", file_scope=["src/foo.py"]),
-            _stub("uow_b", file_scope=["src/bar.py"]),
+            _stub(f"uow_{i}", file_scope=[f"src/file{i}.py"])
+            for i in range(DEFAULT_MAX_PARALLEL)
         ]
         decision = check_shard_dispatch_eligibility(
-            candidate_file_scope=["src/baz.py"],  # no overlap — gate 1 fires first
+            candidate_file_scope=["src/other.py"],  # no overlap — gate 1 fires first
             candidate_shard_id=None,
             executing_uows=executing,
-            max_parallel=DEFAULT_MAX_PARALLEL,  # == 2
+            max_parallel=DEFAULT_MAX_PARALLEL,
         )
         assert isinstance(decision, DispatchBlocked)
-        assert "max_parallel=2" in decision.reason
+        assert f"max_parallel={DEFAULT_MAX_PARALLEL}" in decision.reason
 
     def test_below_max_parallel_proceeds_to_next_gate(self):
-        """One in-flight with max_parallel=2 — gate 1 does not fire."""
+        """One in-flight with max_parallel=DEFAULT_MAX_PARALLEL — gate 1 does not fire."""
         executing = [_stub("uow_a", file_scope=["src/foo.py"])]
-        # Use non-overlapping scope so gate 4 also passes
+        # Use non-overlapping scope so gate 3 also passes
         decision = check_shard_dispatch_eligibility(
             candidate_file_scope=["src/bar.py"],
             candidate_shard_id=None,
@@ -268,14 +268,14 @@ class TestNullScopeIndependent:
     def test_null_scope_still_blocked_by_max_parallel(self):
         """Null-scope candidate is still blocked when max_parallel cap is reached."""
         executing = [
-            _stub("uow_a", file_scope=None),
-            _stub("uow_b", file_scope=None),
+            _stub(f"uow_{i}", file_scope=None)
+            for i in range(DEFAULT_MAX_PARALLEL)
         ]
         decision = check_shard_dispatch_eligibility(
             candidate_file_scope=None,
             candidate_shard_id=None,
             executing_uows=executing,
-            max_parallel=DEFAULT_MAX_PARALLEL,  # == 2, both slots filled
+            max_parallel=DEFAULT_MAX_PARALLEL,  # all slots filled
         )
         assert isinstance(decision, DispatchBlocked)
         assert "max_parallel" in decision.reason
@@ -566,6 +566,6 @@ class TestWithinCycleAccumulation:
 # ---------------------------------------------------------------------------
 
 class TestDefaultMaxParallel:
-    def test_default_is_two(self):
-        """DEFAULT_MAX_PARALLEL must be 2 per spec."""
-        assert DEFAULT_MAX_PARALLEL == 2
+    def test_default_is_five(self):
+        """DEFAULT_MAX_PARALLEL must be 5 (raised from 2 on 2026-06-03 after production evidence)."""
+        assert DEFAULT_MAX_PARALLEL == 5

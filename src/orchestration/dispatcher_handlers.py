@@ -75,8 +75,12 @@ _DEFAULT_WOS_CONFIG: dict = {
     # max_parallel: maximum number of UoWs that may execute concurrently.
     # The steward shard-stream gate enforces this cap before dispatching
     # a new UoW to ready-for-executor. Requires non-overlapping file_scope
-    # annotations on concurrent candidates. Default 2 (conservative).
-    "max_parallel": 2,
+    # annotations on concurrent candidates.
+    # Raised from 2 to 5 (2026-06-03): original value was conservative
+    # with no Attunement evidence at higher scale; matches
+    # MAX_CONCURRENT_PRESCRIPTIONS=5 (PR #1391). Additional throttles
+    # (ScalingGovernor, CC quota gate, context pressure threshold) remain.
+    "max_parallel": 5,
 }
 
 
