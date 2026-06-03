@@ -41,6 +41,7 @@ import json
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from enum import StrEnum
@@ -94,6 +95,13 @@ log = logging.getLogger("steward-heartbeat")
 _DEFAULT_STALL_SECONDS = 1800  # 30 minutes fallback when timeout_at is NULL
 HIGH_PRESCRIPTION_THRESHOLD = 10  # Alert when prescriptions per cycle exceeds this (#618)
 
+# Failure-traces cleanup caps (issue #947)
+TRACES_DIR: Path = Path(
+    os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
+) / "orchestration" / "failure-traces"
+MAX_TRACE_AGE_DAYS: int = 30  # Delete traces older than this
+MAX_TRACE_COUNT: int = 500    # After age cleanup, trim oldest until count <= this
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -143,6 +151,69 @@ def _write_task_output(output: str, status: str, timestamp: str) -> None:
     tmp_path = Path(str(out_path) + ".tmp")
     tmp_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp_path.replace(out_path)
+
+
+def cleanup_failure_traces(active_uow_ids: set) -> int:
+    """
+    Delete old and excess failure-trace files from TRACES_DIR.
+
+    Two-pass cleanup (issue #947):
+      Pass 1 — Age cap: delete .json files whose mtime exceeds MAX_TRACE_AGE_DAYS,
+                unless their stem is in active_uow_ids.
+      Pass 2 — Count cap: if more than MAX_TRACE_COUNT files remain, delete the
+                oldest (by mtime, ascending) until the count reaches MAX_TRACE_COUNT,
+                skipping any file whose stem is in active_uow_ids.
+
+    The active_uow_ids guard prevents deleting traces that belong to UoWs currently
+    executing — those traces may still be needed for in-flight debugging.
+
+    Returns the total number of files deleted.
+    """
+    if not TRACES_DIR.exists():
+        return 0
+
+    cutoff = time.time() - MAX_TRACE_AGE_DAYS * 86400
+    deleted = 0
+
+    # Pass 1: age cap
+    for f in list(TRACES_DIR.glob("*.json")):
+        if f.stem in active_uow_ids:
+            continue
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+                deleted += 1
+        except OSError:
+            pass  # concurrent write or already gone — skip silently
+
+    # Pass 2: count cap
+    # Sort remaining files by mtime ascending (oldest first).
+    # Identify the `excess` oldest as candidates; among them, delete non-active ones.
+    # Active-guarded files consume a candidate slot — they are not replaced by the
+    # next oldest file. This bounds deletion to the initial excess window.
+    def _safe_mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return float("inf")  # sort to end; unlink will no-op via existing OSError catch
+
+    remaining = sorted(
+        TRACES_DIR.glob("*.json"),
+        key=_safe_mtime,
+    )
+    excess = len(remaining) - MAX_TRACE_COUNT
+    if excess > 0:
+        candidates = remaining[:excess]
+        for f in candidates:
+            if f.stem in active_uow_ids:
+                continue
+            try:
+                f.unlink()
+                deleted += 1
+            except OSError:
+                pass
+
+    return deleted
 
 
 # ---------------------------------------------------------------------------
@@ -1105,6 +1176,29 @@ def _main_inner() -> int:
         )
     except Exception:
         log.exception("Stale agent cleanup failed — continuing to startup sweep")
+
+    # Phase 0b: Failure-traces cleanup (issue #947)
+    # Collect active UoW IDs before cleanup to protect in-flight traces.
+    log.info("--- Phase 0b: Failure-traces cleanup ---")
+    try:
+        active_ids: set = set()
+        try:
+            executing_uows = registry.list(status="executing")
+            active_ids = {u.id for u in executing_uows}
+        except Exception:
+            log.exception("Failed to collect active UoW IDs for failure-traces guard — proceeding with empty guard")
+
+        if dry_run:
+            log.info("Failure-traces cleanup: skipped (dry-run)")
+        else:
+            traces_deleted = cleanup_failure_traces(active_ids)
+            log.info(
+                "Failure-traces cleanup complete: deleted=%d protected_active_ids=%d",
+                traces_deleted,
+                len(active_ids),
+            )
+    except Exception:
+        log.exception("Failure-traces cleanup failed — continuing to startup sweep")
 
     # Phase 1: Startup sweep
     log.info("--- Phase 1: Startup sweep ---")
