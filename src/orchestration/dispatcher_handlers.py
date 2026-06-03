@@ -1331,12 +1331,19 @@ def handle_steward_trigger(uow_id: str) -> dict[str, Any]:
 #
 # Called when the dispatcher receives a message with type="wos_prescribe".
 # The message was written by steward._process_uow when the heartbeat offloaded
-# the blocking claude -p prescription call to a background subagent.
+# the blocking LLM call to avoid tying up the 3-minute cron.
+#
+# Design: the prescription subagent IS an LLM — it generates the prescription
+# directly from the embedded context rather than spawning a nested `claude -p`
+# subprocess. The previous approach (running wos-prescription-agent.py which
+# calls `claude -p`) failed systematically: the Bash tool default timeout (2 min)
+# killed the Python script before `claude -p` (600s budget) could complete,
+# causing ~41 consecutive failures per UoW with startup_sweep resetting each at 660s.
 #
 # The prescription subagent:
-# 1. Calls the prescription script with the embedded inputs
-# 2. Writes the WorkflowArtifact to disk
-# 3. Transitions the UoW from 'prescribing' → 'ready-for-executor'
+# 1. Generates the prescription text directly using its own LLM reasoning
+# 2. Passes it to wos-write-artifact.py (pure Python, <5s, no LLM call)
+# 3. The helper writes the WorkflowArtifact and transitions prescribing → ready-for-executor
 # 4. Calls write_result to signal completion
 #
 # Always returns action="spawn_subagent".
@@ -1351,8 +1358,9 @@ def handle_wos_prescribe(msg: dict[str, Any]) -> dict[str, Any]:
     (Path 1 migration): the steward heartbeat wrote this message after
     offloading the blocking LLM call to avoid tying up the 3-minute cron.
 
-    The prescription subagent runs the claude -p call, writes the
-    WorkflowArtifact, and transitions the UoW to ready-for-executor.
+    The prescription subagent generates the prescription directly (as an LLM
+    it already is), then calls wos-write-artifact.py to write the artifact and
+    transition the UoW. No nested `claude -p` subprocess is involved.
 
     Args:
         msg: The wos_prescribe inbox message dict. Required fields:
@@ -1367,16 +1375,132 @@ def handle_wos_prescribe(msg: dict[str, Any]) -> dict[str, Any]:
     uow_id: str = msg["uow_id"]
     task_id = f"wos-prescribe-{uow_id[:8]}"
 
-    # Embed the full wos_prescribe payload into the subagent prompt so it has
-    # all context needed to run the prescription and write the artifact.
-    import json as _json_mod
-    payload_json = _json_mod.dumps(msg, ensure_ascii=False)
+    # Extract prescription context from the payload.
+    uow_summary: str = msg.get("uow_summary", "")
+    uow_type: str = msg.get("uow_type", "")
+    success_criteria: str = msg.get("success_criteria", "")
+    reentry_posture: str = msg.get("reentry_posture", "first_execution")
+    completion_gap: str = msg.get("completion_gap", "")
+    issue_body: str = msg.get("issue_body", "")
+    cycles: int = msg.get("cycles", 0)
+    new_cycles: int = msg.get("new_cycles", 1)
+    selected_executor_type: str = msg.get("selected_executor_type", "functional-engineer")
+    prescribed_skills: list = msg.get("prescribed_skills", [])
+    vision_orientation: str = msg.get("vision_orientation", "")
+    dan_register: str = msg.get("dan_register", "")
+    steward_log: str = msg.get("steward_log", "")
+    uow_source: str = msg.get("uow_source", "telegram")
 
-    prescription_script = os.path.abspath(
-        os.path.join(
-            os.path.dirname(__file__), '..', '..', 'scheduled-tasks',
-            'wos-prescription-agent.py',
+    # Build prior prescription history from steward_log for context.
+    import json as _json_mod
+    prior_prescriptions_lines: list[str] = []
+    if steward_log:
+        for line in steward_log.strip().splitlines():
+            if not line.strip():
+                continue
+            try:
+                entry = _json_mod.loads(line)
+                if not isinstance(entry, dict):
+                    continue
+                event = entry.get("event", "")
+                if event in ("prescription", "reentry_prescription"):
+                    assessment = entry.get("completion_assessment", "")
+                    cycle = entry.get("steward_cycles", "?")
+                    if assessment:
+                        prior_prescriptions_lines.append(
+                            f"  - Cycle {cycle}: {assessment}"
+                        )
+            except (_json_mod.JSONDecodeError, KeyError):
+                pass
+
+    # Truncate issue_body if very large to keep the prompt manageable.
+    issue_body_excerpt = issue_body.strip()
+    if len(issue_body_excerpt) > 2000:
+        issue_body_excerpt = issue_body_excerpt[:2000] + "\n[...truncated]"
+
+    # Build the UoW context block (mirrors _llm_prescribe logic in steward.py).
+    context_parts = [
+        f"UoW ID: {uow_id}",
+        f"Summary: {uow_summary}",
+    ]
+    if uow_type:
+        context_parts.append(f"Type: {uow_type}")
+    if success_criteria:
+        context_parts.append(f"Success criteria: {success_criteria}")
+    elif issue_body_excerpt:
+        context_parts.append(f"Issue body:\n{issue_body_excerpt}")
+    context_parts.append(f"Execution cycle: {cycles} (0 = first pass)")
+    context_parts.append(f"Executor posture: {reentry_posture}")
+    context_parts.append(f"Completion gap identified: {completion_gap}")
+    if prior_prescriptions_lines:
+        context_parts.append(
+            "Prior prescription history:\n" + "\n".join(prior_prescriptions_lines)
         )
+    uow_context = "\n".join(context_parts)
+
+    orientation_block = (
+        "\n## Dan's current orientation\n\n" + dan_register + "\n"
+        if dan_register
+        else ""
+    )
+
+    vision_block = (
+        "\n## Vision orientation\n\n" + vision_orientation + "\n"
+        if vision_orientation
+        else ""
+    )
+
+    # Dispatch conventions embedded in the prescription so the Executor knows
+    # how to structure its own work.
+    dispatch_conventions = (
+        "## Lobster Subagent Dispatch Conventions\n\n"
+        "### Prompt YAML Frontmatter (required at top of every prompt)\n"
+        "---\n"
+        "task_id: <short-slug>\n"
+        "chat_id: <user's chat_id>\n"
+        "source: " + uow_source + "\n"
+        "---\n\n"
+        "### Agent type selection\n"
+        "- GitHub issue implementation, feature work, bug fix: functional-engineer\n"
+        "- Lobster system ops, infra, deploy: lobster-ops\n"
+        "- General background tasks: lobster-generalist\n\n"
+        "### Required prompt structure\n"
+        "Every prompt must include:\n"
+        "  Minimum viable output: <one concrete deliverable>\n"
+        "  Boundary: do not <X>\n\n"
+        "### Output delivery\n"
+        "1. send_reply(chat_id=<id>, text='<result>', task_id='<slug>')\n"
+        "2. write_result(task_id='<slug>', sent_reply_to_user=True)\n"
+        "For internal tasks (no user reply): write_result only with sent_reply_to_user=False\n"
+    )
+
+    # Path to the write-artifact helper (pure Python, <5s, no LLM call).
+    # Resolves from this file's location: src/orchestration/ -> ../../scheduled-tasks/
+    repo_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), '..', '..')
+    )
+    write_artifact_script = os.path.join(
+        repo_root, 'scheduled-tasks', 'wos-write-artifact.py'
+    )
+    prescribed_skills_json_arg = _json_mod.dumps(prescribed_skills)
+
+    # Build the artifact-write command. Prescription text is piped via a temp file
+    # to avoid heredoc/quoting issues with multiline content.
+    write_cmd = (
+        f"cd {repo_root} && uv run {write_artifact_script}"
+        f" --uow-id {uow_id}"
+        f" --new-cycles {new_cycles}"
+        f" --executor-type {selected_executor_type}"
+        f" --prescribed-skills {repr(prescribed_skills_json_arg)}"
+        " < /tmp/wos_prescription_text.txt"
+    )
+
+    reset_cmd = (
+        f"cd {repo_root} && uv run python -c "
+        f"'import sys; sys.path.insert(0, \"{repo_root}/src\"); "
+        f"from orchestration.registry import Registry, UoWStatus; "
+        f"Registry().transition(\"{uow_id}\", UoWStatus.READY_FOR_STEWARD, UoWStatus.PRESCRIBING); "
+        f"print(\"reset to ready-for-steward\")'"
     )
 
     prompt = (
@@ -1385,34 +1509,50 @@ def handle_wos_prescribe(msg: dict[str, Any]) -> dict[str, Any]:
         f"chat_id: 0\n"
         f"source: system\n"
         f"---\n\n"
-        f"Run the WOS prescription agent for UoW {uow_id}.\n\n"
-        f"This UoW is in 'prescribing' state. Your task:\n"
-        f"1. Run the prescription script below with the embedded payload\n"
-        f"2. The script calls claude -p, writes the WorkflowArtifact, and transitions "
-        f"the UoW to ready-for-executor\n"
-        f"3. Call write_result to signal completion\n\n"
-        f"```bash\n"
-        f"cd ~/lobster && uv run {prescription_script} --payload-stdin <<'PAYLOAD_EOF'\n"
-        f"{payload_json}\n"
-        f"PAYLOAD_EOF\n"
-        f"```\n\n"
-        f"If the script succeeds (exit 0), the UoW is already transitioned. "
-        f"If it fails, log the error and transition the UoW back to ready-for-steward "
-        f"so the steward can retry:\n\n"
-        f"```bash\n"
-        f"cd ~/lobster && uv run python -c \"\n"
-        f"import sys\n"
-        f"sys.path.insert(0, 'src')\n"
-        f"from orchestration.registry import Registry, UoWStatus\n"
-        f"r = Registry()\n"
-        f"r.transition('{uow_id}', UoWStatus.READY_FOR_STEWARD, UoWStatus.PRESCRIBING)\n"
-        f"print('UoW {uow_id} reset to ready-for-steward')\n"
-        f"\"\n"
-        f"```\n\n"
+        "You are prescribing work instructions for a Lobster subagent that will execute "
+        "a Unit of Work (UoW) in a software development pipeline. "
+        "Your prescription must be concrete, actionable, and directly executable. "
+        "Avoid vague language. Use the success_criteria as your north star for what 'done' means. "
+        "The Executor is a capable autonomous coding agent — write instructions at that level.\n\n"
+        "HARD CONSTRAINT: SiderealPress/Lobster is the upstream read-only repo. "
+        "Never generate a prescription that targets SiderealPress/Lobster for any write operation — "
+        "this includes PR comments, issue comments, PR updates, pushes, or any other mutation. "
+        "Write targets must always be dcetlin/lobster or another non-upstream repo.\n\n"
+        "## Unit of Work\n\n"
+        f"{uow_context}\n"
+        f"{orientation_block}"
+        f"{vision_block}"
+        f"\n{dispatch_conventions}\n"
+        "## Step 1: Generate the prescription\n\n"
+        "Write a precise prescription for this UoW in front-matter + prose format. "
+        "Output ONLY the prescription — no preamble, no explanation outside this structure:\n\n"
+        "---\n"
+        f"executor_type: {selected_executor_type}\n"
+        "estimated_cycles: <integer 1-3>\n"
+        "success_criteria_check: <one or two sentences describing how to verify completion>\n"
+        "---\n\n"
+        "<complete, actionable instructions for the Executor — include specific steps, "
+        "what to produce, where to write output, and constraints; embed YAML frontmatter, "
+        "Minimum viable output, Boundary, and agent_type lines as described above>\n\n"
+        "## Step 2: Write the WorkflowArtifact and transition the UoW\n\n"
+        "After generating the prescription above, write it to a temp file and run the "
+        "write-artifact helper (pure Python, ~2s, no LLM call):\n\n"
+        "```bash\n"
+        "# Write your prescription output to a temp file\n"
+        "cat > /tmp/wos_prescription_text.txt << 'PRESC_EOF'\n"
+        "<paste your complete prescription output here — the entire ---...--- block plus instructions>\n"
+        "PRESC_EOF\n\n"
+        f"# Run the write-artifact helper\n"
+        f"{write_cmd}\n"
+        "```\n\n"
+        "If the helper fails:\n"
+        f"```bash\n{reset_cmd}\n```\n\n"
+        f"Then call write_result(task_id=\"{task_id}\", chat_id=0, "
+        f"text=\"Prescription complete for {uow_id}\", sent_reply_to_user=False).\n\n"
         f"Minimum viable output: UoW {uow_id} transitioned to ready-for-executor "
-        f"(or reset to ready-for-steward on failure).\n"
-        f"Boundary: do not modify the UoW's steward_agenda, steward_log, or "
-        f"steward_cycles fields — those are managed by the steward heartbeat."
+        "(or reset to ready-for-steward on failure).\n"
+        "Boundary: do not modify the UoW's steward_agenda, steward_log, or "
+        "steward_cycles fields directly — those are managed by the steward heartbeat."
     )
 
     return {
