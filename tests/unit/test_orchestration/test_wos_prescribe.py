@@ -294,14 +294,22 @@ class TestHandleWosPrescribe:
         result = handle_wos_prescribe(self._make_msg())
         assert "Boundary" in result["prompt"]
 
-    def test_prompt_embeds_payload_json(self):
-        """Prompt must embed the full wos_prescribe payload as JSON."""
+    def test_prompt_embeds_prescription_context(self):
+        """Prompt must embed the prescription context fields from the payload."""
         msg = self._make_msg()
         result = handle_wos_prescribe(msg)
-        # The payload JSON must be embedded in the prompt
-        assert msg["uow_id"] in result["prompt"]
-        # Check that the payload JSON is present (parsed from the embedded content)
-        assert '"reentry_posture"' in result["prompt"] or "reentry_posture" in result["prompt"]
+        prompt = result["prompt"]
+        # The subagent's prompt must contain the UoW context fields.
+        # The new design expands payload fields into human-readable context
+        # rather than embedding raw JSON — verify key fields are present.
+        assert msg["uow_id"] in prompt, "uow_id must appear in prompt"
+        assert msg["uow_summary"] in prompt, "uow_summary must appear in prompt"
+        # Executor posture is shown as "Executor posture: first_execution"
+        assert "first_execution" in prompt, "reentry_posture value must appear in prompt"
+        # Artifact write helper must be referenced
+        assert "wos-write-artifact.py" in prompt, (
+            "Prompt must reference the wos-write-artifact.py helper script"
+        )
 
 
 # ---------------------------------------------------------------------------
