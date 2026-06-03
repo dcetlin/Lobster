@@ -115,7 +115,7 @@ Two lightweight proposals:
 
 ### Resolution — Minimum Viable Juice-Preservation Artifact
 
-*Resolved: 2026-06-03. Answers the first open question above; the second and third open questions remain open.*
+*Resolved: 2026-06-03. Answers all three open questions above (artifact type, required fields for resumption, and steward discriminator).*
 
 #### (1) Artifact Type
 
