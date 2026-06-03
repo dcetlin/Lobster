@@ -4992,6 +4992,38 @@ def _process_uow(
                 "timestamp": _now_iso(),
             })
 
+    # Step 2b: Vision anchor logging (Mechanism 2 — Vision Object commitment device).
+    # Every steward cycle records which vision field it is serving (or null when absent).
+    # This creates an auditable trail without blocking execution: routing decisions are
+    # accountable to vision.yaml structurally (visible in steward_log) without hard-blocking
+    # the pipeline when coverage is incomplete.
+    #
+    # Spec: issue #689 — cycle_vision_anchor event:
+    #   {"event": "cycle_vision_anchor", "vision_ref": <value or null>,
+    #    "uow_id": ..., "cycle": ..., "timestamp": ..., "note": <warning if null>}
+    _vision_ref_value = uow.vision_ref  # dict or None
+    _cycle_anchor_entry: dict[str, Any] = {
+        "event": "cycle_vision_anchor",
+        "vision_ref": _vision_ref_value,
+        "uow_id": uow_id,
+        "cycle": cycles,
+        "timestamp": _now_iso(),
+    }
+    if _vision_ref_value is None:
+        _cycle_anchor_entry["note"] = (
+            "UoW has no vision_ref — not anchored to a vision field. "
+            "Consider adding a vision_ref to align this UoW with vision.yaml."
+        )
+        log.warning(
+            "steward: UoW %s cycle %d has no vision_ref — not aligned to a vision field",
+            uow_id, cycles,
+        )
+    current_log_str = _append_steward_log_entry(
+        registry, uow_id, current_log_str, _cycle_anchor_entry
+    )
+    if not dry_run:
+        _write_steward_fields(registry, uow_id, steward_log=current_log_str)
+
     # Step 3: Diagnose — returns typed Diagnosis dataclass
     diagnosis = _diagnose_uow(uow, audit_entries, issue_info)
     reentry_posture = diagnosis.reentry_posture
