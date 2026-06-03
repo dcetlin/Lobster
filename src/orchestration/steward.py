@@ -3958,6 +3958,34 @@ def _detect_stuck_condition(
 
 
 # ---------------------------------------------------------------------------
+# Source issue closed — pure completion signal
+# ---------------------------------------------------------------------------
+
+#: GitHub issue state string indicating a closed issue (as returned by gh CLI).
+_GITHUB_ISSUE_STATE_CLOSED = "CLOSED"
+
+
+def _source_issue_is_closed(issue_info: "IssueInfo | None") -> bool:
+    """
+    Return True when the source GitHub issue is definitively closed.
+
+    Pure function — no side effects, no I/O.
+
+    A closed issue is a completion signal regardless of executor output:
+    if the work was done (by a previous execution, human intervention, or
+    any other means), the UoW is done.
+
+    Returns False when:
+    - issue_info is None (non-GitHub source or GitHub fetch failed)
+    - issue_info.state is None (fetch returned an error)
+    - issue_info.state != "CLOSED" (issue is open or in another state)
+    """
+    if issue_info is None:
+        return False
+    return issue_info.state == _GITHUB_ISSUE_STATE_CLOSED
+
+
+# ---------------------------------------------------------------------------
 # Core per-UoW diagnosis function (pure — returns typed Diagnosis, no DB writes)
 # ---------------------------------------------------------------------------
 
@@ -3971,6 +3999,13 @@ def _diagnose_uow(
 
     Pure function: reads inputs, returns a typed Diagnosis dataclass.
     The Diagnosis is frozen and immutable — callers cannot modify it.
+
+    Source-issue-closed signal (issue #843):
+    When issue_info.state == "CLOSED", is_complete is overridden to True
+    regardless of reentry_posture or the hard-cap stuck_condition. A closed
+    source issue is definitive evidence the work is done — no further
+    execution is needed, and the UoW should transition to 'done' cleanly
+    rather than looping indefinitely as a prescribing_orphan.
     """
     return_reason = _most_recent_return_reason(audit_entries)
     reentry_posture = _determine_reentry_posture(audit_entries, return_reason)
@@ -4014,6 +4049,32 @@ def _diagnose_uow(
     # Hard cap overrides completion
     if stuck_condition == "hard_cap":
         is_complete = False
+
+    # Source-issue-closed signal (issue #843): override is_complete when the GitHub
+    # source issue is definitively closed. This fires after all other checks — including
+    # the hard-cap override — so a closed issue always wins. The rationale is that a
+    # closed issue is external evidence the work is done, regardless of executor output
+    # or cycle count. This resolves the prescribing_orphan livelock for UoWs whose
+    # source issue was resolved by a previous execution or human intervention.
+    if _source_issue_is_closed(issue_info):
+        prior_stuck_condition = stuck_condition
+        is_complete = True
+        completion_rationale = (
+            f"source_issue_closed: GitHub issue #{uow.source_issue_number} "
+            f"is already closed — work is done"
+        )
+        # Clear stuck_condition so _process_uow takes the Done path, not the surface path.
+        # A closed issue supersedes all stuck conditions including hard_cap.
+        stuck_condition = None
+        executor_outcome = None
+        log.info(
+            "_diagnose_uow: source issue #%s is closed — UoW %s marked complete "
+            "(overrides reentry_posture=%r, prior stuck_condition=%r)",
+            uow.source_issue_number,
+            uow.id,
+            reentry_posture,
+            prior_stuck_condition,
+        )
 
     return Diagnosis(
         reentry_posture=reentry_posture,
