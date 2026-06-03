@@ -35,6 +35,7 @@ Test coverage:
 
 from __future__ import annotations
 
+import ast
 import json
 import sqlite3
 import sys
@@ -568,4 +569,47 @@ class TestRecoverStalePrescribingUows:
         )
         assert executing_row["status"] == "executing", (
             f"executing UoW should remain executing, got {executing_row['status']}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sync-guard: local test constant must match production source
+# ---------------------------------------------------------------------------
+
+class TestConstantSync:
+    """Verify that PRESCRIBING_SILENCE_TTL_SECONDS matches the production value.
+
+    Uses AST parsing to read the constant from steward-heartbeat.py without
+    importing the module (which has side-effect transitive imports unavailable
+    in the test environment). If the production value changes, this test fails
+    and forces a deliberate update to both places.
+    """
+
+    def test_prescribing_silence_ttl_matches_production(self) -> None:
+        """Local PRESCRIBING_SILENCE_TTL_SECONDS must equal the value in steward-heartbeat.py."""
+        production_file = REPO_ROOT / "scheduled-tasks" / "steward-heartbeat.py"
+        assert production_file.exists(), f"Production file not found: {production_file}"
+
+        source = production_file.read_text()
+        tree = ast.parse(source)
+
+        production_value: int | None = None
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == "PRESCRIBING_SILENCE_TTL_SECONDS"
+                and node.value is not None
+            ):
+                production_value = ast.literal_eval(node.value)
+                break
+
+        assert production_value is not None, (
+            "PRESCRIBING_SILENCE_TTL_SECONDS not found in steward-heartbeat.py — "
+            "was it renamed or removed?"
+        )
+        assert PRESCRIBING_SILENCE_TTL_SECONDS == production_value, (
+            f"Test constant ({PRESCRIBING_SILENCE_TTL_SECONDS}) does not match "
+            f"production value ({production_value}) in steward-heartbeat.py. "
+            "Update PRESCRIBING_SILENCE_TTL_SECONDS in this file to match."
         )
