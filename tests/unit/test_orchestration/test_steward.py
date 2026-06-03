@@ -4975,3 +4975,277 @@ class TestSelectPrescribedSkills:
         uow = self._make_uow(register="iterative-convergent")
         skills = self._call(uow, "crashed_no_output")
         assert skills.count("systematic-debugging") == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: Source issue closed → UoW marked complete
+#
+# Behavior under test:
+# When a UoW's source GitHub issue is already CLOSED, the Steward should
+# recognize the work as done regardless of reentry_posture. This prevents
+# the livelock where a UoW stuck in `prescribing_orphan` → `first_execution`
+# cycles indefinitely even though the source issue was already resolved.
+#
+# Named constant:
+#   ISSUE_CLOSED_STATE = "CLOSED"  (gh CLI returns uppercase)
+#
+# The check fires in _diagnose_uow after _assess_completion — issue_info.state
+# overrides is_complete when the issue is definitively closed.
+# ---------------------------------------------------------------------------
+
+#: GitHub state string returned by `gh issue view --json state` for closed issues.
+ISSUE_CLOSED_STATE = "CLOSED"
+
+#: GitHub state string returned by `gh issue view --json state` for open issues.
+ISSUE_OPEN_STATE = "OPEN"
+
+
+class TestSourceIssueClosedCompletion:
+    """
+    Tests for the source-issue-closed completion signal in _diagnose_uow.
+
+    When the source GitHub issue is already CLOSED, _diagnose_uow must override
+    is_complete to True regardless of reentry_posture — including when posture
+    is 'first_execution' (the normal livelock scenario).
+    """
+
+    CLOSED_ISSUE_INFO_FACTORY = staticmethod(lambda: None)  # set in each test via helper
+
+    def _make_closed_issue_info(self):
+        from src.orchestration.steward import IssueInfo
+        return IssueInfo(
+            status_code=200,
+            state=ISSUE_CLOSED_STATE,
+            labels=[],
+            body="This issue has been resolved.",
+            title="executor: implement UoW close-out protocol",
+        )
+
+    def _make_open_issue_info(self):
+        from src.orchestration.steward import IssueInfo
+        return IssueInfo(
+            status_code=200,
+            state=ISSUE_OPEN_STATE,
+            labels=[],
+            body="This issue is still open.",
+            title="Test issue",
+        )
+
+    def _make_uow(self, source_issue_number: int = 843, output_ref: str | None = None):
+        """Build a minimal UoW with a GitHub issue source."""
+        from src.orchestration.registry import UoW, UoWStatus
+        return UoW(
+            id=f"uow_test_{source_issue_number}",
+            status=UoWStatus.READY_FOR_STEWARD,
+            summary="executor: implement UoW close-out protocol",
+            source=f"github:issue/{source_issue_number}",
+            source_issue_number=source_issue_number,
+            created_at="2026-05-22T00:00:00+00:00",
+            updated_at="2026-06-03T00:00:00+00:00",
+            type="executable",
+            success_criteria="Close-out comment posted to source issue on UoW completion.",
+            steward_cycles=12,
+            output_ref=output_ref,
+        )
+
+    def test_closed_issue_with_first_execution_posture_is_complete(self):
+        """
+        When the source issue is CLOSED and reentry_posture is 'first_execution',
+        _diagnose_uow must return is_complete=True.
+
+        This is the primary livelock scenario: UoW was dispatched, the issue
+        got closed (by a previous execution or human), but the UoW recycled
+        as a prescribing_orphan with reentry_posture=first_execution. Without
+        the closed-issue check, the Steward loops forever.
+        """
+        steward = _import_steward()
+        uow = self._make_uow()
+        closed_issue_info = self._make_closed_issue_info()
+
+        # No audit entries → reentry_posture defaults to first_execution
+        diagnosis = steward._diagnose_uow(uow, audit_entries=[], issue_info=closed_issue_info)
+
+        assert diagnosis.is_complete is True, (
+            f"UoW with closed source issue must be diagnosed as complete. "
+            f"Got is_complete={diagnosis.is_complete}, "
+            f"completion_rationale={diagnosis.completion_rationale!r}"
+        )
+
+    def test_closed_issue_completion_rationale_mentions_issue_closed(self):
+        """
+        The completion_rationale must mention that the source issue is closed,
+        so the audit trail explains why the UoW was marked complete without
+        a result file.
+        """
+        steward = _import_steward()
+        uow = self._make_uow()
+        closed_issue_info = self._make_closed_issue_info()
+
+        diagnosis = steward._diagnose_uow(uow, audit_entries=[], issue_info=closed_issue_info)
+
+        assert "closed" in diagnosis.completion_rationale.lower(), (
+            f"completion_rationale must mention the issue is closed. "
+            f"Got: {diagnosis.completion_rationale!r}"
+        )
+
+    def test_open_issue_with_first_execution_posture_is_not_complete(self):
+        """
+        When the source issue is OPEN and reentry_posture is 'first_execution',
+        _diagnose_uow must return is_complete=False (existing behavior preserved).
+
+        This ensures we don't regress the normal new-UoW path.
+        """
+        steward = _import_steward()
+        uow = self._make_uow()
+        open_issue_info = self._make_open_issue_info()
+
+        diagnosis = steward._diagnose_uow(uow, audit_entries=[], issue_info=open_issue_info)
+
+        assert diagnosis.is_complete is False, (
+            f"UoW with open source issue and first_execution posture must NOT be complete. "
+            f"Got is_complete={diagnosis.is_complete}"
+        )
+
+    def test_none_issue_info_with_first_execution_posture_is_not_complete(self):
+        """
+        When issue_info is None (non-GitHub source or GitHub fetch failed),
+        the closed-issue check must not fire — is_complete remains False for
+        first_execution posture.
+        """
+        steward = _import_steward()
+        uow = self._make_uow()
+
+        diagnosis = steward._diagnose_uow(uow, audit_entries=[], issue_info=None)
+
+        assert diagnosis.is_complete is False, (
+            "is_complete must be False when issue_info is None and posture is first_execution"
+        )
+
+    def test_closed_issue_marks_uow_done_in_steward_cycle(self, db_path, registry, tmp_path):
+        """
+        Integration: when the source GitHub issue is CLOSED, run_steward_cycle
+        must transition the UoW to 'done' rather than re-prescribing.
+
+        This directly tests the fix for the 12-cycle livelock scenario.
+        Uses steward_cycles=3 (below hard-cap) so the closed-issue signal is
+        the deciding factor — not the hard cap.
+        """
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=3,  # below _HARD_CAP_CYCLES=9 — closed-issue signal is decisive
+            source_issue_number=843,
+            output_ref=None,
+            # No audit entries with execution_complete → reentry_posture=first_execution
+            audit_log_entries=[],
+        )
+        conn.close()
+
+        def mock_github_client_closed(issue_number):
+            return _make_closed_issue_info_for_test()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=mock_github_client_closed,
+            artifact_dir=tmp_path / "artifacts",
+            llm_prescriber=None,
+        )
+
+        uow = _get_uow(db_path, uow_id)
+        assert uow["status"] == "done", (
+            f"UoW with closed source issue must transition to 'done'. "
+            f"Got status={uow['status']!r}"
+        )
+
+    def test_open_issue_does_not_close_uow_in_steward_cycle(self, db_path, registry, tmp_path):
+        """
+        When the source GitHub issue is OPEN and posture is first_execution,
+        run_steward_cycle must prescribe the UoW (not close it).
+
+        This verifies the open-issue path is unaffected.
+        """
+        _ensure_registry_has_phase2_methods(registry)
+        steward = _import_steward()
+
+        conn = _open_db(db_path)
+        uow_id = _make_uow_row(
+            conn,
+            status="ready-for-steward",
+            steward_cycles=0,
+            source_issue_number=999,
+            output_ref=None,
+        )
+        conn.close()
+
+        steward.run_steward_cycle(
+            registry=registry,
+            dry_run=False,
+            github_client=_mock_github_client_open,
+            artifact_dir=tmp_path / "artifacts",
+            llm_prescriber=None,
+        )
+
+        uow = _get_uow(db_path, uow_id)
+        assert uow["status"] != "done", (
+            f"UoW with open source issue must NOT be closed. "
+            f"Got status={uow['status']!r}"
+        )
+
+
+    def test_closed_issue_overrides_hard_cap_to_close_cleanly(self):
+        """
+        When the source issue is CLOSED and steward_cycles exceeds _HARD_CAP_CYCLES,
+        the closed-issue signal must override the hard cap to close the UoW as
+        'done' rather than surfacing to Dan.
+
+        Rationale: the hard cap prevents infinite LLM loops, but a closed issue is
+        definitive evidence the work is done. Surfacing a closed-issue UoW to Dan
+        would be noise — the issue is already resolved.
+        """
+        steward = _import_steward()
+        # steward_cycles above hard cap (9)
+        uow = self._make_uow()
+        # Force high lifetime_cycles by building UoW with explicit value
+        from src.orchestration.registry import UoW, UoWStatus
+        uow_over_cap = UoW(
+            id="uow_test_overcap",
+            status=UoWStatus.READY_FOR_STEWARD,
+            summary="executor: implement UoW close-out protocol",
+            source="github:issue/843",
+            source_issue_number=843,
+            created_at="2026-05-22T00:00:00+00:00",
+            updated_at="2026-06-03T00:00:00+00:00",
+            type="executable",
+            success_criteria="Close-out comment posted.",
+            steward_cycles=12,
+            lifetime_cycles=12,
+            output_ref=None,
+        )
+        closed_issue_info = self._make_closed_issue_info()
+
+        diagnosis = steward._diagnose_uow(
+            uow_over_cap, audit_entries=[], issue_info=closed_issue_info
+        )
+
+        assert diagnosis.is_complete is True, (
+            f"Closed source issue must override hard_cap: is_complete should be True. "
+            f"Got is_complete={diagnosis.is_complete}, "
+            f"completion_rationale={diagnosis.completion_rationale!r}"
+        )
+
+
+def _make_closed_issue_info_for_test():
+    """Build a closed IssueInfo for test helpers that need a plain function."""
+    from src.orchestration.steward import IssueInfo
+    return IssueInfo(
+        status_code=200,
+        state=ISSUE_CLOSED_STATE,
+        labels=[],
+        body="This issue has been resolved.",
+        title="executor: implement UoW close-out protocol",
+    )
