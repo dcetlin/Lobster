@@ -312,6 +312,31 @@ Never use cron for user-space jobs. Never use systemd tools for system-level inf
 
   **Decision rule:** If the job would run identically regardless of which LLM model responds, and it runs more frequently than every 15 minutes, prefer Type B.
 
+### Staleness gate for file-scanning scorers
+
+Type A jobs that scan a file on a schedule (e.g. philosophy-discovery-scorer) must
+call the staleness gate at the top of their run, before any LLM/inference call. If
+the target file has not changed since the last scan, the job should exit immediately
+with `write_task_output(..., status="success")` — no LLM call.
+
+```python
+# Reference pattern — add to the task prompt as Step 0, before any scoring:
+from src.utils.staleness_gate import file_changed, record_scan
+
+if not file_changed(target_file, job_name="my-scorer"):
+    write_task_output(job_name="my-scorer", output="<file> unchanged — skipped (heat).", status="success")
+    return  # exit without any LLM call
+
+# ... run scoring ...
+
+record_scan(target_file, job_name="my-scorer")  # update baseline after successful scan
+```
+
+The gate uses SHA-256 content hashes (not mtime) and persists records in
+`~/lobster-workspace/data/staleness-records.json`. See `src/utils/staleness_gate.py`
+for the full API. The record store is created on first use and tolerates a missing or
+corrupt file (treats as "no record" → proceed with scoring).
+
 - **Long-running services** (dispatcher, MCP servers, Telegram bot, health daemons): These are processes, not jobs. Systemd is the right tool here when/if Lobster moves to fully-automated operation. Not part of the job type taxonomy.
 
 ## Key Directories
