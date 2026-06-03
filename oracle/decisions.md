@@ -433,3 +433,42 @@ agent instead of spawning an oracle review agent directly. Non-WOS PRs fall thro
 to the existing review agent path unchanged. This is a durable behavioral default
 change anchored to vision.yaml principle-3 and principle-4. See the full decision
 file for constraint-3 authorization and vision anchors.
+
+---
+
+## ADR-009: Mandatory golden-patterns.md Read in Subagent Bootup — Encoded Orientation Behavioral Default
+
+**Date:** 2026-06-03
+**Status:** Accepted
+**PR:** #1395 (docs(bootup): require subagents to read golden-patterns.md before code work)
+**WOS Reference:** uow_20260603_6ec5f5
+
+### Context
+
+PR #1395 added a "Golden Patterns" mandatory read directive to `.claude/sys.subagent.bootup.md`. Every subagent session now reads `~/lobster/oracle/golden-patterns.md` before writing or modifying any code. The patterns file encodes hard-won structural lessons: StrEnum discipline, dead-code analysis scope (grep full repo, not just one directory), and canonical placement principles. These lessons caused latent bugs when ignored.
+
+Without a read directive in the bootup file, subagents had no reliable path to the file across session boundaries and context compactions — it existed but was never referenced in the startup sequence. The oracle PR #1395 verdict identified this as a constraint-3 gap: the change establishes a durable behavioral default without a logged decision authorizing it as Encoded Orientation. This ADR closes the gap.
+
+### What Changed
+
+`.claude/sys.subagent.bootup.md` now contains a "Golden Patterns" section early in the startup sequence (immediately after the user-context files block). The read is mandatory, not advisory. The `golden-patterns.md` file itself is not modified by this PR.
+
+### Why This Is an Encoded Orientation Decision
+
+The mandatory read directive fires on every subagent session without Dan's real-time input. Per constraint-3: Encoded Orientation decisions require (a) a prior logged decision of the same class and (b) a traceable vision.yaml anchor. ADR-007 (developmental register injection into `_llm_prescribe`) establishes the pattern: durable prompt-layer injection without per-session authorization. The golden-patterns read directive is the same class.
+
+### Vision Anchor
+
+**Primary:** `core.operating_principles.principle-1` — "Proactive resilience over reactive recovery. Structural prevention is preferred over better correction mechanisms."
+
+Requiring subagents to read hard-won structural lessons at session start is structural prevention: it prevents a class of latent bugs (StrEnum misuse, narrow dead-code analysis, canonical placement violations) that would otherwise require reactive correction after PR review. The mandatory read is cheaper than the correction path.
+
+**Secondary:** `core.inviolable_constraints.constraint-2` — "Every agent decision that touches Dan's priorities must be traceable to a specific field in the Vision Object or a logged open decision — not inferred from conversational texture."
+
+The golden-patterns.md file encodes decisions already made about structural quality standards. Making it a required read operationalizes constraint-2: agents read the logged standards rather than inferring quality from conversational texture.
+
+### Rationale
+
+The patterns represent hard-won structural lessons that have caused actual bugs when ignored. A prose reminder in meeting notes is not sufficient — the lessons must be structurally present in context at the point where code work begins. The bootup directive is the minimum-friction mechanism.
+
+Long-term direction: as these patterns mature, the goal is for them to become self-documenting at the structural level — embedded in types, conventions, and tests rather than requiring a separate required-read file. This ADR explicitly names the bootup directive as a transitional mechanism, not a permanent design.
