@@ -51,6 +51,15 @@ These issues are absorbed as sub-tasks of this architectural interface; their
 implementations will register checks here rather than adding per-type logic to
 the dispatch core.
 
+Type key derivation
+-------------------
+``is_still_needed`` uses ``_derive_preflight_key(uow)`` rather than the raw
+``type`` attribute to determine which check function to call.  This allows
+semantic sub-types (e.g. "merge-pr") to be derived from other UoW fields:
+
+- UoWs with ``source_ref`` starting with ``"github:pr/"`` → key "merge-pr".
+- All other UoWs → key from ``str(uow.type)`` (backwards-compatible default).
+
 Public API
 ----------
 ``is_still_needed(uow: UoW) -> bool``
@@ -60,6 +69,9 @@ Public API
     Register a type-specific check.  Idempotent: re-registering the same type
     overwrites the previous entry (useful for tests and hot-reloading).
 
+``_derive_preflight_key(uow: object) -> str``
+    Private helper used by ``is_still_needed``. Exported for test access.
+
 ``PreflightCheck``
     Protocol type: ``(uow: UoW) -> bool``.
 """
@@ -67,6 +79,7 @@ Public API
 from __future__ import annotations
 
 import logging
+import subprocess as _subprocess
 from typing import Protocol, runtime_checkable
 
 log = logging.getLogger("wos_preflight")
@@ -149,6 +162,99 @@ def _default_check(uow: object) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Key derivation
+# ---------------------------------------------------------------------------
+
+def _derive_preflight_key(uow: object) -> str:
+    """
+    Derive the preflight registry key for a UoW.
+
+    Most UoWs use str(uow.type) directly. The exception is UoWs whose
+    source_ref starts with "github:pr/" — these represent PRs to merge and
+    use the semantic key "merge-pr" regardless of their .type field.
+
+    This indirection lets is_still_needed dispatch to the merge-pr check
+    without requiring a dedicated UoWType enum value.
+    """
+    source_ref: str = getattr(uow, "source_ref", "") or ""
+    if source_ref.startswith("github:pr/"):
+        return "merge-pr"
+    uow_type: str = str(getattr(uow, "type", "") or "")
+    return uow_type
+
+
+# ---------------------------------------------------------------------------
+# Merge-pr idempotency check (issue #927)
+# ---------------------------------------------------------------------------
+
+def _check_merge_pr(uow: object) -> bool:
+    """
+    Pre-flight check for merge-pr UoWs.
+
+    Extracts the PR number from uow.source_ref ("github:pr/<number>"),
+    calls ``gh pr view <number> --repo <repo> --json state``, and returns
+    False (work no longer needed) when state == "MERGED".
+
+    Fail-open: any gh failure, parse error, or missing field returns True
+    so the executor proceeds with dispatch rather than silently suppressing
+    a legitimate merge.
+
+    The repo is read from the LOBSTER_WOS_REPO environment variable
+    (default: "dcetlin/Lobster").
+    """
+    import json as _json
+    import os as _os
+
+    source_ref: str = getattr(uow, "source_ref", "") or ""
+    if not source_ref.startswith("github:pr/"):
+        return True
+    try:
+        pr_number = int(source_ref.split("/")[-1])
+    except (ValueError, IndexError):
+        log.warning(
+            "_check_merge_pr: could not parse PR number from source_ref=%r — fail-open",
+            source_ref,
+        )
+        return True
+
+    repo = _os.environ.get("LOBSTER_WOS_REPO", "dcetlin/Lobster")
+    try:
+        result = _subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--repo", repo, "--json", "state"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            log.warning(
+                "_check_merge_pr: gh pr view failed for PR #%d (exit %d) — fail-open",
+                pr_number, result.returncode,
+            )
+            return True
+        data = _json.loads(result.stdout)
+        state = data.get("state", "")
+        if state == "MERGED":
+            log.info(
+                "_check_merge_pr: PR #%d is already MERGED — short-circuiting dispatch (heat)",
+                pr_number,
+            )
+            return False
+        return True
+    except Exception as exc:
+        log.warning(
+            "_check_merge_pr: error checking PR #%d state — %s: %s — fail-open",
+            pr_number, type(exc).__name__, exc,
+        )
+        return True
+
+
+# Register the merge-pr idempotency check (issue #927).
+# Must be registered at module load time so the executor's is_still_needed
+# call picks it up without requiring any additional wiring.
+register_preflight_check("merge-pr", _check_merge_pr)
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -176,15 +282,15 @@ def is_still_needed(uow: object) -> bool:
         A failing check must not block dispatch — the executor must proceed
         unless explicitly told the work is not needed.
     """
-    uow_type: str = getattr(uow, "type", "") or ""
-    check_fn = _REGISTRY.get(uow_type, _default_check)
+    uow_key: str = _derive_preflight_key(uow)
+    check_fn = _REGISTRY.get(uow_key, _default_check)
 
     try:
         result = check_fn(uow)
     except Exception as exc:
         log.warning(
-            "wos_preflight: check for uow_type=%r raised %s: %s — defaulting to True (fail-open)",
-            uow_type,
+            "wos_preflight: check for key=%r raised %s: %s — defaulting to True (fail-open)",
+            uow_key,
             type(exc).__name__,
             exc,
         )
