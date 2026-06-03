@@ -3455,6 +3455,155 @@ class Registry:
             conn.close()
 
     # -----------------------------------------------------------------------
+    # Prescribing-state heartbeat-silence TTL (issue #1388)
+    # -----------------------------------------------------------------------
+
+    def get_stale_prescribing_uows(
+        self,
+        stale_after_seconds: int = 1800,
+    ) -> list["UoW"]:
+        """
+        Return UoWs in `prescribing` state whose heartbeat has been silent
+        for at least stale_after_seconds (default: 1800 s / 30 minutes).
+
+        A UoW is eligible when:
+        1. status = 'prescribing'
+        2. heartbeat_at IS NOT NULL and (now - heartbeat_at) > stale_after_seconds
+           — agent was alive but has since gone silent (auth outage, kill, partition)
+           OR heartbeat_at IS NULL and (now - updated_at) > stale_after_seconds
+           — no heartbeat was ever written and the UoW has been prescribing
+             for longer than the threshold (startup_sweep handles <660s cases)
+
+        Two staleness paths:
+        1. heartbeat_at IS NOT NULL and (now - heartbeat_at) > stale_after_seconds:
+           The prescription subagent was alive and writing heartbeats but has since
+           gone silent — auth outage, process kill, network partition.
+        2. heartbeat_at IS NULL and (now - updated_at) > stale_after_seconds:
+           The UoW entered prescribing but no heartbeat was ever written. The startup
+           sweep handles fresh NULL-heartbeat UoWs at 660 s (prescribing_orphan_threshold);
+           this method handles the longer 30-minute window for UoWs the startup sweep
+           did not yet reach or that recovered from a prior reset without writing heartbeats.
+
+        Contrast with get_stale_heartbeat_uows() (active/executing path):
+        - That method uses heartbeat_ttl + buffer_seconds per-UoW threshold.
+        - This method uses a single fixed stale_after_seconds for all prescribing
+          UoWs, because prescription subagents write heartbeats on a different
+          cadence and heartbeat_ttl is not set at prescribing transition time.
+
+        Args:
+            stale_after_seconds: Minimum silence threshold in seconds. Default 1800.
+
+        Returns:
+            List of UoW objects that are stale in prescribing state (may be empty).
+        """
+        conn = self._connect()
+        try:
+            now = _now_iso()
+            rows = conn.execute(
+                """
+                SELECT * FROM uow_registry
+                WHERE status = 'prescribing'
+                  AND (
+                    (
+                      heartbeat_at IS NOT NULL
+                      AND CAST(
+                            (julianday(?) - julianday(heartbeat_at)) * 86400 AS INTEGER
+                          ) > ?
+                    )
+                    OR (
+                      heartbeat_at IS NULL
+                      AND CAST(
+                            (julianday(?) - julianday(updated_at)) * 86400 AS INTEGER
+                          ) > ?
+                    )
+                  )
+                ORDER BY COALESCE(heartbeat_at, updated_at) ASC
+                """,
+                (now, stale_after_seconds, now, stale_after_seconds),
+            ).fetchall()
+            return [self._row_to_uow(r) for r in rows]
+        finally:
+            conn.close()
+
+    def record_prescribing_silence_reset(
+        self,
+        uow_id: str,
+        heartbeat_at: str | None,
+        silence_seconds: float,
+    ) -> int:
+        """
+        Atomically write a `heartbeat_silence_ttl` audit entry and transition
+        a UoW from `prescribing` to `ready-for-steward`.
+
+        Called by the steward heartbeat's prescribing-silence recovery loop
+        when get_stale_prescribing_uows() identifies a stale prescribing UoW.
+
+        Follows the same optimistic-lock + audit pattern used throughout the
+        registry (Principle 1: no silent transitions):
+        - UPDATE uses WHERE status = 'prescribing' as the optimistic lock.
+        - Audit INSERT is written in the same transaction only if rows == 1.
+        - Returns 1 on success, 0 if another component already advanced this
+          UoW (race-safe — no duplicate audit entry written).
+
+        The audit entry uses event='heartbeat_silence_ttl' with a structured
+        note payload so the steward's re-entry classifier and human operators
+        can distinguish this recovery reason from other ready-for-steward
+        transitions (e.g. stall_detected, startup_sweep, execution_complete).
+
+        Args:
+            uow_id: The UoW identifier.
+            heartbeat_at: Last known heartbeat_at timestamp (may be None).
+            silence_seconds: Computed silence duration in seconds (for audit note).
+
+        Returns:
+            1 if the transition succeeded; 0 on race (UoW already advanced).
+        """
+        now = _now_iso()
+        note_payload = json.dumps({
+            "event": "heartbeat_silence_ttl",
+            "actor": "steward_heartbeat",
+            "uow_id": uow_id,
+            "reason": "heartbeat_silence_ttl",
+            "heartbeat_at": heartbeat_at,
+            "silence_seconds": silence_seconds,
+            "timestamp": now,
+        })
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            cursor = conn.execute(
+                """
+                UPDATE uow_registry
+                SET status = 'ready-for-steward', updated_at = ?
+                WHERE id = ? AND status = 'prescribing'
+                """,
+                (now, uow_id),
+            )
+            rows_affected = cursor.rowcount
+
+            if rows_affected == 1:
+                conn.execute(
+                    """
+                    INSERT INTO audit_log
+                        (ts, uow_id, event, from_status, to_status, agent, note)
+                    VALUES (?, ?, 'heartbeat_silence_ttl', 'prescribing',
+                            'ready-for-steward', 'steward_heartbeat', ?)
+                    """,
+                    (now, uow_id, note_payload),
+                )
+
+            conn.commit()
+            return rows_affected
+
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    # -----------------------------------------------------------------------
     # Time-window query (used by registry_cli report command)
     # -----------------------------------------------------------------------
 

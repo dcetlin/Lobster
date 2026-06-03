@@ -95,6 +95,12 @@ log = logging.getLogger("steward-heartbeat")
 _DEFAULT_STALL_SECONDS = 1800  # 30 minutes fallback when timeout_at is NULL
 HIGH_PRESCRIPTION_THRESHOLD = 10  # Alert when prescriptions per cycle exceeds this (#618)
 
+# Heartbeat-silence TTL for prescribing UoWs (issue #1388).
+# A UoW stuck in prescribing with no heartbeat for this many seconds is
+# automatically reset to ready-for-steward with a heartbeat_silence_ttl audit event.
+# 30 minutes balances recovery latency against false positives for long prescriptions.
+PRESCRIBING_SILENCE_TTL_SECONDS: int = 1800
+
 # Failure-traces cleanup caps (issue #947)
 TRACES_DIR: Path = Path(
     os.environ.get("LOBSTER_WORKSPACE", str(Path.home() / "lobster-workspace"))
@@ -251,6 +257,14 @@ class ObservationResult:
 @dataclass(frozen=True, slots=True)
 class HeartbeatStallResult:
     """Pure result value returned by recover_stale_heartbeat_uows."""
+    checked: int
+    recovered: int
+    skipped_dry_run: int
+
+
+@dataclass(frozen=True, slots=True)
+class PrescribingSilenceResult:
+    """Pure result value returned by recover_stale_prescribing_uows (issue #1388)."""
     checked: int
     recovered: int
     skipped_dry_run: int
@@ -671,6 +685,114 @@ def recover_stale_heartbeat_uows(
             )
 
     return HeartbeatStallResult(
+        checked=len(stale_uows),
+        recovered=recovered,
+        skipped_dry_run=skipped_dry_run,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prescribing-state heartbeat-silence recovery (issue #1388)
+# ---------------------------------------------------------------------------
+
+def recover_stale_prescribing_uows(
+    registry,
+    dry_run: bool = False,
+    ttl_seconds: int = PRESCRIBING_SILENCE_TTL_SECONDS,
+) -> PrescribingSilenceResult:
+    """
+    Scan for prescribing UoWs whose heartbeat has been silent for ttl_seconds
+    and reset them to ready-for-steward.
+
+    Called in the observation phase alongside recover_stale_heartbeat_uows.
+    This handles UoWs stuck in `prescribing` — a state entered when the steward
+    dispatches an async LLM prescription subagent. If the subagent stops writing
+    heartbeats (auth outage, process kill, network partition), the UoW can remain
+    in `prescribing` indefinitely.
+
+    Staleness condition:
+    - status = 'prescribing'
+    - heartbeat_at IS NULL (subagent never started)
+      OR (now - heartbeat_at) > ttl_seconds
+
+    Recovery action: transition to 'ready-for-steward' via
+    record_prescribing_silence_reset(), which writes a heartbeat_silence_ttl
+    audit entry. The steward's re-entry classifier treats the UoW as a fresh
+    prescription candidate on re-entry.
+
+    Healthy long-running prescriptions that write periodic heartbeats are NOT
+    reset — only genuinely silent UoWs trigger recovery. This prevents false
+    positives for prescriptions that legitimately take 60–90+ minutes.
+
+    In dry_run mode: detects stale UoWs but does NOT write audit entries or
+    transition status. Returns detected count in skipped_dry_run.
+
+    Args:
+        registry: Registry instance.
+        dry_run: If True, detect only — no state transitions.
+        ttl_seconds: Heartbeat silence threshold in seconds. Default 1800 (30 min).
+
+    Returns:
+        PrescribingSilenceResult(checked, recovered, skipped_dry_run).
+    """
+    try:
+        stale_uows = registry.get_stale_prescribing_uows(stale_after_seconds=ttl_seconds)
+    except Exception as e:
+        log.warning("Prescribing-silence recovery: failed to query stale UoWs — %s", e)
+        return PrescribingSilenceResult(checked=0, recovered=0, skipped_dry_run=0)
+
+    recovered = 0
+    skipped_dry_run = 0
+
+    for uow in stale_uows:
+        uow_id = uow.id
+        heartbeat_at = uow.heartbeat_at
+
+        # Compute silence duration for logging.
+        silence_seconds: float = 0.0
+        try:
+            if heartbeat_at:
+                silence_seconds = (_utc_now() - _parse_iso(heartbeat_at)).total_seconds()
+        except (ValueError, TypeError):
+            pass
+
+        if dry_run:
+            log.info(
+                "Prescribing-silence (DRY RUN): UoW %s would be reset to ready-for-steward "
+                "(heartbeat_at=%s, silence=%.0fs, ttl=%ds)",
+                uow_id, heartbeat_at, silence_seconds, ttl_seconds,
+            )
+            skipped_dry_run += 1
+            continue
+
+        try:
+            rows = registry.record_prescribing_silence_reset(
+                uow_id=uow_id,
+                heartbeat_at=heartbeat_at,
+                silence_seconds=silence_seconds,
+            )
+        except Exception as e:
+            log.warning(
+                "Prescribing-silence recovery: failed to reset UoW %s — %s",
+                uow_id, e,
+            )
+            continue
+
+        if rows == 1:
+            recovered += 1
+            log.info(
+                "Prescribing-silence recovery: auto-reset UoW %s from prescribing to "
+                "ready-for-steward (heartbeat_silence_ttl, silence=%.0fs, ttl=%ds)",
+                uow_id, silence_seconds, ttl_seconds,
+            )
+        else:
+            log.debug(
+                "Prescribing-silence recovery: race on UoW %s — already advanced by "
+                "another component (rows_affected=0)",
+                uow_id,
+            )
+
+    return PrescribingSilenceResult(
         checked=len(stale_uows),
         recovered=recovered,
         skipped_dry_run=skipped_dry_run,
@@ -1270,6 +1392,23 @@ def _main_inner() -> int:
         )
     except Exception:
         log.exception("Sidecar-masked detection failed — continuing to Steward main loop")
+
+    # Phase 2b-iii: Prescribing-state heartbeat-silence recovery (issue #1388).
+    # Detects UoWs stuck in prescribing with no heartbeat for PRESCRIBING_SILENCE_TTL_SECONDS.
+    # Complements Phase 2b (active/executing heartbeat stall recovery): that path handles
+    # UoWs in active/executing; this path handles UoWs in prescribing that stop heartbeating
+    # due to auth outages, process kills, or network partitions.
+    log.info("--- Phase 2b-iii: Prescribing-silence recovery ---")
+    try:
+        prescribing_result = recover_stale_prescribing_uows(registry, dry_run=dry_run)
+        log.info(
+            "Prescribing-silence recovery complete: %d checked, %d recovered, "
+            "%d skipped (dry-run)",
+            prescribing_result.checked, prescribing_result.recovered,
+            prescribing_result.skipped_dry_run,
+        )
+    except Exception:
+        log.exception("Prescribing-silence recovery failed — continuing to Steward main loop")
 
     # Phase 2c: Stuck-agent detection — progress governor (migration 0017, issue #994).
     # Agents that write heartbeats while consuming no tokens are alive but not progressing.
