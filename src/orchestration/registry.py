@@ -786,6 +786,34 @@ class Registry:
                     trigger_message_id,
                 ),
             )
+
+            # Mechanism 1: soft vision_ref gate (issue #689 — Vision Object commitment device).
+            # vision_ref is written by the issue-sweeper after UoW creation (not available at
+            # upsert time). Record a warning-only audit entry so the alignment gap is visible
+            # in the audit log. This is a soft gate: execution is not blocked.
+            # A UoW without a vision_ref is "less aligned" — the audit trail makes that
+            # explicit without adding pipeline friction for incomplete vision.yaml coverage.
+            conn.execute(
+                """
+                INSERT INTO audit_log (ts, uow_id, event, note)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    now,
+                    uow_id,
+                    "vision_ref_missing",
+                    json.dumps({
+                        "event": "vision_ref_missing",
+                        "note": (
+                            "UoW proposed without vision_ref — not aligned to a vision field. "
+                            "vision_ref is written by the issue-sweeper after germination; "
+                            "this entry records the alignment gap at creation time."
+                        ),
+                        "timestamp": now,
+                    }),
+                ),
+            )
+
             conn.commit()
             return UpsertInserted(id=uow_id)
 
