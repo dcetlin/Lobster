@@ -1961,6 +1961,12 @@ def _parse_workflow_artifact(raw_text: str) -> dict:
 
     success_criteria_check = front_matter.get("success_criteria_check", "")
 
+    raw_max_turns = front_matter.get("max_turns", "")
+    try:
+        max_turns: int | None = int(raw_max_turns) if raw_max_turns else None
+    except (TypeError, ValueError):
+        max_turns = None
+
     # Preserve the prose body exactly — strip only the leading blank line that
     # typically follows the closing --- delimiter.
     instructions = "\n".join(prose_lines).strip()
@@ -1970,6 +1976,7 @@ def _parse_workflow_artifact(raw_text: str) -> dict:
         "estimated_cycles": estimated_cycles,
         "success_criteria_check": success_criteria_check,
         "instructions": instructions,
+        "max_turns": max_turns,
     }
 
 
@@ -4185,6 +4192,7 @@ def _write_workflow_artifact(
     prescribed_skills: list[str],
     artifact_dir: Path | None = None,
     executor_type: str = _EXECUTOR_TYPE_GENERAL,
+    max_turns: int | None = None,
 ) -> str:
     """
     Write a WorkflowArtifact to disk in front-matter + prose format (.md).
@@ -4196,6 +4204,7 @@ def _write_workflow_artifact(
     Returns the absolute path to the written file.
     artifact_dir: override for the artifact directory (used in tests).
     executor_type: the executor type to embed in the artifact (defaults to general).
+    max_turns: optional turn cap to embed in the artifact (None means use executor-type default).
     """
     from orchestration.workflow_artifact import WorkflowArtifact, to_frontmatter
     artifact = WorkflowArtifact(
@@ -4205,6 +4214,8 @@ def _write_workflow_artifact(
         prescribed_skills=prescribed_skills,
         instructions=instructions,
     )
+    if max_turns is not None:
+        artifact["max_turns"] = max_turns
     artifact_text = to_frontmatter(artifact)
 
     if artifact_dir is not None:

@@ -91,11 +91,18 @@ def main() -> int:
         default="[]",
         help="JSON array of prescribed skill names",
     )
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=None,
+        help="Turn cap to embed in artifact (overrides parsed value from prescription front-matter)",
+    )
     args = parser.parse_args()
 
     uow_id = args.uow_id
     new_cycles = args.new_cycles
     selected_executor_type = args.executor_type
+    cli_max_turns: int | None = args.max_turns
 
     try:
         prescribed_skills = json.loads(args.prescribed_skills)
@@ -157,6 +164,10 @@ def main() -> int:
         _reset_to_ready_for_steward(uow_id)
         return 1
 
+    # Resolve max_turns: CLI arg takes priority over the parsed prescription front-matter value.
+    parsed_max_turns: int | None = parsed.get("max_turns")
+    effective_max_turns: int | None = cli_max_turns if cli_max_turns is not None else parsed_max_turns
+
     # Write WorkflowArtifact to disk.
     artifact_dir = Path(os.path.expanduser("~/lobster-workspace/orchestration/artifacts"))
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -168,6 +179,7 @@ def main() -> int:
             prescribed_skills=prescribed_skills,
             artifact_dir=artifact_dir,
             executor_type=selected_executor_type,
+            max_turns=effective_max_turns,
         )
         log.info("wos-write-artifact: WorkflowArtifact written at %s", artifact_path)
     except Exception as exc:
