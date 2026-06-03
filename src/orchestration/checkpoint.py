@@ -7,6 +7,7 @@ Checkpoint files live at:
 Schema (full spec, compatible with startup_sweep._read_checkpoint reader):
 {
   "uow_id": str,
+  "subagent_session_id": str,
   "checkpoint_version": 1,
   "written_at": str (ISO-8601 UTC),
   "steps": [{"index": int, "name": str, "status": str, "completed_at": str, "artifacts": dict}],
@@ -39,6 +40,7 @@ class StepRecord(TypedDict):
 
 class CheckpointData(TypedDict):
     uow_id: str
+    subagent_session_id: str
     checkpoint_version: int
     written_at: str
     steps: list[StepRecord]
@@ -100,6 +102,7 @@ def write_checkpoint(
     uow_id: str,
     steps: list[StepRecord],
     next_step_index: int,
+    subagent_session_id: str = "",
     next_step_name: str = "",
     completion_fraction: float = 0.0,
     notes: str = "",
@@ -117,6 +120,9 @@ def write_checkpoint(
         steps: List of step records. Each completed step should have
             status='complete', a non-empty completed_at, and an artifacts dict.
         next_step_index: Index of the next step to execute (0-based).
+        subagent_session_id: Claude Code session UUID of the writing subagent.
+            Used by the reconciler to distinguish checkpoints written by
+            different sessions on the same UoW.
         next_step_name: Name of the next step (human-readable, for audit notes).
         completion_fraction: Fraction of work complete (0.0–1.0).
         notes: Free-form notes for the Steward (e.g. last known state).
@@ -126,6 +132,7 @@ def write_checkpoint(
     now_iso = datetime.now(timezone.utc).isoformat()
     data: CheckpointData = {
         "uow_id": uow_id,
+        "subagent_session_id": subagent_session_id,
         "checkpoint_version": 1,
         "written_at": now_iso,
         "steps": steps,

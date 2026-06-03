@@ -38,6 +38,7 @@ for _p in (_SRC, _SCHEDULED_TASKS):
 from orchestration.checkpoint import (  # noqa: E402
     CHECKPOINT_SCHEMA_VERSION,
     _write_checkpoint_atomic,
+    write_checkpoint,
 )
 
 # startup_sweep._read_checkpoint has a different signature (takes a path string
@@ -153,3 +154,36 @@ class TestCheckpointSchemaVersion:
     def test_schema_version_is_1(self):
         """CHECKPOINT_SCHEMA_VERSION must equal 1."""
         assert CHECKPOINT_SCHEMA_VERSION == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests for write_checkpoint — subagent_session_id field
+# ---------------------------------------------------------------------------
+
+
+class TestWriteCheckpointSubagentSessionId:
+    """Verify write_checkpoint writes subagent_session_id into the checkpoint file."""
+
+    def test_subagent_session_id_written_to_file(self, tmp_path: Path, monkeypatch):
+        """write_checkpoint must include subagent_session_id in the checkpoint JSON."""
+        import src.orchestration.paths as paths_mod
+
+        monkeypatch.setattr(
+            paths_mod,
+            "CHECKPOINTS_DIR",
+            tmp_path,
+        )
+        # Re-import checkpoint_path after monkeypatching so it picks up the patched dir.
+        import importlib
+        import orchestration.checkpoint as cp_mod
+        importlib.reload(cp_mod)
+
+        session_id = "test-session-uuid-1234"
+        path = cp_mod.write_checkpoint(
+            uow_id="uow_test_session",
+            steps=[],
+            next_step_index=0,
+            subagent_session_id=session_id,
+        )
+        written = json.loads(path.read_text())
+        assert written["subagent_session_id"] == session_id
