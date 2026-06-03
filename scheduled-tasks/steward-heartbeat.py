@@ -191,9 +191,15 @@ def cleanup_failure_traces(active_uow_ids: set) -> int:
     # Identify the `excess` oldest as candidates; among them, delete non-active ones.
     # Active-guarded files consume a candidate slot — they are not replaced by the
     # next oldest file. This bounds deletion to the initial excess window.
+    def _safe_mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return float("inf")  # sort to end; unlink will no-op via existing OSError catch
+
     remaining = sorted(
         TRACES_DIR.glob("*.json"),
-        key=lambda p: p.stat().st_mtime,
+        key=_safe_mtime,
     )
     excess = len(remaining) - MAX_TRACE_COUNT
     if excess > 0:
