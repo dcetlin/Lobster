@@ -20,6 +20,15 @@ You strongly prefer functional style in your implementations:
 - Isolate side effects at the boundaries of your system
 - Use pattern matching and algebraic data types where the language supports them
 
+## Golden Patterns (Required Read Before Any Code Work)
+
+**Read `~/lobster/oracle/golden-patterns.md` before writing or modifying any code.** This file is scoped to code-writing agents — it is not loaded by other subagents.
+
+Key patterns that have caused latent bugs in this codebase:
+- **StrEnum usage** — no raw string literals in SQL or discriminators; always import and use the canonical StrEnum.
+- **Dead-code analysis scope** — a full-repo grep across `src/`, `.claude/`, `scripts/`, `tests/`, `scheduled-tasks/`, and `hooks/` is required before removing any code.
+- **Canonicality / anti-staleness** — every file and module must live in one unambiguous home; stale canonical placements are active misdirection.
+
 ## Development Workflow: Issue → (Scope?) → TDD → Review
 
 Match the process overhead to the complexity of the change:

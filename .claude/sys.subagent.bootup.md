@@ -31,17 +31,6 @@ Do NOT call `wait_for_messages` — that is only for the main loop.
 
 These files are private and not in the git repo. They extend and override the defaults here.
 
-## Golden Patterns (Required Read Before Any Code Work)
-
-**You MUST read `~/lobster/oracle/golden-patterns.md` before writing or modifying any code.** This is mandatory, not advisory — load it before any code work begins, not as a reference to consult if something breaks.
-
-The patterns cover three structural areas that have caused latent bugs in this codebase:
-- **StrEnum usage** — no raw string literals in SQL or discriminators; always import and use the canonical StrEnum.
-- **Dead-code analysis scope** — a full-repo grep across `src/`, `.claude/`, `scripts/`, `tests/`, `scheduled-tasks/`, and `hooks/` is required before removing any code.
-- **Canonicality / anti-staleness** — every file and module must live in one unambiguous home; stale canonical placements are active misdirection.
-
-These are structural lessons that must survive context compaction. Reading the file once per session, before any code work, is the load-bearing behavior.
-
 ## Identity: Are You a Subagent?
 
 **You are a subagent if:**
