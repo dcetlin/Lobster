@@ -1049,3 +1049,112 @@ class TestDispatchBoundaryLog:
             )
         finally:
             executor_mod._DISPATCH_BOUNDARY_LOG_TEMPLATE = orig
+
+
+# ---------------------------------------------------------------------------
+# Tests: pre-flight protocol (issue #929)
+# ---------------------------------------------------------------------------
+
+class TestPreflightProtocol:
+    """
+    Executor integration tests for the is_still_needed() pre-flight hook.
+
+    These tests verify that the executor correctly calls the hook and honours
+    its return value — specifically the three required paths from issue #929:
+
+      - Default path: UoW type with no registered check dispatches normally.
+      - False path: registered check returning False → no subagent spawned,
+        UoW marked complete with outcome_category="heat".
+      - True path: registered check returning True → dispatch proceeds normally.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_preflight_registry(self):
+        """Save and restore the preflight registry around each test."""
+        from orchestration.wos_preflight import _REGISTRY
+        saved = dict(_REGISTRY)
+        _REGISTRY.clear()
+        yield
+        _REGISTRY.clear()
+        _REGISTRY.update(saved)
+
+    def test_default_path_dispatches_normally(
+        self, registry: Registry, db_path: Path
+    ) -> None:
+        """Default path: no registered check → UoW dispatches normally (regression guard)."""
+        uow_id = "uow_preflight_default"
+        _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
+
+        dispatched: list[str] = []
+
+        def fake_dispatcher(instructions: str, uid: str) -> str:
+            dispatched.append(uid)
+            return "task-default"
+
+        executor = Executor(registry, dispatcher=fake_dispatcher)
+        executor.execute_uow(uow_id)
+
+        assert dispatched == [uow_id], "Subagent must be dispatched when no check is registered"
+
+    def test_false_path_no_subagent_spawned(
+        self, registry: Registry, db_path: Path
+    ) -> None:
+        """False path: registered check returning False → no subagent spawned."""
+        from orchestration.wos_preflight import register_preflight_check
+        register_preflight_check("executable", lambda _: False)
+
+        uow_id = "uow_preflight_false"
+        _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
+
+        dispatched: list[str] = []
+
+        def fake_dispatcher(instructions: str, uid: str) -> str:
+            dispatched.append(uid)
+            return "task-should-not-run"
+
+        executor = Executor(registry, dispatcher=fake_dispatcher)
+        executor.execute_uow(uow_id)
+
+        assert dispatched == [], "No subagent must be spawned when pre-flight returns False"
+
+    def test_false_path_marks_complete_with_heat(
+        self, registry: Registry, db_path: Path
+    ) -> None:
+        """False path: UoW is marked complete with outcome_category='heat'."""
+        from orchestration.wos_preflight import register_preflight_check
+        register_preflight_check("executable", lambda _: False)
+
+        uow_id = "uow_preflight_heat"
+        _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
+
+        executor = Executor(registry, dispatcher=_noop_dispatcher)
+        result = executor.execute_uow(uow_id)
+
+        assert result.outcome == ExecutorOutcome.COMPLETE
+        assert result.success is True
+        assert _get_uow_status(db_path, uow_id) == "ready-for-steward"
+        outcome_cat = _get_uow_field(db_path, uow_id, "outcome_category")
+        assert outcome_cat == "heat", (
+            f"outcome_category must be 'heat' after pre-flight short-circuit, got {outcome_cat!r}"
+        )
+
+    def test_true_path_dispatches_normally(
+        self, registry: Registry, db_path: Path
+    ) -> None:
+        """True path: registered check returning True → subagent dispatched normally."""
+        from orchestration.wos_preflight import register_preflight_check
+        register_preflight_check("executable", lambda _: True)
+
+        uow_id = "uow_preflight_true"
+        _insert_uow(db_path, uow_id, workflow_artifact=_make_artifact(uow_id))
+
+        dispatched: list[str] = []
+
+        def fake_dispatcher(instructions: str, uid: str) -> str:
+            dispatched.append(uid)
+            return "task-true"
+
+        executor = Executor(registry, dispatcher=fake_dispatcher)
+        executor.execute_uow(uow_id)
+
+        assert dispatched == [uow_id], "Subagent must be dispatched when pre-flight returns True"

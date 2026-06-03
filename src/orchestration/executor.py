@@ -800,24 +800,71 @@ class Executor:
         register: str = "operational",
     ) -> ExecutorResult:
         """
-        Inner execution: activate skills, dispatch subagent, write results.
+        Inner execution: activate skills, run pre-flight check, dispatch subagent, write results.
         Returns ExecutorResult. Callers must catch exceptions.
 
         Chain primitives: when artifact["chain_type"] is set, routes to the
         appropriate chain dispatch function instead of the single-subagent path.
         Fallback (chain_type absent/None/unrecognized) uses the existing path.
+
+        Pre-flight protocol (issue #929):
+        ``is_still_needed(uow)`` is called after skill activation and before any
+        subagent is spawned (both single-subagent and chain paths).  When the hook
+        returns ``False`` the UoW is marked complete with outcome_category="heat"
+        and the method returns without dispatching a subagent.
         """
         # Step 1: Activate prescribed skills
         prescribed_skills: list[str] = artifact.get("prescribed_skills") or []
         for skill_id in prescribed_skills:
             self._skill_activator(skill_id)
 
-        # Step 2: Check for chain primitives — route before single-dispatch path.
+        # Step 2: Pre-flight check — is this work still needed?
+        # Reads the current UoW from the registry so the check function receives
+        # a fully-hydrated object with all fields (type, status, source, etc.).
+        # Falls back to fail-open (True) when the UoW cannot be read.
+        from orchestration.wos_preflight import is_still_needed as _is_still_needed
+        uow_for_preflight = None
+        try:
+            uow_for_preflight = self.registry.get(uow_id)
+        except Exception as _preflight_read_err:
+            log.warning(
+                "Executor: could not read UoW %s for pre-flight check — %s (proceeding with dispatch)",
+                uow_id, _preflight_read_err,
+            )
+        if uow_for_preflight is not None and not _is_still_needed(uow_for_preflight):
+            log.info(
+                "Executor: pre-flight short-circuit for UoW %s — is_still_needed() returned False; "
+                "marking complete with outcome_category=heat (no subagent spawned)",
+                uow_id,
+            )
+            heat_result = ExecutorResult(
+                uow_id=uow_id,
+                outcome=ExecutorOutcome.COMPLETE,
+                success=True,
+                reason="pre-flight: is_still_needed() returned False",
+            )
+            _write_output_ref_content(output_ref, "pre-flight short-circuit: work no longer needed")
+            _write_result_json(output_ref, heat_result)
+            _validate_result_json_written(uow_id, output_ref)
+            trace = _build_trace(
+                uow_id=uow_id,
+                register=register,
+                outcome=ExecutorOutcome.COMPLETE,
+                execution_summary="pre-flight short-circuit: is_still_needed() returned False",
+                surprises=[],
+                prescription_delta="pre-flight: work determined no longer needed at dispatch time",
+            )
+            _write_trace_json(output_ref, trace)
+            _insert_corrective_trace(self.registry.db_path, trace)
+            self.registry.complete_uow(uow_id, output_ref, outcome_category="heat")
+            return heat_result
+
+        # Step 3: Check for chain primitives — route before single-dispatch path.
         chain_type = artifact.get("chain_type")
         if chain_type:
             return self._run_chain_execution(uow_id, output_ref, artifact, register, chain_type)
 
-        # Step 3: Dispatch LLM subagent via register-appropriate dispatcher.
+        # Step 4: Dispatch LLM subagent via register-appropriate dispatcher.
         # Build the WOS context block (UoW ID + artifact stamping instructions, issue #868)
         # and inject it into every dispatched prompt regardless of dispatcher path.
         #
@@ -837,10 +884,10 @@ class Executor:
             dispatcher = _resolve_dispatcher(executor_type)
             executor_id = dispatcher(instructions, uow_id)
 
-        # Step 4: Write output_ref content (signal that execution produced output)
+        # Step 5: Write output_ref content (signal that execution produced output)
         _write_output_ref_content(output_ref, f"execution dispatched: task_id={executor_id}")
 
-        # Step 5: Build result
+        # Step 6: Build result
         result = ExecutorResult(
             uow_id=uow_id,
             outcome=ExecutorOutcome.COMPLETE,
@@ -848,11 +895,11 @@ class Executor:
             executor_id=executor_id or None,
         )
 
-        # Step 6: Write result.json (executor-contract.md: required at every intentional exit)
+        # Step 7: Write result.json (executor-contract.md: required at every intentional exit)
         _write_result_json(output_ref, result)
         _validate_result_json_written(uow_id, output_ref)
 
-        # Step 6b: Write trace.json (V3 corrective trace contract — required alongside result.json)
+        # Step 7b: Write trace.json (V3 corrective trace contract — required alongside result.json)
         trace = _build_trace(
             uow_id=uow_id,
             register=register,
@@ -865,7 +912,7 @@ class Executor:
         _write_trace_json(output_ref, trace)
         _insert_corrective_trace(self.registry.db_path, trace)
 
-        # Step 7: Status transition — depends on dispatch path.
+        # Step 8: Status transition — depends on dispatch path.
         #
         # Async (inbox) dispatchers: write wos_execute to inbox and return immediately.
         # The subagent has NOT yet done any work — calling complete_uow here would produce
