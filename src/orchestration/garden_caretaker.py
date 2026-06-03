@@ -250,12 +250,12 @@ class GardenCaretaker:
             )
 
         for uow in proposed_uows:
-            if not uow.source:
+            if not uow.source_ref:
                 logger.debug("requalify_proposed: skipping UoW %s — no source_ref", uow.id)
                 continue
 
             try:
-                snapshot = self.source.get_issue(uow.source)
+                snapshot = self.source.get_issue(uow.source_ref)
             except Exception as exc:
                 logger.warning(
                     "requalify_proposed: error fetching source for UoW %s: %s — skipping",
@@ -287,13 +287,13 @@ class GardenCaretaker:
                     "actor": "garden_caretaker",
                     "from_status": "proposed",
                     "to_status": "ready-for-steward",
-                    "source_ref": uow.source,
+                    "source_ref": uow.source_ref,
                     "timestamp": _now_iso(),
                 })
                 requalified += 1
                 logger.info(
                     "requalify_proposed: auto-qualified UoW %s → ready-for-steward (source_ref=%s)",
-                    uow.id, uow.source,
+                    uow.id, uow.source_ref,
                 )
 
         return {"requalified": requalified}
@@ -386,13 +386,13 @@ class GardenCaretaker:
         active_uows = self._fetch_active_uows()
 
         for uow in active_uows:
-            if not uow.source:
+            if not uow.source_ref:
                 logger.debug("tend: skipping UoW %s — no source_ref", uow.id)
                 no_change += 1
                 continue
 
             try:
-                snapshot = self.source.get_issue(uow.source)
+                snapshot = self.source.get_issue(uow.source_ref)
             except Exception as exc:
                 logger.warning("tend: error fetching source for UoW %s: %s — no state change", uow.id, exc)
                 no_change += 1
@@ -419,8 +419,8 @@ class GardenCaretaker:
 
             elif action == "warn":
                 logger.warning(
-                    "tend: unknown/error source state for UoW %s (source=%s) — no state change",
-                    uow.id, uow.source,
+                    "tend: unknown/error source state for UoW %s (source_ref=%s) — no state change",
+                    uow.id, uow.source_ref,
                 )
                 no_change += 1
 
@@ -518,7 +518,7 @@ class GardenCaretaker:
                 "classification": reason,
                 "from_status": str(uow.status),
                 "to_status": "expired",
-                "source_ref": uow.source,
+                "source_ref": uow.source_ref,
                 "timestamp": _now_iso(),
             })
             logger.info("tend: archived UoW %s (was %s) — %s", uow.id, uow.status, reason)
@@ -547,7 +547,7 @@ class GardenCaretaker:
                 "classification": classification,
                 "from_status": str(uow.status),
                 "to_status": "ready-for-steward",
-                "source_ref": uow.source,
+                "source_ref": uow.source_ref,
                 "timestamp": _now_iso(),
             })
             logger.info(
@@ -565,7 +565,7 @@ class GardenCaretaker:
         the TOCTOU race where a concurrent intake could insert a new proposed row
         between the check and the write.
         """
-        issue_number = self._extract_issue_number(uow.source or "")
+        issue_number = self._extract_issue_number(uow.source_ref or "")
         if issue_number is None:
             # Cannot extract issue number — fall back to direct reactivation.
             # This path is rare (only UoWs with malformed source_ref).
@@ -577,7 +577,7 @@ class GardenCaretaker:
                     "classification": "source_reopened",
                     "from_status": str(uow.status),
                     "to_status": "proposed",
-                    "source_ref": uow.source,
+                    "source_ref": uow.source_ref,
                     "timestamp": _now_iso(),
                 })
                 logger.info("tend: reactivated UoW %s → proposed (source reopened, no issue_number)", uow.id)
@@ -614,7 +614,7 @@ class GardenCaretaker:
             "classification": "source_reopened",
             "from_status": str(uow.status),
             "to_status": "proposed",
-            "source_ref": uow.source,
+            "source_ref": uow.source_ref,
             "timestamp": _now_iso(),
         })
         logger.info("tend: reactivated UoW %s → proposed (source reopened)", uow.id)
