@@ -346,3 +346,15 @@ StartupSweepResult = _sweep_mod.StartupSweepResult
 **Where it appears:** `memory/canonical-templates/sweep-instruction.template.md` introduced in PR #1188. Three mandatory harness sections: Dependencies (contract-declaration pattern, prevents silent-contract-violation), Operational Posture (state-registry-read, prevents missing-state-registry-read), Classification States (elimination-completeness invariant, prevents binary-classifier coherence failure).
 
 **Reuse guidance:** Apply to any new sweep or diagnostic instruction. The three harness sections are a minimum baseline — they address the two named failure classes known as of PR #1188. If a sweep introduces a new external dependency type not covered by the Dependencies section, add a row to the Dependencies table. If a sweep classifies a state space that includes additional legitimate no-activity states, add those states to the Classification States section. The template is a starting point, not a ceiling. Cross-reference to named smells in `oracle/smell-patterns.yaml` when a harness section directly prevents a named failure class — the traceability is load-bearing for future sweep audits.
+
+---
+
+### [2026-06-03] Pattern: two-signal steward discriminator (specificity + TTL)
+
+**Pattern:** When a steward must route a pre-metabolic artifact (juice, a frontier thread, an uncrystallized direction), use a two-signal gate: Signal 1 — qualitative specificity test (can the steward reconstruct the gradient from the signal alone?); Signal 2 — temporal TTL check (is the artifact within the default TTL, or does it map to an active open thread?). Both signals must pass for the artifact to be treated as live.
+
+**Why it works:** A single-signal gate (specificity only) misses artifacts that were once specific but have since been answered. A single-signal gate (TTL only) misses dead letters that are within the window but contain generic signals. The two-signal conjunction eliminates both failure modes. The decision rule on failure is also explicit: archive, do not dispatch a UoW (dispatching a UoW to resume a dead thread converts heat into more heat). The pattern encodes the discrimination function in terms the steward can apply without judgment overhead.
+
+**Where it appears:** `philosophy/frontier/metabolic-juice.md §Resolution §(3) Steward Discriminator — Juice vs. Dead Letter`. Introduced in PR #1403 (uow_20260522_bf4a96).
+
+**Reuse guidance:** Apply whenever a steward or agent must distinguish live generative threads from dead letters in a pre-metabolic context. The specificity test (qualitative) and TTL test (temporal) are complementary axes. Extend to new contexts by replacing "heat_signal" and "14-day TTL" with the domain-appropriate signal name and threshold, but preserve the two-signal conjunction and explicit archive-on-failure rule.
