@@ -64,6 +64,7 @@ from orchestration.error_capture import (
     has_repeated_error,
 )
 from orchestration.steward import _build_claude_env
+import orchestration.checkpoint as _checkpoint_module
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +527,19 @@ class Executor:
                 (output_ref, uow_id),
             )
 
+            # Step 4b: Compute and write checkpoint_ref.
+            # Uses checkpoint_path() from orchestration.checkpoint — the canonical
+            # path function that the startup_sweep and Steward also use to locate
+            # checkpoint files. Registering the path in the DB here (inside the
+            # transaction) ensures durability before the subagent starts. The actual
+            # directory and file are created after commit to keep I/O outside the
+            # transaction boundary.
+            checkpoint_ref_path = str(_checkpoint_module.checkpoint_path(uow_id))
+            conn.execute(
+                "UPDATE uow_registry SET checkpoint_ref = ? WHERE id = ?",
+                (checkpoint_ref_path, uow_id),
+            )
+
             # Step 5: Compute and write timeout_at
             estimated_runtime = row["estimated_runtime"]
             timeout_seconds = int(estimated_runtime) if estimated_runtime is not None else 1800
@@ -595,6 +609,36 @@ class Executor:
                     "Proceeding; startup sweep may misclassify if heartbeat fires "
                     "before subprocess completes.",
                     output_ref, _e,
+                )
+
+            # Initial checkpoint file — written immediately after the claim commits.
+            # Ensures checkpoint.json exists before the subagent receives its first token.
+            # Uses write_checkpoint() from orchestration.checkpoint for a schema-correct
+            # initial state (all steps pending, fraction 0.0). Written atomically via
+            # tmp→rename so the file is never in a partial-write state.
+            # A missing checkpoint is recoverable (the subagent can recreate it);
+            # failure here is logged as a warning and does not abort the claim.
+            _INITIAL_STEPS = [
+                {"index": 0, "name": "read_issue",      "status": "pending", "completed_at": "", "artifacts": {}},
+                {"index": 1, "name": "create_worktree", "status": "pending", "completed_at": "", "artifacts": {}},
+                {"index": 2, "name": "implement",       "status": "pending", "completed_at": "", "artifacts": {}},
+                {"index": 3, "name": "run_tests",       "status": "pending", "completed_at": "", "artifacts": {}},
+                {"index": 4, "name": "open_pr",         "status": "pending", "completed_at": "", "artifacts": {}},
+                {"index": 5, "name": "write_result",    "status": "pending", "completed_at": "", "artifacts": {}},
+            ]
+            try:
+                _checkpoint_module.write_checkpoint(
+                    uow_id,
+                    steps=_INITIAL_STEPS,
+                    next_step_index=0,
+                    next_step_name="read_issue",
+                    completion_fraction=0.0,
+                )
+            except OSError as _e:
+                log.warning(
+                    "Executor: could not write initial checkpoint for %s — %s. "
+                    "Subagent will proceed without a pre-written checkpoint.",
+                    uow_id, _e,
                 )
 
             # Deserialize workflow_artifact (after transaction commits)
@@ -874,13 +918,15 @@ class Executor:
         # have provenance context available even in test/CI environments).
         raw_instructions = artifact["instructions"]
         wos_context = _build_wos_context_block(uow_id)
+        checkpoint_ref_str = str(_checkpoint_module.checkpoint_path(uow_id))
+        checkpoint_path_block = f"CHECKPOINT_PATH: {checkpoint_ref_str}\n"
         if self._dispatcher_override is not None:
-            instructions_with_context = wos_context + raw_instructions
+            instructions_with_context = wos_context + checkpoint_path_block + raw_instructions
             executor_id = self._dispatcher_override(instructions_with_context, uow_id)
         else:
             executor_type = artifact.get("executor_type", "functional-engineer")
             preamble = _EXECUTOR_TYPE_TO_PREAMBLE.get(executor_type, "")
-            instructions = preamble + wos_context + raw_instructions
+            instructions = preamble + checkpoint_path_block + wos_context + raw_instructions
             dispatcher = _resolve_dispatcher(executor_type)
             executor_id = dispatcher(instructions, uow_id)
 
@@ -1154,6 +1200,58 @@ Follow the functional-engineer protocol:
 
 Do NOT call send_reply. Do NOT call wait_for_messages.
 Write result via: mcp__lobster-inbox__write_result
+
+## Checkpoint Protocol
+
+You MUST write a checkpoint at each step boundary. The checkpoint path is given in
+CHECKPOINT_PATH above.
+
+### Canonical step plan for implementation UoWs
+
+Step 0: read_issue        — read the GitHub issue, extract requirements
+Step 1: create_worktree   — create branch and worktree
+Step 2: implement         — write/modify code
+Step 3: run_tests         — run test suite, confirm pass
+Step 4: open_pr           — open PR with WOS-UoW stamp
+Step 5: write_result      — call write_result MCP, finalize checkpoint
+
+For multi-file implementations, step 2 may be subdivided:
+  Step 2a: implement_file_A
+  Step 2b: implement_file_B
+
+### Write protocol
+
+1. At session start: write initial checkpoint (all steps `pending`, fraction 0.0)
+2. Before starting each step: mark it `in_progress`, update `next_step_index`, rewrite file atomically
+3. After completing each step: mark it `complete`, populate `artifacts`, increment `next_step_index`, rewrite file atomically
+
+### Atomic write protocol
+
+Always write to CHECKPOINT_PATH + ".tmp" first, then rename to CHECKPOINT_PATH:
+
+```python
+import json, pathlib
+tmp = pathlib.Path(CHECKPOINT_PATH + ".tmp")
+tmp.write_text(json.dumps(checkpoint_data, indent=2))
+tmp.rename(CHECKPOINT_PATH)
+```
+
+### Artifacts to record per step
+
+- read_issue: `{"issue_number": N, "title": "...", "repo": "owner/repo"}`
+- create_worktree: `{"branch": "fix/...", "worktree_path": "/absolute/path"}`
+- implement: `{"files_modified": ["path/a", "path/b"], "files_remaining": [...]}`
+- run_tests: `{"test_command": "uv run pytest ...", "result": "pass"}`
+- open_pr: `{"pr_number": N, "pr_url": "https://..."}`
+- write_result: `{"status": "success"}`
+
+### Notes field
+
+When `next_step_index > 0`, populate the `notes` field with context a fresh subagent
+needs to resume:
+- What was accomplished
+- Any non-obvious state (e.g., "branch already pushed, worktree at /path")
+- Any known issues or decisions made during implementation
 
 Prescription:
 """
