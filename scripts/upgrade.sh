@@ -4780,6 +4780,58 @@ PY131
         warn "wos-event-poller.py not found at $WOS_EVENT_POLLER_SCRIPT — skipping Migration 131 cron entries"
     fi
 
+    # Migration 132: Add checkpoint_ref column to uow_registry and create checkpoints/ directory.
+    # checkpoint_ref stores the path to the most recently written checkpoint.json for a UoW.
+    # This is the DB-side half of the compaction-resilience checkpoint protocol (issue #1322).
+    # The column is already present in schema.sql for new installs; this migration backfills
+    # existing installs via ALTER TABLE (idempotent — SQLite ignores duplicate column errors).
+    local _REGISTRY_DB="$WORKSPACE_DIR/orchestration/registry.db"
+    if [ -f "$_REGISTRY_DB" ]; then
+        local _has_checkpoint_ref
+        _has_checkpoint_ref=$(uv run python3 -c "
+import sqlite3, sys
+try:
+    conn = sqlite3.connect('$_REGISTRY_DB')
+    cols = [row[1] for row in conn.execute('PRAGMA table_info(uow_registry)').fetchall()]
+    print('yes' if 'checkpoint_ref' in cols else 'no')
+    conn.close()
+except Exception as e:
+    print('no')
+" 2>/dev/null)
+        if [ "${_has_checkpoint_ref}" = "no" ]; then
+            substep "Migration 132: adding checkpoint_ref column to uow_registry..."
+            uv run python3 -c "
+import sqlite3
+conn = sqlite3.connect('$_REGISTRY_DB')
+try:
+    conn.execute('ALTER TABLE uow_registry ADD COLUMN checkpoint_ref TEXT')
+    conn.commit()
+    print('OK')
+except sqlite3.OperationalError as e:
+    if 'duplicate column' in str(e).lower():
+        print('already exists')
+    else:
+        raise
+finally:
+    conn.close()
+" 2>/dev/null && substep "Migration 132: checkpoint_ref column added" && migrated=$((migrated + 1)) || warn "Migration 132: failed to add checkpoint_ref column — add manually"
+        else
+            substep "Migration 132: checkpoint_ref column already present — skipping"
+        fi
+    else
+        substep "Migration 132: registry.db not found at $_REGISTRY_DB — skipping column migration (will be applied at first run)"
+    fi
+
+    # Migration 132b: Create orchestration/checkpoints/ directory.
+    local _CHECKPOINTS_DIR="$WORKSPACE_DIR/orchestration/checkpoints"
+    if [ ! -d "$_CHECKPOINTS_DIR" ]; then
+        mkdir -p "$_CHECKPOINTS_DIR"
+        substep "Migration 132b: created $WORKSPACE_DIR/orchestration/checkpoints/"
+        migrated=$((migrated + 1))
+    else
+        substep "Migration 132b: orchestration/checkpoints/ already exists — skipping"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
