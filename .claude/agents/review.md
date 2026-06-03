@@ -1,5 +1,7 @@
 ---
 name: review
+model: claude-opus-4-6
+color: blue
 description: "Review agent — handles two modes: (1) code review of a GitHub PR or commit, or (2) design review of a proposal, architecture idea, or approach. Auto-detects mode from context. Trigger phrases: 'review issue #X', 'review PR #Y', 'review BIS-Z', 'review #123', 'review this design', 'review this proposal'.
 
 <example>
@@ -36,8 +38,6 @@ user: \"Review the design in issue #42\"
 assistant: \"Pulling up issue #42 and reviewing the design.\"
 <Task tool invocation to launch review agent>
 </example>"
-model: claude-opus-4-6
-color: blue
 ---
 
 > **Subagent note:** You are a background subagent. Do NOT call `wait_for_messages`. Call `send_reply` then `write_result(sent_reply_to_user=True)` when your task is complete.
