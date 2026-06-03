@@ -116,6 +116,9 @@ class WorkflowArtifact(TypedDict, total=False):
     approaches: NotRequired[list[str] | None]
     synthesis_prompt: NotRequired[str | None]
 
+    # Turn-cap field (optional — falls back to per-executor-type default in executor.py)
+    max_turns: NotRequired[int | None]
+
 
 # ---------------------------------------------------------------------------
 # Serialization
@@ -149,8 +152,8 @@ def from_json(json_str: str) -> WorkflowArtifact:
     if missing:
         raise ValueError(f"WorkflowArtifact missing required fields: {missing}")
 
-    # Reconstruct required fields, then layer in any chain-primitive fields present.
-    known = _REQUIRED_FIELDS | _CHAIN_FIELDS
+    # Reconstruct required fields, then layer in any optional fields present.
+    known = _REQUIRED_FIELDS | _CHAIN_FIELDS | {"max_turns"}
     return WorkflowArtifact(**{k: v for k, v in data.items() if k in known})
 
 
@@ -191,6 +194,9 @@ _ENVELOPE_FIELDS = ("uow_id", "executor_type", "constraints", "prescribed_skills
 # Optional chain fields included in the envelope when present.
 _CHAIN_ENVELOPE_FIELDS = ("chain_type", "perspectives", "decomposition_prompt", "approaches", "synthesis_prompt")
 
+# Optional scalar fields included in the envelope when present and non-None.
+_OPTIONAL_SCALAR_ENVELOPE_FIELDS = ("max_turns",)
+
 
 def to_frontmatter(artifact: WorkflowArtifact) -> str:
     """
@@ -211,6 +217,9 @@ def to_frontmatter(artifact: WorkflowArtifact) -> str:
     """
     envelope = {k: artifact[k] for k in _ENVELOPE_FIELDS}  # type: ignore[literal-required]
     for k in _CHAIN_ENVELOPE_FIELDS:
+        if k in artifact and artifact.get(k) is not None:  # type: ignore[literal-required]
+            envelope[k] = artifact[k]  # type: ignore[literal-required]
+    for k in _OPTIONAL_SCALAR_ENVELOPE_FIELDS:
         if k in artifact and artifact.get(k) is not None:  # type: ignore[literal-required]
             envelope[k] = artifact[k]  # type: ignore[literal-required]
     envelope_line = json.dumps(envelope, separators=(",", ":"))
@@ -321,4 +330,11 @@ def from_frontmatter(text: str) -> WorkflowArtifact:
     for k in _CHAIN_ENVELOPE_FIELDS:
         if k in envelope:
             artifact[k] = envelope[k]  # type: ignore[literal-required]
+    # Include max_turns if present and non-None.
+    raw_max_turns = envelope.get("max_turns")
+    if raw_max_turns is not None:
+        try:
+            artifact["max_turns"] = int(raw_max_turns)  # type: ignore[literal-required]
+        except (TypeError, ValueError):
+            pass  # silently ignore malformed values; executor falls back to type default
     return artifact

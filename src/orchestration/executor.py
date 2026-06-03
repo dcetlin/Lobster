@@ -920,15 +920,32 @@ class Executor:
         wos_context = _build_wos_context_block(uow_id)
         checkpoint_ref_str = str(_checkpoint_module.checkpoint_path(uow_id))
         checkpoint_path_block = f"CHECKPOINT_PATH: {checkpoint_ref_str}\n"
+        # Resolve max_turns: prefer artifact-level value; fall back to per-executor-type default.
+        artifact_max_turns: int | None = artifact.get("max_turns")  # type: ignore[assignment]
         if self._dispatcher_override is not None:
             instructions_with_context = wos_context + checkpoint_path_block + raw_instructions
             executor_id = self._dispatcher_override(instructions_with_context, uow_id)
         else:
             executor_type = artifact.get("executor_type", "functional-engineer")
+            effective_max_turns = (
+                artifact_max_turns
+                if artifact_max_turns is not None
+                else _DEFAULT_MAX_TURNS.get(executor_type, _FALLBACK_MAX_TURNS)
+            )
             preamble = _EXECUTOR_TYPE_TO_PREAMBLE.get(executor_type, "")
             instructions = preamble + checkpoint_path_block + wos_context + raw_instructions
             dispatcher = _resolve_dispatcher(executor_type)
-            executor_id = dispatcher(instructions, uow_id)
+            # Pass max_turns only when the dispatcher accepts it (subprocess path).
+            # Inbox dispatchers (_dispatch_via_inbox_*) do not accept max_turns — the
+            # turn cap travels in the wos_execute message for those paths (deferred to
+            # when the inbox dispatcher is wired to read max_turns from the artifact file).
+            # For now, only _dispatch_via_claude_p, _dispatch_via_stub, and the two
+            # named stub dispatchers accept max_turns.
+            try:
+                executor_id = dispatcher(instructions, uow_id, max_turns=effective_max_turns)  # type: ignore[call-arg]
+            except TypeError:
+                # Dispatcher does not accept max_turns (e.g. inbox dispatchers).
+                executor_id = dispatcher(instructions, uow_id)
 
         # Step 5: Write output_ref content (signal that execution produced output)
         _write_output_ref_content(output_ref, f"execution dispatched: task_id={executor_id}")
@@ -1184,6 +1201,20 @@ def _get_claude_p_timeout() -> int:
 #: a mock binary on PATH without patching the module.
 _CLAUDE_BIN = "claude"
 
+#: Per-executor-type default turn caps.
+#: Exploration-oriented types get a tighter budget (30 turns) to prevent
+#: runaway sessions (issue #742). functional-engineer keeps the existing 40-turn default.
+_DEFAULT_MAX_TURNS: dict[str, int] = {
+    "functional-engineer": 40,
+    "lobster-ops": 40,
+    "general": 40,
+    "frontier-writer": 30,
+    "design-review": 30,
+}
+
+#: Fallback turn cap for executor types not in _DEFAULT_MAX_TURNS.
+_FALLBACK_MAX_TURNS: int = 40
+
 #: Functional-engineer agent prompt preamble — sets context before the
 #: prescription body. The subagent receives the full prescription as the
 #: prompt body and is responsible for reading the issue, implementing,
@@ -1307,7 +1338,7 @@ def _build_wos_context_block(uow_id: str) -> str:
     )
 
 
-def _dispatch_via_claude_p(instructions: str, uow_id: str) -> str:
+def _dispatch_via_claude_p(instructions: str, uow_id: str, max_turns: int | None = None) -> str:
     """
     Production dispatcher: spawn a functional-engineer subagent via `claude -p`.
 
@@ -1325,15 +1356,18 @@ def _dispatch_via_claude_p(instructions: str, uow_id: str) -> str:
     — same failure path applies.
     Raises FileNotFoundError if the claude binary is not on PATH — caught by
     the caller's exception handler.
+
+    max_turns: turn cap to pass to claude -p. Defaults to _FALLBACK_MAX_TURNS when None.
     """
     run_id = f"{uow_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     prompt = instructions
+    effective_max_turns = max_turns if max_turns is not None else _FALLBACK_MAX_TURNS
 
     command = [
         _CLAUDE_BIN,
         "-p",
         "--dangerously-skip-permissions",
-        "--max-turns", "40",
+        "--max-turns", str(effective_max_turns),
         "--",  # end-of-options sentinel: prevents prompts starting with '---' from being
                # parsed as CLI flags by the claude argument parser
         prompt,
@@ -1445,7 +1479,7 @@ _EXECUTOR_TYPE_TO_PREAMBLE: dict[str, str] = {
 }
 
 
-def _dispatch_via_stub(register_name: str, instructions: str, uow_id: str) -> str:
+def _dispatch_via_stub(register_name: str, instructions: str, uow_id: str, max_turns: int | None = None) -> str:
     """
     Shared subprocess mechanism for stub dispatchers.
 
@@ -1463,14 +1497,16 @@ def _dispatch_via_stub(register_name: str, instructions: str, uow_id: str) -> st
 
     ``register_name`` is used only for log messages; it does not affect
     dispatch behaviour.
+    max_turns: turn cap to pass to claude -p. Defaults to _FALLBACK_MAX_TURNS when None.
     """
     run_id = f"{uow_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    effective_max_turns = max_turns if max_turns is not None else _FALLBACK_MAX_TURNS
 
     command = [
         _CLAUDE_BIN,
         "-p",
         "--dangerously-skip-permissions",
-        "--max-turns", "40",
+        "--max-turns", str(effective_max_turns),
         "--",  # end-of-options sentinel: prevents prompts starting with '---' from being
                # parsed as CLI flags by the claude argument parser
         instructions,
@@ -1508,26 +1544,28 @@ def _dispatch_via_stub(register_name: str, instructions: str, uow_id: str) -> st
     return run_id
 
 
-def _dispatch_via_frontier_writer(instructions: str, uow_id: str) -> str:
+def _dispatch_via_frontier_writer(instructions: str, uow_id: str, max_turns: int | None = None) -> str:
     """
     Stub dispatcher for frontier-writer-register UoWs.
 
     Uses the same subprocess mechanism as _dispatch_via_claude_p via
     _dispatch_via_stub. Replace with register-specific dispatch (different
     model, output format, or CLI flags) when frontier-writer is implemented.
+    max_turns: turn cap (defaults to _DEFAULT_MAX_TURNS["frontier-writer"] = 30 via _dispatch_via_stub).
     """
-    return _dispatch_via_stub("frontier-writer", instructions, uow_id)
+    return _dispatch_via_stub("frontier-writer", instructions, uow_id, max_turns=max_turns)
 
 
-def _dispatch_via_design_review(instructions: str, uow_id: str) -> str:
+def _dispatch_via_design_review(instructions: str, uow_id: str, max_turns: int | None = None) -> str:
     """
     Stub dispatcher for design-review-register UoWs.
 
     Uses the same subprocess mechanism as _dispatch_via_claude_p via
     _dispatch_via_stub. Replace with register-specific dispatch (different
     model, output format, or CLI flags) when design-review is implemented.
+    max_turns: turn cap (defaults to _DEFAULT_MAX_TURNS["design-review"] = 30 via _dispatch_via_stub).
     """
-    return _dispatch_via_stub("design-review", instructions, uow_id)
+    return _dispatch_via_stub("design-review", instructions, uow_id, max_turns=max_turns)
 
 
 #: Dispatch table mapping executor_type to the attribute name of its dispatcher
