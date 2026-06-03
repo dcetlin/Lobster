@@ -1,7 +1,7 @@
 ---
 oracle_status: approved
-oracle_pr: https://github.com/dcetlin/Lobster/pull/885
-oracle_date: 2026-04-23
+oracle_pr: https://github.com/dcetlin/Lobster/pull/1403
+oracle_date: 2026-06-03
 ---
 
 # Frontier: Metabolic Juice — Pre-Cadential Aliveness
@@ -112,6 +112,46 @@ Two lightweight proposals:
 **How does the steward sense juice vs. readiness?** The calibration skill — knowing when to hold in juice state versus when to dispatch — is described here as a competency, but its operational form is not yet specified. What signals does a steward prescription carry that indicate the thread is still genuinely generative rather than just indeterminate?
 
 **Can juice be shared?** A single generative thread often spans multiple steward prescriptions, multiple UoW cycles. When a UoW closes a pearl, the prescription that dispatched it may carry the same juice into the next UoW. How does juice transfer across boundary events without degrading?
+
+### Resolution — Minimum Viable Juice-Preservation Artifact
+
+*Resolved: 2026-06-03. Answers all three open questions above (artifact type, required fields for resumption, and steward discriminator).*
+
+#### (1) Artifact Type
+
+**Decision: a frontier-doc stub (inline note), not a GitHub issue and not a commit.**
+
+A GitHub issue is too heavy: it presupposes a deliverable, a label, a success criterion — the crystallized address that juice does not yet have. A commit is heavier still — it implies a code artifact exists or that a design decision is closed. A frontier-doc stub is the minimum structure that survives compaction: a named, locatable text block that carries the thread's generative direction without forcing the thread to resolve into a deliverable. It can live inline in the most contextually-relevant frontier doc (this one, or the frontier doc the thread is currently extending) under a named heading. Minimum-sufficiency reasoning: the only requirement for resumption is that the next session can find the thread and reconstruct its heat from a brief description. A named section in a frontier doc meets this bar with zero overhead — no GitHub API call, no issue triage, no label taxonomy.
+
+#### (2) Required Fields for Resumption
+
+The artifact is a short structured block. Fields marked **required** are necessary to resume the generative thread (not merely to log that one existed); fields marked **optional** add navigability but can be omitted if the thread is time-pressured.
+
+| Field | Required? | Purpose (one phrase) |
+|---|---|---|
+| `live_question` | **Required** | The exact unresolved tension the thread was pursuing — without this, the next session cannot find the gradient |
+| `last_generative_move` | **Required** | The last inference or formulation that advanced the thread — establishes re-entry point |
+| `heat_signal` | **Required** | What made this juicy: the specific friction, surprise, or forward pull — tells the steward whether the thread is still worth continuing |
+| `next_intended_move` | **Required** | The action or exploration that was about to happen when compaction interrupted — prevents re-deriving the already-derived next step |
+| `source_context_ref` | **Required** | Pointer back to the session, doc, or conversation that generated this thread (e.g. `2026-04-23-philosophy-explore.md`, `frontier/metabolic-juice.md §Compaction Risk`) — enables context recovery |
+| `captured_at` | **Optional** | ISO timestamp of when this note was written — supports staleness detection |
+| `origin_doc_section` | **Optional** | Section anchor within the source doc the thread extends — navigability shortcut |
+
+The `live_question` and `heat_signal` are the two load-bearing fields. A thread with only these two can be resumed; the others accelerate resumption but are not required for the thread to survive compaction.
+
+#### (3) Steward Discriminator — Juice vs. Dead Letter
+
+The steward reads two signals to distinguish a preservation artifact with live juice from a dead letter:
+
+**Signal 1 — `heat_signal` presence and specificity.** A generic heat_signal (e.g. "this was interesting") is a dead-letter marker. A specific heat_signal names the exact friction or forward pull that made the thread generative (e.g. "the compaction-as-forced-cadence framing revealed that closure states and juice are mutually exclusive in a way that the taxonomy was not designed to express"). Specificity test: could a steward reconstruct the gradient from the heat_signal text alone, without reading the full session? If yes, the juice is live. If no, it is a dead letter.
+
+**Signal 2 — staleness.** A preservation artifact older than **14 days** (default TTL) is treated as a dead letter unless the `live_question` maps to an active, open thread in a frontier doc or an open GitHub issue. The steward checks: does the `source_context_ref` still point to a frontier doc with an open question? If the question has been answered (the section has a resolution, or a corresponding issue is closed), the artifact is a dead letter regardless of TTL.
+
+**Decision rule:**
+- Both signals pass (specific heat_signal + within TTL or still-open source question) → juice is live; steward should continue sensing, not dispatch
+- Either signal fails → dead letter; archive the artifact; do not dispatch a UoW to "resume" it (dispatching a UoW to resume a dead thread converts heat into more heat)
+
+Default TTL: 14 days. The steward may extend TTL explicitly by rewriting the artifact with a new `captured_at` timestamp and updated `last_generative_move`.
 
 ---
 
