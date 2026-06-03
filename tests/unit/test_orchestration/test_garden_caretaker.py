@@ -367,7 +367,7 @@ class TestTend:
         assert len(proposed) == 1
 
     def test_tend_archives_proposed_uow_when_source_closed(self, registry: Registry) -> None:
-        registry.upsert(issue_number=10, title="Will close", success_criteria="Test completion.")
+        registry.upsert(issue_number=10, title="Will close", success_criteria="Test completion.", source_ref="github:issue/10")
 
         snap = _snapshot(source_ref="github:issue/10", state="closed")
         source = _make_source(issue_map={"github:issue/10": snap})
@@ -388,7 +388,7 @@ class TestTend:
         A UoW that has been approved (ready-for-steward) and whose source closes is
         surfaced to the Steward (not archived) because in-flight work is involved.
         """
-        upsert_result = registry.upsert(issue_number=11, title="Pending issue", success_criteria="Test completion.")
+        upsert_result = registry.upsert(issue_number=11, title="Pending issue", success_criteria="Test completion.", source_ref="github:issue/11")
         # approve() now lands on ready-for-steward, not pending
         registry.approve(upsert_result.id)
         uow = registry.get(upsert_result.id)
@@ -410,7 +410,7 @@ class TestTend:
 
     def test_tend_archives_pending_uow_set_directly_when_source_closed(self, registry: Registry) -> None:
         """Legacy: a UoW manually set to pending (pre-auto-advance) is archived when source closes."""
-        upsert_result = registry.upsert(issue_number=111, title="Legacy pending issue", success_criteria="Test completion.")
+        upsert_result = registry.upsert(issue_number=111, title="Legacy pending issue", success_criteria="Test completion.", source_ref="github:issue/111")
         # Bypass approve() to simulate a legacy pending UoW
         registry.set_status_direct(upsert_result.id, "pending")
 
@@ -477,7 +477,7 @@ class TestTend:
     def test_tend_reactivates_archived_uow_when_source_reopens(
         self, registry: Registry
     ) -> None:
-        upsert_result = registry.upsert(issue_number=50, title="Was expired", success_criteria="Test completion.")
+        upsert_result = registry.upsert(issue_number=50, title="Was expired", success_criteria="Test completion.", source_ref="github:issue/50")
         # Simulate archived (expired) UoW
         registry.set_status_direct(upsert_result.id, "expired")
 
@@ -524,7 +524,7 @@ class TestTend:
 
     def test_tend_audit_log_written_on_archive(self, registry: Registry) -> None:
         import sqlite3
-        upsert_result = registry.upsert(issue_number=80, title="Audit check", success_criteria="Test completion.")
+        upsert_result = registry.upsert(issue_number=80, title="Audit check", success_criteria="Test completion.", source_ref="github:issue/80")
 
         snap = _snapshot(source_ref="github:issue/80", state="closed")
         source = _make_source(issue_map={"github:issue/80": snap})
@@ -545,7 +545,7 @@ class TestTend:
     def test_tend_audit_log_written_on_surface(self, registry: Registry) -> None:
         """Audit log records surface event for diagnosing UoW whose source closes."""
         import sqlite3
-        upsert_result = registry.upsert(issue_number=90, title="Surface audit", success_criteria="Test completion.")
+        upsert_result = registry.upsert(issue_number=90, title="Surface audit", success_criteria="Test completion.", source_ref="github:issue/90")
         # Use 'diagnosing' — still in _SURFACE_ON_CLOSE_STATES (not EXECUTING_STATES).
         # 'active' is now protected (EXECUTING_STATES) and yields no_op on close.
         registry.set_status_direct(upsert_result.id, "diagnosing")
@@ -569,7 +569,7 @@ class TestTend:
     def test_tend_archives_proposed_uow_when_source_deleted(
         self, registry: Registry
     ) -> None:
-        registry.upsert(issue_number=100, title="Deleted source", success_criteria="Test completion.")
+        registry.upsert(issue_number=100, title="Deleted source", success_criteria="Test completion.", source_ref="github:issue/100")
 
         source = _make_source(issue_map={"github:issue/100": None})
         caretaker = GardenCaretaker(source=source, registry=registry)
@@ -620,7 +620,8 @@ class TestRequalifyProposed:
     ) -> None:
         """A proposed UoW whose source now carries a qualifying label advances to ready-for-steward."""
         upsert_result = registry.upsert(
-            issue_number=300, title="Now has bug label", success_criteria="Fix the bug."
+            issue_number=300, title="Now has bug label", success_criteria="Fix the bug.",
+            source_ref="github:issue/300",
         )
         snap = _snapshot(
             source_ref="github:issue/300",
@@ -649,7 +650,8 @@ class TestRequalifyProposed:
         Blocking labels still suppress promotion at any age.
         """
         upsert_result = registry.upsert(
-            issue_number=301, title="Old issue", success_criteria="Do something."
+            issue_number=301, title="Old issue", success_criteria="Do something.",
+            source_ref="github:issue/301",
         )
         snap = _snapshot(
             source_ref="github:issue/301",
@@ -786,7 +788,8 @@ class TestRequalifyProposed:
         """Audit log records 'auto_qualified' event to distinguish from seed-time qualification."""
         import sqlite3
         upsert_result = registry.upsert(
-            issue_number=307, title="Audit event check", success_criteria="Verify audit."
+            issue_number=307, title="Audit event check", success_criteria="Verify audit.",
+            source_ref="github:issue/307",
         )
         snap = _snapshot(
             source_ref="github:issue/307",
@@ -841,7 +844,8 @@ class TestRequalifyProposed:
     ) -> None:
         """run() merges requalify_proposed() output — 'requalified' key is present and correct."""
         upsert_result = registry.upsert(
-            issue_number=309, title="Run integration", success_criteria="Check run output."
+            issue_number=309, title="Run integration", success_criteria="Check run output.",
+            source_ref="github:issue/309",
         )
         snap = _snapshot(
             source_ref="github:issue/309",
