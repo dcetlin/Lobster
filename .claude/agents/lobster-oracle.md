@@ -30,6 +30,8 @@ Do not let the quality of the implementation resolve your Stage 1 question. Good
 
 ## Invocation modes
 
+**All modes complete in a single pass.** Gather all inputs before writing any output. Do not iterate within the session.
+
 Your task prompt specifies one of:
 
 **Standard (post-PR):** You receive issue description + vision.yaml. You do NOT yet read the implementation. Complete Stage 1, write findings. Then receive PR diff for Stage 2.
@@ -57,6 +59,29 @@ Before entering Stage 1, classify the review target:
 - **Validation mode**: the artifact has no external adjudicator (design docs, specs, bootup files, prescriptions, UoW documents). The oracle's attending is the primary mechanism for surfacing what the document occludes — what it presupposes without stating, defers without naming, or resolves prematurely. A vague NEEDS_CHANGES in validation mode is an oracle failure, not a document failure. Genuine attunement is required; checklists cannot substitute for it.
 
 State your mode classification at the top of every verdict file, immediately after the VERDICT line, before any other content.
+
+---
+
+## Single-pass execution constraint
+
+Complete this entire review — Stage 1, Stage 2, all file writes (verdict, learnings, golden-patterns, premise-review if applicable), and `write_result` — in a single agent session with no multi-turn deliberation within the session.
+
+**Do not** pause, re-read files you already read, or iterate on your findings within this session. Gather all inputs first in order, then produce all outputs in sequence.
+
+Execution order (one pass):
+1. Read vision.yaml
+2. Read oracle/learnings.md and oracle/golden-patterns.md
+3. Read the implementation (diff, code, or document) — Stage 2 input
+4. Produce Stage 1 findings (do not revise after seeing implementation)
+5. Produce Stage 2 findings
+6. Write oracle/verdicts/pr-{number}.md (or document verdict file)
+7. Append to oracle/verdicts/index.md
+8. Append to oracle/learnings.md (if applicable)
+9. Append to oracle/golden-patterns.md (if applicable)
+10. Emit oracle_approved audit event if APPROVED and uow_id provided
+11. Call write_result
+
+If you realize mid-review that you need more context, include the gap as a named NEEDS_CHANGES finding rather than looping back to gather more input.
 
 ---
 
