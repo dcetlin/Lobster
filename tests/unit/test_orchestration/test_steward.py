@@ -51,7 +51,7 @@ REPO_ROOT = Path(__file__).parent.parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.orchestration.steward import _HARD_CAP_CYCLES
+from src.orchestration.steward import _GITHUB_ISSUE_STATE_CLOSED, _HARD_CAP_CYCLES
 
 
 # ---------------------------------------------------------------------------
@@ -4987,17 +4987,11 @@ class TestSelectPrescribedSkills:
 # cycles indefinitely even though the source issue was already resolved.
 #
 # Named constant:
-#   ISSUE_CLOSED_STATE = "CLOSED"  (gh CLI returns uppercase)
+#   _GITHUB_ISSUE_STATE_CLOSED — imported from src.orchestration.steward
 #
 # The check fires in _diagnose_uow after _assess_completion — issue_info.state
 # overrides is_complete when the issue is definitively closed.
 # ---------------------------------------------------------------------------
-
-#: GitHub state string returned by `gh issue view --json state` for closed issues.
-ISSUE_CLOSED_STATE = "CLOSED"
-
-#: GitHub state string returned by `gh issue view --json state` for open issues.
-ISSUE_OPEN_STATE = "OPEN"
 
 
 class TestSourceIssueClosedCompletion:
@@ -5015,7 +5009,7 @@ class TestSourceIssueClosedCompletion:
         from src.orchestration.steward import IssueInfo
         return IssueInfo(
             status_code=200,
-            state=ISSUE_CLOSED_STATE,
+            state=_GITHUB_ISSUE_STATE_CLOSED,
             labels=[],
             body="This issue has been resolved.",
             title="executor: implement UoW close-out protocol",
@@ -5025,7 +5019,7 @@ class TestSourceIssueClosedCompletion:
         from src.orchestration.steward import IssueInfo
         return IssueInfo(
             status_code=200,
-            state=ISSUE_OPEN_STATE,
+            state="OPEN",
             labels=[],
             body="This issue is still open.",
             title="Test issue",
@@ -5244,7 +5238,7 @@ def _make_closed_issue_info_for_test():
     from src.orchestration.steward import IssueInfo
     return IssueInfo(
         status_code=200,
-        state=ISSUE_CLOSED_STATE,
+        state=_GITHUB_ISSUE_STATE_CLOSED,
         labels=[],
         body="This issue has been resolved.",
         title="executor: implement UoW close-out protocol",
