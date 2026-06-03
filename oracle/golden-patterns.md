@@ -370,3 +370,15 @@ StartupSweepResult = _sweep_mod.StartupSweepResult
 **Where it appears:** `bulk_swap_executing_to_paused` and `bulk_swap_paused_to_executing` in `src/orchestration/wos_issue_lifecycle.py`, introduced in PR #1425. Both functions follow this structure identically.
 
 **Reuse guidance:** Apply whenever a function must apply a gh CLI operation (or any external side-effecting call) to a list of items where partial success is acceptable and visibility into partial failure is required. The one-time setup step (before the loop) is load-bearing — move anything that is invariant across iterations out of the loop body. The per-item except-Exception catch is not optional: gh CLI failures sometimes arrive as `subprocess.CalledProcessError`; network and OS failures arrive as other exception types. Both must be counted, not propagated.
+
+---
+
+### [2026-06-03] Pattern: named constants dict + fallback constant for per-type dispatch configuration
+
+**Pattern:** When a dispatcher must apply different configuration values (turn caps, timeouts, model names) per executor type, encode the map as a module-level dict (`_CONFIG_BY_TYPE: dict[str, T]`) and a separate fallback constant (`_FALLBACK_CONFIG: T`). Resolution logic is a single expression: `artifact_value if artifact_value is not None else _CONFIG_BY_TYPE.get(executor_type, _FALLBACK_CONFIG)`. Both constants are importable by tests without re-declaring values locally.
+
+**Why it works:** A hardcoded literal at the dispatch site is a magic number — invisible to search and inert to type checking. A module-level named constant is importable, grep-able, and documentable. The separate fallback constant makes the "unknown type" path explicit rather than silent (a `.get()` with no default silently returns `None`, which the caller must then interpret). The three-level resolution (artifact override → type default → global fallback) is a clean precedence chain with no ambiguous cases.
+
+**Where it appears:** `_DEFAULT_MAX_TURNS` and `_FALLBACK_MAX_TURNS` in `src/orchestration/executor.py`, introduced in PR #1426.
+
+**Reuse guidance:** Apply to any dispatch configuration that varies by executor type. The three-level precedence chain (artifact-level, type-level, global fallback) is the canonical extension point — adding a new executor type requires only a new key in the dict. The artifact-level override gives operators per-UoW control without code changes. Do not use a function-local dict for this pattern — the values must be importable by tests to avoid mirror-constant risk.
