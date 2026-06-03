@@ -4832,6 +4832,15 @@ finally:
         substep "Migration 132b: orchestration/checkpoints/ already exists — skipping"
     fi
 
+    # Migration 133: Prescribing-state heartbeat-silence TTL auto-reset (issue #1388).
+    # No schema change required — behavioral addition to steward-heartbeat.py only.
+    # Phase 2b-iii in the steward heartbeat loop now auto-resets prescribing UoWs
+    # whose heartbeat has been silent for 30+ minutes to ready-for-steward.
+    # This requires no operator action; the steward-heartbeat cron (*/3 * * * *) picks
+    # it up automatically on the next cycle after deploy.
+    substep "Migration 133: prescribing-silence TTL auto-reset (no schema change, no action required)"
+    # Not counted in migrated — there is nothing to apply.
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
