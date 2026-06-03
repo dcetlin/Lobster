@@ -29,6 +29,12 @@ Exit codes:
 
 from __future__ import annotations
 
+import sys as _sys
+import os as _os
+_REPO_ROOT = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..")
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
+
 import argparse
 import json
 import os
@@ -960,6 +966,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    from src.utils.jobs import is_job_enabled
+    if not is_job_enabled("agent-monitor"):
+        print("[agent-monitor] Skipped (disabled in jobs.json)", file=sys.stderr)
+        return 0
 
     db_path: Path = args.db
     if not db_path.exists():
