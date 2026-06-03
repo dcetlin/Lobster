@@ -233,20 +233,6 @@ def main() -> int:
             uow_id, type(exc).__name__, exc,
         )
 
-    # Step 4: Write v2 prescription to audit trail (non-fatal).
-    try:
-        from orchestration.steward import _diagnose_uow, _fetch_audit_entries
-        from orchestration.steward import generate_v2_prescription, IssueInfo
-        audit_entries = _fetch_audit_entries(registry, uow_id)
-        # Note: generate_v2_prescription requires a Diagnosis object; we use a
-        # lightweight stub constructed from the payload fields.
-        # Full v2 is a best-effort bonus — not required for ready-for-executor.
-    except Exception as v2_exc:
-        log.debug(
-            "prescription-agent: v2 prescription skipped for %s — %s: %s",
-            uow_id, type(v2_exc).__name__, v2_exc,
-        )
-
     # Write prescription audit entry.
     from datetime import datetime, timezone
     now_iso = datetime.now(timezone.utc).isoformat()
