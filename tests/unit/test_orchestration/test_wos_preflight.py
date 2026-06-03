@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ import orchestration.wos_preflight as preflight_mod
 from orchestration.wos_preflight import (
     is_still_needed,
     register_preflight_check,
+    _derive_preflight_key,
 )
 
 
@@ -48,6 +50,15 @@ class _StubUoW:
     def __init__(self, uow_type: str = "executable") -> None:
         self.type = uow_type
         self.id = "stub-uow-id"
+
+
+class _StubMergeUoW:
+    """Stub UoW with source_ref for merge-pr preflight tests."""
+
+    def __init__(self, source_ref: str = "github:pr/42", uow_type: str = "executable") -> None:
+        self.source_ref = source_ref
+        self.type = uow_type
+        self.id = "stub-merge-uow"
 
 
 def _make_artifact(
@@ -427,3 +438,87 @@ class TestExecutorPreflightFalsePath:
         assert len(injected_called) == 0, (
             "Injected dispatcher must NOT be called when pre-flight returns False"
         )
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: merge-pr idempotency pre-flight check (issue #927)
+# ---------------------------------------------------------------------------
+
+
+class TestMergePrPreflightCheck:
+    """Tests for the merge-pr idempotency pre-flight check (issue #927)."""
+
+    def _make_gh_result(self, state: str, returncode: int = 0) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(
+            args=["gh", "pr", "view"],
+            returncode=returncode,
+            stdout=json.dumps({"state": state}),
+            stderr="",
+        )
+
+    def test_merged_pr_returns_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """MERGED PR: is_still_needed returns False — executor short-circuits."""
+        monkeypatch.setattr(
+            "orchestration.wos_preflight._subprocess.run",
+            lambda *a, **kw: self._make_gh_result("MERGED"),
+        )
+        uow = _StubMergeUoW(source_ref="github:pr/42")
+        assert is_still_needed(uow) is False
+
+    def test_open_pr_returns_true(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """OPEN PR: is_still_needed returns True — executor dispatches normally."""
+        monkeypatch.setattr(
+            "orchestration.wos_preflight._subprocess.run",
+            lambda *a, **kw: self._make_gh_result("OPEN"),
+        )
+        uow = _StubMergeUoW(source_ref="github:pr/42")
+        assert is_still_needed(uow) is True
+
+    def test_closed_pr_returns_true(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CLOSED PR: is_still_needed returns True (CLOSED != MERGED)."""
+        monkeypatch.setattr(
+            "orchestration.wos_preflight._subprocess.run",
+            lambda *a, **kw: self._make_gh_result("CLOSED"),
+        )
+        uow = _StubMergeUoW(source_ref="github:pr/42")
+        assert is_still_needed(uow) is True
+
+    def test_gh_failure_returns_true_fail_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """gh exit non-zero: is_still_needed returns True (fail-open)."""
+        monkeypatch.setattr(
+            "orchestration.wos_preflight._subprocess.run",
+            lambda *a, **kw: self._make_gh_result("", returncode=1),
+        )
+        uow = _StubMergeUoW(source_ref="github:pr/42")
+        assert is_still_needed(uow) is True
+
+    def test_gh_exception_returns_true_fail_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """subprocess.run raises: is_still_needed returns True (fail-open)."""
+        def raise_timeout(*a, **kw):
+            raise subprocess.TimeoutExpired(cmd="gh", timeout=15)
+        monkeypatch.setattr("orchestration.wos_preflight._subprocess.run", raise_timeout)
+        uow = _StubMergeUoW(source_ref="github:pr/42")
+        assert is_still_needed(uow) is True
+
+    def test_source_ref_without_pr_prefix_returns_true(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Non-PR source_ref: check returns True without calling gh."""
+        calls: list = []
+
+        def should_not_call(*a, **kw):
+            calls.append(True)
+            return self._make_gh_result("MERGED")
+
+        monkeypatch.setattr("orchestration.wos_preflight._subprocess.run", should_not_call)
+        uow = _StubMergeUoW(source_ref="github:issue/123")
+        assert is_still_needed(uow) is True
+        assert len(calls) == 0, "gh must not be called for non-PR source_ref"
+
+    def test_derive_preflight_key_pr_source(self) -> None:
+        """source_ref='github:pr/99' maps to key 'merge-pr'."""
+        uow = _StubMergeUoW(source_ref="github:pr/99")
+        assert _derive_preflight_key(uow) == "merge-pr"
+
+    def test_derive_preflight_key_non_pr_source(self) -> None:
+        """source_ref='github:issue/99', type='executable' maps to key 'executable'."""
+        uow = _StubMergeUoW(source_ref="github:issue/99", uow_type="executable")
+        assert _derive_preflight_key(uow) == "executable"
