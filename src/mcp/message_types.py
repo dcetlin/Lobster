@@ -56,6 +56,13 @@ INBOX_SYSTEM_TYPES: frozenset[str] = frozenset({
     "debug_observation",      # debug output from inbox_server.py internals; excluded from skill processing
     "session_note_reminder",  # MCP counter reached 20 user messages — dispatcher should spawn session-note-appender
     "wos_execute",            # WOS executor dispatched a UoW — dispatcher must call route_wos_message() to spawn subagent (issue #856)
+    "wos_prescribe",          # WOS steward dispatched a prescription task — dispatcher must call route_wos_message() to spawn prescription subagent
+    "wos_escalate",           # WOS subagent escalated a UoW for owner attention
+    "wos_done",               # WOS UoW reached terminal done state
+    "wos_surface",            # WOS surfacing event — steward surfacing a completed/notable UoW result
+    "steward_trigger",        # WOS steward-heartbeat trigger message
+    "wos_uow_completed",      # WOS UoW completed and result is ready
+    "wos_capacity_available", # WOS executor capacity became available (slot freed after completion)
     "wos_owner_required",     # WOS subagent escalated with outcome=owner_decision_required; UoW is awaiting-owner; dispatcher relays to Dan
     "scheduled_task_crash",   # heartbeat script caught an unhandled exception and wrote a crash alert (fields: job_name, text)
     "pr_review_request",      # PR-review sweeper coordinator requests oracle review for a specific PR (source: pr_review_sweeper)
