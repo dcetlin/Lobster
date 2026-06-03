@@ -29,6 +29,12 @@ Exit codes:
 
 from __future__ import annotations
 
+import os
+import sys
+_REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import argparse
 import hashlib
 import json
@@ -342,7 +348,13 @@ def run(
 ) -> int:
     """Main logic. Returns exit code (0=clean, 1=OOM detected, 2=error)."""
 
-    # 0. Debug-mode gate — only active when LOBSTER_DEBUG=true
+    # 0. jobs.json governance gate
+    from src.utils.jobs import is_job_enabled
+    if not is_job_enabled("oom-monitor"):
+        log_event(log_file, "OOM monitor skipped (disabled in jobs.json)")
+        return 0
+
+    # 1. Debug-mode gate — only active when LOBSTER_DEBUG=true
     if os.environ.get("LOBSTER_DEBUG", "").lower() != "true":
         # Silent no-op: log-only so cron output stays clean
         log_event(log_file, "LOBSTER_DEBUG not set — OOM monitor is disabled. Set LOBSTER_DEBUG=true to enable.")

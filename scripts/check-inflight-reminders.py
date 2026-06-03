@@ -13,6 +13,12 @@ The jsonl file is rewritten atomically with reminded_at timestamps on triggered 
 
 from __future__ import annotations
 
+import sys
+import os
+_REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import json
 import os
 import sys
@@ -238,6 +244,9 @@ def drop_inbox_message(
 
 def main() -> None:
     now = datetime.now(tz=timezone.utc)
+    from src.utils.jobs import is_job_enabled
+    if not is_job_enabled("check-inflight-reminders"):
+        return
 
     data_dir = os.environ.get("LOBSTER_DATA_DIR", os.path.expanduser("~/lobster-workspace/data"))
     jsonl_path = os.path.join(data_dir, "inflight-work.jsonl")
