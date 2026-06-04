@@ -1441,8 +1441,16 @@ check_usage_limit() {
         return 1
     fi
 
+    # Match the current Anthropic limit banners. The wording changed from the
+    # legacy "You've hit your limit" to qualified forms like "You've hit your
+    # session limit · resets 3pm (UTC)" and "You've hit your Sonnet limit ·
+    # resets Jun 5, 4pm (UTC)". The optional "([a-z0-9-]+ )?" segment captures the
+    # qualifier ("session", "Sonnet", "usage", "5-hour", …) that sits between
+    # "your" and "limit"; without it the detector is blind to every modern banner
+    # and the usage-limit gate never fires — the exact failure that wedged the
+    # dispatcher for hours when a quota hit was misread as a crash.
     local limit_line
-    limit_line=$(tail -50 "$CLAUDE_SESSION_LOG" 2>/dev/null | grep -i "you.ve hit your limit\|hit your limit\|out of extra usage\|you.re out of" | tail -1)
+    limit_line=$(tail -50 "$CLAUDE_SESSION_LOG" 2>/dev/null | grep -iE "hit your ([a-z0-9-]+ )?limit|usage limit|out of extra usage|you.?re out of" | tail -1)
 
     if [[ -z "$limit_line" ]]; then
         return 1
@@ -1450,36 +1458,68 @@ check_usage_limit() {
 
     log_info "USAGE LIMIT: Detected rate-limit signal in claude-session.log: $limit_line"
 
-    # Extract reset time if present — e.g. "resets 6pm (UTC)" or "resets at 6:00pm"
-    local reset_time=""
-    reset_time=$(echo "$limit_line" | grep -oiE 'resets? (at )?[0-9]{1,2}(:[0-9]{2})?(am|pm)( \([A-Z]+\))?' | head -1)
-
     local now
     now=$(date +%s)
+
+    # --- Determine the actual quota-reset target, not a hardcoded midnight UTC ---
+    # The banner states the reset time in UTC, e.g. "resets 3pm (UTC)",
+    # "resets 10:30pm (UTC)", or the dated "resets Jun 5, 4pm (UTC)". Sleeping
+    # until midnight UTC (the old behaviour) either over-sleeps (system stays down
+    # for hours after the quota already reset) or wakes early and re-hits the limit.
+    # Parse the reset expression and wait until that moment; fall back to midnight
+    # UTC only when it cannot be parsed — so the worst case equals the old behaviour.
     local midnight_utc
     midnight_utc=$(date -u -d 'tomorrow 00:00:00' +%s)
-    local sleep_seconds=$(( midnight_utc - now ))
-    echo "$now $sleep_seconds $midnight_utc ${reset_time:-midnight-utc}" > "$LIMIT_WAIT_STATE_FILE"
-    log_info "USAGE LIMIT: Wrote limit-wait state to $LIMIT_WAIT_STATE_FILE (sleep ${sleep_seconds}s until midnight UTC)"
+
+    # Capture the text between "resets"/"resets at" and the "(UTC)" tag.
+    local reset_expr=""
+    reset_expr=$(echo "$limit_line" | sed -nE 's/.*[Rr]esets?[[:space:]]+([Aa]t[[:space:]]+)?([^()]+?)[[:space:]]*\([Uu][Tt][Cc]\).*/\2/p' | head -1)
+    # Fallback: a bare time-of-day with no "(UTC)" tag.
+    if [[ -z "$reset_expr" ]]; then
+        reset_expr=$(echo "$limit_line" | grep -oiE 'resets?[[:space:]]+(at[[:space:]]+)?[0-9]{1,2}(:[0-9]{2})?(am|pm)' | head -1 | sed -E 's/^[Rr]esets?[[:space:]]+([Aa]t[[:space:]]+)?//')
+    fi
+    # Normalize: drop commas (GNU date rejects "Jun 5, 4pm" but accepts "Jun 5 4pm")
+    # and trim surrounding whitespace.
+    reset_expr=$(echo "$reset_expr" | tr -d ',' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+
+    local target_epoch=""
+    if [[ -n "$reset_expr" ]]; then
+        # Interpret the expression in UTC (GNU date parses "3pm", "10:30pm",
+        # "Jun 5, 4pm", etc.).
+        target_epoch=$(TZ=UTC date -d "$reset_expr" +%s 2>/dev/null)
+        # If it parsed to a time-of-day that already passed today AND carries no
+        # explicit date (no month name → no 3+ letter run), roll to the next day.
+        if [[ "$target_epoch" =~ ^[0-9]+$ ]] && (( target_epoch <= now )) \
+           && ! echo "$reset_expr" | grep -qiE '[a-z]{3}'; then
+            target_epoch=$(TZ=UTC date -d "$reset_expr tomorrow" +%s 2>/dev/null)
+        fi
+    fi
+    # Safe fallback: midnight UTC when parsing failed or produced a non-integer.
+    [[ "$target_epoch" =~ ^[0-9]+$ ]] || target_epoch=$midnight_utc
+
+    local sleep_seconds=$(( target_epoch - now ))
+    (( sleep_seconds < 0 )) && sleep_seconds=0
+    echo "$now $sleep_seconds $target_epoch ${reset_expr:-midnight-utc}" > "$LIMIT_WAIT_STATE_FILE"
+    log_info "USAGE LIMIT: Wrote limit-wait state to $LIMIT_WAIT_STATE_FILE (target=$(date -u -d "@$target_epoch" '+%Y-%m-%dT%H:%M:%SZ'), sleep ${sleep_seconds}s)"
 
     local wake_time_et
-    wake_time_et=$(TZ="America/New_York" date -d "@$midnight_utc" "+%-I:%M %p ET")
+    wake_time_et=$(TZ="America/New_York" date -d "@$target_epoch" "+%-I:%M %p ET on %b %-d")
 
     local alert_text
-    if [[ -n "$reset_time" ]]; then
-        alert_text="Claude usage limit hit. ${reset_time^}. Sleeping until midnight UTC ($wake_time_et). Will retry automatically — no restart needed."
+    if [[ -n "$reset_expr" ]]; then
+        alert_text="Claude usage limit hit (resets $reset_expr UTC). Waiting until then ($wake_time_et) to retry automatically — no restart needed."
     else
-        alert_text="Claude usage limit hit. Sleeping until midnight UTC ($wake_time_et). Will retry automatically — no restart needed."
+        alert_text="Claude usage limit hit. Waiting until quota reset ($wake_time_et) to retry automatically — no restart needed."
     fi
 
     send_telegram_alert_deduped "usage-limit" "$alert_text"
     return 0
 }
 
-# is_limit_wait — returns 0 if a usage-limit event was recorded and midnight
-# UTC (quota reset) has not yet been reached.  Reads the stored target epoch
-# from $LIMIT_WAIT_STATE_FILE so the guard window matches the actual quota
-# reset boundary rather than a fixed 10-minute interval.
+# is_limit_wait — returns 0 if a usage-limit event was recorded and the quota
+# reset target has not yet been reached.  Reads the stored target epoch from
+# $LIMIT_WAIT_STATE_FILE (written by check_usage_limit from the banner's parsed
+# reset time) so the guard window matches the actual quota reset boundary.
 is_limit_wait() {
     [[ -f "$LIMIT_WAIT_STATE_FILE" ]] || return 1
     local recorded_at sleep_secs target_epoch
@@ -1488,10 +1528,10 @@ is_limit_wait() {
     local now; now=$(date +%s)
     if [[ "$target_epoch" =~ ^[0-9]+$ ]] && (( now < target_epoch )); then
         local remaining=$(( target_epoch - now ))
-        log_info "LIMIT-WAIT: Quota exhausted — sleeping until midnight UTC (${remaining}s remaining)"
+        log_info "LIMIT-WAIT: Quota exhausted — waiting until reset target (${remaining}s remaining)"
         return 0
     fi
-    # Midnight UTC reached — remove stale state file so normal logic resumes
+    # Reset target reached — remove stale state file so normal logic resumes
     rm -f "$LIMIT_WAIT_STATE_FILE"
     return 1
 }
@@ -1620,15 +1660,33 @@ do_restart() {
     local inbox_count
     inbox_count=$(ls "$INBOX_DIR" 2>/dev/null | wc -l)
     if [[ "$inbox_count" -gt "$INBOX_STORM_CAP" ]]; then
-        log_warn "STORM CAP: Skipping restart — inbox has $inbox_count messages (cap: $INBOX_STORM_CAP). Reason: $reason"
-        if [[ "$suppress_alert" != "true" ]]; then
-            send_telegram_alert_deduped "storm-cap" "Health check skipped restart: inbox has $inbox_count pending messages (cap: $INBOX_STORM_CAP).
+        # Liveness exemption: the storm cap exists to break a *live* dispatcher's
+        # restart feedback loop (restart → MCP recovers messages from processing/
+        # back to inbox/ → stale-inbox RED → restart → …). In that case the
+        # dispatcher is alive and will drain, so suppressing the restart is correct.
+        #
+        # But when the restart is driven by a CONFIRMED FROZEN/DEAD dispatcher
+        # (reason contains "heartbeat stale" / "frozen"), a large inbox is a
+        # *symptom* of the deadness, not evidence of a storm — and a restart is the
+        # ONLY recovery. Suppressing it here is exactly what wedged the system for
+        # hours (heartbeat aging 1425→3826s while every restart was skipped, inbox
+        # climbing 42→73). So bypass the cap for liveness-driven restarts. The
+        # MAX_RESTART_ATTEMPTS/BLACK rate limiter below still bounds genuine loops
+        # and alerts Dan, so this cannot reintroduce the original 433-restart storm
+        # (that storm's reason was "stale inbox", which is NOT exempted here).
+        if [[ "$reason" == *"heartbeat stale"* || "$reason" == *"frozen"* ]]; then
+            log_warn "STORM CAP bypassed: liveness restart ('$reason') with inbox=$inbox_count — a frozen/dead dispatcher must restart regardless of backlog"
+        else
+            log_warn "STORM CAP: Skipping restart — inbox has $inbox_count messages (cap: $INBOX_STORM_CAP). Reason: $reason"
+            if [[ "$suppress_alert" != "true" ]]; then
+                send_telegram_alert_deduped "storm-cap" "Health check skipped restart: inbox has $inbox_count pending messages (cap: $INBOX_STORM_CAP).
 
 Reason: $reason
 
 Restart suppressed to prevent a restart storm. System will re-evaluate on the next health check cycle."
+            fi
+            return 0
         fi
-        return 0
     fi
 
     # Subagent guard: do not restart while subagents are active.

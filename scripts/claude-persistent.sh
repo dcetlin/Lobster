@@ -542,7 +542,7 @@ launch_claude() {
     # the background write would overwrite "hibernate" with "active", causing
     # the health check to see mode=active + no WFM heartbeat → false restart.
     # Only write "active" if the current mode is NOT "hibernate".
-    ( sleep 5 && current_mode=$(read_state_mode 2>/dev/null || echo "unknown"); [[ "$current_mode" != "hibernate" ]] && write_state "active" "claude running, attempt=$attempt" ) &
+    ( sleep 5 && current_mode=$(read_state_mode 2>/dev/null || echo "unknown"); [[ "$current_mode" != "hibernate" && "$current_mode" != "quota_wait" ]] && write_state "active" "claude running, attempt=$attempt" ) &
 
     # Write the dispatcher PID file so the health check can target this specific
     # process for cleanup without relying on ambiguous pgrep matches.
@@ -576,8 +576,27 @@ launch_claude() {
         # injects dispatcher bootup context. Stale flags (dead PID) are ignored.
         mkdir -p "$WORKSPACE_DIR/data"
         echo "$BASHPID" > "$WORKSPACE_DIR/data/dispatcher-startup-flag"
+        local _dispatcher_model="${LOBSTER_DISPATCHER_MODEL:-sonnet}"
+        if [[ "$_dispatcher_model" == "auto" ]]; then
+            # Auto-fallback: if cc-usage-poller has fresh data showing Sonnet
+            # weekly >= 95%, fall back to opus. Otherwise default to sonnet.
+            # Stale data (>2h) is treated as "unknown" → keep sonnet.
+            local _budget="$HOME/.claude/cc-budget/state.json"
+            _dispatcher_model="sonnet"
+            if [[ -f "$_budget" ]]; then
+                local _sonnet_pct _ts _age
+                _sonnet_pct=$(jq -r '.rate_limits.seven_day_sonnet.pct // empty' "$_budget" 2>/dev/null)
+                _ts=$(jq -r '.ts // 0' "$_budget" 2>/dev/null)
+                _age=$(( $(date +%s) - ${_ts:-0} ))
+                if [[ -n "$_sonnet_pct" && $_age -lt 7200 ]]; then
+                    if awk -v p="$_sonnet_pct" 'BEGIN{exit !(p+0 >= 95)}'; then
+                        _dispatcher_model="opus"
+                    fi
+                fi
+            fi
+        fi
         exec claude --dangerously-skip-permissions \
-            --model sonnet \
+            --model "$_dispatcher_model" \
             --max-turns 150 \
             -p "$init_prompt"
     ) 2>&1 | tee -a "$LOG_DIR/claude-session.log" || claude_exit_code=$?
@@ -668,12 +687,12 @@ with open('$tmp_state', 'w') as f:
         local current_session_output
         current_session_output=$(awk '/^=== SESSION_START /{buf=""} {buf=buf"\n"$0} END{print buf}' \
             "$LOG_DIR/claude-session.log" 2>/dev/null)
-        if echo "$current_session_output" | grep -qi "out of extra usage\|you.ve hit your limit\|hit your limit\|you.re out of"; then
+        if echo "$current_session_output" | grep -qiE "out of extra usage|hit your ([A-Za-z]+ )?limit|you.re out of"; then
             # Classify quota type from the message text to send a specific alert.
             local quota_type="unknown"
             if echo "$current_session_output" | grep -qi "out of extra usage\|you.re out of"; then
                 quota_type="weekly"
-            elif echo "$current_session_output" | grep -qi "you.ve hit your limit\|hit your limit"; then
+            elif echo "$current_session_output" | grep -qiE "hit your ([A-Za-z]+ )?limit"; then
                 quota_type="session"
             fi
 

@@ -340,6 +340,70 @@ else
 fi
 
 #===============================================================================
+# Test 13: Modern banner — "hit your session limit" (regression for the stale
+# detector that silently broke recovery: the wording changed from "hit your
+# limit" to "hit your session limit", and the old regex no longer matched).
+#===============================================================================
+begin_test "check_usage_limit: detects modern 'session limit' banner"
+
+rm -f "$TEST_SESSION_LOG" "$TEST_LIMIT_WAIT_STATE"
+echo "You've hit your session limit · resets 3pm (UTC)" > "$TEST_SESSION_LOG"
+touch "$TEST_SESSION_LOG"
+
+run_and_capture_rc check_usage_limit
+if [[ $RC -eq 0 ]]; then
+    pass
+else
+    fail "expected 0 (modern 'session limit' banner must be detected), got $RC"
+fi
+
+#===============================================================================
+# Test 14: Modern banner — "hit your Sonnet limit" (per-model qualifier)
+#===============================================================================
+begin_test "check_usage_limit: detects modern 'Sonnet limit' banner"
+
+rm -f "$TEST_SESSION_LOG" "$TEST_LIMIT_WAIT_STATE"
+echo "You've hit your Sonnet limit · resets Jun 5, 4pm (UTC)" > "$TEST_SESSION_LOG"
+touch "$TEST_SESSION_LOG"
+
+run_and_capture_rc check_usage_limit
+if [[ $RC -eq 0 ]]; then
+    pass
+else
+    fail "expected 0 ('Sonnet limit' banner must be detected), got $RC"
+fi
+
+#===============================================================================
+# Test 15: Reset target is the PARSED reset time, not hardcoded midnight UTC.
+# "resets 6pm (UTC)" must yield a target at 18:00 UTC, never 00:00.
+#===============================================================================
+begin_test "check_usage_limit: reset target uses parsed time (6pm), not midnight"
+
+rm -f "$TEST_SESSION_LOG" "$TEST_LIMIT_WAIT_STATE"
+echo "You've hit your session limit · resets 6pm (UTC)" > "$TEST_SESSION_LOG"
+touch "$TEST_SESSION_LOG"
+
+run_and_capture_rc check_usage_limit
+read -r _ra _ss target_epoch _ < "$TEST_LIMIT_WAIT_STATE"
+target_hour=$(date -u -d "@$target_epoch" +%H 2>/dev/null)
+assert_eq "$target_hour" "18"
+
+#===============================================================================
+# Test 16: Dated reset form "Jun 5, 4pm (UTC)" parses to 2026-06-05 16:00 UTC
+# (comma normalization — GNU date rejects the comma form).
+#===============================================================================
+begin_test "check_usage_limit: dated reset 'Jun 5, 4pm' parses to 16:00 UTC"
+
+rm -f "$TEST_SESSION_LOG" "$TEST_LIMIT_WAIT_STATE"
+echo "You've hit your Sonnet limit · resets Jun 5, 4pm (UTC)" > "$TEST_SESSION_LOG"
+touch "$TEST_SESSION_LOG"
+
+run_and_capture_rc check_usage_limit
+read -r _ra _ss target_epoch _ < "$TEST_LIMIT_WAIT_STATE"
+target_stamp=$(date -u -d "@$target_epoch" +%H:%M 2>/dev/null)
+assert_eq "$target_stamp" "16:00"
+
+#===============================================================================
 # Summary
 #===============================================================================
 echo ""

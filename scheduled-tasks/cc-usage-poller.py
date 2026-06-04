@@ -344,6 +344,7 @@ def parse_usage_response(data: dict[str, Any]) -> dict[str, Any]:
     """
     five_hour = data.get("five_hour")
     seven_day = data.get("seven_day")
+    seven_day_sonnet = data.get("seven_day_sonnet")
 
     if five_hour is None and seven_day is None:
         raise ValueError(
@@ -366,6 +367,8 @@ def parse_usage_response(data: dict[str, Any]) -> dict[str, Any]:
         "five_hour_resets_at": _resets_at(five_hour),
         "seven_day_pct": _pct(seven_day),
         "seven_day_resets_at": _resets_at(seven_day),
+        "seven_day_sonnet_pct": _pct(seven_day_sonnet),
+        "seven_day_sonnet_resets_at": _resets_at(seven_day_sonnet),
     }
 
 
@@ -395,6 +398,10 @@ def merge_into_state(existing: dict[str, Any], parsed: dict[str, Any]) -> dict[s
         "seven_day": {
             "pct": parsed["seven_day_pct"],
             "resets_at": parsed["seven_day_resets_at"],
+        },
+        "seven_day_sonnet": {
+            "pct": parsed["seven_day_sonnet_pct"],
+            "resets_at": parsed["seven_day_sonnet_resets_at"],
         },
     }
     updated["last_updated"] = now_iso
