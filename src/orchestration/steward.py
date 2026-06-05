@@ -3475,6 +3475,8 @@ def _write_prescription_request(
     vision_orientation: str,
     dan_register: str,
     now_iso: str,
+    *,
+    prescribe_artifact_dir: "Path | None" = None,
 ) -> str:
     """
     Write a ``wos_prescribe`` inbox message and return the generated message ID.
@@ -3484,6 +3486,17 @@ def _write_prescription_request(
     steward writes an inbox message with all the prescription inputs and returns
     immediately.  The dispatcher routes the message to a prescription subagent
     that runs the claude -p call asynchronously.
+
+    Large fields (issue_body, steward_log, dan_register, vision_orientation,
+    diagnosis_section) are written to a separate artifact file keyed by
+    ``uow_id`` rather than embedded in the inbox message.  This keeps the inbox
+    message small (< 2 KB), preventing the dispatcher from building huge subagent
+    prompts that stall the heartbeat.  The artifact file path is included in the
+    inbox message as ``artifact_path``; the dispatcher reads it at consumption time.
+
+    Backward-compat: old in-flight messages that pre-date this change carry the
+    large fields inline.  ``handle_wos_prescribe`` in dispatcher_handlers.py
+    handles both shapes — artifact_path present (new) or absent (old/inline).
 
     The UoW must already be in ``diagnosing`` state when this is called.
     The caller is responsible for transitioning the UoW to ``prescribing``
@@ -3502,14 +3515,31 @@ def _write_prescription_request(
         vision_orientation: Vision context string for the prescription agent.
         dan_register: Dan's developmental register excerpt.
         now_iso: Current UTC timestamp in ISO 8601 format.
+        prescribe_artifact_dir: Override for the prescribe-artifacts directory.
+            Defaults to ``PRESCRIBE_ARTIFACTS_DIR``.  Useful in tests to avoid
+            writing to the real workspace.
 
     Returns:
         The message ID (str) written to the inbox.
 
     Raises:
-        OSError: If the inbox write fails.
+        OSError: If the inbox write or artifact write fails.
     """
+    from orchestration.prescribe_artifacts import write_prescribe_artifact
+
     msg_id = str(uuid.uuid4())
+
+    # Write large fields to a sidecar artifact file.
+    # The inbox message carries only the artifact_path reference.
+    artifact_path = write_prescribe_artifact(
+        uow.id,
+        artifact_dir=prescribe_artifact_dir,
+        issue_body=issue_body,
+        steward_log=uow.steward_log or "",
+        dan_register=dan_register,
+        vision_orientation=vision_orientation,
+        diagnosis_section=diagnosis_section,
+    )
 
     msg: dict[str, Any] = {
         "id": msg_id,
@@ -3524,16 +3554,13 @@ def _write_prescription_request(
         "success_criteria": uow.success_criteria or "",
         "reentry_posture": reentry_posture,
         "completion_gap": completion_gap,
-        "issue_body": issue_body,
         "cycles": cycles,
         "new_cycles": new_cycles,
         "selected_executor_type": selected_executor_type,
         "prescribed_skills": prescribed_skills,
-        "diagnosis_section": diagnosis_section,
-        "vision_orientation": vision_orientation,
-        "dan_register": dan_register,
-        "steward_log": uow.steward_log or "",
         "now_iso": now_iso,
+        # Reference to the artifact file — large fields live there, not inline.
+        "artifact_path": str(artifact_path),
     }
 
     _INBOX_DIR_PATH.mkdir(parents=True, exist_ok=True)
@@ -3542,8 +3569,8 @@ def _write_prescription_request(
     )
     log.info(
         "_write_prescription_request: wos_prescribe message written to inbox "
-        "(uow_id=%s, msg_id=%s, cycles=%d)",
-        uow.id, msg_id, cycles,
+        "(uow_id=%s, msg_id=%s, cycles=%d, artifact=%s)",
+        uow.id, msg_id, cycles, artifact_path,
     )
     return msg_id
 

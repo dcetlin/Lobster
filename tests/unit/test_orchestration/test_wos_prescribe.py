@@ -458,6 +458,7 @@ class TestWritePrescriptionRequest:
         """_write_prescription_request must write a JSON file to the inbox directory."""
         import orchestration.steward as steward_mod
         inbox_dir = tmp_path / "inbox"
+        artifact_dir = tmp_path / "prescribe-artifacts"
         inbox_dir.mkdir()
         monkeypatch.setattr(steward_mod, "_INBOX_DIR_PATH", inbox_dir)
 
@@ -475,6 +476,7 @@ class TestWritePrescriptionRequest:
             vision_orientation="",
             dan_register="",
             now_iso=_now_iso(),
+            prescribe_artifact_dir=artifact_dir,
         )
 
         assert msg_id, "must return a message ID"
@@ -489,6 +491,7 @@ class TestWritePrescriptionRequest:
         """Message type must be 'wos_prescribe'."""
         import orchestration.steward as steward_mod
         inbox_dir = tmp_path / "inbox"
+        artifact_dir = tmp_path / "prescribe-artifacts"
         inbox_dir.mkdir()
         monkeypatch.setattr(steward_mod, "_INBOX_DIR_PATH", inbox_dir)
 
@@ -506,14 +509,17 @@ class TestWritePrescriptionRequest:
             vision_orientation="",
             dan_register="",
             now_iso=_now_iso(),
+            prescribe_artifact_dir=artifact_dir,
         )
         msg = json.loads((inbox_dir / f"{msg_id}.json").read_text(encoding="utf-8"))
         assert msg["type"] == "wos_prescribe"
 
     def test_message_contains_prescription_inputs(self, tmp_path, monkeypatch):
-        """Message must contain all prescription inputs needed by the subagent."""
+        """Inbox message must carry scalar fields; large fields must be in the artifact file."""
         import orchestration.steward as steward_mod
+        import orchestration.prescribe_artifacts as pa_mod
         inbox_dir = tmp_path / "inbox"
+        artifact_dir = tmp_path / "prescribe-artifacts"
         inbox_dir.mkdir()
         monkeypatch.setattr(steward_mod, "_INBOX_DIR_PATH", inbox_dir)
 
@@ -531,16 +537,46 @@ class TestWritePrescriptionRequest:
             vision_orientation="Vision context",
             dan_register="Dan register",
             now_iso=_now_iso(),
+            prescribe_artifact_dir=artifact_dir,
         )
         msg = json.loads((inbox_dir / f"{msg_id}.json").read_text(encoding="utf-8"))
 
+        # Scalar fields remain in the inbox message.
         assert msg["reentry_posture"] == "continuation"
         assert msg["completion_gap"] == "Work not complete"
         assert msg["cycles"] == 2
         assert msg["new_cycles"] == 3
         assert msg["selected_executor_type"] == "lobster-ops"
         assert msg["prescribed_skills"] == ["verify"]
-        assert msg["vision_orientation"] == "Vision context"
+
+        # Large fields must NOT be inlined in the inbox message.
+        assert "vision_orientation" not in msg, (
+            "vision_orientation must be in the artifact file, not the inbox message"
+        )
+        assert "issue_body" not in msg, (
+            "issue_body must be in the artifact file, not the inbox message"
+        )
+        assert "steward_log" not in msg, (
+            "steward_log must be in the artifact file, not the inbox message"
+        )
+        assert "dan_register" not in msg, (
+            "dan_register must be in the artifact file, not the inbox message"
+        )
+        assert "diagnosis_section" not in msg, (
+            "diagnosis_section must be in the artifact file, not the inbox message"
+        )
+
+        # artifact_path must be present and point to an existing file.
+        assert "artifact_path" in msg, "inbox message must carry artifact_path"
+        artifact_path = msg["artifact_path"]
+        artifact_file = Path(artifact_path)
+        assert artifact_file.exists(), f"artifact file must exist at {artifact_path}"
+
+        # Large fields must be in the artifact file with correct values.
+        artifact = json.loads(artifact_file.read_text(encoding="utf-8"))
+        assert artifact["vision_orientation"] == "Vision context"
+        assert artifact["issue_body"] == "Issue body text"
+        assert artifact["dan_register"] == "Dan register"
 
 
 # ---------------------------------------------------------------------------
