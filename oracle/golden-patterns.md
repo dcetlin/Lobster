@@ -382,3 +382,17 @@ StartupSweepResult = _sweep_mod.StartupSweepResult
 **Where it appears:** `_DEFAULT_MAX_TURNS` and `_FALLBACK_MAX_TURNS` in `src/orchestration/executor.py`, introduced in PR #1426.
 
 **Reuse guidance:** Apply to any dispatch configuration that varies by executor type. The three-level precedence chain (artifact-level, type-level, global fallback) is the canonical extension point — adding a new executor type requires only a new key in the dict. The artifact-level override gives operators per-UoW control without code changes. Do not use a function-local dict for this pattern — the values must be importable by tests to avoid mirror-constant risk.
+
+---
+
+### [2026-06-05] Pattern: sidecar artifact file for large inbox message fields
+
+**Pattern:** When an inbox message grows large due to a small number of embedded blobs (issue bodies, logs, context strings), strip those blobs to a JSON sidecar file keyed by a stable unique ID (e.g., `uow_id`), store the file path as a scalar field in the inbox message, and have the consumer read the sidecar at consumption time. Keep the inbox message under 2KB with scalar routing fields only.
+
+**Why it works:** The inbox message's job is routing and identification, not payload transport. When large blobs are embedded inline, any system that reads the inbox message — including the dispatcher's message loop and any monitoring or analysis tool — pays the full payload cost on every read. Separating blobs into a sidecar means the routing layer (dispatcher) pays only the cost of the path reference; the consuming layer (subagent) pays the content cost. For dispatcher architectures where message processing happens synchronously in a blocking loop, this is a structural correctness guarantee, not merely an optimization: the loop's latency is now bounded by Python I/O + string ops, not by LLM inference over large context.
+
+The None-sentinel return from the reader function (`return None` when file missing) is the correct backward-compat mechanism: the consumer checks `if artifact is not None` and falls back to inline fields for old-shape messages. This eliminates the need for a migration or a cut-over deployment.
+
+**Where it appears:** `src/orchestration/prescribe_artifacts.py` introduced in PR #1433. `LARGE_FIELDS` frozenset + `PRESCRIBE_ARTIFACTS_DIR` Path constant at module scope (importable by tests). `write_prescribe_artifact` / `read_prescribe_artifact` are the two pure-function I/O operations. Wired into `steward._write_prescription_request` (writer) and `dispatcher_handlers.handle_wos_prescribe` (reader).
+
+**Reuse guidance:** Apply when (a) an inbox message contains blobs whose total size exceeds ~5KB; (b) the consumer of the message is the dispatcher's synchronous loop (blocking latency matters); (c) the blobs are written by a producer that can be modified at the same time as the consumer. Key implementation decisions: (1) key the sidecar by a stable unique ID, not a timestamp — UoW IDs are stable across retries, timestamps are not; (2) return `None` (not raise) from the reader when the file is missing — this is the backward-compat path for in-flight messages; (3) re-raise on parse errors (corrupt file) — a corrupt sidecar is a real error, not a backward-compat case; (4) provide an `artifact_dir` override parameter on both writer and reader for test isolation; (5) store the path as a string field in the inbox message, not as a content hash or relative path — absolute paths are unambiguous and the consumer can check existence directly.
