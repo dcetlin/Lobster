@@ -99,7 +99,10 @@ HEARTBEAT_FILE="$WORKSPACE_DIR/logs/claude-heartbeat"   # legacy WFM-touch signa
 # Single file, single integer (Unix epoch seconds). No JSON parsing required.
 # Threshold is generous enough to cover compaction + catchup without suppression.
 DISPATCHER_HEARTBEAT_FILE="${LOBSTER_DISPATCHER_HEARTBEAT_OVERRIDE:-$WORKSPACE_DIR/logs/dispatcher-heartbeat}"
-DISPATCHER_HEARTBEAT_STALE_SECONDS=1200   # 20 min — covers compaction (~5m) + catchup (~12m) + margin
+DISPATCHER_HEARTBEAT_STALE_SECONDS=1800   # TEMPORARY BUFFER (2026-06-05): raised from 1200s to 1800s while structural
+                                           # WOS quota_wait fixes land. 1800s = 30 min, covers the worst-case compaction
+                                           # + catchup window observed during the Jun 4-5 quota storm. Revert to 1200s
+                                           # once quota_wait mode correctly suppresses heartbeat checks in production.
 
 # Session age limit: CC enforces a hard 7440s session lifetime (issue #2059).
 # At this limit, CC kills the process without firing the Stop hook — no tombstone,
@@ -2283,9 +2286,9 @@ main() {
 
     if is_hibernating; then
         log_info "Dispatcher heartbeat suppressed (hibernating)"
-    elif [[ "$lobster_mode" == "starting" || "$lobster_mode" == "restarting" || \
-            "$lobster_mode" == "waking"    || "$lobster_mode" == "backoff"    || \
-            "$lobster_mode" == "stopped" ]]; then
+    elif [[ "$lobster_mode" == "starting"    || "$lobster_mode" == "restarting" || \
+            "$lobster_mode" == "waking"      || "$lobster_mode" == "backoff"    || \
+            "$lobster_mode" == "stopped"     || "$lobster_mode" == "quota_wait" ]]; then
         log_info "Dispatcher heartbeat suppressed (transient lifecycle state: $lobster_mode)"
     else
         check_dispatcher_heartbeat
