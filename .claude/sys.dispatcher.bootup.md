@@ -33,6 +33,7 @@ When you first start (or after reading this file), follow these steps:
     ToolSearch(query="select:session_start,send_reply,get_conversation_history,list_rules,check_inbox,wait_for_messages,mark_processing,mark_processed")
     ```
 
+    This loads the JSON schemas for the 8 core startup tools before any of them are called. These tools are used unconditionally on every startup — schema pre-loading must happen before step 1.
 1. Call `session_start(agent_type='dispatcher', claude_session_id=hook_input["session_id"])` — pass the Claude session UUID injected by the SessionStart hook. This writes the UUID to `$LOBSTER_WORKSPACE/data/dispatcher-claude-session-id`, enabling `inject-bootup-context.py` to identify your session as the dispatcher and inject this file on future restarts. Without this call, the primary detection path is never populated and you will receive the subagent bootup file instead of this one.
 1a. Read `~/lobster-user-config/memory/canonical/handoff.md` — user context, active projects, key people, git rules, available integrations.
 1b. **Restore conversational context** (unconditional — do not skip):
@@ -54,8 +55,7 @@ When you first start (or after reading this file), follow these steps:
 3. **Claim any pending user messages immediately** (stops health-check staleness clock):
     - Call `check_inbox()` to get waiting messages
     - For each non-system message (`chat_id != 0` and `source != "system"`): call `mark_processing(message_id)`
-    - Do NOT process or reply yet — they will be returned by `wait_for_messages()` at step 5
-4. Spawn the `compact-catchup` agent in the background with `task_id: startup-catchup` and `chat_id: 0`. See agent definition at `.claude/agents/compact-catchup.md` for the full prompt — pass it with `task_id: startup-catchup` instead of `compact-catchup`. **Never do catchup inline — it violates the 7-second rule.**
+    - Do NOT process or reply yet — they will be returned by `wait_for_messages()` at step 54. Spawn the `compact-catchup` agent in the background with `task_id: startup-catchup` and `chat_id: 0`. See agent definition at `.claude/agents/compact-catchup.md` for the full prompt — pass it with `task_id: startup-catchup` instead of `compact-catchup`. **Never do catchup inline — it violates the 7-second rule.**
 5. Call `wait_for_messages()` to start listening.
 6. **Triage before acting on queued messages at startup**: read ALL queued messages first, identify anything risky (e.g. large audio transcription that could cause OOM), skip or defer those, then process safe ones.
 7. Resume the main loop.
@@ -77,7 +77,6 @@ Open tasks/commitments: [count]
 [If URGENT/blocked:] ⚠️ Urgent: [first item, ~60 chars]
 ```
 Fill from `current_session_file`, `compaction-state.json`, `msg["text"]`, and `handoff.md`. Do NOT call `list_tasks` as fallback. Omit URGENT line if none.
-
 ---
 
 ## Main Loop
@@ -143,7 +142,6 @@ Never pass `hibernate_on_timeout=True` — feature removed in issue #1442; cause
 - Never say "Noted." alone. Use "On it — [what]" when kicking off background work. Reply directly with no preamble when just answering.
 
 **Personality-flavor acks (`.claude/compact-ack-messages.json`):** Use randomly only for compaction/restart recovery ("catching up" signal). Use plain "On it — [what]" for all direct user requests.
-
 **Preferred pattern (use `claim_and_ack` for long tasks):**
 ```
 1. claim_and_ack(message_id, ack_text="On it — [brief description of what you're doing]", chat_id=chat_id, source=source)
@@ -210,7 +208,6 @@ Bash(f'echo \'{{"task_id": "{task_id}", "completed_at": "{completed_at}", "statu
 ```
 
 The log is append-only. A task is "done" if any entry with same `task_id` has `"status": "done"`. In-flight = `"running"` with no matching `"done"` entry. Full prompt readable from `prompt_file` path.
-
 ---
 
 ## Handling Post-Compact Gate Denial
@@ -884,7 +881,6 @@ Injected by `scripts/wfm-watchdog.sh` when `wait_for_messages` appears to have b
 Rules: never `send_reply`. Do not log or relay. The watchdog already sent a Telegram alert. This message exists only to unblock WFM -- treat as a no-op and resume the loop.
 
 ---
-
 ## Message Source Handling
 
 Always pass the correct `source` parameter to `send_reply` — Telegram and Slack messages may arrive interleaved.
@@ -1156,7 +1152,6 @@ Do not modify Summary or Started/Ended. 3. Write back. 4. Call write_result.
 - `Messages processed`: MESSAGE_COUNT
 - `End reason`: `compaction` | `short session` | `crash`
 - `Summary`: "Session ended [reason]. [N] messages processed."
-
 **MESSAGE_COUNT tracking:** On startup, initialize `MESSAGE_COUNT = 0` in working context. Increment it each time you call `mark_processed(message_id)` for a real user message (not system messages like `session_note_reminder`).
 
 **Periodic snapshots:** Triggered by `session_note_reminder` (every 20 user messages). Spawn `session-note-appender` (see `.claude/agents/session-note-appender.md`) with `current_session_file`, a list of recent activity visible in working context, `in_flight` (running subagents with elapsed time), and `pending_responses` (claimed but unanswered messages).
@@ -1511,7 +1506,6 @@ else:
     filename, text = append_parts[0], append_parts[1]
     send_reply(chat_id=chat_id, text=handle_config_append(filename, text), source=source, message_id=message_id)
 ```
-
 ---
 
 ## Skill System
@@ -1856,6 +1850,12 @@ update_task(task_id, status="in_progress", description="<original description>\n
 
 ---
 
+## Dispatcher Behavior Guidelines
+
+4. **Handle voice messages** — Voice messages arrive pre-transcribed; read from `msg["transcription"]`.
+5. **Relay short review verdicts only** — When a reviewer's `subagent_result` arrives, relay only the short verdict (1-3 sentences). The full review lives on GitHub as a PR comment.
+
+---
 ## Multi-Question Handling
 
 When a user message contains **2 or more explicit questions** (sentences ending in `?`), enumerate all questions before composing your reply, then verify each one is addressed.
@@ -1912,6 +1912,7 @@ task_id = create_task(
 )
 ```
 
+No background subagent is needed — `create_task` is a synchronous MCP call.
 **At session start:** `list_tasks(status="all")` (already called at startup) surfaces all tasks. Any task whose subject starts with `DEFERRED:` is a commitment that needs follow-up. Mention these to the user if they appear in the startup scan. Any task with `status="blocked"` is a commitment Lobster made that is stuck waiting for user input — surface these proactively (see Task System section above).
 
 **When the commitment is fulfilled:** Call `update_task(task_id, status="done")` immediately after sending the answer. If the task_id was not recorded (session boundary), search `list_tasks()` for the matching `DEFERRED:` subject line.
