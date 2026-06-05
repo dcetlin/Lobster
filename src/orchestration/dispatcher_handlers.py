@@ -1432,34 +1432,65 @@ def handle_wos_prescribe(msg: dict[str, Any]) -> dict[str, Any]:
     it already is), then calls wos-write-artifact.py to write the artifact and
     transition the UoW. No nested `claude -p` subprocess is involved.
 
+    Large-field handling (slim-message design):
+        New messages carry an ``artifact_path`` field pointing to a sidecar
+        JSON file that holds issue_body, steward_log, dan_register,
+        vision_orientation, and diagnosis_section.  This keeps the inbox
+        message under ~2 KB.  The dispatcher reads the artifact here and
+        passes the full content to the subagent prompt.
+
+        Old in-flight messages (pre-slim-message) carry the large fields
+        inline in the message dict.  Both shapes are supported: if
+        ``artifact_path`` is present and readable, the artifact fields take
+        precedence; otherwise the inline fields are used as fallback.
+
     Args:
         msg: The wos_prescribe inbox message dict. Required fields:
-            uow_id, uow_summary, reentry_posture, completion_gap, issue_body,
-            cycles, new_cycles, selected_executor_type, prescribed_skills,
-            vision_orientation, dan_register, steward_log, now_iso.
+            uow_id, uow_summary, reentry_posture, completion_gap, cycles,
+            new_cycles, selected_executor_type, prescribed_skills, now_iso.
+            Either ``artifact_path`` (new) OR inline fields (issue_body,
+            vision_orientation, dan_register, steward_log, diagnosis_section)
+            must be present.
 
     Returns:
         A dict with action="spawn_subagent" containing task_id, agent_type,
         and prompt for the dispatcher to pass to the background Task call.
     """
+    from orchestration.prescribe_artifacts import read_prescribe_artifact
+
     uow_id: str = msg["uow_id"]
     task_id = f"wos-prescribe-{uow_id[:8]}"
 
-    # Extract prescription context from the payload.
+    # Extract scalar fields from the inbox message (always present, never large).
     uow_summary: str = msg.get("uow_summary", "")
     uow_type: str = msg.get("uow_type", "")
     success_criteria: str = msg.get("success_criteria", "")
     reentry_posture: str = msg.get("reentry_posture", "first_execution")
     completion_gap: str = msg.get("completion_gap", "")
-    issue_body: str = msg.get("issue_body", "")
     cycles: int = msg.get("cycles", 0)
     new_cycles: int = msg.get("new_cycles", 1)
     selected_executor_type: str = msg.get("selected_executor_type", "functional-engineer")
     prescribed_skills: list = msg.get("prescribed_skills", [])
-    vision_orientation: str = msg.get("vision_orientation", "")
-    dan_register: str = msg.get("dan_register", "")
-    steward_log: str = msg.get("steward_log", "")
     uow_source: str = msg.get("uow_source", "telegram")
+
+    # Resolve large fields: prefer artifact file (new path), fall back to
+    # inline message fields (backward-compat for pre-slim-message messages).
+    artifact: dict[str, Any] | None = None
+    artifact_path: str = msg.get("artifact_path", "")
+    if artifact_path:
+        artifact = read_prescribe_artifact(artifact_path)
+
+    if artifact is not None:
+        issue_body: str = artifact.get("issue_body", "")
+        steward_log: str = artifact.get("steward_log", "")
+        dan_register: str = artifact.get("dan_register", "")
+        vision_orientation: str = artifact.get("vision_orientation", "")
+    else:
+        # Inline fallback — in-flight messages written before this migration.
+        issue_body = msg.get("issue_body", "")
+        steward_log = msg.get("steward_log", "")
+        dan_register = msg.get("dan_register", "")
+        vision_orientation = msg.get("vision_orientation", "")
 
     # Build prior prescription history from steward_log for context.
     import json as _json_mod
