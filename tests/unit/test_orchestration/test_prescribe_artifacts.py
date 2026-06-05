@@ -33,14 +33,6 @@ from orchestration.prescribe_artifacts import (  # noqa: E402
 from orchestration.dispatcher_handlers import handle_wos_prescribe  # noqa: E402
 from orchestration.steward import _write_prescription_request  # noqa: E402
 
-# Constants matching the spec — named so tests stay readable if the value changes.
-EXPECTED_LARGE_FIELDS = frozenset({
-    "issue_body",
-    "steward_log",
-    "dan_register",
-    "vision_orientation",
-    "diagnosis_section",
-})
 
 
 def _now_iso() -> str:
@@ -178,9 +170,10 @@ class TestLargeFieldsConstant:
 
     def test_large_fields_covers_expected_set(self):
         """LARGE_FIELDS must cover all fields identified as large in the spec."""
-        assert LARGE_FIELDS == EXPECTED_LARGE_FIELDS, (
+        expected = frozenset({"issue_body", "steward_log", "dan_register", "vision_orientation", "diagnosis_section"})
+        assert LARGE_FIELDS == expected, (
             f"LARGE_FIELDS must exactly match the spec set.\n"
-            f"  Expected: {EXPECTED_LARGE_FIELDS}\n"
+            f"  Expected: {expected}\n"
             f"  Got: {LARGE_FIELDS}"
         )
 
