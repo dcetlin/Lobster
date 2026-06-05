@@ -17,15 +17,19 @@ Coverage:
 - run_poll_cycle returns 0 when gated out
 - run_poll_cycle returns the count of wos_execute messages found
 - agent_type from routing decision is forwarded to _dispatch_via_inbox
+- Status guard: wos_execute for a UoW with status=executing is discarded without dispatch
+- Status guard: wos_execute for a UoW with status=ready-for-executor is dispatched
+- Status guard: wos_execute for a UoW with status=active is dispatched
+- Status guard: wos_execute for an unknown UoW is discarded without dispatch
+- Status guard: registry read failure is fail-open (dispatch proceeds)
 """
 
 from __future__ import annotations
 
 import json
 import sys
-import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 import pytest
 
 
@@ -43,6 +47,7 @@ def _get_router_module():
         "orchestration": MagicMock(),
         "orchestration.dispatcher_handlers": MagicMock(),
         "orchestration.executor": MagicMock(),
+        "orchestration.registry": MagicMock(),
         "orchestration.steward": MagicMock(),
         "agents": MagicMock(),
         "agents.session_store": MagicMock(),
@@ -95,6 +100,10 @@ def router(tmp_path):
     # Default: execution enabled, 0 active agents
     mod.read_wos_config.return_value = {"execution_enabled": True}
     mod.get_active_sessions.return_value = []
+
+    # Default: status guard passes (UoW is dispatchable).
+    # Tests that exercise the status guard behavior override this mock directly.
+    mod._uow_status_allows_dispatch = MagicMock(return_value=True)
 
     return mod
 
@@ -577,7 +586,7 @@ class TestClaimRaceCondition:
 
         # Inject directly into the read result by monkeypatching _read_inbox_messages
         with patch.object(router, "_read_inbox_messages", return_value=[msg]):
-            result = router.run_poll_cycle()
+            router.run_poll_cycle()
 
         # Should not crash; dispatch never called
         router._dispatch.assert_not_called()
@@ -633,6 +642,7 @@ class TestDispatch:
             "orchestration": MagicMock(),
             "orchestration.dispatcher_handlers": MagicMock(),
             "orchestration.executor": MagicMock(_dispatch_via_inbox=mock_inbox_dispatch),
+            "orchestration.registry": MagicMock(),
             "orchestration.steward": MagicMock(),
             "agents": MagicMock(),
             "agents.session_store": MagicMock(),
@@ -685,3 +695,269 @@ class TestDispatch:
         assert call_kwargs.get("agent_type") == "functional-engineer", (
             f"Default agent_type must be 'functional-engineer', got {call_kwargs.get('agent_type')!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: status guard (_uow_status_allows_dispatch)
+# ---------------------------------------------------------------------------
+# These tests exercise _uow_status_allows_dispatch directly with a real
+# in-memory Registry, verifying the guard logic independently of the poll loop.
+# ---------------------------------------------------------------------------
+
+class TestUoWStatusGuard:
+    """_uow_status_allows_dispatch returns True only for dispatchable statuses."""
+
+    def _load_module_with_real_registry(self, registry_mock):
+        """Load the router module with a controlled Registry mock."""
+        import importlib.util
+
+        repo_root = Path(__file__).resolve().parent.parent
+
+        registry_module_mock = MagicMock()
+        registry_module_mock.Registry = registry_mock
+        # UoWStatus must be the real enum for the guard to work correctly —
+        # use the actual import from the registry module.
+        import sys
+        import importlib
+        # Load the real registry to get the real UoWStatus enum
+        sys.path.insert(0, str(repo_root))
+        sys.path.insert(0, str(repo_root / "src"))
+        from orchestration.registry import UoWStatus as _RealUoWStatus
+
+        registry_module_mock.UoWStatus = _RealUoWStatus
+
+        with patch.dict("sys.modules", {
+            "orchestration": MagicMock(),
+            "orchestration.dispatcher_handlers": MagicMock(),
+            "orchestration.executor": MagicMock(),
+            "orchestration.registry": registry_module_mock,
+            "orchestration.steward": MagicMock(),
+            "agents": MagicMock(),
+            "agents.session_store": MagicMock(),
+            "utils": MagicMock(),
+            "utils.inbox_write": MagicMock(),
+        }):
+            spec = importlib.util.spec_from_file_location(
+                "wos_execute_router_status_guard",
+                repo_root / "src" / "daemons" / "wos_execute_router.py",
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+
+    def _make_uow_mock(self, status_value: str):
+        """Create a mock UoW object with the given status string."""
+        import sys
+        from pathlib import Path
+        repo_root = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(repo_root))
+        sys.path.insert(0, str(repo_root / "src"))
+        from orchestration.registry import UoWStatus
+        uow = MagicMock()
+        uow.status = UoWStatus(status_value)
+        return uow
+
+    def test_executing_status_blocks_dispatch(self):
+        """A UoW with status=executing must not be dispatched (loop prevention)."""
+        uow = self._make_uow_mock("executing")
+        registry_instance = MagicMock()
+        registry_instance.get.return_value = uow
+        registry_cls = MagicMock(return_value=registry_instance)
+
+        mod = self._load_module_with_real_registry(registry_cls)
+
+        result = mod._uow_status_allows_dispatch("uow_20260603_5cc6fa")
+
+        assert result is False, (
+            "status=executing must return False — re-dispatching an executing UoW "
+            "is the root cause of the observed infinite loop."
+        )
+
+    def test_ready_for_executor_permits_dispatch(self):
+        """A UoW with status=ready-for-executor is the initial dispatch — must proceed."""
+        uow = self._make_uow_mock("ready-for-executor")
+        registry_instance = MagicMock()
+        registry_instance.get.return_value = uow
+        registry_cls = MagicMock(return_value=registry_instance)
+
+        mod = self._load_module_with_real_registry(registry_cls)
+
+        result = mod._uow_status_allows_dispatch("uow_pending_123")
+
+        assert result is True, (
+            "status=ready-for-executor must return True — this is the normal dispatch path."
+        )
+
+    def test_active_status_permits_dispatch(self):
+        """A UoW with status=active is mid-claim — dispatch is safe."""
+        uow = self._make_uow_mock("active")
+        registry_instance = MagicMock()
+        registry_instance.get.return_value = uow
+        registry_cls = MagicMock(return_value=registry_instance)
+
+        mod = self._load_module_with_real_registry(registry_cls)
+
+        result = mod._uow_status_allows_dispatch("uow_active_456")
+
+        assert result is True
+
+    def test_done_status_blocks_dispatch(self):
+        """A UoW with status=done must not be dispatched (already completed)."""
+        uow = self._make_uow_mock("done")
+        registry_instance = MagicMock()
+        registry_instance.get.return_value = uow
+        registry_cls = MagicMock(return_value=registry_instance)
+
+        mod = self._load_module_with_real_registry(registry_cls)
+
+        result = mod._uow_status_allows_dispatch("uow_done_789")
+
+        assert result is False
+
+    def test_failed_status_blocks_dispatch(self):
+        """A UoW with status=failed must not be dispatched."""
+        uow = self._make_uow_mock("failed")
+        registry_instance = MagicMock()
+        registry_instance.get.return_value = uow
+        registry_cls = MagicMock(return_value=registry_instance)
+
+        mod = self._load_module_with_real_registry(registry_cls)
+
+        result = mod._uow_status_allows_dispatch("uow_failed_000")
+
+        assert result is False
+
+    def test_ready_for_steward_blocks_dispatch(self):
+        """A UoW with status=ready-for-steward must not be re-dispatched."""
+        uow = self._make_uow_mock("ready-for-steward")
+        registry_instance = MagicMock()
+        registry_instance.get.return_value = uow
+        registry_cls = MagicMock(return_value=registry_instance)
+
+        mod = self._load_module_with_real_registry(registry_cls)
+
+        result = mod._uow_status_allows_dispatch("uow_rfs_abc")
+
+        assert result is False
+
+    def test_unknown_uow_blocks_dispatch(self):
+        """A wos_execute message for a UoW not found in registry is discarded."""
+        registry_instance = MagicMock()
+        registry_instance.get.return_value = None  # not found
+        registry_cls = MagicMock(return_value=registry_instance)
+
+        mod = self._load_module_with_real_registry(registry_cls)
+
+        result = mod._uow_status_allows_dispatch("uow_nonexistent_xyz")
+
+        assert result is False, (
+            "A wos_execute message for an unknown UoW must be discarded (fail-closed)."
+        )
+
+    def test_registry_error_is_fail_open(self):
+        """On registry read error, dispatch is allowed (fail-open to avoid silent stall)."""
+        registry_instance = MagicMock()
+        registry_instance.get.side_effect = Exception("DB locked")
+        registry_cls = MagicMock(return_value=registry_instance)
+
+        mod = self._load_module_with_real_registry(registry_cls)
+
+        result = mod._uow_status_allows_dispatch("uow_error_test")
+
+        assert result is True, (
+            "Registry read errors must fail-open: a stalled dispatch is recoverable; "
+            "a silently suppressed dispatch is not."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: status guard integration with poll loop
+# ---------------------------------------------------------------------------
+
+class TestStatusGuardInPollLoop:
+    """Status guard fires before claim, discarding duplicate wos_execute messages."""
+
+    def test_executing_uow_message_discarded_not_dispatched(self, router):
+        """wos_execute for an executing UoW is moved to processed/ without dispatch."""
+        router._uow_status_allows_dispatch.return_value = False
+
+        msg = _make_wos_execute_msg(uow_id="uow_executing_abc")
+        _write_msg(router.INBOX_DIR, msg)
+
+        router.run_poll_cycle()
+
+        # Message must be in processed/ — not in inbox/ or failed/
+        assert not (router.INBOX_DIR / f"{msg['id']}.json").exists(), (
+            "Duplicate message must be removed from inbox"
+        )
+        assert (router.PROCESSED_DIR / f"{msg['id']}.json").exists(), (
+            "Duplicate message must be moved to processed/ (not failed/)"
+        )
+        # Dispatch must never be called
+        router._dispatch.assert_not_called()
+        # route_wos_message must never be called
+        router.route_wos_message.assert_not_called()
+
+    def test_executing_uow_does_not_write_alert(self, router):
+        """Discarding a duplicate wos_execute message does not write an alert."""
+        router._uow_status_allows_dispatch.return_value = False
+
+        msg = _make_wos_execute_msg(uow_id="uow_executing_noalert")
+        _write_msg(router.INBOX_DIR, msg)
+
+        router.run_poll_cycle()
+
+        # No alert should be written for a normal status-guard discard
+        router.write_inbox_message.assert_not_called()
+
+    def test_ready_for_executor_uow_is_dispatched(self, router):
+        """wos_execute for a ready-for-executor UoW proceeds normally."""
+        router._uow_status_allows_dispatch.return_value = True
+
+        msg = _make_wos_execute_msg(uow_id="uow_rfe_dispatch")
+        _write_msg(router.INBOX_DIR, msg)
+
+        router.route_wos_message.return_value = {
+            "action": "spawn_subagent",
+            "task_id": f"wos-{msg['uow_id']}",
+            "prompt": "run this",
+            "agent_type": "functional-engineer",
+            "message_type": "wos_execute",
+        }
+        router._dispatch.return_value = "msg-id"
+
+        router.run_poll_cycle()
+
+        router._dispatch.assert_called_once()
+        assert (router.PROCESSED_DIR / f"{msg['id']}.json").exists()
+
+    def test_mixed_inbox_only_executing_skipped(self, router):
+        """
+        With two UoWs — one executing, one ready — only the ready one is dispatched.
+        """
+        msg_exec = _make_wos_execute_msg(uow_id="uow_executing_skip")
+        msg_ready = _make_wos_execute_msg(uow_id="uow_ready_dispatch")
+        _write_msg(router.INBOX_DIR, msg_exec)
+        _write_msg(router.INBOX_DIR, msg_ready)
+
+        def status_side_effect(uow_id: str) -> bool:
+            return uow_id == "uow_ready_dispatch"
+
+        router._uow_status_allows_dispatch.side_effect = status_side_effect
+
+        router.route_wos_message.return_value = {
+            "action": "spawn_subagent",
+            "task_id": f"wos-{msg_ready['uow_id']}",
+            "prompt": "run",
+            "agent_type": "functional-engineer",
+            "message_type": "wos_execute",
+        }
+        router._dispatch.return_value = "msg-id"
+
+        router.run_poll_cycle()
+
+        # Only one dispatch — the ready one
+        router._dispatch.assert_called_once()
+        # Both messages in processed/ — executing one discarded, ready one dispatched
+        assert (router.PROCESSED_DIR / f"{msg_exec['id']}.json").exists()
+        assert (router.PROCESSED_DIR / f"{msg_ready['id']}.json").exists()

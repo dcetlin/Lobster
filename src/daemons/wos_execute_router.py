@@ -12,14 +12,17 @@ The daemon is a persistent systemd service.  On each poll cycle it:
 1. Reads all messages in the inbox directory (pure file I/O, no MCP).
 2. Filters to ``type == "wos_execute"`` client-side.
 3. For each matching message:
-   a. Claims it by moving it from inbox/ to processing/ (mark_processing).
-   b. Calls ``route_wos_message()`` — a pure function that returns a routing
+   a. Status guard: checks the UoW's registry status.  If the status is not
+      ACTIVE or READY_FOR_EXECUTOR (e.g. already EXECUTING), moves the message
+      directly to processed/ without dispatching — prevents duplicate dispatch.
+   b. Claims it by moving it from inbox/ to processing/ (mark_processing).
+   c. Calls ``route_wos_message()`` — a pure function that returns a routing
       decision dict without spawning anything.
-   c. If the decision is ``action == "spawn_subagent"``, dispatches via
+   d. If the decision is ``action == "spawn_subagent"``, dispatches via
       ``_dispatch_via_inbox()`` from ``executor.py`` (the canonical inbox
       dispatch path).
-   d. Moves the message from processing/ to processed/ (mark_processed).
-   e. On hard error: writes a system alert to inbox/ via inbox_write.py and
+   e. Moves the message from processing/ to processed/ (mark_processed).
+   f. On hard error: writes a system alert to inbox/ via inbox_write.py and
       moves the message to failed/.
 4. If a ``send_reply`` action is returned (spawn-gate alert from the pure
    router), writes a ``subagent_result`` inbox message so the dispatcher can
@@ -30,6 +33,10 @@ Gates
 - ``wos-config.json`` ``execution_enabled`` gate: if False, skip routing.
 - ``MAX_AGENTS_GATE``: if active agent count >= threshold, defer by leaving
   messages unclaimed and trying again on the next cycle.
+- ``_DISPATCHABLE_STATUSES`` status guard: if the UoW's registry status is not
+  ACTIVE or READY_FOR_EXECUTOR, the message is discarded (moved to processed/)
+  without dispatch.  Prevents the infinite re-emission loop where the router
+  re-dispatches already-executing UoWs every poll cycle.
 
 Awareness path
 --------------
@@ -51,7 +58,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import signal
 import sys
 import time
@@ -76,6 +82,7 @@ for _p in [str(_REPO_ROOT), str(_SRC_ROOT)]:
 
 from orchestration.dispatcher_handlers import route_wos_message, read_wos_config  # noqa: E402
 from orchestration.executor import _dispatch_via_inbox  # noqa: E402
+from orchestration.registry import Registry as _Registry, UoWStatus  # noqa: E402
 from agents.session_store import get_active_sessions  # noqa: E402
 from utils.inbox_write import write_inbox_message  # noqa: E402
 
@@ -262,6 +269,38 @@ def _find_in_dir(directory: Path, message_id: str) -> Path | None:
     return None
 
 
+def _discard_inbox_message(msg: dict) -> None:
+    """
+    Move a message directly from inbox/ to processed/ without claiming it.
+
+    Used by the status guard to discard duplicate wos_execute messages for
+    UoWs that are already executing (or otherwise not dispatchable).  Bypasses
+    the claim/processing step so the message does not linger in processing/.
+
+    Locates the file by ``_filepath`` key stamped by ``_read_inbox_messages``.
+    Logs a warning but does not raise if the file is missing (another process
+    may have claimed it in a race condition).
+    """
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+
+    filepath = msg.get("_filepath")
+    if not filepath:
+        log.warning("discard: no _filepath in message %s — cannot discard", msg.get("id", "?"))
+        return
+
+    src = Path(filepath)
+    if not src.exists():
+        log.debug("discard: %s no longer in inbox — already claimed or discarded", src.name)
+        return
+
+    dest = PROCESSED_DIR / src.name
+    try:
+        src.rename(dest)
+        log.debug("discard: moved %s -> processed/ (status guard)", src.name)
+    except OSError as exc:
+        log.warning("discard: could not move %s to processed/: %s", src.name, exc)
+
+
 # ---------------------------------------------------------------------------
 # Gate helpers
 # ---------------------------------------------------------------------------
@@ -280,6 +319,76 @@ def _active_agent_count() -> int:
     except Exception as exc:
         log.warning("active_agent_count: could not read session store: %s — assuming 0", exc)
         return 0
+
+
+# Statuses that indicate a UoW is ready to be dispatched by the router.
+# A wos_execute message whose UoW is NOT in one of these statuses must be
+# discarded (marked processed without spawning), because:
+#
+# - UoWStatus.ACTIVE: executor_heartbeat has claimed the UoW and is in the
+#   middle of the claim/dispatch transaction; dispatch is imminent and this
+#   message represents the in-flight request — safe to route.
+#
+# - UoWStatus.READY_FOR_EXECUTOR: the UoW is waiting to be claimed; this
+#   message is the initial dispatch request — safe to route.
+#
+# Any other status (EXECUTING, DONE, FAILED, READY_FOR_STEWARD, ...) means
+# the UoW has already been dispatched or has completed — routing again would
+# create a duplicate subagent and is the root cause of the observed loop.
+_DISPATCHABLE_STATUSES: frozenset[UoWStatus] = frozenset({
+    UoWStatus.ACTIVE,
+    UoWStatus.READY_FOR_EXECUTOR,
+})
+
+
+def _uow_status_allows_dispatch(uow_id: str) -> bool:
+    """
+    Return True if the UoW's registry status permits dispatch.
+
+    Queries the registry for the UoW's current status.  Returns True only when
+    the status is in ``_DISPATCHABLE_STATUSES``; returns False for any other
+    status (including EXECUTING, DONE, FAILED, etc.) and when the UoW is not
+    found.
+
+    On registry read error the function returns True (fail-open) so a transient
+    DB hiccup does not permanently suppress a legitimate dispatch.  The error
+    is logged at WARNING level.
+
+    The fail-open posture is the safer default here: a false-positive dispatch
+    (re-routing a genuinely in-flight UoW) is visible and recoverable via the
+    existing TTL/sweep path; a false-negative (suppressing a legitimate dispatch)
+    would silently stall the UoW with no recovery signal.
+    """
+    try:
+        reg = _Registry()
+        uow = reg.get(uow_id)
+    except Exception as exc:
+        log.warning(
+            "status_guard: registry read failed for uow_id=%s — failing open: %s",
+            uow_id, exc,
+        )
+        return True  # fail-open: allow dispatch on transient error
+
+    if uow is None:
+        # UoW not in registry — the message may reference a stale or deleted UoW.
+        # Suppress dispatch (fail-closed for unknown UoWs — nothing to recover).
+        log.info(
+            "status_guard: uow_id=%s not found in registry — discarding message",
+            uow_id,
+        )
+        return False
+
+    if uow.status in _DISPATCHABLE_STATUSES:
+        return True
+
+    log.info(
+        "status_guard: uow_id=%s has status=%s — not in dispatchable set %s; "
+        "discarding duplicate wos_execute message",
+        uow_id,
+        uow.status,
+        {s.value for s in _DISPATCHABLE_STATUSES},
+    )
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -369,16 +478,42 @@ def _route_single_message(msg: dict) -> None:
     """
     Route a single wos_execute message end-to-end.
 
-    Claim → route → dispatch (if spawn_subagent) → mark_processed.
+    Status guard → Claim → route → dispatch (if spawn_subagent) → mark_processed.
     On failure: mark_failed + write alert.
 
     All exceptions are caught and logged — never propagated to the poll loop.
+
+    Status guard: if the UoW's registry status is not in ``_DISPATCHABLE_STATUSES``
+    (i.e. it is already EXECUTING, DONE, FAILED, etc.), the message is discarded
+    by moving it to processed/ without dispatching.  This prevents the infinite
+    re-emission loop where the router repeatedly re-dispatches an already-executing
+    UoW every poll cycle.
     """
     message_id: str = msg.get("id", "")
     uow_id: str = msg.get("uow_id", "?")
 
     if not message_id:
         log.warning("route: message has no id field — skipping: %r", msg)
+        return
+
+    # -----------------------------------------------------------------------
+    # Status guard (loop-prevention): skip dispatch if UoW is already in-flight.
+    # A wos_execute message for a UoW that is already EXECUTING (or in any
+    # non-dispatchable status) is a duplicate produced by a prior router cycle.
+    # Claiming and re-dispatching it would spawn another subagent for the same
+    # UoW, compound inbox flooding, and prevent natural TTL/sweep recovery.
+    #
+    # The guard runs BEFORE claim so the message file is never moved to
+    # processing/ for duplicate messages — it moves directly to processed/.
+    # -----------------------------------------------------------------------
+    if not _uow_status_allows_dispatch(uow_id):
+        log.info(
+            "route: skipping duplicate wos_execute for uow_id=%s message_id=%s "
+            "(UoW status not dispatchable — discarding without spawning)",
+            uow_id, message_id,
+        )
+        # Move directly from inbox to processed — bypass claim/processing
+        _discard_inbox_message(msg)
         return
 
     log.info("route: claiming wos_execute message_id=%s uow_id=%s", message_id, uow_id)
