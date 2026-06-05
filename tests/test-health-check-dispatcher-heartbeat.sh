@@ -6,8 +6,8 @@
 #
 # Tests:
 #   1. Heartbeat file absent → GREEN (skipped, no false alarm on fresh install)
-#   2. Heartbeat file recent (< DISPATCHER_HEARTBEAT_STALE_SECONDS) → GREEN
-#   3. Heartbeat file stale (> DISPATCHER_HEARTBEAT_STALE_SECONDS) → RED (exit 2)
+#   2. Heartbeat file recent (< DISPATCHER_HEARTBEAT_STALE_SECONDS, currently 1800s) → GREEN
+#   3. Heartbeat file stale (> DISPATCHER_HEARTBEAT_STALE_SECONDS, currently 1800s) → RED (exit 2)
 #   4. Heartbeat file contains non-integer content → GREEN (graceful fallback)
 #   5. Heartbeat file exists but empty → GREEN (graceful fallback)
 #   6. LOBSTER_DISPATCHER_HEARTBEAT_OVERRIDE respected
@@ -55,7 +55,7 @@ assert_exit() {
 
 # Source check_dispatcher_heartbeat() from the health check script once.
 LOG_FILE="$TEST_LOG_DIR/health-check.log"
-DISPATCHER_HEARTBEAT_STALE_SECONDS=1200
+DISPATCHER_HEARTBEAT_STALE_SECONDS=1800
 # WFM-active variables (issue #1713): must match the values in health-check-v3.sh.
 # Default to an absent file so existing heartbeat tests are unaffected.
 DISPATCHER_WFM_ACTIVE_FILE="$TEST_LOG_DIR/dispatcher-wfm-active-ABSENT"
@@ -98,10 +98,10 @@ run_heartbeat_check "$DISPATCHER_HEARTBEAT_FILE" && rc=$? || rc=$?
 assert_exit "$rc" 0
 
 # -------------------------------------------------------------------
-# Test 3: Stale heartbeat (> 1200s ago) → RED
+# Test 3: Stale heartbeat (> 1800s ago) → RED
 # -------------------------------------------------------------------
-begin_test "Stale heartbeat (1500s ago) → RED"
-echo "$(( $(date +%s) - 1500 ))" > "$DISPATCHER_HEARTBEAT_FILE"
+begin_test "Stale heartbeat (2100s ago) → RED"
+echo "$(( $(date +%s) - 2100 ))" > "$DISPATCHER_HEARTBEAT_FILE"
 run_heartbeat_check "$DISPATCHER_HEARTBEAT_FILE" && rc=$? || rc=$?
 assert_exit "$rc" 2
 
@@ -133,16 +133,16 @@ assert_exit "$rc" 0
 # -------------------------------------------------------------------
 # Test 7: Exactly 1 second past threshold → RED (boundary)
 # -------------------------------------------------------------------
-begin_test "1s past threshold (1201s ago) → RED"
-echo "$(( $(date +%s) - 1201 ))" > "$DISPATCHER_HEARTBEAT_FILE"
+begin_test "1s past threshold (1801s ago) → RED"
+echo "$(( $(date +%s) - 1801 ))" > "$DISPATCHER_HEARTBEAT_FILE"
 run_heartbeat_check "$DISPATCHER_HEARTBEAT_FILE" && rc=$? || rc=$?
 assert_exit "$rc" 2
 
 # -------------------------------------------------------------------
 # Test 8: Exactly 1 second before threshold → GREEN (boundary)
 # -------------------------------------------------------------------
-begin_test "1s before threshold (1199s ago) → GREEN"
-echo "$(( $(date +%s) - 1199 ))" > "$DISPATCHER_HEARTBEAT_FILE"
+begin_test "1s before threshold (1799s ago) → GREEN"
+echo "$(( $(date +%s) - 1799 ))" > "$DISPATCHER_HEARTBEAT_FILE"
 run_heartbeat_check "$DISPATCHER_HEARTBEAT_FILE" && rc=$? || rc=$?
 assert_exit "$rc" 0
 
