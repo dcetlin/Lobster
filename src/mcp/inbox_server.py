@@ -1465,6 +1465,19 @@ except Exception as _ss_err:
 try:
     _claims_db = _AtomicClaimDB()
     log.info("Atomic claim DB initialized (message_claims + dispatcher_lock tables)")
+    # One-shot startup cleanup: remove claim rows older than 7 days.
+    # message_claims accumulates one row per processed message and is never
+    # pruned between restarts, so we do a bulk cleanup here on every server
+    # start before any new claims are recorded (issue #1436).
+    try:
+        _claims_pruned = _claims_db.cleanup_old_claims()
+        if _claims_pruned > 0:
+            log.info(
+                "[claims] startup: pruned %d stale claim row(s) from message_claims",
+                _claims_pruned,
+            )
+    except Exception as _claims_prune_err:
+        log.warning(f"[claims] startup pruning failed (non-fatal): {_claims_prune_err}")
 except Exception as _claims_err:
     # Degrade gracefully: create a no-op stub so the rest of the module
     # continues to work even if the DB cannot be opened.
@@ -1478,6 +1491,7 @@ except Exception as _claims_err:
         def get_dispatcher_lock(self, *a, **kw): return None
         def release_dispatcher_lock(self, *a, **kw) -> None: pass
         def force_replace_dispatcher_lock(self, *a, **kw) -> None: pass
+        def cleanup_old_claims(self, *a, **kw) -> int: return 0
     _claims_db = _NoOpClaimsDB()
 
 # NOTE: Startup cleanup (cleanup_stale_running_sessions) is intentionally NOT
