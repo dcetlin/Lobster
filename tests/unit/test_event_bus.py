@@ -32,6 +32,7 @@ from event_bus import (
     EventFilter,
     JsonlFileListener,
     LobsterEvent,
+    MetricsListener,
     TelegramOutboxListener,
     get_event_bus,
     init_event_bus,
@@ -277,6 +278,103 @@ class TestTelegramOutboxListener:
 # ---------------------------------------------------------------------------
 # Singleton behaviour
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# MetricsListener — memory-leak fix (issue #1436)
+# ---------------------------------------------------------------------------
+
+class TestMetricsListenerBounded:
+    """Verify that _error_timestamps stays bounded without calling get_snapshot().
+
+    The original bug: _error_timestamps was only pruned inside get_snapshot().
+    A long-running server that never calls get_snapshot() would accumulate every
+    error/critical timestamp without bound, eventually exhausting RSS.
+
+    The fix: prune every _PRUNE_INTERVAL deliveries even without get_snapshot().
+    """
+
+    PRUNE_INTERVAL = MetricsListener._PRUNE_INTERVAL
+
+    def _make_error_event(self) -> LobsterEvent:
+        return make_event(severity="error")
+
+    def _make_old_error_event(self, hours_ago: int = 2) -> LobsterEvent:
+        from datetime import datetime, timezone, timedelta
+        old_ts = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+        return LobsterEvent(
+            event_type="test.old_error",
+            severity="error",
+            source="test",
+            payload={"msg": "old error"},
+            timestamp=old_ts,
+        )
+
+    def test_error_timestamps_bounded_without_get_snapshot(self):
+        """After 2x the prune interval, old timestamps must not remain in the list."""
+        listener = MetricsListener()
+
+        # Deliver enough old-error events to trigger pruning at least once.
+        # We use events timestamped >1h ago so they fall outside the sliding window.
+        old_events = [self._make_old_error_event(hours_ago=2)
+                      for _ in range(self.PRUNE_INTERVAL + 10)]
+
+        async def run():
+            for ev in old_events:
+                await listener.deliver(ev)
+
+        asyncio.run(run())
+
+        # After pruning, old timestamps must have been evicted.
+        # We never called get_snapshot() — the prune must have happened in deliver().
+        with listener._lock:
+            remaining = len(listener._error_timestamps)
+        assert remaining < len(old_events), (
+            f"Expected old timestamps to be pruned; still have {remaining} entries"
+        )
+
+    def test_recent_error_timestamps_preserved_after_prune(self):
+        """Current-hour error events must not be evicted by the pruning logic."""
+        listener = MetricsListener()
+
+        # Mix of old and recent events to fill past the prune interval.
+        old_events = [self._make_old_error_event(hours_ago=2)
+                      for _ in range(self.PRUNE_INTERVAL - 5)]
+        recent_events = [self._make_error_event() for _ in range(10)]
+
+        async def run():
+            for ev in old_events + recent_events:
+                await listener.deliver(ev)
+
+        asyncio.run(run())
+
+        with listener._lock:
+            remaining = len(listener._error_timestamps)
+        # All 10 recent events must be retained; old ones must be gone.
+        assert remaining == len(recent_events), (
+            f"Expected only {len(recent_events)} recent entries; got {remaining}"
+        )
+
+    def test_get_snapshot_errors_last_1h_accurate(self):
+        """get_snapshot().errors_last_1h must reflect only within-window events."""
+        listener = MetricsListener()
+
+        old_events = [self._make_old_error_event(hours_ago=3) for _ in range(5)]
+        recent_events = [self._make_error_event() for _ in range(3)]
+
+        async def run():
+            for ev in old_events + recent_events:
+                await listener.deliver(ev)
+
+        asyncio.run(run())
+
+        snap = listener.get_snapshot()
+        assert snap["errors_last_1h"] == len(recent_events)
+
+    def test_prune_interval_constant_is_importable(self):
+        """_PRUNE_INTERVAL is a class attribute importable by tests (golden-patterns: named constant)."""
+        assert isinstance(MetricsListener._PRUNE_INTERVAL, int)
+        assert MetricsListener._PRUNE_INTERVAL > 0
+
 
 class TestSingleton:
     def test_get_event_bus_returns_same_instance(self):

@@ -19,7 +19,7 @@ Design:
 import logging
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 log = logging.getLogger("lobster-mcp")
@@ -102,6 +102,7 @@ class AtomicClaimDB:
 
     def __init__(self, path: Path | None = None) -> None:
         self._path = path if path is not None else _DEFAULT_DB_PATH
+        self._claim_count: int = 0  # used to amortise periodic pruning
         self._ensure_schema()
 
     def _conn(self) -> sqlite3.Connection:
@@ -121,6 +122,71 @@ class AtomicClaimDB:
     # Message claim operations
     # ------------------------------------------------------------------
 
+    # Rows older than this threshold are eligible for pruning regardless of
+    # status.  7 days is generous enough to cover any retry window.
+    _CLAIM_PRUNE_AGE_DAYS: int = 7
+
+    # Prune at most once every N claim() calls to amortise the DELETE cost.
+    # With ~100 claims/hour at peak, this fires roughly once per 10 hours.
+    _CLAIM_PRUNE_INTERVAL: int = 1000
+
+    def _prune_old_claims(self) -> None:
+        """Delete claim rows older than _CLAIM_PRUNE_AGE_DAYS days.
+
+        Called periodically from claim() to prevent the message_claims table
+        from growing without bound over the server's lifetime (issue #1436).
+        Targets only rows whose claimed_at timestamp is older than the prune
+        window — active 'processing' rows within that window are preserved.
+
+        Never raises — pruning failure is non-fatal and logged at DEBUG level.
+        """
+        try:
+            conn = self._conn()
+            cutoff_dt = datetime.now(timezone.utc) - timedelta(days=self._CLAIM_PRUNE_AGE_DAYS)
+            cutoff_iso = cutoff_dt.isoformat()
+            with conn:
+                result = conn.execute(
+                    "DELETE FROM message_claims WHERE claimed_at < ?",
+                    (cutoff_iso,),
+                )
+            deleted = result.rowcount
+            if deleted > 0:
+                log.debug(
+                    "[claims] pruned %d old claim row(s) (older than %d days)",
+                    deleted,
+                    self._CLAIM_PRUNE_AGE_DAYS,
+                )
+        except Exception as exc:
+            log.debug("[claims] prune failed (non-fatal): %s", exc)
+
+    def cleanup_old_claims(self) -> int:
+        """Public one-shot cleanup of old claim rows. Returns count of deleted rows.
+
+        Intended to be called at server startup to immediately reclaim space from
+        the accumulated backlog of old rows.  Raises no exceptions — returns 0 on
+        failure.
+        """
+        try:
+            conn = self._conn()
+            cutoff_dt = datetime.now(timezone.utc) - timedelta(days=self._CLAIM_PRUNE_AGE_DAYS)
+            cutoff_iso = cutoff_dt.isoformat()
+            with conn:
+                result = conn.execute(
+                    "DELETE FROM message_claims WHERE claimed_at < ?",
+                    (cutoff_iso,),
+                )
+            deleted = result.rowcount
+            if deleted > 0:
+                log.info(
+                    "[claims] startup cleanup: pruned %d old claim row(s) (older than %d days)",
+                    deleted,
+                    self._CLAIM_PRUNE_AGE_DAYS,
+                )
+            return deleted
+        except Exception as exc:
+            log.warning("[claims] startup cleanup failed (non-fatal): %s", exc)
+            return 0
+
     def claim(self, message_id: str, session_id: str = "dispatcher") -> bool:
         """Attempt to claim message_id for session_id.
 
@@ -129,6 +195,10 @@ class AtomicClaimDB:
 
         Thread-safe: SQLite serializes concurrent INSERTs under WAL mode.
         Two callers racing on the same message_id: one wins, one returns False.
+
+        Periodically prunes old claim rows (every _CLAIM_PRUNE_INTERVAL calls)
+        to prevent the message_claims table from growing without bound
+        (issue #1436).
         """
         try:
             conn = self._conn()
@@ -142,6 +212,9 @@ class AtomicClaimDB:
                         datetime.now(timezone.utc).isoformat(),
                     ),
                 )
+            self._claim_count += 1
+            if self._claim_count % self._CLAIM_PRUNE_INTERVAL == 0:
+                self._prune_old_claims()
             return True
         except sqlite3.IntegrityError:
             return False
