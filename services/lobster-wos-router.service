@@ -1,7 +1,7 @@
 [Unit]
 Description=Lobster WOS Execute Router — mechanical wos_execute inbox routing daemon
 Documentation=https://github.com/dcetlin/Lobster/issues/940
-After=network.target lobster-mcp.service
+After=network.target
 
 [Service]
 Type=simple

@@ -4841,6 +4841,59 @@ finally:
     substep "Migration 133: prescribing-silence TTL auto-reset (no schema change, no action required)"
     # Not counted in migrated — there is nothing to apply.
 
+    # Migration 134: Disable and stop lobster-mcp.service (vestigial HTTP bridge unit).
+    #
+    # lobster-mcp.service runs inbox_server_http.py and requires MCP_HTTP_TOKEN.
+    # The token was never added to the unit's environment, causing it to exit immediately
+    # with "No MCP_HTTP_TOKEN configured" on every start and re-enter the Restart=always
+    # cycle (~every 10s). At audit time (2026-06-06) the unit had restarted 43,894 times.
+    #
+    # This unit is vestigial: the live MCP server is inbox_server.py launched by the
+    # claude binary as a child of lobster-claude.service — NOT managed by this systemd
+    # unit. Confirmed: no other unit has Requires= or Wants= on lobster-mcp.service.
+    # lobster-wos-router.service had an After= ordering reference (already removed in this
+    # PR's services/lobster-wos-router.service), but After= is an ordering constraint only —
+    # it does not start the dependency.
+    #
+    # Fix: disable (prevent boot start) and stop (halt the current restart loop).
+    # The unit file is left in place so the history is visible, but it will no longer
+    # auto-start or restart. Reference: dcetlin/Lobster#1437.
+    if systemctl list-unit-files lobster-mcp.service --no-pager 2>/dev/null | grep -q "lobster-mcp.service"; then
+        local _mcp_enabled
+        _mcp_enabled=$(systemctl is-enabled lobster-mcp.service 2>/dev/null || echo "unknown")
+        local _mcp_active
+        _mcp_active=$(systemctl is-active lobster-mcp.service 2>/dev/null || echo "unknown")
+
+        if [ "$_mcp_active" != "inactive" ] && [ "$_mcp_active" != "unknown" ]; then
+            sudo systemctl stop lobster-mcp.service 2>/dev/null || true
+            substep "Migration 134: stopped lobster-mcp.service (was: $_mcp_active)"
+            migrated=$((migrated + 1))
+        fi
+
+        if [ "$_mcp_enabled" != "disabled" ] && [ "$_mcp_enabled" != "unknown" ]; then
+            sudo systemctl disable lobster-mcp.service 2>/dev/null || true
+            substep "Migration 134: disabled lobster-mcp.service (was: $_mcp_enabled)"
+            migrated=$((migrated + 1))
+        fi
+
+        # Also remove the stale After=lobster-mcp.service ordering from the installed
+        # wos-router unit, if it is present. The services/ directory file is already
+        # updated; this fixes the installed copy without requiring a full re-install.
+        local _wos_router_unit="/etc/systemd/system/lobster-wos-router.service"
+        if [ -f "$_wos_router_unit" ] && grep -q "lobster-mcp.service" "$_wos_router_unit"; then
+            sudo sed -i 's/After=network\.target lobster-mcp\.service/After=network.target/' "$_wos_router_unit"
+            sudo systemctl daemon-reload 2>/dev/null || true
+            substep "Migration 134: removed stale After=lobster-mcp.service from $_wos_router_unit"
+            migrated=$((migrated + 1))
+        fi
+
+        if [ "$_mcp_active" = "inactive" ] && [ "$_mcp_enabled" = "disabled" ]; then
+            substep "Migration 134: lobster-mcp.service already stopped and disabled — skipping"
+        fi
+    else
+        substep "Migration 134: lobster-mcp.service not installed — skipping"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
