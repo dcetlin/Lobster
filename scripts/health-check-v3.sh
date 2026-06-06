@@ -91,6 +91,19 @@ BOOT_GRACE_SECONDS=90                # 90s - skip stale-inbox, WFM, and process 
 
 HIBERNATE_FRESH_SECONDS=30           # DEPRECATED — kept for reference; hibernate state is no longer written by dispatcher
 
+# Systemd-state-aware restart classification (issue: false-RED during RestartSec window).
+# When lobster-claude is in activating/auto-restart state, systemd is mid-restart and
+# the service is not dead — it is healing. Classifying this as RED and triggering an
+# additional restart is incorrect. Instead we emit YELLOW ("healing in progress") and
+# suppress the do_restart() call.
+#
+# SYSTEMD_ACTIVATING_GRACE_SECONDS: how long we tolerate an activating/auto-restart
+# state before escalating to RED. RestartSec=30 so a healthy auto-restart completes
+# in well under 60s; we allow 120s as a generous buffer before concluding systemd
+# itself is stuck (e.g. StartLimitHit or a race where the unit is perpetually
+# restarting without making progress).
+SYSTEMD_ACTIVATING_GRACE_SECONDS="${LOBSTER_SYSTEMD_ACTIVATING_GRACE_SECONDS:-120}"
+
 WFM_STALE_SECONDS=1200               # 20 minutes - kept for backward-compat references; superseded by DISPATCHER_HEARTBEAT_STALE_SECONDS
 HEARTBEAT_FILE="$WORKSPACE_DIR/logs/claude-heartbeat"   # legacy WFM-touch signal; superseded by dispatcher-heartbeat
 
@@ -587,6 +600,64 @@ except Exception:
     return 1
 }
 
+# Query systemd for the ActiveState and SubState of a given unit.
+# Outputs two lines: "ActiveState=<value>" and "SubState=<value>".
+# Returns 0 on success, 1 if systemctl is unavailable or unit is unknown.
+get_systemd_state() {
+    local unit="$1"
+    systemctl show "$unit" -p ActiveState,SubState 2>/dev/null
+}
+
+# Return 0 (true) if the given unit is in an activating/auto-restart state —
+# meaning systemd is mid-restart and the service is healing normally.
+# Sets the global SYSTEMD_ACTIVATING_AGE_SECONDS to the elapsed time (in seconds)
+# the unit has been in the transitional state (0 if age cannot be determined).
+#
+# States classified as "activating":
+#   ActiveState=activating  (unit is starting up)
+#   SubState=auto-restart   (systemd is waiting through RestartSec before restarting)
+#
+# Returns 0 (activating/healing), 1 (not activating).
+SYSTEMD_ACTIVATING_AGE_SECONDS=0  # global written by is_systemd_activating()
+
+is_systemd_activating() {
+    local unit="$1"
+    SYSTEMD_ACTIVATING_AGE_SECONDS=0
+
+    local state_output
+    state_output=$(get_systemd_state "$unit")
+    if [[ -z "$state_output" ]]; then
+        return 1
+    fi
+
+    local active_state sub_state
+    active_state=$(echo "$state_output" | grep '^ActiveState=' | cut -d= -f2)
+    sub_state=$(echo "$state_output" | grep '^SubState=' | cut -d= -f2)
+
+    # activating (any substate) or SubState=auto-restart counts as healing
+    if [[ "$active_state" == "activating" || "$sub_state" == "auto-restart" ]]; then
+        # Compute age from InactiveExitTimestampMonotonic (systemd monotonic clock,
+        # microseconds since boot). Compare against /proc/uptime (seconds since boot).
+        # This is the most reliable proxy for how long the unit has been in transition.
+        local inactive_exit_ts
+        inactive_exit_ts=$(systemctl show "$unit" -p InactiveExitTimestampMonotonic 2>/dev/null | cut -d= -f2)
+        if [[ "$inactive_exit_ts" =~ ^[0-9]+$ && "$inactive_exit_ts" -gt 0 ]]; then
+            # /proc/uptime field 1 is total seconds since boot (float).
+            # systemd InactiveExitTimestampMonotonic is microseconds since boot.
+            local uptime_s
+            uptime_s=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
+            local uptime_us=$(( uptime_s * 1000000 ))
+            local age_us=$(( uptime_us - inactive_exit_ts ))
+            local age_s=$(( age_us / 1000000 ))
+            [[ $age_s -lt 0 ]] && age_s=0
+            SYSTEMD_ACTIVATING_AGE_SECONDS=$age_s
+        fi
+        return 0
+    fi
+
+    return 1
+}
+
 # Check if a health-check-triggered restart occurred within the last
 # RESTART_COOLDOWN_SUPPRESS_SECONDS. When Lobster restarts, the MCP server
 # recovers stale messages from processing/ back to inbox/. Without this guard,
@@ -719,13 +790,58 @@ is_transient_state() {
 #===============================================================================
 
 # Check 1: Are systemd services active?
+#
+# Systemd-state-aware classification for lobster-claude:
+#   active/running  → 0 (GREEN)
+#   activating or SubState=auto-restart (within SYSTEMD_ACTIVATING_GRACE_SECONDS)
+#                   → 1 (YELLOW — "healing in progress", do NOT restart)
+#   activating past grace window, failed, inactive, or unknown
+#                   → 2 (RED — trigger restart)
+#
+# The distinction matters during the RestartSec=30 window after a session exit
+# (autocompact rotation, 2h session-age rotation, etc.). During that window,
+# systemd already has a pending restart scheduled — the health check must not
+# pile on with an additional restart attempt, which would interrupt the in-flight
+# recovery and potentially create a restart storm.
+#
+# Returns: 0=GREEN, 1=YELLOW (healing), 2=RED (genuinely dead)
 check_services() {
-    local failed=0
+    local rc=0  # 0=GREEN, 1=YELLOW, 2=RED
 
-    if ! systemctl is-active --quiet "$SERVICE_CLAUDE" 2>/dev/null; then
-        log_error "Service $SERVICE_CLAUDE is not active"
-        failed=1
-    fi
+    local claude_active
+    claude_active=$(systemctl is-active "$SERVICE_CLAUDE" 2>/dev/null || true)
+
+    case "$claude_active" in
+        active)
+            log_info "Service $SERVICE_CLAUDE is active"
+            ;;
+        activating|*)
+            # Not straightforwardly active — consult the full systemd state to
+            # distinguish a healing restart from a genuinely dead/failed service.
+            if is_systemd_activating "$SERVICE_CLAUDE"; then
+                # systemd is mid-restart (activating or auto-restart SubState).
+                # SYSTEMD_ACTIVATING_AGE_SECONDS was set by is_systemd_activating().
+                local activating_age=$SYSTEMD_ACTIVATING_AGE_SECONDS
+                if [[ $activating_age -le $SYSTEMD_ACTIVATING_GRACE_SECONDS ]]; then
+                    log_warn "YELLOW: $SERVICE_CLAUDE is healing (activating/auto-restart, ${activating_age}s elapsed, grace: ${SYSTEMD_ACTIVATING_GRACE_SECONDS}s) — systemd is handling the restart, suppressing RED"
+                    rc=1  # YELLOW: healing in progress
+                else
+                    # Activating for too long — systemd itself may be stuck (StartLimitHit?).
+                    log_error "RED: $SERVICE_CLAUDE stuck in activating/auto-restart for ${activating_age}s (grace: ${SYSTEMD_ACTIVATING_GRACE_SECONDS}s) — treating as genuinely dead"
+                    rc=2
+                fi
+            else
+                # Not activating — check if it's failed or simply inactive.
+                local full_state
+                full_state=$(get_systemd_state "$SERVICE_CLAUDE")
+                local active_state sub_state
+                active_state=$(echo "$full_state" | grep '^ActiveState=' | cut -d= -f2)
+                sub_state=$(echo "$full_state" | grep '^SubState=' | cut -d= -f2)
+                log_error "RED: $SERVICE_CLAUDE is not active (ActiveState=$active_state, SubState=$sub_state)"
+                rc=2
+            fi
+            ;;
+    esac
 
     local router_state
     router_state=$(systemctl is-active "$SERVICE_ROUTER" 2>/dev/null || true)
@@ -739,7 +855,7 @@ check_services() {
             ;;
         failed)
             log_error "Service $SERVICE_ROUTER has failed"
-            failed=1
+            [[ $rc -lt 2 ]] && rc=2
             ;;
         *)
             # inactive, unknown, etc. — warn but don't trigger claude restart
@@ -747,7 +863,7 @@ check_services() {
             ;;
     esac
 
-    return $failed
+    return $rc
 }
 
 # Check 2: Does the tmux session exist?
@@ -2041,9 +2157,23 @@ main() {
     fi
 
     # --- Always check systemd services (includes router/bot) ---
-    if ! check_services; then
+    # check_services() returns: 0=GREEN, 1=YELLOW (healing/activating), 2=RED (dead).
+    # When healing (1), systemd already has a restart in flight — do NOT add another.
+    # When RED (2), the service is genuinely dead past the grace window.
+    check_services
+    local svc_rc=$?
+    if [[ $svc_rc -eq 2 ]]; then
         level="RED"
         restart_reason="systemd service not active"
+    elif [[ $svc_rc -eq 1 ]]; then
+        # YELLOW: systemd is mid-restart (activating/auto-restart).
+        # Skip all further process/inbox checks this run — the service is healing
+        # and those checks will produce false positives (tmux gone, inbox stale, etc.)
+        # while the restart is in progress. We'll re-evaluate on the next 4-min cycle.
+        log_warn "YELLOW: $SERVICE_CLAUDE is healing (systemd activating) — skipping process/inbox checks this run"
+        level="YELLOW"
+        log_warn "=== Health check v3 complete (level=YELLOW, systemd-healing, mode=$lobster_mode) ==="
+        exit 0
     fi
 
     # --- Lifecycle-aware Claude checks ---
