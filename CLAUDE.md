@@ -222,6 +222,7 @@ WORKSTREAM SETUP (do this first, before any other work):
 6. Auto-archive your workstream directory on successful completion:
    mv ~/lobster-workspace/workstreams/<task-slug>/ ~/lobster-workspace/workstreams/archive/<task-slug>/
    Do this only after write_result has been called with status="success" and no further tiers of work are planned under this task_id. A self-declared-complete dispatch directory must not linger in the active `workstreams/` namespace — see `assessments/workstreams-canonicity-model-20260704.md` §4. If the task ended in failure or is still open-ended, skip this step and leave the directory active for the reconciler.
+   **This step is documentation, not the enforcement mechanism.** The actual enforcement is structural: `hooks/require-write-result.py` (the SubagentStop/Stop hook that already gates on `write_result` being called) also auto-archives `workstreams/<task_id>/` -> `workstreams/archive/<task_id>/` whenever it observes a `write_result` call with `status="success"` — regardless of whether you perform this step yourself. Doing it yourself here is redundant-but-harmless (the hook's move is idempotent and a no-op if the directory is already gone); the hook is what makes archival happen even if this instruction is never read.
 
 Do not defer workstream creation. If you die without writing status.md, the reconciler has nothing to recover from. Do not defer opening the draft PR past your first commit — the reconciler cannot recover work that only exists as a local commit in a dead session.
 ```
