@@ -75,7 +75,7 @@ List all entries where `state: orphan`. These are Phase 1 candidates. For each:
 
 For artifacts orphan for > 14 days: recommend Phase 1 quarantine action per class:
 - `workstream` → move directory to `workstreams/archive/<name>-quarantine-<date>/`
-- `scheduled_job` → set `enabled: false` in jobs.json
+- `scheduled_job` → set `enabled: false` in jobs.json, keyed on the last path segment of the artifact's `id` (registry ids for `scheduled_job` entries are three-segment — `jobs/<state>/<key>`, e.g. `jobs/orphan/canon-reconciler` — the jobs.json key is `<key>`, never the `<state>` segment; see `src/utils/artifact_registry.py` and `scheduled-tasks/canon-digest.py`'s `compute_job_diff` for the same rule)
 - `repo` → add `QUARANTINE.md` at root noting quarantine date and reason
 - `canonical_doc` → flag in registry notes only (docs are not moved)
 
