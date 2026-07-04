@@ -1,3 +1,4 @@
+| 2026-06-03 | PR #1424 | Round 1 | APPROVED |
 | 2026-06-03 | PR #1411 | Round 1 | APPROVED |
 | 2026-06-03 | PR #1409 | Round 1 | APPROVED |
 | 2026-06-03 | PR #1408 | Round 2 | APPROVED |
@@ -328,3 +329,5 @@
 | 2026-06-03 | PR #1414 | Round 1 | APPROVED |
 | 2026-06-03 | PR #1415 | Round 1 | APPROVED |
 | 2026-06-03 | PR #1417 | Round 1 | APPROVED |
+| 2026-06-03 | PR #1425 | Round 1 | APPROVED |
+| 2026-06-03 | PR #1422 | Round 1 | APPROVED |
