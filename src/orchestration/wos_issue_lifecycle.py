@@ -47,6 +47,12 @@ WOS_EXECUTING_LABEL: str = "wos:executing"
 #: Label color (hex, no leading #) — blue to indicate active machine work.
 WOS_EXECUTING_LABEL_COLOR: str = "0052cc"
 
+#: GitHub label applied when execution is paused (swap target for wos:executing).
+WOS_PAUSED_LABEL: str = "wos:paused"
+
+#: Label color (hex, no leading #) — grey to indicate suspended machine work.
+WOS_PAUSED_LABEL_COLOR: str = "e4e669"
+
 #: Subprocess timeout for gh CLI calls (seconds).
 _GH_TIMEOUT: int = 30
 
@@ -134,6 +140,69 @@ def _ensure_wos_executing_label_exists(repo: str, gh_bin: str = "gh") -> bool:
     except Exception as exc:
         log.warning(
             "wos_issue_lifecycle: _ensure_wos_executing_label_exists unexpected error "
+            "for %s — %s: %s",
+            repo, type(exc).__name__, exc,
+        )
+        return False
+
+
+def _ensure_wos_paused_label_exists(repo: str, gh_bin: str = "gh") -> bool:
+    """
+    Ensure the wos:paused label exists on the repo.
+
+    If the label is absent, creates it with WOS_PAUSED_LABEL_COLOR.
+    Returns True on success or if label already exists. Returns False if
+    any gh CLI call fails (non-blocking — callers proceed without the label
+    in that case, with a warning logged).
+
+    Pure side effect: no registry access, no UoW state.
+    """
+    try:
+        result = _run_gh(
+            ["label", "list", "--repo", repo, "--json", "name"],
+            gh_bin=gh_bin,
+        )
+        labels_json = json.loads(result.stdout.decode(errors="replace"))
+        existing_names = {lbl["name"] for lbl in labels_json}
+
+        if WOS_PAUSED_LABEL in existing_names:
+            log.debug(
+                "wos_issue_lifecycle: label %r already exists on %s — no-op",
+                WOS_PAUSED_LABEL,
+                repo,
+            )
+            return True
+
+        # Label is absent — create it.
+        log.info(
+            "wos_issue_lifecycle: creating label %r on %s (color #%s)",
+            WOS_PAUSED_LABEL,
+            repo,
+            WOS_PAUSED_LABEL_COLOR,
+        )
+        _run_gh(
+            [
+                "label", "create", WOS_PAUSED_LABEL,
+                "--repo", repo,
+                "--color", WOS_PAUSED_LABEL_COLOR,
+                "--description", "WOS execution paused — was wos:executing before pause",
+            ],
+            gh_bin=gh_bin,
+        )
+        return True
+
+    except subprocess.CalledProcessError as exc:
+        log.warning(
+            "wos_issue_lifecycle: _ensure_wos_paused_label_exists failed for %s "
+            "— exit %d: %s",
+            repo,
+            exc.returncode,
+            (exc.stderr or b"").decode(errors="replace")[:300],
+        )
+        return False
+    except Exception as exc:
+        log.warning(
+            "wos_issue_lifecycle: _ensure_wos_paused_label_exists unexpected error "
             "for %s — %s: %s",
             repo, type(exc).__name__, exc,
         )
@@ -535,3 +604,137 @@ def stamp_issue_unverifiable(
             repo, issue_number, uow_id, type(exc).__name__, exc,
         )
         return False
+
+
+# ---------------------------------------------------------------------------
+# Bulk control-plane label swap functions (pause/resume)
+# ---------------------------------------------------------------------------
+
+def bulk_swap_executing_to_paused(
+    issue_numbers: list[int],
+    repo: str = "dcetlin/Lobster",
+    gh_bin: str = "gh",
+) -> tuple[int, int]:
+    """
+    For each issue in issue_numbers:
+      - Remove wos:executing label
+      - Add wos:paused label
+
+    Called by handle_wos_stop to keep label state aligned with execution reality.
+    When execution is paused, wos:executing becomes misleading — this swap signals
+    that the issue was executing when the pipeline was deliberately halted.
+
+    Returns (success_count, failure_count). Never raises.
+
+    A single gh CLI failure on any issue does not abort the loop — remaining
+    issues are processed and counted in failure_count.
+    """
+    if not issue_numbers:
+        return (0, 0)
+
+    # Ensure the wos:paused label exists once before iterating over all issues.
+    _ensure_wos_paused_label_exists(repo, gh_bin=gh_bin)
+
+    success_count = 0
+    failure_count = 0
+
+    for issue_number in issue_numbers:
+        try:
+            _run_gh(
+                [
+                    "issue", "edit", str(issue_number),
+                    "--repo", repo,
+                    "--remove-label", WOS_EXECUTING_LABEL,
+                    "--add-label", WOS_PAUSED_LABEL,
+                ],
+                gh_bin=gh_bin,
+            )
+            log.info(
+                "wos_issue_lifecycle: bulk_swap_executing_to_paused: swapped %s#%d "
+                "wos:executing → wos:paused",
+                repo, issue_number,
+            )
+            success_count += 1
+        except subprocess.CalledProcessError as exc:
+            log.warning(
+                "wos_issue_lifecycle: bulk_swap_executing_to_paused: failed for %s#%d "
+                "— exit %d: %s",
+                repo, issue_number,
+                exc.returncode,
+                (exc.stderr or b"").decode(errors="replace")[:300],
+            )
+            failure_count += 1
+        except Exception as exc:
+            log.warning(
+                "wos_issue_lifecycle: bulk_swap_executing_to_paused: unexpected error "
+                "for %s#%d — %s: %s",
+                repo, issue_number, type(exc).__name__, exc,
+            )
+            failure_count += 1
+
+    return (success_count, failure_count)
+
+
+def bulk_swap_paused_to_executing(
+    issue_numbers: list[int],
+    repo: str = "dcetlin/Lobster",
+    gh_bin: str = "gh",
+) -> tuple[int, int]:
+    """
+    For each issue in issue_numbers:
+      - Remove wos:paused label
+      - Add wos:executing label
+
+    Called by handle_wos_start to restore label state after a pause.
+    Issues that carried wos:executing before the pause are restored to that
+    state so consumers of the GitHub label accurately see what is executing.
+
+    Returns (success_count, failure_count). Never raises.
+
+    A single gh CLI failure on any issue does not abort the loop — remaining
+    issues are processed and counted in failure_count.
+    """
+    if not issue_numbers:
+        return (0, 0)
+
+    # Ensure the wos:executing label exists once before iterating over all issues.
+    _ensure_wos_executing_label_exists(repo, gh_bin=gh_bin)
+
+    success_count = 0
+    failure_count = 0
+
+    for issue_number in issue_numbers:
+        try:
+            _run_gh(
+                [
+                    "issue", "edit", str(issue_number),
+                    "--repo", repo,
+                    "--remove-label", WOS_PAUSED_LABEL,
+                    "--add-label", WOS_EXECUTING_LABEL,
+                ],
+                gh_bin=gh_bin,
+            )
+            log.info(
+                "wos_issue_lifecycle: bulk_swap_paused_to_executing: restored %s#%d "
+                "wos:paused → wos:executing",
+                repo, issue_number,
+            )
+            success_count += 1
+        except subprocess.CalledProcessError as exc:
+            log.warning(
+                "wos_issue_lifecycle: bulk_swap_paused_to_executing: failed for %s#%d "
+                "— exit %d: %s",
+                repo, issue_number,
+                exc.returncode,
+                (exc.stderr or b"").decode(errors="replace")[:300],
+            )
+            failure_count += 1
+        except Exception as exc:
+            log.warning(
+                "wos_issue_lifecycle: bulk_swap_paused_to_executing: unexpected error "
+                "for %s#%d — %s: %s",
+                repo, issue_number, type(exc).__name__, exc,
+            )
+            failure_count += 1
+
+    return (success_count, failure_count)

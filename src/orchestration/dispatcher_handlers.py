@@ -47,7 +47,11 @@ if TYPE_CHECKING:
 from .registry import ApproveConfirmed, ApproveExpired, ApproveNotFound, ApproveSkipped
 from .paths import LOBSTER_WORKSPACE as _LOBSTER_WORKSPACE, WOS_CONFIG as _WOS_CONFIG_PATH_FROM_PATHS, WOS_GATE_CLEARED_FLAG as _GATE_CLEARED_FLAG, JOBS_JSON as _JOBS_JSON_PATH
 from .steward import ReturnReasonClassification, MAX_RETRIES as _STEWARD_MAX_RETRIES, _HARD_CAP_CYCLES
-from .wos_issue_lifecycle import HUMAN_GATE_LABELS as _HUMAN_GATE_LABELS
+from .wos_issue_lifecycle import (
+    HUMAN_GATE_LABELS as _HUMAN_GATE_LABELS,
+    bulk_swap_executing_to_paused as _bulk_swap_executing_to_paused,
+    bulk_swap_paused_to_executing as _bulk_swap_paused_to_executing,
+)
 from src.utils.timezone import format_iso_for_user as _format_iso_for_user, get_owner_tz_name as _get_owner_tz_name
 
 
@@ -840,6 +844,10 @@ def handle_wos_start(*, registry: "Registry | None" = None) -> str:
     enable leaves the steward (or other core jobs) disabled while the system
     believes the pipeline is running.
 
+    After enabling jobs, bulk-swaps wos:paused → wos:executing on all GitHub
+    issues whose UoWs are currently in executing status, restoring label state
+    to accurately reflect active execution.
+
     Idempotent: calling /wos start when already fully started (all wos_core jobs
     enabled) returns a notice without calling toggle_wos_core_jobs.
 
@@ -893,7 +901,21 @@ def handle_wos_start(*, registry: "Registry | None" = None) -> str:
                 f"(may be systemd-only): {', '.join(sorted(result['not_found']))}"
             )
 
+        # Restore wos:paused → wos:executing on all currently-executing issues.
         reg = registry if registry is not None else _Registry()
+        executing_uows = reg.list(status="executing")
+        issue_numbers = [
+            uow.source_issue_number
+            for uow in executing_uows
+            if uow.source_issue_number is not None
+        ]
+        wos_repo = os.environ.get("LOBSTER_WOS_REPO", "dcetlin/Lobster")
+        label_success, label_failure = _bulk_swap_paused_to_executing(issue_numbers, repo=wos_repo)
+        lines.append(
+            f"Labels restored: {label_success} wos:paused → wos:executing "
+            f"(failures: {label_failure})"
+        )
+
         reg.log_control_event(
             ControlEventType.WOS_START,
             {
@@ -902,6 +924,7 @@ def handle_wos_start(*, registry: "Registry | None" = None) -> str:
                 "toggled": sorted(result["toggled"]),
                 "not_found": sorted(result["not_found"]),
                 "timers_toggled": sorted(timer_toggled),
+                "label_swap": {"success": label_success, "failed": label_failure},
             },
         )
 
@@ -934,13 +957,28 @@ def handle_wos_start(*, registry: "Registry | None" = None) -> str:
             f"(may be systemd-only): {', '.join(sorted(result['not_found']))}"
         )
 
+    # Restore wos:paused → wos:executing on all currently-executing issues.
     reg = registry if registry is not None else _Registry()
+    executing_uows = reg.list(status="executing")
+    issue_numbers = [
+        uow.source_issue_number
+        for uow in executing_uows
+        if uow.source_issue_number is not None
+    ]
+    wos_repo = os.environ.get("LOBSTER_WOS_REPO", "dcetlin/Lobster")
+    label_success, label_failure = _bulk_swap_paused_to_executing(issue_numbers, repo=wos_repo)
+    lines.append(
+        f"Labels restored: {label_success} wos:paused → wos:executing "
+        f"(failures: {label_failure})"
+    )
+
     reg.log_control_event(
         ControlEventType.WOS_START,
         {
             "toggled": sorted(result["toggled"]),
             "not_found": sorted(result["not_found"]),
             "timers_toggled": sorted(timer_toggled),
+            "label_swap": {"success": label_success, "failed": label_failure},
         },
     )
 
@@ -956,6 +994,10 @@ def handle_wos_stop(*, registry: "Registry | None" = None) -> str:
     in wos-config.json so that executor-heartbeat skips dispatch on its next
     cycle. UoWs already active are not affected — TTL recovery will handle
     any that stall.
+
+    After disabling jobs, bulk-swaps wos:executing → wos:paused on all GitHub
+    issues whose UoWs are currently in executing status, so label state stays
+    aligned with execution reality during the pause.
 
     Idempotent: calling /wos stop when already stopped returns a notice.
 
@@ -1002,13 +1044,28 @@ def handle_wos_stop(*, registry: "Registry | None" = None) -> str:
             f"(may be systemd-only): {', '.join(sorted(result['not_found']))}"
         )
 
+    # Bulk-swap wos:executing → wos:paused on all currently-executing issues.
     reg = registry if registry is not None else _Registry()
+    executing_uows = reg.list(status="executing")
+    issue_numbers = [
+        uow.source_issue_number
+        for uow in executing_uows
+        if uow.source_issue_number is not None
+    ]
+    wos_repo = os.environ.get("LOBSTER_WOS_REPO", "dcetlin/Lobster")
+    label_success, label_failure = _bulk_swap_executing_to_paused(issue_numbers, repo=wos_repo)
+    lines.append(
+        f"Labels swapped: {label_success} wos:executing → wos:paused "
+        f"(failures: {label_failure})"
+    )
+
     reg.log_control_event(
         ControlEventType.WOS_STOP,
         {
             "toggled": sorted(result["toggled"]),
             "not_found": sorted(result["not_found"]),
             "timers_toggled": sorted(timer_toggled),
+            "label_swap": {"success": label_success, "failed": label_failure},
         },
     )
 

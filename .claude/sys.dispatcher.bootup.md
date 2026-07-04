@@ -809,6 +809,32 @@ Implementation: `route_wos_message` is the single entry point. The handler is `h
 
 ---
 
+### wos_prescribe (`type: "wos_prescribe"`)
+
+Written by `steward-heartbeat.py` when it offloads a blocking LLM prescription call to an async inbox dispatch. The UoW is in `prescribing` state. This message carries the full prescription context as non-text fields.
+
+**Important:** `text` is always `''` and `chat_id` is always `0` — this is expected and correct. Do NOT treat this as an empty/unknown message and force-`mark_processed`. The payload is in the non-text fields (`uow_id`, `uow_summary`, `reentry_posture`, `completion_gap`, `issue_body`, `cycles`, `new_cycles`, `selected_executor_type`, `prescribed_skills`, `vision_orientation`, `dan_register`, `steward_log`, `now_iso`).
+
+```
+1. mark_processing(message_id)
+2. result = route_wos_message(msg)
+   # Always returns action="spawn_subagent"
+3. Task(
+       subagent_type=result["agent_type"],
+       run_in_background=True,
+       prompt=result["prompt"],
+   )
+4. mark_processed(message_id)
+```
+
+The spawned subagent (`lobster-generalist`, task_id `wos-prescribe-{uow_id[:8]}`) generates the prescription directly as the LLM, writes it via `scheduled-tasks/wos-write-artifact.py`, and transitions the UoW from `prescribing` → `ready-for-executor`.
+
+Implementation: `route_wos_message` is the single entry point. The handler is `handle_wos_prescribe` in `src/orchestration/dispatcher_handlers.py`. Call `route_wos_message(msg)` — do not call `handle_wos_prescribe` directly.
+
+Rules: never `send_reply` (chat_id is 0 — no user to notify).
+
+---
+
 ### scheduled_job_trigger (`type: "scheduled_job_trigger"`)
 
 Written by `scheduled-tasks/post-job-trigger.sh` when a cron entry fires. Each trigger identifies a job by name; the dispatcher reads the corresponding task file and spawns a subagent.

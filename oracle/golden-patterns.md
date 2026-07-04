@@ -358,3 +358,15 @@ StartupSweepResult = _sweep_mod.StartupSweepResult
 **Where it appears:** `philosophy/frontier/metabolic-juice.md §Resolution §(3) Steward Discriminator — Juice vs. Dead Letter`. Introduced in PR #1403 (uow_20260522_bf4a96).
 
 **Reuse guidance:** Apply whenever a steward or agent must distinguish live generative threads from dead letters in a pre-metabolic context. The specificity test (qualitative) and TTL test (temporal) are complementary axes. Extend to new contexts by replacing "heat_signal" and "14-day TTL" with the domain-appropriate signal name and threshold, but preserve the two-signal conjunction and explicit archive-on-failure rule.
+
+---
+
+### [2026-06-03] Pattern: bulk gh CLI operation with (success_count, failure_count) return and per-item fault isolation
+
+**Pattern:** When a function must apply a gh CLI operation to a list of N items, structure it as: (1) one-time precondition setup before the loop (e.g., label ensure); (2) a try/except per item catching both `CalledProcessError` and `Exception`; (3) accumulate `success_count` / `failure_count` without aborting the loop on any single failure; (4) return `(success_count, failure_count)` as a tuple; (5) never raise. Surface the tuple to the caller for operator feedback.
+
+**Why it works:** A single GitHub API failure (rate limit, transient error, label not found) must not abort the remaining N-1 operations. The tuple return gives the caller actionable signal (how many succeeded, how many failed) without requiring the function to make a decision about what the caller does with partial success. The one-time precondition setup before the loop avoids N redundant API calls for shared preconditions (e.g., label existence check). The "never raises" contract means callers never need to wrap in try/except.
+
+**Where it appears:** `bulk_swap_executing_to_paused` and `bulk_swap_paused_to_executing` in `src/orchestration/wos_issue_lifecycle.py`, introduced in PR #1425. Both functions follow this structure identically.
+
+**Reuse guidance:** Apply whenever a function must apply a gh CLI operation (or any external side-effecting call) to a list of items where partial success is acceptable and visibility into partial failure is required. The one-time setup step (before the loop) is load-bearing — move anything that is invariant across iterations out of the loop body. The per-item except-Exception catch is not optional: gh CLI failures sometimes arrive as `subprocess.CalledProcessError`; network and OS failures arrive as other exception types. Both must be counted, not propagated.
