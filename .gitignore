@@ -73,3 +73,10 @@ PLAN-*.md
 
 # Runtime output (written by async-deep-work job)
 deep-work/
+
+# Workstream content is runtime data, canonical only at
+# ~/lobster-workspace/workstreams/ (see assessments/workstreams-canonicity-model-20260704.md
+# §3, "The One-Canonical-Location Rule"). It must never re-form as a fork
+# inside the code repo — kept as a safety net after PR #1464 removed the
+# existing content forks.
+/workstreams/

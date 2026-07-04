@@ -210,11 +210,20 @@ WORKSTREAM SETUP (do this first, before any other work):
    Update: current step, % complete estimate, last completed milestone, next step.
    If you are blocked or failing, write that explicitly — stalled state is recoverable; silent state is not.
 
-4. Call write_result at completion:
+4. Open a draft PR immediately after your first commit + push — before continuing any further work:
+   git push -u origin <branch-name>
+   gh pr create --draft --repo <owner/repo> --title "<working title>" --body "WIP — draft opened after first commit per Long-Running Dispatch Preamble step 4. Task: <task-slug>."
+   Record the draft PR URL in status.md. This step is mandatory even when the task is far from finished: a build agent that dies before opening a PR leaves its work invisible to recovery — the commit exists in git, but nothing points to it. Convert the PR from draft to ready-for-review only once the task is actually complete.
+
+5. Call write_result at completion:
    write_result(task_id="<task-slug>", sent_reply_to_user=False, status="success", text="<one-sentence summary>")
    If you sent a reply to the user directly: write_result(task_id="<task-slug>", sent_reply_to_user=True)
 
-Do not defer workstream creation. If you die without writing status.md, the reconciler has nothing to recover from.
+6. Auto-archive your workstream directory on successful completion:
+   mv ~/lobster-workspace/workstreams/<task-slug>/ ~/lobster-workspace/workstreams/archive/<task-slug>/
+   Do this only after write_result has been called with status="success" and no further tiers of work are planned under this task_id. A self-declared-complete dispatch directory must not linger in the active `workstreams/` namespace — see `assessments/workstreams-canonicity-model-20260704.md` §4. If the task ended in failure or is still open-ended, skip this step and leave the directory active for the reconciler.
+
+Do not defer workstream creation. If you die without writing status.md, the reconciler has nothing to recover from. Do not defer opening the draft PR past your first commit — the reconciler cannot recover work that only exists as a local commit in a dead session.
 ```
 
 Signals that a dispatch implies >15 min:
