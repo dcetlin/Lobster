@@ -220,6 +220,12 @@ Patterns and antipatterns surfaced through oracle review. These inform future de
 |------|---------|----------|
 | 2026-05-24 | commit 8cb1bb87 | Cherry-pick of ea95c523 onto feat/wos-dashboard-v5 left unresolved conflict markers in 3 files. SyntaxError in dispatcher_handlers.py was the loud symptom; wos_dashboard.py had undefined variables and a missing inner for-loop — semantic corruption that Python's parser does not catch. Standing check: after any cherry-pick or complex merge, scan all Python files for conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) before merging. A SyntaxError is the loud failure mode; undefined variables and missing control-flow are the silent ones. |
 
+### Concurrent/Duplicate Implementation
+
+| Date | PR | Learning |
+|------|----|----------|
+| 2026-07-04 | #1463 | A "recovery" PR (crashed/interrupted session, work committed but never opened as a PR) can be stale relative to a *different* implementation of the same ratified directive completed by a separate session while the first was interrupted — especially when deliverables are runtime/workspace artifacts (not code), since those go live without ever touching a PR. Detection: check the live workspace for artifacts serving the same purpose before trusting a recovery PR's diff in isolation; grep the PR's own workstream README/log for self-documented "may overlap with X" — that phrasing is a direct signal of a known, unresolved competing implementation shipped anyway. |
+
 ---
 
 
@@ -1475,3 +1481,15 @@ When a bash function contains an inner system call (e.g., a second `systemctl sh
 **Learning: Classification-layer fix for a transient-state race creates a precedent for successive classification extensions**
 
 When a health check fires during a short transient window (RestartSec=30) and the fix is made at the classification layer (teach the classifier to recognize the transient state), a precedent is set: future transient sources of false-RED will be addressed the same way. Each extension couples the classifier more tightly to the system's lifecycle model. The alternative — a confirmation step at the action edge (resample before calling do_restart()) — is more general but adds latency to genuine RED response. When this pattern appears, note the action-coupling architecture as a premise-level observation even if the classification fix is correct for the immediate problem. See meta/premise-review.md id: pr-20260606-health-check-classification-vs-action-edge.
+
+---
+
+### [2026-07-04] PR #1463 — two agent sessions independently built competing implementations of the same ratified proposal, neither aware of the other until oracle review
+
+**Learning: "Recovered" or "crashed-session" work must be checked against the live workspace state at review time, not just against the branch's own commit — a recovery PR can be stale relative to work completed in parallel after the branch was cut.**
+
+PR #1463 recovers a commit (`74069d88`, single commit, branch `feature/artifact-registry`) implementing Dan's ratified global-canon proposal by extending `lobster-meta.md` (Step 2.75/2.76) and `lobster-hygiene.md` (Step 2c), seeding `data/artifact-registry.json` via Migration 135 from a 86-entry template. At review time, the live workspace already contained a *different* implementation of the same proposal — `CANON.md`, a `canon-reconciler` weekly scheduled job (enabled, registered in `jobs.json`), and a live `data/artifact-registry.json` with 72 entries in an incompatible schema (`_meta`/`path`-keyed vs. this PR's `_schema_version`/`_state_law`/`path`-less schema) — created by a separate session ~13 minutes *before* this PR's commit. Both sessions were dispatched from the same ratified proposal and same underlying directive ("build the global canon") but chose different architectures (extend-existing-agents vs. stand-up-a-new-job) and neither knew about the other. The PR's own authoring workstream (`workstreams/implement-artifact-registry/README.md`) documents the collision as an unresolved "open question" ("canon-reconciler job... may overlap with lobster-meta's new Phase 0 scan. Should one be disabled after Tier 1 merges?") rather than resolving it before requesting review. Consequence: Migration 135's existence-guard (`if [ ! -f "$_artifact_registry" ]`) makes the PR's own seed data permanently dead on any machine where the competing implementation already ran, and if both reconcilers ever execute, two independently-scheduled processes (nightly vs. weekly) would read-modify-write the same file under incompatible schema assumptions.
+
+**Detection:** when a PR describes itself as "recovering" already-committed or already-approved work (crashed session, interrupted MCP restart, etc.), do not evaluate it solely against its own diff and its own commit history. Check the *live runtime workspace* (not just the repo) for artifacts with the same purpose that may have been built by a different, unlinked session in the intervening time — especially for proposals whose deliverables are runtime/workspace files (not code), since those can be created and go live without ever touching a PR. Grep the PR's own workstream README/log for self-documented "open questions" or "may overlap with X" — these are a direct signal the author already knows of an unresolved competing implementation and shipped anyway.
+
+**Where it appears:** `oracle/verdicts/pr-1463.md`. Related golden pattern: "canonical placement must be obvious from first encounter" (2026-04-25) — "no split canonical homes" is exactly the invariant this PR's own governance mechanism is designed to enforce, and exactly what its own merge would (temporarily) violate.
