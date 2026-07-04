@@ -1,0 +1,874 @@
+{
+  "_schema_version": "1.0",
+  "_description": "Global artifact registry — owner, liveness, convergence-state per artifact. Maintained nightly by lobster-meta. Reviewed quarterly by lobster-hygiene. See oracle/golden-patterns.md and CLAUDE.md for governance protocol.",
+  "_state_law": {
+    "seed": "Reusable golden pattern or template. No time box. Owner = lobster or Dan. Does not expire; gets updated or deprecated, not killed.",
+    "cadence": "Owned recurring process. Owner must be named. Has no expiry but must have liveness signal (last_activity within 2x schedule period).",
+    "active_wip": "Owned, time-boxed work in progress. Owner + convergence_target + expiry all required. If expiry passes without resolution, state auto-transitions to orphan.",
+    "orphan": "No owner, no liveness, or expiry passed without resolution. The purge queue. Nothing survives more than one human-review cycle before being deleted or promoted."
+  },
+  "_last_reconciled": "2026-07-04",
+  "_reconciled_by": "initial-population (implement-artifact-registry task)",
+  "artifacts": [
+    {
+      "id": "workstreams/abstractions-report",
+      "artifact_class": "workstream",
+      "owner": "unowned",
+      "state": "orphan",
+      "last_activity": "2026-05-18",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. Last activity May 2026. No clear convergence target."
+    },
+    {
+      "id": "workstreams/abstractions-report-v2",
+      "artifact_class": "workstream",
+      "owner": "unowned",
+      "state": "orphan",
+      "last_activity": "2026-05-18",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. Likely supersedes abstractions-report but neither is active."
+    },
+    {
+      "id": "workstreams/agent-council",
+      "artifact_class": "workstream",
+      "owner": "unowned",
+      "state": "orphan",
+      "last_activity": "2026-05-24",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. Last activity May 2026."
+    },
+    {
+      "id": "workstreams/alb",
+      "artifact_class": "workstream",
+      "owner": "unowned",
+      "state": "orphan",
+      "last_activity": "2026-05-09",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. Last activity May 2026. ALB = likely a project shortname."
+    },
+    {
+      "id": "workstreams/async-deep-work",
+      "artifact_class": "workstream",
+      "owner": "Dan",
+      "state": "cadence",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Ongoing deep-work session management and reflection cadence",
+      "expiry": null,
+      "notes": "Has README and log. Active today. Paired with async-deep-work scheduled job."
+    },
+    {
+      "id": "workstreams/canon-build",
+      "artifact_class": "workstream",
+      "owner": "lobster",
+      "state": "active_wip",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Global canon implementation (artifact registry, lobster-meta extension, lobster-hygiene lifecycle)",
+      "expiry": "2026-08-01",
+      "notes": "Has README and log. This workstream. Converges when PR merged and registry is live."
+    },
+    {
+      "id": "workstreams/compaction-resilience-spec",
+      "artifact_class": "workstream",
+      "owner": "unowned",
+      "state": "orphan",
+      "last_activity": "2026-05-25",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. Last active May 2026. Spec likely absorbed into CLAUDE.md or bootup files."
+    },
+    {
+      "id": "workstreams/dancetlin_dot_com",
+      "artifact_class": "workstream",
+      "owner": "Dan",
+      "state": "orphan",
+      "last_activity": "2026-05-09",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. Personal website workstream. Last active May 2026."
+    },
+    {
+      "id": "workstreams/deep-hygiene-audit",
+      "artifact_class": "workstream",
+      "owner": "lobster",
+      "state": "active_wip",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Complete 2026-07-04 hygiene audit findings and implement recommendations",
+      "expiry": "2026-07-18",
+      "notes": "No README or log yet. Active today as part of the global-canon work."
+    },
+    {
+      "id": "workstreams/ergonomics-orient",
+      "artifact_class": "workstream",
+      "owner": "unowned",
+      "state": "orphan",
+      "last_activity": "2026-05-31",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. Last active May 2026."
+    },
+    {
+      "id": "workstreams/first-principles",
+      "artifact_class": "workstream",
+      "owner": "Dan",
+      "state": "seed",
+      "last_activity": "2026-05-04",
+      "convergence_target": "Stable reference for system first principles",
+      "expiry": null,
+      "notes": "Has README and log. Seed-state: foundational reference document, not time-boxed WIP."
+    },
+    {
+      "id": "workstreams/generative-resistance",
+      "artifact_class": "workstream",
+      "owner": "unowned",
+      "state": "orphan",
+      "last_activity": "2026-05-23",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. Last active May 2026."
+    },
+    {
+      "id": "workstreams/html-interface",
+      "artifact_class": "workstream",
+      "owner": "Dan",
+      "state": "active_wip",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Ship Tier 2 of html-interface workstream",
+      "expiry": "2026-08-01",
+      "notes": "Has README and log. Active today."
+    },
+    {
+      "id": "workstreams/html-mastery-tooling",
+      "artifact_class": "workstream",
+      "owner": "Dan",
+      "state": "active_wip",
+      "last_activity": "2026-06-04",
+      "convergence_target": "HTML mastery tooling for Dan's writing workflow",
+      "expiry": "2026-08-01",
+      "notes": "Has README and log. Last active June 2026."
+    },
+    {
+      "id": "workstreams/html-templates",
+      "artifact_class": "workstream",
+      "owner": "unowned",
+      "state": "orphan",
+      "last_activity": "2026-05-29",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. Last active May 2026. May be subsumed by html-interface or html-mastery-tooling."
+    },
+    {
+      "id": "workstreams/hygiene-safe-batch",
+      "artifact_class": "workstream",
+      "owner": "lobster",
+      "state": "active_wip",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Safe batch hygiene operations for the 2026-07-04 audit",
+      "expiry": "2026-07-18",
+      "notes": "No README or log. Active today as part of hygiene audit work."
+    },
+    {
+      "id": "workstreams/implement-artifact-registry",
+      "artifact_class": "workstream",
+      "owner": "lobster",
+      "state": "active_wip",
+      "last_activity": "2026-07-04",
+      "convergence_target": "PR merged: artifact registry live, lobster-meta and lobster-hygiene extended",
+      "expiry": "2026-07-11",
+      "notes": "This workstream. Created today as part of global-canon implementation."
+    },
+    {
+      "id": "workstreams/kill-ralph-loop",
+      "artifact_class": "workstream",
+      "owner": "lobster",
+      "state": "active_wip",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Terminate or fix the ralph feedback loop",
+      "expiry": "2026-07-18",
+      "notes": "No README or log. Active today."
+    },
+    {
+      "id": "workstreams/linear-migration",
+      "artifact_class": "workstream",
+      "owner": "unowned",
+      "state": "orphan",
+      "last_activity": "2026-04-26",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "Has README but no log. Last active April 2026. Migration may be complete or abandoned."
+    },
+    {
+      "id": "workstreams/lobster-core",
+      "artifact_class": "workstream",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "2026-04-26",
+      "convergence_target": "Core lobster system maintenance and evolution",
+      "expiry": null,
+      "notes": "Has README and log. Cadence: ongoing system work. Last activity April 2026 — borderline stale."
+    },
+    {
+      "id": "workstreams/los",
+      "artifact_class": "workstream",
+      "owner": "Dan",
+      "state": "active_wip",
+      "last_activity": "2026-05-11",
+      "convergence_target": "LOS system implementation",
+      "expiry": "2026-08-01",
+      "notes": "Has README but no log. Last active May 2026."
+    },
+    {
+      "id": "workstreams/multi-channel-threading",
+      "artifact_class": "workstream",
+      "owner": "lobster",
+      "state": "active_wip",
+      "last_activity": "2026-05-29",
+      "convergence_target": "Multi-channel threading implementation",
+      "expiry": "2026-08-01",
+      "notes": "Has README and log. Last active May 2026."
+    },
+    {
+      "id": "workstreams/negentropic-sweep",
+      "artifact_class": "workstream",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Ongoing negentropic sweep cadence",
+      "expiry": null,
+      "notes": "Has README and log. Active today. Paired with negentropic-sweep scheduled job (disabled)."
+    },
+    {
+      "id": "workstreams/philosophy",
+      "artifact_class": "workstream",
+      "owner": "Dan",
+      "state": "orphan",
+      "last_activity": "2026-04-26",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. Last active April 2026. May overlap with philosophy-explore."
+    },
+    {
+      "id": "workstreams/philosophy-explore",
+      "artifact_class": "workstream",
+      "owner": "Dan",
+      "state": "cadence",
+      "last_activity": "2026-06-03",
+      "convergence_target": "Ongoing philosophy exploration and synthesis",
+      "expiry": null,
+      "notes": "No README or log. Last active June 2026. Paired with philosophy-explore-1 and philosophy-explore-weekly-synthesis scheduled jobs."
+    },
+    {
+      "id": "workstreams/semantic-mirror",
+      "artifact_class": "workstream",
+      "owner": "unowned",
+      "state": "orphan",
+      "last_activity": "2026-05-01",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. Last active May 2026."
+    },
+    {
+      "id": "workstreams/sensibility-content-rebuild",
+      "artifact_class": "workstream",
+      "owner": "Dan",
+      "state": "orphan",
+      "last_activity": "2026-05-31",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. Last active May 2026."
+    },
+    {
+      "id": "workstreams/synthesis-violin-resistance-tol",
+      "artifact_class": "workstream",
+      "owner": "Dan",
+      "state": "orphan",
+      "last_activity": "2026-05-25",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. Music synthesis workstream. Last active May 2026."
+    },
+    {
+      "id": "workstreams/tania-ads",
+      "artifact_class": "workstream",
+      "owner": "Dan",
+      "state": "active_wip",
+      "last_activity": "2026-05-11",
+      "convergence_target": "Tania ads campaign management",
+      "expiry": "2026-08-01",
+      "notes": "Has README but no log. Last active May 2026."
+    },
+    {
+      "id": "workstreams/the-jewels-jar",
+      "artifact_class": "workstream",
+      "owner": "Dan",
+      "state": "active_wip",
+      "last_activity": "2026-05-11",
+      "convergence_target": "The Jewels Jar project",
+      "expiry": "2026-08-01",
+      "notes": "Has README and log. Last active May 2026."
+    },
+    {
+      "id": "workstreams/town-square",
+      "artifact_class": "workstream",
+      "owner": "Dan",
+      "state": "active_wip",
+      "last_activity": "2026-05-01",
+      "convergence_target": "Town Square community platform",
+      "expiry": "2026-08-01",
+      "notes": "Has README but no log. Last active May 2026."
+    },
+    {
+      "id": "workstreams/violin-synthesis-v2",
+      "artifact_class": "workstream",
+      "owner": "Dan",
+      "state": "orphan",
+      "last_activity": "2026-05-25",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. Violin synthesis v2. Last active May 2026."
+    },
+    {
+      "id": "workstreams/vision-object",
+      "artifact_class": "workstream",
+      "owner": "Dan",
+      "state": "orphan",
+      "last_activity": "2026-04-26",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. Last active April 2026."
+    },
+    {
+      "id": "workstreams/wos",
+      "artifact_class": "workstream",
+      "owner": "lobster",
+      "state": "active_wip",
+      "last_activity": "2026-05-31",
+      "convergence_target": "WOS (Work Orchestration System) core implementation and stabilization",
+      "expiry": "2026-08-01",
+      "notes": "Has README and log. Last active May 2026."
+    },
+    {
+      "id": "workstreams/wos-dashboard-v5",
+      "artifact_class": "workstream",
+      "owner": "lobster",
+      "state": "orphan",
+      "last_activity": "2026-05-18",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. Dashboard v5 workstream. Likely superseded."
+    },
+    {
+      "id": "workstreams/wos-evolution-spec",
+      "artifact_class": "workstream",
+      "owner": "lobster",
+      "state": "orphan",
+      "last_activity": "2026-05-29",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. Spec workstream. May be absorbed into wos workstream."
+    },
+    {
+      "id": "workstreams/wos-pr-coord-1319-fix-r1",
+      "artifact_class": "workstream",
+      "owner": "lobster",
+      "state": "orphan",
+      "last_activity": "2026-05-25",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. PR coordination workstream — likely ephemeral and mergeable to archive."
+    },
+    {
+      "id": "workstreams/wos-stage2-event-native",
+      "artifact_class": "workstream",
+      "owner": "lobster",
+      "state": "orphan",
+      "last_activity": "2026-05-31",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. WOS stage 2 event-native implementation. Last active May 2026."
+    },
+    {
+      "id": "workstreams/wos-steward",
+      "artifact_class": "workstream",
+      "owner": "lobster",
+      "state": "active_wip",
+      "last_activity": "2026-06-03",
+      "convergence_target": "WOS steward agent implementation",
+      "expiry": "2026-08-01",
+      "notes": "No README or log. Last active June 2026. Paired with steward-heartbeat job."
+    },
+    {
+      "id": "workstreams/wos-uow_20260601_bfe09e",
+      "artifact_class": "workstream",
+      "owner": "lobster",
+      "state": "orphan",
+      "last_activity": "2026-06-03",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "No README or log. WOS unit-of-work ephemeral workstream — should be archived or purged."
+    },
+    {
+      "id": "repos/lobster",
+      "artifact_class": "repo",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "2026-06-03",
+      "convergence_target": "Lobster system — ongoing maintenance and feature development",
+      "expiry": null,
+      "notes": "Primary system repo. dcetlin/Lobster. Cadence: always active."
+    },
+    {
+      "id": "repos/dcetlin-website",
+      "artifact_class": "repo",
+      "owner": "Dan",
+      "state": "active_wip",
+      "last_activity": "2026-05-10",
+      "convergence_target": "Dan's personal website",
+      "expiry": "2026-08-01",
+      "notes": "Last commit May 2026. Active but borderline stale."
+    },
+    {
+      "id": "repos/html-canon-public",
+      "artifact_class": "repo",
+      "owner": "Dan",
+      "state": "active_wip",
+      "last_activity": "2026-06-04",
+      "convergence_target": "HTML canon public-facing site",
+      "expiry": "2026-08-01",
+      "notes": "Last commit June 2026."
+    },
+    {
+      "id": "repos/myr-system",
+      "artifact_class": "repo",
+      "owner": "Dan",
+      "state": "active_wip",
+      "last_activity": "2026-04-29",
+      "convergence_target": "MYR system implementation",
+      "expiry": "2026-08-01",
+      "notes": "Last commit April 2026. Borderline stale."
+    },
+    {
+      "id": "repos/claude-epistemic-system",
+      "artifact_class": "repo",
+      "owner": "unowned",
+      "state": "orphan",
+      "last_activity": "2026-03-22",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "Last commit March 2026. No active workstream linked. Candidate for archival."
+    },
+    {
+      "id": "repos/lobster-instance",
+      "artifact_class": "repo",
+      "owner": "lobster",
+      "state": "seed",
+      "last_activity": "2026-03-22",
+      "convergence_target": "Instance configuration and deploy artifacts",
+      "expiry": null,
+      "notes": "Instance-specific config repo. Seed: reference, not WIP."
+    },
+    {
+      "id": "repos/riffs",
+      "artifact_class": "repo",
+      "owner": "Dan",
+      "state": "orphan",
+      "last_activity": "2026-03-30",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "Last commit March 2026. No linked workstream."
+    },
+    {
+      "id": "repos/website",
+      "artifact_class": "repo",
+      "owner": "Dan",
+      "state": "active_wip",
+      "last_activity": "2026-05-10",
+      "convergence_target": "Dan's website",
+      "expiry": "2026-08-01",
+      "notes": "Last commit May 2026. May overlap with dcetlin-website."
+    },
+    {
+      "id": "repos/lobster-outputs",
+      "artifact_class": "repo",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Lobster outputs and artifacts",
+      "expiry": null,
+      "notes": "Active today. Cadence: output repository."
+    },
+    {
+      "id": "repos/myr-system-worktrees",
+      "artifact_class": "repo",
+      "owner": "unowned",
+      "state": "orphan",
+      "last_activity": "2026-04-29",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "Worktree directories in projects/ that are not full repos (feat, feat-p3-uow-owner-decision-dashboard, feature-issue-742-max-turns, feature-sprint-skill, fix-*, docs-delivery-deferred-mode, lobster-574, lobster-steward-7section, pattern-obs-routing-loop). These are ephemeral worktrees, not standalone repos. Stale orphan candidates."
+    },
+    {
+      "id": "jobs/weekly-epistemic-retro",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "2026-06-28",
+      "convergence_target": "Weekly epistemic retrospective delivery",
+      "expiry": null,
+      "notes": "Enabled. Last run 2026-06-28. Cadence."
+    },
+    {
+      "id": "jobs/async-deep-work",
+      "artifact_class": "scheduled_job",
+      "owner": "Dan",
+      "state": "cadence",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Daily deep work session facilitation",
+      "expiry": null,
+      "notes": "Enabled. Last run today. Cadence."
+    },
+    {
+      "id": "jobs/lobster-hygiene",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Quarterly instruction hygiene review",
+      "expiry": null,
+      "notes": "Enabled. Last run today. Cadence."
+    },
+    {
+      "id": "jobs/lobster-hygiene-biweekly",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "2026-07-01",
+      "convergence_target": "Biweekly instruction hygiene review",
+      "expiry": null,
+      "notes": "Enabled. Last run 2026-07-01. May duplicate lobster-hygiene — reconciliation candidate."
+    },
+    {
+      "id": "jobs/pattern-candidate-sweep",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "2026-06-03",
+      "convergence_target": "Weekly pattern candidate identification",
+      "expiry": null,
+      "notes": "Enabled. Last run 2026-06-03. WOS core."
+    },
+    {
+      "id": "jobs/morning-briefing",
+      "artifact_class": "scheduled_job",
+      "owner": "Dan",
+      "state": "cadence",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Daily morning briefing delivery",
+      "expiry": null,
+      "notes": "Enabled. Last run today. Cadence."
+    },
+    {
+      "id": "jobs/uow-reflection",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "2026-06-05",
+      "convergence_target": "Daily UoW reflection",
+      "expiry": null,
+      "notes": "Enabled. Last run 2026-06-05. WOS core."
+    },
+    {
+      "id": "jobs/structural-hygiene-audit",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "2026-03-31",
+      "convergence_target": "Annual structural hygiene audit",
+      "expiry": null,
+      "notes": "Enabled. Last run 2026-03-31. Runs annually (March 31 only)."
+    },
+    {
+      "id": "jobs/upstream-sync",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Twice-daily upstream sync",
+      "expiry": null,
+      "notes": "Enabled. Last run today. Cadence."
+    },
+    {
+      "id": "jobs/steward-heartbeat",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "2026-03-31",
+      "convergence_target": "WOS steward heartbeat (cron-direct)",
+      "expiry": null,
+      "notes": "Enabled. Cron-direct. WOS core."
+    },
+    {
+      "id": "jobs/executor-heartbeat",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "2026-03-31",
+      "convergence_target": "WOS executor heartbeat (cron-direct)",
+      "expiry": null,
+      "notes": "Enabled. Cron-direct. WOS core."
+    },
+    {
+      "id": "jobs/wos-overnight-loop",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "2026-06-05",
+      "convergence_target": "WOS overnight execution loop",
+      "expiry": null,
+      "notes": "Enabled. Last run 2026-06-05. WOS core."
+    },
+    {
+      "id": "jobs/lobster-meta",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "never",
+      "convergence_target": "Nightly drift detection and artifact registry reconciliation",
+      "expiry": null,
+      "notes": "Enabled. Never run yet. Cadence."
+    },
+    {
+      "id": "jobs/learnings-proposals",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "2026-06-28",
+      "convergence_target": "Extract learnings and proposals from recent signals",
+      "expiry": null,
+      "notes": "Enabled. Last run 2026-06-28."
+    },
+    {
+      "id": "jobs/epistemic-drift-sweep",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "2026-06-28",
+      "convergence_target": "Epistemic drift detection sweep",
+      "expiry": null,
+      "notes": "Enabled. Last run 2026-06-28."
+    },
+    {
+      "id": "jobs/negentropic-sweep",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "orphan",
+      "last_activity": "2026-07-04",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "Disabled. Runs but is disabled. The 0%-resolution-rate issue. Candidate for redesign or kill."
+    },
+    {
+      "id": "jobs/quick-classifier-loop",
+      "artifact_class": "scheduled_job",
+      "owner": "unowned",
+      "state": "orphan",
+      "last_activity": "2026-03-31",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "Disabled. Last run March 2026."
+    },
+    {
+      "id": "jobs/slow-reclassifier-loop",
+      "artifact_class": "scheduled_job",
+      "owner": "unowned",
+      "state": "orphan",
+      "last_activity": "2026-03-31",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "Disabled. Last run March 2026."
+    },
+    {
+      "id": "jobs/phase2-design-review",
+      "artifact_class": "scheduled_job",
+      "owner": "unowned",
+      "state": "orphan",
+      "last_activity": "2026-03-30",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "Disabled. Last run March 2026. Phase 2 design review — likely superseded."
+    },
+    {
+      "id": "jobs/canon-reconciler",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "active_wip",
+      "last_activity": "never",
+      "convergence_target": "Weekly artifact invariant enforcement — scan registry, flag violations, route orphans",
+      "expiry": "2026-08-01",
+      "notes": "Enabled. Never run. Created 2026-07-04 as part of canon build. Review whether this duplicates lobster-meta nightly."
+    },
+    {
+      "id": "jobs/usage-alert",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "never",
+      "convergence_target": "Usage alert monitoring",
+      "expiry": null,
+      "notes": "Enabled. Never run."
+    },
+    {
+      "id": "jobs/proposals-digest",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "never",
+      "convergence_target": "Proposals digest delivery",
+      "expiry": null,
+      "notes": "Enabled. Never run."
+    },
+    {
+      "id": "jobs/auto-router",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "never",
+      "convergence_target": "Automated message routing",
+      "expiry": null,
+      "notes": "Enabled. Never run."
+    },
+    {
+      "id": "jobs/operativity-quarterly-review",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "cadence",
+      "last_activity": "never",
+      "convergence_target": "Quarterly operativity review",
+      "expiry": null,
+      "notes": "Enabled. Never run."
+    },
+    {
+      "id": "jobs/los-action-scanner",
+      "artifact_class": "scheduled_job",
+      "owner": "Dan",
+      "state": "cadence",
+      "last_activity": "never",
+      "convergence_target": "LOS action scanning",
+      "expiry": null,
+      "notes": "Enabled. Never run."
+    },
+    {
+      "id": "jobs/los-weekly-review",
+      "artifact_class": "scheduled_job",
+      "owner": "Dan",
+      "state": "cadence",
+      "last_activity": "never",
+      "convergence_target": "Weekly LOS review",
+      "expiry": null,
+      "notes": "Enabled. Never run."
+    },
+    {
+      "id": "jobs/daily-metrics",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "orphan",
+      "last_activity": "never",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "Enabled. Never run. No clear owner or convergence."
+    },
+    {
+      "id": "jobs/decay-detector",
+      "artifact_class": "scheduled_job",
+      "owner": "lobster",
+      "state": "orphan",
+      "last_activity": "never",
+      "convergence_target": "",
+      "expiry": null,
+      "notes": "Enabled. Never run. No clear owner or convergence."
+    },
+    {
+      "id": "docs/CLAUDE.md",
+      "artifact_class": "canonical_doc",
+      "owner": "lobster",
+      "state": "seed",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Behavioral canon for Lobster — dispatcher gates, agent protocols, system architecture",
+      "expiry": null,
+      "notes": "Primary behavioral specification. Active. Seed: foundational, not time-boxed."
+    },
+    {
+      "id": "docs/CONVENTIONS.md",
+      "artifact_class": "canonical_doc",
+      "owner": "lobster",
+      "state": "seed",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Workspace layout and directory placement rules",
+      "expiry": null,
+      "notes": "Layout canon. Updated 2026-07-04. Seed."
+    },
+    {
+      "id": "docs/HOWTO.md",
+      "artifact_class": "canonical_doc",
+      "owner": "lobster",
+      "state": "seed",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Workstream structure specification",
+      "expiry": null,
+      "notes": "Workstream spec. Seed."
+    },
+    {
+      "id": "docs/oracle/golden-patterns.md",
+      "artifact_class": "canonical_doc",
+      "owner": "lobster",
+      "state": "seed",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Reusable structural wins and design patterns",
+      "expiry": null,
+      "notes": "Active pattern store. Oracle-curated. Seed."
+    },
+    {
+      "id": "docs/oracle/learnings.md",
+      "artifact_class": "canonical_doc",
+      "owner": "lobster",
+      "state": "seed",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Documented failure modes and antipatterns",
+      "expiry": null,
+      "notes": "Active antipattern store. Oracle-curated. Seed."
+    },
+    {
+      "id": "docs/sys.dispatcher.bootup.md",
+      "artifact_class": "canonical_doc",
+      "owner": "lobster",
+      "state": "seed",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Dispatcher behavioral specification",
+      "expiry": null,
+      "notes": "Injected at session start. Seed."
+    },
+    {
+      "id": "docs/sys.subagent.bootup.md",
+      "artifact_class": "canonical_doc",
+      "owner": "lobster",
+      "state": "seed",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Subagent behavioral specification",
+      "expiry": null,
+      "notes": "Injected at session start. Seed."
+    },
+    {
+      "id": "docs/data/artifact-registry.json",
+      "artifact_class": "canonical_doc",
+      "owner": "lobster",
+      "state": "seed",
+      "last_activity": "2026-07-04",
+      "convergence_target": "Global artifact inventory — owner, liveness, convergence-state per artifact",
+      "expiry": null,
+      "notes": "This file. Created 2026-07-04 as part of global-canon implementation. Maintained nightly by lobster-meta."
+    }
+  ]
+}

@@ -4894,6 +4894,46 @@ finally:
         substep "Migration 134: lobster-mcp.service not installed — skipping"
     fi
 
+    # Migration 135: Seed artifact-registry.json if absent.
+    #
+    # ~/lobster-workspace/data/artifact-registry.json is the global artifact registry —
+    # owner, liveness, and convergence-state per artifact. It is maintained nightly by
+    # lobster-meta and reviewed quarterly by lobster-hygiene.
+    #
+    # The file is runtime data (workspace, not the repo) so it is created on first deploy
+    # from the seed template at memory/canonical-templates/artifact-registry.json. On
+    # subsequent upgrades it is preserved as-is (lobster-meta is the live maintainer).
+    #
+    # If the seed template is absent (pre-canonicalization install), falls back to a
+    # minimal empty registry so lobster-meta's Phase 0 scan can populate it.
+    local _artifact_registry="$WORKSPACE_DIR/data/artifact-registry.json"
+    local _artifact_registry_seed="$LOBSTER_DIR/memory/canonical-templates/artifact-registry.json"
+    if [ ! -f "$_artifact_registry" ]; then
+        mkdir -p "$WORKSPACE_DIR/data"
+        if [ -f "$_artifact_registry_seed" ]; then
+            cp "$_artifact_registry_seed" "$_artifact_registry"
+            substep "Migration 135: seeded artifact-registry.json from canonical-templates/"
+        else
+            cat > "$_artifact_registry" <<'EOF'
+{
+  "_schema_version": "1.0",
+  "_description": "Global artifact registry — owner, liveness, convergence-state per artifact. Maintained nightly by lobster-meta. Reviewed quarterly by lobster-hygiene.",
+  "_state_law": {
+    "seed": "Reusable golden pattern or template. No time box. Does not expire; gets updated or deprecated, not killed.",
+    "cadence": "Owned recurring process. Owner must be named. Must have liveness signal (last_activity within 2x schedule period).",
+    "active_wip": "Owned, time-boxed work in progress. Owner + convergence_target + expiry all required. Expiry passed = auto-transition to orphan.",
+    "orphan": "No owner, no liveness, or expiry passed. The purge queue. Survives at most one human-review cycle before deletion or promotion."
+  },
+  "_last_reconciled": null,
+  "_reconciled_by": "upgrade.sh (fallback-seed)",
+  "artifacts": []
+}
+EOF
+            substep "Migration 135: created minimal artifact-registry.json (seed template not found)"
+        fi
+        migrated=$((migrated + 1))
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

@@ -55,6 +55,69 @@ From the anomalies and silences identified in Step 2, ask:
 
 If yes to any: add one entry to the anomalies list with source tagged as `instruction-layer` rather than `signal-layer`. This entry routes to `premise-review.md`, not `proposals.md`. Maximum one instruction-layer anomaly per Meta run — if multiple candidates exist, name the one with the most evidence and discard the rest.
 
+**Step 2.75: Artifact registry reconciliation (Phase 0 scan)**
+
+Read `~/lobster-workspace/data/artifact-registry.json`. This is the global artifact registry — one entry per workstream, repo, scheduled job, and canonical doc. Your job here is Phase 0: detect drift, flag violations of the converge-or-kill invariant, and update the registry in place.
+
+**Invariant:** Every artifact must either converge into a seed/cadence with an owner, or be stripped and killed. Nothing idle, in an unstable state, without an owner.
+
+**What to check (in order):**
+
+1. **Stale `last_activity`:** For each entry with `state` in `{active_wip, cadence}`:
+   - `cadence`: If `last_activity` is more than 2× the job's schedule period old (or > 60 days for non-job cadences), flag it as stale. Mark `notes` with "STALE-CADENCE detected [date]".
+   - `active_wip`: If `last_activity` is > 30 days old AND no `expiry` is set, flag as stale. Mark `notes` with "STALE-WIP detected [date]".
+
+2. **Expired `active_wip`:** For each entry with `state: active_wip` where `expiry` is non-null and `expiry` < today's date:
+   - Transition `state` to `orphan`.
+   - Append to `notes`: "auto-transitioned orphan [date] — expiry [expiry] passed without resolution".
+   - Add the artifact to the anomalies list in your Step 4 output.
+
+3. **Unowned non-seeds:** For each entry with `owner: unowned` and `state` not in `{orphan}`:
+   - Flag as a violation: an active artifact with no owner.
+   - Do NOT auto-change state — surface as anomaly in Step 4.
+
+4. **`orphan` entries:** List all entries where `state: orphan`. These are the purge queue. Surface them in Step 4 as a named list, not a synthesis.
+
+5. **New unregistered artifacts (opportunistic scan):** Do a quick directory check:
+   - List directory names in `~/lobster-workspace/workstreams/` (exclude HOWTO.md, INDEX.md, archive/).
+   - For each name not found in the registry as `workstreams/<name>`, add a new entry with `state: orphan`, `owner: unowned`, `last_activity: [today]`, `convergence_target: ""`, `notes: "unregistered — detected by lobster-meta [date]"`.
+   - Do the same for `~/lobster-workspace/projects/` (non-git and git directories alike) and compare against `repos/<name>` entries.
+   - Do NOT scan scheduled jobs in this step — jobs.json is the source of truth and is reconciled separately.
+
+**After all checks, write the updated registry back to `~/lobster-workspace/data/artifact-registry.json`.** Set `_last_reconciled` to today's date and `_reconciled_by` to `lobster-meta [date]`.
+
+**What to produce for Step 4:** A "Artifact registry: Phase 0 scan" section listing:
+- Count of entries by state
+- Orphan entries (IDs only, one per line)
+- Any state transitions made (active_wip → orphan)
+- Stale-cadence or stale-wip flags added
+- Newly registered unregistered artifacts
+
+Keep this section terse — it feeds the proposals file, not the user. No synthesis.
+
+**Step 2.76: Valence promotion — wire converged artifacts to golden memory**
+
+This step connects the "converge into a seed" path to the valence memory system. It is the promotion lever the proposal identified as inert.
+
+**What to promote:** Any artifact in the registry whose `state` was just transitioned to `seed` in Step 2.75, OR any artifact that meets ALL of:
+- `state: seed`
+- `convergence_target` is non-empty (has a stated purpose)
+- No existing `golden` memory event exists for this artifact (check by searching memory for the artifact ID)
+
+**How to promote:** For each candidate, call `memory_store` with:
+- `type: "artifact_promotion"`
+- `source: "lobster-meta"`
+- `project: [artifact_class]` (e.g., "workstream", "repo", "scheduled_job", "canonical_doc")
+- `subject: [artifact_id]` (e.g., "workstreams/first-principles")
+- `content: "Artifact [artifact_id] promoted to seed state. Convergence target: [convergence_target]. [notes field if non-empty]"`
+- `valence: "golden"`
+
+**Cap:** Promote at most 3 new artifacts per run. If more than 3 are eligible, promote the ones with the oldest `last_activity` (most stable). Note the remainder for the next run.
+
+**Do not promote:** Artifacts with `state: orphan`, `state: active_wip`, or `state: cadence`. Cadences are owned recurring processes — they are not seeds. Only `seed` state maps to `golden` valence.
+
+**Effect:** This connects artifact graduation to the memory DB valence system so that `golden` valence is no longer vestigial. Searches for `valence=golden` will return artifact seeds alongside oracle-curated patterns.
+
 **Step 3: Check premise-review.md**
 
 Read `~/lobster-workspace/meta/premise-review.md`. Note items where:

@@ -57,6 +57,49 @@ Bootup files to check: `.claude/sys.dispatcher.bootup.md`, `.claude/sys.subagent
 
 Surface entries expiring within 7 days or already expired. Do not graduate or discard — surface only. Graduation is a Dan decision.
 
+**Step 2c: Artifact lifecycle — quarantine candidates and seed graduation**
+
+This step covers the quarterly artifact lifecycle review: (a) quarantine recommendations, and (b) seed graduation candidates.
+
+**Read `~/lobster-workspace/data/artifact-registry.json` first.** It is the authoritative registry maintained nightly by lobster-meta.
+
+**A. Quarantine candidates (Phase 1 of lifecycle)**
+
+List all entries where `state: orphan`. These are Phase 1 candidates. For each:
+
+- State the artifact ID and class (`workstream`, `repo`, `scheduled_job`, `canonical_doc`)
+- State the last_activity date and owner
+- State whether the artifact has been in `orphan` state for > 14 days (check `notes` for when the orphan transition was logged by lobster-meta)
+
+For artifacts orphan for > 14 days: recommend Phase 1 quarantine action per class:
+- `workstream` → move directory to `workstreams/archive/<name>-quarantine-<date>/`
+- `scheduled_job` → set `enabled: false` in jobs.json
+- `repo` → add `QUARANTINE.md` at root noting quarantine date and reason
+- `canonical_doc` → flag in registry notes only (docs are not moved)
+
+**CRITICAL: Do NOT execute any of these actions.** Surface the recommendation list only. Quarantine requires Dan's explicit confirmation — this is a NEEDS-DAN gate. The dispatcher executes after Dan approves.
+
+For artifacts newly orphaned (< 14 days): list as "watching — dwell period not yet elapsed".
+
+**B. Seed graduation candidates (the "converge into a seed" half)**
+
+Review `active_wip` entries where ALL of:
+- `last_activity` > 60 days ago (artifact has been active for 60+ days)
+- The workstream has a `README.md` and `log.md` (if class = `workstream`)
+- The `notes` field contains no indication of active blocker or open PR
+
+These are graduation candidates: artifacts that have stabilized enough to transition from `active_wip` to `seed` or be archived/killed. Surface them as a list with one question per candidate: "Is this a reusable golden pattern (promote to seed), an ongoing cadence (reclassify as cadence), or dead work (mark orphan/archive)?"
+
+Dan decides; you surface candidates only. Do not change any `state` field without Dan's confirmation.
+
+**C. Update registry notes**
+
+For each candidate you are surfacing (quarantine or graduation):
+- Append to its `notes` field: "hygiene-quarterly [date]: recommended for [quarantine / seed-graduation / archive]"
+- Do NOT change `state` — only lobster-meta auto-transitions (expiry) or Dan-confirmed actions change state
+
+Write the updated registry back to `~/lobster-workspace/data/artifact-registry.json` with `_last_reconciled` set to today and `_reconciled_by` set to `lobster-hygiene [date]`.
+
 **Step 3: Write output**
 
 Append to `~/lobster-workspace/meta/hygiene-review.md`:
@@ -64,7 +107,7 @@ Append to `~/lobster-workspace/meta/hygiene-review.md`:
 ```markdown
 ### [YYYY-MM-DD] Hygiene Review
 
-**Orphans (no downstream effect detected):**
+**Orphans (no downstream effect detected — instruction layer):**
 - [specific item reference]
 
 **Load/decoration collapse (structure unclear):**
@@ -72,6 +115,15 @@ Append to `~/lobster-workspace/meta/hygiene-review.md`:
 
 **Accumulation without signal (growing without effect):**
 - [specific file]
+
+**Artifact registry — quarantine candidates (NEEDS-DAN to execute):**
+- [artifact-id]: orphan since [date], class=[class], owner=[owner]
+
+**Artifact registry — seed graduation candidates (NEEDS-DAN to decide):**
+- [artifact-id]: active_wip for [N] days — promote to seed / reclassify as cadence / mark orphan?
+
+**HYPOTHESIS entries expiring within 7 days or expired:**
+- [entry title]: expires [date], review question: [question]
 ```
 
 **Step 4: Route high-signal items**
