@@ -10,6 +10,24 @@ When write_result was called, this hook also marks the session completed in
 agent_sessions.db synchronously — without relying on the unreliable server-side
 auto-unregister path in inbox_server.py.
 
+## Auto-archive-on-completion (structural, not preamble-only)
+
+On a successful write_result call (status == "success"), this hook also
+attempts to archive the subagent's workstream directory:
+`workstreams/<task_id>/` -> `workstreams/archive/<task_id>/`.
+
+This mechanizes assessments/workstreams-canonicity-model-20260704.md §4 at
+the tooling layer rather than relying on the agent remembering the
+documentation-only preamble step in CLAUDE.md's Long-Running Dispatch
+Preamble (step 6). The hook fires whenever CC observes a SubagentStop/Stop
+event with a valid write_result call — regardless of whether the agent's
+prompt included the preamble, or whether the agent "remembered" to archive.
+
+The archive attempt is a no-op (not an error) when no workstream directory
+exists for the task_id — most subagents never create one. See
+`_archive_workstream_dir` for the path-safety checks applied before any
+filesystem move.
+
 ## Session ID strategy
 
 The SubagentStop hook receives a session_id that is CC's internal UUID for the
@@ -78,6 +96,8 @@ The file is cleaned up after the fallback emit.
 """
 import json
 import os
+import re
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -167,6 +187,84 @@ def _mark_session_notified(id_or_task_id: str) -> None:
         set_notified(id_or_task_id)
     except Exception:
         pass  # DB update is best-effort; never block exit
+
+
+# ---------------------------------------------------------------------------
+# Auto-archive-on-completion (canonicity-model-20260704.md §4, mechanized)
+# ---------------------------------------------------------------------------
+
+_SAFE_SLUG_RE = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _archive_workstream_dir(task_id: str, workspace_root: "Path | None" = None) -> bool:
+    """Move workspace_root/workstreams/<task_id>/ to .../workstreams/archive/<task_id>/.
+
+    Returns True if a move happened, False otherwise (no-op or skipped).
+    Never raises — any failure is swallowed so the hook always exits 0.
+
+    Safety checks, in order:
+    - task_id must be a non-empty string matching a safe slug pattern
+      (alphanumerics, dash, underscore only) — rejects path-traversal payloads
+      like "../../etc" outright, before any path is constructed.
+    - The resolved source directory must be a direct child of workstreams_root
+      (defense in depth in case the slug check is ever weakened).
+    - Source must exist and be a directory; if absent, this is the normal case
+      for the vast majority of subagents (no workstream dir was ever created)
+      and is a silent no-op, not a failure.
+    - Destination must not already exist — never overwrite an existing archive
+      entry; skip instead (idempotent re-fires of this hook do nothing after
+      the first successful move).
+    """
+    if not task_id or not _SAFE_SLUG_RE.fullmatch(task_id):
+        return False
+
+    try:
+        if workspace_root is None:
+            workspace_root = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+
+        workstreams_root = (workspace_root / "workstreams").resolve()
+        src = (workstreams_root / task_id)
+        dst_root = workstreams_root / "archive"
+        dst = dst_root / task_id
+
+        if not src.exists():
+            return False  # nothing to archive — normal case, not an error
+
+        if src.resolve().parent != workstreams_root:
+            return False  # defense in depth; should be unreachable given the slug check
+
+        if not src.is_dir():
+            return False  # not a directory — leave whatever this is alone
+
+        if dst.exists():
+            return False  # already archived, or name collision — never overwrite
+
+        dst_root.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+        return True
+    except Exception:
+        return False  # best-effort; never block hook exit
+
+
+def _maybe_auto_archive_workstreams(
+    write_result_items: list, workspace_root: "Path | None" = None
+) -> None:
+    """Auto-archive the workstream dir for each successful write_result call.
+
+    Structural enforcement, not documentation: this runs from the SubagentStop/
+    Stop hook whenever CC observes a valid write_result tool call, independent
+    of whether the dispatched agent's prompt included (or the agent honored)
+    the CLAUDE.md Long-Running Dispatch Preamble's auto-archive step. Failed
+    tasks (status == "error") are left alone, matching the preamble's own
+    "skip if failed" guidance — the reconciler should still be able to find
+    an in-progress or failed task's workstream dir in the active namespace.
+    """
+    for item in write_result_items:
+        inp = item.get("input", {})
+        status = inp.get("status", "success")
+        task_id = inp.get("task_id", "")
+        if status == "success":
+            _archive_workstream_dir(task_id, workspace_root=workspace_root)
 
 
 def _load_transcript_from_jsonl(path: str) -> list:
@@ -532,6 +630,13 @@ def main():
             # write_result, so reset the counter for this session.
             key = _agent_key(data)
             _cleanup_fire_state(_fire_count_path(key))
+
+            # Structural auto-archive-on-completion (canonicity-model-20260704.md
+            # §4): move workstreams/<task_id>/ to workstreams/archive/<task_id>/
+            # for each successful write_result call. Best-effort and a no-op for
+            # the common case (no workstream dir ever created) — see
+            # _archive_workstream_dir for the safety checks.
+            _maybe_auto_archive_workstreams(valid_calls)
 
             _exit_ok()
         else:
