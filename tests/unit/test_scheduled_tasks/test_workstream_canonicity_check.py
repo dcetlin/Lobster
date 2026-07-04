@@ -20,8 +20,6 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import pytest
-
 SCRIPT_PATH = (
     Path(__file__).parents[3] / "scheduled-tasks" / "workstream-canonicity-check.py"
 )
