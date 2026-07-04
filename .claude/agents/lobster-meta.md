@@ -29,7 +29,7 @@ Then ask: if someone who had never heard of this vision read only the work produ
 
 ## Processing sequence
 
-Complete each step before moving to the next. Stay within `--max-turns 15`.
+Complete each step before moving to the next. Stay within `--max-turns 18` (raised from 15 to accommodate Step 2.75/2.76's registry read/scan/write-back work ahead of the pre-existing steps).
 
 **Step 1: Read signals**
 Read all `.json` files in `~/lobster-workspace/signals/phase-alignment/` (not the `archive/` subdirectory). Count them. If zero, note this and proceed to Step 3.
@@ -54,6 +54,74 @@ From the anomalies and silences identified in Step 2, ask:
 - Do any recurring themes across signals suggest that a meta-instruction (not just a task-level decision) is the upstream cause?
 
 If yes to any: add one entry to the anomalies list with source tagged as `instruction-layer` rather than `signal-layer`. This entry routes to `premise-review.md`, not `proposals.md`. Maximum one instruction-layer anomaly per Meta run — if multiple candidates exist, name the one with the most evidence and discard the rest.
+
+**Step 2.75: Artifact registry reconciliation (Phase 0 scan)**
+
+*If turns are running low when you reach this step, do the cheapest useful pass (Steps 1–2 below) and yield the remainder of the budget to Steps 3+ — do not let Phase 0 scanning crowd out premise-review, proposals, or archival.*
+
+Read `~/lobster-workspace/data/artifact-registry.json`. This is the global artifact registry — one entry per workstream, repo, scheduled job, and canonical doc, wrapped in a `_meta` object (`version`, `created`, `last_reconciled`, `invariant`, `classifications`, `staleness_thresholds`) plus an `artifacts` array where each entry carries `id`, `artifact_class`, `path`, `owner`, `state`, `last_activity`, `convergence_target`, `expiry`, `notes`. Your job here is Phase 0: detect drift, flag violations of the converge-or-kill invariant, and update the registry in place.
+
+**Invariant:** Every artifact must either converge into a seed/cadence with an owner, or be stripped and killed. Nothing idle, in an unstable state, without an owner.
+
+**Read thresholds from the registry itself — never hardcode them.** Use `_meta.staleness_thresholds.workstream_active_wip_days`, `_meta.staleness_thresholds.repo_active_wip_days`, and `_meta.staleness_thresholds.cadence_missed_cycles` (currently 60, 60, 2). CANON.md documents these same values in prose; `_meta.staleness_thresholds` is the single machine-readable source of truth for them — a literal number in this step would give the same threshold two independently-driftable homes.
+
+**What to check (in order):**
+
+1. **Stale `last_activity`:** For each entry with `state` in `{active_wip, cadence}`:
+   - `cadence`: If `last_activity` is more than `cadence_missed_cycles` × the job's schedule period old, flag it as stale. Mark `notes` with "STALE-CADENCE detected [date]".
+   - `active_wip`: If `last_activity` is older than `workstream_active_wip_days` (for `artifact_class: workstream`) or `repo_active_wip_days` (for `artifact_class: repo`) AND no `expiry` is set, flag as stale. Mark `notes` with "STALE-WIP detected [date]".
+
+2. **Expired `active_wip`:** For each entry with `state: active_wip` where `expiry` is non-null and `expiry` < today's date:
+   - Transition `state` to `orphan`.
+   - Append to `notes`: "auto-transitioned orphan [date] — expiry [expiry] passed without resolution".
+   - Add the artifact to the anomalies list in your Step 4 output.
+
+3. **Unowned non-seeds:** For each entry with `owner: unowned` and `state` not in `{orphan}`:
+   - Flag as a violation: an active artifact with no owner.
+   - Do NOT auto-change state — surface as anomaly in Step 4.
+
+4. **`orphan` entries:** List all entries where `state: orphan`. These are the purge queue. Surface them in Step 4 as a named list, not a synthesis.
+
+5. **New unregistered artifacts, and scheduled-job reconciliation (opportunistic scan):**
+   - List directory names in `~/lobster-workspace/workstreams/` (exclude `HOWTO.md`, `INDEX.md`, `archive/`). For each name not found in the registry as `workstreams/<name>`, add a new entry: `id: workstreams/<name>`, `artifact_class: workstream`, `path: ~/lobster-workspace/workstreams/<name>/`, `owner: unowned`, `state: orphan`, `last_activity: [today]`, `convergence_target: null`, `expiry: null`, `notes: "unregistered — detected by lobster-meta [date]"`.
+   - Do the same for `~/lobster-workspace/projects/` against `repos/<name>` entries (`path: ~/lobster-workspace/projects/<name>/`).
+   - **Scheduled jobs are reconciled in this step — do not skip them. Registry ids for `scheduled_job` entries are three-segment, not two-segment:** `jobs/<state>/<key>` (e.g. `jobs/cadence/lobster-meta`, `jobs/orphan/canon-reconciler`), where `<state>` is one of the four `ArtifactState` values (`seed`, `cadence`, `active_wip`, `orphan` — see `src/utils/artifact_registry.py`) and the `jobs.json` key is always the id's *last* path segment — never match on the literal two-segment string `jobs/<key>`. This is the exact same id-extraction rule `scheduled-tasks/canon-digest.py`'s `compute_job_diff` uses (`rid.rsplit("/", 1)[-1]` for any id starting with `jobs/`); mirror that logic here rather than re-deriving it. Read `~/lobster-workspace/scheduled-jobs/jobs.json`. Build the set of registered job keys by taking the last path segment of every registry entry whose `id` starts with `jobs/`. For each key in `jobs` not in that set, add a new entry: `id: jobs/orphan/<key>`, `artifact_class: scheduled_job`, `path: scheduled-jobs/tasks/<key>.md` if that task file exists else `null`, `owner: unowned`, `state: orphan`, `last_activity: [today]`, `convergence_target: null`, `expiry: null`, `notes: "unregistered — detected by lobster-meta [date]"`. Conversely, for each registered `scheduled_job` entry whose id's last path segment has no matching key in the live `jobs.json`, append to its `notes`: "STALE-REGISTRY-ENTRY [date] — no matching jobs.json key" (surface only, do not delete the entry).
+   - For `scheduled_job` entries with `state: cadence` (id shape `jobs/cadence/<key>`), compute liveness for check 1 above by looking up `<key>` — the id's last path segment — in `jobs.json`'s `last_run` field against `schedule` and `cadence_missed_cycles`.
+
+**After all checks, write the updated registry back to `~/lobster-workspace/data/artifact-registry.json`.** Set `_meta.last_reconciled` to today's date.
+
+**What to produce for Step 4:** An "Artifact registry: Phase 0 scan" section listing:
+- Count of entries by state
+- Orphan entries (IDs only, one per line)
+- Any state transitions made (active_wip → orphan)
+- Stale-cadence or stale-wip flags added
+- Newly registered unregistered artifacts (workstreams, repos, and jobs)
+- Registry entries flagged STALE-REGISTRY-ENTRY (no matching live job)
+
+Keep this section terse — it feeds the proposals file, not the user. No synthesis.
+
+**Step 2.76: Valence promotion — wire converged artifacts to golden memory**
+
+This step connects the "converge into a seed" path to the valence memory system. It is the promotion lever the proposal identified as inert.
+
+**What to promote:** Any artifact in the registry whose `state` was just transitioned to `seed` in Step 2.75, OR any artifact that meets ALL of:
+- `state: seed`
+- `convergence_target` is non-empty (has a stated purpose)
+- No existing `golden` memory event exists for this artifact (check by searching memory for the artifact ID)
+
+**How to promote:** For each candidate, call `memory_store` with:
+- `type: "artifact_promotion"`
+- `source: "lobster-meta"`
+- `project: [artifact_class]` (e.g., "workstream", "repo", "scheduled_job", "canonical_doc")
+- `subject: [artifact_id]` (e.g., "workstreams/first-principles")
+- `content: "Artifact [artifact_id] promoted to seed state. Convergence target: [convergence_target]. [notes field if non-empty]"`
+- `valence: "golden"`
+
+**Cap:** Promote at most 3 new artifacts per run. If more than 3 are eligible, promote the ones with the oldest `last_activity` (most stable). Note the remainder for the next run.
+
+**Do not promote:** Artifacts with `state: orphan`, `state: active_wip`, or `state: cadence`. Cadences are owned recurring processes — they are not seeds. Only `seed` state maps to `golden` valence.
+
+**Effect:** This connects artifact graduation to the memory DB valence system so that `golden` valence is no longer vestigial. Searches for `valence=golden` will return artifact seeds alongside oracle-curated patterns.
 
 **Step 3: Check premise-review.md**
 

@@ -4894,6 +4894,142 @@ finally:
         substep "Migration 134: lobster-mcp.service not installed — skipping"
     fi
 
+    # Migration 135: Schema-normalize data/artifact-registry.json.
+    #
+    # This is a *normalizing* migration, not an existence check — it runs on
+    # every upgrade and brings whatever shape the file is currently in up to
+    # the canonical schema (Implementation A from the 2026-07-04 canon
+    # reconciliation: `_meta` wrapper + per-entry `path` field + machine-
+    # readable `staleness_thresholds`). This replaces PR #1463's original
+    # Migration 135, whose `if [ ! -f ... ]` guard was a confirmed permanent
+    # no-op on any machine where a registry already existed under a
+    # different schema (oracle verdict pr-1463.md, blocking finding #2).
+    #
+    # Normalization logic lives in scripts/normalize-artifact-registry.py
+    # (unit-tested in tests/unit/test_scripts/test_normalize_artifact_registry.py)
+    # so it is a single reviewable, testable place rather than inline bash.
+    # It never overwrites existing `artifacts` data — only backfills missing
+    # fields and folds a legacy flat schema into `_meta`.
+    local _NORMALIZE_SCRIPT="$LOBSTER_DIR/scripts/normalize-artifact-registry.py"
+    if [ -f "$_NORMALIZE_SCRIPT" ]; then
+        local _m135_output
+        _m135_output=$(cd "$LOBSTER_DIR" && uv run "$_NORMALIZE_SCRIPT" "$WORKSPACE_DIR/data/artifact-registry.json" 2>&1) || true
+        if echo "$_m135_output" | grep -q "^CHANGED"; then
+            substep "Migration 135: $_m135_output"
+            migrated=$((migrated + 1))
+        else
+            substep "Migration 135: artifact-registry.json already canonical — skipping"
+        fi
+    else
+        warn "Migration 135: normalize-artifact-registry.py not found — skipping"
+    fi
+
+    # Migration 136: Retire the standalone weekly canon-reconciler job in
+    # favor of lobster-meta (nightly Phase 0 scan, Step 2.75/2.76) and
+    # lobster-hygiene (quarterly Phase 1, Step 2c); register the read-only
+    # canon-digest Type B script as its Telegram-summary replacement.
+    #
+    # Running canon-reconciler (weekly, dispatch: subagent, schema
+    # assumptions: A) alongside lobster-meta's new nightly Phase 0 scan
+    # (schema assumptions: also A, post-salvage) against the same
+    # data/artifact-registry.json would be exactly the dual-reconciler
+    # read-modify-write collision the 2026-07-04 canon reconciliation
+    # analysis flagged as a real, confirmed risk — so canon-reconciler is
+    # disabled here rather than left enabled alongside its replacement.
+    local _JOBS_FILE_135="$WORKSPACE_DIR/scheduled-jobs/jobs.json"
+    if [ -f "$_JOBS_FILE_135" ]; then
+        if uv run python3 -c "import json,sys; d=json.load(open('$_JOBS_FILE_135')); sys.exit(0 if d.get('jobs',{}).get('canon-reconciler',{}).get('enabled') else 1)" 2>/dev/null; then
+            substep "Migration 136: disabling canon-reconciler in jobs.json (superseded by lobster-meta/hygiene)"
+            local _m136_tmp
+            _m136_tmp=$(mktemp)
+            uv run python3 - <<'PY136A' "$_JOBS_FILE_135" "$_m136_tmp"
+import json, sys
+from datetime import datetime, timezone
+jobs_path, tmp_path = sys.argv[1], sys.argv[2]
+with open(jobs_path) as f:
+    data = json.load(f)
+job = data.get("jobs", {}).get("canon-reconciler")
+if job is not None:
+    job["enabled"] = False
+    job["updated_at"] = datetime.now(timezone.utc).isoformat()
+    job["description"] = (
+        job.get("description", "")
+        + " [disabled 2026-07 — superseded by lobster-meta Step 2.75/2.76 "
+        + "(nightly) and lobster-hygiene Step 2c (quarterly); see canon-digest "
+        + "for the read-only weekly Telegram summary]"
+    )
+with open(tmp_path, "w") as f:
+    json.dump(data, f, indent=2, default=str)
+print("OK")
+PY136A
+            if [ -s "$_m136_tmp" ]; then
+                mv "$_m136_tmp" "$_JOBS_FILE_135"
+                migrated=$((migrated + 1))
+            else
+                rm -f "$_m136_tmp"
+                warn "Migration 136: failed to disable canon-reconciler — disable manually in jobs.json"
+            fi
+        else
+            substep "Migration 136: canon-reconciler already disabled or absent — skipping"
+        fi
+
+        if ! uv run python3 -c "import json,sys; d=json.load(open('$_JOBS_FILE_135')); sys.exit(0 if 'canon-digest' in d.get('jobs',{}) else 1)" 2>/dev/null; then
+            substep "Migration 136: adding canon-digest to jobs.json"
+            local _m136b_tmp
+            _m136b_tmp=$(mktemp)
+            uv run python3 - <<'PY136B' "$_JOBS_FILE_135" "$_m136b_tmp"
+import json, sys
+from datetime import datetime, timezone
+jobs_path, tmp_path = sys.argv[1], sys.argv[2]
+with open(jobs_path) as f:
+    data = json.load(f)
+data.setdefault("jobs", {})["canon-digest"] = {
+    "name": "canon-digest",
+    "type": "B",
+    "dispatch": "cron-direct",
+    "schedule": "0 3 * * 0",
+    "schedule_human": "Weekly, Sundays at 03:00 UTC",
+    "task_file": None,
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+    "enabled": True,
+    "last_run": None,
+    "last_status": None,
+    "description": "Read-only weekly Telegram digest of data/artifact-registry.json + jobs.json diff — replaces canon-reconciler's Telegram summary. Performs no registry writes (lobster-meta/hygiene own those).",
+}
+with open(tmp_path, "w") as f:
+    json.dump(data, f, indent=2, default=str)
+print("OK")
+PY136B
+            if [ -s "$_m136b_tmp" ]; then
+                mv "$_m136b_tmp" "$_JOBS_FILE_135"
+                substep "Migration 136: canon-digest added to jobs.json"
+                migrated=$((migrated + 1))
+            else
+                rm -f "$_m136b_tmp"
+                warn "Migration 136: failed to add canon-digest to jobs.json — add manually"
+            fi
+        else
+            substep "Migration 136: canon-digest already in jobs.json — skipping"
+        fi
+    fi
+
+    local CANON_DIGEST_MARKER="# LOBSTER-CANON-DIGEST"
+    local CANON_DIGEST_SCRIPT="$LOBSTER_DIR/scheduled-tasks/canon-digest.py"
+    if [ -f "$CANON_DIGEST_SCRIPT" ]; then
+        if ! crontab -l 2>/dev/null | grep -qF "$CANON_DIGEST_MARKER"; then
+            local CANON_DIGEST_ENTRY="0 3 * * 0 cd $LOBSTER_DIR && uv run scheduled-tasks/canon-digest.py >> $WORKSPACE_DIR/scheduled-jobs/logs/canon-digest.log 2>&1 $CANON_DIGEST_MARKER"
+            (crontab -l 2>/dev/null; echo "$CANON_DIGEST_ENTRY") | crontab - && {
+                substep "Migration 136: added LOBSTER-CANON-DIGEST cron entry (weekly, Sundays 03:00 UTC)"
+                migrated=$((migrated + 1))
+            } || warn "Could not add LOBSTER-CANON-DIGEST cron entry — add manually"
+        else
+            substep "Migration 136: LOBSTER-CANON-DIGEST cron entry already present — skipping"
+        fi
+    else
+        warn "canon-digest.py not found at $CANON_DIGEST_SCRIPT — skipping Migration 136 cron entry"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
