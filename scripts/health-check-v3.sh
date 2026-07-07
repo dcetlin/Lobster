@@ -37,6 +37,15 @@
 #   suppression logic. The dispatcher no longer needs to call
 #   record-catchup-state.sh to suppress false alarms. See issue #1483.
 #
+#   WFM-active suppression: while the dispatcher blocks in wait_for_messages on
+#   an idle inbox, the WFM daemon thread refreshes DISPATCHER_WFM_ACTIVE_FILE
+#   every 60s. A fresh WFM-active file (< 180s) suppresses the heartbeat-stale RED.
+#   CRITICAL (issue #2074): suppression is time-bounded at WFM_SUPPRESSION_MAX_SECONDS
+#   (2700s). A frozen dispatcher's daemon thread keeps refreshing WFM-active
+#   independently of the asyncio loop — unbounded suppression recreates the
+#   false-negative that caused the May 2026 2-day outage. After 2700s of heartbeat
+#   staleness, RED fires regardless of WFM-active freshness.
+#
 # Boot grace period:
 #   After any restart (health-check-initiated or manual), the new Claude session
 #   needs ~60-90s to initialize and begin draining the inbox. During this window
@@ -133,6 +142,22 @@ DISPATCHER_SESSION_START_FILE="${LOBSTER_DISPATCHER_SESSION_START_FILE_OVERRIDE:
 # File is deleted by the MCP server when WFM returns (message arrived or timeout).
 DISPATCHER_WFM_ACTIVE_FILE="${LOBSTER_WFM_ACTIVE_OVERRIDE:-$WORKSPACE_DIR/logs/dispatcher-wfm-active}"
 WFM_ACTIVE_STALE_SECONDS=180   # 3x WAIT_HEARTBEAT_INTERVAL (60s) — absorbs one missed tick
+#
+# CRITICAL TIME CAP (issue #2074): A frozen dispatcher's WFM daemon thread
+# continues to refresh DISPATCHER_WFM_ACTIVE_FILE every 60s independently of the
+# main asyncio event loop — so WFM-active freshness alone is NOT sufficient proof
+# of liveness. The suppression is therefore time-bounded:
+#
+#   If the dispatcher heartbeat has been stale for > WFM_SUPPRESSION_MAX_SECONDS,
+#   the WFM-active freshness check is ignored and RED fires regardless.
+#
+# Rationale: the heartbeat goes stale when the dispatcher enters WFM (the last
+# PostToolUse fires just before wait_for_messages is called). So heartbeat stale
+# age ≈ time spent in WFM. After WFM_SUPPRESSION_MAX_SECONDS the system has been
+# idle long enough that (a) the watchdog has already fired if WFM was frozen, and
+# (b) the session age limit (SESSION_AGE_LIMIT_SECONDS = 7200s) will soon force a
+# graceful restart. This constant must be less than SESSION_AGE_LIMIT_SECONDS.
+WFM_SUPPRESSION_MAX_SECONDS=2700   # 45 min: stop suppressing beyond this heartbeat-stale age
 
 OUTBOX_DIR="$MESSAGES_DIR/outbox"
 OUTBOX_STALE_THRESHOLD_SECONDS=900   # 15 min = RED
@@ -1134,7 +1159,18 @@ check_dispatcher_heartbeat() {
         if [[ -n "$wfm_active_ts" ]] && [[ "$wfm_active_ts" =~ ^[0-9]+$ ]]; then
             local wfm_age=$(( now - wfm_active_ts ))
             if [[ $wfm_age -le $WFM_ACTIVE_STALE_SECONDS ]]; then
-                log_info "Dispatcher heartbeat stale (${age}s) but WFM-active is fresh (${wfm_age}s) — dispatcher alive in wait_for_messages, skipping RED"
+                # WFM-active is fresh: the daemon thread is alive and updating.
+                # Normally this means the dispatcher is idle in WFM — suppress RED.
+                # BUT: check the time-cap first (issue #2074). A frozen dispatcher's
+                # daemon thread continues refreshing WFM-active independently of the
+                # asyncio loop. If the heartbeat has been stale for longer than
+                # WFM_SUPPRESSION_MAX_SECONDS, the system has been unresponsive long
+                # enough that we must escalate regardless of daemon thread activity.
+                if [[ $age -ge $WFM_SUPPRESSION_MAX_SECONDS ]]; then
+                    log_error "RED: dispatcher heartbeat stale (${age}s >= ${WFM_SUPPRESSION_MAX_SECONDS}s cap) — WFM-active is fresh (daemon thread alive) but suppression window expired; frozen dispatcher suspected (issue #2074)"
+                    return 2
+                fi
+                log_info "Dispatcher heartbeat stale (${age}s) but WFM-active is fresh (${wfm_age}s) and within suppression window (${WFM_SUPPRESSION_MAX_SECONDS}s) — dispatcher alive in wait_for_messages, skipping RED"
                 return 0
             else
                 log_error "RED: dispatcher heartbeat stale (${age}s) and WFM-active also stale (${wfm_age}s, threshold: ${WFM_ACTIVE_STALE_SECONDS}s) — dispatcher appears frozen"
@@ -1740,6 +1776,9 @@ check_session_age() {
         # No Telegram alert: proactive session rotation is designed behavior that
         # fires every ~2h. The log entry above is sufficient internal evidence.
         # Alert was removed because it never correlated with an actionable condition.
+        # (Divergence note: upstream/main re-added this alert gated behind
+        # LOBSTER_DEBUG=true in 9555d4c1 — intentionally not reincorporated here
+        # since our fork already deleted it outright as noise; see PR #2093.)
         # Delete the start timestamp so a subsequent health check run (within the
         # next 4 minutes) does not send a second SIGTERM before the restart completes.
         rm -f "$DISPATCHER_SESSION_START_FILE" 2>/dev/null || true
