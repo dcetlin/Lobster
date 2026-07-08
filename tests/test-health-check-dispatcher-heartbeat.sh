@@ -22,12 +22,22 @@
 #   13. Stale heartbeat + WFM-active absent → RED (no suppression)
 #   14. Stale heartbeat + WFM-active tombstone ("exited") → RED (WFM returned normally)
 #   15. Stale heartbeat + WFM-active fresh + heartbeat well inside cap → GREEN
+#   16. REGRESSION (2026-07 recalibration): heartbeat stale at the OLD 2700s/45min
+#       cap value + WFM-active fresh → GREEN. Under the pre-fix cap this incorrectly
+#       fired RED on ordinary idle periods (the "restart storm" in issue #1472).
+#       This test locks in that the false-positive path is actually closed, not
+#       just relabeled.
 #
-# Key behavioral assertion (issue #2074): WFM-active suppression is time-bounded.
-# A frozen dispatcher's WFM daemon thread continues refreshing the WFM-active file
-# every 60s independently of the main asyncio loop. File freshness alone does NOT
-# prove the dispatcher is responsive. After WFM_SUPPRESSION_MAX_SECONDS (2700s)
-# of heartbeat staleness, RED fires regardless of WFM-active freshness.
+# Key behavioral assertion (issue #2074, recalibrated 2026-07): WFM-active
+# suppression is time-bounded, but the bound is derived from
+# SESSION_AGE_LIMIT_SECONDS (with a safety margin) rather than a fixed 45-minute
+# value. A fixed 2700s cap fired on ordinary idle periods because a session can
+# enter an idle WFM wait at any point in its lifetime, not just right after a
+# restart — see scripts/health-check-v3.sh for the full rationale. A frozen
+# dispatcher's WFM daemon thread continues refreshing the WFM-active file every
+# 60s independently of the main asyncio loop, so file freshness alone does NOT
+# prove the dispatcher is responsive. After WFM_SUPPRESSION_MAX_SECONDS of
+# heartbeat staleness, RED fires regardless of WFM-active freshness.
 #
 # Usage: bash tests/test-health-check-dispatcher-heartbeat.sh
 #===============================================================================
@@ -73,7 +83,14 @@ DISPATCHER_HEARTBEAT_STALE_SECONDS=1800
 # script's DISPATCHER_HEARTBEAT_STALE_SECONDS to 1800 in #1431, temporary buffer.)
 DISPATCHER_WFM_ACTIVE_FILE="$TEST_LOG_DIR/dispatcher-wfm-active-ABSENT"
 WFM_ACTIVE_STALE_SECONDS=180
-WFM_SUPPRESSION_MAX_SECONDS=2700
+# Mirror the real script's derivation (recalibrated 2026-07): the cap is
+# SESSION_AGE_LIMIT_SECONDS minus a safety margin, not a fixed 45-minute value.
+SESSION_AGE_LIMIT_SECONDS=7200
+WFM_SUPPRESSION_MARGIN_SECONDS=300
+WFM_SUPPRESSION_MAX_SECONDS=$(( SESSION_AGE_LIMIT_SECONDS - WFM_SUPPRESSION_MARGIN_SECONDS ))
+# The pre-fix cap value (issue #1472's "restart storm" fired at this age on
+# ordinary idle periods). Used by the regression test below.
+OLD_FIXED_CAP_SECONDS=2700
 
 log()       { echo "[$1] $2" >> "$LOG_FILE" 2>/dev/null; }
 log_info()  { log INFO "$1"; }
@@ -220,12 +237,12 @@ assert_exit "$rc" 2
 # -------------------------------------------------------------------
 # Test 11: Stale heartbeat + WFM-active fresh + heartbeat beyond cap → RED
 # This is the May 2026 frozen-dispatcher scenario: the daemon thread keeps
-# WFM-active fresh, but the dispatcher has been unresponsive for 3600s.
-# The suppression cap (2700s) has expired → RED must fire.
+# WFM-active fresh, but the dispatcher has been unresponsive well beyond the
+# suppression cap → RED must fire.
 # -------------------------------------------------------------------
-begin_test "Stale hb (3600s, beyond cap) + WFM-active fresh → RED (frozen dispatcher)"
+begin_test "Stale hb (beyond cap=${WFM_SUPPRESSION_MAX_SECONDS}s) + WFM-active fresh → RED (frozen dispatcher)"
 write_wfm_active 5
-run_check_with_wfm 3600 && rc=$? || rc=$?
+run_check_with_wfm $(( WFM_SUPPRESSION_MAX_SECONDS + 900 )) && rc=$? || rc=$?
 remove_wfm_active
 assert_exit "$rc" 2
 
@@ -269,6 +286,24 @@ assert_exit "$rc" 2
 begin_test "Stale hb (2500s) + WFM-active fresh + well inside cap → GREEN"
 write_wfm_active 5
 run_check_with_wfm $(( WFM_SUPPRESSION_MAX_SECONDS - 200 )) && rc=$? || rc=$?
+remove_wfm_active
+assert_exit "$rc" 0
+
+# -------------------------------------------------------------------
+# Test 16: REGRESSION — heartbeat stale at the OLD fixed 2700s (45min) cap
+# value + WFM-active fresh → GREEN.
+#
+# This is the exact false-positive that caused the "restart storm" in issue
+# #1472: a healthy dispatcher idling in wait_for_messages, stale for 45
+# minutes, was force-killed every ~45 min because the old cap was a fixed
+# 2700s regardless of how much of the session's natural 2h lifetime remained.
+# With the cap now derived from SESSION_AGE_LIMIT_SECONDS, this heartbeat age
+# must be GREEN (suppressed) — proving the false-positive path is actually
+# closed, not just relabeled.
+# -------------------------------------------------------------------
+begin_test "Stale hb (${OLD_FIXED_CAP_SECONDS}s, the old 45min cap) + WFM-active fresh → GREEN (regression, issue #1472)"
+write_wfm_active 5
+run_check_with_wfm "$OLD_FIXED_CAP_SECONDS" && rc=$? || rc=$?
 remove_wfm_active
 assert_exit "$rc" 0
 

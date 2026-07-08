@@ -41,10 +41,13 @@
 #   an idle inbox, the WFM daemon thread refreshes DISPATCHER_WFM_ACTIVE_FILE
 #   every 60s. A fresh WFM-active file (< 180s) suppresses the heartbeat-stale RED.
 #   CRITICAL (issue #2074): suppression is time-bounded at WFM_SUPPRESSION_MAX_SECONDS
-#   (2700s). A frozen dispatcher's daemon thread keeps refreshing WFM-active
-#   independently of the asyncio loop — unbounded suppression recreates the
-#   false-negative that caused the May 2026 2-day outage. After 2700s of heartbeat
-#   staleness, RED fires regardless of WFM-active freshness.
+#   (SESSION_AGE_LIMIT_SECONDS - 300s, i.e. just under the 2h graceful-restart
+#   window — recalibrated 2026-07 after the original fixed 2700s/45min value was
+#   found to fire on ordinary idle periods, see below). A frozen dispatcher's
+#   daemon thread keeps refreshing WFM-active independently of the asyncio loop —
+#   unbounded suppression recreates the false-negative that caused the May 2026
+#   2-day outage. After WFM_SUPPRESSION_MAX_SECONDS of heartbeat staleness, RED
+#   fires regardless of WFM-active freshness.
 #
 # Boot grace period:
 #   After any restart (health-check-initiated or manual), the new Claude session
@@ -143,21 +146,37 @@ DISPATCHER_SESSION_START_FILE="${LOBSTER_DISPATCHER_SESSION_START_FILE_OVERRIDE:
 DISPATCHER_WFM_ACTIVE_FILE="${LOBSTER_WFM_ACTIVE_OVERRIDE:-$WORKSPACE_DIR/logs/dispatcher-wfm-active}"
 WFM_ACTIVE_STALE_SECONDS=180   # 3x WAIT_HEARTBEAT_INTERVAL (60s) — absorbs one missed tick
 #
-# CRITICAL TIME CAP (issue #2074): A frozen dispatcher's WFM daemon thread
-# continues to refresh DISPATCHER_WFM_ACTIVE_FILE every 60s independently of the
-# main asyncio event loop — so WFM-active freshness alone is NOT sufficient proof
-# of liveness. The suppression is therefore time-bounded:
+# CRITICAL TIME CAP (issue #2074, recalibrated 2026-07): A frozen dispatcher's
+# WFM daemon thread continues to refresh DISPATCHER_WFM_ACTIVE_FILE every 60s
+# independently of the main asyncio event loop — so WFM-active freshness alone
+# is NOT sufficient proof of liveness. The suppression is therefore time-bounded:
 #
 #   If the dispatcher heartbeat has been stale for > WFM_SUPPRESSION_MAX_SECONDS,
 #   the WFM-active freshness check is ignored and RED fires regardless.
 #
-# Rationale: the heartbeat goes stale when the dispatcher enters WFM (the last
-# PostToolUse fires just before wait_for_messages is called). So heartbeat stale
-# age ≈ time spent in WFM. After WFM_SUPPRESSION_MAX_SECONDS the system has been
-# idle long enough that (a) the watchdog has already fired if WFM was frozen, and
-# (b) the session age limit (SESSION_AGE_LIMIT_SECONDS = 7200s) will soon force a
-# graceful restart. This constant must be less than SESSION_AGE_LIMIT_SECONDS.
-WFM_SUPPRESSION_MAX_SECONDS=2700   # 45 min: stop suppressing beyond this heartbeat-stale age
+# PR #2090 set this to 2700s (45 min) on the assumption that "heartbeat stale
+# age ≈ time spent in WFM" — i.e. that the dispatcher always enters WFM right
+# after a graceful SESSION_AGE_LIMIT_SECONDS restart, so the natural restart
+# would arrive shortly after the cap. That assumption is false: the dispatcher
+# can (and normally does) enter an idle WFM wait at ANY point in its session
+# lifetime — e.g. seconds after a fresh restart — and wait_for_messages is
+# explicitly designed to block for up to 20h with no traffic. When idle begins
+# early in a session, 2700s of heartbeat staleness arrives up to ~75 minutes
+# before the session would naturally restart, so this fired on every ordinary
+# quiet period (observed: ~every 45 min, 16 forced restarts in one day, 3x the
+# rate of the by-design 2h rotation — see issue #1472's "restart storm" finding).
+#
+# Fix: bound the cap just under SESSION_AGE_LIMIT_SECONDS instead of a fixed
+# 45-minute value. This preserves the original invariant ("this constant must
+# be less than SESSION_AGE_LIMIT_SECONDS") but means a *legitimately* idle
+# session — whose total heartbeat-stale time can never exceed roughly one
+# session lifetime — is caught by the graceful SESSION_AGE_LIMIT restart before
+# this cap can fire. The cap now only fires for a session that has been
+# heartbeat-stale for nearly its entire lifetime AND fails to be reaped by the
+# graceful restart (e.g. because the process is too frozen to act on SIGTERM),
+# which is the actual frozen-dispatcher scenario this mechanism exists to catch.
+WFM_SUPPRESSION_MARGIN_SECONDS="${LOBSTER_WFM_SUPPRESSION_MARGIN_SECONDS:-300}"
+WFM_SUPPRESSION_MAX_SECONDS="${LOBSTER_WFM_SUPPRESSION_MAX_SECONDS:-$(( SESSION_AGE_LIMIT_SECONDS - WFM_SUPPRESSION_MARGIN_SECONDS ))}"
 
 OUTBOX_DIR="$MESSAGES_DIR/outbox"
 OUTBOX_STALE_THRESHOLD_SECONDS=900   # 15 min = RED
