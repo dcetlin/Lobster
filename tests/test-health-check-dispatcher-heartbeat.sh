@@ -28,6 +28,20 @@
 #       This test locks in that the false-positive path is actually closed, not
 #       just relabeled.
 #
+# Ordering-guard tests (oracle PR #1473 Rounds 1-2):
+#   17. Idle-since-start at the cap boundary → GREEN (ordering guard)
+#   18. Idle-since-start 1s before SESSION_AGE_LIMIT_SECONDS → GREEN
+#   19. ENFORCED INVARIANT: RED cannot fire anywhere in the gap window
+#       (idle-since-start), sampled at several points
+#   20. Frozen dispatcher, no session-start file, hb well beyond cap → RED
+#       (guard does not mask a genuine freeze)
+#   21. TWO-TICK REGRESSION (Round 2): tick1 (session-start present, age at
+#       cap) → GREEN; tick2 (session-start absent, simulating
+#       check_session_age()'s unconditional file deletion after SIGTERM,
+#       regardless of whether the restart completed) → RED. Proves the
+#       suppression is self-terminating and a genuinely frozen dispatcher is
+#       still caught on the following health-check tick.
+#
 # Key behavioral assertion (issue #2074, recalibrated 2026-07): WFM-active
 # suppression is time-bounded, but the bound is derived from
 # SESSION_AGE_LIMIT_SECONDS (with a safety margin) rather than a fixed 45-minute
@@ -456,6 +470,55 @@ run_check_with_wfm_and_session $(( WFM_SUPPRESSION_MAX_SECONDS + 900 )) "" && rc
 remove_wfm_active
 remove_session_start
 assert_exit "$rc" 2
+
+# -------------------------------------------------------------------
+# Test 21 (TWO-TICK REGRESSION, oracle PR #1473 Round 2): proves the
+# suppression is self-terminating rather than relying on the graceful
+# restart actually completing.
+#
+# The real safety net for a session that is genuinely frozen (not just
+# idle) since near its own start is NOT "SIGTERM delivery guarantees the
+# restart completes" — check_session_age() only confirms the dispatcher
+# PID is alive before sending SIGTERM, then UNCONDITIONALLY deletes
+# DISPATCHER_SESSION_START_FILE and exits, regardless of whether the
+# restart actually completes (see check_session_age() in
+# scripts/health-check-v3.sh). That unconditional deletion is what
+# re-enables the ordering guard's absent-file/no-suppress (RED-fires)
+# branch on the very next health-check cycle, even when the restart
+# silently failed.
+#
+# Tick 1: session-start file present, session_age at the cap → GREEN
+#         (ordering guard suppresses — the graceful restart is expected
+#         to act on this same or a prior tick).
+# Tick 2: session-start file now ABSENT — as it would be immediately
+#         after check_session_age() delivers SIGTERM and unconditionally
+#         removes the file, regardless of whether the restart actually
+#         completed — with heartbeat staleness held at the same age →
+#         RED fires.
+#
+# This is the two-tick sequence the Round 2 finding required a test for:
+# it proves suppression is bounded and self-terminating (does not depend
+# on confirming the restart succeeded), not that it "always" holds.
+# -------------------------------------------------------------------
+begin_test "Two-tick sequence: tick1 session-start present at cap → GREEN, tick2 session-start removed (simulating check_session_age's unconditional delete) → RED"
+write_wfm_active 5
+two_tick_probe_age="$WFM_SUPPRESSION_MAX_SECONDS"
+
+# Tick 1: session-start file present, session_age == cap → suppressed (GREEN).
+run_check_with_wfm_and_session "$two_tick_probe_age" "$two_tick_probe_age" && tick1_rc=$? || tick1_rc=$?
+
+# Tick 2: simulate check_session_age()'s side effect — the start-timestamp
+# file has been unconditionally removed after SIGTERM delivery, whether or
+# not the restart actually completed. Heartbeat staleness is unchanged.
+run_check_with_wfm_and_session "$two_tick_probe_age" "" && tick2_rc=$? || tick2_rc=$?
+
+remove_wfm_active
+remove_session_start
+if [[ "$tick1_rc" -eq 0 && "$tick2_rc" -eq 2 ]]; then
+    pass
+else
+    fail "expected tick1=0 (GREEN, suppressed) tick2=2 (RED, fires), got tick1=$tick1_rc tick2=$tick2_rc"
+fi
 
 # -------------------------------------------------------------------
 # Summary

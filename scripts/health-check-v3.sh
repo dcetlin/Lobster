@@ -166,7 +166,7 @@ WFM_ACTIVE_STALE_SECONDS=180   # 3x WAIT_HEARTBEAT_INTERVAL (60s) — absorbs on
 # quiet period (observed: ~every 45 min, 16 forced restarts in one day, 3x the
 # rate of the by-design 2h rotation — see issue #1472's "restart storm" finding).
 #
-# Fix (two parts, oracle PR #1473 Round 1): bounding the cap just under
+# Fix (two parts, oracle PR #1473 Round 1 & 2): bounding the cap just under
 # SESSION_AGE_LIMIT_SECONDS instead of a fixed 45-minute value cuts the
 # false-positive *frequency* dramatically (once per idle-from-start session at
 # ~115 min, instead of every ~45 min) — but the margin by itself does not
@@ -176,15 +176,26 @@ WFM_ACTIVE_STALE_SECONDS=180   # 3x WAIT_HEARTBEAT_INTERVAL (60s) — absorbs on
 # fires) gets a chance to act. The second part — an explicit ordering guard in
 # check_dispatcher_heartbeat() that re-derives session_age and suppresses this
 # RED whenever session_age is already at/past WFM_SUPPRESSION_MAX_SECONDS — is
-# what actually closes that specific race, cadence-independently, for the
-# idle-since-start case (see the ordering-guard block below and
+# what closes that specific race for the idle-since-start case (see the
+# ordering-guard block below and
 # tests/test-health-check-dispatcher-heartbeat.sh for the enforced invariant).
-# The cap can still fire for a session whose DISPATCHER_SESSION_START_FILE is
-# absent (e.g. an earlier graceful SIGTERM attempt already cleared it but the
-# process didn't actually die) — that residual case, where no independent
-# liveness signal exists to distinguish "idle" from "frozen," is the structural
-# risk named in the PR's "Root-cause answer" section and is intentionally not
-# claimed to be closed here.
+#
+# What actually bounds detection for a session that is genuinely frozen (not
+# just idle) since near its own start is NOT "the graceful restart is
+# guaranteed regardless of cron cadence" (Round 2 found this claim false — a
+# frozen dispatcher may never act on a delivered SIGTERM). It is that
+# check_session_age() unconditionally deletes DISPATCHER_SESSION_START_FILE
+# the moment it sends SIGTERM, regardless of whether the restart actually
+# completes, which re-enables the ordering guard's own absent-file/no-suppress
+# branch (RED fires) on the very next health-check cycle even if the restart
+# silently failed. So detection for a frozen-since-start dispatcher is bounded
+# to roughly SESSION_AGE_LIMIT_SECONDS + one cron interval — not eliminated,
+# not instantaneous, but not unboundedly suppressed either. The cap can still
+# fire for a session whose DISPATCHER_SESSION_START_FILE is absent for other
+# reasons — that residual case, where no independent liveness signal exists to
+# distinguish "idle" from "frozen," is the structural risk named in the PR's
+# "Root-cause answer" section and is intentionally not claimed to be fully
+# closed here.
 WFM_SUPPRESSION_MARGIN_SECONDS="${LOBSTER_WFM_SUPPRESSION_MARGIN_SECONDS:-300}"
 WFM_SUPPRESSION_MAX_SECONDS="${LOBSTER_WFM_SUPPRESSION_MAX_SECONDS:-$(( SESSION_AGE_LIMIT_SECONDS - WFM_SUPPRESSION_MARGIN_SECONDS ))}"
 
@@ -1208,21 +1219,36 @@ check_dispatcher_heartbeat() {
                     #
                     # Fix: re-derive session_age directly from
                     # DISPATCHER_SESSION_START_FILE and, whenever it is already at or
-                    # past WFM_SUPPRESSION_MAX_SECONDS, suppress this RED — the
-                    # graceful SESSION_AGE_LIMIT_SECONDS restart is guaranteed to fire
-                    # within WFM_SUPPRESSION_MARGIN_SECONDS more seconds regardless of
-                    # cron cadence (it does not depend on the heartbeat at all, only
-                    # on the dispatcher PID being alive), so escalating here would
-                    # only race a restart that is already coming. This is provably
-                    # cadence-independent: it does not rely on the cron interval being
-                    # smaller than the margin, unlike a margin-only recalibration.
+                    # past WFM_SUPPRESSION_MAX_SECONDS, suppress this RED — a session
+                    # that is at/past this age has either already had check_session_age()
+                    # act on it, or will on this same run (check_session_age() runs
+                    # earlier in main() and, when session_age >= SESSION_AGE_LIMIT_SECONDS,
+                    # sends SIGTERM and exits the script before this check ever runs).
+                    #
+                    # The real safety net here is NOT "SIGTERM delivery implies the
+                    # restart completes" (oracle PR #1473 Round 2: that claim is false —
+                    # a genuinely frozen dispatcher, e.g. an asyncio-loop deadlock, may
+                    # never actually act on a delivered SIGTERM). The actual mechanism is
+                    # that check_session_age() unconditionally deletes
+                    # DISPATCHER_SESSION_START_FILE the instant it sends SIGTERM,
+                    # regardless of whether the restart actually completes. That deletion
+                    # re-enables the "absent file" branch below (session_age unknown →
+                    # RED, no suppression) on the very next health-check cycle, even if
+                    # the SIGTERM silently failed to produce a restart. So a
+                    # frozen-since-start dispatcher is still caught — just delayed by at
+                    # most one cron interval past SESSION_AGE_LIMIT_SECONDS, not
+                    # indefinitely suppressed. That is a bounded, not guaranteed-instant,
+                    # detection delay — do not restate this as "provably cadence-
+                    # independent" or "guaranteed regardless of cron cadence": the
+                    # guarantee is bounded-delay-via-file-deletion, not PID-liveness.
                     #
                     # If DISPATCHER_SESSION_START_FILE is absent or malformed, treat
                     # session_age as unknown and fall through to RED unchanged — this
                     # preserves detection for a session whose start-timestamp file was
                     # already cleared by an earlier (possibly ineffective) graceful
-                    # SIGTERM attempt, which is the genuine frozen-dispatcher case this
-                    # cap exists to catch.
+                    # SIGTERM attempt (see check_session_age()'s unconditional `rm -f`),
+                    # which is the genuine frozen-dispatcher case this cap exists to
+                    # catch, and is exactly the mechanism this comment describes above.
                     local ordering_guard_session_age=""
                     if [[ -f "$DISPATCHER_SESSION_START_FILE" ]]; then
                         local ordering_guard_session_start
