@@ -980,3 +980,150 @@ def test_cleanup_stale_marks_end_turn_as_completed_not_dead(isolated_db, tmp_pat
     assert result["status"] == "completed", (
         f"Expected 'completed' for end_turn agent but got {result['status']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test: dispatcher-type sessions excluded from dead-session sweeps (issue #1472)
+#
+# The dispatcher registers its own long-running session via
+# session_start(agent_type="dispatcher", ...) with no output_file and no
+# timeout_minutes. Before this fix, cleanup_stale_running_sessions()'s
+# fallback elapsed-time heuristic (limit_minutes defaults to 120) and
+# get_unnotified_completed() had no agent_type guard, so a routine ~2h
+# graceful session-age restart could tip the dispatcher's own row past the
+# fallback limit, get it marked 'dead', and immediately surface it as a
+# "task(s) disappeared (no output)" false alarm in the startup sweep.
+# get_active_sessions() already carried this guard (from #781/#782); these
+# tests lock in that the other two query sites now match.
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_stale_running_excludes_dispatcher_session(isolated_db):
+    """A dispatcher-type session past the fallback elapsed-time limit is left alone."""
+    db = isolated_db
+
+    old_spawned_at = (datetime.now(timezone.utc) - timedelta(minutes=200)).isoformat()
+    session_store._get_connection(db).execute(
+        """
+        INSERT INTO agent_sessions
+            (id, agent_type, description, chat_id, source, status, spawned_at)
+        VALUES ('lobster-dispatcher', 'dispatcher', 'Lobster dispatcher main loop',
+                '0', 'system', 'running', ?)
+        """,
+        (old_spawned_at,),
+    )
+    session_store._get_connection(db).commit()
+
+    server_start = datetime.now(timezone.utc)
+    changed = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    assert "lobster-dispatcher" not in changed, (
+        "dispatcher session must be excluded from the fallback elapsed-time sweep"
+    )
+    result = session_store.find_session("lobster-dispatcher", path=db)
+    assert result["status"] == "running"
+
+
+def test_cleanup_stale_running_excludes_hook_session(isolated_db):
+    """A hook-type session past the fallback elapsed-time limit is also left alone."""
+    db = isolated_db
+
+    old_spawned_at = (datetime.now(timezone.utc) - timedelta(minutes=200)).isoformat()
+    session_store._get_connection(db).execute(
+        """
+        INSERT INTO agent_sessions
+            (id, agent_type, description, chat_id, source, status, spawned_at)
+        VALUES ('some-hook-session', 'hook', 'A hook session', '0', 'system', 'running', ?)
+        """,
+        (old_spawned_at,),
+    )
+    session_store._get_connection(db).commit()
+
+    server_start = datetime.now(timezone.utc)
+    changed = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    assert "some-hook-session" not in changed
+
+
+def test_cleanup_stale_running_still_reaps_real_subagent(isolated_db):
+    """A non-dispatcher agent_type past the fallback limit is still marked dead.
+
+    Confirms the new guard is scoped to 'dispatcher'/'hook' and does not
+    disable the fallback heuristic generally.
+    """
+    db = isolated_db
+
+    old_spawned_at = (datetime.now(timezone.utc) - timedelta(minutes=200)).isoformat()
+    session_store._get_connection(db).execute(
+        """
+        INSERT INTO agent_sessions
+            (id, agent_type, description, chat_id, source, status, spawned_at, timeout_minutes)
+        VALUES ('real-subagent', 'functional-engineer', 'Fix something', '123',
+                'telegram', 'running', ?, 60)
+        """,
+        (old_spawned_at,),
+    )
+    session_store._get_connection(db).commit()
+
+    server_start = datetime.now(timezone.utc)
+    changed = session_store.cleanup_stale_running_sessions(server_start, path=db)
+
+    assert "real-subagent" in changed
+    result = session_store.find_session("real-subagent", path=db)
+    assert result["status"] == "dead"
+
+
+def test_get_unnotified_completed_excludes_dead_dispatcher_session(isolated_db):
+    """A dead dispatcher-type session is not returned for re-notification.
+
+    Without this guard, a dispatcher row marked 'dead' by the fallback
+    heuristic would be picked up here and folded into the startup sweep
+    summary as a "disappeared" notification on the very next MCP server
+    startup — the second half of the issue #1472 false-alarm chain.
+    """
+    db = isolated_db
+    conn = session_store._get_connection(db)
+
+    now = datetime.now(timezone.utc)
+    conn.execute(
+        """
+        INSERT INTO agent_sessions
+            (id, agent_type, description, chat_id, source, status,
+             spawned_at, completed_at, notified_at)
+        VALUES ('lobster-dispatcher', 'dispatcher', 'Lobster dispatcher main loop',
+                '0', 'system', 'dead', ?, ?, NULL)
+        """,
+        (now.isoformat(), now.isoformat()),
+    )
+    conn.commit()
+
+    unnotified = session_store.get_unnotified_completed(path=db)
+
+    assert all(s["id"] != "lobster-dispatcher" for s in unnotified), (
+        "dead dispatcher session must not be surfaced for re-notification"
+    )
+
+
+def test_get_unnotified_completed_still_returns_real_subagent(isolated_db):
+    """A dead real-subagent session is still returned for re-notification."""
+    db = isolated_db
+    conn = session_store._get_connection(db)
+
+    now = datetime.now(timezone.utc)
+    conn.execute(
+        """
+        INSERT INTO agent_sessions
+            (id, agent_type, description, chat_id, source, status,
+             spawned_at, completed_at, notified_at)
+        VALUES ('real-subagent', 'functional-engineer', 'Fix something', '123',
+                'telegram', 'dead', ?, ?, NULL)
+        """,
+        (now.isoformat(), now.isoformat()),
+    )
+    conn.commit()
+
+    unnotified = session_store.get_unnotified_completed(path=db)
+
+    assert any(s["id"] == "real-subagent" for s in unnotified), (
+        "real subagent dead sessions must still be surfaced for re-notification"
+    )

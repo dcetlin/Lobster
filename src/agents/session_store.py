@@ -506,6 +506,15 @@ def cleanup_stale_running_sessions(
     4. ``output_file`` absent, elapsed > timeout → dead (fallback heuristic)
     5. ``output_file`` absent, elapsed ≤ timeout → leave running
 
+    Rows with ``agent_type`` in ('dispatcher', 'hook') are excluded entirely
+    (issue #1472). The dispatcher registers its own long-running session with
+    no ``output_file`` and no ``timeout_minutes``, so rule 4's fallback
+    elapsed-time heuristic (default limit 120 minutes) would otherwise mark
+    the dispatcher's own row dead shortly after the routine ~2h graceful
+    session-age restart on every MCP server startup — the same guard already
+    applied in ``get_active_sessions()`` and the reconciler's dead-session
+    sweep in ``inbox_server.py``.
+
     Args:
         server_start_time: UTC datetime when the current server process started
                            (kept for logging; no longer used for mtime comparison).
@@ -522,6 +531,7 @@ def cleanup_stale_running_sessions(
         SELECT id, output_file, spawned_at, timeout_minutes
         FROM agent_sessions
         WHERE status IN ('running', 'starting')
+          AND (agent_type IS NULL OR agent_type NOT IN ('dispatcher', 'hook'))
         """
     )
     rows = cursor.fetchall()
@@ -687,6 +697,14 @@ def get_unnotified_completed(
     Used by the startup sweep to re-send notifications that were enqueued but
     not delivered before a crash or restart.
 
+    Rows with ``agent_type`` in ('dispatcher', 'hook') are excluded (issue
+    #1472). Without this guard, a dispatcher row marked 'dead' by
+    ``cleanup_stale_running_sessions()``'s fallback heuristic would immediately
+    be picked up here and folded into the startup sweep summary as a
+    "task(s) disappeared (no output)" notification — a false alarm on every
+    routine graceful restart whose timing happened to tip the dispatcher's own
+    session row past the fallback elapsed-time limit.
+
     Args:
         since_hours: Only return sessions completed within this many hours.
                      Prevents re-notifying ancient sessions on a fresh install.
@@ -708,6 +726,7 @@ def get_unnotified_completed(
         WHERE status IN ('completed', 'dead')
           AND notified_at IS NULL
           AND completed_at >= ?
+          AND (agent_type IS NULL OR agent_type NOT IN ('dispatcher', 'hook'))
         ORDER BY completed_at ASC
         """,
         (cutoff_str,),
