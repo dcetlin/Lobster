@@ -83,11 +83,29 @@ DISPATCHER_HEARTBEAT_STALE_SECONDS=1800
 # script's DISPATCHER_HEARTBEAT_STALE_SECONDS to 1800 in #1431, temporary buffer.)
 DISPATCHER_WFM_ACTIVE_FILE="$TEST_LOG_DIR/dispatcher-wfm-active-ABSENT"
 WFM_ACTIVE_STALE_SECONDS=180
-# Mirror the real script's derivation (recalibrated 2026-07): the cap is
-# SESSION_AGE_LIMIT_SECONDS minus a safety margin, not a fixed 45-minute value.
-SESSION_AGE_LIMIT_SECONDS=7200
-WFM_SUPPRESSION_MARGIN_SECONDS=300
-WFM_SUPPRESSION_MAX_SECONDS=$(( SESSION_AGE_LIMIT_SECONDS - WFM_SUPPRESSION_MARGIN_SECONDS ))
+# Default to a path that does not exist, so tests 1-16 (which never write to
+# it) exercise the "session_age unknown" fallback in the ordering guard added
+# for issue #1473 Round 1 — i.e. behave exactly as they did before that guard
+# existed. Tests 17-20 below point this at a real file to exercise the guard.
+DISPATCHER_SESSION_START_FILE="$TEST_TMPDIR/dispatcher-session-start-ABSENT.ts"
+# Derive these directly from the production script rather than hand-copying
+# literals. A prior version of this test mirrored SESSION_AGE_LIMIT_SECONDS
+# and WFM_SUPPRESSION_MARGIN_SECONDS as hardcoded numbers here — the exact
+# "locally-declared mirror of a production constant" antipattern named in
+# oracle/learnings.md (2026-04-20, PR #800) and flagged again in PR #1473
+# Round 1 review for reintroducing it in bash. Extracting the assignment
+# lines verbatim means a future change to the production defaults cannot
+# silently desync this test from what actually ships — if health-check-v3.sh's
+# derivation changes, this test picks it up automatically instead of testing
+# a stale relationship.
+#
+# Unset the LOBSTER_* overrides first so this test always exercises the
+# checked-in defaults regardless of the host environment — a real deployment
+# (like the one these tests run on) may export LOBSTER_SESSION_AGE_LIMIT_SECONDS
+# for its own operational reasons, and a test whose pass/fail depends on
+# ambient env vars is not hermetic.
+unset LOBSTER_SESSION_AGE_LIMIT_SECONDS LOBSTER_WFM_SUPPRESSION_MARGIN_SECONDS LOBSTER_WFM_SUPPRESSION_MAX_SECONDS
+eval "$(grep -E '^(SESSION_AGE_LIMIT_SECONDS|WFM_SUPPRESSION_MARGIN_SECONDS|WFM_SUPPRESSION_MAX_SECONDS)=' "$HEALTH_SCRIPT")"
 # The pre-fix cap value (issue #1472's "restart storm" fired at this age on
 # ordinary idle periods). Used by the regression test below.
 OLD_FIXED_CAP_SECONDS=2700
@@ -297,15 +315,147 @@ assert_exit "$rc" 0
 # #1472: a healthy dispatcher idling in wait_for_messages, stale for 45
 # minutes, was force-killed every ~45 min because the old cap was a fixed
 # 2700s regardless of how much of the session's natural 2h lifetime remained.
-# With the cap now derived from SESSION_AGE_LIMIT_SECONDS, this heartbeat age
-# must be GREEN (suppressed) — proving the false-positive path is actually
-# closed, not just relabeled.
+# With the cap now derived from SESSION_AGE_LIMIT_SECONDS, this specific
+# heartbeat age must be GREEN (suppressed). This test alone only proves the
+# one historical value is now suppressed, not that the false-positive *class*
+# is closed for every session_age in the gap window — that stronger, enforced
+# claim is proven by the ordering-guard invariant test below (issue #1473
+# Round 1), not by this regression test in isolation.
 # -------------------------------------------------------------------
 begin_test "Stale hb (${OLD_FIXED_CAP_SECONDS}s, the old 45min cap) + WFM-active fresh → GREEN (regression, issue #1472)"
 write_wfm_active 5
 run_check_with_wfm "$OLD_FIXED_CAP_SECONDS" && rc=$? || rc=$?
 remove_wfm_active
 assert_exit "$rc" 0
+
+# ===================================================================
+# Ordering-guard tests (issue #1473 Round 1)
+#
+# Oracle Round 1 found that WFM_SUPPRESSION_MARGIN_SECONDS alone does not
+# prove the graceful SESSION_AGE_LIMIT_SECONDS restart (check_session_age(),
+# which runs earlier in main() and exits the script if it fires) always wins
+# the race against the heartbeat cap for a session idle since near its own
+# start: heartbeat_stale_age tracks session_age 1:1 in that scenario, and the
+# [WFM_SUPPRESSION_MAX_SECONDS, SESSION_AGE_LIMIT_SECONDS) gap window is wide
+# enough that a false RED was still reachable there.
+#
+# The fix adds an explicit ordering guard to check_dispatcher_heartbeat():
+# whenever session_age (re-derived from DISPATCHER_SESSION_START_FILE) is
+# already at/past WFM_SUPPRESSION_MAX_SECONDS, RED is suppressed because the
+# graceful restart is guaranteed to fire within WFM_SUPPRESSION_MARGIN_SECONDS
+# more seconds regardless of cron cadence (it only depends on the dispatcher
+# PID being alive, not on heartbeat activity).
+#
+# These tests exercise that guard directly — not by asserting a margin vs.
+# cron-cadence relationship as prose, but by simulating the exact race at and
+# across the previously-vulnerable gap window and asserting GREEN.
+# ===================================================================
+
+echo ""
+echo "--- Ordering-guard tests (issue #1473 Round 1) ---"
+DISPATCHER_SESSION_START_TEST_FILE="$TEST_TMPDIR/dispatcher-session-start.ts"
+
+# Helper: write a session-start file recording a session that is $1 seconds old.
+write_session_start() {
+    local age_seconds="$1"
+    echo "$(( $(date +%s) - age_seconds ))" > "$DISPATCHER_SESSION_START_TEST_FILE"
+}
+
+remove_session_start() {
+    rm -f "$DISPATCHER_SESSION_START_TEST_FILE"
+}
+
+# Run with WFM-active file active, a heartbeat stale for $1 seconds, and
+# DISPATCHER_SESSION_START_FILE recording a session $2 seconds old. Pass ""
+# for $2 to simulate the start-timestamp file being absent (e.g. already
+# cleared by an earlier, possibly ineffective, graceful SIGTERM attempt).
+run_check_with_wfm_and_session() {
+    local hb_stale_age="$1"
+    local session_age="${2:-}"
+    echo "$(( $(date +%s) - hb_stale_age ))" > "$DISPATCHER_HEARTBEAT_FILE"
+    DISPATCHER_WFM_ACTIVE_FILE="$WFM_ACTIVE_TEST_FILE"
+    DISPATCHER_SESSION_START_FILE="$DISPATCHER_SESSION_START_TEST_FILE"
+    if [[ -n "$session_age" ]]; then
+        write_session_start "$session_age"
+    else
+        remove_session_start
+    fi
+    check_dispatcher_heartbeat
+    local rc=$?
+    DISPATCHER_WFM_ACTIVE_FILE="$TEST_LOG_DIR/dispatcher-wfm-active-ABSENT"
+    return $rc
+}
+
+# -------------------------------------------------------------------
+# Test 17: Idle-since-start at the cap boundary → GREEN (ordering guard)
+# session_age == heartbeat stale age == exactly WFM_SUPPRESSION_MAX_SECONDS:
+# without the ordering guard this fired RED (see test 10, which reproduces
+# the same heartbeat age but with no session-start file — i.e. session_age
+# unknown). With a session-start file present and matching, the graceful
+# restart is known to be imminent, so this must be GREEN.
+# -------------------------------------------------------------------
+begin_test "Idle-since-start at cap boundary (hb=session_age=${WFM_SUPPRESSION_MAX_SECONDS}s) → GREEN (ordering guard)"
+write_wfm_active 5
+run_check_with_wfm_and_session "$WFM_SUPPRESSION_MAX_SECONDS" "$WFM_SUPPRESSION_MAX_SECONDS" && rc=$? || rc=$?
+remove_wfm_active
+remove_session_start
+assert_exit "$rc" 0
+
+# -------------------------------------------------------------------
+# Test 18: Idle-since-start 1 second before the graceful restart threshold →
+# still GREEN. This is the far edge of the gap window Round 1 identified
+# (session_age = SESSION_AGE_LIMIT_SECONDS - 1); the guard must hold across
+# the whole window, not just at its near boundary.
+# -------------------------------------------------------------------
+begin_test "Idle-since-start 1s before SESSION_AGE_LIMIT_SECONDS → GREEN (ordering guard holds across gap window)"
+write_wfm_active 5
+gap_far_probe=$(( SESSION_AGE_LIMIT_SECONDS - 1 ))
+run_check_with_wfm_and_session "$gap_far_probe" "$gap_far_probe" && rc=$? || rc=$?
+remove_wfm_active
+remove_session_start
+assert_exit "$rc" 0
+
+# -------------------------------------------------------------------
+# Test 19 (ENFORCED INVARIANT): RED cannot fire anywhere in the
+# [WFM_SUPPRESSION_MAX_SECONDS, SESSION_AGE_LIMIT_SECONDS) gap window for an
+# idle-since-start session. This is the concrete assertion Round 1 asked for
+# in place of a prose claim: sample several points spanning the gap
+# (boundary, near-middle, and far edge) and require GREEN at every one.
+# -------------------------------------------------------------------
+begin_test "ENFORCED INVARIANT: RED cannot precede graceful restart anywhere in the gap window (idle-since-start)"
+write_wfm_active 5
+gap_width=$(( SESSION_AGE_LIMIT_SECONDS - WFM_SUPPRESSION_MAX_SECONDS ))  # == WFM_SUPPRESSION_MARGIN_SECONDS
+invariant_failures=0
+for offset in 0 1 $(( gap_width / 2 )) $(( gap_width - 1 )); do
+    probe=$(( WFM_SUPPRESSION_MAX_SECONDS + offset ))
+    run_check_with_wfm_and_session "$probe" "$probe" && probe_rc=$? || probe_rc=$?
+    if [[ "$probe_rc" -ne 0 ]]; then
+        invariant_failures=$(( invariant_failures + 1 ))
+        echo "    invariant violated at session_age=${probe}s (rc=$probe_rc, expected 0/GREEN)"
+    fi
+done
+remove_wfm_active
+remove_session_start
+if [[ "$invariant_failures" -eq 0 ]]; then
+    pass
+else
+    fail "$invariant_failures of 4 sampled points in the gap window incorrectly fired RED"
+fi
+
+# -------------------------------------------------------------------
+# Test 20: Frozen-dispatcher detection is preserved when the session-start
+# file is absent (e.g. an earlier graceful SIGTERM attempt already cleared it
+# but the process did not actually exit) — the ordering guard must NOT
+# suppress in this case, since session_age is unknown and the graceful path
+# has no further scheduled attempt. This confirms the guard doesn't weaken
+# the genuine frozen-dispatcher detection this cap exists to catch.
+# -------------------------------------------------------------------
+begin_test "Frozen dispatcher (no session-start file, hb well beyond cap) → RED (guard does not mask genuine freeze)"
+write_wfm_active 5
+run_check_with_wfm_and_session $(( WFM_SUPPRESSION_MAX_SECONDS + 900 )) "" && rc=$? || rc=$?
+remove_wfm_active
+remove_session_start
+assert_exit "$rc" 2
 
 # -------------------------------------------------------------------
 # Summary

@@ -166,15 +166,25 @@ WFM_ACTIVE_STALE_SECONDS=180   # 3x WAIT_HEARTBEAT_INTERVAL (60s) — absorbs on
 # quiet period (observed: ~every 45 min, 16 forced restarts in one day, 3x the
 # rate of the by-design 2h rotation — see issue #1472's "restart storm" finding).
 #
-# Fix: bound the cap just under SESSION_AGE_LIMIT_SECONDS instead of a fixed
-# 45-minute value. This preserves the original invariant ("this constant must
-# be less than SESSION_AGE_LIMIT_SECONDS") but means a *legitimately* idle
-# session — whose total heartbeat-stale time can never exceed roughly one
-# session lifetime — is caught by the graceful SESSION_AGE_LIMIT restart before
-# this cap can fire. The cap now only fires for a session that has been
-# heartbeat-stale for nearly its entire lifetime AND fails to be reaped by the
-# graceful restart (e.g. because the process is too frozen to act on SIGTERM),
-# which is the actual frozen-dispatcher scenario this mechanism exists to catch.
+# Fix (two parts, oracle PR #1473 Round 1): bounding the cap just under
+# SESSION_AGE_LIMIT_SECONDS instead of a fixed 45-minute value cuts the
+# false-positive *frequency* dramatically (once per idle-from-start session at
+# ~115 min, instead of every ~45 min) — but the margin by itself does not
+# prove the graceful restart always wins the race: a session idle since near
+# its own start can still cross WFM_SUPPRESSION_MAX_SECONDS before
+# check_session_age() (which runs earlier in main() and exits the script if it
+# fires) gets a chance to act. The second part — an explicit ordering guard in
+# check_dispatcher_heartbeat() that re-derives session_age and suppresses this
+# RED whenever session_age is already at/past WFM_SUPPRESSION_MAX_SECONDS — is
+# what actually closes that specific race, cadence-independently, for the
+# idle-since-start case (see the ordering-guard block below and
+# tests/test-health-check-dispatcher-heartbeat.sh for the enforced invariant).
+# The cap can still fire for a session whose DISPATCHER_SESSION_START_FILE is
+# absent (e.g. an earlier graceful SIGTERM attempt already cleared it but the
+# process didn't actually die) — that residual case, where no independent
+# liveness signal exists to distinguish "idle" from "frozen," is the structural
+# risk named in the PR's "Root-cause answer" section and is intentionally not
+# claimed to be closed here.
 WFM_SUPPRESSION_MARGIN_SECONDS="${LOBSTER_WFM_SUPPRESSION_MARGIN_SECONDS:-300}"
 WFM_SUPPRESSION_MAX_SECONDS="${LOBSTER_WFM_SUPPRESSION_MAX_SECONDS:-$(( SESSION_AGE_LIMIT_SECONDS - WFM_SUPPRESSION_MARGIN_SECONDS ))}"
 
@@ -1186,6 +1196,45 @@ check_dispatcher_heartbeat() {
                 # WFM_SUPPRESSION_MAX_SECONDS, the system has been unresponsive long
                 # enough that we must escalate regardless of daemon thread activity.
                 if [[ $age -ge $WFM_SUPPRESSION_MAX_SECONDS ]]; then
+                    # Ordering guard (oracle PR #1473 Round 1 finding): the margin
+                    # alone does not guarantee that check_session_age() — which runs
+                    # earlier in main() and exits the whole script if it fires — wins
+                    # the race for a session that has been idle since near its own
+                    # start. heartbeat_stale_age ("$age" here) tracks session_age 1:1
+                    # in that scenario, so age crossing WFM_SUPPRESSION_MAX_SECONDS
+                    # (== SESSION_AGE_LIMIT_SECONDS - WFM_SUPPRESSION_MARGIN_SECONDS)
+                    # does not by itself prove the graceful restart has already had a
+                    # chance to fire on an earlier cron tick.
+                    #
+                    # Fix: re-derive session_age directly from
+                    # DISPATCHER_SESSION_START_FILE and, whenever it is already at or
+                    # past WFM_SUPPRESSION_MAX_SECONDS, suppress this RED — the
+                    # graceful SESSION_AGE_LIMIT_SECONDS restart is guaranteed to fire
+                    # within WFM_SUPPRESSION_MARGIN_SECONDS more seconds regardless of
+                    # cron cadence (it does not depend on the heartbeat at all, only
+                    # on the dispatcher PID being alive), so escalating here would
+                    # only race a restart that is already coming. This is provably
+                    # cadence-independent: it does not rely on the cron interval being
+                    # smaller than the margin, unlike a margin-only recalibration.
+                    #
+                    # If DISPATCHER_SESSION_START_FILE is absent or malformed, treat
+                    # session_age as unknown and fall through to RED unchanged — this
+                    # preserves detection for a session whose start-timestamp file was
+                    # already cleared by an earlier (possibly ineffective) graceful
+                    # SIGTERM attempt, which is the genuine frozen-dispatcher case this
+                    # cap exists to catch.
+                    local ordering_guard_session_age=""
+                    if [[ -f "$DISPATCHER_SESSION_START_FILE" ]]; then
+                        local ordering_guard_session_start
+                        ordering_guard_session_start=$(< "$DISPATCHER_SESSION_START_FILE") 2>/dev/null || true
+                        if [[ "$ordering_guard_session_start" =~ ^[0-9]+$ ]]; then
+                            ordering_guard_session_age=$(( now - ordering_guard_session_start ))
+                        fi
+                    fi
+                    if [[ -n "$ordering_guard_session_age" ]] && [[ $ordering_guard_session_age -ge $WFM_SUPPRESSION_MAX_SECONDS ]]; then
+                        log_info "Dispatcher heartbeat stale (${age}s >= ${WFM_SUPPRESSION_MAX_SECONDS}s cap) but session_age (${ordering_guard_session_age}s) is already at/past the same threshold — graceful SESSION_AGE_LIMIT_SECONDS restart (${SESSION_AGE_LIMIT_SECONDS}s) is imminent, skipping RED (ordering guard, issue #1473)"
+                        return 0
+                    fi
                     log_error "RED: dispatcher heartbeat stale (${age}s >= ${WFM_SUPPRESSION_MAX_SECONDS}s cap) — WFM-active is fresh (daemon thread alive) but suppression window expired; frozen dispatcher suspected (issue #2074)"
                     return 2
                 fi
