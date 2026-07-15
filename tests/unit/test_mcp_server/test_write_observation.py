@@ -27,6 +27,26 @@ import src.mcp.inbox_server  # noqa: F401
 OWNER_CHAT_ID_PLACEHOLDER = "OWNER_CHAT_ID_PLACEHOLDER"
 
 
+class TestResolveDebugConfig:
+    """Regression coverage for issue #1481.
+
+    _resolve_debug_config() previously had a body of `pas` (a truncated
+    `pass` statement, introduced in merge commit 8f6b38dd6), which raised
+    NameError: name 'pas' is not defined on every invocation. Since
+    _resolve_debug_config() is called unconditionally as the first
+    statement in handle_write_observation(), this crashed every call to
+    the write_observation MCP tool, silently disabling gate-miss /
+    proprioceptive feedback logging system-wide.
+    """
+
+    def test_resolve_debug_config_does_not_raise(self):
+        """Calling _resolve_debug_config() directly must not raise NameError."""
+        from src.mcp.inbox_server import _resolve_debug_config
+
+        # Must not raise — this is the documented no-op stub behavior.
+        assert _resolve_debug_config() is None
+
+
 class TestHandleWriteObservation:
     """Tests for the write_observation handler."""
 
