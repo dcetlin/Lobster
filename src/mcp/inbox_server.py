@@ -379,7 +379,7 @@ def _emit_event(
 
 def _resolve_debug_config() -> None:
     """No-op — preserved for call compatibility. Config resolution moved to event bus."""
-    pas
+    pass
 
 
 # ---------------------------------------------------------------------------
