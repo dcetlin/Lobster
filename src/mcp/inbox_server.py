@@ -11148,6 +11148,13 @@ async def _startup_sweep() -> None:
             f"[reconciler] Startup sweep: found {len(unnotified)} unnotified "
             f"completed/dead session(s) — grouping into per-chat summaries"
         )
+        # Note: upstream #781 added a per-session `agent_type == "dispatcher"` skip
+        # and an `_inbox_already_has_agent` idempotency guard here. Both are
+        # superseded on this fork: get_unnotified_completed() already excludes
+        # dispatcher/hook sessions at the SQL layer (#781/#1472/#1473), and
+        # _enqueue_startup_sweep_summaries() groups all sessions into one summary
+        # per chat_id (#459/#469) rather than one notification per session, so the
+        # per-agent idempotency check doesn't apply the same way.
         _enqueue_startup_sweep_summaries(unnotified)
     except Exception as exc:
         log.error(f"[reconciler] Startup sweep error: {exc}", exc_info=True)

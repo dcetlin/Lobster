@@ -531,7 +531,7 @@ def cleanup_stale_running_sessions(
         SELECT id, output_file, spawned_at, timeout_minutes
         FROM agent_sessions
         WHERE status IN ('running', 'starting')
-          AND (agent_type IS NULL OR agent_type NOT IN ('dispatcher', 'hook'))
+          AND (agent_type IS NULL OR agent_type NOT IN ('dispatcher', 'hook'))  -- #781/#1472/#1473: never reconcile the dispatcher (output_file is legitimately NULL) or a hook session as a dead subagent
         """
     )
     rows = cursor.fetchall()
@@ -726,7 +726,7 @@ def get_unnotified_completed(
         WHERE status IN ('completed', 'dead')
           AND notified_at IS NULL
           AND completed_at >= ?
-          AND (agent_type IS NULL OR agent_type NOT IN ('dispatcher', 'hook'))
+          AND (agent_type IS NULL OR agent_type NOT IN ('dispatcher', 'hook'))  -- #781/#1473: belt-and-suspenders, never re-notify the dispatcher or a hook session as a failed agent
         ORDER BY completed_at ASC
         """,
         (cutoff_str,),
