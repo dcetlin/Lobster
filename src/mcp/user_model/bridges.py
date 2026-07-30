@@ -121,14 +121,24 @@ def _parse_project_file(content: str, filename: str) -> dict[str, Any]:
 def sync_projects_to_arcs(
     conn: sqlite3.Connection,
     workspace_path: str | None = None,
+    canonical_path: str | None = None,
 ) -> dict[str, Any]:
     """
     Read project files from canonical memory and sync them as narrative arcs.
     Creates new arcs for new projects, updates existing ones.
     Returns summary of changes.
+
+    `canonical_path` is the directory containing `memory/canonical/` (the
+    real-world default is `~/lobster-user-config`, per CLAUDE.md's Key
+    Directories section — canonical memory is user-config, not workspace).
+    If omitted, falls back to `workspace_path` for backward compatibility
+    with existing callers/tests that colocate canonical memory under the
+    workspace path they pass in.
     """
-    ws = Path(workspace_path) if workspace_path else Path.home() / "lobster-workspace"
-    projects_dir = ws / "memory" / "canonical" / "projects"
+    base = Path(canonical_path) if canonical_path else (
+        Path(workspace_path) if workspace_path else Path.home() / "lobster-workspace"
+    )
+    projects_dir = base / "memory" / "canonical" / "projects"
 
     if not projects_dir.exists():
         return {"synced": 0, "created": 0, "updated": 0}
@@ -190,13 +200,19 @@ def sync_projects_to_arcs(
 def sync_priorities_to_attention(
     conn: sqlite3.Connection,
     workspace_path: str | None = None,
+    canonical_path: str | None = None,
 ) -> dict[str, Any]:
     """
     Read priorities.md and inject top items into the attention stack.
     These supplement (not replace) the organic attention items from observations.
+
+    See `sync_projects_to_arcs` for the `canonical_path` vs `workspace_path`
+    distinction and backward-compatibility fallback.
     """
-    ws = Path(workspace_path) if workspace_path else Path.home() / "lobster-workspace"
-    priorities_file = ws / "memory" / "canonical" / "priorities.md"
+    base = Path(canonical_path) if canonical_path else (
+        Path(workspace_path) if workspace_path else Path.home() / "lobster-workspace"
+    )
+    priorities_file = base / "memory" / "canonical" / "priorities.md"
 
     content = _read_file_safe(priorities_file)
     if not content.strip():
@@ -333,20 +349,35 @@ def write_context_cache(
 def run_bridges(
     conn: sqlite3.Connection,
     workspace_path: str | None = None,
+    canonical_path: str | None = None,
 ) -> dict[str, Any]:
     """
     Run all bridge operations. Called during nightly consolidation.
     Returns combined summary.
+
+    `canonical_path` (default `~/lobster-user-config` when omitted and no
+    `workspace_path` given either) is where `memory/canonical/projects/*.md`
+    and `memory/canonical/priorities.md` actually live in production — see
+    Issue #1480. `workspace_path` (default `~/lobster-workspace`) is where
+    `_context.md` is written; unrelated to canonical-memory source location.
+
+    Defensively sets `row_factory = sqlite3.Row` — several `db.py` readers
+    called transitively from here (e.g. `get_active_narrative_arcs`) index
+    rows by column name and raise `TypeError` on a connection using the
+    default tuple row factory (Issue #1480).
     """
+    if conn.row_factory is not sqlite3.Row:
+        conn.row_factory = sqlite3.Row
+
     summary: dict[str, Any] = {}
 
     try:
-        summary["projects"] = sync_projects_to_arcs(conn, workspace_path)
+        summary["projects"] = sync_projects_to_arcs(conn, workspace_path, canonical_path)
     except Exception as e:
         summary["projects"] = {"error": str(e)}
 
     try:
-        summary["priorities"] = sync_priorities_to_attention(conn, workspace_path)
+        summary["priorities"] = sync_priorities_to_attention(conn, workspace_path, canonical_path)
     except Exception as e:
         summary["priorities"] = {"error": str(e)}
 

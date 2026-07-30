@@ -350,18 +350,19 @@ Include the GitHub activity summary in the synthesis for rolling-summary.md and 
    Run the bridge pass to push projects, priorities, and preferences from canonical markdown files into the user model DB. This also generates the pre-computed `_context.md` via `write_context_cache()`:
    ```bash
    cd ~/lobster && uv run python -c "
-   import sys; sys.path.insert(0, 'src')
-   from mcp.user_model.bridges import run_bridges
+   import sys; sys.path.insert(0, 'src/mcp')
+   from user_model.bridges import run_bridges
    import sqlite3, os
    db_path = os.path.expanduser('~/lobster-workspace/data/memory.db')
    conn = sqlite3.connect(db_path)
-   result = run_bridges(conn)
+   result = run_bridges(conn, canonical_path=os.path.expanduser('~/lobster-user-config'))
    conn.close()
    print(result)
    "
    ```
    This syncs `projects/*.md` as narrative arcs and `priorities.md` as attention items, and writes the pre-computed `~/lobster-workspace/user-model/_context.md`.
    If the script fails (e.g. DB not initialized), continue to step 11.
+   (Note: the import uses `sys.path.insert(0, 'src/mcp')` + `from user_model.bridges import ...`, matching the convention `inbox_server.py` itself uses — `sys.path.insert(0, 'src')` + `import mcp.user_model...` resolves `mcp` to the installed MCP SDK package rather than the local `src/mcp` namespace package and raises `ModuleNotFoundError` — see Issue #1482. `canonical_path` is passed explicitly because canonical memory lives under `~/lobster-user-config`, not `~/lobster-workspace` — see Issue #1480.)
 
 11. **Write `_context.md` (user model summary).**
     Call `model_user_context(deep=True)` to retrieve structured user model data from the DB.

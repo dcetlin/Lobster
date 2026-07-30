@@ -112,6 +112,60 @@ class TestBridges:
         assert "priorities" in result
         assert "context_cache" in result
 
+    def test_canonical_path_overrides_workspace_path_for_source(self, conn, tmp_path):
+        """
+        Regression test for Issue #1480: canonical_path controls where
+        memory/canonical/{projects,priorities.md} are read from, independent
+        of workspace_path (which controls only _context.md output location).
+        """
+        from user_model.bridges import run_bridges
+
+        canonical_dir = tmp_path / "canonical-home"
+        (canonical_dir / "memory" / "canonical" / "projects").mkdir(parents=True)
+        (canonical_dir / "memory" / "canonical" / "projects" / "realproj.md").write_text(
+            "# Real Project\n\nLives under canonical_path, not workspace_path.\n"
+        )
+        (canonical_dir / "memory" / "canonical" / "priorities.md").write_text(
+            "1. **Ship it** — top priority\n"
+        )
+
+        workspace_dir = tmp_path / "workspace-home"
+        (workspace_dir / "user-model").mkdir(parents=True)
+        # Deliberately do NOT create workspace_dir/memory/canonical/* — proves
+        # the source read comes from canonical_path, not workspace_path.
+
+        result = run_bridges(
+            conn,
+            workspace_path=str(workspace_dir),
+            canonical_path=str(canonical_dir),
+        )
+        assert result["projects"]["synced"] == 1
+        assert result["priorities"]["injected"] == 1
+        assert (workspace_dir / "user-model" / "_context.md").exists()
+
+    def test_run_bridges_sets_row_factory_defensively(self, tmp_path):
+        """
+        Regression test for Issue #1480: a bare sqlite3.connect() (no
+        row_factory set) — the exact pattern nightly-consolidation.md's
+        step 10 inline script uses — must not raise TypeError from
+        db.py readers that index rows by column name.
+        """
+        import sqlite3
+        from user_model.db import init_schema
+        from user_model.bridges import run_bridges
+
+        db_path = tmp_path / "test.db"
+        setup_conn = sqlite3.connect(str(db_path))
+        init_schema(setup_conn)
+        setup_conn.close()
+
+        raw_conn = sqlite3.connect(str(db_path))
+        assert raw_conn.row_factory is None  # confirms the bug precondition
+
+        result = run_bridges(raw_conn, canonical_path=str(tmp_path))
+        assert "error" not in result.get("projects", {})
+        raw_conn.close()
+
 
 # ---------------------------------------------------------------------------
 # Narrative tests
