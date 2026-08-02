@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -528,8 +529,9 @@ class TestHandleGetConversationHistoryDbFirst:
         mock_conn = MagicMock()
         return mock_conn
 
-    def test_uses_db_when_available(self, tmp_path: Path):
-        """When DB reader is available and returns rows, results come from DB."""
+    def test_uses_db_when_available_and_writes_enabled(self, tmp_path: Path):
+        """When DB reader is available, LOBSTER_USE_DB=1, and DB returns rows,
+        results come from DB."""
         from src.mcp.inbox_server import handle_get_conversation_history
 
         db_rows = [
@@ -539,7 +541,7 @@ class TestHandleGetConversationHistoryDbFirst:
         ]
         mock_conn = MagicMock()
 
-        with patch.multiple(
+        with patch.dict(os.environ, {"LOBSTER_USE_DB": "1"}), patch.multiple(
             "src.mcp.inbox_server",
             _db_get_conversation_history=MagicMock(return_value=db_rows),
             _db_count_conversation_history=MagicMock(return_value=1),
@@ -550,8 +552,64 @@ class TestHandleGetConversationHistoryDbFirst:
         assert len(result) == 1
         assert "From DB" in result[0].text
 
+    def test_skips_db_and_uses_filesystem_when_db_writes_disabled(self, tmp_path: Path):
+        """Regression test for issue #1471.
+
+        messages.db can contain a non-empty but stale seed/fixture table (e.g.
+        a one-time test insert) while LOBSTER_USE_DB is unset/0, meaning the
+        live write path (persist_inbound/persist_outbound) has never run and
+        the DB has never received real conversation data. Previously the
+        handler treated any non-empty DB result as authoritative — masking
+        the real filesystem archive behind stale fixture rows whenever
+        chat_id was omitted. The DB path must now be skipped entirely (not
+        just "fall back on zero rows") whenever DB writes are disabled, and
+        the real archive must be read from the filesystem instead.
+        """
+        from src.mcp.inbox_server import handle_get_conversation_history
+
+        processed_dir = tmp_path / "processed"
+        processed_dir.mkdir()
+        real_msg = {
+            "id": "real1",
+            "text": "Real conversation history",
+            "source": "telegram",
+            "chat_id": "8075091586",
+            "timestamp": "2026-07-01T10:00:00+00:00",
+            "user_name": "Dan",
+        }
+        (processed_dir / "real1.json").write_text(json.dumps(real_msg))
+
+        # Stale, non-empty test-fixture DB rows — structurally satisfy the
+        # query filters (total_count > 0) but must not be trusted, because
+        # LOBSTER_USE_DB is not set below.
+        stale_fixture_rows = [
+            {"id": "fixture1", "_direction": "received", "source": "test",
+             "chat_id": "123456", "timestamp": "2026-05-22T00:49:46+00:00",
+             "text": "Hello Lobster!", "user_name": "TestUser", "username": "testuser"},
+        ]
+        mock_conn = MagicMock()
+
+        env_without_use_db = dict(os.environ)
+        env_without_use_db.pop("LOBSTER_USE_DB", None)
+
+        with patch.dict(os.environ, env_without_use_db, clear=True), patch.multiple(
+            "src.mcp.inbox_server",
+            _db_get_conversation_history=MagicMock(return_value=stale_fixture_rows),
+            _db_count_conversation_history=MagicMock(return_value=len(stale_fixture_rows)),
+            _open_messages_db_conn=MagicMock(return_value=mock_conn),
+            PROCESSED_DIR=processed_dir,
+            SENT_DIR=tmp_path / "sent",
+        ):
+            result = asyncio.run(handle_get_conversation_history({"sender_type": "conversation"}))
+
+        text = result[0].text
+        assert "Real conversation history" in text
+        assert "Hello Lobster!" not in text
+        assert "TestUser" not in text
+
     def test_falls_back_to_filesystem_when_db_unavailable(self, tmp_path: Path):
-        """When _open_messages_db_conn returns None, filesystem fallback is used."""
+        """When LOBSTER_USE_DB=1 and _open_messages_db_conn returns None,
+        filesystem fallback is used."""
         from src.mcp.inbox_server import handle_get_conversation_history
 
         processed_dir = tmp_path / "processed"
@@ -566,16 +624,19 @@ class TestHandleGetConversationHistoryDbFirst:
         }
         (processed_dir / "fs1.json").write_text(json.dumps(msg))
 
-        with patch.multiple(
+        mock_open_conn = MagicMock(return_value=None)
+
+        with patch.dict(os.environ, {"LOBSTER_USE_DB": "1"}), patch.multiple(
             "src.mcp.inbox_server",
             _db_get_conversation_history=MagicMock(return_value=[]),
             _db_count_conversation_history=MagicMock(return_value=0),
-            _open_messages_db_conn=MagicMock(return_value=None),
+            _open_messages_db_conn=mock_open_conn,
             PROCESSED_DIR=processed_dir,
             SENT_DIR=tmp_path / "sent",
         ):
             result = asyncio.run(handle_get_conversation_history({}))
 
+        assert mock_open_conn.called
         assert len(result) == 1
         assert "From filesystem" in result[0].text
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -436,13 +437,16 @@ class TestHandleGetConversationHistorySql:
     """Integration tests for the BIS-165 Slice 4 handler."""
 
     def test_db_path_is_primary_source(self, tmp_path: Path):
-        """When the DB returns rows, output reflects DB data not filesystem."""
+        """When DB writes are enabled and the DB returns rows, output reflects
+        DB data not filesystem. (DB path is gated on LOBSTER_USE_DB=1 — see
+        issue #1471: a disabled write path means messages.db can't be trusted
+        as current, so the handler must skip it entirely otherwise.)"""
         db_rows = [
             _make_msg("db1", text="From DB"),
         ]
         mock_conn = MagicMock()
 
-        with patch.multiple(
+        with patch.dict(os.environ, {"LOBSTER_USE_DB": "1"}), patch.multiple(
             "src.mcp.inbox_server",
             _db_get_conversation_history=MagicMock(return_value=db_rows),
             _db_count_conversation_history=MagicMock(return_value=1),
@@ -455,23 +459,27 @@ class TestHandleGetConversationHistorySql:
         mock_conn.close.assert_called_once()
 
     def test_filesystem_fallback_when_db_conn_is_none(self, tmp_path: Path):
-        """When _open_messages_db_conn returns None, filesystem JSON is used."""
+        """When LOBSTER_USE_DB=1 and _open_messages_db_conn returns None,
+        filesystem JSON is used."""
         processed = tmp_path / "processed"
         processed.mkdir()
         (tmp_path / "sent").mkdir()
         msg = _make_msg("fs1", text="Filesystem message")
         (processed / "fs1.json").write_text(json.dumps(msg))
 
-        with patch.multiple(
+        mock_open_conn = MagicMock(return_value=None)
+
+        with patch.dict(os.environ, {"LOBSTER_USE_DB": "1"}), patch.multiple(
             "src.mcp.inbox_server",
             _db_get_conversation_history=MagicMock(return_value=[]),
             _db_count_conversation_history=MagicMock(return_value=0),
-            _open_messages_db_conn=MagicMock(return_value=None),
+            _open_messages_db_conn=mock_open_conn,
             PROCESSED_DIR=processed,
             SENT_DIR=tmp_path / "sent",
         ):
             result = asyncio.run(handle_get_conversation_history({}))
 
+        assert mock_open_conn.called
         assert "Filesystem message" in result[0].text
 
     def test_filesystem_fallback_when_db_reader_not_imported(self, tmp_path: Path):
@@ -516,7 +524,7 @@ class TestHandleGetConversationHistorySql:
         mock_count = MagicMock(return_value=1)
         mock_conn = MagicMock()
 
-        with patch.multiple(
+        with patch.dict(os.environ, {"LOBSTER_USE_DB": "1"}), patch.multiple(
             "src.mcp.inbox_server",
             _db_get_conversation_history=mock_get,
             _db_count_conversation_history=mock_count,
@@ -533,7 +541,7 @@ class TestHandleGetConversationHistorySql:
         mock_count = MagicMock(return_value=0)
         mock_conn = MagicMock()
 
-        with patch.multiple(
+        with patch.dict(os.environ, {"LOBSTER_USE_DB": "1"}), patch.multiple(
             "src.mcp.inbox_server",
             _db_get_conversation_history=mock_get,
             _db_count_conversation_history=mock_count,
@@ -559,7 +567,7 @@ class TestHandleGetConversationHistorySql:
 
         mock_conn = MagicMock()
 
-        with patch.multiple(
+        with patch.dict(os.environ, {"LOBSTER_USE_DB": "1"}), patch.multiple(
             "src.mcp.inbox_server",
             _db_get_conversation_history=_raise,
             _db_count_conversation_history=MagicMock(return_value=0),
