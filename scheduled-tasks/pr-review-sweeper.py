@@ -6,9 +6,18 @@ Runs every 15 minutes. On each invocation:
 1. Lists open PRs on dcetlin/Lobster
 2. Skips PRs newer than MIN_AGE_MINUTES (too new — avoid races with CI)
 3. Skips PRs already dispatched in the current 2-hour window (state file gate)
-4. Skips PRs that already have a Lobster review comment (has_review_comment check)
-5. Classifies each eligible PR via src.agents.pr_classifier
-6. Writes a pr_review_request inbox message so the dispatcher spawns oracle review
+4. Skips PRs that already have a committed terminal oracle verdict (has_final_verdict check)
+5. Skips PRs that already have a Lobster review comment (has_review_comment check)
+6. Classifies each eligible PR via src.agents.pr_classifier
+7. Writes a pr_review_request inbox message so the dispatcher spawns oracle review
+
+Note on step 3 vs step 4: the state-file gate (step 3) is short-lived (pruned after
+STATE_PRUNE_HOURS) and only covers dispatches made by *this* sweeper. It does not know
+about oracle reviews that completed and were committed to `oracle/verdicts/pr-{n}.md` —
+whether triggered by this sweeper in a prior, now-pruned cycle, or by any other path
+(e.g. a manual dispatch). Step 4 closes that gap by checking the durable, git-committed
+verdict file directly, so a PR that already has a terminal `VERDICT: APPROVED` is never
+re-dispatched regardless of state-file pruning (see issue #1491).
 
 This is a Type B cron-direct script. It does not interact with the dispatcher directly —
 it writes inbox messages that the dispatcher consumes via route_wos_message /
@@ -72,6 +81,12 @@ REVIEW_MARKER = "<!-- lobster-review -->"
 STATE_FILE = Path("~/lobster-workspace/data/pr-review-sweeper-state.json").expanduser()
 STATE_PRUNE_HOURS = 2
 
+# Terminal oracle verdict line — see CLAUDE.md "PR Merge Gate" and
+# .claude/agents/lobster-oracle.md. The oracle writes exactly this string as the
+# first line of oracle/verdicts/pr-{number}.md when a PR is approved to merge.
+VERDICT_APPROVED_LINE = "VERDICT: APPROVED"
+ORACLE_VERDICTS_DIR = _REPO_ROOT / "oracle" / "verdicts"
+
 
 # ---------------------------------------------------------------------------
 # State management
@@ -120,6 +135,31 @@ def pr_age_minutes(created_at: str) -> float:
         return (datetime.now(timezone.utc) - created).total_seconds() / 60
     except (ValueError, AttributeError):
         return float("inf")
+
+
+def has_final_verdict(pr_number: int) -> bool:
+    """Return True iff a terminal oracle verdict (VERDICT: APPROVED) is already
+    committed for this PR at oracle/verdicts/pr-{number}.md.
+
+    This is the durable, git-committed source of truth for "has this PR already
+    been reviewed to completion" — unlike the state file (pruned after
+    STATE_PRUNE_HOURS) or has_review_comment() (depends on a PR comment marker
+    that is not posted in every review configuration), the verdict file persists
+    for as long as the PR stays open and is unaffected by sweeper-cycle timing.
+
+    A missing file, an unreadable file, or a non-terminal verdict (e.g.
+    VERDICT: NEEDS_CHANGES, which means a fix round is in progress and a fresh
+    review may legitimately be needed) all return False — i.e. do not skip.
+    """
+    verdict_path = ORACLE_VERDICTS_DIR / f"pr-{pr_number}.md"
+    if not verdict_path.exists():
+        return False
+    try:
+        first_line = verdict_path.read_text(encoding="utf-8").splitlines()[0].strip()
+    except Exception as exc:
+        log.warning("has_final_verdict: could not read %s — %s — treating as no verdict", verdict_path, exc)
+        return False
+    return first_line == VERDICT_APPROVED_LINE
 
 
 def has_review_comment(pr_number: int) -> bool:
@@ -218,6 +258,7 @@ def main(dry_run: bool = False) -> int:
     skipped_has_review = 0
     skipped_too_new = 0
     skipped_already_dispatched = 0
+    skipped_final_verdict = 0
 
     for pr in prs:
         pr_number = pr["number"]
@@ -234,6 +275,11 @@ def main(dry_run: bool = False) -> int:
         if pr_key in state["dispatched"]:
             log.debug("PR #%d already dispatched in this window — skipping", pr_number)
             skipped_already_dispatched += 1
+            continue
+
+        if has_final_verdict(pr_number):
+            log.debug("PR #%d already has a terminal oracle verdict (%s) — skipping", pr_number, VERDICT_APPROVED_LINE)
+            skipped_final_verdict += 1
             continue
 
         if has_review_comment(pr_number):
@@ -266,7 +312,8 @@ def main(dry_run: bool = False) -> int:
         f"Scanned: {scanned} PRs | Dispatched: {dispatched} reviews | "
         f"Skipped (has review): {skipped_has_review} | "
         f"Skipped (too new): {skipped_too_new} | "
-        f"Skipped (already dispatched): {skipped_already_dispatched}"
+        f"Skipped (already dispatched): {skipped_already_dispatched} | "
+        f"Skipped (final verdict): {skipped_final_verdict}"
     )
     log.info(summary_line)
 
