@@ -608,7 +608,8 @@ class TestHandleGetConversationHistoryDbFirst:
         assert "TestUser" not in text
 
     def test_falls_back_to_filesystem_when_db_unavailable(self, tmp_path: Path):
-        """When _open_messages_db_conn returns None, filesystem fallback is used."""
+        """When LOBSTER_USE_DB=1 and _open_messages_db_conn returns None,
+        filesystem fallback is used."""
         from src.mcp.inbox_server import handle_get_conversation_history
 
         processed_dir = tmp_path / "processed"
@@ -623,16 +624,19 @@ class TestHandleGetConversationHistoryDbFirst:
         }
         (processed_dir / "fs1.json").write_text(json.dumps(msg))
 
-        with patch.multiple(
+        mock_open_conn = MagicMock(return_value=None)
+
+        with patch.dict(os.environ, {"LOBSTER_USE_DB": "1"}), patch.multiple(
             "src.mcp.inbox_server",
             _db_get_conversation_history=MagicMock(return_value=[]),
             _db_count_conversation_history=MagicMock(return_value=0),
-            _open_messages_db_conn=MagicMock(return_value=None),
+            _open_messages_db_conn=mock_open_conn,
             PROCESSED_DIR=processed_dir,
             SENT_DIR=tmp_path / "sent",
         ):
             result = asyncio.run(handle_get_conversation_history({}))
 
+        assert mock_open_conn.called
         assert len(result) == 1
         assert "From filesystem" in result[0].text
 

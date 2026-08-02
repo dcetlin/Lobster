@@ -459,23 +459,27 @@ class TestHandleGetConversationHistorySql:
         mock_conn.close.assert_called_once()
 
     def test_filesystem_fallback_when_db_conn_is_none(self, tmp_path: Path):
-        """When _open_messages_db_conn returns None, filesystem JSON is used."""
+        """When LOBSTER_USE_DB=1 and _open_messages_db_conn returns None,
+        filesystem JSON is used."""
         processed = tmp_path / "processed"
         processed.mkdir()
         (tmp_path / "sent").mkdir()
         msg = _make_msg("fs1", text="Filesystem message")
         (processed / "fs1.json").write_text(json.dumps(msg))
 
-        with patch.multiple(
+        mock_open_conn = MagicMock(return_value=None)
+
+        with patch.dict(os.environ, {"LOBSTER_USE_DB": "1"}), patch.multiple(
             "src.mcp.inbox_server",
             _db_get_conversation_history=MagicMock(return_value=[]),
             _db_count_conversation_history=MagicMock(return_value=0),
-            _open_messages_db_conn=MagicMock(return_value=None),
+            _open_messages_db_conn=mock_open_conn,
             PROCESSED_DIR=processed,
             SENT_DIR=tmp_path / "sent",
         ):
             result = asyncio.run(handle_get_conversation_history({}))
 
+        assert mock_open_conn.called
         assert "Filesystem message" in result[0].text
 
     def test_filesystem_fallback_when_db_reader_not_imported(self, tmp_path: Path):
