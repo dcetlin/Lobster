@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -436,13 +437,16 @@ class TestHandleGetConversationHistorySql:
     """Integration tests for the BIS-165 Slice 4 handler."""
 
     def test_db_path_is_primary_source(self, tmp_path: Path):
-        """When the DB returns rows, output reflects DB data not filesystem."""
+        """When DB writes are enabled and the DB returns rows, output reflects
+        DB data not filesystem. (DB path is gated on LOBSTER_USE_DB=1 — see
+        issue #1471: a disabled write path means messages.db can't be trusted
+        as current, so the handler must skip it entirely otherwise.)"""
         db_rows = [
             _make_msg("db1", text="From DB"),
         ]
         mock_conn = MagicMock()
 
-        with patch.multiple(
+        with patch.dict(os.environ, {"LOBSTER_USE_DB": "1"}), patch.multiple(
             "src.mcp.inbox_server",
             _db_get_conversation_history=MagicMock(return_value=db_rows),
             _db_count_conversation_history=MagicMock(return_value=1),
@@ -516,7 +520,7 @@ class TestHandleGetConversationHistorySql:
         mock_count = MagicMock(return_value=1)
         mock_conn = MagicMock()
 
-        with patch.multiple(
+        with patch.dict(os.environ, {"LOBSTER_USE_DB": "1"}), patch.multiple(
             "src.mcp.inbox_server",
             _db_get_conversation_history=mock_get,
             _db_count_conversation_history=mock_count,
@@ -533,7 +537,7 @@ class TestHandleGetConversationHistorySql:
         mock_count = MagicMock(return_value=0)
         mock_conn = MagicMock()
 
-        with patch.multiple(
+        with patch.dict(os.environ, {"LOBSTER_USE_DB": "1"}), patch.multiple(
             "src.mcp.inbox_server",
             _db_get_conversation_history=mock_get,
             _db_count_conversation_history=mock_count,
@@ -559,7 +563,7 @@ class TestHandleGetConversationHistorySql:
 
         mock_conn = MagicMock()
 
-        with patch.multiple(
+        with patch.dict(os.environ, {"LOBSTER_USE_DB": "1"}), patch.multiple(
             "src.mcp.inbox_server",
             _db_get_conversation_history=_raise,
             _db_count_conversation_history=MagicMock(return_value=0),

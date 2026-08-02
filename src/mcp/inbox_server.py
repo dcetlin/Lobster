@@ -139,6 +139,22 @@ try:
 except Exception as _db_reader_import_err:
     _startup_log.warning('DB reader module unavailable: %s', _db_reader_import_err)
 
+def _db_writes_enabled() -> bool:
+    """True when LOBSTER_USE_DB=1 — i.e. the write path is actively persisting
+    inbound/outbound messages to messages.db (see persist_inbound/persist_outbound
+    below, BIS-167 Slice 6).
+
+    When this is False, messages.db can only ever reflect whatever it was
+    seeded with at some point in the past — it never receives live writes.
+    DB-first read paths must treat that as "not authoritative" rather than
+    silently trusting a non-empty-but-stale table (issue #1471: a five-row
+    test-fixture seed from 2026-05-22 was served as real conversation history
+    indefinitely, because the DB-vs-filesystem fallback trigger was
+    `total_count == 0`, which a stale-but-nonempty DB never satisfies).
+    """
+    return os.environ.get("LOBSTER_USE_DB", "0") == "1"
+
+
 # BIS-167 Slice 6: Live DB write path — persist messages to messages.db
 _db_persist_inbound = None
 _db_persist_outbound = None
@@ -149,10 +165,9 @@ try:
         persist_outbound as _db_persist_outbound,
         persist_agent_event as _db_persist_agent_event,
     )
-    _db_flag = os.environ.get("LOBSTER_USE_DB", "0")
-    _db_status = "ENABLED" if _db_flag == "1" else "DISABLED (set LOBSTER_USE_DB=1 to enable)"
+    _db_status = "ENABLED" if _db_writes_enabled() else "DISABLED (set LOBSTER_USE_DB=1 to enable)"
     _startup_log.info('[DB] message_store loaded — DB writes %s', _db_status)
-    del _db_flag, _db_status
+    del _db_status
 except Exception as _db_import_err:
     _startup_log.warning('messages.db write path unavailable: %s', _db_import_err)
 
@@ -6357,8 +6372,9 @@ async def handle_get_conversation_history(args: dict) -> list[TextContent]:
 
     BIS-165 Slice 4: SQL-first read path with extracted pure-function helpers.
     Queries messages.db when available; falls back to the legacy filesystem scan
-    (processed/ + sent/ JSON files) when the DB is unavailable or returns zero
-    results for the given filters.
+    (processed/ + sent/ JSON files) when the DB is unavailable, DB writes are
+    disabled (LOBSTER_USE_DB != 1 — see _db_writes_enabled, issue #1471), or the
+    DB query returns zero results for the given filters.
     """
     chat_id_filter = args.get("chat_id")
     search_text = args.get("search", "").strip()
@@ -6374,8 +6390,20 @@ async def handle_get_conversation_history(args: dict) -> list[TextContent]:
 
     # ------------------------------------------------------------------
     # Primary path: SQL query against messages.db (BIS-165 Slice 4)
+    #
+    # Gated on _db_writes_enabled(): when LOBSTER_USE_DB != 1, the write path
+    # (persist_inbound/persist_outbound) never runs, so messages.db cannot
+    # reflect real conversation history — only whatever it was seeded with.
+    # Skipping the DB path entirely in that case (rather than trusting a
+    # non-empty-but-stale table) prevents issue #1471: a stale seed row count
+    # > 0 permanently masked the real filesystem archive because the old
+    # fallback trigger was `total_count == 0`.
     # ------------------------------------------------------------------
-    if _db_get_conversation_history is not None and _db_count_conversation_history is not None:
+    if (
+        _db_get_conversation_history is not None
+        and _db_count_conversation_history is not None
+        and _db_writes_enabled()
+    ):
         conn = _open_messages_db_conn()
         if conn is not None:
             try:
