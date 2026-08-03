@@ -42,7 +42,7 @@ _SCAN_DIRS = [
 # Files exempt from the check (relative to repo root)
 _EXEMPT_FILES = {
     "src/utils/timezone.py",
-    "src/mcp/user_model/owner.py",       # documents example return values in docstring
+    "src/utils/owner_config.py",         # documents example return values in docstring
     "src/mcp/inbox_server.py",           # default calendar tz param — not user-facing output
 }
 

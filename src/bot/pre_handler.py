@@ -7,10 +7,9 @@ Output that needs LLM context or judgment → dispatcher.
 Commands handled here (bypasses inbox entirely):
   /todos      — open LOS action items from self_action_items.db
   /quota      — CC usage from ~/.claude/cc-budget/state.json
-  /status     — WOS state + active agents + CC usage (file reads + session DB)
+  /status     — active agents + CC usage (file reads + session DB)
   /subagents  — active subagent sessions from session store
   /jobs       — scheduled jobs from jobs.json
-  /wos        — WOS queue counts and dashboard link
   /restart    — restart dispatcher (with confirmation) or warn for mcp/all
 
 WOS-UoW: uow_20260515_75d522
@@ -46,7 +45,7 @@ _ALLOWED_USERS: frozenset[int] = frozenset(
 
 PRE_HANDLER_COMMANDS: frozenset[str] = frozenset({
     "/todos", "/quota", "/status",
-    "/subagents", "/jobs", "/wos", "/restart",
+    "/subagents", "/jobs", "/restart",
 })
 
 
@@ -86,8 +85,6 @@ async def try_handle(
             await _handle_subagents(message)
         elif cmd == "/jobs":
             await _handle_jobs(message)
-        elif cmd == "/wos":
-            await _handle_wos(message)
         elif cmd == "/restart":
             await _handle_restart(message, args)
     except Exception as exc:
@@ -138,7 +135,7 @@ async def handle_help_command(
     user = update.effective_user
     if not user or user.id not in _ALLOWED_USERS:
         return
-    from orchestration.dispatcher_handlers import handle_help  # noqa: PLC0415
+    from bot.dispatcher_commands import handle_help  # noqa: PLC0415
     await update.message.reply_text(handle_help())
 
 
@@ -160,16 +157,6 @@ async def handle_jobs_command(
     if not user or user.id not in _ALLOWED_USERS:
         return
     await _handle_jobs(update.message)
-
-
-async def handle_wos_command(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Pre-handler for /wos — WOS queue counts and dashboard link, bypasses dispatcher."""
-    user = update.effective_user
-    if not user or user.id not in _ALLOWED_USERS:
-        return
-    await _handle_wos(update.message)
 
 
 async def handle_restart_command(
@@ -224,7 +211,7 @@ async def _handle_todos(message: "Message") -> None:
 
 
 async def _handle_quota(message: "Message") -> None:
-    from orchestration.dispatcher_handlers import format_quota_message, read_quota_state  # noqa: PLC0415
+    from bot.dispatcher_commands import format_quota_message, read_quota_state  # noqa: PLC0415
 
     state = read_quota_state()
     msg = format_quota_message(state)
@@ -233,31 +220,20 @@ async def _handle_quota(message: "Message") -> None:
 
 async def _handle_status(message: "Message") -> None:
     from agents.session_store import get_active_sessions  # noqa: PLC0415
-    from orchestration.dispatcher_handlers import (  # noqa: PLC0415
+    from bot.dispatcher_commands import (  # noqa: PLC0415
         format_status_message,
         read_quota_state,
-        read_wos_config,
     )
-    from orchestration.registry import Registry  # noqa: PLC0415
 
     quota_state = read_quota_state()
-    wos_config = read_wos_config()
 
     try:
         active_sessions = get_active_sessions()
     except Exception:
         active_sessions = []
 
-    try:
-        registry = Registry()
-        status_counts = registry.get_status_counts()
-    except Exception:
-        status_counts = {}
-
     msg = format_status_message(
         active_sessions=active_sessions,
-        wos_config=wos_config,
-        status_counts=status_counts,
         quota_state=quota_state,
     )
     await message.reply_text(msg)
@@ -304,36 +280,6 @@ async def _handle_jobs(message: "Message") -> None:
     for name, j in sorted(disabled):
         schedule = j.get("schedule", "?")
         lines.append(f"[off] {name} — {schedule}")
-    await message.reply_text("\n".join(lines))
-
-
-async def _handle_wos(message: "Message") -> None:
-    from orchestration.dispatcher_handlers import read_wos_config  # noqa: PLC0415
-    from orchestration.registry import Registry  # noqa: PLC0415
-    from orchestration.wos_dashboard import _get_bisque_relay_base_url  # noqa: PLC0415  # private import intentional; try/except below bounds the risk
-
-    config = read_wos_config()
-    execution_enabled = bool(config.get("execution_enabled", False))
-    status_label = "enabled" if execution_enabled else "stopped"
-
-    registry = Registry()
-    counts = registry.get_status_counts()
-    active = counts.get("active", 0)
-    ready = counts.get("ready-for-steward", 0)
-    pending = counts.get("pending", 0)
-
-    try:
-        base_url = _get_bisque_relay_base_url()
-        dashboard_url = f"{base_url}/files/wos-dashboard-active.html"
-        link_line = f"Dashboard: {dashboard_url}"
-    except Exception:
-        link_line = "Dashboard: (URL unavailable)"
-
-    lines = [
-        f"WOS: {status_label}",
-        f"Queue: {active} active, {ready} ready, {pending} pending",
-        link_line,
-    ]
     await message.reply_text("\n".join(lines))
 
 

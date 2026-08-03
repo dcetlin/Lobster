@@ -15,10 +15,10 @@ from pathlib import Path
 
 import pytest
 
-# Insert src/mcp into path so user_model can be imported directly
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src" / "mcp"))
+# Insert src/ into path so utils.owner_config can be imported directly
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
-from user_model.owner import read_owner
+from utils.owner_config import read_owner
 
 
 # ---------------------------------------------------------------------------

@@ -438,25 +438,6 @@ Background subagents call `write_result(task_id, chat_id, text, ...)`, which dro
            pr_number = pr_parts[-1]
            pr_repo = f"{pr_parts[-4]}/{pr_parts[-3]}"
 
-           # WOS PR coordinator fast-path: WOS-originated PRs bypass the review
-           # agent and go directly to the coordinator which owns oracle→fix→merge.
-           from src.orchestration.dispatcher_handlers import route_wos_pr_result
-           wos_routing = route_wos_pr_result(
-               pr_url=pr_url,
-               task_id=msg.get("task_id"),
-               chat_id=msg["chat_id"],
-               result_text=msg["text"],
-           )
-           if wos_routing["action"] == "spawn_subagent":
-               Task(
-                   subagent_type=wos_routing["agent_type"],
-                   run_in_background=True,
-                   prompt=wos_routing["prompt"],
-               )
-               mark_processed(message_id)
-               continue
-           # else: task_id does not start with "wos-" — fall through to review agent
-
            # Dedup check: skip if reviewer already running for this PR
            active = get_active_sessions()
            reviewer_task_id = f"review-{msg.get('task_id', 'unknown')}"
@@ -495,76 +476,8 @@ Background subagents call `write_result(task_id, chat_id, text, ...)`, which dro
                mark_processed(message_id)
            continue
 
-       # --- METABOLIC CLASSIFICATION (src/orchestration/metabolic_router.py) ---
-       # Apply classify_result() heuristics to the result text before relaying.
-       # Rules are documented in metabolic_router.py — apply them cognitively in order:
-       #   1. HEAT  : len < 120 and no artifact signals
-       #   2. PEARL : task_id starts with "review-" AND "VERDICT: APPROVED" in text
-       #   3. PEARL : len > 800 AND 2+ artifact signals (URLs, #refs, /home/ paths, PR #N)
-       #   4. SEED  : forward-trajectory language ("could", "next step", etc.) AND len < 600
-       #   5. SHIT  : failure vocabulary ("failed", "traceback", etc.) AND no "VERDICT: APPROVED"
-       #   6. JUICE : len > 400 AND forward-trajectory AND artifact signals (not caught by SEED)
-       #   7. MIXED : default
-       #
-       # ARTIFACT_PATTERNS: https?://\S+  |  #\d{2,5}\b  |  /home/\S+  |  oracle/verdicts/  |  VERDICT:  |  PR #\d+  |  Issue #\d+
-       #
        result_text = msg["text"]
-       task_id_for_cls = msg.get("task_id", "")
-       cls_result = classify_result(result_text, task_id_for_cls, {})  # apply rules above
-       # cls_result.cls is one of: pearl, seed, shit, heat, juice, mixed
-       # cls_result.artifacts is the list of extracted artifact strings
-       # cls_result.provisional is always True in cycle 1
-       #
-       prefix_map = {
-           "pearl": "🔵 Pearl",
-           "seed":  "🌱 Seed",
-           "shit":  "⚠️ Issue",
-           "heat":  None,    # relay as-is
-           "juice": "⚡ Juice",
-           "mixed": None,    # relay as-is
-       }
-       cls_prefix = prefix_map.get(cls_result.cls if isinstance(cls_result, object) else str(cls_result), None)
-       reply_text = f"[{cls_prefix}] {result_text}" if cls_prefix else result_text
-       #
-       # Pearl: dispatch background preservation agent
-       if (cls_result.cls if hasattr(cls_result, "cls") else cls_result) == "pearl":
-           pearl_task_id = f"preserve-pearl-{task_id_for_cls[:20]}"
-           pearl_date = datetime.utcnow().strftime("%Y%m%d")
-           pearl_file = f"~/lobster-user-config/memory/canonical/pearls/pearl-{task_id_for_cls}-{pearl_date}.md"
-           artifacts_yaml = "\n".join(f"  - {a}" for a in (cls_result.artifacts if hasattr(cls_result, "artifacts") else []))
-           cls_confidence = cls_result.confidence if hasattr(cls_result, "confidence") else 0.0
-           cls_rationale = cls_result.rationale if hasattr(cls_result, "rationale") else ""
-           Task(
-               subagent_type="lobster-generalist",
-               run_in_background=True,
-               prompt=(
-                   f"---\ntask_id: {pearl_task_id}\nchat_id: 0\nsource: system\n---\n\n"
-                   f"Write a structured pearl record. Create directory if needed.\n\n"
-                   f"1. Write this file: {pearl_file}\n\n"
-                   f"```\n---\nsource_task_id: {task_id_for_cls}\n"
-                   f"produced_at: {datetime.utcnow().isoformat()}Z\n"
-                   f"classification_confidence: {cls_confidence}\n"
-                   f"rationale: {cls_rationale}\n"
-                   f"artifacts:\n{artifacts_yaml}\n"
-                   f"tags: [pearl]\n---\n\n"
-                   f"# Pearl: {task_id_for_cls}\n\n{result_text}\n```\n\n"
-                   f"2. Call memory_store with tags=['pearl', '{task_id_for_cls}'] and the full result text above.\n\n"
-                   f"Minimum viable output: markdown file written and memory_store called.\n"
-                   f"Boundary: do not send_reply to the user — background preservation only.\n"
-                   f"Call write_result(task_id='{pearl_task_id}', sent_reply_to_user=False, status='success') when done."
-               ),
-           )
-       #
-       # Shit: append to sweep-candidates.jsonl (fire-and-forget Bash append, no LLM)
-       if (cls_result.cls if hasattr(cls_result, "cls") else cls_result) == "shit":
-           import json as _json
-           _sweep_entry = _json.dumps({
-               "task_id": task_id_for_cls,
-               "flagged_at": datetime.utcnow().isoformat() + "Z",
-               "reason": "metabolic-shit",
-               "text_preview": result_text[:200],
-           })
-           Bash(f"echo '{_sweep_entry}' >> ~/lobster-workspace/data/sweep-candidates.jsonl")
+       reply_text = result_text
        #
        # --- RESULT ELEGANCE AUDIT (before every relay) ---
        # Before calling send_reply with a subagent result, apply this heuristic check:
@@ -694,7 +607,7 @@ Dead/failed agent events routed by the reconciler. These are system-internal —
 
 ### scheduled_task_crash (`type: "scheduled_task_crash"`)
 
-Written by heartbeat scripts (`executor-heartbeat.py`, `steward-heartbeat.py`) when `main()` raises an unhandled exception. The script catches the exception in its outer crash handler, writes this inbox message, and exits with code 1.
+Written by Type B cron-direct scripts (e.g. `cc-usage-poller.py`, `export-logs.py`) when `main()` raises an unhandled exception. The script catches the exception in its outer crash handler, writes this inbox message, and exits with code 1.
 
 ```
 1. mark_processing(message_id)
@@ -702,9 +615,9 @@ Written by heartbeat scripts (`executor-heartbeat.py`, `steward-heartbeat.py`) w
 3. mark_processed(message_id)
 ```
 
-**Key fields:** `job_name` (which heartbeat crashed), `text` (human-readable crash summary with traceback, pre-formatted for Telegram).
+**Key fields:** `job_name` (which script crashed), `text` (human-readable crash summary with traceback, pre-formatted for Telegram).
 
-No subagent needed — relay the `text` field directly. The crash alert is already formatted for user delivery by the heartbeat script.
+No subagent needed — relay the `text` field directly. The crash alert is already formatted for user delivery by the script.
 
 ---
 
@@ -786,49 +699,6 @@ Injected by the MCP server after every 20 real user messages. Spawn session-note
            pending_responses: <pending_responses list from step 3>
 5. mark_processed(message_id)
 ```
-
----
-
-### wos_owner_required (`type: "wos_owner_required"`)
-
-Written by `steward._write_owner_required_message` when a WOS subagent writes `outcome=owner_decision_required` in its result file. The UoW has already been transitioned to `awaiting-owner` status by the steward before this message arrives. The message is pre-formatted — no subagent spawn needed.
-
-```
-1. mark_processing(message_id)
-2. route_wos_message(msg) → returns action="send_reply" with pre-formatted text
-3. send_reply(chat_id=result["chat_id"], text=result["text"], source="telegram")
-4. mark_processed(message_id)
-```
-
-Dan's reply provides the decision. The notification text includes the exact command to re-queue: `/decide <uow_id> owner <decision>`. This calls `handle_owner_decide` in `dispatcher_handlers.py`, which records the decision in the UoW's steward_log and transitions it from `awaiting-owner` → `ready-for-steward`.
-
-Implementation: `route_wos_message` is the single entry point. The handler is `handle_wos_owner_required` in `src/orchestration/dispatcher_handlers.py`. Call `route_wos_message(msg)` — do not call `handle_wos_owner_required` directly.
-
----
-
-### wos_prescribe (`type: "wos_prescribe"`)
-
-Written by `steward-heartbeat.py` when it offloads a blocking LLM prescription call to an async inbox dispatch. The UoW is in `prescribing` state. This message carries the full prescription context as non-text fields.
-
-**Important:** `text` is always `''` and `chat_id` is always `0` — this is expected and correct. Do NOT treat this as an empty/unknown message and force-`mark_processed`. The payload is in the non-text fields (`uow_id`, `uow_summary`, `reentry_posture`, `completion_gap`, `issue_body`, `cycles`, `new_cycles`, `selected_executor_type`, `prescribed_skills`, `vision_orientation`, `dan_register`, `steward_log`, `now_iso`).
-
-```
-1. mark_processing(message_id)
-2. result = route_wos_message(msg)
-   # Always returns action="spawn_subagent"
-3. Task(
-       subagent_type=result["agent_type"],
-       run_in_background=True,
-       prompt=result["prompt"],
-   )
-4. mark_processed(message_id)
-```
-
-The spawned subagent (`lobster-generalist`, task_id `wos-prescribe-{uow_id[:8]}`) generates the prescription directly as the LLM, writes it via `scheduled-tasks/wos-write-artifact.py`, and transitions the UoW from `prescribing` → `ready-for-executor`.
-
-Implementation: `route_wos_message` is the single entry point. The handler is `handle_wos_prescribe` in `src/orchestration/dispatcher_handlers.py`. Call `route_wos_message(msg)` — do not call `handle_wos_prescribe` directly.
-
-Rules: never `send_reply` (chat_id is 0 — no user to notify).
 
 ---
 
@@ -1060,16 +930,10 @@ If `reacted_to_text` is empty: use `get_conversation_history` to get context.
        else:
            send_reply(chat_id=chat_id, text=f"Unknown todo callback: {data}", source=source)
 
-8. elif data.startswith("decide_retry:") or data.startswith("decide_close:") or data.startswith("routing_pref_confirm:") or data.startswith("routing_pref_reject:"):
-       from src.orchestration.dispatcher_handlers import route_callback_message
-       result = route_callback_message(msg)
-       if result["handled"]:
-           send_reply(chat_id=chat_id, text=result["text"], source=source)
-
-9. else:
+8. else:
        send_reply(chat_id=chat_id, text=f"Unknown callback: {data}", source=source)
 
-10. mark_processed(message_id)
+9. mark_processed(message_id)
 ```
 
 ### Telegram-specific
@@ -1234,22 +1098,6 @@ Do not modify Summary or Started/Ended. 3. Write back. 4. Call write_result.
 
 ---
 
-## WOS Dashboard Command
-
-**`/wos dashboard`** (or `wos dashboard`) — generate a fresh HTML dashboard from live registry data and upload to Bisque.
-
-Detected by `parse_wos_dashboard_command(msg["text"])`. Handled inline (calls `handle_wos_dashboard()` which calls `wos_dashboard_gen.generate_and_upload()` and returns the public URL — fast enough for the main thread):
-
-```python
-from src.orchestration.dispatcher_handlers import parse_wos_dashboard_command, handle_wos_dashboard
-
-if parse_wos_dashboard_command(msg.get("text", "")):
-    result = handle_wos_dashboard()
-    send_reply(chat_id=chat_id, text=result, source=source, message_id=message_id)
-```
-
----
-
 ## LOS (Life Operating System) Commands
 
 **`/todos`** — display Dan's current action items with interactive buttons.
@@ -1324,7 +1172,7 @@ Task(
 send_reply(chat_id=chat_id, text="Checking quota...", source=source)
 ```
 
-**`/status`** — show system status snapshot (agents, WOS state, CC usage).
+**`/status`** — show system status snapshot (agents, CC usage).
 
 Dispatch to a status-query subagent (reads files and DB — 7-second rule applies):
 
@@ -1340,65 +1188,10 @@ Task(
 send_reply(chat_id=chat_id, text="Gathering status...", source=source)
 ```
 
-**`/wos`** — show WOS pipeline state (active UoW count, status breakdown, Bisque dashboard link).
-
-Dispatch to a wos-query subagent (reads wos.db — 7-second rule applies):
-
-```python
-Task(
-    subagent_type="lobster-generalist",
-    run_in_background=True,
-    prompt=(
-        f"---\ntask_id: wos-query-{chat_id}\nchat_id: {chat_id}\nsource: {source}\n---\n\n"
-        + open(Path.home() / "lobster-workspace/scheduled-jobs/tasks/dispatcher-wos-query.md").read()
-    ),
-)
-send_reply(chat_id=chat_id, text="Querying WOS pipeline...", source=source)
-```
-
-**`/wos uow <uow-id>`** — show detail for a specific Unit of Work.
-
-Accepts a full ID (`uow_20260501_abc123`) or just the trailing hex suffix (`abc123`).
-
-Dispatch to a wos-uow-detail subagent (reads wos.db — 7-second rule applies):
-
-```python
-from src.orchestration.dispatcher_handlers import handle_wos_uow
-from src.orchestration.registry import Registry
-
-registry = Registry()
-parts = msg["text"].strip().split(None, 2)
-# parts: ["wos", "uow", "<id>"]
-uow_id = parts[2].strip() if len(parts) >= 3 else ""
-
-if not uow_id:
-    send_reply(chat_id=chat_id, text="Usage: /wos uow <uow-id>", source=source)
-    mark_processed(message_id)
-else:
-    result = handle_wos_uow(uow_id, registry=registry)
-    if result != "found":
-        # Not found or ambiguous — send the error message inline, no subagent needed
-        send_reply(chat_id=chat_id, text=result, source=source, message_id=message_id)
-    else:
-        task_id = f"wos-uow-detail-{uow_id}"
-        task_file = open(Path.home() / "lobster-workspace/scheduled-jobs/tasks/dispatcher-wos-uow-detail.md").read()
-        Task(
-            subagent_type="lobster-generalist",
-            run_in_background=True,
-            prompt=(
-                f"---\ntask_id: {task_id}\nchat_id: {chat_id}\nsource: {source}\n---\n\n"
-                f"uow_id = {uow_id!r}\n\n"
-                + task_file
-            ),
-        )
-        send_reply(chat_id=chat_id, text=f"Looking up UoW `{uow_id}`...", source=source)
-        mark_processed(message_id)
-```
-
 **`/help`** — show command index. Handled inline, no subagent needed:
 
 ```python
-from src.orchestration.dispatcher_handlers import handle_help
+from bot.dispatcher_commands import handle_help
 
 send_reply(chat_id=chat_id, text=handle_help(), source=source, message_id=message_id)
 ```
@@ -1415,7 +1208,7 @@ cmd = msg["text"].strip().lstrip("/").lower()
 **`status` / `health`** — inline system snapshot. `get_active_sessions()` is a fast MCP call allowed on the main thread.
 
 ```python
-from src.orchestration.dispatcher_handlers import handle_status
+from bot.dispatcher_commands import handle_status
 
 active_sessions = get_active_sessions()  # inline — fast read
 text = handle_status(active_sessions)
@@ -1425,7 +1218,7 @@ send_reply(chat_id=chat_id, text=text, source=source, message_id=message_id)
 **`usage`** — inline CC quota read. Pure file read, no MCP calls needed.
 
 ```python
-from src.orchestration.dispatcher_handlers import handle_usage
+from bot.dispatcher_commands import handle_usage
 
 send_reply(chat_id=chat_id, text=handle_usage(), source=source, message_id=message_id)
 ```
@@ -1433,7 +1226,7 @@ send_reply(chat_id=chat_id, text=handle_usage(), source=source, message_id=messa
 **`usage full`** — spawns subagent for full usage report.
 
 ```python
-from src.orchestration.dispatcher_handlers import handle_usage_full
+from bot.dispatcher_commands import handle_usage_full
 
 send_reply(chat_id=chat_id, text=handle_usage_full(), source=source, message_id=message_id)
 Task(
@@ -1451,7 +1244,7 @@ Task(
 **`agents`** — inline active agent list. `get_active_sessions()` is a fast MCP call allowed on the main thread.
 
 ```python
-from src.orchestration.dispatcher_handlers import handle_agents
+from bot.dispatcher_commands import handle_agents
 
 active_sessions = get_active_sessions()  # inline — fast read
 text = handle_agents(active_sessions)
@@ -1461,7 +1254,7 @@ send_reply(chat_id=chat_id, text=text, source=source, message_id=message_id)
 **`inbox`** — inline queue depth. `check_inbox()` and `get_stats()` are allowed on the main thread.
 
 ```python
-from src.orchestration.dispatcher_handlers import handle_inbox
+from bot.dispatcher_commands import handle_inbox
 
 msgs = check_inbox(limit=5)
 stats = get_stats()
@@ -1473,7 +1266,7 @@ send_reply(chat_id=chat_id, text=text, source=source, message_id=message_id)
 **`restart mcp`** — inline ack then subagent restart. The inline half writes the ack; the subagent handles the slow systemctl call.
 
 ```python
-from src.orchestration.dispatcher_handlers import handle_restart_mcp
+from bot.dispatcher_commands import handle_restart_mcp
 
 send_reply(
     chat_id=chat_id,
@@ -1497,7 +1290,7 @@ Note: `message_id` is passed to `send_reply` to atomically mark the message as p
 **`restart dispatcher`** — inline instructions. No code operation; returns a static message.
 
 ```python
-from src.orchestration.dispatcher_handlers import handle_restart_dispatcher
+from bot.dispatcher_commands import handle_restart_dispatcher
 
 send_reply(chat_id=chat_id, text=handle_restart_dispatcher(), source=source, message_id=message_id)
 ```
@@ -1505,7 +1298,7 @@ send_reply(chat_id=chat_id, text=handle_restart_dispatcher(), source=source, mes
 **`debug on` / `debug off`** — inline flag file toggle.
 
 ```python
-from src.orchestration.dispatcher_handlers import handle_debug
+from bot.dispatcher_commands import handle_debug
 
 on = cmd == "debug on"
 text = handle_debug(on=on)
@@ -1531,7 +1324,7 @@ args = parts[2] if len(parts) > 2 else ""
 **`/config list`** — inline, no subagent needed:
 
 ```python
-from src.orchestration.dispatcher_handlers import handle_config_list
+from bot.dispatcher_commands import handle_config_list
 
 send_reply(chat_id=chat_id, text=handle_config_list(), source=source, message_id=message_id)
 ```
@@ -1539,7 +1332,7 @@ send_reply(chat_id=chat_id, text=handle_config_list(), source=source, message_id
 **`/config read <filename>`** — inline for short files; chunked reply for long files:
 
 ```python
-from src.orchestration.dispatcher_handlers import handle_config_read
+from bot.dispatcher_commands import handle_config_read
 
 filename = args.strip()
 if not filename:
@@ -1558,7 +1351,7 @@ else:
 **`/config search <query>`** — inline search across all user config files:
 
 ```python
-from src.orchestration.dispatcher_handlers import handle_config_search
+from bot.dispatcher_commands import handle_config_search
 
 query = args.strip()
 send_reply(chat_id=chat_id, text=handle_config_search(query), source=source, message_id=message_id)
@@ -1567,7 +1360,7 @@ send_reply(chat_id=chat_id, text=handle_config_search(query), source=source, mes
 **`/config append <filename> <text>`** — inline append to a user config file:
 
 ```python
-from src.orchestration.dispatcher_handlers import handle_config_append
+from bot.dispatcher_commands import handle_config_append
 
 # args format: "<filename> <text>"
 append_parts = args.split(None, 1)
@@ -1639,93 +1432,6 @@ pr_ref = parts[1].strip() if len(parts) > 1 else ""
 #   - POST: gh pr review {pr_number} --repo {pr_repo} --comment --body "🤖🦞 Lobster (reviewer): PASS/NEEDS-WORK/FAIL: ..."
 #   - write_result: plain-English verdict, no code terms
 # send_reply: "On it — reviewing {pr_url}."
-```
-
----
-
-## Agent Council — "council: [topic]" Trigger
-
-When a user message matches `^council:\s+(.+)` (case-insensitive), extract the topic and dispatch a council-deliberation subagent.
-
-**Match trigger:**
-```python
-import re
-council_match = re.match(r'^council:\s+(.+)', msg["text"].strip(), re.IGNORECASE)
-```
-
-**Dispatch pattern:**
-```python
-if council_match:
-    topic = council_match.group(1).strip()
-    council_task_id = f"council-{re.sub(r'[^a-z0-9]+', '-', topic.lower())[:40]}"
-    send_reply(
-        chat_id=chat_id,
-        text=f"Deliberating on: {topic}",
-        source=source,
-        reply_to_message_id=msg.get("telegram_message_id"),
-    )
-    Task(
-        subagent_type="lobster-generalist",
-        run_in_background=True,
-        prompt=(
-            f"---\n"
-            f"task_id: {council_task_id}\n"
-            f"chat_id: {chat_id}\n"
-            f"source: {source}\n"
-            f"background: true\n"
-            f"---\n\n"
-            f"Run a council deliberation on the following topic:\n\n"
-            f"TOPIC: {topic}\n"
-            f"DOMAIN_CONTEXT_PATH: ~/lobster-workspace/workstreams/ergonomics-orient/frontier.md\n"
-            f"CANON_PATH: ~/lobster-workspace/workstreams/agent-council/canon/\n"
-            f"COUNCIL_STATE_PATH: ~/lobster-workspace/workstreams/agent-council/council-state.json\n"
-            f"SOURCE: in-conversation\n"
-            f"CHAT_ID: {chat_id}\n\n"
-            f"Follow the council-deliberation task definition at:\n"
-            f"~/lobster-workspace/scheduled-jobs/tasks/council-deliberation.md\n\n"
-            f"Minimum viable output: A write_result call with the deliberation outcome — "
-            f"either a committed canon entry or a clear note on why the topic was deferred.\n"
-            f"Boundary: do not include the Researcher/Synthesizer/Canon-Keeper deliberation transcript "
-            f"in the output — only the committed claim (or deferral note) goes to Dan.\n"
-            f"Boundary: do not implement Devil's Advocate — this is the 3-role MVP (Researcher, "
-            f"Synthesizer, Canon-Keeper only)."
-        ),
-    )
-    mark_processed(message_id)
-    continue
-```
-
-**When the council result arrives** (`task_id` starts with `council-`, `chat_id` is user's chat):
-- Result is relayed normally through the subagent_result handler
-- Short results (< 500 chars): relay inline
-- The result text is already in Dan's output format — do not reformat or summarize
-
----
-
-## System Investigations (lobster-auditor)
-
-When the user asks to investigate a system issue — restart cause, missing messages, hook failures, queue anomalies — spawn `lobster-auditor`.
-
-**Before constructing the auditor prompt**, call `memory_search('restart diagnosis', project='lobster')`. If any results are returned, include them verbatim in the task prompt under the heading `Relevant operational rules from memory:`. The auditor uses these rules to apply project-specific diagnostic knowledge without having that knowledge hardcoded into the agent definition.
-
-```python
-# Step 1: fetch domain-specific diagnostic rules from memory
-memory_results = memory_search('restart diagnosis', project='lobster')
-memory_context = ""
-if memory_results:
-    rules_text = "\n".join(r["content"] for r in memory_results)
-    memory_context = f"\nRelevant operational rules from memory:\n{rules_text}\n"
-
-# Step 2: spawn auditor with rules injected into the prompt
-Task(
-    subagent_type="lobster-auditor",
-    run_in_background=True,
-    prompt=(
-        f"---\ntask_id: {task_id}\nchat_id: {chat_id}\nsource: {source}\n---\n\n"
-        f"Investigate: {investigation_description}\n"
-        f"{memory_context}"
-    ),
-)
 ```
 
 ---
@@ -1994,33 +1700,5 @@ No background subagent is needed — `create_task` is a synchronous MCP call.
 
 # HYPOTHESIS
 
-## [HYPOTHESIS] routing-preferences-dispatcher-check
-**Added:** 2026-05-22
-**Expires:** 2026-06-05
-**Confidence:** forming
-**Observation basis:** routing-preferences.yaml and check_routing_preferences() exist in dispatcher_handlers.py; callback wiring for routing_pref_confirm:/routing_pref_reject: was added in uow_20260522_c2b5a0 without a prior oracle decision.
-
-Routing preferences are stored in `~/lobster-user-config/routing-preferences.yaml` and confirmed by Dan via Telegram inline buttons (proposed by the morning briefing job when recurring `pattern_observation` events cross a confidence threshold).
-
-**Applying:** Before determining which subagent to route a user message to, check routing preferences:
-
-```python
-from src.orchestration.dispatcher_handlers import check_routing_preferences
-
-agent_hint = check_routing_preferences(msg["text"])
-# Do not apply if message is an explicit command (/command, wos operation, /decide, /approve)
-if agent_hint and not msg["text"].startswith("/"):
-    subagent_type = agent_hint  # prefer the matched routing preference
-# else: proceed with normal routing decision
-```
-
-- `check_routing_preferences` reads from disk on every call (no caching) and returns the `agent_hint` for the first matching preference, or `None` if none match.
-- Matching uses case-insensitive substring check against each preference's `condition` field.
-- **Do not override explicit commands.** If the message is a `/command`, a named WOS operation, or a `/decide`/`/approve` action, skip routing preference checks.
-- When a preference fires, `check_routing_preferences` logs `routing_preference_applied: <id>` to the Python logger. No additional logging needed.
-- This check costs a single file read (~1ms) — do it on every user message (not just at startup).
-
-**Callback handling:** Routing preference confirmations and rejections arrive as `type: "callback"` with `callback_data` starting with `routing_pref_confirm:` or `routing_pref_reject:`. These are handled by `route_callback_message` in `src/orchestration/dispatcher_handlers.py` (already wired into the callback dispatch table — step 8).
-
-**Review question:** Has the routing preferences feature shipped a complete HITL loop (morning briefing proposes → Dan confirms → preference fires in dispatch) and been verified correct at least twice in production?
+(none active — the routing-preferences-dispatcher-check entry expired 2026-06-05 without graduation and was discarded per the Bootup File Edit Protocol expiry rule during the 2026-08-03 process-layer slimdown; its subject, `check_routing_preferences()`, was never implemented in `dispatcher_handlers.py` and that module has since been removed entirely.)
 

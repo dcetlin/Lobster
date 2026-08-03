@@ -151,7 +151,7 @@ class TestFormatIsoForUser:
 
 class TestNoHardcodedTimezoneInQuotaFormatter:
     """
-    The quota reset formatter in dispatcher_handlers must use the timezone utility,
+    The quota reset formatter in bot.dispatcher_commands must use the timezone utility,
     not a hardcoded America/New_York or America/Los_Angeles string.
 
     This test fails if the hardcoded strings are present — it will pass once
@@ -190,7 +190,7 @@ class TestNoHardcodedTimezoneInQuotaFormatter:
             },
         }
 
-        from orchestration.dispatcher_handlers import format_quota_message
+        from bot.dispatcher_commands import format_quota_message
 
         with patch.dict(os.environ, {"LOBSTER_USER_TZ": "America/New_York"}, clear=False):
             msg_et = format_quota_message(state)

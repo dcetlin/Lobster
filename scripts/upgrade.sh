@@ -5063,6 +5063,134 @@ PY136B
         migrated=$((migrated + 1))
     fi
 
+    # Migration 138: Slimdown — disable the category-C process-layer jobs/cron/
+    # systemd timers left over from the 2026-08-03 WOS/oracle/philosophy purge.
+    #
+    # The repo files for the WOS orchestration engine, oracle review gate,
+    # philosophy/discovery system, and their scheduled-tasks scripts were removed
+    # in this same PR. On an existing install, jobs.json entries, crontab lines,
+    # and installed systemd timer units for those jobs still exist and would now
+    # fail (script/module not found) if triggered. This migration disables them
+    # in place — idempotent, reversible (re-enable manually if ever needed), and
+    # safe to run against an install that already had them disabled live.
+    local _M138_JOBS=(
+        wos-audit-9am-delivery wos-event-poller wos-health-check wos-hourly-observation
+        wos-metabolic-digest wos-overnight-loop wos-pr-sweeper wos-queue-monitor
+        learnings-proposals proposals-authorship
+        philosophy-explore-weekly-synthesis philosophy-harvest
+        pattern-candidate-sweep
+        lobster-hygiene lobster-hygiene-biweekly structural-hygiene-audit lobster-meta
+        council-note-check proposals-digest decay-detector garden-caretaker
+        pr-review-sweeper orchestration-artifacts-cleanup executor-heartbeat
+        steward-heartbeat github-issue-cultivator weekly-epistemic-retro
+        epistemic-drift-sweep issue-sweeper operativity-quarterly-review
+        uow-reflection registry-vacuum
+    )
+    local _JOBS_FILE_138="$WORKSPACE_DIR/scheduled-jobs/jobs.json"
+    if [ -f "$_JOBS_FILE_138" ]; then
+        local _m138_names_csv
+        _m138_names_csv=$(IFS=,; echo "${_M138_JOBS[*]}")
+        local _m138_tmp
+        _m138_tmp=$(mktemp)
+        local _m138_changed
+        _m138_changed=$(uv run python3 - "$_JOBS_FILE_138" "$_m138_tmp" "$_m138_names_csv" <<'PY138'
+import json, sys
+from datetime import datetime, timezone
+jobs_path, tmp_path, names_csv = sys.argv[1], sys.argv[2], sys.argv[3]
+names = [n for n in names_csv.split(",") if n]
+with open(jobs_path) as f:
+    data = json.load(f)
+jobs = data.get("jobs", {})
+changed = 0
+for name in names:
+    job = jobs.get(name)
+    if job is not None and job.get("enabled") is True:
+        job["enabled"] = False
+        job["updated_at"] = datetime.now(timezone.utc).isoformat()
+        changed += 1
+with open(tmp_path, "w") as f:
+    json.dump(data, f, indent=2, default=str)
+print(changed)
+PY138
+        )
+        if [ -s "$_m138_tmp" ] && [ "${_m138_changed:-0}" -gt 0 ] 2>/dev/null; then
+            mv "$_m138_tmp" "$_JOBS_FILE_138"
+            substep "Migration 138: disabled $_m138_changed category-C job(s) in jobs.json"
+            migrated=$((migrated + 1))
+        else
+            rm -f "$_m138_tmp"
+            substep "Migration 138: no enabled category-C jobs found in jobs.json — skipping"
+        fi
+    fi
+
+    local _M138_CRON_MARKERS=(
+        LOBSTER-WOS-METABOLIC-DIGEST LOBSTER-GARDEN-CARETAKER LOBSTER-REGISTRY-VACUUM
+        LOBSTER-SCHEDULED-LEARNINGS-PROPOSALS LOBSTER-PHILOSOPHY-HARVEST LOBSTER-WOS-HEALTH-CHECK
+        LOBSTER-WOS-PR-SWEEPER LOBSTER-ORCHESTRATION-ARTIFACTS-CLEANUP LOBSTER-PR-REVIEW-SWEEPER
+        LOBSTER-WOS-QUEUE-MONITOR LOBSTER-COUNCIL-NOTE-CHECK LOBSTER-WOS-SPRINT-CYCLE
+        LOBSTER-STEWARD-HEARTBEAT LOBSTER-EXECUTOR-HEARTBEAT LOBSTER-WOS-EVENT-POLLER
+        LOBSTER-WOS-EVENT-POLLER-30S
+    )
+    if crontab -l >/dev/null 2>&1; then
+        local _m138_cron_changed=0
+        local _m138_cron_tmp
+        _m138_cron_tmp=$(mktemp)
+        crontab -l 2>/dev/null > "$_m138_cron_tmp"
+        for marker in "${_M138_CRON_MARKERS[@]}"; do
+            if grep -qF "# $marker" "$_m138_cron_tmp" && ! grep -qF "SLIMDOWN-DISABLED" <(grep -F "# $marker" "$_m138_cron_tmp"); then
+                sed -i "s|^\(.*# $marker\)$|# SLIMDOWN-DISABLED-138: \1|" "$_m138_cron_tmp"
+                _m138_cron_changed=$((_m138_cron_changed + 1))
+            fi
+        done
+        if [ "$_m138_cron_changed" -gt 0 ]; then
+            crontab "$_m138_cron_tmp"
+            substep "Migration 138: commented out $_m138_cron_changed category-C cron entr(y/ies)"
+            migrated=$((migrated + 1))
+        else
+            substep "Migration 138: no active category-C cron entries found — skipping"
+        fi
+        rm -f "$_m138_cron_tmp"
+    fi
+
+    local _M138_TIMERS=(
+        lobster-council-sunday-sweep.timer lobster-epistemic-drift-sweep.timer
+        lobster-lobster-hygiene-biweekly.timer lobster-lobster-hygiene.timer
+        lobster-philosophy-discovery-scorer.timer lobster-structural-hygiene-audit.timer
+        lobster-system-retrospective.timer lobster-weekly-epistemic-retro.timer
+        lobster-weekly-hygiene.timer lobster-wos-restart-0500.timer
+        lobster-wos-timed-pause-20260614.timer lobster-negentropic-sweep.timer
+    )
+    for timer in "${_M138_TIMERS[@]}"; do
+        if systemctl list-unit-files "$timer" --no-pager 2>/dev/null | grep -q "$timer"; then
+            local _m138_t_enabled
+            _m138_t_enabled=$(systemctl is-enabled "$timer" 2>/dev/null || echo "unknown")
+            if [ "$_m138_t_enabled" = "enabled" ]; then
+                sudo systemctl stop "$timer" 2>/dev/null || true
+                sudo systemctl disable "$timer" 2>/dev/null || true
+                substep "Migration 138: stopped+disabled $timer"
+                migrated=$((migrated + 1))
+            fi
+        fi
+    done
+
+    # Note: lobster-wos-router.service (a persistent daemon, not a timer) is
+    # intentionally NOT touched by this migration — stopping/killing a running
+    # service is out of scope for an automated migration. Stop it manually
+    # (sudo systemctl disable --now lobster-wos-router.service) once confirmed
+    # unneeded; its backing daemon (src/daemons/wos_execute_router.py) was
+    # removed by this same PR, so the service will error on next restart
+    # regardless.
+    #
+    # Note: /home/lobster/.claude/settings.json (global Claude Code settings,
+    # not tracked in this repo) may still register PreToolUse/PostToolUse/
+    # SubagentStop hooks for files removed by this PR (pr-merge-gate.py,
+    # wos-execute-gate.py, post-commit-oracle.py, require-auditor-context-update.py,
+    # dispatch-template-check.py, catchup-gate.py, pre-tool-use-pr-idempotency.py,
+    # require-register-agent-task-id.py, require-task-id-in-prompt.py,
+    # validate-workflow-artifact.py, post-compact-gate.py). This migration cannot
+    # safely edit that file (outside git, live Claude Code config) — remove those
+    # hook entries by hand after this upgrade completes.
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

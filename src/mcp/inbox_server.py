@@ -188,103 +188,6 @@ except Exception as _mem_err:
     import traceback as _tb
     _startup_log.warning('Memory system unavailable: %s', _mem_err)
 
-# User Model subsystem
-_user_model = None
-_user_model_tool_names: set[str] = set()
-USER_MODEL_TOOL_DEFINITIONS: list = []
-try:
-    from user_model import create_user_model, USER_MODEL_TOOL_DEFINITIONS
-    _user_model = create_user_model()
-    _user_model_tool_names = _user_model.tool_names
-    _startup_log.info('User Model subsystem initialized.')
-except Exception as _um_err:
-    import traceback as _um_tb
-    _startup_log.warning('User Model subsystem unavailable: %s', _um_err)
-
-# ---------------------------------------------------------------------------
-# Background observation worker — fire-and-forget, zero main-thread blocking
-# ---------------------------------------------------------------------------
-import queue as _queue_mod
-
-_observation_queue: _queue_mod.Queue = _queue_mod.Queue(maxsize=500)
-_observation_thread: threading.Thread | None = None
-
-
-def _observation_worker() -> None:
-    """Daemon thread: drain observation queue, call user_model.observe()."""
-    while True:
-        try:
-            item = _observation_queue.get(timeout=10)
-        except _queue_mod.Empty:
-            continue
-        if item is None:  # shutdown sentinel
-            break
-        try:
-            msg_text, msg_id, source, ts = item
-            if _user_model is not None:
-                obs_ids = _user_model.observe(msg_text, msg_id, context=source or "", message_ts=ts)
-                # Debug: emit Tier 1 signal summary when LOBSTER_DEBUG=true.
-                # _emit_event is a no-op when LOBSTER_DEBUG != true (bus filter).
-                if obs_ids:
-                    try:
-                        from user_model.observation import extract_signals
-                        signals = extract_signals(msg_text, msg_id, context=source or "")
-                        if signals:
-                            signal_parts = []
-                            for sig in signals:
-                                sig_type = (
-                                    sig.signal_type.value
-                                    if hasattr(sig.signal_type, "value")
-                                    else str(sig.signal_type)
-                                )
-                                signal_parts.append(
-                                    f"{sig_type}={sig.content[:30]!r} ({sig.confidence:.2f})"
-                                )
-                            summary = ", ".join(signal_parts[:6])  # cap at 6
-                            short_id = msg_id[:20] if len(msg_id) > 20 else msg_id
-                            _emit_event(
-                                f"\U0001f50d [tier 1 fired] msg={short_id} "
-                                f"extracted {len(signals)} signal(s): {summary}",
-                                event_type="user_model.tier1",
-                                severity="debug",
-                                source="observation-worker",
-                            )
-                    except Exception:
-                        pass  # never block observation on debug emit
-        except Exception as _obs_exc:
-            import traceback as _tb
-            _emit_event(
-                f"\U0001f50d [observation worker error] {type(_obs_exc).__name__}: {_obs_exc}\n"
-                + _tb.format_exc()[-800:],
-                event_type="system.error",
-                severity="error",
-                source="observation-worker",
-            )
-            # never crash the worker
-
-
-def _ensure_observation_worker() -> None:
-    """Start the background observation thread if not already running."""
-    global _observation_thread
-    if _user_model is None:
-        return
-    if _observation_thread is not None and _observation_thread.is_alive():
-        return
-    _observation_thread = threading.Thread(
-        target=_observation_worker, daemon=True, name="um-observer"
-    )
-    _observation_thread.start()
-
-
-def _queue_observation(msg_text: str, msg_id: str, source: str | None = None, ts: str | None = None) -> None:
-    """Non-blocking: enqueue a message for background observation. Drops if full."""
-    if _user_model is None:
-        return
-    try:
-        _observation_queue.put_nowait((msg_text, msg_id, source, ts))
-    except _queue_mod.Full:
-        pass  # drop silently — observation is best-effort
-
 # ---------------------------------------------------------------------------
 # Debug observability — LOBSTER_DEBUG=true push notifications
 #
@@ -497,38 +400,6 @@ except ImportError:
     _VALID_SEVERITIES = frozenset({"debug", "info", "warn", "error", "critical"})  # type: ignore[assignment]
 
 
-# ---------------------------------------------------------------------------
-# User model context injection heuristic
-# ---------------------------------------------------------------------------
-_USER_CONTEXT_TRIGGERS = re.compile(
-    r'(?i)(?:'
-    r'(?:what|where)\s+should\s+i'             # "what should I focus on"
-    r'|priorit(?:y|ies|ize)'                    # priorities
-    r'|what\s+(?:matters|do\s+i\s+care)'        # "what matters to me"
-    r'|help\s+me\s+(?:decide|choose|think)'     # decision-making
-    r'|(?:my|the)\s+(?:values?|principles?|preferences?|constraints?)' # explicit model refs
-    r'|what.{0,8}(?:on\s+my\s+plate|next)'     # "what's on my plate"
-    r'|big\s+picture'                           # stepping back
-    r'|step(?:ping)?\s+back'                    # reflection
-    r'|how\s+am\s+i\s+doing'                    # self-check
-    r'|(?:over|under)whelm'                     # emotional state
-    r'|burn.?out|stressed\s+(?:about|out)'      # stress
-    r'|life\s+(?:situation|direction|goals?)'    # life-level
-    r'|introspect|self.?reflect'                # introspection
-    r'|what\s+(?:do\s+i|did\s+i)\s+think'      # recall preferences
-    r'|remind\s+me\s+(?:what|why)\s+i'          # recall motivations
-    r'|(?:deprioritize|reprioritize|reorder)'   # attention management
-    r'|what.{0,8}(?:important|urgent)'          # importance queries
-    r'|good\s+(?:morning|evening|night)'        # greetings that often start reflective exchanges
-    r')',
-)
-
-def _should_inject_user_context(text: str) -> bool:
-    """Fast heuristic: does this message benefit from user model context?"""
-    if not text or len(text) < 8:
-        return False
-    return bool(_USER_CONTEXT_TRIGGERS.search(text))
-
 # MCP SDK
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -606,7 +477,7 @@ def _get_display_tz():
         return _tz_get_owner_zoneinfo()
     import zoneinfo as _zoneinfo
     try:
-        from user_model.owner import get_owner_timezone as _get_owner_tz
+        from src.utils.owner_config import get_owner_timezone as _get_owner_tz
         return _zoneinfo.ZoneInfo(_get_owner_tz())
     except Exception:
         return _zoneinfo.ZoneInfo("UTC")
@@ -4102,19 +3973,7 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
-    ] + (
-        # User Model Tools (only registered when feature flag is enabled)
-        [
-            Tool(
-                name=t["name"],
-                description=t["description"],
-                inputSchema=t["inputSchema"],
-            )
-            for t in USER_MODEL_TOOL_DEFINITIONS
-        ]
-        if _user_model is not None
-        else []
-    )
+    ]
 
 
 def _track_tool_outcome(name: str, result: list[TextContent]) -> None:
@@ -4402,12 +4261,6 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         return await handle_update_session_file(arguments)
     elif name == "list_session_files":
         return await handle_list_session_files(arguments)
-    # User Model Tools (dispatched to user_model subsystem)
-    elif name in _user_model_tool_names and _user_model is not None:
-        result_json = _user_model.dispatch(name, arguments)
-        return [TextContent(type="text", text=result_json)]
-    elif name in _user_model_tool_names and _user_model is None:
-        return [TextContent(type="text", text='{"error": "User model subsystem not initialized."}')]
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -5838,60 +5691,8 @@ async def handle_mark_processing(args: dict) -> list[TextContent]:
             "Add to INBOX_MESSAGE_SOURCES in message_types.py if this is intentional."
         )
 
-    # Queue background observation (non-blocking, best-effort)
     msg_text = msg_data.get("text", "") or msg_data.get("transcription", "")
-    if msg_text and msg_type in USER_FACING_TYPES:
-        _queue_observation(
-            msg_text, message_id,
-            source=msg_data.get("source"),
-            ts=msg_data.get("timestamp"),
-        )
-
-    # Conditionally inject user model context for messages that would benefit
     context_block = ""
-    short_msg_id = message_id[:20] if len(message_id) > 20 else message_id
-    if _user_model is not None and msg_text and msg_type in USER_FACING_TYPES:
-        if _should_inject_user_context(msg_text):
-            try:
-                ctx = _user_model.get_context()
-                if ctx and ctx.strip():
-                    context_block = (
-                        "\n\n---\n"
-                        "**User Model Context** (auto-injected for this message):\n\n"
-                        f"{ctx}"
-                    )
-                    # Debug: notify context was injected
-                    _emit_event(
-                        f"\U0001f50d [context injected] msg={short_msg_id} "
-                        f"trigger matched, injected {len(ctx)} chars of user model context",
-                        event_type="user_model.context_inject",
-                        severity="debug",
-                        source="mark-processing",
-                    )
-                else:
-                    # Debug: trigger matched but no context available.
-                    _emit_event(
-                        f"\U0001f50d [context skipped] msg={short_msg_id} "
-                        "trigger matched but user model returned empty context",
-                        event_type="user_model.context_skip",
-                        severity="debug",
-                        source="mark-processing",
-                    )
-            except Exception as _ctx_exc:
-                import traceback as _tb
-                _emit_event(
-                    f"\U0001f50d [context inject error] msg={short_msg_id} "
-                    f"{type(_ctx_exc).__name__}: {_ctx_exc}\n"
-                    + _tb.format_exc()[-600:],
-                    event_type="system.error",
-                    severity="error",
-                    source="mark-processing",
-                )
-                # never block mark_processing
-        else:
-            # No trigger match — context injection skipped. No notification emitted;
-            # this is the common case and emitting on every no-match is pure noise.
-            pass
 
     # User message counter — session-note-appender trigger (issue #1159)
     # Shared helper handles filtering, incrementing, and reminder injection.
@@ -5961,19 +5762,7 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
     except Exception:
         pass  # non-fatal; stale recovery falls back to mtime
 
-    # Queue background observation (non-blocking, best-effort).
-    # Only queue for user-facing message types — system-generated types
-    # (cron_reminder, consolidation, subagent_result, etc.) must not
-    # feed the user model. Use USER_FACING_TYPES as the single source of
-    # truth (issue #660).
-    msg_text = msg_data.get("text", "") or msg_data.get("transcription", "")
     msg_type = msg_data.get("type", "")
-    if msg_text and msg_type in USER_FACING_TYPES:
-        _queue_observation(
-            msg_text, message_id,
-            source=msg_data.get("source"),
-            ts=msg_data.get("timestamp"),
-        )
 
     # User message counter — session-note-appender trigger (issue #1159)
     # Shared helper handles filtering, incrementing, and reminder injection.
@@ -11401,7 +11190,6 @@ async def reconcile_agent_sessions() -> None:
 async def main():
     """Run the MCP server."""
     setup_logging()
-    _ensure_observation_worker()
 
     # Clear the dispatcher state file on startup so a stale session ID from a
     # previous run cannot linger and mislead hooks into thinking the old session

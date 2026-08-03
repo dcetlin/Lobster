@@ -105,21 +105,20 @@ def get_owner_tz_name() -> str:
     if env_tz:
         return env_tz
 
-    # 2. owner.toml — try direct import first, then package-qualified path
+    # 2. owner.toml — read via the standalone owner-config reader
     try:
-        from user_model.owner import get_owner_timezone as _get
+        from src.utils.owner_config import get_owner_timezone as _get
         name = _get()
         if name:
             return name
     except Exception:
-        pass
-    try:
-        from mcp.user_model.owner import get_owner_timezone as _get2
-        name = _get2()
-        if name:
-            return name
-    except Exception:
-        pass
+        try:
+            from utils.owner_config import get_owner_timezone as _get2
+            name = _get2()
+            if name:
+                return name
+        except Exception:
+            pass
 
     # 3. UTC fallback
     return "UTC"

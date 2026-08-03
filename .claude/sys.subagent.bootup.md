@@ -149,7 +149,7 @@ mcp__lobster-inbox__write_result(
 
 **For delivery-deferred tasks (reviewer chain):**
 
-Use this mode when your task produces an artifact — a PR, a generated document, a structured output — that **must pass through a second agent before reaching the user**. The canonical example is `functional-engineer`: it opens a PR but does NOT send the PR link to the user, because the dispatcher will spawn an oracle reviewer before surfacing anything.
+Use this mode when your task produces an artifact — a PR, a generated document, a structured output — that **must pass through a second agent before reaching the user**. The canonical example is `functional-engineer`: it opens a PR but does NOT send the PR link to the user, because the dispatcher will spawn a `review` agent before surfacing anything.
 
 Call `write_result` only — do NOT call `send_reply`. Set `sent_reply_to_user=False` (the default). Include enough context in `text` for the dispatcher or reviewer agent to understand what was produced and what to do next.
 
@@ -157,7 +157,7 @@ Call `write_result` only — do NOT call `send_reply`. Set `sent_reply_to_user=F
 mcp__lobster-inbox__write_result(
     task_id="<task_id>",
     chat_id=<chat_id>,
-    text="PR #42 opened: <brief description>. Awaiting oracle review before surfacing to user.",
+    text="PR #42 opened: <brief description>. Awaiting review before surfacing to user.",
     source="telegram",
     sent_reply_to_user=False,  # dispatcher spawns reviewer; user sees nothing yet
 )
@@ -196,30 +196,6 @@ mcp__lobster-inbox__write_result(
 The `artifacts` field is accepted by the inbox server and surfaced in the `subagent_result` message payload. The dispatcher reads those files and includes their content inline in the reply to the user — never relaying a raw file path.
 
 **Never put large content in `text` directly.** The dispatcher's context window pays the cost of relaying whatever is in `text`. A 1,000-line report in `text` stalls the main loop and may trigger a health-check restart. Artifacts are read lazily, after the message is picked up, and do not bloat the inbox message itself.
-
-## Oracle Frontmatter Check (Required Before Delivering Substantial Documents)
-
-Before calling `send_reply` to deliver a substantial document (>500 words or multi-source synthesis), verify the document has `oracle_status: approved` in its YAML frontmatter.
-
-A document is substantial if it is:
-- A design document, architecture proposal, retro, or sprint design doc
-- A multi-source synthesis or research output
-- Any document the user asked to be oracle-reviewed before delivery
-
-**If `oracle_status: approved` is not present:**
-- Do NOT call `send_reply` to deliver the document to the user
-- Call `write_task_output(job_name="<task_id>", output="Document pending oracle review: <document path or title>", status="pending")`
-- Include in your `write_result` text a note that the document is pending oracle review and the oracle gate must be run before delivery
-
-**If the document has `oracle_status: not_required`:** proceed with delivery — the author has explicitly waived review.
-
-**If the document has no frontmatter at all:** treat it as pending. Do not assume unreviewed documents are safe to deliver.
-
-For PR merges specifically, the `pr-merge-gate.py` PreToolUse hook enforces this mechanically — any `gh pr merge <N>` command is hard-blocked unless `oracle/verdicts/pr-{N}.md` exists and its first line is exactly `VERDICT: APPROVED`. Do not attempt to merge by other means to bypass this check.
-
-This check applies to documents being delivered, not to internal reports or log summaries. Short replies, task acknowledgments, and inline answers do not require frontmatter.
-
-See `docs/oracle-review-protocol.md` for the full frontmatter schema and when each value is used.
 
 ## Signal Footer (Required on All Replies Referencing Completed Work)
 
@@ -310,7 +286,7 @@ Two persistence paths exist for agent observations. Choose the right one:
 
 **Use `write_observation`** when you want the dispatcher to receive a real-time signal — the message enters the dispatcher inbox and may surface to Dan via Telegram if the category warrants it (`user_context`, or escalation-class `system_error`). Use this path for: urgent structural issues, gate misses, stuck-agent signals, and anything the operator should know about *now*.
 
-**Use `memory_store` (with `valence='smell'` or `valence='golden'`)** when you want the observation stored for future retrieval without triggering a real-time dispatcher notification. The write goes directly to the vector DB and is available via `memory_search`. Use this path for: named pattern instances, sweep-level findings, and non-urgent observations that contribute to the oracle vocabulary over time.
+**Use `memory_store` (with `valence='smell'` or `valence='golden'`)** when you want the observation stored for future retrieval without triggering a real-time dispatcher notification. The write goes directly to the vector DB and is available via `memory_search`. Use this path for: named pattern instances, sweep-level findings, and non-urgent observations worth accumulating over time.
 
 Rule of thumb: if the observation should change behavior *today*, use `write_observation`. If it is archival evidence that accumulates value over time, use `memory_store`.
 
@@ -406,8 +382,8 @@ Lobster uses a tiered model strategy to balance cost and quality. Each subagent 
 
 **Agent model assignments:**
 
-- **Opus**: `functional-engineer`, `lobster-oracle`, `review` -- tasks requiring deep adversarial reasoning or thorough code review
-- **Sonnet**: `brain-dumps`, `compact-catchup`, `lobster-auditor`, `lobster-generalist`, `lobster-hygiene`, `lobster-meta`, `nightly-consolidation`, `session-note-polish`, `wos-pr-coordinator` -- structured work, synthesis, planning
+- **Opus**: `functional-engineer`, `review` -- tasks requiring deep adversarial reasoning or thorough code review
+- **Sonnet**: `brain-dumps`, `compact-catchup`, `lobster-generalist`, `nightly-consolidation`, `session-note-polish` -- structured work, synthesis, planning
 - **Haiku**: `lobster-ops`, `session-note-appender` -- lightweight ops and incremental logging
 
 **When to override:** If a task normally handled by a Sonnet agent requires unusually deep reasoning (e.g., a complex multi-system execution plan), consider using `functional-engineer` (Opus) instead.
@@ -482,7 +458,7 @@ Before declaring any integration or manual test PASS:
 - **Default repo:** `SiderealPress/lobster` (owner=SiderealPress, repo=lobster) is the Lobster *system* repo — for Lobster maintenance tasks. For user work tasks, get the target repo from the task context or message; do not default to the system repo.
 
 - **Always specify `--repo dcetlin/Lobster` in `gh` CLI commands.**
-  When running `gh pr` or `gh issue` commands in WOS dispatch or any task context, always pass `--repo dcetlin/Lobster` explicitly. Never rely on the working directory's git remote to determine the target repository — the remote may point to `SiderealPress/lobster` (the upstream public fork) and will silently operate on the wrong repo.
+  When running `gh pr` or `gh issue` commands in any task context, always pass `--repo dcetlin/Lobster` explicitly. Never rely on the working directory's git remote to determine the target repository — the remote may point to `SiderealPress/lobster` (the upstream public fork) and will silently operate on the wrong repo.
 
 - **Linear API:** Access Linear via REST API. The `LINEAR_API_KEY` environment variable is set. GraphQL endpoint: `https://api.linear.app/graphql`. Use `curl -H "Authorization: $LINEAR_API_KEY" -H "Content-Type: application/json"`.
 
@@ -507,41 +483,12 @@ Before declaring any integration or manual test PASS:
 
 ## HTML Generation Layer
 
-When working with HTML documents (WOS spec, design docs, bisque artifacts):
+When working with HTML documents (design docs, bisque artifacts):
 - **Edit existing docs** via `src/htmlgen/editor.py` — never rewrite from scratch; use `list_section_ids` first, then `apply_edit` or `apply_edits`
 - **Generate new docs** via `src/htmlgen/renderer.py` with conventions loaded from `src/htmlgen/conventions.py`
 - **Load conventions first** — `load_conventions()` before any render or edit call
 - Source of truth: `~/lobster-workspace/workstreams/html-interface/`
 - The `html-generation` skill loads full context (primitives, delivery pattern, canon standards) when triggered
-
-## WOS Subagent Contract
-
-When you are dispatched to execute a **Unit of Work (UoW)** by the WOS Executor, your task prompt will contain an `output_ref` path and a `uow_id`. Before you exit — success or failure — you **must** write a result.json file at that path. The Steward reads this file on its next heartbeat cycle to determine whether the UoW is complete, failed, or needs re-diagnosis. Without it, the Steward cannot distinguish a successful silent exit from a crash and will eventually mark the UoW failed via TTL expiry.
-
-**How to identify a WOS task:** your task prompt includes a line like `output_ref: /path/to/<uow-id>.json` and a `uow_id`.
-
-**Write the result file before calling `write_result`:**
-
-```python
-from orchestration.result_writer import write_result as wos_write_result
-wos_write_result(output_ref, status="done", summary="PR #42 opened and tests pass")
-```
-
-- `status`: `"done"` for successful completion, `"failed"` for any failure
-- `summary`: one human-readable sentence — the Steward logs this and may surface it to the user
-- `artifacts`: optional list of absolute paths produced (PR URLs, generated files, etc.)
-
-**The result file path** is derived from `output_ref` by replacing its extension: `foo.json` → `foo.result.json`. If there is no extension, `.result.json` is appended. This derivation is shared by the Executor, the Steward, and `result_writer.py` — do not compute it manually.
-
-**On failure,** write the result file with `status="failed"` before calling `write_result` with `status="error"`. The Steward uses the result file for re-diagnosis; the `write_result` MCP call delivers the failure signal to the dispatcher. Both are required.
-
-```python
-# Failure path
-wos_write_result(output_ref, status="failed", summary="tests failed: 3 errors in test_foo.py")
-mcp__lobster-inbox__write_result(task_id=..., chat_id=..., text="...", status="error", sent_reply_to_user=False)
-```
-
-**Summary:** if your task prompt has an `output_ref`, calling `wos_write_result` before exit is a hard requirement — the same as calling `write_result` at the end of every subagent task.
 
 ## IFTTT Behavioral Rules
 

@@ -186,52 +186,10 @@ Before consulting any gate, classify the message as ACTION or DESIGN_OPEN. These
 | **7-Second Rule** | Any tool call that is not `wait_for_messages`, `check_inbox`, `mark_processing`, `mark_processed`, `mark_failed`, or `send_reply` must go to a background subagent. | Structural — if you reach for any other tool, stop and delegate. |
 | **Design Gate** | A message is DESIGN_OPEN when no concrete output artifact can be stated in one sentence from the message alone. | Advisory — classify before routing; fire the gate if DESIGN_OPEN. |
 | **Bias to Action** | Classifier returned ACTION. Proceed with implementation without asking for confirmation. | Advisory — classifier output is the entry condition; no secondary check needed. |
-| **Dispatch template** | Every subagent Task call must include `Minimum viable output: [deliverable]` and `Boundary: do not produce [X]` in its prompt. Every subagent prompt must begin with a YAML frontmatter block (preferred): `task_id: <slug>`, `chat_id: <id>`, `source: <telegram|slack|system>`. task_id must be a slug (not a UUID); the SessionStart hook rejects sessions without it. Legacy inline format `Your task_id is: <slug>` is still accepted for backward compat. **Long-running gate:** If the Minimum viable output implies >15 min of work, prepend the workstream scaffolding preamble (see "Long-Running Dispatch Preamble" below) to the subagent prompt before any other content. A dispatch without both fields is a gate miss — log via `write_observation`. | Structural — dispatcher cannot call Agent without completing both fields. Treat an empty Minimum viable output as a dispatch blocker, not a reminder. |
+| **Dispatch template** | Every subagent Task call must include `Minimum viable output: [deliverable]` and `Boundary: do not produce [X]` in its prompt. Every subagent prompt must begin with a YAML frontmatter block (preferred): `task_id: <slug>`, `chat_id: <id>`, `source: <telegram|slack|system>`. task_id must be a slug (not a UUID); the SessionStart hook rejects sessions without it. Legacy inline format `Your task_id is: <slug>` is still accepted for backward compat. A dispatch without both fields is a gate miss — log via `write_observation`. | Structural — dispatcher cannot call Agent without completing both fields. Treat an empty Minimum viable output as a dispatch blocker, not a reminder. |
 | **No self-relay** | When `sent_reply_to_user == True` or message type is `subagent_notification`, mark_processed without calling send_reply. | Structural — the message type routes it; no discretion needed. |
 | **Relay filter** | If the key signal in a send_reply to Dan is buried past paragraph 2, move it to the lead. | Advisory — apply before every send_reply. |
-| **PR Merge Gate** | Every code PR must pass oracle review before merge. Flow: open PR → oracle agent → writes `oracle/verdicts/pr-{number}.md` → if first line is `VERDICT: APPROVED` dispatch merge agent; if `VERDICT: NEEDS_CHANGES` dispatch fix agent → re-oracle → repeat. Merge agent must read `oracle/verdicts/pr-{number}.md` and confirm first line is `VERDICT: APPROVED` before merging, then move file to `oracle/verdicts/archive/pr-{number}.md`. Oracle round cap: Rounds 1–2: auto-fix. Round 3: notify Dan before dispatching another fix. Round 4+: escalate to Dan before dispatching; include a summary of what gaps keep re-opening and why. | Advisory — never dispatch a merge agent without first confirming `VERDICT: APPROVED` in `oracle/verdicts/pr-{number}.md`. Two enforcement paths: **Option A** — if `LOBSTER_REVIEW_TOKEN` is configured, the oracle posts a formal GitHub Approved review via the GitHub API (required for branch protection rules with non-author reviewer requirement); **Option B** (always active, Option A fallback) — dispatcher checks the verdict file directly. If Option A is configured but the `gh api` call fails, a warning is appended to the verdict file and Option B governs. |
 | **Behavioral Failure Gate** | A behavioral failure is detected (gate miss, misclassification, wrong routing decision). | Advisory — open a GitHub issue in `dcetlin/Lobster` with label `needs-discriminator-fix`; title: the specific failure class; body: the concrete example that triggered detection. Do NOT add advisory text to bootup docs or CLAUDE.md instead. Behavioral failure → GitHub issue, not advisory text. |
-
-### Long-Running Dispatch Preamble
-
-Any dispatch where the `Minimum viable output` implies >15 minutes of runtime **must** begin with the following preamble, substituting `<task-slug>` with the agent's task_id:
-
-```
-WORKSTREAM SETUP (do this first, before any other work):
-
-1. Create your workstream directory:
-   mkdir -p ~/lobster-workspace/workstreams/<task-slug>/
-
-2. Write an initial status file immediately after creating the directory:
-   ~/lobster-workspace/workstreams/<task-slug>/status.md
-   Content: task_id, start time, goal summary, current step ("started"), next planned step.
-
-3. Rewrite status.md every ~5 minutes as you work:
-   Update: current step, % complete estimate, last completed milestone, next step.
-   If you are blocked or failing, write that explicitly — stalled state is recoverable; silent state is not.
-
-4. Open a draft PR immediately after your first commit + push — before continuing any further work:
-   git push -u origin <branch-name>
-   gh pr create --draft --repo <owner/repo> --title "<working title>" --body "WIP — draft opened after first commit per Long-Running Dispatch Preamble step 4. Task: <task-slug>."
-   Record the draft PR URL in status.md. This step is mandatory even when the task is far from finished: a build agent that dies before opening a PR leaves its work invisible to recovery — the commit exists in git, but nothing points to it. Convert the PR from draft to ready-for-review only once the task is actually complete.
-
-5. Call write_result at completion:
-   write_result(task_id="<task-slug>", sent_reply_to_user=False, status="success", text="<one-sentence summary>")
-   If you sent a reply to the user directly: write_result(task_id="<task-slug>", sent_reply_to_user=True)
-
-6. Auto-archive your workstream directory on successful completion:
-   mv ~/lobster-workspace/workstreams/<task-slug>/ ~/lobster-workspace/workstreams/archive/<task-slug>/
-   Do this only after write_result has been called with status="success" and no further tiers of work are planned under this task_id. A self-declared-complete dispatch directory must not linger in the active `workstreams/` namespace — see `assessments/workstreams-canonicity-model-20260704.md` §4. If the task ended in failure or is still open-ended, skip this step and leave the directory active for the reconciler.
-   **This step is documentation, not the enforcement mechanism.** The actual enforcement is structural: `hooks/require-write-result.py` (the SubagentStop/Stop hook that already gates on `write_result` being called) also auto-archives `workstreams/<task_id>/` -> `workstreams/archive/<task_id>/` whenever it observes a `write_result` call with `status="success"` — regardless of whether you perform this step yourself. Doing it yourself here is redundant-but-harmless (the hook's move is idempotent and a no-op if the directory is already gone); the hook is what makes archival happen even if this instruction is never read.
-
-Do not defer workstream creation. If you die without writing status.md, the reconciler has nothing to recover from. Do not defer opening the draft PR past your first commit — the reconciler cannot recover work that only exists as a local commit in a dead session.
-```
-
-Signals that a dispatch implies >15 min:
-- The Minimum viable output involves cloning a repo, running a migration, or merging many commits
-- The prompt includes words like "full", "complete", "all", "every", "rewrite", "port", "migrate"
-- The task requires reading many files before writing any output
-- The task_id is for a WOS UoW with estimated_cycles > 1
 
 ### Gate-Miss Logging (Proprioceptive Feedback)
 
@@ -246,12 +204,11 @@ mcp__lobster-inbox__write_observation(
 )
 ```
 
-Gate names for the `gate=` field: `7_second_rule`, `design_gate`, `bias_to_action`, `dispatch_template`, `no_self_relay`, `relay_filter`, `pr_merge_gate`, `behavioral_failure_gate`.
+Gate names for the `gate=` field: `7_second_rule`, `design_gate`, `bias_to_action`, `dispatch_template`, `no_self_relay`, `relay_filter`, `behavioral_failure_gate`.
 
 Examples:
 - You reach for `Bash` or `Glob` directly (7-second rule): log `gate=7_second_rule condition=direct_tool_call outcome=miss`
 - You route a DESIGN_OPEN message directly to action without checking the discriminator: log `gate=design_gate condition=no_artifact_stated outcome=miss`
-- A PR result arrives without an oracle approval check: log `gate=pr_merge_gate condition=missing_oracle_check outcome=miss`
 - You are about to add advisory text to a bootup doc encoding a previously-failed behavioral rule: log `gate=behavioral_failure_gate condition=advisory_text_addition outcome=miss` and open a GitHub issue with label `needs-discriminator-fix` instead.
 
 This fires **in addition to** the correct recovery action (e.g., delegating to a subagent). Log the miss, then do the right thing. Do not log a miss for a gate that correctly fired and was honored.
@@ -309,7 +266,7 @@ Never use cron for user-space jobs. Never use systemd tools for system-level inf
   */N * * * * cd ~/lobster && uv run scheduled-tasks/my-script.py >> ~/lobster-workspace/scheduled-jobs/logs/my-script.log 2>&1 # LOBSTER-MY-SCRIPT
   ```
 
-  **Required: jobs.json gate.** Add `from src.utils.jobs import is_job_enabled` at the top of the file (after your `sys.path` setup) and call `is_job_enabled(job_name)` at the top of `main()` before any DB work. This preserves runtime enable/disable via `wos start/stop` and direct jobs.json edits. See `scheduled-tasks/executor-heartbeat.py` and `scheduled-tasks/steward-heartbeat.py` for the reference implementation.
+  **Required: jobs.json gate.** Add `from src.utils.jobs import is_job_enabled` at the top of the file (after your `sys.path` setup) and call `is_job_enabled(job_name)` at the top of `main()` before any DB work. This preserves runtime enable/disable via direct jobs.json edits. See `scheduled-tasks/cc-usage-poller.py` or `scheduled-tasks/export-logs.py` for the reference implementation.
 
   **jobs.json fields for Type B jobs:**
   ```json
@@ -324,7 +281,7 @@ Never use cron for user-space jobs. Never use systemd tools for system-level inf
 
 ### Staleness gate for file-scanning scorers
 
-Type A jobs that scan a file on a schedule (e.g. philosophy-discovery-scorer) must
+Type A jobs that scan a file on a schedule must
 call the staleness gate at the top of their run, before any LLM/inference call. If
 the target file has not changed since the last scan, the job should exit immediately
 with `write_task_output(..., status="success")` — no LLM call.
@@ -366,7 +323,7 @@ corrupt file (treats as "no record" → proceed with scoring).
   - `.claude` → symlink to `~/lobster/.claude/` — **editing files here is immediately live, no deploy needed**
   - `CLAUDE.md` → symlink to `~/lobster/CLAUDE.md` — same, live immediately
   - `projects/` - All Lobster-managed projects (`$LOBSTER_PROJECTS`)
-  - `assessments/` - Assessment documents (audits, retros, design reviews). Maintenance logs only → `hygiene/`.
+  - `assessments/` - Assessment documents (audits, retros, design reviews).
   - `data/memory.db` - Vector memory SQLite DB
   - `data/memory-events.jsonl` - StaticMemory event log (JSONL fallback backend)
   - `data/decisions-ledger.md` — Decision text from `decision:` footer blocks, routed by `hooks/decision-router.py`
@@ -382,16 +339,6 @@ corrupt file (treats as "no record" → proceed with scoring).
 - `~/messages/audio/` - Voice message audio files
 - `~/messages/task-outputs/` - Outputs from scheduled jobs
 - For full workspace layout and conventions, see `~/lobster-workspace/CONVENTIONS.md`
-
-## WOS Runtime Execution Control
-
-WOS executor dispatch is gated by `~/lobster-workspace/data/wos-config.json`:
-
-- `execution_enabled: true` — executor-heartbeat dispatches UoWs normally
-- `execution_enabled: false` — executor-heartbeat skips dispatch (TTL recovery still runs)
-- File absent — treated as `false` (safe default)
-
-Toggle via dispatcher commands: `wos start` sets `execution_enabled: true`; `wos stop` sets it `false`. These are handled directly in the dispatcher (no subagent). See `src/orchestration/dispatcher_handlers.py` for implementation.
 
 ## Permissions
 

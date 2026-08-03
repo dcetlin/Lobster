@@ -548,18 +548,6 @@ def main() -> None:
         if _inject_if_exists(USER_SUBAGENT_BOOTUP, "user.subagent.bootup.md"):
             injected.append(USER_SUBAGENT_BOOTUP.name)
 
-    # Inject active user model delta block (issue: orient layer, cycle 0).
-    # Must never crash the hook — wrap in try/except unconditionally.
-    try:
-        _lobster_root = str(Path(__file__).parent.parent)
-        if _lobster_root not in sys.path:
-            sys.path.insert(0, _lobster_root)
-        from src.orient.active_user_model import compute_delta, format_delta_block  # noqa: PLC0415
-        print("\n" + format_delta_block(compute_delta()))
-        injected.append("active_user_model")
-    except Exception as _aum_exc:
-        print(f"[{HOOK_NAME}] active-user-model skipped: {_aum_exc}", file=sys.stderr)
-
     _append_injection_log(session_id, role, injected)
     sys.exit(0)
 
