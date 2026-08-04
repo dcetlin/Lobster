@@ -382,6 +382,136 @@ class TestClaimAndAck:
             assert reminder["type"] == "session_note_reminder"
             assert reminder["user_message_count"] == interval
 
+    def test_local_claude_ack_writes_ack_slot_not_answer_slot(self, dirs):
+        """source='local-claude' writes agent-replies/<request_id>.ack.json, and never
+        touches agent-replies/<request_id>.json (the single-shot answer slot).
+        """
+        inbox, processing, outbox, sent = dirs
+        agent_replies = inbox.parent / "agent-replies"
+        agent_replies.mkdir(exist_ok=True)
+
+        msg_id = "1700000000000-abcd1234"
+        msg = {
+            "id": msg_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "what's the status of PR 1234?",
+            "request_id": msg_id,
+            "timestamp": "2026-08-04T10:00:00.000000",
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+
+            result = asyncio.run(handle_claim_and_ack({
+                "message_id": msg_id,
+                "ack_text": "On it — checking PR 1234...",
+                "chat_id": "local-claude",
+                "source": "local-claude",
+                "request_id": msg_id,
+            }))
+
+        # Claimed successfully
+        assert not (inbox / f"{msg_id}.json").exists()
+        assert (processing / f"{msg_id}.json").exists()
+        # Ack landed in the distinct ack slot...
+        assert (agent_replies / f"{msg_id}.ack.json").exists()
+        ack = json.loads((agent_replies / f"{msg_id}.ack.json").read_text())
+        assert ack["text"] == "On it — checking PR 1234..."
+        assert ack["request_id"] == msg_id
+        # ...and the single-shot answer slot was NOT touched.
+        assert not (agent_replies / f"{msg_id}.json").exists()
+        # Never touches outbox/ — this is machine-to-machine, not a Dan-facing reply.
+        assert list(outbox.glob("*.json")) == []
+        assert "agent-replies" in result[0].text
+
+    def test_local_claude_requires_request_id(self, dirs):
+        """source='local-claude' without request_id is rejected before claiming —
+        the message must remain in inbox/ untouched."""
+        inbox, processing, outbox, sent = dirs
+        msg_id = "1700000000001-efgh5678"
+        msg = {
+            "id": msg_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "hi",
+            "request_id": msg_id,
+            "timestamp": "2026-08-04T10:00:00.000000",
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+
+            result = asyncio.run(handle_claim_and_ack({
+                "message_id": msg_id,
+                "ack_text": "On it.",
+                "chat_id": "local-claude",
+                "source": "local-claude",
+            }))
+
+        assert "Error" in result[0].text
+        assert "request_id" in result[0].text
+        # Message must remain unclaimed — no partial state.
+        assert (inbox / f"{msg_id}.json").exists()
+        assert not (processing / f"{msg_id}.json").exists()
+
+    def test_source_mismatch_refuses_claim(self, dirs):
+        """A message that originated with source='local-claude' can never be acked
+        with source='telegram' (or vice versa) — fail-closed on source mismatch."""
+        inbox, processing, outbox, sent = dirs
+        msg_id = "1700000000002-ijkl9012"
+        msg = {
+            "id": msg_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "what's the status of PR 1234?",
+            "request_id": msg_id,
+            "timestamp": "2026-08-04T10:00:00.000000",
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+
+            # Caller forgot to pass source="local-claude" — falls back to the
+            # "telegram" default. Must be refused, not silently sent to Dan.
+            result = asyncio.run(handle_claim_and_ack({
+                "message_id": msg_id,
+                "ack_text": "On it.",
+                "chat_id": "local-claude",
+            }))
+
+        assert "Error" in result[0].text
+        assert "mismatch" in result[0].text.lower()
+        # Never claimed, never written to outbox.
+        assert (inbox / f"{msg_id}.json").exists()
+        assert not (processing / f"{msg_id}.json").exists()
+        assert list(outbox.glob("*.json")) == []
+
     def test_counter_does_not_increment_for_system_messages(self, dirs):
         """Claiming a system/subagent message via claim_and_ack must NOT increment the counter."""
         inbox, processing, outbox, sent = dirs

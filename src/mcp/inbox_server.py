@@ -85,6 +85,7 @@ from reliability import (
     atomic_write_json,
     validate_send_reply_args,
     validate_message_id,
+    sanitize_request_id,
     ValidationError,
     init_audit_log,
     audit_log,
@@ -1988,7 +1989,12 @@ async def list_tools() -> list[Tool]:
                 "means the user already received the ack. "
                 "If the message is not found in inbox/ (already claimed or missing), returns an error "
                 "without sending the ack. If the ack send fails after claiming, the message stays in "
-                "processing/ and stale recovery handles it."
+                "processing/ and stale recovery handles it. "
+                "For source='local-claude' (the agent channel): request_id is required, and the ack is "
+                "written to ~/messages/agent-replies/<request_id>.ack.json — NOT to "
+                "agent-replies/<request_id>.json, which is the single-shot answer slot that a later "
+                "send_reply(source='local-claude', request_id=..., ...) call must still write. The ack "
+                "never consumes the answer slot (ack != answer)."
             ),
             inputSchema={
                 "type": "object",
@@ -2012,6 +2018,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "The source to reply via (telegram, slack, etc.). Default: telegram.",
                         "default": "telegram",
+                    },
+                    "request_id": {
+                        "type": "string",
+                        "description": "Required when source='local-claude'. The request_id from the inbound local-claude message; the ack is written to ~/messages/agent-replies/<request_id>.ack.json (never the answer slot).",
                     },
                     "reply_to_message_id": {
                         "type": "integer",
@@ -5840,13 +5850,56 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
     fails (message not found or already claimed), the ack is never sent.
     If the ack fails after claiming, the message remains in processing/ and
     stale recovery handles it.
+
+    For source="local-claude" (the agent channel): request_id is required, and
+    the ack is written to agent-replies/<request_id>.ack.json — a distinct file
+    from agent-replies/<request_id>.json, the single-shot answer slot that
+    send_reply(source="local-claude", ...) writes. The ack never touches the
+    answer slot (agent-channel protocol spec, principle 4: ack != answer).
     """
     message_id = validate_message_id(args.get("message_id", ""))
+    source = str(args.get("source", "telegram")).lower()
+    is_local_claude = source == "local-claude"
+
+    # --- Step 0: source-specific pre-checks, before we ever claim the message ---
+    # (a) local-claude requires a sanitized request_id up front — same rule as
+    #     send_reply, enforced before the atomic claim so a malformed request never
+    #     leaves a message stuck in processing/ with no way to answer it.
+    request_id: str | None = None
+    if is_local_claude:
+        try:
+            request_id = sanitize_request_id(args.get("request_id"))
+        except ValidationError as e:
+            return [TextContent(type="text", text=f"Error: {e}")]
 
     # --- Step 1: Claim the message (must succeed before sending ack) ---
     found = _find_message_file(INBOX_DIR, message_id)
     if not found:
         return [TextContent(type="text", text=f"Error: Message not found in inbox: {message_id}")]
+
+    # (b) Fail-closed source verification (principle 5), same rule as send_reply:
+    # the message's own `source` field is ground truth. Checked BEFORE claiming
+    # so a mismatched ack never wins a claim it can't legitimately service.
+    try:
+        _pre_claim_msg = json.loads(found.read_text())
+    except Exception:
+        _pre_claim_msg = {}
+    _origin_source = _pre_claim_msg.get("source")
+    if _origin_source and _origin_source != source:
+        log.error(
+            f"claim_and_ack: source mismatch — message {message_id} originated "
+            f"from source={_origin_source!r} but ack requested source={source!r}. "
+            "Refusing to claim (fail-closed on source mismatch)."
+        )
+        return [TextContent(
+            type="text",
+            text=(
+                f"Error: source mismatch — message {message_id} originated from "
+                f"source={_origin_source!r} but this ack requested source={source!r}. "
+                "Refusing to claim: the ack's source must match the originating "
+                "message's source (fail-closed, per agent-channel protocol spec)."
+            ),
+        )]
 
     # Atomic claim via SQLite INSERT OR FAIL (issue #1360).
     # Must succeed before any filesystem move or ack is sent.
@@ -5882,7 +5935,43 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
 
     log.info(f"claim_and_ack: message claimed: {message_id}")
 
-    # --- Step 2: Send the ack reply ---
+    # --- Step 2: Send the ack ---
+    if is_local_claude:
+        # Ack != answer: write to a distinct ack slot, never to
+        # agent-replies/<request_id>.json — that file is the single-shot answer
+        # slot a later send_reply(source="local-claude", request_id=..., ...)
+        # call must still write. Bypasses handle_send_reply entirely so there is
+        # no code path from this ack into the answer slot.
+        ack_payload = {
+            "request_id": request_id,
+            "ack": True,
+            "text": args["ack_text"],
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            atomic_write_json(AGENT_REPLIES_DIR / f"{request_id}.ack.json", ack_payload)
+            log.info(f"claim_and_ack: local-claude ack written for request {request_id}")
+            return [TextContent(
+                type="text",
+                text=(
+                    f"Claimed and acked (local-claude): {message_id}\n\n"
+                    f"Ack written to agent-replies/{request_id}.ack.json "
+                    "(answer slot untouched — still call send_reply(source='local-claude', "
+                    f"request_id='{request_id}', ...) with the real answer).\n\n"
+                    f"Ack: {args['ack_text'][:100]}"
+                ),
+            )]
+        except Exception as e:
+            # Ack write failed — message stays in processing/, stale recovery handles it
+            log.warning(f"claim_and_ack: local-claude ack write failed (message stays in processing/): {e}")
+            return [TextContent(
+                type="text",
+                text=(
+                    f"Warning: message claimed but local-claude ack write failed: {e}\n"
+                    f"Message {message_id} remains in processing/. Stale recovery will handle it."
+                ),
+            )]
+
     ack_args = {
         "chat_id": args["chat_id"],
         "text": args["ack_text"],
