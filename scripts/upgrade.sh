@@ -5323,6 +5323,79 @@ PY140
         warn "watched-things-audit.py not found at $WTA_SCRIPT — skipping Migration 142"
     fi
 
+    # Migration 143: Register main-staleness-check in jobs.json and add cron entry.
+    #
+    # The live dispatcher + MCP server run off the ~/lobster checkout, which is
+    # expected to always be a clean, up-to-date `main`. A prior incident: a
+    # `git checkout` was run against a stale local main, causing a sub-second
+    # file-flip on the live system. This Type B script fetches origin every 15
+    # minutes and alerts (rate-limited to once/day) if the checkout is behind
+    # origin/main, has diverged (local commits not on origin), or is not on
+    # `main` at all (detached HEAD or a feature branch) — the deeper anti-pattern
+    # that caused the original staleness. Silent on a clean run.
+    local _MSC_JOBS_FILE="$WORKSPACE_DIR/scheduled-jobs/jobs.json"
+    local MSC_MARKER="# LOBSTER-MAIN-STALENESS-CHECK"
+    local MSC_SCRIPT="$LOBSTER_DIR/scheduled-tasks/main-staleness-check.py"
+    if [ -f "$MSC_SCRIPT" ]; then
+        chmod +x "$MSC_SCRIPT" 2>/dev/null || true
+
+        if [ -f "$_MSC_JOBS_FILE" ]; then
+            if ! uv run python3 -c "import json,sys; d=json.load(open('$_MSC_JOBS_FILE')); sys.exit(0 if 'main-staleness-check' in d.get('jobs',{}) else 1)" 2>/dev/null; then
+                substep "Migration 143: adding main-staleness-check to jobs.json"
+                local _m143_tmp
+                _m143_tmp=$(mktemp)
+                uv run python3 - <<'PY143' "$_MSC_JOBS_FILE" "$_m143_tmp"
+import json, sys
+from datetime import datetime, timezone
+jobs_path, tmp_path = sys.argv[1], sys.argv[2]
+with open(jobs_path) as f:
+    data = json.load(f)
+data.setdefault("jobs", {})["main-staleness-check"] = {
+    "name": "main-staleness-check",
+    "type": "B",
+    "dispatch": "cron-direct",
+    "schedule": "*/15 * * * *",
+    "schedule_human": "Every 15 minutes",
+    "task_file": None,
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+    "enabled": True,
+    "last_run": None,
+    "last_status": None,
+    "description": "Every 15 min: fetch origin and alert (rate-limited to once/day) if the live ~/lobster checkout is behind, diverged, or not on main",
+}
+with open(tmp_path, "w") as f:
+    json.dump(data, f, indent=2, default=str)
+print("OK")
+PY143
+                if [ -s "$_m143_tmp" ]; then
+                    mv "$_m143_tmp" "$_MSC_JOBS_FILE"
+                    substep "Migration 143: main-staleness-check added to jobs.json"
+                    migrated=$((migrated + 1))
+                else
+                    rm -f "$_m143_tmp"
+                    warn "Migration 143: failed to update jobs.json — add main-staleness-check manually"
+                fi
+            else
+                substep "Migration 143: main-staleness-check already in jobs.json — skipping"
+            fi
+        else
+            warn "Migration 143: jobs.json not found at $_MSC_JOBS_FILE — main-staleness-check not registered"
+        fi
+
+        if ! crontab -l 2>/dev/null | grep -qF "$MSC_MARKER"; then
+            "$LOBSTER_DIR/scripts/cron-manage.sh" add "$MSC_MARKER" \
+                "*/15 * * * * cd $LOBSTER_DIR && uv run scheduled-tasks/main-staleness-check.py >> $WORKSPACE_DIR/scheduled-jobs/logs/main-staleness-check.log 2>&1 $MSC_MARKER" 2>/dev/null && {
+                substep "Migration 143: added LOBSTER-MAIN-STALENESS-CHECK cron entry (every 15 minutes)"
+                migrated=$((migrated + 1))
+            } || warn "Migration 143: could not add LOBSTER-MAIN-STALENESS-CHECK cron entry — check cron-manage.sh"
+        else
+            substep "Migration 143: LOBSTER-MAIN-STALENESS-CHECK cron entry already present — skipping"
+        fi
+    else
+        warn "main-staleness-check.py not found at $MSC_SCRIPT — skipping Migration 143"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
