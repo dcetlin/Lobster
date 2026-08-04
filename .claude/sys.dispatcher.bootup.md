@@ -147,12 +147,17 @@ Never pass `hibernate_on_timeout=True` — feature removed in issue #1442; cause
 1. claim_and_ack(message_id, ack_text="On it — [brief description of what you're doing]", chat_id=chat_id, source=source)
    # Atomically: moves message inbox/ → processing/ AND sends the ack.
    # If return starts with "Warning:": claim succeeded, ack failed — proceed normally.
+   # source="local-claude" (agent channel): also pass request_id — see "Agent channel" below.
 2. Generate a short task_id (e.g. "fix-pr-475", "upstream-check")
 3. Write in-flight entry (see "In-flight work tracking" below)
 4. Task(
        prompt="---\ntask_id: <task_id>\nchat_id: <chat_id>\nsource: <source>\nbackground: true\n---\n\n...",
        subagent_type="..."
    )
+   # source="local-claude": frontmatter MUST also carry `request_id: <request_id>` —
+   # see "Agent channel" under Message Source Handling. Without it the subagent has
+   # no way to address its reply; a PreToolUse hook (require-background-agent.py)
+   # fails closed on this and blocks the dispatch outright.
 5. mark_processed(message_id)
 6. Return to wait_for_messages() IMMEDIATELY
 ```
@@ -969,6 +974,33 @@ send_reply(
 ```
 
 The `from` field carries sender identity (e.g. `"AlbertLobster"`). The `chat_id` in the inbox message is always `ADMIN_CHAT_ID_REDACTED` (the owner's Telegram ID) — do not use any other value for routing.
+
+### Agent channel (`source: "local-claude"`)
+
+A local Claude Code session (on Dan's laptop, over SSH) talking to the dispatcher machine-to-machine — never appears on Dan's Telegram/Slack. Full protocol: `docs/agent-channel.md` and the agent-channel protocol spec. Detect it the same way as any other source: `msg.get("source") == "local-claude"`. The inbound message also carries `request_id` (conventionally equal to `id`) — this is the correlation key for the reply, not `chat_id`.
+
+**Detection checklist:**
+- `source == "local-claude"` on the inbox message
+- `request_id` present (required — every reply for this source must include it)
+- `chat_id` is required by the schema but is NOT used for routing on this channel; routing is by `request_id` only
+
+**Direct reply (preferred — no subagent needed for fast answers):**
+```
+send_reply(
+    source="local-claude",
+    chat_id=<chat_id from the message>,
+    request_id=<request_id from the message>,
+    text=<the answer>,
+    message_id=<the message's id>,   # atomically marks processed
+)
+```
+This writes the one-shot answer to `~/messages/agent-replies/<request_id>.json`. No `mark_processed` call needed — `message_id` does both.
+
+**Delegated reply (work takes >7s — 7-Second Rule still applies):** use `claim_and_ack` as usual, but pass `request_id` — for this source the "ack" is written to a *separate* file (`agent-replies/<request_id>.ack.json`), never the answer slot. Then spawn the subagent with `request_id` in its frontmatter (see the claim_and_ack template above) and instruct it explicitly to call `send_reply(source="local-claude", request_id=..., ...)` **directly itself** — never the internal/deferred `write_result`-only pattern for the final answer. The dispatcher's normal `write_result` relay path does not carry `request_id` forward, so if the subagent doesn't call `send_reply` itself, nothing can ever complete the reply. (`hooks/require-background-agent.py` fails closed on this at dispatch time: a `source: local-claude` frontmatter block without a valid `request_id` blocks the `Task`/`Agent` call outright.)
+
+**Ack ≠ answer:** `claim_and_ack`'s ack for this source is a distinct file (`<request_id>.ack.json`) from the one-shot answer slot (`<request_id>.json`). Sending the ack is never sufficient — the real result must still be delivered via `send_reply`.
+
+**Fail-closed source invariant:** never route a `source: "local-claude"` reply through `source="telegram"`, `"slack"`, or any chat channel — not even as a fallback when something seems wrong. If you cannot determine the correct `request_id` or the reply's destination is ambiguous, do not guess: skip the reply rather than risk it leaking to Dan's phone. `send_reply` itself enforces this server-side (it refuses when a `message_id`'s originating `source` doesn't match the reply's declared `source`) — but the dispatcher must never try to route around that refusal by picking a different source.
 
 ---
 

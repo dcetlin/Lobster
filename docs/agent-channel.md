@@ -101,6 +101,37 @@ to a subagent per the usual 7-second rule, same as any other message type).
 The reply must **never** be sent via `source="telegram"` — that would leak
 agent-channel traffic to Dan's phone.
 
+### Delegating to a subagent
+
+`write_result`'s dispatcher-relay path does not carry `request_id` — only the
+inbound message and whatever the dispatcher explicitly forwards do. So when
+the dispatcher delegates the work behind a `local-claude` request to a
+background subagent (7-second rule), `request_id` must ride along in that
+subagent's prompt frontmatter:
+
+```
+---
+task_id: <task_id>
+chat_id: local-claude
+source: local-claude
+request_id: <request_id from the inbound message>
+background: true
+---
+```
+
+The subagent is then responsible for calling
+`send_reply(source="local-claude", request_id=..., ...)` **itself** — never
+the internal/`write_result`-only delivery pattern, since the dispatcher has no
+route back to `request_id` once the subagent's result reaches it as a plain
+`subagent_result`/`subagent_notification` message.
+
+This is enforced structurally, not just by convention: `hooks/require-background-agent.py`
+(a `PreToolUse` hook on `Agent`/`Task` calls) blocks any dispatch whose
+frontmatter declares `source: local-claude` without a valid, filesystem-safe
+`request_id` — regardless of whether the caller is the dispatcher or a
+subagent spawning a nested agent. `hooks/auto-register-agent.py` additionally
+records `request_id` into `agent_sessions.db` for audit/observability.
+
 ## Deploy: does this need an MCP restart?
 
 **Yes.** The routing lives in `handle_send_reply()` inside
@@ -171,3 +202,16 @@ manually later — the dispatcher may still be working on it.
 - `scripts/lobster-chat.py` — the local-machine CLI.
 - `scripts/upgrade.sh` — Migration 139 creates `~/messages/agent-replies/`
   on existing installs.
+- `hooks/require-background-agent.py` — fail-closed `PreToolUse` check: blocks
+  any `Agent`/`Task` dispatch whose frontmatter declares `source: local-claude`
+  without a valid `request_id`. Applies unconditionally (dispatcher and
+  subagent-initiated dispatch alike).
+- `hooks/auto-register-agent.py` — `request_id` added as an optional
+  frontmatter field, parsed and persisted to `agent_sessions.db` for
+  audit/observability (additive `ALTER TABLE` migration for pre-existing DBs).
+- `.claude/sys.dispatcher.bootup.md` — "Agent channel" subsection under
+  Message Source Handling; `claim_and_ack`/`Task()` template notes on carrying
+  `request_id` into a delegated subagent.
+- `.claude/sys.subagent.bootup.md` — "Agent Channel Tasks" section: detection,
+  the mandatory direct-`send_reply` delivery pattern, ack≠answer, and the
+  fail-closed source invariant.
