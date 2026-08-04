@@ -130,6 +130,21 @@ INBOUND_ENVELOPE: dict[str, dict[str, Any]] = {
         "format": "date-time",
         "description": "ISO 8601 UTC timestamp of when the request was written.",
     },
+    "agent": {
+        "type": "string",
+        "required": False,
+        "description": (
+            "Optional identity label for the calling agent/session (e.g. "
+            "\"glyph\"), set via lobster-chat's --agent flag or the "
+            "LOBSTER_CHAT_AGENT env var. Purely cosmetic — Lobster does not "
+            "use it for routing, correlation, or authorization (request_id "
+            "remains the sole correlation key); it exists so the dispatcher "
+            "can render inbox messages as \"from <agent>\" instead of a "
+            "generic source label when multiple external agent sessions "
+            "share this channel. Omit it entirely rather than sending an "
+            "empty string if the caller has no identity to report."
+        ),
+    },
 }
 
 REPLY_ENVELOPE: dict[str, dict[str, Any]] = {
