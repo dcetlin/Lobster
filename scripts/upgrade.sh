@@ -4399,13 +4399,13 @@ PYEOF
     # which writes a scheduled_job_trigger inbox message (vs scheduled_reminder).
     # The dispatcher handles both types, so existing jobs continue to work during
     # the transition. run-job.sh entries (older installs) are also caught.
-    if crontab -l 2>/dev/null | grep -qE '(run-job|dispatch-job)\.sh.*# LOBSTER-SCHEDULED'; then
-        log_step "123" "Rewriting crontab entries: run-job.sh / dispatch-job.sh → post-job-trigger.sh"
+    if crontab -l 2>/dev/null | grep -qE '^[^#].*(run-job|dispatch-job)\.sh.*# LOBSTER-SCHEDULED'; then
+        substep "Migration 123: Rewriting crontab entries: run-job.sh / dispatch-job.sh → post-job-trigger.sh"
         crontab -l 2>/dev/null | sed 's|run-job\.sh|post-job-trigger.sh|g; s|dispatch-job\.sh|post-job-trigger.sh|g' | crontab -
-        log_ok "Crontab entries updated"
+        success "Migration 123: Crontab entries updated"
         migrated=$((migrated + 1))
     else
-        substep "Migration 123: no run-job.sh / dispatch-job.sh LOBSTER-SCHEDULED crontab entries — skipping"
+        substep "Migration 123: no active run-job.sh / dispatch-job.sh LOBSTER-SCHEDULED crontab entries — skipping"
     fi
 
     # Migration 124: [PHASE 3 — apply only after 7 clean days] Remove block-claude-p hook
