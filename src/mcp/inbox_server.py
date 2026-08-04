@@ -528,8 +528,27 @@ def _format_ts_with_et(ts_str: str) -> str:
         return ts_str
 
 
+def _reply_track_key(chat_id: Any, source: str = "", request_id: Any = None) -> str:
+    """Return the key used by the dropped-reply guard / reply-tracking dict.
+
+    Per-request identity, not per-client identity (agent-channel protocol spec,
+    principle 3): every local-claude client shares the constant chat_id="local-claude"
+    (see scripts/lobster-chat.py), so keying the dropped-reply guard on chat_id alone
+    would let one client's successful reply mask the fact that a *different*
+    client's request was silently dropped. For source="local-claude", key on
+    request_id instead — it's already the per-request correlation id the CLI
+    polls on, so it is genuinely unique per request. All other sources keep
+    keying on chat_id (unchanged behavior).
+    """
+    if source == "local-claude" and request_id:
+        return f"local-claude:{request_id}"
+    return str(chat_id)
+
+
 def _track_reply(chat_id: Any) -> None:
-    """Record that a reply was sent to chat_id."""
+    """Record that a reply was sent, keyed by `chat_id` (or an equivalent
+    per-request identity produced by `_reply_track_key`).
+    """
     global _recent_replies
     key = str(chat_id)
     _recent_replies[key] = time.time()
@@ -5413,8 +5432,11 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
         if _db_persist_outbound is not None:
             _db_persist_outbound(reply_data)
 
-    # Track reply for mark_processed guard
-    _track_reply(chat_id)
+    # Track reply for mark_processed guard. Per-request identity for local-claude
+    # (see _reply_track_key) — every local-claude client shares the same constant
+    # chat_id, so keying on chat_id alone would let one client's reply mask another
+    # client's dropped reply.
+    _track_reply(_reply_track_key(chat_id, source=source, request_id=args.get("request_id") if is_local_claude else None))
 
     # Record direct send for write_result deduplication (suppress duplicate relays)
     _record_direct_send(chat_id, text)
@@ -5618,7 +5640,7 @@ async def handle_mark_processed(args: dict) -> list[TextContent]:
                     except (ValueError, TypeError):
                         pass
 
-                chat_key = str(chat_id)
+                chat_key = _reply_track_key(chat_id, source=msg.get("source", ""), request_id=msg.get("request_id"))
                 reply_ts = _recent_replies.get(chat_key, 0.0)
                 if reply_ts < msg_epoch:
                     # No reply was sent for this human message — log and proceed silently.

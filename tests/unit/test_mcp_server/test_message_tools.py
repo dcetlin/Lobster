@@ -946,6 +946,84 @@ class TestMarkProcessed:
             assert "processed" in result[0].text.lower()
             assert not (inbox / f"{msg_id}.json").exists()
 
+    def test_local_claude_dropped_reply_guard_is_per_request(self, setup_dirs, caplog):
+        """Per-request identity (protocol spec principle 3): every local-claude client
+        shares the constant chat_id="local-claude", so a reply sent for request B must
+        NOT mask the fact that request A (a different request_id, same chat_id) was
+        never answered.
+        """
+        import logging
+        inbox, processed = setup_dirs
+
+        msg_a = {
+            "id": "req-A",
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "request A — never answered",
+            "request_id": "req-A",
+            "timestamp": "2026-08-04T12:00:00.000000",
+        }
+        (inbox / "req-A.json").write_text(json.dumps(msg_a))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSED_DIR=processed,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_mark_processed, _track_reply, _reply_track_key
+
+            # A DIFFERENT request (req-B), sharing the same constant chat_id, got its
+            # reply sent. Before the fix this alone would satisfy req-A's guard too,
+            # because both were tracked under the shared key "local-claude".
+            _track_reply(_reply_track_key("local-claude", source="local-claude", request_id="req-B"))
+
+            with caplog.at_level(logging.WARNING):
+                result = asyncio.run(handle_mark_processed({"message_id": "req-A"}))
+
+            assert "processed" in result[0].text.lower()
+            # req-A's own reply was never sent — the guard must still fire.
+            assert any(
+                "mark_processed called without send_reply" in r.message
+                for r in caplog.records
+            ), "dropped-reply guard must fire for req-A even though req-B's reply was tracked"
+
+    def test_local_claude_dropped_reply_guard_satisfied_by_own_request(self, setup_dirs, caplog):
+        """The guard is satisfied when the reply was tracked under the SAME request_id."""
+        import logging
+        inbox, processed = setup_dirs
+
+        msg = {
+            "id": "req-C",
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "request C — answered",
+            "request_id": "req-C",
+            "timestamp": "2026-08-04T12:00:00.000000",
+        }
+        (inbox / "req-C.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSED_DIR=processed,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_mark_processed, _track_reply, _reply_track_key
+
+            _track_reply(_reply_track_key("local-claude", source="local-claude", request_id="req-C"))
+
+            with caplog.at_level(logging.WARNING):
+                result = asyncio.run(handle_mark_processed({"message_id": "req-C"}))
+
+            assert "processed" in result[0].text.lower()
+            assert not any(
+                "mark_processed called without send_reply" in r.message
+                for r in caplog.records
+            ), "dropped-reply guard must NOT fire when req-C's own reply was tracked"
+
     # -----------------------------------------------------------------------
     # Issue #1594 — "Noted." fallback removal
     # -----------------------------------------------------------------------
