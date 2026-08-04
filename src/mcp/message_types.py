@@ -10,7 +10,15 @@ Every inbox message carries two required routing fields:
 
 The constants here are the single source of truth. inbox_server.py imports
 from this module; nothing else should define its own ad-hoc type strings.
+
+The agent-channel source name ("local-claude") is itself owned by
+src/protocol/agent_channel_schema.py, the canonical schema module for that
+protocol — imported below rather than redefined so the source string
+recognized here and the one described to an external agent can't drift
+apart.
 """
+
+from src.protocol.agent_channel_schema import SOURCE as _AGENT_CHANNEL_SOURCE
 
 # ---------------------------------------------------------------------------
 # User-initiated types  (source = telegram | slack | sms | signal | whatsapp | bisque)
@@ -89,7 +97,7 @@ INBOX_MESSAGE_SOURCES: frozenset[str] = frozenset({
     "gmail",              # email poller injects messages with source="gmail"
     "pr_review_sweeper",  # PR-review sweep coordinator — dispatches pr_review_request messages (issue #1268)
     "wos_pr_sweep",       # WOS PR sweep cron script — reports stale/merged PRs (scheduled-tasks/wos-pr-sweeper.py)
-    "local-claude",       # agent channel: local Claude Code session (SSH) talking to the dispatcher — see docs/agent-channel.md
+    _AGENT_CHANNEL_SOURCE,  # "local-claude" — agent channel: local Claude Code session (SSH) talking to the dispatcher — see docs/agent-channel.md and docs/agent-channel-schema.md
 })
 
 # ---------------------------------------------------------------------------

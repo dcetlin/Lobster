@@ -387,6 +387,142 @@ class TestSendReplyLocalClaude:
             assert not (processing / "req-xyz.json").exists()
             assert (processed / "req-xyz.json").exists()
 
+    def test_source_mismatch_refuses_and_never_touches_outbox(self, dirs, temp_messages_dir: Path):
+        """A message that originated with source='local-claude' must never be
+        answered with source='telegram' (fail-closed on source mismatch) — the
+        one hard guarantee is that agent-channel traffic can never leak to Dan's
+        Telegram/Slack outbox."""
+        outbox, sent, agent_replies = dirs
+        processing = temp_messages_dir / "processing"
+        inbox = temp_messages_dir / "inbox"
+        processing.mkdir(parents=True, exist_ok=True)
+        inbox.mkdir(parents=True, exist_ok=True)
+
+        msg = {
+            "id": "req-leak",
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "what's the status of PR 1234?",
+            "request_id": "req-leak",
+            "timestamp": "2026-08-04T12:00:00.000000",
+        }
+        (processing / "req-leak.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            # Caller forgot source="local-claude" — falls back to the "telegram"
+            # default. Must be refused, not silently delivered to Dan's phone.
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": 123456,
+                    "text": "PR 1234 is merged.",
+                    "message_id": "req-leak",
+                })
+            )
+
+            assert "Error" in result[0].text
+            assert "mismatch" in result[0].text.lower()
+            assert list(outbox.glob("*.json")) == []
+            assert list(agent_replies.glob("*.json")) == []
+            # Message must remain in processing/ — never marked processed on refusal.
+            assert (processing / "req-leak.json").exists()
+
+    def test_source_match_still_succeeds(self, dirs, temp_messages_dir: Path):
+        """A correctly source-matched reply (message_id references a local-claude
+        message, reply source='local-claude') is unaffected by the mismatch guard."""
+        outbox, sent, agent_replies = dirs
+        processing = temp_messages_dir / "processing"
+        inbox = temp_messages_dir / "inbox"
+        processing.mkdir(parents=True, exist_ok=True)
+        inbox.mkdir(parents=True, exist_ok=True)
+
+        msg = {
+            "id": "req-ok",
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "what's the status of PR 1234?",
+            "request_id": "req-ok",
+            "timestamp": "2026-08-04T12:00:00.000000",
+        }
+        (processing / "req-ok.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "PR 1234 is merged.",
+                    "source": "local-claude",
+                    "request_id": "req-ok",
+                    "message_id": "req-ok",
+                })
+            )
+
+            assert "Error" not in result[0].text
+            assert (agent_replies / "req-ok.json").exists()
+
+    def test_second_writer_does_not_overwrite_first(self, dirs):
+        """Single-shot reply slot (agent-channel protocol spec, principle 1): a
+        second send_reply for the same request_id must never clobber the first
+        writer's answer, even though each individual write is itself atomic.
+        Reproduces the exact race a crash/redispatch under
+        _recover_stale_processing() can produce — two independent callers
+        racing for the same agent-replies/<request_id>.json slot."""
+        outbox, sent, agent_replies = dirs
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            first = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "First answer (correct).",
+                    "source": "local-claude",
+                    "request_id": "req-race",
+                })
+            )
+            second = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "Second answer (should NOT win).",
+                    "source": "local-claude",
+                    "request_id": "req-race",
+                })
+            )
+
+            assert "Reply written" in first[0].text
+            assert "already exists" in second[0].text.lower()
+
+            files = list(agent_replies.glob("*.json"))
+            assert len(files) == 1
+            content = json.loads(files[0].read_text())
+            assert content["text"] == "First answer (correct)."
+
 
 class TestAutoThreading:
     """Tests for automatic reply threading (issue #330).
@@ -945,6 +1081,84 @@ class TestMarkProcessed:
 
             assert "processed" in result[0].text.lower()
             assert not (inbox / f"{msg_id}.json").exists()
+
+    def test_local_claude_dropped_reply_guard_is_per_request(self, setup_dirs, caplog):
+        """Per-request identity (protocol spec principle 3): every local-claude client
+        shares the constant chat_id="local-claude", so a reply sent for request B must
+        NOT mask the fact that request A (a different request_id, same chat_id) was
+        never answered.
+        """
+        import logging
+        inbox, processed = setup_dirs
+
+        msg_a = {
+            "id": "req-A",
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "request A — never answered",
+            "request_id": "req-A",
+            "timestamp": "2026-08-04T12:00:00.000000",
+        }
+        (inbox / "req-A.json").write_text(json.dumps(msg_a))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSED_DIR=processed,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_mark_processed, _track_reply, _reply_track_key
+
+            # A DIFFERENT request (req-B), sharing the same constant chat_id, got its
+            # reply sent. Before the fix this alone would satisfy req-A's guard too,
+            # because both were tracked under the shared key "local-claude".
+            _track_reply(_reply_track_key("local-claude", source="local-claude", request_id="req-B"))
+
+            with caplog.at_level(logging.WARNING):
+                result = asyncio.run(handle_mark_processed({"message_id": "req-A"}))
+
+            assert "processed" in result[0].text.lower()
+            # req-A's own reply was never sent — the guard must still fire.
+            assert any(
+                "mark_processed called without send_reply" in r.message
+                for r in caplog.records
+            ), "dropped-reply guard must fire for req-A even though req-B's reply was tracked"
+
+    def test_local_claude_dropped_reply_guard_satisfied_by_own_request(self, setup_dirs, caplog):
+        """The guard is satisfied when the reply was tracked under the SAME request_id."""
+        import logging
+        inbox, processed = setup_dirs
+
+        msg = {
+            "id": "req-C",
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "request C — answered",
+            "request_id": "req-C",
+            "timestamp": "2026-08-04T12:00:00.000000",
+        }
+        (inbox / "req-C.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSED_DIR=processed,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_mark_processed, _track_reply, _reply_track_key
+
+            _track_reply(_reply_track_key("local-claude", source="local-claude", request_id="req-C"))
+
+            with caplog.at_level(logging.WARNING):
+                result = asyncio.run(handle_mark_processed({"message_id": "req-C"}))
+
+            assert "processed" in result[0].text.lower()
+            assert not any(
+                "mark_processed called without send_reply" in r.message
+                for r in caplog.records
+            ), "dropped-reply guard must NOT fire when req-C's own reply was tracked"
 
     # -----------------------------------------------------------------------
     # Issue #1594 — "Noted." fallback removal

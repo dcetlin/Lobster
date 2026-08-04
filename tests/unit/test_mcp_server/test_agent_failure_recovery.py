@@ -218,6 +218,25 @@ class TestBuildReconcilerMessageDirect:
         msg = build_fn(session, "dead", NOW)
         assert msg["task_id"] == session["id"]
 
+    def test_dead_includes_original_source(self, build_fn):
+        """Dead outcome: original_source carries the session's own source — distinct
+        from the notification's own source='system' — so the dispatcher can tell a
+        crashed local-claude request apart from a crashed Telegram/Slack one."""
+        session = dict(_BASE_SESSION)
+        msg = build_fn(session, "dead", NOW)
+
+        assert msg["source"] == "system"
+        assert msg["original_source"] == "telegram"
+
+    def test_dead_original_source_local_claude(self, build_fn):
+        """Dead outcome: a crashed local-claude session's original_source is preserved
+        as 'local-claude', not the notification's own source='system'."""
+        session = dict(_BASE_SESSION, source="local-claude", chat_id="local-claude")
+        msg = build_fn(session, "dead", NOW)
+
+        assert msg["original_source"] == "local-claude"
+        assert msg["original_chat_id"] == "local-claude"
+
 
 # ---------------------------------------------------------------------------
 # Test: agent-monitor build_mark_failed_inbox_message

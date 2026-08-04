@@ -83,12 +83,20 @@ import uuid as _uuid_mod
 # Reliability utilities (atomic writes, validation, audit logging)
 from reliability import (
     atomic_write_json,
+    atomic_create_json,
     validate_send_reply_args,
     validate_message_id,
+    sanitize_request_id,
     ValidationError,
     init_audit_log,
     audit_log,
 )
+
+# Agent channel (source="local-claude"): envelope construction, the
+# single-shot reply-slot write, the ack write, and the agent_channel.*
+# audit emits. See src/mcp/agent_channel.py module docstring for the
+# extraction's boundary (what stays here vs. what moved).
+import agent_channel
 
 # Self-update system
 from update_manager import UpdateManager
@@ -528,8 +536,27 @@ def _format_ts_with_et(ts_str: str) -> str:
         return ts_str
 
 
+def _reply_track_key(chat_id: Any, source: str = "", request_id: Any = None) -> str:
+    """Return the key used by the dropped-reply guard / reply-tracking dict.
+
+    Per-request identity, not per-client identity (agent-channel protocol spec,
+    principle 3): every local-claude client shares the constant chat_id="local-claude"
+    (see scripts/lobster-chat.py), so keying the dropped-reply guard on chat_id alone
+    would let one client's successful reply mask the fact that a *different*
+    client's request was silently dropped. For source="local-claude", key on
+    request_id instead — it's already the per-request correlation id the CLI
+    polls on, so it is genuinely unique per request. All other sources keep
+    keying on chat_id (unchanged behavior).
+    """
+    if source == "local-claude" and request_id:
+        return f"local-claude:{request_id}"
+    return str(chat_id)
+
+
 def _track_reply(chat_id: Any) -> None:
-    """Record that a reply was sent to chat_id."""
+    """Record that a reply was sent, keyed by `chat_id` (or an equivalent
+    per-request identity produced by `_reply_track_key`).
+    """
     global _recent_replies
     key = str(chat_id)
     _recent_replies[key] = time.time()
@@ -1969,7 +1996,12 @@ async def list_tools() -> list[Tool]:
                 "means the user already received the ack. "
                 "If the message is not found in inbox/ (already claimed or missing), returns an error "
                 "without sending the ack. If the ack send fails after claiming, the message stays in "
-                "processing/ and stale recovery handles it."
+                "processing/ and stale recovery handles it. "
+                "For source='local-claude' (the agent channel): request_id is required, and the ack is "
+                "written to ~/messages/agent-replies/<request_id>.ack.json — NOT to "
+                "agent-replies/<request_id>.json, which is the single-shot answer slot that a later "
+                "send_reply(source='local-claude', request_id=..., ...) call must still write. The ack "
+                "never consumes the answer slot (ack != answer)."
             ),
             inputSchema={
                 "type": "object",
@@ -1993,6 +2025,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "The source to reply via (telegram, slack, etc.). Default: telegram.",
                         "default": "telegram",
+                    },
+                    "request_id": {
+                        "type": "string",
+                        "description": "Required when source='local-claude'. The request_id from the inbound local-claude message; the ack is written to ~/messages/agent-replies/<request_id>.ack.json (never the answer slot).",
                     },
                     "reply_to_message_id": {
                         "type": "integer",
@@ -4325,12 +4361,30 @@ def _find_all_message_files(directories: list[Path], message_id: str) -> list[Pa
     return matches
 
 
-def _stale_timeout_for_message(msg: dict) -> int:
-    """Return the stale processing timeout in seconds based on message type.
+# Stale-processing timeout for the agent channel (source="local-claude"). This
+# source is source-aware, not type-aware (its inbound messages are always
+# type="text"): its explicit use case is multi-step work — e.g. "what's the
+# status of PR 1234?" routed through a delegated subagent — which routinely
+# exceeds the generic 90s text timeout below. Using the generic timeout here
+# would let _recover_stale_processing() reclaim an in-flight request and
+# re-dispatch it to a second execution path while the first is still writing
+# its answer, producing two racing writers to the same
+# agent-replies/<request_id>.json (see agent-channel protocol spec, "fail
+# path" — a crash/restart must not produce a second racing writer).
+_LOCAL_CLAUDE_STALE_TIMEOUT_SECONDS = 600  # 10 minutes
 
-    Text messages are expected to complete quickly; media types (voice, audio,
-    photo, document) may take longer due to transcription or download time.
+
+def _stale_timeout_for_message(msg: dict) -> int:
+    """Return the stale processing timeout in seconds based on message source/type.
+
+    Source-aware first: the agent channel (source="local-claude") gets its own,
+    longer budget regardless of type — see _LOCAL_CLAUDE_STALE_TIMEOUT_SECONDS.
+    Otherwise, type-aware: text messages are expected to complete quickly; media
+    types (voice, audio, photo, document) may take longer due to transcription
+    or download time.
     """
+    if msg.get("source") == "local-claude":
+        return _LOCAL_CLAUDE_STALE_TIMEOUT_SECONDS
     slow_types = {"voice", "photo", "document"}  # "audio" removed: normalized to "voice" at ingest
     msg_type = msg.get("type", "text")
     return 300 if msg_type in slow_types else 90
@@ -5334,8 +5388,57 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
     buttons = args.get("buttons")
     thread_ts = args.get("thread_ts")
 
+    # Fail-closed source verification (agent-channel protocol spec, principle 5):
+    # when message_id is provided and resolves to the originating inbox/processing
+    # message, that message's `source` field is ground truth for where this reply
+    # must go. A mismatch means the caller (or a stale "telegram" default) is about
+    # to route a reply to the wrong channel — most critically, a local-claude
+    # agent-channel reply falling back to the Telegram/Slack outbox, which the
+    # protocol spec guarantees can never happen (principle 2). Refuse rather than
+    # guess. Verification *failure* (message not found / unreadable / no source
+    # field) is deliberately NOT treated as a mismatch — the guard only fires on a
+    # confirmed disagreement, so it never blocks the many callers that pass
+    # message_id for messages without a `source` field or that the guard can't
+    # resolve for unrelated reasons.
+    origin_found: Path | None = None
+    origin_msg: dict = {}
+    message_id_arg = args.get("message_id")
+    if message_id_arg:
+        try:
+            _mid_for_check = validate_message_id(message_id_arg)
+            origin_found = (
+                _find_message_file(PROCESSING_DIR, _mid_for_check)
+                or _find_message_file(INBOX_DIR, _mid_for_check)
+            )
+            if origin_found:
+                origin_msg = json.loads(origin_found.read_text())
+        except Exception:
+            origin_found = None
+            origin_msg = {}
+
+        origin_source = origin_msg.get("source")
+        if origin_source and origin_source != source:
+            log.error(
+                f"send_reply: source mismatch — message {message_id_arg} originated "
+                f"from source={origin_source!r} but reply requested source={source!r}. "
+                "Refusing to send (fail-closed on source mismatch)."
+            )
+            return [TextContent(
+                type="text",
+                text=(
+                    f"Error: source mismatch — message {message_id_arg} originated from "
+                    f"source={origin_source!r} but this reply requested source={source!r}. "
+                    "Refusing to send: a reply's source must match the originating "
+                    "message's source (fail-closed, per agent-channel protocol spec)."
+                ),
+            )]
+
     reply_id = f"{int(time.time() * 1000)}_{source}"
-    is_local_claude = source == "local-claude"
+    is_local_claude = source == agent_channel.SOURCE
+    # Only meaningful when is_local_claude; tracks whether *this* call won the
+    # single-shot reply slot (see below) so the tail code and final return can
+    # skip reply-specific bookkeeping when it didn't.
+    reply_slot_created = True
 
     if is_local_claude:
         # Agent channel: local Claude Code session (SSH) <-> dispatcher. This is a
@@ -5343,13 +5446,13 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
         # never touch the Telegram/Slack/SMS outbox. validate_send_reply_args()
         # already confirmed request_id is present and safe.
         request_id = str(args["request_id"]).strip()
-        agent_reply = {
-            "request_id": request_id,
-            "text": text,
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "in_reply_to": args.get("message_id") or request_id,
-        }
-        atomic_write_json(AGENT_REPLIES_DIR / f"{request_id}.json", agent_reply)
+        reply_outcome = agent_channel.write_reply(
+            agent_replies_dir=AGENT_REPLIES_DIR,
+            request_id=request_id,
+            text=text,
+            in_reply_to=args.get("message_id"),
+        )
+        reply_slot_created = reply_outcome.reply_slot_created
     else:
         # Create reply file in outbox
         reply_data = {
@@ -5395,29 +5498,49 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
         if _db_persist_outbound is not None:
             _db_persist_outbound(reply_data)
 
-    # Track reply for mark_processed guard
-    _track_reply(chat_id)
+    # The block below is "a new reply was sent" bookkeeping (dedup tracking,
+    # audit event). Skip it when this call lost the single-shot reply-slot
+    # race above — nothing new was actually delivered, so recording it as a
+    # send would be misleading (e.g. it would let a losing duplicate mask a
+    # different, later-arriving reply for the same request_id).
+    if reply_slot_created:
+        # Track reply for mark_processed guard. Per-request identity for local-claude
+        # (see _reply_track_key) — every local-claude client shares the same constant
+        # chat_id, so keying on chat_id alone would let one client's reply mask another
+        # client's dropped reply.
+        _track_reply(_reply_track_key(chat_id, source=source, request_id=args.get("request_id") if is_local_claude else None))
 
-    # Record direct send for write_result deduplication (suppress duplicate relays)
-    _record_direct_send(chat_id, text)
+        # Record direct send for write_result deduplication (suppress duplicate relays)
+        _record_direct_send(chat_id, text)
 
-    # Task-ID-based dedup (primary): if task_id provided, record so write_result can
-    # auto-set sent_reply_to_user=True even when texts differ (e.g. full reply vs short summary).
-    task_id_param = args.get("task_id", "").strip() if args.get("task_id") else ""
-    if task_id_param:
-        _record_task_replied(task_id_param, chat_id)
-        log.debug(f"Recorded task_id dedup for task={task_id_param!r} chat={chat_id}")
+        # Task-ID-based dedup (primary): if task_id provided, record so write_result can
+        # auto-set sent_reply_to_user=True even when texts differ (e.g. full reply vs short summary).
+        task_id_param = args.get("task_id", "").strip() if args.get("task_id") else ""
+        if task_id_param:
+            _record_task_replied(task_id_param, chat_id)
+            log.debug(f"Recorded task_id dedup for task={task_id_param!r} chat={chat_id}")
 
-    log.info(f"Reply sent to {source} chat {chat_id}")
+        log.info(f"Reply sent to {source} chat {chat_id}")
 
-    # Emit telegram.outbound to EventBus for audit trail (issue #1352).
-    # Skipped for bot-talk — that source already emits via bot_talk_mirror.
-    # Skipped for local-claude — internal agent-channel round-trip, not a chat delivery.
-    if source not in ("bot-talk", "local-claude"):
-        _emit_mcp_event(
-            "telegram.outbound",
-            {"source": source, "chat_id": chat_id, "text_len": len(text)},
-            chat_id=chat_id,
+        # Emit telegram.outbound to EventBus for audit trail (issue #1352).
+        # Skipped for bot-talk — that source already emits via bot_talk_mirror.
+        # local-claude gets its own distinct category (agent_channel.reply, below)
+        # rather than the shared telegram.outbound stream — it isn't a chat delivery.
+        if source not in ("bot-talk", "local-claude"):
+            _emit_mcp_event(
+                "telegram.outbound",
+                {"source": source, "chat_id": chat_id, "text_len": len(text)},
+                chat_id=chat_id,
+            )
+
+    # Agent-channel audit trail (agent-channel-hardening) — see
+    # agent_channel.emit_reply_audit() for what this covers and why.
+    if is_local_claude:
+        agent_channel.emit_reply_audit(
+            request_id=request_id,
+            reply_slot_created=reply_slot_created,
+            text_len=len(text),
+            emit_event=_emit_mcp_event,
         )
 
     # Mirror outbound bot-talk messages to the EventBus so TelegramOutboxListener
@@ -5429,13 +5552,15 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
         except Exception as _bt_exc:
             log.warning(f"bot-talk mirror_outbound failed (non-fatal): {_bt_exc}")
 
-    # Atomic mark_processed: if message_id provided, move message to processed/ in same call
+    # Atomic mark_processed: if message_id provided, move message to processed/ in same call.
+    # Reuses `origin_found` from the fail-closed source check above (same message_id) so the
+    # message is only located once.
     mark_info = ""
     message_id = args.get("message_id")
     if message_id:
         try:
             mid = validate_message_id(message_id)
-            found = _find_message_file(PROCESSING_DIR, mid)
+            found = origin_found if origin_found is not None else _find_message_file(PROCESSING_DIR, mid)
             if not found:
                 found = _find_message_file(INBOX_DIR, mid)
             if found:
@@ -5463,7 +5588,12 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
             log.warning(f"Atomic mark_processed failed for {message_id}: {e}")
 
     if is_local_claude:
-        return [TextContent(type="text", text=f"✅ Reply written to agent-replies/{request_id}.json{mark_info}:\n\n{text[:100]}{'...' if len(text) > 100 else ''}")]
+        return [TextContent(type="text", text=agent_channel.format_reply_response(
+            request_id=request_id,
+            text=text,
+            reply_slot_created=reply_slot_created,
+            mark_info=mark_info,
+        ))]
 
     button_info = f" with {sum(len(row) for row in buttons)} button(s)" if buttons else ""
     thread_info = f" (thread reply)" if thread_ts and source == "slack" else ""
@@ -5600,7 +5730,7 @@ async def handle_mark_processed(args: dict) -> list[TextContent]:
                     except (ValueError, TypeError):
                         pass
 
-                chat_key = str(chat_id)
+                chat_key = _reply_track_key(chat_id, source=msg.get("source", ""), request_id=msg.get("request_id"))
                 reply_ts = _recent_replies.get(chat_key, 0.0)
                 if reply_ts < msg_epoch:
                     # No reply was sent for this human message — log and proceed silently.
@@ -5753,13 +5883,56 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
     fails (message not found or already claimed), the ack is never sent.
     If the ack fails after claiming, the message remains in processing/ and
     stale recovery handles it.
+
+    For source="local-claude" (the agent channel): request_id is required, and
+    the ack is written to agent-replies/<request_id>.ack.json — a distinct file
+    from agent-replies/<request_id>.json, the single-shot answer slot that
+    send_reply(source="local-claude", ...) writes. The ack never touches the
+    answer slot (agent-channel protocol spec, principle 4: ack != answer).
     """
     message_id = validate_message_id(args.get("message_id", ""))
+    source = str(args.get("source", "telegram")).lower()
+    is_local_claude = source == agent_channel.SOURCE
+
+    # --- Step 0: source-specific pre-checks, before we ever claim the message ---
+    # (a) local-claude requires a sanitized request_id up front — same rule as
+    #     send_reply, enforced before the atomic claim so a malformed request never
+    #     leaves a message stuck in processing/ with no way to answer it.
+    request_id: str | None = None
+    if is_local_claude:
+        try:
+            request_id = sanitize_request_id(args.get("request_id"))
+        except ValidationError as e:
+            return [TextContent(type="text", text=f"Error: {e}")]
 
     # --- Step 1: Claim the message (must succeed before sending ack) ---
     found = _find_message_file(INBOX_DIR, message_id)
     if not found:
         return [TextContent(type="text", text=f"Error: Message not found in inbox: {message_id}")]
+
+    # (b) Fail-closed source verification (principle 5), same rule as send_reply:
+    # the message's own `source` field is ground truth. Checked BEFORE claiming
+    # so a mismatched ack never wins a claim it can't legitimately service.
+    try:
+        _pre_claim_msg = json.loads(found.read_text())
+    except Exception:
+        _pre_claim_msg = {}
+    _origin_source = _pre_claim_msg.get("source")
+    if _origin_source and _origin_source != source:
+        log.error(
+            f"claim_and_ack: source mismatch — message {message_id} originated "
+            f"from source={_origin_source!r} but ack requested source={source!r}. "
+            "Refusing to claim (fail-closed on source mismatch)."
+        )
+        return [TextContent(
+            type="text",
+            text=(
+                f"Error: source mismatch — message {message_id} originated from "
+                f"source={_origin_source!r} but this ack requested source={source!r}. "
+                "Refusing to claim: the ack's source must match the originating "
+                "message's source (fail-closed, per agent-channel protocol spec)."
+            ),
+        )]
 
     # Atomic claim via SQLite INSERT OR FAIL (issue #1360).
     # Must succeed before any filesystem move or ack is sent.
@@ -5795,7 +5968,29 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
 
     log.info(f"claim_and_ack: message claimed: {message_id}")
 
-    # --- Step 2: Send the ack reply ---
+    # Agent-channel audit trail (agent-channel-hardening) — see
+    # agent_channel.emit_request_audit() for what this covers and why.
+    if is_local_claude:
+        agent_channel.emit_request_audit(
+            request_id=request_id,
+            message_id=message_id,
+            emit_event=_emit_mcp_event,
+        )
+
+    # --- Step 2: Send the ack ---
+    if is_local_claude:
+        # Ack != answer — see agent_channel.write_ack() docstring. Bypasses
+        # handle_send_reply entirely so there is no code path from this ack
+        # into the answer slot.
+        response_text = agent_channel.write_ack(
+            agent_replies_dir=AGENT_REPLIES_DIR,
+            request_id=request_id,
+            ack_text=args["ack_text"],
+            message_id=message_id,
+            emit_event=_emit_mcp_event,
+        )
+        return [TextContent(type="text", text=response_text)]
+
     ack_args = {
         "chat_id": args["chat_id"],
         "text": args["ack_text"],
@@ -10589,7 +10784,6 @@ def _build_reconciler_message(
         # the user's Telegram.
         original_chat_id = session.get("chat_id", "")
         last_output = _read_last_output(output_file)
-        original_chat_id = session.get("chat_id", "")
         return {
             "id": message_id,
             "type": "agent_failed",
@@ -10603,6 +10797,13 @@ def _build_reconciler_message(
             "task_id": task_id,
             "agent_id": agent_id,
             "original_chat_id": original_chat_id,
+            # The session's own source (e.g. "local-claude"), distinct from this
+            # notification's own source="system" above. Needed so the dispatcher
+            # can tell a crashed local-claude request apart from a crashed
+            # Telegram/Slack one — a generic send_reply(chat_id=original_chat_id)
+            # escalation is only valid for the latter (see agent_failed handler,
+            # "Local-claude originated failures").
+            "original_source": session.get("source", "telegram"),
             "original_prompt": input_summary,
             "last_output": last_output,
             "status": "error",

@@ -5205,6 +5205,79 @@ PY138
         substep "Migration 139: $_AGENT_REPLIES_DIR already exists — skipping"
     fi
 
+    # Migration 140: Register and schedule agent-replies-sweep, the Type B
+    # (cron-direct) retention job for messages/agent-replies/ (agent-channel-
+    # hardening). The agent channel (source="local-claude") writes one reply
+    # file per request and never deletes it — nothing swept that directory
+    # before this. The job only ever removes files older than its retention
+    # window that match the <request_id>.json / <request_id>.ack.json naming
+    # scheme; see scheduled-tasks/agent-replies-sweep.py for the full safety
+    # argument. No MCP restart needed — this is a plain cron script, not
+    # inbox_server.py code.
+    local _JOBS_FILE_140="$WORKSPACE_DIR/scheduled-jobs/jobs.json"
+    if [ -f "$_JOBS_FILE_140" ]; then
+        if ! uv run python3 -c "import json,sys; d=json.load(open('$_JOBS_FILE_140')); sys.exit(0 if 'agent-replies-sweep' in d.get('jobs',{}) else 1)" 2>/dev/null; then
+            substep "Migration 140: adding agent-replies-sweep to jobs.json"
+            local _m140_tmp
+            _m140_tmp=$(mktemp)
+            uv run python3 - <<'PY140' "$_JOBS_FILE_140" "$_m140_tmp"
+import json, sys
+from datetime import datetime, timezone
+jobs_path, tmp_path = sys.argv[1], sys.argv[2]
+with open(jobs_path) as f:
+    data = json.load(f)
+data.setdefault("jobs", {})["agent-replies-sweep"] = {
+    "name": "agent-replies-sweep",
+    "type": "B",
+    "dispatch": "cron-direct",
+    "schedule": "12 4 * * *",
+    "schedule_human": "Daily at 04:12 UTC",
+    "task_file": None,
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+    "enabled": True,
+    "last_run": None,
+    "last_status": None,
+    "description": "Retention sweep for messages/agent-replies/ (agent channel, source=\"local-claude\") — removes reply/ack files past the retention window (default 7 days, env LOBSTER_AGENT_REPLIES_RETENTION_HOURS). Never touches inbox/processing/ — in-flight requests have no file here to delete.",
+}
+with open(tmp_path, "w") as f:
+    json.dump(data, f, indent=2, default=str)
+print("OK")
+PY140
+            if [ -s "$_m140_tmp" ]; then
+                mv "$_m140_tmp" "$_JOBS_FILE_140"
+                substep "Migration 140: agent-replies-sweep added to jobs.json"
+                migrated=$((migrated + 1))
+            else
+                rm -f "$_m140_tmp"
+                warn "Migration 140: failed to add agent-replies-sweep to jobs.json — add manually"
+            fi
+        else
+            substep "Migration 140: agent-replies-sweep already in jobs.json — skipping"
+        fi
+    else
+        substep "Migration 140: $_JOBS_FILE_140 not found — skipping jobs.json registration (will be created at first job run)"
+    fi
+
+    local AGENT_REPLIES_SWEEP_MARKER="# LOBSTER-AGENT-REPLIES-SWEEP"
+    local AGENT_REPLIES_SWEEP_SCRIPT="$LOBSTER_DIR/scheduled-tasks/agent-replies-sweep.py"
+    if [ -f "$AGENT_REPLIES_SWEEP_SCRIPT" ]; then
+        if ! crontab -l 2>/dev/null | grep -qF "$AGENT_REPLIES_SWEEP_MARKER"; then
+            if ! $DRY_RUN; then
+                "$LOBSTER_DIR/scripts/cron-manage.sh" add "$AGENT_REPLIES_SWEEP_MARKER" \
+                    "12 4 * * * cd $LOBSTER_DIR && uv run scheduled-tasks/agent-replies-sweep.py >> $WORKSPACE_DIR/scheduled-jobs/logs/agent-replies-sweep.log 2>&1 $AGENT_REPLIES_SWEEP_MARKER"
+                substep "Migration 140: added agent-replies-sweep cron entry (daily at 04:12 UTC)"
+            else
+                substep "Migration 140 (dry-run): would add agent-replies-sweep cron entry"
+            fi
+            migrated=$((migrated + 1))
+        else
+            substep "Migration 140: agent-replies-sweep cron entry already present — skipping"
+        fi
+    else
+        substep "Migration 140: agent-replies-sweep.py not found — skipping cron entry"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
