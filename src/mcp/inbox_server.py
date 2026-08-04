@@ -83,6 +83,7 @@ import uuid as _uuid_mod
 # Reliability utilities (atomic writes, validation, audit logging)
 from reliability import (
     atomic_write_json,
+    atomic_create_json,
     validate_send_reply_args,
     validate_message_id,
     sanitize_request_id,
@@ -5428,6 +5429,10 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
 
     reply_id = f"{int(time.time() * 1000)}_{source}"
     is_local_claude = source == "local-claude"
+    # Only meaningful when is_local_claude; tracks whether *this* call won the
+    # single-shot reply slot (see below) so the tail code and final return can
+    # skip reply-specific bookkeeping when it didn't.
+    reply_slot_created = True
 
     if is_local_claude:
         # Agent channel: local Claude Code session (SSH) <-> dispatcher. This is a
@@ -5441,7 +5446,26 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
             "ts": datetime.now(timezone.utc).isoformat(),
             "in_reply_to": args.get("message_id") or request_id,
         }
-        atomic_write_json(AGENT_REPLIES_DIR / f"{request_id}.json", agent_reply)
+        # Single-shot reply slot (agent-channel protocol spec, principle 1):
+        # "Once written, that slot is final — nothing may overwrite it with a
+        # different answer. A design that lets two writers race for the same
+        # slot violates this even if the filesystem-level write is atomic."
+        # atomic_write_json's rename-based atomicity only makes ONE write
+        # atomic; it does not stop a second writer from clobbering the first
+        # (e.g. the original subagent for a request finishing just as
+        # _recover_stale_processing() reclaims and re-dispatches the same
+        # request past _LOCAL_CLAUDE_STALE_TIMEOUT_SECONDS). atomic_create_json
+        # closes that gap: the first writer's content lands, every later
+        # writer for the same request_id is told it lost the race and leaves
+        # the existing slot untouched.
+        reply_path = AGENT_REPLIES_DIR / f"{request_id}.json"
+        reply_slot_created = atomic_create_json(reply_path, agent_reply)
+        if not reply_slot_created:
+            log.warning(
+                "send_reply(local-claude): reply slot already occupied for "
+                f"request_id={request_id!r} — refusing to overwrite (first "
+                "writer wins; agent-channel protocol spec principle 1)."
+            )
     else:
         # Create reply file in outbox
         reply_data = {
@@ -5487,33 +5511,39 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
         if _db_persist_outbound is not None:
             _db_persist_outbound(reply_data)
 
-    # Track reply for mark_processed guard. Per-request identity for local-claude
-    # (see _reply_track_key) — every local-claude client shares the same constant
-    # chat_id, so keying on chat_id alone would let one client's reply mask another
-    # client's dropped reply.
-    _track_reply(_reply_track_key(chat_id, source=source, request_id=args.get("request_id") if is_local_claude else None))
+    # The block below is "a new reply was sent" bookkeeping (dedup tracking,
+    # audit event). Skip it when this call lost the single-shot reply-slot
+    # race above — nothing new was actually delivered, so recording it as a
+    # send would be misleading (e.g. it would let a losing duplicate mask a
+    # different, later-arriving reply for the same request_id).
+    if reply_slot_created:
+        # Track reply for mark_processed guard. Per-request identity for local-claude
+        # (see _reply_track_key) — every local-claude client shares the same constant
+        # chat_id, so keying on chat_id alone would let one client's reply mask another
+        # client's dropped reply.
+        _track_reply(_reply_track_key(chat_id, source=source, request_id=args.get("request_id") if is_local_claude else None))
 
-    # Record direct send for write_result deduplication (suppress duplicate relays)
-    _record_direct_send(chat_id, text)
+        # Record direct send for write_result deduplication (suppress duplicate relays)
+        _record_direct_send(chat_id, text)
 
-    # Task-ID-based dedup (primary): if task_id provided, record so write_result can
-    # auto-set sent_reply_to_user=True even when texts differ (e.g. full reply vs short summary).
-    task_id_param = args.get("task_id", "").strip() if args.get("task_id") else ""
-    if task_id_param:
-        _record_task_replied(task_id_param, chat_id)
-        log.debug(f"Recorded task_id dedup for task={task_id_param!r} chat={chat_id}")
+        # Task-ID-based dedup (primary): if task_id provided, record so write_result can
+        # auto-set sent_reply_to_user=True even when texts differ (e.g. full reply vs short summary).
+        task_id_param = args.get("task_id", "").strip() if args.get("task_id") else ""
+        if task_id_param:
+            _record_task_replied(task_id_param, chat_id)
+            log.debug(f"Recorded task_id dedup for task={task_id_param!r} chat={chat_id}")
 
-    log.info(f"Reply sent to {source} chat {chat_id}")
+        log.info(f"Reply sent to {source} chat {chat_id}")
 
-    # Emit telegram.outbound to EventBus for audit trail (issue #1352).
-    # Skipped for bot-talk — that source already emits via bot_talk_mirror.
-    # Skipped for local-claude — internal agent-channel round-trip, not a chat delivery.
-    if source not in ("bot-talk", "local-claude"):
-        _emit_mcp_event(
-            "telegram.outbound",
-            {"source": source, "chat_id": chat_id, "text_len": len(text)},
-            chat_id=chat_id,
-        )
+        # Emit telegram.outbound to EventBus for audit trail (issue #1352).
+        # Skipped for bot-talk — that source already emits via bot_talk_mirror.
+        # Skipped for local-claude — internal agent-channel round-trip, not a chat delivery.
+        if source not in ("bot-talk", "local-claude"):
+            _emit_mcp_event(
+                "telegram.outbound",
+                {"source": source, "chat_id": chat_id, "text_len": len(text)},
+                chat_id=chat_id,
+            )
 
     # Mirror outbound bot-talk messages to the EventBus so TelegramOutboxListener
     # can forward them as debug notifications. Fire-and-forget: non-blocking.
@@ -5560,7 +5590,17 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
             log.warning(f"Atomic mark_processed failed for {message_id}: {e}")
 
     if is_local_claude:
-        return [TextContent(type="text", text=f"✅ Reply written to agent-replies/{request_id}.json{mark_info}:\n\n{text[:100]}{'...' if len(text) > 100 else ''}")]
+        if reply_slot_created:
+            return [TextContent(type="text", text=f"✅ Reply written to agent-replies/{request_id}.json{mark_info}:\n\n{text[:100]}{'...' if len(text) > 100 else ''}")]
+        return [TextContent(
+            type="text",
+            text=(
+                f"⚠️ No-op: agent-replies/{request_id}.json already exists — another "
+                "caller already wrote the reply for this request_id (single-shot "
+                "reply slot, first writer wins). Nothing was overwritten; the "
+                f"request is already answered{mark_info}."
+            ),
+        )]
 
     button_info = f" with {sum(len(row) for row in buttons)} button(s)" if buttons else ""
     thread_info = f" (thread reply)" if thread_ts and source == "slack" else ""

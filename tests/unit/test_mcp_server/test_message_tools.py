@@ -481,6 +481,48 @@ class TestSendReplyLocalClaude:
             assert "Error" not in result[0].text
             assert (agent_replies / "req-ok.json").exists()
 
+    def test_second_writer_does_not_overwrite_first(self, dirs):
+        """Single-shot reply slot (agent-channel protocol spec, principle 1): a
+        second send_reply for the same request_id must never clobber the first
+        writer's answer, even though each individual write is itself atomic.
+        Reproduces the exact race a crash/redispatch under
+        _recover_stale_processing() can produce — two independent callers
+        racing for the same agent-replies/<request_id>.json slot."""
+        outbox, sent, agent_replies = dirs
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            first = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "First answer (correct).",
+                    "source": "local-claude",
+                    "request_id": "req-race",
+                })
+            )
+            second = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "Second answer (should NOT win).",
+                    "source": "local-claude",
+                    "request_id": "req-race",
+                })
+            )
+
+            assert "Reply written" in first[0].text
+            assert "already exists" in second[0].text.lower()
+
+            files = list(agent_replies.glob("*.json"))
+            assert len(files) == 1
+            content = json.loads(files[0].read_text())
+            assert content["text"] == "First answer (correct)."
+
 
 class TestAutoThreading:
     """Tests for automatic reply threading (issue #330).

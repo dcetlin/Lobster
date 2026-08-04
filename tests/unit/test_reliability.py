@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src" / "mcp"))
 
 from reliability import (
     atomic_write_json,
+    atomic_create_json,
     safe_move,
     validate_send_reply_args,
     validate_message_id,
@@ -89,6 +90,44 @@ class TestAtomicWriteJson:
         # No temp files left behind
         tmp_files = [f for f in tmp_path.iterdir() if f.suffix == ".tmp"]
         assert len(tmp_files) == 0
+
+
+class TestAtomicCreateJson:
+    def test_creates_when_absent(self, tmp_path):
+        """First call creates the file and returns True."""
+        path = tmp_path / "slot.json"
+        created = atomic_create_json(path, {"answer": "first"})
+
+        assert created is True
+        assert json.loads(path.read_text()) == {"answer": "first"}
+
+    def test_second_call_does_not_overwrite(self, tmp_path):
+        """Single-shot semantics: a second call for the same path is a no-op
+        that leaves the first writer's content untouched and reports False."""
+        path = tmp_path / "slot.json"
+        first = atomic_create_json(path, {"answer": "first"})
+        second = atomic_create_json(path, {"answer": "second"})
+
+        assert first is True
+        assert second is False
+        assert json.loads(path.read_text()) == {"answer": "first"}
+
+    def test_no_temp_files_left_on_success_or_loss(self, tmp_path):
+        """Temp files are cleaned up whether this call wins or loses the race."""
+        path = tmp_path / "slot.json"
+        atomic_create_json(path, {"answer": "first"})
+        atomic_create_json(path, {"answer": "second"})
+
+        tmp_files = [f for f in tmp_path.iterdir() if f.suffix == ".tmp"]
+        assert len(tmp_files) == 0
+
+    def test_fails_on_unserializable_data(self, tmp_path):
+        """Non-serializable data raises TypeError and creates nothing."""
+        path = tmp_path / "slot.json"
+        with pytest.raises(TypeError):
+            atomic_create_json(path, {"bad": object()})
+
+        assert not path.exists()
 
 
 class TestSafeMove:
