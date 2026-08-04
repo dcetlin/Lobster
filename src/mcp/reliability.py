@@ -16,6 +16,7 @@ Design principles:
 
 import json
 import logging
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -57,6 +58,37 @@ class ValidationError(Exception):
     pass
 
 
+# request_id doubles as a filesystem path component (agent-replies/<request_id>.json
+# and agent-replies/<request_id>.ack.json) for the agent channel (source="local-claude").
+# Per the agent-channel protocol spec, principle 6 ("filesystem-safe request identity"),
+# it must be sanitized at the boundary where it enters the system — reject traversal
+# characters, cap length, and use a charset allowlist rather than a blocklist so novel
+# path-unsafe characters can't slip through.
+_REQUEST_ID_MAX_LEN = 128
+_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def sanitize_request_id(request_id: Any) -> str:
+    """Validate and normalize a request_id for safe use as a filesystem path component.
+
+    Raises ValidationError with a descriptive message on invalid input:
+    missing/empty, too long, or containing anything outside [A-Za-z0-9_-].
+    """
+    if request_id is None or not str(request_id).strip():
+        raise ValidationError("request_id is required")
+    value = str(request_id).strip()
+    if len(value) > _REQUEST_ID_MAX_LEN:
+        raise ValidationError(
+            f"request_id exceeds max length of {_REQUEST_ID_MAX_LEN} characters"
+        )
+    if not _REQUEST_ID_PATTERN.match(value):
+        raise ValidationError(
+            "request_id contains invalid characters — only letters, digits, "
+            "'-' and '_' are allowed (no path separators or traversal sequences)"
+        )
+    return value
+
+
 def validate_send_reply_args(args: dict) -> dict:
     """Validate and normalize send_reply arguments.
 
@@ -94,20 +126,18 @@ def validate_send_reply_args(args: dict) -> dict:
 
     # local-claude: request_id is required — it is the correlation key the local
     # `lobster-chat` CLI polls on (~/messages/agent-replies/<request_id>.json).
+    normalized_args = {**args, "chat_id": chat_id, "text": text, "source": source}
     if source == "local-claude":
-        request_id = args.get("request_id")
-        if not request_id or not str(request_id).strip():
-            raise ValidationError("request_id is required when source='local-claude'")
-        request_id = str(request_id).strip()
-        if ".." in request_id or "/" in request_id or "\\" in request_id:
-            raise ValidationError("request_id contains invalid characters")
+        try:
+            normalized_args["request_id"] = sanitize_request_id(args.get("request_id"))
+        except ValidationError as e:
+            # Preserve the more specific "when source='local-claude'" wording for the
+            # missing case; the sanitizer's own message covers the invalid-charset case.
+            if "is required" in str(e):
+                raise ValidationError("request_id is required when source='local-claude'") from e
+            raise
 
-    return {
-        **args,
-        "chat_id": chat_id,
-        "text": text,
-        "source": source,
-    }
+    return normalized_args
 
 
 def validate_message_id(message_id: Any) -> str:
