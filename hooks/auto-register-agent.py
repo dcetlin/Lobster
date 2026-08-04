@@ -16,6 +16,15 @@ state is used — the agent IS running at the point this hook fires.
     source: telegram
     ---
 
+`request_id` is an additional optional frontmatter field, present only when
+`source: local-claude` (the agent channel — see docs/agent-channel.md). It is
+the correlation id the dispatcher carries into a delegated subagent so that
+subagent can address `send_reply(source="local-claude", request_id=..., ...)`
+at the correct `agent-replies/<request_id>.json` slot. Recorded here purely
+for observability/audit (`agent_sessions.request_id`) — the subagent itself
+already has the value directly in its own prompt and does not depend on this
+hook to "receive" it.
+
 ## Legacy text format (backward compat)
 
     Your task_id is: my-task
@@ -121,10 +130,11 @@ def _extract_task_id_from_text(prompt: str) -> str | None:
 
 
 def extract_metadata(prompt: str) -> dict:
-    """Return a dict with task_id, chat_id, source, reply_to_message_id from prompt.
+    """Return a dict with task_id, chat_id, source, reply_to_message_id, request_id from prompt.
 
     Tries YAML frontmatter first. Falls back to text parsing for task_id.
-    All values are strings (or None if absent).
+    All values are strings (or None if absent). request_id has no legacy text
+    fallback — it only ever arrives via frontmatter (see module docstring).
     """
     fm = _parse_yaml_frontmatter(prompt)
 
@@ -132,6 +142,7 @@ def extract_metadata(prompt: str) -> dict:
     chat_id = fm.get("chat_id")
     source = fm.get("source", "telegram")
     reply_to_message_id = fm.get("reply_to_message_id")
+    request_id = fm.get("request_id")
 
     return {
         "task_id": task_id,
@@ -140,6 +151,7 @@ def extract_metadata(prompt: str) -> dict:
         "reply_to_message_id": (
             str(reply_to_message_id) if reply_to_message_id is not None else None
         ),
+        "request_id": str(request_id) if request_id is not None else None,
     }
 
 
@@ -197,6 +209,7 @@ def insert_agent_session(
     session_id: str,
     output_file: str | None,
     input_summary: str | None,
+    request_id: str | None = None,
 ) -> None:
     """Insert a 'running' row into agent_sessions.db.
 
@@ -236,18 +249,26 @@ def insert_agent_session(
                 notified_at         TEXT,
                 trigger_message_id  TEXT,
                 trigger_snippet     TEXT,
-                reply_message_ids   TEXT
+                reply_message_ids   TEXT,
+                request_id          TEXT
             )
         """)
+        # Additive migration for DBs created before request_id existed. Safe to
+        # re-run: sqlite3.OperationalError ("duplicate column name") is swallowed,
+        # matching the idempotent ALTER TABLE pattern used by session_store.py.
+        try:
+            conn.execute("ALTER TABLE agent_sessions ADD COLUMN request_id TEXT")
+        except sqlite3.OperationalError:
+            pass
         now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         conn.execute(
             """
             INSERT OR IGNORE INTO agent_sessions
                 (id, task_id, agent_type, description, chat_id, source,
-                 status, output_file, input_summary, spawned_at)
+                 status, output_file, input_summary, spawned_at, request_id)
             VALUES
                 (?, ?, 'subagent', 'auto-registered by PostToolUse hook', ?, ?,
-                 'running', ?, ?, ?)
+                 'running', ?, ?, ?, ?)
             """,
             (
                 agent_id,
@@ -257,6 +278,7 @@ def insert_agent_session(
                 output_file,
                 input_summary,
                 now,
+                request_id,
             ),
         )
         conn.commit()
@@ -306,6 +328,7 @@ def main() -> None:
             session_id=session_id,
             output_file=output_file,
             input_summary=input_summary,
+            request_id=metadata["request_id"],
         )
 
     except Exception as exc:  # noqa: BLE001

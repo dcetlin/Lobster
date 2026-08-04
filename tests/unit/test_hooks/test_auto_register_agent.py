@@ -162,6 +162,18 @@ class TestExtractMetadata:
         # Frontmatter parse fails, legacy text used
         assert meta["task_id"] == "textid"
 
+    def test_request_id_from_frontmatter(self):
+        """request_id (agent-channel field) is parsed like any other frontmatter key."""
+        prompt = "---\ntask_id: t-001\nchat_id: local-claude\nsource: local-claude\nrequest_id: 1732900000-a1b2c3d4\n---\nbody"
+        meta = extract_metadata(prompt)
+        assert meta["request_id"] == "1732900000-a1b2c3d4"
+
+    def test_request_id_absent_is_none(self):
+        """Normal telegram/slack tasks have no request_id — must be None, not empty string."""
+        prompt = "---\ntask_id: t-002\nchat_id: 123\nsource: telegram\n---\nbody"
+        meta = extract_metadata(prompt)
+        assert meta["request_id"] is None
+
 
 # ---------------------------------------------------------------------------
 # extract_agent_id: pure function tests
@@ -318,6 +330,72 @@ class TestHookAgentWithAgentId:
 
         row = _get_row(tmp_path, "agent-of")
         assert row["output_file"] == "/tmp/result.json"
+
+    def test_request_id_stored_for_local_claude_task(self, tmp_path):
+        """request_id from frontmatter is persisted to the agent_sessions row (audit trail)."""
+        prompt = (
+            "---\ntask_id: t-agent-channel\nchat_id: local-claude\n"
+            "source: local-claude\nrequest_id: req-abc123\n---\nDo the local-claude task."
+        )
+        hook_input = _make_hook_input(
+            prompt=prompt,
+            tool_response={"agentId": "agent-local-claude"},
+        )
+        exit_code, _, _ = _run_hook(hook_input, tmp_path)
+        assert exit_code == 0
+
+        row = _get_row(tmp_path, "agent-local-claude")
+        assert row is not None
+        assert row["request_id"] == "req-abc123"
+        assert row["source"] == "local-claude"
+
+    def test_request_id_null_for_non_agent_channel_task(self, tmp_path):
+        """Ordinary telegram tasks store NULL request_id, not an empty string."""
+        prompt = "---\ntask_id: t-plain\nchat_id: 12345\nsource: telegram\n---\nDo normal work."
+        hook_input = _make_hook_input(
+            prompt=prompt,
+            tool_response={"agentId": "agent-plain"},
+        )
+        exit_code, _, _ = _run_hook(hook_input, tmp_path)
+        assert exit_code == 0
+
+        row = _get_row(tmp_path, "agent-plain")
+        assert row is not None
+        assert row["request_id"] is None
+
+    def test_request_id_column_added_to_pre_existing_db(self, tmp_path):
+        """A DB created before request_id existed gets the column via additive ALTER TABLE."""
+        db_dir = tmp_path / "messages" / "config"
+        db_dir.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_dir / "agent_sessions.db"))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_sessions (
+                id TEXT PRIMARY KEY, task_id TEXT, agent_type TEXT,
+                description TEXT NOT NULL, chat_id TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'telegram',
+                status TEXT NOT NULL DEFAULT 'running',
+                output_file TEXT, timeout_minutes INTEGER,
+                input_summary TEXT, result_summary TEXT, parent_id TEXT,
+                spawned_at TEXT NOT NULL, completed_at TEXT,
+                last_seen_at TEXT, notified_at TEXT,
+                trigger_message_id TEXT, trigger_snippet TEXT,
+                reply_message_ids TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        prompt = "---\ntask_id: t-migrate\nsource: local-claude\nrequest_id: req-migrated\n---"
+        hook_input = _make_hook_input(
+            prompt=prompt,
+            tool_response={"agentId": "agent-migrated"},
+        )
+        exit_code, _, _ = _run_hook(hook_input, tmp_path)
+        assert exit_code == 0
+
+        row = _get_row(tmp_path, "agent-migrated")
+        assert row is not None
+        assert row["request_id"] == "req-migrated"
 
     def test_no_chat_id_defaults_to_zero(self, tmp_path):
         """Missing chat_id stores '0' to satisfy NOT NULL constraint."""
