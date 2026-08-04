@@ -92,6 +92,12 @@ from reliability import (
     audit_log,
 )
 
+# Agent channel (source="local-claude"): envelope construction, the
+# single-shot reply-slot write, the ack write, and the agent_channel.*
+# audit emits. See src/mcp/agent_channel.py module docstring for the
+# extraction's boundary (what stays here vs. what moved).
+import agent_channel
+
 # Self-update system
 from update_manager import UpdateManager
 
@@ -5428,7 +5434,7 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
             )]
 
     reply_id = f"{int(time.time() * 1000)}_{source}"
-    is_local_claude = source == "local-claude"
+    is_local_claude = source == agent_channel.SOURCE
     # Only meaningful when is_local_claude; tracks whether *this* call won the
     # single-shot reply slot (see below) so the tail code and final return can
     # skip reply-specific bookkeeping when it didn't.
@@ -5440,32 +5446,13 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
         # never touch the Telegram/Slack/SMS outbox. validate_send_reply_args()
         # already confirmed request_id is present and safe.
         request_id = str(args["request_id"]).strip()
-        agent_reply = {
-            "request_id": request_id,
-            "text": text,
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "in_reply_to": args.get("message_id") or request_id,
-        }
-        # Single-shot reply slot (agent-channel protocol spec, principle 1):
-        # "Once written, that slot is final — nothing may overwrite it with a
-        # different answer. A design that lets two writers race for the same
-        # slot violates this even if the filesystem-level write is atomic."
-        # atomic_write_json's rename-based atomicity only makes ONE write
-        # atomic; it does not stop a second writer from clobbering the first
-        # (e.g. the original subagent for a request finishing just as
-        # _recover_stale_processing() reclaims and re-dispatches the same
-        # request past _LOCAL_CLAUDE_STALE_TIMEOUT_SECONDS). atomic_create_json
-        # closes that gap: the first writer's content lands, every later
-        # writer for the same request_id is told it lost the race and leaves
-        # the existing slot untouched.
-        reply_path = AGENT_REPLIES_DIR / f"{request_id}.json"
-        reply_slot_created = atomic_create_json(reply_path, agent_reply)
-        if not reply_slot_created:
-            log.warning(
-                "send_reply(local-claude): reply slot already occupied for "
-                f"request_id={request_id!r} — refusing to overwrite (first "
-                "writer wins; agent-channel protocol spec principle 1)."
-            )
+        reply_outcome = agent_channel.write_reply(
+            agent_replies_dir=AGENT_REPLIES_DIR,
+            request_id=request_id,
+            text=text,
+            in_reply_to=args.get("message_id"),
+        )
+        reply_slot_created = reply_outcome.reply_slot_created
     else:
         # Create reply file in outbox
         reply_data = {
@@ -5546,23 +5533,14 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
                 chat_id=chat_id,
             )
 
-    # Agent-channel audit trail (agent-channel-hardening). Previously this whole
-    # source was excluded from telegram.outbound with no replacement — the reply
-    # half of the channel was invisible in events.jsonl. Distinct event_type from
-    # telegram.outbound because this is a machine-to-machine reply, not a chat
-    # delivery. Emitted for BOTH outcomes — won the single-shot reply slot, or
-    # lost the race (reply_slot_created=False, agent-channel protocol spec
-    # principle 1) — so a lost-race conflict is visible in the audit trail
-    # instead of silently vanishing.
+    # Agent-channel audit trail (agent-channel-hardening) — see
+    # agent_channel.emit_reply_audit() for what this covers and why.
     if is_local_claude:
-        _emit_mcp_event(
-            "agent_channel.reply",
-            {
-                "request_id": request_id,
-                "reply_slot_created": reply_slot_created,
-                "text_len": len(text),
-            },
-            severity="info" if reply_slot_created else "warn",
+        agent_channel.emit_reply_audit(
+            request_id=request_id,
+            reply_slot_created=reply_slot_created,
+            text_len=len(text),
+            emit_event=_emit_mcp_event,
         )
 
     # Mirror outbound bot-talk messages to the EventBus so TelegramOutboxListener
@@ -5610,17 +5588,12 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
             log.warning(f"Atomic mark_processed failed for {message_id}: {e}")
 
     if is_local_claude:
-        if reply_slot_created:
-            return [TextContent(type="text", text=f"✅ Reply written to agent-replies/{request_id}.json{mark_info}:\n\n{text[:100]}{'...' if len(text) > 100 else ''}")]
-        return [TextContent(
-            type="text",
-            text=(
-                f"⚠️ No-op: agent-replies/{request_id}.json already exists — another "
-                "caller already wrote the reply for this request_id (single-shot "
-                "reply slot, first writer wins). Nothing was overwritten; the "
-                f"request is already answered{mark_info}."
-            ),
-        )]
+        return [TextContent(type="text", text=agent_channel.format_reply_response(
+            request_id=request_id,
+            text=text,
+            reply_slot_created=reply_slot_created,
+            mark_info=mark_info,
+        ))]
 
     button_info = f" with {sum(len(row) for row in buttons)} button(s)" if buttons else ""
     thread_info = f" (thread reply)" if thread_ts and source == "slack" else ""
@@ -5919,7 +5892,7 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
     """
     message_id = validate_message_id(args.get("message_id", ""))
     source = str(args.get("source", "telegram")).lower()
-    is_local_claude = source == "local-claude"
+    is_local_claude = source == agent_channel.SOURCE
 
     # --- Step 0: source-specific pre-checks, before we ever claim the message ---
     # (a) local-claude requires a sanitized request_id up front — same rule as
@@ -5995,63 +5968,28 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
 
     log.info(f"claim_and_ack: message claimed: {message_id}")
 
-    # Agent-channel audit trail (agent-channel-hardening): claim_and_ack never
-    # emitted anything for local-claude — neither the claim nor the ack — so
-    # the request half of the round trip was invisible in events.jsonl. This
-    # is the inbound counterpart to agent_channel.reply/agent_channel.ack
-    # below; distinct event_type from telegram.inbound because this is a
-    # machine-to-machine request, not a chat message.
+    # Agent-channel audit trail (agent-channel-hardening) — see
+    # agent_channel.emit_request_audit() for what this covers and why.
     if is_local_claude:
-        _emit_mcp_event(
-            "agent_channel.request",
-            {"request_id": request_id, "message_id": message_id},
+        agent_channel.emit_request_audit(
+            request_id=request_id,
+            message_id=message_id,
+            emit_event=_emit_mcp_event,
         )
 
     # --- Step 2: Send the ack ---
     if is_local_claude:
-        # Ack != answer: write to a distinct ack slot, never to
-        # agent-replies/<request_id>.json — that file is the single-shot answer
-        # slot a later send_reply(source="local-claude", request_id=..., ...)
-        # call must still write. Bypasses handle_send_reply entirely so there is
-        # no code path from this ack into the answer slot.
-        ack_payload = {
-            "request_id": request_id,
-            "ack": True,
-            "text": args["ack_text"],
-            "ts": datetime.now(timezone.utc).isoformat(),
-        }
-        try:
-            atomic_write_json(AGENT_REPLIES_DIR / f"{request_id}.ack.json", ack_payload)
-            log.info(f"claim_and_ack: local-claude ack written for request {request_id}")
-            _emit_mcp_event(
-                "agent_channel.ack",
-                {"request_id": request_id, "message_id": message_id, "text_len": len(args["ack_text"])},
-            )
-            return [TextContent(
-                type="text",
-                text=(
-                    f"Claimed and acked (local-claude): {message_id}\n\n"
-                    f"Ack written to agent-replies/{request_id}.ack.json "
-                    "(answer slot untouched — still call send_reply(source='local-claude', "
-                    f"request_id='{request_id}', ...) with the real answer).\n\n"
-                    f"Ack: {args['ack_text'][:100]}"
-                ),
-            )]
-        except Exception as e:
-            # Ack write failed — message stays in processing/, stale recovery handles it
-            log.warning(f"claim_and_ack: local-claude ack write failed (message stays in processing/): {e}")
-            _emit_mcp_event(
-                "agent_channel.ack",
-                {"request_id": request_id, "message_id": message_id, "error": str(e)},
-                severity="warn",
-            )
-            return [TextContent(
-                type="text",
-                text=(
-                    f"Warning: message claimed but local-claude ack write failed: {e}\n"
-                    f"Message {message_id} remains in processing/. Stale recovery will handle it."
-                ),
-            )]
+        # Ack != answer — see agent_channel.write_ack() docstring. Bypasses
+        # handle_send_reply entirely so there is no code path from this ack
+        # into the answer slot.
+        response_text = agent_channel.write_ack(
+            agent_replies_dir=AGENT_REPLIES_DIR,
+            request_id=request_id,
+            ack_text=args["ack_text"],
+            message_id=message_id,
+            emit_event=_emit_mcp_event,
+        )
+        return [TextContent(type="text", text=response_text)]
 
     ack_args = {
         "chat_id": args["chat_id"],
