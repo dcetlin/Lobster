@@ -5191,6 +5191,20 @@ PY138
     # safely edit that file (outside git, live Claude Code config) — remove those
     # hook entries by hand after this upgrade completes.
 
+    # Migration 139: Create messages/agent-replies/ directory for the agent
+    # channel (source="local-claude"). handle_send_reply() in inbox_server.py
+    # writes replies there for the lobster-chat CLI to poll — see
+    # docs/agent-channel.md. Requires an MCP server restart to take effect
+    # (restart-mcp.sh), since inbox_server.py is a long-lived stdio process.
+    local _AGENT_REPLIES_DIR="$MESSAGES_DIR/agent-replies"
+    if [ ! -d "$_AGENT_REPLIES_DIR" ]; then
+        mkdir -p "$_AGENT_REPLIES_DIR"
+        substep "Migration 139: created $_AGENT_REPLIES_DIR"
+        migrated=$((migrated + 1))
+    else
+        substep "Migration 139: $_AGENT_REPLIES_DIR already exists — skipping"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

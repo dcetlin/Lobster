@@ -149,6 +149,28 @@ class TestValidateSendReplyArgs:
         with pytest.raises(ValidationError, match="Invalid source"):
             validate_send_reply_args({"chat_id": 123, "text": "Hi", "source": "carrier_pigeon"})
 
+    def test_local_claude_requires_request_id(self):
+        """source='local-claude' without request_id raises ValidationError."""
+        with pytest.raises(ValidationError, match="request_id"):
+            validate_send_reply_args({"chat_id": "local", "text": "Hi", "source": "local-claude"})
+
+    def test_local_claude_rejects_path_traversal_request_id(self):
+        """request_id containing path-traversal characters is rejected."""
+        with pytest.raises(ValidationError, match="invalid characters"):
+            validate_send_reply_args({
+                "chat_id": "local",
+                "text": "Hi",
+                "source": "local-claude",
+                "request_id": "../../etc/passwd",
+            })
+
+    def test_valid_local_claude_args(self):
+        """Valid local-claude reply args pass validation."""
+        args = {"chat_id": "local", "text": "Hello", "source": "local-claude", "request_id": "abc123"}
+        result = validate_send_reply_args(args)
+        assert result["source"] == "local-claude"
+        assert result["request_id"] == "abc123"
+
     def test_does_not_truncate_below_sanity_cap(self):
         """Text longer than 4096 chars is NOT truncated — chunking handles it.
 

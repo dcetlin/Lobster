@@ -86,11 +86,21 @@ def validate_send_reply_args(args: dict) -> dict:
         text = text[:99_997] + "..."
 
     # source: must be a known source
-    valid_sources = {"telegram", "slack", "sms", "signal", "whatsapp", "bisque"}
+    valid_sources = {"telegram", "slack", "sms", "signal", "whatsapp", "bisque", "local-claude"}
     if source not in valid_sources:
         raise ValidationError(
             f"Invalid source '{source}'. Must be one of: {', '.join(sorted(valid_sources))}"
         )
+
+    # local-claude: request_id is required — it is the correlation key the local
+    # `lobster-chat` CLI polls on (~/messages/agent-replies/<request_id>.json).
+    if source == "local-claude":
+        request_id = args.get("request_id")
+        if not request_id or not str(request_id).strip():
+            raise ValidationError("request_id is required when source='local-claude'")
+        request_id = str(request_id).strip()
+        if ".." in request_id or "/" in request_id or "\\" in request_id:
+            raise ValidationError("request_id contains invalid characters")
 
     return {
         **args,

@@ -423,6 +423,7 @@ TASK_REPLIED_DIR = BASE_DIR / "task-replied"
 TASKS_FILE = BASE_DIR / "tasks.json"
 TASK_OUTPUTS_DIR = BASE_DIR / "task-outputs"
 BISQUE_OUTBOX_DIR = BASE_DIR / "bisque-outbox"
+AGENT_REPLIES_DIR = BASE_DIR / "agent-replies"  # agent channel: dispatcher replies to source="local-claude" land here, keyed by request_id (see docs/agent-channel.md)
 MESSAGES_DB_PATH = Path(
     os.environ.get("LOBSTER_MESSAGES_DB", str(BASE_DIR / "messages.db"))
 )
@@ -909,7 +910,7 @@ CANONICAL_DIR = _USER_CONFIG / "memory" / "canonical"
 
 # Ensure directories exist
 for d in [INBOX_DIR, OUTBOX_DIR, PROCESSED_DIR, PROCESSING_DIR, FAILED_DIR, SENT_DIR, SENT_REPLIES_DIR,
-          TASK_REPLIED_DIR, CONFIG_DIR, AUDIO_DIR, TASK_OUTPUTS_DIR, BISQUE_OUTBOX_DIR,
+          TASK_REPLIED_DIR, CONFIG_DIR, AUDIO_DIR, TASK_OUTPUTS_DIR, BISQUE_OUTBOX_DIR, AGENT_REPLIES_DIR,
           SCHEDULED_TASKS_TASKS_DIR, SCHEDULED_JOBS_DIR, SCHEDULED_TASKS_LOGS_DIR, CANONICAL_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
@@ -1785,7 +1786,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="send_reply",
-            description="Send a reply to a message. The reply will be routed back to the original source (Telegram, Slack, SMS, etc.). Supports optional inline keyboard buttons for Telegram and thread replies for Slack.",
+            description="Send a reply to a message. The reply will be routed back to the original source (Telegram, Slack, SMS, etc.). Supports optional inline keyboard buttons for Telegram and thread replies for Slack. For source='local-claude' (the agent channel — a local Claude Code session talking to the dispatcher over SSH), the reply is written to ~/messages/agent-replies/<request_id>.json instead of any chat channel; request_id is required in that case.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1794,7 +1795,7 @@ async def list_tools() -> list[Tool]:
                             {"type": "integer"},
                             {"type": "string"}
                         ],
-                        "description": "The chat/channel ID to reply to (from the original message). Integer for Telegram, string for Slack.",
+                        "description": "The chat/channel ID to reply to (from the original message). Integer for Telegram, string for Slack. For source='local-claude' this is not used for routing (routing is by request_id) but is still required — pass the value from the inbound local-claude message.",
                     },
                     "text": {
                         "type": "string",
@@ -1802,8 +1803,12 @@ async def list_tools() -> list[Tool]:
                     },
                     "source": {
                         "type": "string",
-                        "description": "The source to reply via (telegram, slack, sms, signal, whatsapp, bisque). Default: telegram.",
+                        "description": "The source to reply via (telegram, slack, sms, signal, whatsapp, bisque, local-claude). Default: telegram.",
                         "default": "telegram",
+                    },
+                    "request_id": {
+                        "type": "string",
+                        "description": "Required when source='local-claude'. The request_id from the inbound local-claude message; the reply is written to ~/messages/agent-replies/<request_id>.json for the lobster-chat CLI to pick up.",
                     },
                     "thread_ts": {
                         "type": "string",
@@ -5329,50 +5334,66 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
     buttons = args.get("buttons")
     thread_ts = args.get("thread_ts")
 
-    # Create reply file in outbox
     reply_id = f"{int(time.time() * 1000)}_{source}"
-    reply_data = {
-        "id": reply_id,
-        "source": source,
-        "chat_id": chat_id,
-        "text": text,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    is_local_claude = source == "local-claude"
 
-    # Include buttons if provided (Telegram only)
-    if buttons and source == "telegram":
-        reply_data["buttons"] = buttons
-
-    # Include thread_ts if provided (Slack only)
-    if thread_ts and source == "slack":
-        reply_data["thread_ts"] = thread_ts
-
-    # Include reply_to_message_id if explicitly provided (Telegram only).
-    # No auto-threading fallback: if reply_to_message_id is absent, the reply is
-    # sent standalone. Auto-threading was removed because it caused replies to
-    # thread under the wrong message when multiple messages were in-flight for
-    # the same chat simultaneously.
-    reply_to_msg_id = args.get("reply_to_message_id")
-    if source == "telegram" and reply_to_msg_id:
-        reply_data["reply_to_message_id"] = int(reply_to_msg_id)
-
-    # Route bisque replies to the bisque-outbox so the relay server picks them up.
-    # All other sources go to the standard outbox for the bot process.
-    if source == "bisque":
-        outbox_file = BISQUE_OUTBOX_DIR / f"{reply_id}.json"
+    if is_local_claude:
+        # Agent channel: local Claude Code session (SSH) <-> dispatcher. This is a
+        # machine-to-machine request/reply, not a Dan-facing chat message — it must
+        # never touch the Telegram/Slack/SMS outbox. validate_send_reply_args()
+        # already confirmed request_id is present and safe.
+        request_id = str(args["request_id"]).strip()
+        agent_reply = {
+            "request_id": request_id,
+            "text": text,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "in_reply_to": args.get("message_id") or request_id,
+        }
+        atomic_write_json(AGENT_REPLIES_DIR / f"{request_id}.json", agent_reply)
     else:
-        outbox_file = OUTBOX_DIR / f"{reply_id}.json"
+        # Create reply file in outbox
+        reply_data = {
+            "id": reply_id,
+            "source": source,
+            "chat_id": chat_id,
+            "text": text,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
 
-    # Atomic write: temp file + fsync + rename to prevent watchdog race condition
-    atomic_write_json(outbox_file, reply_data)
+        # Include buttons if provided (Telegram only)
+        if buttons and source == "telegram":
+            reply_data["buttons"] = buttons
 
-    # Save a copy to sent directory for conversation history
-    sent_file = SENT_DIR / f"{reply_id}.json"
-    atomic_write_json(sent_file, reply_data)
+        # Include thread_ts if provided (Slack only)
+        if thread_ts and source == "slack":
+            reply_data["thread_ts"] = thread_ts
 
-    # BIS-167 Slice 6: persist outbound reply to messages.db (no-op when LOBSTER_USE_DB!=1)
-    if _db_persist_outbound is not None:
-        _db_persist_outbound(reply_data)
+        # Include reply_to_message_id if explicitly provided (Telegram only).
+        # No auto-threading fallback: if reply_to_message_id is absent, the reply is
+        # sent standalone. Auto-threading was removed because it caused replies to
+        # thread under the wrong message when multiple messages were in-flight for
+        # the same chat simultaneously.
+        reply_to_msg_id = args.get("reply_to_message_id")
+        if source == "telegram" and reply_to_msg_id:
+            reply_data["reply_to_message_id"] = int(reply_to_msg_id)
+
+        # Route bisque replies to the bisque-outbox so the relay server picks them up.
+        # All other sources go to the standard outbox for the bot process.
+        if source == "bisque":
+            outbox_file = BISQUE_OUTBOX_DIR / f"{reply_id}.json"
+        else:
+            outbox_file = OUTBOX_DIR / f"{reply_id}.json"
+
+        # Atomic write: temp file + fsync + rename to prevent watchdog race condition
+        atomic_write_json(outbox_file, reply_data)
+
+        # Save a copy to sent directory for conversation history
+        sent_file = SENT_DIR / f"{reply_id}.json"
+        atomic_write_json(sent_file, reply_data)
+
+        # BIS-167 Slice 6: persist outbound reply to messages.db (no-op when LOBSTER_USE_DB!=1)
+        if _db_persist_outbound is not None:
+            _db_persist_outbound(reply_data)
 
     # Track reply for mark_processed guard
     _track_reply(chat_id)
@@ -5391,7 +5412,8 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
 
     # Emit telegram.outbound to EventBus for audit trail (issue #1352).
     # Skipped for bot-talk — that source already emits via bot_talk_mirror.
-    if source != "bot-talk":
+    # Skipped for local-claude — internal agent-channel round-trip, not a chat delivery.
+    if source not in ("bot-talk", "local-claude"):
         _emit_mcp_event(
             "telegram.outbound",
             {"source": source, "chat_id": chat_id, "text_len": len(text)},
@@ -5439,6 +5461,9 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
         except Exception as e:
             mark_info = f" | ⚠️ mark_processed failed: {e}"
             log.warning(f"Atomic mark_processed failed for {message_id}: {e}")
+
+    if is_local_claude:
+        return [TextContent(type="text", text=f"✅ Reply written to agent-replies/{request_id}.json{mark_info}:\n\n{text[:100]}{'...' if len(text) > 100 else ''}")]
 
     button_info = f" with {sum(len(row) for row in buttons)} button(s)" if buttons else ""
     thread_info = f" (thread reply)" if thread_ts and source == "slack" else ""

@@ -20,8 +20,9 @@ Do NOT add per-test mocks for:
     LOBSTER_STATE_FILE, INBOX_DIR, OUTBOX_DIR, PROCESSED_DIR, PROCESSING_DIR,
     FAILED_DIR, CONFIG_DIR, AUDIO_DIR, SENT_DIR, SENT_REPLIES_DIR,
     TASK_REPLIED_DIR, TASKS_FILE, TASK_OUTPUTS_DIR, BISQUE_OUTBOX_DIR,
-    SCHEDULED_JOBS_DIR, SCHEDULED_JOBS_FILE, SCHEDULED_TASKS_TASKS_DIR,
-    SCHEDULED_TASKS_LOGS_DIR, LOG_DIR, LOBSTER_INBOX_DIR (env var)
+    AGENT_REPLIES_DIR, SCHEDULED_JOBS_DIR, SCHEDULED_JOBS_FILE,
+    SCHEDULED_TASKS_TASKS_DIR, SCHEDULED_TASKS_LOGS_DIR, LOG_DIR,
+    LOBSTER_INBOX_DIR (env var)
 
 These are all redirected automatically.
 
@@ -104,7 +105,7 @@ def isolate_inbox_server_paths(tmp_path: Path):
         messages/
             inbox/, outbox/, processed/, processing/, failed/,
             config/, audio/, sent/, sent-replies/, task-replied/,
-            task-outputs/, bisque-outbox/
+            task-outputs/, bisque-outbox/, agent-replies/
         workspace/
             logs/
             scheduled-jobs/
@@ -116,7 +117,7 @@ def isolate_inbox_server_paths(tmp_path: Path):
     for subdir in [
         "inbox", "outbox", "processed", "processing", "failed",
         "config", "audio", "sent", "sent-replies", "task-replied",
-        "task-outputs", "bisque-outbox",
+        "task-outputs", "bisque-outbox", "agent-replies",
     ]:
         (messages / subdir).mkdir(parents=True, exist_ok=True)
 
@@ -151,6 +152,7 @@ def isolate_inbox_server_paths(tmp_path: Path):
         "tasks_file": messages / "tasks.json",
         "task_outputs": messages / "task-outputs",
         "bisque_outbox": messages / "bisque-outbox",
+        "agent_replies": messages / "agent-replies",
         "state_file": state_file,
         "log_dir": log_dir,
         "scheduled_jobs_dir": sched,
@@ -201,6 +203,7 @@ def isolate_inbox_server_paths(tmp_path: Path):
             TASKS_FILE=messages / "tasks.json",
             TASK_OUTPUTS_DIR=messages / "task-outputs",
             BISQUE_OUTBOX_DIR=messages / "bisque-outbox",
+            AGENT_REPLIES_DIR=messages / "agent-replies",
             LOBSTER_STATE_FILE=state_file,
             LOG_DIR=log_dir,
             SCHEDULED_JOBS_DIR=sched,

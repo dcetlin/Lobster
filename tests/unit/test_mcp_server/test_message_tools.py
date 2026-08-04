@@ -265,6 +265,129 @@ class TestSendReply:
             assert content["source"] == "telegram"
 
 
+class TestSendReplyLocalClaude:
+    """Tests for the agent channel: send_reply(source='local-claude').
+
+    A local Claude Code session (SSH) polls ~/messages/agent-replies/<request_id>.json
+    for its answer instead of receiving a Telegram/Slack message. See docs/agent-channel.md.
+    """
+
+    @pytest.fixture
+    def dirs(self, temp_messages_dir: Path):
+        outbox = temp_messages_dir / "outbox"
+        sent = temp_messages_dir / "sent"
+        agent_replies = temp_messages_dir / "agent-replies"
+        outbox.mkdir(parents=True, exist_ok=True)
+        sent.mkdir(parents=True, exist_ok=True)
+        agent_replies.mkdir(parents=True, exist_ok=True)
+        return outbox, sent, agent_replies
+
+    def test_writes_agent_reply_file_not_outbox(self, dirs):
+        """A local-claude reply lands only in agent-replies/, never outbox/ or sent/."""
+        outbox, sent, agent_replies = dirs
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local",
+                    "text": "The answer is 42.",
+                    "source": "local-claude",
+                    "request_id": "req-abc123",
+                })
+            )
+
+            assert "agent-replies/req-abc123.json" in result[0].text
+            assert list(outbox.glob("*.json")) == []
+            assert list(sent.glob("*.json")) == []
+
+            files = list(agent_replies.glob("*.json"))
+            assert len(files) == 1
+            assert files[0].name == "req-abc123.json"
+
+            content = json.loads(files[0].read_text())
+            assert content["request_id"] == "req-abc123"
+            assert content["text"] == "The answer is 42."
+            assert content["in_reply_to"] == "req-abc123"
+            assert "ts" in content
+
+    def test_missing_request_id_errors(self, dirs):
+        """source='local-claude' without request_id returns an Error, writes nothing."""
+        outbox, sent, agent_replies = dirs
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local",
+                    "text": "Hello",
+                    "source": "local-claude",
+                })
+            )
+
+            assert "Error" in result[0].text
+            assert list(agent_replies.glob("*.json")) == []
+
+    def test_message_id_marks_processed(self, dirs, temp_messages_dir: Path):
+        """message_id is still honored for local-claude — atomic mark_processed applies."""
+        outbox, sent, agent_replies = dirs
+        processing = temp_messages_dir / "processing"
+        processed = temp_messages_dir / "processed"
+        inbox = temp_messages_dir / "inbox"
+        processing.mkdir(parents=True, exist_ok=True)
+        processed.mkdir(parents=True, exist_ok=True)
+        inbox.mkdir(parents=True, exist_ok=True)
+
+        msg = {
+            "id": "req-xyz",
+            "source": "local-claude",
+            "chat_id": "local",
+            "type": "text",
+            "text": "What is the deploy status?",
+            "request_id": "req-xyz",
+            "timestamp": "2026-03-14T12:00:00.000000",
+        }
+        (processing / "req-xyz.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            PROCESSED_DIR=processed,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local",
+                    "text": "All green.",
+                    "source": "local-claude",
+                    "request_id": "req-xyz",
+                    "message_id": "req-xyz",
+                })
+            )
+
+            assert "marked processed" in result[0].text
+            assert not (processing / "req-xyz.json").exists()
+            assert (processed / "req-xyz.json").exists()
+
+
 class TestAutoThreading:
     """Tests for automatic reply threading (issue #330).
 

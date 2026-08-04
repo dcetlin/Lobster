@@ -89,6 +89,7 @@ INBOX_MESSAGE_SOURCES: frozenset[str] = frozenset({
     "gmail",              # email poller injects messages with source="gmail"
     "pr_review_sweeper",  # PR-review sweep coordinator — dispatches pr_review_request messages (issue #1268)
     "wos_pr_sweep",       # WOS PR sweep cron script — reports stale/merged PRs (scheduled-tasks/wos-pr-sweeper.py)
+    "local-claude",       # agent channel: local Claude Code session (SSH) talking to the dispatcher — see docs/agent-channel.md
 })
 
 # ---------------------------------------------------------------------------
