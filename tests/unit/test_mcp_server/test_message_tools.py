@@ -387,6 +387,100 @@ class TestSendReplyLocalClaude:
             assert not (processing / "req-xyz.json").exists()
             assert (processed / "req-xyz.json").exists()
 
+    def test_source_mismatch_refuses_and_never_touches_outbox(self, dirs, temp_messages_dir: Path):
+        """A message that originated with source='local-claude' must never be
+        answered with source='telegram' (fail-closed on source mismatch) — the
+        one hard guarantee is that agent-channel traffic can never leak to Dan's
+        Telegram/Slack outbox."""
+        outbox, sent, agent_replies = dirs
+        processing = temp_messages_dir / "processing"
+        inbox = temp_messages_dir / "inbox"
+        processing.mkdir(parents=True, exist_ok=True)
+        inbox.mkdir(parents=True, exist_ok=True)
+
+        msg = {
+            "id": "req-leak",
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "what's the status of PR 1234?",
+            "request_id": "req-leak",
+            "timestamp": "2026-08-04T12:00:00.000000",
+        }
+        (processing / "req-leak.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            # Caller forgot source="local-claude" — falls back to the "telegram"
+            # default. Must be refused, not silently delivered to Dan's phone.
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": 123456,
+                    "text": "PR 1234 is merged.",
+                    "message_id": "req-leak",
+                })
+            )
+
+            assert "Error" in result[0].text
+            assert "mismatch" in result[0].text.lower()
+            assert list(outbox.glob("*.json")) == []
+            assert list(agent_replies.glob("*.json")) == []
+            # Message must remain in processing/ — never marked processed on refusal.
+            assert (processing / "req-leak.json").exists()
+
+    def test_source_match_still_succeeds(self, dirs, temp_messages_dir: Path):
+        """A correctly source-matched reply (message_id references a local-claude
+        message, reply source='local-claude') is unaffected by the mismatch guard."""
+        outbox, sent, agent_replies = dirs
+        processing = temp_messages_dir / "processing"
+        inbox = temp_messages_dir / "inbox"
+        processing.mkdir(parents=True, exist_ok=True)
+        inbox.mkdir(parents=True, exist_ok=True)
+
+        msg = {
+            "id": "req-ok",
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "what's the status of PR 1234?",
+            "request_id": "req-ok",
+            "timestamp": "2026-08-04T12:00:00.000000",
+        }
+        (processing / "req-ok.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "PR 1234 is merged.",
+                    "source": "local-claude",
+                    "request_id": "req-ok",
+                    "message_id": "req-ok",
+                })
+            )
+
+            assert "Error" not in result[0].text
+            assert (agent_replies / "req-ok.json").exists()
+
 
 class TestAutoThreading:
     """Tests for automatic reply threading (issue #330).

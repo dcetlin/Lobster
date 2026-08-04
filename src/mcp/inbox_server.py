@@ -5371,6 +5371,51 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
     buttons = args.get("buttons")
     thread_ts = args.get("thread_ts")
 
+    # Fail-closed source verification (agent-channel protocol spec, principle 5):
+    # when message_id is provided and resolves to the originating inbox/processing
+    # message, that message's `source` field is ground truth for where this reply
+    # must go. A mismatch means the caller (or a stale "telegram" default) is about
+    # to route a reply to the wrong channel — most critically, a local-claude
+    # agent-channel reply falling back to the Telegram/Slack outbox, which the
+    # protocol spec guarantees can never happen (principle 2). Refuse rather than
+    # guess. Verification *failure* (message not found / unreadable / no source
+    # field) is deliberately NOT treated as a mismatch — the guard only fires on a
+    # confirmed disagreement, so it never blocks the many callers that pass
+    # message_id for messages without a `source` field or that the guard can't
+    # resolve for unrelated reasons.
+    origin_found: Path | None = None
+    origin_msg: dict = {}
+    message_id_arg = args.get("message_id")
+    if message_id_arg:
+        try:
+            _mid_for_check = validate_message_id(message_id_arg)
+            origin_found = (
+                _find_message_file(PROCESSING_DIR, _mid_for_check)
+                or _find_message_file(INBOX_DIR, _mid_for_check)
+            )
+            if origin_found:
+                origin_msg = json.loads(origin_found.read_text())
+        except Exception:
+            origin_found = None
+            origin_msg = {}
+
+        origin_source = origin_msg.get("source")
+        if origin_source and origin_source != source:
+            log.error(
+                f"send_reply: source mismatch — message {message_id_arg} originated "
+                f"from source={origin_source!r} but reply requested source={source!r}. "
+                "Refusing to send (fail-closed on source mismatch)."
+            )
+            return [TextContent(
+                type="text",
+                text=(
+                    f"Error: source mismatch — message {message_id_arg} originated from "
+                    f"source={origin_source!r} but this reply requested source={source!r}. "
+                    "Refusing to send: a reply's source must match the originating "
+                    "message's source (fail-closed, per agent-channel protocol spec)."
+                ),
+            )]
+
     reply_id = f"{int(time.time() * 1000)}_{source}"
     is_local_claude = source == "local-claude"
 
@@ -5469,13 +5514,15 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
         except Exception as _bt_exc:
             log.warning(f"bot-talk mirror_outbound failed (non-fatal): {_bt_exc}")
 
-    # Atomic mark_processed: if message_id provided, move message to processed/ in same call
+    # Atomic mark_processed: if message_id provided, move message to processed/ in same call.
+    # Reuses `origin_found` from the fail-closed source check above (same message_id) so the
+    # message is only located once.
     mark_info = ""
     message_id = args.get("message_id")
     if message_id:
         try:
             mid = validate_message_id(message_id)
-            found = _find_message_file(PROCESSING_DIR, mid)
+            found = origin_found if origin_found is not None else _find_message_file(PROCESSING_DIR, mid)
             if not found:
                 found = _find_message_file(INBOX_DIR, mid)
             if found:
