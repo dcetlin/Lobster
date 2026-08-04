@@ -10805,7 +10805,6 @@ def _build_reconciler_message(
         # the user's Telegram.
         original_chat_id = session.get("chat_id", "")
         last_output = _read_last_output(output_file)
-        original_chat_id = session.get("chat_id", "")
         return {
             "id": message_id,
             "type": "agent_failed",
@@ -10819,6 +10818,13 @@ def _build_reconciler_message(
             "task_id": task_id,
             "agent_id": agent_id,
             "original_chat_id": original_chat_id,
+            # The session's own source (e.g. "local-claude"), distinct from this
+            # notification's own source="system" above. Needed so the dispatcher
+            # can tell a crashed local-claude request apart from a crashed
+            # Telegram/Slack one — a generic send_reply(chat_id=original_chat_id)
+            # escalation is only valid for the latter (see agent_failed handler,
+            # "Local-claude originated failures").
+            "original_source": session.get("source", "telegram"),
             "original_prompt": input_summary,
             "last_output": last_output,
             "status": "error",

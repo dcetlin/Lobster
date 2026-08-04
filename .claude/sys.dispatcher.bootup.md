@@ -379,6 +379,25 @@ Background subagents call `write_result(task_id, chat_id, text, ...)`, which dro
        mark_processed(message_id)
 
 3. else:
+       # --- LOCAL-CLAUDE SOURCE GUARD (agent-channel protocol spec, principles 1 & 5) ---
+       # Applies to both subagent_result and subagent_error when msg.get("source") ==
+       # "local-claude". No relay path below is valid for this source: chat_id is the
+       # shared constant "local-claude" (not a Telegram/Slack destination — routing for
+       # this channel is by request_id only), and write_result carries no request_id
+       # field, so there is no way to address a send_reply call from this message alone.
+       # Never call send_reply or spawn a relay subagent for these — that would either
+       # error uselessly (source="local-claude" without request_id is refused server-side)
+       # or, worse, risk falling through to a default source. If you're seeing this
+       # message at all, the subagent already tried and gave up (per its own bootup
+       # doc: retries the same request_id, then stops) — the request going unanswered
+       # is the spec-sanctioned failure mode ("silence is recoverable", principle 5),
+       # not a bug to route around here.
+       if msg.get("source") == "local-claude":
+           # Read msg["text"] for situational awareness (the failure reason) — worth a
+           # line in handoff.md if it recurs, but never a send_reply attempt.
+           mark_processed(message_id)
+           continue
+
        # --- SILENT DROP: scheduled job no-ops ---
        NOOP_PHRASES = ["no action taken", "nothing to do", "no new", "no findings", "nothing to report"]
        INFRA_FAILURE_SIGNALS = ["econnrefused", "connection refused", "api down", "service unreachable",
@@ -547,7 +566,7 @@ Background subagents call `write_result(task_id, chat_id, text, ...)`, which dro
 send_reply(chat_id=msg["chat_id"], text=f"Sorry, something went wrong:\n\n{msg['text']}", source=...)
 mark_processed(message_id)
 ```
-Errors always relay — a failed subagent may not have delivered anything.
+Errors always relay for Telegram/Slack sources — a failed subagent may not have delivered anything. **Exception: `source == "local-claude"`** never reaches this block — the LOCAL-CLAUDE SOURCE GUARD above intercepts it earlier and `continue`s without calling `send_reply`, because there is no `request_id` on this message to address a reply with.
 
 ---
 
@@ -603,10 +622,19 @@ Dead/failed agent events routed by the reconciler. These are system-internal —
 - `original_chat_id` is empty/0 → system job → drop silently
 - `task_id` starts with `ghost-`, `oom-`, or contains `reconciler` → internal cleanup → drop silently
 - `original_prompt` is None and no known chat → drop silently
+- `original_source == "local-claude"` → **do not** use the generic escalation below — see "Local-claude originated failures" immediately after this table.
 - Otherwise → brief escalation to `original_chat_id`:
   `"A background task failed: <description>. Let me know if you would like to retry."`
 
-**Key fields:** `task_id`, `agent_id`, `original_chat_id`, `original_prompt` (first 500 chars), `last_output` (last 500 chars).
+**Local-claude originated failures (`original_source == "local-claude"`):** this is a subagent that crashed or was killed *before* it ever called `send_reply` — the "gave up after retrying" case the subagent doc handles is a different, self-reported failure that arrives as a `subagent_error`/`subagent_result` message and is already covered by the LOCAL-CLAUDE SOURCE GUARD above. This one has no self-report at all, so recovery is the dispatcher's job:
+
+1. **Never apply the generic escalation.** `original_chat_id` for this source is the shared constant `"local-claude"` — not a Telegram/Slack destination — and a generic `send_reply(chat_id=original_chat_id, ...)` call defaults to `source="telegram"`, which would either error uselessly or, worse, be one incorrect default away from misrouting agent-channel traffic. Never do this for `original_source == "local-claude"`, under any circumstance.
+2. **Recover `request_id` from the saved in-flight prompt.** Read `~/lobster-workspace/data/inflight-prompts/<task_id>.txt` (written verbatim at dispatch time — see "In-Flight Work Tracking" above) and extract the `request_id:` value from its YAML frontmatter. (`original_prompt` on this message is a ~200-char truncated summary and may also contain it, but the in-flight-prompt file is the reliable source — it is never truncated.) If the file is missing, unreadable, or has no `request_id`, **drop silently** — per the agent-channel protocol spec's documented error path, an unanswered request is the sanctioned failure mode here (the `lobster-chat` client times out and reports "no reply"; "silence is recoverable," principle 5).
+3. **Check whether the reply slot is already occupied.** If `~/messages/agent-replies/<request_id>.json` already exists, some other writer (e.g. a re-dispatched retry that itself succeeded) beat the crash to the answer — drop silently, nothing more to do.
+4. **Otherwise, close the loop honestly.** Call `send_reply(chat_id="local-claude", source="local-claude", request_id=<recovered>, text="Internal error: the process handling this request crashed before completing.")` directly (the 7-Second Rule exempts `send_reply`). This is not fabricating an answer — it is reporting the true, known outcome (the request failed) through the one channel that can reach the requester, which is strictly better than making it wait out the full timeout for the same "no reply" outcome.
+5. **Fail-closed invariant still applies.** Never fall back to `source="telegram"`/`"slack"` for this `original_source` — not in step 1, not here, not as a "just in case Dan should know" gesture. If a real notification to Dan is warranted (e.g. this is happening repeatedly), that's a separate, explicit page via `send_reply`/`write_result` to Dan's own chat_id — never a reroute of the local-claude reply itself.
+
+**Key fields:** `task_id`, `agent_id`, `original_chat_id`, `original_source`, `original_prompt` (first 500 chars), `last_output` (last 500 chars).
 
 ---
 
@@ -999,6 +1027,10 @@ This writes the one-shot answer to `~/messages/agent-replies/<request_id>.json`.
 **Delegated reply (work takes >7s — 7-Second Rule still applies):** use `claim_and_ack` as usual, but pass `request_id` — for this source the "ack" is written to a *separate* file (`agent-replies/<request_id>.ack.json`), never the answer slot. Then spawn the subagent with `request_id` in its frontmatter (see the claim_and_ack template above) and instruct it explicitly to call `send_reply(source="local-claude", request_id=..., ...)` **directly itself** — never the internal/deferred `write_result`-only pattern for the final answer. The dispatcher's normal `write_result` relay path does not carry `request_id` forward, so if the subagent doesn't call `send_reply` itself, nothing can ever complete the reply. (`hooks/require-background-agent.py` fails closed on this at dispatch time: a `source: local-claude` frontmatter block without a valid `request_id` blocks the `Task`/`Agent` call outright.)
 
 **Ack ≠ answer:** `claim_and_ack`'s ack for this source is a distinct file (`<request_id>.ack.json`) from the one-shot answer slot (`<request_id>.json`). Sending the ack is never sufficient — the real result must still be delivered via `send_reply`.
+
+**When the delegated subagent fails or crashes:** two different failure shapes, two different handlers — neither one is `write_result` relaying the answer, because `write_result` never carries `request_id` and cannot address a reply.
+- The subagent *called* `send_reply` and it errored (after its own retries, per its bootup doc, it gave up): this surfaces as a `subagent_error`/`subagent_result` message and is handled by the LOCAL-CLAUDE SOURCE GUARD under "subagent_result / subagent_error" above — mark_processed, no relay attempt.
+- The subagent *crashed before ever calling* `send_reply` (killed, OOM, never scheduled): this surfaces as an `agent_failed` message from the reconciler and is handled under "agent_failed" → "Local-claude originated failures" above, which recovers `request_id` from the saved in-flight prompt and can close the loop directly via `send_reply` — worth doing since the crash is a known, reportable fact, not a guess.
 
 **Fail-closed source invariant:** never route a `source: "local-claude"` reply through `source="telegram"`, `"slack"`, or any chat channel — not even as a fallback when something seems wrong. If you cannot determine the correct `request_id` or the reply's destination is ambiguous, do not guess: skip the reply rather than risk it leaking to Dan's phone. `send_reply` itself enforces this server-side (it refuses when a `message_id`'s originating `source` doesn't match the reply's declared `source`) — but the dispatcher must never try to route around that refusal by picking a different source.
 

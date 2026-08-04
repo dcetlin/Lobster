@@ -132,6 +132,41 @@ frontmatter declares `source: local-claude` without a valid, filesystem-safe
 subagent spawning a nested agent. `hooks/auto-register-agent.py` additionally
 records `request_id` into `agent_sessions.db` for audit/observability.
 
+## Error handling
+
+Two independent guarantees, both from the protocol spec, both enforced
+below the bootup-doc layer:
+
+- **Single-shot reply slot (principle 1).** `handle_send_reply()` writes the
+  answer via `atomic_create_json()` (`src/utils/fs.py`), not the general
+  `atomic_write_json()` every other source uses — the difference matters
+  here: `atomic_create_json` fails closed if `agent-replies/<request_id>.json`
+  already exists instead of silently overwriting it. This is what makes a
+  crash-and-redispatch race (the original subagent finishing just as
+  `_recover_stale_processing()` reclaims and re-runs the same request past
+  `_LOCAL_CLAUDE_STALE_TIMEOUT_SECONDS`) safe: whichever writer gets there
+  first wins, and the second is told so rather than clobbering the answer.
+- **Silence is a sanctioned failure (principle 5), not something to route
+  around.** `write_result` has no `request_id` field and never will — it
+  cannot address a reply on this channel, by design. So there is no
+  "fallback to write_result" for a failed or crashed delegated subagent.
+  Instead:
+  - If the subagent *called* `send_reply` and it errored, the subagent
+    retries with its own (correct) `request_id` a couple of times, then
+    gives up — the `lobster-chat` client times out and reports "no reply."
+    See `.claude/sys.subagent.bootup.md` → "Agent Channel Tasks."
+  - If the subagent *crashed before calling* `send_reply` at all, the
+    reconciler's `agent_failed` notification carries `original_source` (see
+    `_build_reconciler_message` in `src/mcp/inbox_server.py`), and the
+    dispatcher can recover `request_id` from the saved in-flight prompt
+    (`~/lobster-workspace/data/inflight-prompts/<task_id>.txt`) to close the
+    loop with a known-true "internal error" reply — see
+    `.claude/sys.dispatcher.bootup.md` → "agent_failed" → "Local-claude
+    originated failures."
+  - In neither case does a `source="telegram"`/`"slack"` fallback ever
+    happen — the fail-closed source invariant holds through both failure
+    paths, not just the happy path.
+
 ## Deploy: does this need an MCP restart?
 
 **Yes.** The routing lives in `handle_send_reply()` inside
@@ -211,7 +246,13 @@ manually later — the dispatcher may still be working on it.
   audit/observability (additive `ALTER TABLE` migration for pre-existing DBs).
 - `.claude/sys.dispatcher.bootup.md` — "Agent channel" subsection under
   Message Source Handling; `claim_and_ack`/`Task()` template notes on carrying
-  `request_id` into a delegated subagent.
+  `request_id` into a delegated subagent; the LOCAL-CLAUDE SOURCE GUARD in
+  the `subagent_result`/`subagent_error` handler; "Local-claude originated
+  failures" under the `agent_failed` handler.
 - `.claude/sys.subagent.bootup.md` — "Agent Channel Tasks" section: detection,
-  the mandatory direct-`send_reply` delivery pattern, ack≠answer, and the
-  fail-closed source invariant.
+  the mandatory direct-`send_reply` delivery pattern, ack≠answer, the
+  fail-closed source invariant, and the retry-then-stop procedure for a
+  failing `send_reply`.
+- `src/utils/fs.py` — `atomic_create_json()`: exclusive-create write (temp
+  file + `os.link`) used for the single-shot `agent-replies/<request_id>.json`
+  slot so a second writer can never overwrite the first.
