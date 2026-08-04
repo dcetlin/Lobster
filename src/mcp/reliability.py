@@ -42,6 +42,19 @@ if _SRC_DIR not in sys.path:
 
 from src.utils.fs import atomic_write_json, atomic_create_json, safe_move  # noqa: E402, F401
 
+# The agent-channel protocol's request_id rules and source name are owned by
+# src/protocol/agent_channel_schema.py — the single canonical schema module
+# that also generates lobster-chat's --schema/--help and
+# docs/agent-channel-schema.md. Importing them here (rather than redefining
+# them) means the value this module actually enforces and the value
+# described to an external agent are the same object, not two copies that
+# could drift apart.
+from src.protocol.agent_channel_schema import (  # noqa: E402
+    REQUEST_ID_MAX_LEN as _CANONICAL_REQUEST_ID_MAX_LEN,
+    REQUEST_ID_PATTERN as _CANONICAL_REQUEST_ID_PATTERN,
+    SOURCE as AGENT_CHANNEL_SOURCE,
+)
+
 
 # =============================================================================
 # Input Validation
@@ -64,8 +77,8 @@ class ValidationError(Exception):
 # it must be sanitized at the boundary where it enters the system — reject traversal
 # characters, cap length, and use a charset allowlist rather than a blocklist so novel
 # path-unsafe characters can't slip through.
-_REQUEST_ID_MAX_LEN = 128
-_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+_REQUEST_ID_MAX_LEN = _CANONICAL_REQUEST_ID_MAX_LEN
+_REQUEST_ID_PATTERN = re.compile(_CANONICAL_REQUEST_ID_PATTERN)
 
 
 def sanitize_request_id(request_id: Any) -> str:
@@ -118,7 +131,7 @@ def validate_send_reply_args(args: dict) -> dict:
         text = text[:99_997] + "..."
 
     # source: must be a known source
-    valid_sources = {"telegram", "slack", "sms", "signal", "whatsapp", "bisque", "local-claude"}
+    valid_sources = {"telegram", "slack", "sms", "signal", "whatsapp", "bisque", AGENT_CHANNEL_SOURCE}
     if source not in valid_sources:
         raise ValidationError(
             f"Invalid source '{source}'. Must be one of: {', '.join(sorted(valid_sources))}"
@@ -127,7 +140,7 @@ def validate_send_reply_args(args: dict) -> dict:
     # local-claude: request_id is required — it is the correlation key the local
     # `lobster-chat` CLI polls on (~/messages/agent-replies/<request_id>.json).
     normalized_args = {**args, "chat_id": chat_id, "text": text, "source": source}
-    if source == "local-claude":
+    if source == AGENT_CHANNEL_SOURCE:
         try:
             normalized_args["request_id"] = sanitize_request_id(args.get("request_id"))
         except ValidationError as e:
