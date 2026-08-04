@@ -167,6 +167,40 @@ mcp__lobster-inbox__write_result(
 
 **What to put in `text`:** Include the artifact reference (PR URL, file path), a one-sentence description of what was done, and any context the reviewer agent needs to start its work. Do not summarize for a human reader — summarize for the next agent.
 
+## Agent Channel Tasks (`source: "local-claude"`)
+
+**Detect this before choosing a delivery pattern:** check your own prompt's YAML frontmatter for `source: local-claude`. If present, `request_id` must also be present in the same frontmatter block — that's the correlation key your reply must carry. (Full protocol: `docs/agent-channel.md`.) This is a machine-to-machine channel — a local Claude Code session on Dan's laptop over SSH — not Dan himself. It is never routed to Telegram/Slack.
+
+**You must call `send_reply` yourself, directly — every time, no exceptions:**
+
+```python
+mcp__lobster-inbox__send_reply(
+    chat_id=<chat_id from your task prompt — typically "local-claude">,
+    text="<your result>",
+    source="local-claude",
+    request_id="<request_id from your task prompt frontmatter>",
+    task_id="<same task_id you'll pass to write_result>",
+)
+mcp__lobster-inbox__write_result(
+    task_id="<task_id>",
+    chat_id=<chat_id>,
+    text="<same result or a brief log summary>",
+    source="local-claude",
+    sent_reply_to_user=True,  # you already delivered via send_reply above
+)
+```
+
+**Never use the internal-task or delivery-deferred patterns for the final answer to a `local-claude` task.** Those patterns rely on the dispatcher relaying your `write_result` payload — but the dispatcher's relay path has no `request_id` to address a reply with, since `write_result` doesn't carry one. If you skip `send_reply` here, the answer can never reach `agent-replies/<request_id>.json` and the local `lobster-chat` client will time out with nothing. Every `local-claude` task is a "call `send_reply` directly, then `write_result`" task — never treat it as internal or deferred, regardless of what the prompt's phrasing might otherwise suggest.
+
+**Ack ≠ answer:** if the dispatcher used `claim_and_ack` before spawning you, that ack was written to a *separate* file (`agent-replies/<request_id>.ack.json`) — it is not your answer and does not satisfy your `send_reply` obligation. You still owe the real result via `send_reply` as shown above.
+
+**Fail-closed source invariant:** never call `send_reply(source="telegram", ...)` (or `slack`/`sms`/any chat source) for a task whose frontmatter says `source: local-claude` — this channel must never surface on Dan's phone, under any circumstance, including error handling. Never retry with a fabricated or different `request_id` — the one from your own frontmatter is the only correct one, and the server rejects an unsanitized or missing one anyway.
+
+**When `send_reply(source="local-claude", ...)` itself fails:** `write_result` cannot rescue this. It has no `request_id` field at all, so the dispatcher's generic relay path — which addresses replies by `chat_id`/`source`, never by `request_id` — is structurally incapable of ever reaching `agent-replies/<request_id>.json`. Do not call `write_result` expecting it to deliver the answer for you; it can't, and the dispatcher does not know to look up your `request_id` on your behalf. Instead:
+1. **Retry `send_reply` once or twice with the exact same `request_id`** from your frontmatter (transient errors — e.g. a momentary filesystem hiccup — are the likely cause; re-sending the correct `request_id` is not the "fabricated or different" retry the invariant above forbids).
+2. **If it keeps failing, stop trying to reach the local-claude client.** Per the agent-channel protocol spec's documented error path, an unanswered request is a *sanctioned* outcome, not a bug to route around: the `lobster-chat` client times out and reports "no reply" instead of getting a false or misrouted answer, and "silence is recoverable" (principle 5) while a leaked or fabricated reply is not. Do not fall back to another `source` and do not treat this as an internal-task/deferred case in disguise.
+3. **Still call `write_result`**, but only for Dan's/the dispatcher's own visibility — not as a delivery attempt: `write_result(task_id=..., chat_id=<chat_id from your frontmatter>, text="local-claude request <request_id> could not be answered after retries: <error>", source="local-claude", status="error", sent_reply_to_user=False)`. This is internal bookkeeping (so the failure is visible in logs/handoff), a genuinely different message to a genuinely different destination than the reply you couldn't send — it never touches `agent-replies/`, so it does not violate the fail-closed invariant. The dispatcher's LOCAL-CLAUDE SOURCE GUARD (see its bootup doc) recognizes `source="local-claude"` on the resulting `subagent_error` message and marks it processed without attempting to relay it — it does not, and cannot, retry your `send_reply` for you.
+
 **Timezone conversion — required for all user-visible timestamps:**
 
 Before including any timestamp in a `send_reply` call, convert it from UTC to the user's local timezone. Determine the timezone dynamically: check `LOBSTER_USER_TZ` in the environment first; if absent, read it from `~/lobster-user-config/agents/user.base.bootup.md` (look for a `LOBSTER_USER_TZ=` line or the timezone preference). Format times with the appropriate timezone abbreviation (e.g. "5:29 AM ET", "2:30 PM PT"). Never send raw UTC ISO strings or "UTC" suffixes to users. This applies to all subagents that produce output containing times — calendar events, log summaries, job results, event timelines, and any other user-facing sentence with a time.

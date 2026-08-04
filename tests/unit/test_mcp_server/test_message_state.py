@@ -403,6 +403,63 @@ class TestStaleRecovery:
             assert (processing / f"{msg_id}.json").exists()
             assert not (inbox / f"{msg_id}.json").exists()
 
+    def test_local_claude_survives_generic_text_timeout(self, setup_dirs, message_generator):
+        """A source='local-claude' message past the generic 90s text timeout, but
+        still under the agent-channel's own budget, must NOT be recovered — recovering
+        it would let a second execution path claim the same request_id while the
+        first is still working (protocol spec: no racing writers to one reply slot).
+        """
+        inbox, processing = setup_dirs
+
+        msg = message_generator.generate_text_message(source="local-claude")
+        msg["request_id"] = msg["id"]
+        msg_id = msg["id"]
+        msg_file = processing / f"{msg_id}.json"
+        msg_file.write_text(json.dumps(msg))
+
+        # 5 minutes old: past the generic 90s text timeout, under the 600s
+        # local-claude timeout.
+        old_time = time.time() - 300
+        os.utime(msg_file, (old_time, old_time))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+        ):
+            from src.mcp.inbox_server import _recover_stale_processing
+
+            _recover_stale_processing()
+
+            assert (processing / f"{msg_id}.json").exists()
+            assert not (inbox / f"{msg_id}.json").exists()
+
+    def test_local_claude_recovered_past_its_own_timeout(self, setup_dirs, message_generator):
+        """A source='local-claude' message DOES get recovered once it exceeds the
+        agent channel's own (longer) stale-processing budget."""
+        inbox, processing = setup_dirs
+
+        msg = message_generator.generate_text_message(source="local-claude")
+        msg["request_id"] = msg["id"]
+        msg_id = msg["id"]
+        msg_file = processing / f"{msg_id}.json"
+        msg_file.write_text(json.dumps(msg))
+
+        old_time = time.time() - 700  # past the 600s local-claude timeout
+        os.utime(msg_file, (old_time, old_time))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+        ):
+            from src.mcp.inbox_server import _recover_stale_processing
+
+            _recover_stale_processing()
+
+            assert not (processing / f"{msg_id}.json").exists()
+            assert (inbox / f"{msg_id}.json").exists()
+
 
 class TestRetryRecovery:
     """Tests for retry recovery from failed/."""

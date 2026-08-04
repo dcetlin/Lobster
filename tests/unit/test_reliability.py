@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src" / "mcp"))
 
 from reliability import (
     atomic_write_json,
+    atomic_create_json,
     safe_move,
     validate_send_reply_args,
     validate_message_id,
@@ -91,6 +92,44 @@ class TestAtomicWriteJson:
         assert len(tmp_files) == 0
 
 
+class TestAtomicCreateJson:
+    def test_creates_when_absent(self, tmp_path):
+        """First call creates the file and returns True."""
+        path = tmp_path / "slot.json"
+        created = atomic_create_json(path, {"answer": "first"})
+
+        assert created is True
+        assert json.loads(path.read_text()) == {"answer": "first"}
+
+    def test_second_call_does_not_overwrite(self, tmp_path):
+        """Single-shot semantics: a second call for the same path is a no-op
+        that leaves the first writer's content untouched and reports False."""
+        path = tmp_path / "slot.json"
+        first = atomic_create_json(path, {"answer": "first"})
+        second = atomic_create_json(path, {"answer": "second"})
+
+        assert first is True
+        assert second is False
+        assert json.loads(path.read_text()) == {"answer": "first"}
+
+    def test_no_temp_files_left_on_success_or_loss(self, tmp_path):
+        """Temp files are cleaned up whether this call wins or loses the race."""
+        path = tmp_path / "slot.json"
+        atomic_create_json(path, {"answer": "first"})
+        atomic_create_json(path, {"answer": "second"})
+
+        tmp_files = [f for f in tmp_path.iterdir() if f.suffix == ".tmp"]
+        assert len(tmp_files) == 0
+
+    def test_fails_on_unserializable_data(self, tmp_path):
+        """Non-serializable data raises TypeError and creates nothing."""
+        path = tmp_path / "slot.json"
+        with pytest.raises(TypeError):
+            atomic_create_json(path, {"bad": object()})
+
+        assert not path.exists()
+
+
 class TestSafeMove:
     def test_moves_file(self, tmp_path):
         """safe_move moves an existing file."""
@@ -148,6 +187,28 @@ class TestValidateSendReplyArgs:
         """Unknown source raises ValidationError."""
         with pytest.raises(ValidationError, match="Invalid source"):
             validate_send_reply_args({"chat_id": 123, "text": "Hi", "source": "carrier_pigeon"})
+
+    def test_local_claude_requires_request_id(self):
+        """source='local-claude' without request_id raises ValidationError."""
+        with pytest.raises(ValidationError, match="request_id"):
+            validate_send_reply_args({"chat_id": "local", "text": "Hi", "source": "local-claude"})
+
+    def test_local_claude_rejects_path_traversal_request_id(self):
+        """request_id containing path-traversal characters is rejected."""
+        with pytest.raises(ValidationError, match="invalid characters"):
+            validate_send_reply_args({
+                "chat_id": "local",
+                "text": "Hi",
+                "source": "local-claude",
+                "request_id": "../../etc/passwd",
+            })
+
+    def test_valid_local_claude_args(self):
+        """Valid local-claude reply args pass validation."""
+        args = {"chat_id": "local", "text": "Hello", "source": "local-claude", "request_id": "abc123"}
+        result = validate_send_reply_args(args)
+        assert result["source"] == "local-claude"
+        assert result["request_id"] == "abc123"
 
     def test_does_not_truncate_below_sanity_cap(self):
         """Text longer than 4096 chars is NOT truncated — chunking handles it.
