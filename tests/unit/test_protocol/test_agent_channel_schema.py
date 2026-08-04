@@ -77,6 +77,12 @@ class TestSchemaModuleStructure:
         for loc in FILE_LOCATIONS.values():
             assert "<request_id>" in loc["path"]
 
+    def test_agent_field_is_optional(self):
+        # The "agent" field is a cosmetic, additive identity label (populated
+        # by lobster-chat --agent) — unlike every other inbound field, it
+        # must NOT be required, so existing callers that omit it keep working.
+        assert INBOUND_ENVELOPE["agent"]["required"] is False
+
 
 class TestJsonSchemaRendering:
     def test_json_schema_is_json_serializable(self):
@@ -94,7 +100,12 @@ class TestJsonSchemaRendering:
     def test_json_schema_request_envelope_required_fields(self):
         s = json_schema()
         required = set(s["envelopes"]["request"]["required"])
-        assert required == set(INBOUND_ENVELOPE.keys())
+        # Derived from the source of truth rather than hardcoded: as of this
+        # change, "agent" is the one optional inbound field, so required
+        # fields are no longer simply "all of them".
+        expected_required = {name for name, f in INBOUND_ENVELOPE.items() if f.get("required")}
+        assert required == expected_required
+        assert "agent" not in required
 
     def test_addressing_covers_dan_and_agent(self):
         s = json_schema()

@@ -5248,6 +5248,14 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
             # fall back to the raw source string (e.g. "system") rather than
             # the misleading literal "Unknown".
             user = msg.get("agent") or msg.get("source") or "agent-channel"
+        elif msg.get("source") == "local-claude" and msg.get("agent"):
+            # Optional cosmetic identity field on the AgentChannelRequest
+            # envelope (src/protocol/agent_channel_schema.py, INBOUND_ENVELOPE
+            # "agent"), populated via lobster-chat's --agent flag /
+            # LOBSTER_CHAT_AGENT env var. Distinct from the subject/body
+            # branch above: this is the standard text/chat_id request shape.
+            # Absent, this falls through to the Unknown default unchanged.
+            user = msg["agent"]
         else:
             user = msg.get("user_name", msg.get("username", "Unknown"))
         ts = msg.get("timestamp", "")

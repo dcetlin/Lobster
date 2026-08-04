@@ -45,7 +45,8 @@ other source (see `src/bot/lobster_bot.py`), with one addition:
   "chat_id": "local-claude",
   "text": "what's the status of PR 1234?",
   "request_id": "1732900000-a1b2c3d4",
-  "timestamp": "2026-08-04T04:40:00.000000+00:00"
+  "timestamp": "2026-08-04T04:40:00.000000+00:00",
+  "agent": "glyph"
 }
 ```
 
@@ -64,6 +65,12 @@ other source (see `src/bot/lobster_bot.py`), with one addition:
 - `chat_id` is required by the inbox schema but unused for routing on this
   channel (routing is by `request_id`, not `chat_id`) — any stable string
   is fine; `lobster-chat` sends `"local-claude"`.
+- `agent` (**optional**) is a cosmetic identity label — set via `lobster-chat
+  --agent`/`LOBSTER_CHAT_AGENT` — for the calling agent/session (e.g.
+  `"glyph"`). It plays no role in routing or correlation (`request_id` is
+  still the sole correlation key); `check_inbox`/`wait_for_messages`
+  renders it in place of a generic source label when present, and falls
+  back to the previous behavior when it's omitted.
 
 ### Outbound: `~/messages/agent-replies/<request_id>.json`
 
@@ -221,7 +228,7 @@ or acked request and nothing previously removed them. `scheduled-tasks/agent-rep
   accidentally delete from this directory — the retention window's only job
   is to give a slow/offline `lobster-chat` client time to poll before its
   answer is swept, which the default 7-day window does with wide margin
-  over the client's 90s default poll timeout.
+  over the client's 300s default poll timeout.
 
 Standalone: `uv run scheduled-tasks/agent-replies-sweep.py [--dry-run] [--retention-hours N]`.
 
@@ -274,12 +281,16 @@ Options:
 |------|---------|---------|---------|
 | `--host` | `LOBSTER_CHAT_HOST` | *(required)* | VPS hostname |
 | `--user` | `LOBSTER_CHAT_USER` | `lobster` | SSH user |
-| `--timeout` | `LOBSTER_CHAT_TIMEOUT` | `90` | Seconds to wait for a reply before giving up |
+| `--timeout` | `LOBSTER_CHAT_TIMEOUT` | `300` | Seconds to wait for a reply before giving up |
 | `--interval` | `LOBSTER_CHAT_INTERVAL` | `2` | Poll interval in seconds |
+| `--agent` | `LOBSTER_CHAT_AGENT` | *(unset)* | Optional identity label (e.g. `"glyph"`) shown in the dispatcher's inbox instead of a generic source label |
 
-If no reply arrives within `--timeout`, the CLI exits 1 and prints the
-`request_id` so you can check `~/messages/agent-replies/<request_id>.json`
-manually later — the dispatcher may still be working on it.
+`request_id` is printed to stderr immediately after the inbox message is
+written, on every send — not only on timeout — so a dropped SSH connection
+never loses the value needed to check
+`~/messages/agent-replies/<request_id>.json` manually. If no reply arrives
+within `--timeout`, the CLI additionally exits 1 and repeats `request_id` in
+the timeout message — the dispatcher may still be working on it.
 
 ## Files touched by this feature
 
