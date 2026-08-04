@@ -167,6 +167,52 @@ below the bootup-doc layer:
     happen — the fail-closed source invariant holds through both failure
     paths, not just the happy path.
 
+## Observability & retention
+
+The channel's request/ack/reply round trip is audited on the EventBus
+(`src/mcp/event_bus.py`), written to `~/lobster-workspace/logs/events.jsonl`
+by the standard `JsonlFileListener`. This closes a gap: earlier versions of
+this channel were entirely excluded from event emission (`source ==
+"local-claude"` was skipped alongside `bot-talk`), so agent-channel traffic
+was invisible in the audit trail. Distinct event types from the
+Telegram/Slack stream, since this is a machine-to-machine round trip, not a
+chat delivery:
+
+| Event type              | Emitted by             | When                                                    |
+|--------------------------|-------------------------|----------------------------------------------------------|
+| `agent_channel.request`  | `handle_claim_and_ack`  | A `local-claude` message is claimed (delegated path only — the direct-reply fast path has no separate claim step). |
+| `agent_channel.ack`      | `handle_claim_and_ack`  | The distinct ack file is written (or fails to write, at `warn` severity). |
+| `agent_channel.reply`    | `handle_send_reply`     | Every call, whether it wins the single-shot reply slot (`info`) or loses the race (`warn`, `reply_slot_created: false`) — a lost race is worth seeing in the audit trail, not silently dropping. |
+
+None of these events touch Telegram/Slack — `JsonlFileListener` accepts all
+severities unconditionally, and `TelegramOutboxListener`/`CriticalAlertListener`
+only forward `warn`/`error`/`critical` events when `LOBSTER_DEBUG=true` or
+severity is `critical`, same as every other event type. This does not change
+the fail-closed source invariant: it is an audit sink, not a reply path.
+
+**Retention.** `~/messages/agent-replies/` accumulates one file per answered
+or acked request and nothing previously removed them. `scheduled-tasks/agent-replies-sweep.py`
+(a Type B cron-direct job, job name `agent-replies-sweep`) sweeps it daily:
+
+- Only ever removes a file whose name matches `<request_id>.json` or
+  `<request_id>.ack.json` with `request_id` passing the same charset
+  allowlist `handle_send_reply` enforces (protocol spec principle 6).
+  Anything else in the directory is left untouched and counted separately
+  in the job's summary.
+- Only removes a file once it is older than the retention window (default
+  7 days, `LOBSTER_AGENT_REPLIES_RETENTION_HOURS` env var / `--retention-hours`
+  flag) — age is read from the reply's own `ts` field when present, falling
+  back to file mtime.
+- Never touches `inbox/` or `processing/`: a request still being worked has
+  no file in `agent-replies/` at all (that state lives in `inbox/`/`processing/`,
+  which this job never scans), so there is nothing "in-flight" to
+  accidentally delete from this directory — the retention window's only job
+  is to give a slow/offline `lobster-chat` client time to poll before its
+  answer is swept, which the default 7-day window does with wide margin
+  over the client's 90s default poll timeout.
+
+Standalone: `uv run scheduled-tasks/agent-replies-sweep.py [--dry-run] [--retention-hours N]`.
+
 ## Deploy: does this need an MCP restart?
 
 **Yes.** The routing lives in `handle_send_reply()` inside
@@ -235,8 +281,6 @@ manually later — the dispatcher may still be working on it.
   `agent-replies/<request_id>.json` instead of the Telegram/Slack/bisque
   outbox.
 - `scripts/lobster-chat.py` — the local-machine CLI.
-- `scripts/upgrade.sh` — Migration 139 creates `~/messages/agent-replies/`
-  on existing installs.
 - `hooks/require-background-agent.py` — fail-closed `PreToolUse` check: blocks
   any `Agent`/`Task` dispatch whose frontmatter declares `source: local-claude`
   without a valid `request_id`. Applies unconditionally (dispatcher and
@@ -256,3 +300,13 @@ manually later — the dispatcher may still be working on it.
 - `src/utils/fs.py` — `atomic_create_json()`: exclusive-create write (temp
   file + `os.link`) used for the single-shot `agent-replies/<request_id>.json`
   slot so a second writer can never overwrite the first.
+- `src/mcp/inbox_server.py` — `agent_channel.request`/`agent_channel.ack`
+  events emitted from `handle_claim_and_ack`'s `local-claude` branch;
+  `agent_channel.reply` emitted from `handle_send_reply` (replaces the prior
+  unconditional skip of `source == "local-claude"` from event emission
+  entirely). See "Observability & retention" above.
+- `scheduled-tasks/agent-replies-sweep.py` — Type B cron-direct retention
+  sweep for `~/messages/agent-replies/`. See "Observability & retention" above.
+- `scripts/upgrade.sh` — Migration 139 creates `~/messages/agent-replies/` on
+  existing installs; Migration 140 registers `agent-replies-sweep` in
+  `jobs.json` and adds its daily cron entry.
