@@ -4325,12 +4325,30 @@ def _find_all_message_files(directories: list[Path], message_id: str) -> list[Pa
     return matches
 
 
-def _stale_timeout_for_message(msg: dict) -> int:
-    """Return the stale processing timeout in seconds based on message type.
+# Stale-processing timeout for the agent channel (source="local-claude"). This
+# source is source-aware, not type-aware (its inbound messages are always
+# type="text"): its explicit use case is multi-step work — e.g. "what's the
+# status of PR 1234?" routed through a delegated subagent — which routinely
+# exceeds the generic 90s text timeout below. Using the generic timeout here
+# would let _recover_stale_processing() reclaim an in-flight request and
+# re-dispatch it to a second execution path while the first is still writing
+# its answer, producing two racing writers to the same
+# agent-replies/<request_id>.json (see agent-channel protocol spec, "fail
+# path" — a crash/restart must not produce a second racing writer).
+_LOCAL_CLAUDE_STALE_TIMEOUT_SECONDS = 600  # 10 minutes
 
-    Text messages are expected to complete quickly; media types (voice, audio,
-    photo, document) may take longer due to transcription or download time.
+
+def _stale_timeout_for_message(msg: dict) -> int:
+    """Return the stale processing timeout in seconds based on message source/type.
+
+    Source-aware first: the agent channel (source="local-claude") gets its own,
+    longer budget regardless of type — see _LOCAL_CLAUDE_STALE_TIMEOUT_SECONDS.
+    Otherwise, type-aware: text messages are expected to complete quickly; media
+    types (voice, audio, photo, document) may take longer due to transcription
+    or download time.
     """
+    if msg.get("source") == "local-claude":
+        return _LOCAL_CLAUDE_STALE_TIMEOUT_SECONDS
     slow_types = {"voice", "photo", "document"}  # "audio" removed: normalized to "voice" at ingest
     msg_type = msg.get("type", "text")
     return 300 if msg_type in slow_types else 90
