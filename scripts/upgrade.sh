@@ -5278,6 +5278,51 @@ PY140
         substep "Migration 140: agent-replies-sweep.py not found — skipping cron entry"
     fi
 
+    # Migration 141: Install LOBSTER-ARCHIVE-PRUNE cron entry (14-day retention
+    # for logs/archive/). export-logs.py (LOBSTER-LOG-EXPORT, 03:00 daily) writes
+    # ~27M/day into logs/archive/YYYY-MM-DD/ with no prune, so it grows unbounded.
+    # archive-log-retention.sh deletes files older than 14 days and removes the
+    # now-empty date directories. Runs at 03:30 to trail the 03:00 export.
+    local ARCHIVE_PRUNE_MARKER="# LOBSTER-ARCHIVE-PRUNE"
+    local ARCHIVE_PRUNE_SCRIPT="$LOBSTER_DIR/scripts/archive-log-retention.sh"
+    if [ -f "$ARCHIVE_PRUNE_SCRIPT" ]; then
+        chmod +x "$ARCHIVE_PRUNE_SCRIPT" 2>/dev/null || true
+        if ! crontab -l 2>/dev/null | grep -qF "$ARCHIVE_PRUNE_MARKER"; then
+            "$LOBSTER_DIR/scripts/cron-manage.sh" add "$ARCHIVE_PRUNE_MARKER" \
+                "30 3 * * * $ARCHIVE_PRUNE_SCRIPT # $ARCHIVE_PRUNE_MARKER" 2>/dev/null && {
+                substep "Added LOBSTER-ARCHIVE-PRUNE cron entry (archive-log-retention.sh, 03:30 daily)"
+                migrated=$((migrated + 1))
+            } || warn "Could not add LOBSTER-ARCHIVE-PRUNE cron entry — check cron-manage.sh"
+        else
+            substep "LOBSTER-ARCHIVE-PRUNE cron entry already present — skipping"
+        fi
+    else
+        warn "archive-log-retention.sh not found at $ARCHIVE_PRUNE_SCRIPT — skipping Migration 141"
+    fi
+
+    # Migration 142: Install LOBSTER-WATCHED-THINGS-AUDIT cron entry (daily
+    # self-audit of Lobster's own rows in the shared Lobster<->glyph monitoring
+    # registry, /home/lobster/monitoring/watched-things.yaml, against the live
+    # health-check-v3.sh check_*() functions + crontab). Advisory-only — never
+    # restarts anything, batches drift (if any) into one inbox message, silent
+    # on a clean run. Does not audit glyph's dancetlin-infra rows.
+    local WTA_MARKER="# LOBSTER-WATCHED-THINGS-AUDIT"
+    local WTA_SCRIPT="$LOBSTER_DIR/scheduled-tasks/watched-things-audit.py"
+    if [ -f "$WTA_SCRIPT" ]; then
+        chmod +x "$WTA_SCRIPT" 2>/dev/null || true
+        if ! crontab -l 2>/dev/null | grep -qF "$WTA_MARKER"; then
+            "$LOBSTER_DIR/scripts/cron-manage.sh" add "$WTA_MARKER" \
+                "0 7 * * * cd $LOBSTER_DIR && uv run scheduled-tasks/watched-things-audit.py >> $HOME/lobster-workspace/scheduled-jobs/logs/watched-things-audit.log 2>&1 $WTA_MARKER" 2>/dev/null && {
+                substep "Added LOBSTER-WATCHED-THINGS-AUDIT cron entry (watched-things-audit.py, 07:00 daily)"
+                migrated=$((migrated + 1))
+            } || warn "Could not add LOBSTER-WATCHED-THINGS-AUDIT cron entry — check cron-manage.sh"
+        else
+            substep "LOBSTER-WATCHED-THINGS-AUDIT cron entry already present — skipping"
+        fi
+    else
+        warn "watched-things-audit.py not found at $WTA_SCRIPT — skipping Migration 142"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else

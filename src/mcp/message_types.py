@@ -98,6 +98,9 @@ INBOX_MESSAGE_SOURCES: frozenset[str] = frozenset({
     "pr_review_sweeper",  # PR-review sweep coordinator — dispatches pr_review_request messages (issue #1268)
     "wos_pr_sweep",       # WOS PR sweep cron script — reports stale/merged PRs (scheduled-tasks/wos-pr-sweeper.py)
     _AGENT_CHANNEL_SOURCE,  # "local-claude" — agent channel: local Claude Code session (SSH) talking to the dispatcher — see docs/agent-channel.md and docs/agent-channel-schema.md
+    "cron",               # cron-triggered job messages (e.g. scheduled_job_trigger from dispatch-job.sh)
+    "hook",               # hook-injected messages (e.g. write_observation from hooks/decision-router.py)
+    "test",               # test harness messages (integration tests)
 })
 
 # ---------------------------------------------------------------------------
