@@ -5231,10 +5231,28 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
     output = f"📬 **{len(messages)} new message(s):**\n\n"
     for msg in messages:
         source = msg.get("source", "unknown").upper()
-        user = msg.get("user_name", msg.get("username", "Unknown"))
+        # Agent-channel / non-standard-schema messages (id/subject/body instead
+        # of chat_id/message_id/text — e.g. glyph's health_check pings) have no
+        # user_name/username field, so they'd otherwise fall through to the
+        # literal "Unknown" default below and render as "[SYSTEM] from Unknown"
+        # with the body content invisible. Detect them and derive a legible
+        # identity/text instead. Additive/defensive: standard telegram/slack/
+        # system text messages (which have neither field) are unaffected.
+        _agent_channel_schema = bool(
+            (msg.get("subject") or msg.get("body"))
+            and not msg.get("user_name")
+            and not msg.get("username")
+        )
+        if _agent_channel_schema:
+            # No dedicated identity field exists yet for these producers —
+            # fall back to the raw source string (e.g. "system") rather than
+            # the misleading literal "Unknown".
+            user = msg.get("agent") or msg.get("source") or "agent-channel"
+        else:
+            user = msg.get("user_name", msg.get("username", "Unknown"))
         ts = msg.get("timestamp", "")
         msg_id = msg.get("id", msg.get("_filename", ""))
-        chat_id = msg.get("chat_id", "")
+        chat_id = msg.get("chat_id") or ("n/a" if _agent_channel_schema else "")
         msg_type = msg.get("type", "text")
         # Synthesize a meaningful text summary for structured system messages
         # that carry no text field (e.g. wos_execute). This prevents the
@@ -5246,6 +5264,8 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
             _uow_id = msg.get("uow_id", "?")
             _summary = str(msg.get("uow_summary", "?"))[:60]
             text = f"wos_prescribe: uow_id={_uow_id}, summary={_summary}"
+        elif _agent_channel_schema:
+            text = msg.get("body") or msg.get("subject") or "(no text)"
         else:
             text = msg.get("text", "(no text)")
 
@@ -5296,6 +5316,10 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
                 output += f"**[{source}]** {emoji} reaction from **{user}** (on: '{reacted_to_text}')\n"
             else:
                 output += f"**[{source}]** {emoji} reaction from **{user}**\n"
+        elif _agent_channel_schema:
+            _subject = msg.get("subject", "")
+            _heading = f": {_subject}" if _subject else ""
+            output += f"**[{source}]** \U0001f517 agent-channel message from **{user}**{_heading}\n"
         else:
             output += f"**[{source}]** from **{user}**\n"
         output += f"Chat ID: `{chat_id}` | Message ID: `{msg_id}`\n"
