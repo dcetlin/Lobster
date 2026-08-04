@@ -5537,13 +5537,33 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
 
         # Emit telegram.outbound to EventBus for audit trail (issue #1352).
         # Skipped for bot-talk — that source already emits via bot_talk_mirror.
-        # Skipped for local-claude — internal agent-channel round-trip, not a chat delivery.
+        # local-claude gets its own distinct category (agent_channel.reply, below)
+        # rather than the shared telegram.outbound stream — it isn't a chat delivery.
         if source not in ("bot-talk", "local-claude"):
             _emit_mcp_event(
                 "telegram.outbound",
                 {"source": source, "chat_id": chat_id, "text_len": len(text)},
                 chat_id=chat_id,
             )
+
+    # Agent-channel audit trail (agent-channel-hardening). Previously this whole
+    # source was excluded from telegram.outbound with no replacement — the reply
+    # half of the channel was invisible in events.jsonl. Distinct event_type from
+    # telegram.outbound because this is a machine-to-machine reply, not a chat
+    # delivery. Emitted for BOTH outcomes — won the single-shot reply slot, or
+    # lost the race (reply_slot_created=False, agent-channel protocol spec
+    # principle 1) — so a lost-race conflict is visible in the audit trail
+    # instead of silently vanishing.
+    if is_local_claude:
+        _emit_mcp_event(
+            "agent_channel.reply",
+            {
+                "request_id": request_id,
+                "reply_slot_created": reply_slot_created,
+                "text_len": len(text),
+            },
+            severity="info" if reply_slot_created else "warn",
+        )
 
     # Mirror outbound bot-talk messages to the EventBus so TelegramOutboxListener
     # can forward them as debug notifications. Fire-and-forget: non-blocking.
@@ -5975,6 +5995,18 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
 
     log.info(f"claim_and_ack: message claimed: {message_id}")
 
+    # Agent-channel audit trail (agent-channel-hardening): claim_and_ack never
+    # emitted anything for local-claude — neither the claim nor the ack — so
+    # the request half of the round trip was invisible in events.jsonl. This
+    # is the inbound counterpart to agent_channel.reply/agent_channel.ack
+    # below; distinct event_type from telegram.inbound because this is a
+    # machine-to-machine request, not a chat message.
+    if is_local_claude:
+        _emit_mcp_event(
+            "agent_channel.request",
+            {"request_id": request_id, "message_id": message_id},
+        )
+
     # --- Step 2: Send the ack ---
     if is_local_claude:
         # Ack != answer: write to a distinct ack slot, never to
@@ -5991,6 +6023,10 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
         try:
             atomic_write_json(AGENT_REPLIES_DIR / f"{request_id}.ack.json", ack_payload)
             log.info(f"claim_and_ack: local-claude ack written for request {request_id}")
+            _emit_mcp_event(
+                "agent_channel.ack",
+                {"request_id": request_id, "message_id": message_id, "text_len": len(args["ack_text"])},
+            )
             return [TextContent(
                 type="text",
                 text=(
@@ -6004,6 +6040,11 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
         except Exception as e:
             # Ack write failed — message stays in processing/, stale recovery handles it
             log.warning(f"claim_and_ack: local-claude ack write failed (message stays in processing/): {e}")
+            _emit_mcp_event(
+                "agent_channel.ack",
+                {"request_id": request_id, "message_id": message_id, "error": str(e)},
+                severity="warn",
+            )
             return [TextContent(
                 type="text",
                 text=(

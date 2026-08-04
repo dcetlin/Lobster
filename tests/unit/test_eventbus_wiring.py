@@ -432,6 +432,132 @@ class TestJobCompletedEvent:
 
 
 # ---------------------------------------------------------------------------
+# agent_channel.reply / agent_channel.request / agent_channel.ack — the
+# agent channel (source="local-claude") audit trail (agent-channel-hardening).
+# Previously this source was excluded from telegram.outbound with no
+# replacement, and claim_and_ack never emitted anything for it at all — the
+# whole channel was invisible in events.jsonl. These are the distinct event
+# categories that close that gap, per the agent-channel protocol spec's
+# "Deliberately left open... Whether/how Dan gets visibility into
+# agent-channel volume or content after the fact (audit trail)."
+# ---------------------------------------------------------------------------
+
+class TestAgentChannelReplyEvent:
+    """send_reply(source='local-claude') emits agent_channel.reply, never telegram.outbound."""
+
+    def _run_send_reply(self, bus: EventBus, agent_replies_dir: Path, request_id: str) -> None:
+        import inbox_server
+        agent_replies_dir.mkdir(parents=True, exist_ok=True)
+        with patch.object(inbox_server, "_EVENT_BUS_AVAILABLE", True), \
+             patch("inbox_server.get_event_bus", return_value=bus), \
+             patch.object(inbox_server, "AGENT_REPLIES_DIR", agent_replies_dir), \
+             patch.object(inbox_server, "_track_reply", MagicMock()), \
+             patch.object(inbox_server, "_record_direct_send", MagicMock()), \
+             patch.object(inbox_server, "_record_task_replied", MagicMock()):
+            asyncio.run(inbox_server.handle_send_reply({
+                "chat_id": "local-claude",
+                "text": "the answer",
+                "source": "local-claude",
+                "request_id": request_id,
+            }))
+
+    def test_local_claude_reply_emits_agent_channel_reply_not_telegram_outbound(self):
+        bus, listener = _make_bus_with_listener()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._run_send_reply(bus, Path(tmpdir) / "agent-replies", "req-1")
+        assert len(_events_of_type(listener, "agent_channel.reply")) == 1
+        assert len(_events_of_type(listener, "telegram.outbound")) == 0
+
+    def test_agent_channel_reply_event_has_request_id_and_won_slot(self):
+        bus, listener = _make_bus_with_listener()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._run_send_reply(bus, Path(tmpdir) / "agent-replies", "req-42")
+        ev = _events_of_type(listener, "agent_channel.reply")[0]
+        assert ev.payload["request_id"] == "req-42"
+        assert ev.payload["reply_slot_created"] is True
+        assert ev.severity == "info"
+
+    def test_lost_reply_slot_race_still_emits_event_at_warn_severity(self):
+        """Second writer for the same request_id loses the single-shot slot
+        (protocol spec principle 1) — this must still be visible in the audit
+        trail, not silently swallowed, since it means a duplicate answer
+        attempt was made for an already-answered request."""
+        bus, listener = _make_bus_with_listener()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            agent_replies_dir = Path(tmpdir) / "agent-replies"
+            self._run_send_reply(bus, agent_replies_dir, "req-race")
+            self._run_send_reply(bus, agent_replies_dir, "req-race")
+        events = _events_of_type(listener, "agent_channel.reply")
+        assert len(events) == 2
+        assert events[0].payload["reply_slot_created"] is True
+        assert events[1].payload["reply_slot_created"] is False
+        assert events[1].severity == "warn"
+
+
+class TestAgentChannelRequestAndAckEvents:
+    """claim_and_ack(source='local-claude') emits agent_channel.request + agent_channel.ack."""
+
+    def _run_claim_and_ack(self, bus: EventBus, tmpdir: Path, msg_id: str = "req-claim-1") -> None:
+        import inbox_server
+        inbox_dir = tmpdir / "inbox"
+        processing_dir = tmpdir / "processing"
+        agent_replies_dir = tmpdir / "agent-replies"
+        for d in (inbox_dir, processing_dir, agent_replies_dir):
+            d.mkdir(parents=True, exist_ok=True)
+        msg = {
+            "id": msg_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "what's the status?",
+            "request_id": msg_id,
+            "timestamp": "2026-08-04T10:00:00.000000",
+        }
+        (inbox_dir / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        # _claims_db defaults to the real agent_sessions.db under $LOBSTER_MESSAGES
+        # (src/mcp/claims.py) unless explicitly mocked — this module is imported via
+        # bare sys.path (not `src.mcp.inbox_server`), so conftest's autouse production-
+        # path isolation fixture does not cover it. Mock it out here so this test can
+        # never write a claim row to a real, shared database.
+        mock_claims = MagicMock()
+        mock_claims.claim.return_value = True
+        with patch.object(inbox_server, "_EVENT_BUS_AVAILABLE", True), \
+             patch("inbox_server.get_event_bus", return_value=bus), \
+             patch.object(inbox_server, "INBOX_DIR", inbox_dir), \
+             patch.object(inbox_server, "PROCESSING_DIR", processing_dir), \
+             patch.object(inbox_server, "AGENT_REPLIES_DIR", agent_replies_dir), \
+             patch.object(inbox_server, "_claims_db", mock_claims), \
+             patch.object(inbox_server, "_tick_user_message_counter", MagicMock()), \
+             patch.object(inbox_server, "_get_current_http_session_id", return_value=None):
+            asyncio.run(inbox_server.handle_claim_and_ack({
+                "message_id": msg_id,
+                "ack_text": "On it.",
+                "chat_id": "local-claude",
+                "source": "local-claude",
+                "request_id": msg_id,
+            }))
+
+    def test_claim_emits_agent_channel_request_event(self):
+        bus, listener = _make_bus_with_listener()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._run_claim_and_ack(bus, Path(tmpdir), "req-claim-1")
+        events = _events_of_type(listener, "agent_channel.request")
+        assert len(events) == 1
+        assert events[0].payload["request_id"] == "req-claim-1"
+        assert events[0].payload["message_id"] == "req-claim-1"
+
+    def test_ack_emits_agent_channel_ack_event(self):
+        bus, listener = _make_bus_with_listener()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._run_claim_and_ack(bus, Path(tmpdir), "req-claim-2")
+        events = _events_of_type(listener, "agent_channel.ack")
+        assert len(events) == 1
+        assert events[0].payload["request_id"] == "req-claim-2"
+        assert events[0].severity == "info"
+
+
+# ---------------------------------------------------------------------------
 # _emit_mcp_event helper — centralized emission contract (issue #1459)
 # ---------------------------------------------------------------------------
 
