@@ -5,6 +5,18 @@ session (running on your laptop, over SSH) and the always-on Lobster
 dispatcher. Use it to ask the dispatcher questions or hand it small tasks
 from your local machine without going through Telegram/Slack.
 
+**If you are an external agent with no other Lobster context**, you probably
+want [`docs/agent-channel-schema.md`](agent-channel-schema.md) instead of
+this file — it's the generated wire-format reference (envelope, request_id
+rules, addressing, error/ack semantics), or run
+`uv run scripts/lobster-chat.py --schema` for the same thing as JSON with no
+repo checkout needed. Both are generated from
+`src/protocol/agent_channel_schema.py`, the single canonical schema module,
+so they can't drift from each other or from what the dispatcher actually
+enforces. This document (`agent-channel.md`) is the prose walkthrough —
+why the channel exists, deploy/observability/retention — written for a
+Lobster maintainer, not an external agent.
+
 ## Why this exists
 
 Lobster already has one inbound channel per messaging platform (Telegram,
@@ -310,3 +322,23 @@ manually later — the dispatcher may still be working on it.
 - `scripts/upgrade.sh` — Migration 139 creates `~/messages/agent-replies/` on
   existing installs; Migration 140 registers `agent-replies-sweep` in
   `jobs.json` and adds its daily cron entry.
+- `src/protocol/agent_channel_schema.py` — the single canonical schema module
+  for the protocol's envelopes, request_id rules, addressing model, and
+  error/ack semantics. Stdlib-only, no other Lobster-internal imports.
+  `src/mcp/reliability.py` imports its `REQUEST_ID_MAX_LEN`/`REQUEST_ID_PATTERN`/
+  `SOURCE` rather than redefining them; `src/mcp/message_types.py` imports
+  `SOURCE` for `INBOX_MESSAGE_SOURCES`.
+- `scripts/generate_agent_channel_docs.py` — generates
+  `docs/agent-channel-schema.md` and the embedded schema block in
+  `scripts/lobster-chat.py` (between its `BEGIN`/`END GENERATED SCHEMA`
+  markers) from `src/protocol/agent_channel_schema.py`. Run with `--check` to
+  verify the generated artifacts are still in sync (no write) — this is what
+  `tests/unit/test_protocol/test_agent_channel_schema.py` calls to catch
+  drift.
+- `docs/agent-channel-schema.md` — generated. The wire-format reference for
+  an external agent with no other Lobster context: envelope field tables,
+  request_id rules, addressing (Dan vs. the Agent), error/ack semantics, and
+  worked JSON examples. Do not hand-edit — regenerate instead.
+- `scripts/lobster-chat.py` — gained `--schema` (prints the schema as JSON,
+  no SSH round trip) and a `--help` epilog summarizing the protocol; both
+  sourced from the generated block described above.
