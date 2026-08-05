@@ -524,6 +524,262 @@ class TestSendReplyLocalClaude:
             assert content["text"] == "First answer (correct)."
 
 
+class TestSendReplyLocalClaudeByAgentPointer:
+    """agent-channel protocol v1, §3.2 — by-agent pointer mailbox.
+
+    Purely additive: writing agent-replies/<request_id>.json for a request
+    whose inbound envelope carried a non-empty `agent` field also writes
+    agent-replies/by-agent/<agent-slug>/<request_id>.
+    """
+
+    @pytest.fixture
+    def dirs(self, temp_messages_dir: Path):
+        outbox = temp_messages_dir / "outbox"
+        sent = temp_messages_dir / "sent"
+        agent_replies = temp_messages_dir / "agent-replies"
+        processing = temp_messages_dir / "processing"
+        inbox = temp_messages_dir / "inbox"
+        for d in (outbox, sent, agent_replies, processing, inbox):
+            d.mkdir(parents=True, exist_ok=True)
+        return outbox, sent, agent_replies, processing, inbox
+
+    def _write_processing_message(self, processing: Path, request_id: str, agent: str | None):
+        msg = {
+            "id": request_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "what's the status?",
+            "request_id": request_id,
+            "timestamp": "2026-08-05T10:00:00.000000",
+        }
+        if agent is not None:
+            msg["agent"] = agent
+        (processing / f"{request_id}.json").write_text(json.dumps(msg))
+
+    def test_agent_field_present_writes_pointer(self, dirs):
+        outbox, sent, agent_replies, processing, inbox = dirs
+        self._write_processing_message(processing, "req-bloom-1", agent="bloom")
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "All green.",
+                    "source": "local-claude",
+                    "request_id": "req-bloom-1",
+                    "message_id": "req-bloom-1",
+                })
+            )
+
+        pointer = agent_replies / "by-agent" / "bloom" / "req-bloom-1"
+        assert pointer.exists()
+        assert pointer.stat().st_size == 0
+
+    def test_agent_field_absent_writes_no_pointer(self, dirs):
+        """Requests with no `agent` field get no pointer — additive, not a
+        behavior change for the common case."""
+        outbox, sent, agent_replies, processing, inbox = dirs
+        self._write_processing_message(processing, "req-anon-1", agent=None)
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "All green.",
+                    "source": "local-claude",
+                    "request_id": "req-anon-1",
+                    "message_id": "req-anon-1",
+                })
+            )
+
+        assert not (agent_replies / "by-agent").exists()
+
+    def test_agent_slug_is_lowercase_normalized(self, dirs):
+        outbox, sent, agent_replies, processing, inbox = dirs
+        self._write_processing_message(processing, "req-Bloom-2", agent="Bloom")
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "All green.",
+                    "source": "local-claude",
+                    "request_id": "req-Bloom-2",
+                    "message_id": "req-Bloom-2",
+                })
+            )
+
+        assert (agent_replies / "by-agent" / "bloom" / "req-Bloom-2").exists()
+        assert not (agent_replies / "by-agent" / "Bloom").exists()
+
+    def test_invalid_agent_value_skips_pointer_but_reply_still_lands(self, dirs):
+        """A malformed `agent` field fails loudly (logged) but must never
+        block the terminal reply write itself — the pointer is a discovery
+        convenience, not load-bearing."""
+        outbox, sent, agent_replies, processing, inbox = dirs
+        self._write_processing_message(processing, "req-bad-agent", agent="bloom session")  # space -> invalid
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "All green.",
+                    "source": "local-claude",
+                    "request_id": "req-bad-agent",
+                    "message_id": "req-bad-agent",
+                })
+            )
+
+        assert "Reply written" in result[0].text
+        assert (agent_replies / "req-bad-agent.json").exists()
+        assert not (agent_replies / "by-agent").exists()
+
+    def test_lost_reply_race_writes_no_pointer(self, dirs):
+        """A second call that loses the single-shot reply-slot race must not
+        write a pointer either — nothing new was actually delivered."""
+        outbox, sent, agent_replies, processing, inbox = dirs
+        self._write_processing_message(processing, "req-race-agent", agent="bloom")
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "first",
+                    "source": "local-claude",
+                    "request_id": "req-race-agent",
+                    "message_id": "req-race-agent",
+                })
+            )
+            pointer_dir = agent_replies / "by-agent" / "bloom"
+            assert list(pointer_dir.iterdir()) == [pointer_dir / "req-race-agent"]
+            before = (pointer_dir / "req-race-agent").stat().st_mtime
+
+            # Re-write the processing message back (message_id-based mark_processed
+            # already moved it to processed/ on the first call) so message_id
+            # resolution still finds a local-claude-sourced origin on the retry.
+            (processing / "req-race-agent.json").write_text(json.dumps({
+                "id": "req-race-agent",
+                "source": "local-claude",
+                "chat_id": "local-claude",
+                "request_id": "req-race-agent",
+                "agent": "bloom",
+            }))
+
+            asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "second — should lose the race",
+                    "source": "local-claude",
+                    "request_id": "req-race-agent",
+                    "message_id": "req-race-agent",
+                })
+            )
+
+        # Still exactly one pointer file, untouched by the losing second call.
+        assert list(pointer_dir.iterdir()) == [pointer_dir / "req-race-agent"]
+        assert (pointer_dir / "req-race-agent").stat().st_mtime == before
+
+    def test_write_pointer_generic_exception_never_blocks_reply_path(self, dirs, temp_messages_dir: Path):
+        """A non-ValidationError failure from write_pointer (e.g. OSError from
+        mkdir/touch — disk full, permission error) must never skip
+        mark_processed, dedup tracking, or audit emission, nor block the
+        reply path. The pointer mailbox is a discovery convenience, not
+        load-bearing — this is the same guarantee as the invalid-agent-value
+        case above, but for filesystem failures rather than validation
+        failures, which only a broad `except Exception` around write_pointer
+        (not `except ValidationError`) can catch."""
+        outbox, sent, agent_replies, processing, inbox = dirs
+        processed = temp_messages_dir / "processed"
+        processed.mkdir(parents=True, exist_ok=True)
+        self._write_processing_message(processing, "req-oserror-agent", agent="bloom")
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            PROCESSED_DIR=processed,
+            INBOX_DIR=inbox,
+        ), patch(
+            "src.mcp.inbox_server.agent_channel.write_pointer",
+            side_effect=OSError("simulated ENOSPC from mkdir/touch"),
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "All green.",
+                    "source": "local-claude",
+                    "request_id": "req-oserror-agent",
+                    "message_id": "req-oserror-agent",
+                })
+            )
+
+        # Reply path completed: terminal reply written, response reports success.
+        assert "Reply written" in result[0].text
+        assert (agent_replies / "req-oserror-agent.json").exists()
+        # mark_processed still ran despite the write_pointer failure.
+        assert "marked processed" in result[0].text
+        assert not (processing / "req-oserror-agent.json").exists()
+        assert (processed / "req-oserror-agent.json").exists()
+        # No pointer was written (the failure was swallowed, not silently succeeded).
+        assert not (agent_replies / "by-agent").exists()
+
+
 class TestAutoThreading:
     """Tests for automatic reply threading (issue #330).
 

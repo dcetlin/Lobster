@@ -10,6 +10,7 @@ patching inbox_server.py globals — see the module docstring for why.
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,22 @@ class _RecordingEmitter:
         self.calls.append(
             {"event_type": event_type, "payload": payload, "severity": severity, "chat_id": chat_id}
         )
+
+
+class _FakeClaimsDB:
+    """Duck-typed stand-in for claims.AtomicClaimDB — write_progress only
+    calls get_claim_status(), so that's all this fake needs to implement.
+    Lets tests set up claim state directly rather than booting a real
+    SQLite-backed AtomicClaimDB."""
+
+    def __init__(self, statuses: dict | None = None):
+        self._statuses = dict(statuses or {})
+
+    def get_claim_status(self, message_id):
+        return self._statuses.get(message_id)
+
+    def set_status(self, message_id, status):
+        self._statuses[message_id] = status
 
 
 class TestSource:
@@ -260,3 +277,344 @@ class TestWriteAck:
         assert emitter.calls[0]["severity"] == "warn"
         assert emitter.calls[0]["payload"]["error"] == "disk full"
         assert not (tmp_path / "req-2.ack.json").exists()
+
+
+class TestWriteProgress:
+    """agent-channel protocol v1, §2 — write_progress: repeatable,
+    claim-bound status writes for an OPEN exchange."""
+
+    # -- Claim-bound authorization (§2.2) -----------------------------------
+
+    def test_no_claim_row_is_refused(self, tmp_path: Path):
+        emitter = _RecordingEmitter()
+        claims_db = _FakeClaimsDB()  # no row at all for "req-1"
+
+        outcome = agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="working on it",
+            emit_event=emitter,
+        )
+
+        assert outcome.accepted is False
+        assert outcome.written is False
+        assert outcome.reason == "unauthorized"
+        assert not (tmp_path / "req-1.ack.json").exists()
+        assert emitter.calls[0]["event_type"] == "agent_channel.progress"
+        assert emitter.calls[0]["severity"] == "warn"
+        assert emitter.calls[0]["payload"]["outcome"] == "unauthorized"
+
+    def test_claim_already_processed_is_refused(self, tmp_path: Path):
+        """A non-claimant (or a claimant whose exchange already closed)
+        cannot resurrect it with a status write — this is the concrete case
+        the adversarial review named: session_id collapses to 'dispatcher'
+        across subagents, so authorization must be claim-row-bound, not
+        session-identity-bound."""
+        emitter = _RecordingEmitter()
+        claims_db = _FakeClaimsDB({"req-1": "processed"})
+
+        outcome = agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="too late",
+            emit_event=emitter,
+        )
+
+        assert outcome.accepted is False
+        assert outcome.reason == "unauthorized"
+        assert not (tmp_path / "req-1.ack.json").exists()
+
+    def test_claim_failed_status_is_refused(self, tmp_path: Path):
+        emitter = _RecordingEmitter()
+        claims_db = _FakeClaimsDB({"req-1": "failed"})
+
+        outcome = agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="x",
+            emit_event=emitter,
+        )
+        assert outcome.accepted is False
+        assert outcome.reason == "unauthorized"
+
+    def test_open_claim_is_authorized_and_writes(self, tmp_path: Path):
+        emitter = _RecordingEmitter()
+        claims_db = _FakeClaimsDB({"req-1": "processing"})
+
+        outcome = agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="3/5 tests passing",
+            emit_event=emitter,
+        )
+
+        assert outcome.accepted is True
+        assert outcome.written is True
+        assert outcome.reason == "written"
+
+        ack_file = tmp_path / "req-1.ack.json"
+        assert ack_file.exists()
+        written = json.loads(ack_file.read_text())
+        assert written["request_id"] == "req-1"
+        assert written["ack"] is True
+        assert written["text"] == "3/5 tests passing"
+        assert "ts" in written
+
+        assert emitter.calls[-1]["event_type"] == "agent_channel.progress"
+        assert emitter.calls[-1]["severity"] == "info"
+        assert emitter.calls[-1]["payload"]["outcome"] == "written"
+
+    # -- last-write-wins overwrite -------------------------------------------
+
+    def test_second_open_write_overwrites_first_after_debounce_window(self, tmp_path: Path):
+        """Current status, not a transcript: the second write clobbers the
+        first entirely — no accumulating history."""
+        claims_db = _FakeClaimsDB({"req-1": "processing"})
+        emitter = _RecordingEmitter()
+
+        agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="first status",
+            emit_event=emitter,
+        )
+        ack_file = tmp_path / "req-1.ack.json"
+        # Backdate the ack file's mtime past the debounce window so the
+        # second write isn't itself debounced — isolates "does overwrite
+        # replace content" from the separate debounce behavior below.
+        old_ts = time.time() - (agent_channel.DEBOUNCE_INTERVAL_SECONDS + 1)
+        import os
+        os.utime(ack_file, (old_ts, old_ts))
+
+        outcome = agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="second status — replaces the first",
+            emit_event=emitter,
+        )
+        assert outcome.written is True
+        written = json.loads(ack_file.read_text())
+        assert written["text"] == "second status — replaces the first"
+
+    # -- Debounce (Open Dial 5) ------------------------------------------
+
+    def test_rapid_second_call_within_window_is_debounced_not_error(self, tmp_path: Path):
+        claims_db = _FakeClaimsDB({"req-1": "processing"})
+        emitter = _RecordingEmitter()
+
+        first = agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="status A",
+            emit_event=emitter,
+        )
+        assert first.written is True
+
+        second = agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="status B — should not land yet",
+            emit_event=emitter,
+        )
+
+        # Debounced calls are still "accepted" (not an error to the caller)
+        # — only the byte write itself is skipped.
+        assert second.accepted is True
+        assert second.written is False
+        assert second.reason == "debounced"
+
+        # File content is unchanged — still the first write.
+        written = json.loads((tmp_path / "req-1.ack.json").read_text())
+        assert written["text"] == "status A"
+
+        assert emitter.calls[-1]["payload"]["outcome"] == "debounced"
+
+    def test_rapid_calls_collapse_to_one_write(self, tmp_path: Path):
+        """Ten calls inside the debounce window produce exactly one write."""
+        claims_db = _FakeClaimsDB({"req-1": "processing"})
+        emitter = _RecordingEmitter()
+
+        outcomes = [
+            agent_channel.write_progress(
+                claims_db=claims_db,
+                agent_replies_dir=tmp_path,
+                request_id="req-1",
+                status_text=f"status {i}",
+                emit_event=emitter,
+            )
+            for i in range(10)
+        ]
+
+        assert sum(1 for o in outcomes if o.written) == 1
+        assert all(o.accepted for o in outcomes)
+        written = json.loads((tmp_path / "req-1.ack.json").read_text())
+        assert written["text"] == "status 0"  # only the first call's content landed
+
+    def test_write_after_debounce_window_elapses_lands(self, tmp_path: Path):
+        claims_db = _FakeClaimsDB({"req-1": "processing"})
+        emitter = _RecordingEmitter()
+
+        agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="status A",
+            emit_event=emitter,
+        )
+        ack_file = tmp_path / "req-1.ack.json"
+        old_ts = time.time() - (agent_channel.DEBOUNCE_INTERVAL_SECONDS + 1)
+        import os
+        os.utime(ack_file, (old_ts, old_ts))
+
+        outcome = agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="status B — lands now",
+            emit_event=emitter,
+        )
+        assert outcome.written is True
+        written = json.loads(ack_file.read_text())
+        assert written["text"] == "status B — lands now"
+
+    # -- Message-after-complete guard (§2.5) ------------------------------
+
+    def test_refuses_write_when_terminal_reply_already_exists(self, tmp_path: Path):
+        claims_db = _FakeClaimsDB({"req-1": "processing"})
+        emitter = _RecordingEmitter()
+        # Terminal reply already landed (OPEN -> COMPLETE), but the claim
+        # row hasn't necessarily flipped yet — COMPLETE is derived from the
+        # reply file's existence, not from claim status (protocol v1 §3
+        # state table).
+        (tmp_path / "req-1.json").write_text('{"request_id": "req-1", "text": "done"}')
+
+        outcome = agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="still going?",
+            emit_event=emitter,
+        )
+
+        assert outcome.accepted is True  # not an error — a sanctioned no-op
+        assert outcome.written is False
+        assert outcome.reason == "already_complete"
+        assert not (tmp_path / "req-1.ack.json").exists()
+        assert emitter.calls[-1]["payload"]["outcome"] == "already_complete"
+
+    def test_message_after_complete_race_is_closed_against_concurrent_write_progress(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The terminal-file check and the write happen inside ONE
+        flock-guarded critical section — simulate a terminal reply landing
+        *during* the check by having reply_path.exists() flip from False to
+        True mid-call, and confirm no ack write follows once it's seen.
+
+        Scope note: this only proves the guard is race-free with respect to
+        write_progress's own check-then-write. It does NOT prove the race is
+        closed against write_reply() (the real terminal writer), which holds
+        no lock at all and is not coordinated with write_progress's flock —
+        see the write_progress docstring's "IMPORTANT SCOPE LIMIT" note.
+        That residual write_progress-vs-write_reply window is a documented,
+        accepted limitation, not something this test (or the flock) closes.
+        """
+        claims_db = _FakeClaimsDB({"req-1": "processing"})
+        emitter = _RecordingEmitter()
+
+        reply_path = tmp_path / "req-1.json"
+        real_exists = Path.exists
+
+        def _flip_on_check(self):
+            if self == reply_path:
+                # Simulate the terminal file landing exactly when checked.
+                reply_path.write_text('{"request_id": "req-1", "text": "raced in"}')
+                return True
+            return real_exists(self)
+
+        monkeypatch.setattr(Path, "exists", _flip_on_check)
+
+        outcome = agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="never lands",
+            emit_event=emitter,
+        )
+        assert outcome.written is False
+        assert outcome.reason == "already_complete"
+        assert not (tmp_path / "req-1.ack.json").exists()
+
+    # -- Lock discipline ----------------------------------------------------
+
+    def test_lock_is_released_after_call_completes(self, tmp_path: Path):
+        """A stuck/held lock would hang every subsequent call — confirm the
+        lock file can be re-acquired immediately after write_progress returns."""
+        import fcntl
+
+        claims_db = _FakeClaimsDB({"req-1": "processing"})
+        emitter = _RecordingEmitter()
+
+        agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="status A",
+            emit_event=emitter,
+        )
+
+        lock_path = tmp_path / ".req-1.progress.lock"
+        assert lock_path.exists()
+        with open(lock_path, "r+") as f:
+            # Non-blocking acquire must succeed — if write_progress leaked
+            # the lock, this raises BlockingIOError.
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+class TestWritePointer:
+    """agent-channel protocol v1, §3.2 — by-agent pointer mailbox."""
+
+    def test_writes_zero_byte_pointer_file(self, tmp_path: Path):
+        pointer_path = agent_channel.write_pointer(
+            agent_replies_dir=tmp_path,
+            agent_slug="bloom",
+            request_id="req-1",
+        )
+        assert pointer_path == tmp_path / "by-agent" / "bloom" / "req-1"
+        assert pointer_path.exists()
+        assert pointer_path.stat().st_size == 0
+
+    def test_creates_per_agent_subdirectory(self, tmp_path: Path):
+        agent_channel.write_pointer(
+            agent_replies_dir=tmp_path, agent_slug="glyph", request_id="req-9"
+        )
+        assert (tmp_path / "by-agent" / "glyph").is_dir()
+
+    def test_idempotent_second_call_does_not_error(self, tmp_path: Path):
+        agent_channel.write_pointer(
+            agent_replies_dir=tmp_path, agent_slug="bloom", request_id="req-1"
+        )
+        # Calling again for the identical (agent, request_id) pair must not
+        # raise — e.g. a retried send_reply for the same request_id.
+        pointer_path = agent_channel.write_pointer(
+            agent_replies_dir=tmp_path, agent_slug="bloom", request_id="req-1"
+        )
+        assert pointer_path.exists()
+
+    def test_different_request_ids_get_distinct_pointer_files(self, tmp_path: Path):
+        agent_channel.write_pointer(
+            agent_replies_dir=tmp_path, agent_slug="bloom", request_id="req-1"
+        )
+        agent_channel.write_pointer(
+            agent_replies_dir=tmp_path, agent_slug="bloom", request_id="req-2"
+        )
+        listing = sorted(p.name for p in (tmp_path / "by-agent" / "bloom").iterdir())
+        assert listing == ["req-1", "req-2"]

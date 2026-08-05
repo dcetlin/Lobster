@@ -266,6 +266,29 @@ class AtomicClaimDB:
         except Exception:
             return False
 
+    def get_claim_status(self, message_id: str) -> str | None:
+        """Return the claim row's status ('processing'|'processed'|'failed')
+        for message_id, or None if no claim row exists.
+
+        Used by write_progress's claim-bound authorization (agent-channel
+        protocol v1, §2.2): binding a repeatable status write to "is this
+        request_id currently claimed and still open" rather than to
+        session_id, which collapses to the literal string "dispatcher"
+        across distinct delegated subagents and so cannot discriminate
+        between them. A row existing with status='processing' is the proof-
+        of-claim signal; 'processed'/'failed' or a missing row both mean the
+        exchange is not currently OPEN and a write must be refused.
+        """
+        try:
+            conn = self._conn()
+            row = conn.execute(
+                "SELECT status FROM message_claims WHERE message_id=?",
+                (message_id,),
+            ).fetchone()
+            return row["status"] if row is not None else None
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------
     # Dispatcher lock operations (Phase 2)
     # ------------------------------------------------------------------

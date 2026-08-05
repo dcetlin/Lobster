@@ -24,6 +24,7 @@ from reliability import (
     safe_move,
     validate_send_reply_args,
     validate_message_id,
+    sanitize_agent_slug,
     ValidationError,
     init_audit_log,
     audit_log,
@@ -259,6 +260,66 @@ class TestValidateMessageId:
         """Slashes in message ID are rejected."""
         with pytest.raises(ValidationError, match="invalid characters"):
             validate_message_id("foo/bar")
+
+
+class TestSanitizeAgentSlug:
+    """agent-channel protocol v1, §3.2 / Open Dial 4: normalize case,
+    strict-reject everything else."""
+
+    def test_lowercase_passes_through_unchanged(self):
+        assert sanitize_agent_slug("bloom") == "bloom"
+
+    def test_uppercase_is_lowercased(self):
+        assert sanitize_agent_slug("Bloom") == "bloom"
+        assert sanitize_agent_slug("BLOOM") == "bloom"
+
+    def test_mixed_case_and_digits_and_dashes_lowercased(self):
+        assert sanitize_agent_slug("Glyph-Session_42") == "glyph-session_42"
+
+    def test_none_raises(self):
+        with pytest.raises(ValidationError, match="required"):
+            sanitize_agent_slug(None)
+
+    def test_empty_string_raises(self):
+        with pytest.raises(ValidationError, match="required"):
+            sanitize_agent_slug("")
+
+    def test_whitespace_only_raises(self):
+        with pytest.raises(ValidationError, match="required"):
+            sanitize_agent_slug("   ")
+
+    def test_internal_whitespace_rejected_not_stripped(self):
+        # Fail-closed, not silently mangled: "bloom " -> reject, not "bloom".
+        with pytest.raises(ValidationError, match="invalid characters"):
+            sanitize_agent_slug("bloom two words")
+
+    def test_path_traversal_rejected(self):
+        with pytest.raises(ValidationError, match="invalid characters"):
+            sanitize_agent_slug("../../etc/passwd")
+
+    def test_slash_rejected(self):
+        with pytest.raises(ValidationError, match="invalid characters"):
+            sanitize_agent_slug("bloom/session")
+
+    def test_dot_rejected(self):
+        with pytest.raises(ValidationError, match="invalid characters"):
+            sanitize_agent_slug("bloom.session")
+
+    def test_too_long_raises(self):
+        with pytest.raises(ValidationError, match="exceeds max length"):
+            sanitize_agent_slug("a" * 129)
+
+    def test_max_length_boundary_passes(self):
+        assert sanitize_agent_slug("a" * 128) == "a" * 128
+
+    def test_case_collision_normalizes_to_same_slug(self):
+        # "Bloom" vs "bloom" vs "BLOOM" must never split one collaborator's
+        # history across different by-agent/ directories.
+        assert (
+            sanitize_agent_slug("Bloom")
+            == sanitize_agent_slug("bloom")
+            == sanitize_agent_slug("BLOOM")
+        )
 
 
 # =============================================================================

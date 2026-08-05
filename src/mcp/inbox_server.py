@@ -87,6 +87,7 @@ from reliability import (
     validate_send_reply_args,
     validate_message_id,
     sanitize_request_id,
+    sanitize_agent_slug,
     ValidationError,
     init_audit_log,
     audit_log,
@@ -1401,6 +1402,7 @@ except Exception as _claims_err:
         def release(self, *a, **kw) -> None: pass
         def update_status(self, *a, **kw) -> None: pass
         def is_claimed(self, *a, **kw) -> bool: return False
+        def get_claim_status(self, *a, **kw): return None
         def acquire_dispatcher_lock(self, *a, **kw) -> bool: return True
         def get_dispatcher_lock(self, *a, **kw): return None
         def release_dispatcher_lock(self, *a, **kw) -> None: pass
@@ -1585,6 +1587,7 @@ _SESSION_GUARDED_TOOLS = frozenset({
     "mark_processing",
     "mark_failed",
     "claim_and_ack",
+    "write_progress",
 })
 
 
@@ -2056,6 +2059,50 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["message_id", "ack_text", "chat_id"],
+            },
+        ),
+        Tool(
+            name="write_progress",
+            description=(
+                "Write a repeatable current-status update for an OPEN local-claude "
+                "agent-channel exchange (source='local-claude'; agent-channel protocol "
+                "v1, Rung A). Overwrites agent-replies/<request_id>.ack.json — the SAME "
+                "file claim_and_ack's ack write uses — with the latest status text. "
+                "Last-write-wins: this is a current-status field, not an appended log; "
+                "an earlier write is silently superseded by a later one. "
+                "Claim-bound authorization: refused unless request_id currently has an "
+                "OPEN claim (claimed and not yet completed/failed) — NOT session-identity-"
+                "based, since session_id collapses to the literal string 'dispatcher' "
+                "across distinct delegated subagents and cannot tell them apart. "
+                "Refused as a no-op (not an error) if the exchange has already reached "
+                "COMPLETE (agent-replies/<request_id>.json exists) — message-after-"
+                "complete guard, evaluated inside the same lock-guarded critical section "
+                "as the write, so there is no check-then-write race. Debounced: if a "
+                "status was already written for this request_id within the last 10 "
+                "seconds, the call is still accepted (no error) but the filesystem write "
+                "is skipped to bound churn from a spammy caller."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "request_id": {
+                        "type": "string",
+                        "description": (
+                            "The request_id of the OPEN local-claude exchange to update "
+                            "— the same request_id from the original inbound message / "
+                            "the claim_and_ack call that opened this exchange."
+                        ),
+                    },
+                    "status_text": {
+                        "type": "string",
+                        "description": (
+                            "The current-status text to write (e.g. 'still running "
+                            "tests, 3/5 done'). Overwrites any previous status for this "
+                            "request_id — repeated calls do not accumulate a history."
+                        ),
+                    },
+                },
+                "required": ["request_id", "status_text"],
             },
         ),
         Tool(
@@ -4132,6 +4179,8 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         return await handle_mark_processing(arguments)
     elif name == "claim_and_ack":
         return await handle_claim_and_ack(arguments)
+    elif name == "write_progress":
+        return await handle_write_progress(arguments)
     elif name == "mark_failed":
         return await handle_mark_failed(arguments)
     elif name == "list_sources":
@@ -5485,6 +5534,43 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
             in_reply_to=args.get("message_id"),
         )
         reply_slot_created = reply_outcome.reply_slot_created
+
+        # by-agent pointer mailbox (agent-channel protocol v1, §3.2 —
+        # durability layer). Purely additive: only fires when (a) this call
+        # actually won the reply slot (a lost-race no-op didn't write
+        # anything new, so it gets no pointer either) and (b) the original
+        # inbound message carried a non-empty `agent` field. origin_msg was
+        # already resolved above (from message_id_arg) for the source-
+        # mismatch check, so no extra file read is needed here. A malformed
+        # `agent` value fails loudly (logged) but never blocks or fails the
+        # reply write itself — the pointer is a discovery convenience, not
+        # load-bearing for the reply itself reaching its single-shot slot.
+        if reply_slot_created:
+            _agent_label = origin_msg.get("agent")
+            if _agent_label:
+                # Broad `except Exception` (not just ValidationError) is
+                # deliberate: this guards both sanitize_agent_slug's
+                # validation failures AND write_pointer's filesystem calls
+                # (mkdir/touch), which can raise OSError (e.g. disk full,
+                # permission error, ENOSPC) that has nothing to do with
+                # input validation. The pointer mailbox is a discovery
+                # convenience, never load-bearing for the reply itself —
+                # any failure here must never skip mark_processed, dedup
+                # tracking, or audit emission, nor block the reply path.
+                try:
+                    _agent_slug = sanitize_agent_slug(_agent_label)
+                    agent_channel.write_pointer(
+                        agent_replies_dir=AGENT_REPLIES_DIR,
+                        agent_slug=_agent_slug,
+                        request_id=request_id,
+                    )
+                except Exception as _slug_err:
+                    log.warning(
+                        f"send_reply(local-claude): agent={_agent_label!r} on "
+                        f"request_id={request_id!r} failed by-agent pointer "
+                        f"write ({_slug_err}) — skipping (fail-closed; the "
+                        "terminal reply itself is unaffected)."
+                    )
     else:
         # Create reply file in outbox
         reply_data = {
@@ -6055,6 +6141,64 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
                 f"Message {message_id} remains in processing/. Stale recovery will handle it."
             ),
         )]
+
+
+async def handle_write_progress(args: dict) -> list[TextContent]:
+    """Write a repeatable, claim-bound current-status update for an OPEN
+    local-claude agent-channel exchange. See agent_channel.write_progress()
+    for the full authorization/debounce/message-after-complete design
+    (agent-channel protocol v1, §2).
+    """
+    try:
+        request_id = sanitize_request_id(args.get("request_id"))
+    except ValidationError as e:
+        return [TextContent(type="text", text=f"Error: {e}")]
+
+    status_text = str(args.get("status_text", "")).strip()
+    if not status_text:
+        return [TextContent(type="text", text="Error: status_text is required")]
+
+    outcome = agent_channel.write_progress(
+        claims_db=_claims_db,
+        agent_replies_dir=AGENT_REPLIES_DIR,
+        request_id=request_id,
+        status_text=status_text,
+        emit_event=_emit_mcp_event,
+    )
+
+    if not outcome.accepted:
+        return [TextContent(
+            type="text",
+            text=(
+                f"Error: write_progress refused for request_id={request_id!r} — no OPEN "
+                "claim currently held for this request_id (claim-bound authorization; "
+                "the exchange must be actively claimed via claim_and_ack and not yet "
+                "COMPLETE — agent-channel protocol v1, §2.2). Nothing was written."
+            ),
+        )]
+    if outcome.reason == "already_complete":
+        return [TextContent(
+            type="text",
+            text=(
+                f"No-op: agent-replies/{request_id}.json already exists (exchange "
+                "COMPLETE) — refusing to write a status update to a closed exchange "
+                "(message-after-complete guard)."
+            ),
+        )]
+    if outcome.reason == "debounced":
+        return [TextContent(
+            type="text",
+            text=(
+                f"Accepted (debounced): a status write for request_id={request_id!r} "
+                f"landed within the last {int(agent_channel.DEBOUNCE_INTERVAL_SECONDS)}s "
+                "— skipping the filesystem write to bound churn; the most recent status "
+                "on disk is still current."
+            ),
+        )]
+    return [TextContent(
+        type="text",
+        text=f"Status written to agent-replies/{request_id}.ack.json: {status_text[:100]}",
+    )]
 
 
 async def handle_mark_failed(args: dict) -> list[TextContent]:

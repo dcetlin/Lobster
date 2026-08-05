@@ -73,6 +73,34 @@ REQUEST_ID_RULES = (
 )
 
 # ---------------------------------------------------------------------------
+# agent-slug rules (agent-channel protocol v1, §3.2 durability layer — the
+# by-agent pointer mailbox: agent-replies/by-agent/<agent-slug>/<request_id>).
+# Inherits the request_id charset allowlist (it's also a filesystem path
+# component) with exactly one normalization exception: case is folded rather
+# than rejected, since case is not semantically load-bearing for an identity
+# label (Open Dial 4, resolved 2026-08-05: "normalize case, strict-reject
+# everything else"). Whitespace and any other out-of-charset character fail
+# loudly — fail-closed, never silently stripped or substituted.
+# ---------------------------------------------------------------------------
+
+AGENT_SLUG_MAX_LEN = 128
+AGENT_SLUG_CHARSET_DESCRIPTION = "letters, digits, '-', and '_' only (case-folded to lowercase)"
+AGENT_SLUG_PATTERN = r"^[A-Za-z0-9_-]+$"
+
+AGENT_SLUG_RULES = (
+    "The optional `agent` field on the inbound request (e.g. \"bloom\"), when "
+    "present, is run through the same sanitization pattern as request_id "
+    "before it is used as the `agent-replies/by-agent/<agent-slug>/` "
+    "directory name: lowercase-normalized (case is not semantically load-"
+    "bearing), then must match "
+    f"`{AGENT_SLUG_PATTERN}` ({AGENT_SLUG_CHARSET_DESCRIPTION}), 1-{AGENT_SLUG_MAX_LEN} "
+    "characters — no path separators, no whitespace, no '.'. An `agent` value "
+    "that fails this check is rejected loudly (fail-closed), never silently "
+    "stripped or substituted. `by-agent/` is a convenience discovery index, "
+    "not an access-control or authorization mechanism."
+)
+
+# ---------------------------------------------------------------------------
 # Envelopes
 # ---------------------------------------------------------------------------
 # Each field entry: {type, required, description, const?, format?}. This
@@ -136,13 +164,16 @@ INBOUND_ENVELOPE: dict[str, dict[str, Any]] = {
         "description": (
             "Optional identity label for the calling agent/session (e.g. "
             "\"glyph\"), set via lobster-chat's --agent flag or the "
-            "LOBSTER_CHAT_AGENT env var. Purely cosmetic — Lobster does not "
-            "use it for routing, correlation, or authorization (request_id "
-            "remains the sole correlation key); it exists so the dispatcher "
-            "can render inbox messages as \"from <agent>\" instead of a "
-            "generic source label when multiple external agent sessions "
-            "share this channel. Omit it entirely rather than sending an "
-            "empty string if the caller has no identity to report."
+            "LOBSTER_CHAT_AGENT env var. Lobster does not use it for "
+            "correlation or authorization (request_id remains the sole "
+            "correlation key and the sole basis for write_progress's "
+            "claim-bound authorization); it exists so the dispatcher can "
+            "render inbox messages as \"from <agent>\" instead of a generic "
+            "source label, and — when non-empty — so the reply is also "
+            "indexed at agent-replies/by-agent/<agent-slug>/<request_id> (see "
+            "AGENT_SLUG_RULES), a read-only discovery convenience, not an "
+            "access-control mechanism. Omit it entirely rather than sending "
+            "an empty string if the caller has no identity to report."
         ),
     },
 }
