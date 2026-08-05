@@ -50,6 +50,26 @@ The pre-existing flat sweep behavior (scope, filename shape, retention
 semantics) is unchanged by this extension — by-agent/ handling is purely
 additive.
 
+**write_progress lock files (issue #1524).** `write_progress()`
+(src/mcp/agent_channel.py §2.5) creates `agent-replies/.{request_id}.progress.lock`
+to serialize its own writes for one request_id. Nothing GC'd these before
+this extension — neither the flat sweep above nor the by-agent/ pointer
+sweep is scoped to the dot-prefixed lock filename shape. This sweep also
+walks the flat directory a second time for lock files:
+
+- A lock is removed once *neither* `<request_id>.json` nor
+  `<request_id>.ack.json` survives this run — the same liveness condition
+  the by-agent/ dangling-pointer GC above uses (target gone ⇒ safe to
+  remove, no separate age check on the lock file itself, since the target's
+  absence already implies it aged out under the retention window or never
+  existed).
+- A lock is kept for as long as either the reply or the ack file is still
+  present — a live exchange (or one whose answer hasn't been read yet)
+  always keeps its lock.
+
+Also purely additive — the flat and by-agent/ sweep behaviors above are
+unchanged.
+
 Schedule: daily (see scripts/upgrade.sh migration for the cron entry).
 Job name: agent-replies-sweep
 
@@ -92,6 +112,7 @@ JOB_NAME = "agent-replies-sweep"
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _REPLY_SUFFIX = ".json"
 _ACK_SUFFIX = ".ack.json"
+_LOCK_SUFFIX = ".progress.lock"
 
 DEFAULT_RETENTION_HOURS = 24 * 7  # 7 days
 RETENTION_HOURS_ENV = "LOBSTER_AGENT_REPLIES_RETENTION_HOURS"
@@ -289,6 +310,79 @@ def summarize_pointers(plans: list[PointerPlan], dry_run: bool) -> str:
 
 
 # ---------------------------------------------------------------------------
+# write_progress lock files — pure helpers (issue #1524)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class LockPlan:
+    """One decision for one `.{request_id}.progress.lock` file — pure data, no I/O."""
+
+    filename: str
+    action: str  # "remove" | "keep"
+    request_id: str
+
+
+def _extract_lock_request_id(filename: str) -> str | None:
+    """
+    Return the request_id if filename matches write_progress()'s lock naming
+    scheme (`.{request_id}.progress.lock` — src/mcp/agent_channel.py §2.5),
+    else None. Distinct from both the flat reply/ack shape and the by-agent/
+    pointer shape above: dot-prefixed, with a `.progress.lock` suffix
+    wrapped around the bare request_id.
+    """
+    if not filename.startswith(".") or not filename.endswith(_LOCK_SUFFIX):
+        return None
+    candidate = filename[1 : -len(_LOCK_SUFFIX)]
+    if not _REQUEST_ID_PATTERN.match(candidate):
+        return None
+    return candidate
+
+
+def plan_lock_sweep(filenames: list[str], surviving_request_ids: set[str]) -> list[LockPlan]:
+    """
+    Pure decision function: given every filename found in agent-replies/ (the
+    same flat scan plan_sweep consumes) plus the set of request_ids that
+    still have a live reply or ack file after this run's flat-sweep
+    decisions, decide which write_progress lock files to remove. No I/O.
+
+    write_progress() takes `.{request_id}.progress.lock` purely to serialize
+    its own writes for one request_id (agent_channel.py §2.5); once that
+    request_id has no reply and no ack left, the lock has nothing left to
+    guard. This mirrors plan_pointer_sweep's "remove_dangling" rule exactly
+    (issue #1524): existence of the target, not the lock file's own age, is
+    the safety condition — a target that's gone already passed through the
+    flat sweep's retention-hours gate (or never existed), so there is no
+    separate age check here.
+
+    Filenames that aren't lock-shaped are silently excluded from the result
+    (not reported as "skip_unrecognized" here) — plan_sweep, scanning the
+    same directory, already owns that accounting for every non-lock name.
+    """
+    plans: list[LockPlan] = []
+    for filename in filenames:
+        request_id = _extract_lock_request_id(filename)
+        if request_id is None:
+            continue
+        action = "keep" if request_id in surviving_request_ids else "remove"
+        plans.append(LockPlan(filename, action, request_id))
+    return plans
+
+
+def summarize_locks(plans: list[LockPlan], dry_run: bool) -> str:
+    """Compose a human-readable summary string for the lock-file sweep. Pure function."""
+    if not plans:
+        return ""
+    removed = [p for p in plans if p.action == "remove"]
+    kept = [p for p in plans if p.action == "keep"]
+    verb = "Would remove" if dry_run else "Removed"
+    return (
+        f"write_progress lock files — {verb} {len(removed)} orphaned "
+        f"(no surviving reply or ack), kept {len(kept)} still guarding a live "
+        f"exchange, out of {len(plans)} scanned."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Side-effecting boundary functions
 # ---------------------------------------------------------------------------
 
@@ -428,6 +522,33 @@ def cleanup_empty_agent_dirs(by_agent_dir: Path, dry_run: bool) -> list[str]:
     return removed_slugs
 
 
+def apply_lock_sweep(directory: Path, plans: list[LockPlan], dry_run: bool) -> tuple[int, list[str]]:
+    """
+    Execute "remove" plans for write_progress lock files. Returns
+    (removed_count, errors). Mirrors apply_sweep()'s and
+    apply_pointer_sweep()'s discipline: only ever unlinks a file whose plan
+    says to remove it.
+    """
+    removed = 0
+    errors: list[str] = []
+    for plan in plans:
+        if plan.action != "remove":
+            continue
+        target = directory / plan.filename
+        if dry_run:
+            removed += 1
+            continue
+        try:
+            target.unlink()
+            removed += 1
+        except FileNotFoundError:
+            # Already gone (e.g. removed by a concurrent sweep run) — not an error.
+            removed += 1
+        except OSError as exc:
+            errors.append(f"{plan.filename}: {exc}")
+    return removed, errors
+
+
 def write_task_output(task_outputs_dir: Path, job_name: str, summary: str, status: str) -> None:
     """
     Write job output to the task-outputs directory in the same format as the
@@ -513,7 +634,22 @@ def main(argv: list[str] | None = None) -> int:
     if pointer_errors:
         summary += f"\n{len(pointer_errors)} pointer error(s):\n" + "\n".join(f"  {e}" for e in pointer_errors[:10])
 
-    errors = errors + pointer_errors
+    # write_progress lock file GC (issue #1524) — reuses the same
+    # surviving_request_ids set computed above for the by-agent/
+    # dangling-pointer check: a lock is orphaned exactly when neither its
+    # reply nor its ack survives this run. Scans the same flat `entries`
+    # listing plan_sweep already consumed, so no extra directory read.
+    lock_filenames = [filename for filename, _mtime, _payload in entries]
+    lock_plans = plan_lock_sweep(lock_filenames, surviving_request_ids)
+    lock_removed_count, lock_errors = apply_lock_sweep(AGENT_REPLIES_DIR, lock_plans, args.dry_run)
+
+    lock_summary = summarize_locks(lock_plans, args.dry_run)
+    if lock_summary:
+        summary += "\n" + lock_summary
+    if lock_errors:
+        summary += f"\n{len(lock_errors)} lock error(s):\n" + "\n".join(f"  {e}" for e in lock_errors[:10])
+
+    errors = errors + pointer_errors + lock_errors
 
     print(summary)
 
