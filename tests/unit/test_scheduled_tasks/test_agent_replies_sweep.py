@@ -33,6 +33,20 @@ by-agent/ pointer mailbox extension (agent-channel-protocol-proposal.md §3.2):
   - test_cleanup_empty_agent_dirs_dry_run_never_touches_filesystem
   - test_main_by_agent_sweep_end_to_end_ages_gcs_and_cleans_up
   - test_main_flat_sweep_behavior_unchanged_by_by_agent_extension
+
+write_progress lock file GC (issue #1524):
+  - test_extracts_lock_request_id_from_dotted_filename
+  - test_rejects_lock_filename_missing_dot_prefix
+  - test_rejects_lock_filename_with_invalid_request_id
+  - test_rejects_non_lock_filename
+  - test_plan_lock_removes_lock_when_neither_reply_nor_ack_survives
+  - test_plan_lock_keeps_lock_while_reply_survives
+  - test_plan_lock_keeps_lock_while_ack_survives
+  - test_plan_lock_excludes_non_lock_filenames_from_result
+  - test_apply_lock_sweep_only_removes_planned_locks
+  - test_apply_lock_sweep_dry_run_never_touches_filesystem
+  - test_main_lock_sweep_removes_lock_only_once_both_reply_and_ack_are_gone
+  - test_main_dry_run_lock_sweep_never_touches_filesystem
 """
 
 from __future__ import annotations
@@ -79,6 +93,11 @@ plan_pointer_sweep = _mod.plan_pointer_sweep
 scan_by_agent_dir = _mod.scan_by_agent_dir
 apply_pointer_sweep = _mod.apply_pointer_sweep
 cleanup_empty_agent_dirs = _mod.cleanup_empty_agent_dirs
+
+_extract_lock_request_id = _mod._extract_lock_request_id
+LockPlan = _mod.LockPlan
+plan_lock_sweep = _mod.plan_lock_sweep
+apply_lock_sweep = _mod.apply_lock_sweep
 
 NOW = datetime(2026, 8, 4, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -607,3 +626,202 @@ def test_main_dry_run_by_agent_sweep_never_touches_filesystem(tmp_path: Path) ->
     assert result == 0
     assert dangling_pointer.exists()  # nothing deleted in dry-run
     assert (by_agent_dir / "glyph").exists()  # nothing rmdir'd in dry-run
+
+
+# ---------------------------------------------------------------------------
+# write_progress lock files — _extract_lock_request_id, pure tests (#1524)
+# ---------------------------------------------------------------------------
+
+
+def test_extracts_lock_request_id_from_dotted_filename() -> None:
+    assert _extract_lock_request_id(".1732900000-a1b2c3d4.progress.lock") == "1732900000-a1b2c3d4"
+
+
+def test_rejects_lock_filename_missing_dot_prefix() -> None:
+    assert _extract_lock_request_id("1732900000-a1b2c3d4.progress.lock") is None
+
+
+def test_rejects_lock_filename_with_invalid_request_id() -> None:
+    assert _extract_lock_request_id(".../../etc/passwd.progress.lock") is None
+    assert _extract_lock_request_id(".progress.lock") is None  # empty request_id
+
+
+def test_rejects_non_lock_filename() -> None:
+    assert _extract_lock_request_id("req-abc.json") is None
+    assert _extract_lock_request_id("req-abc.ack.json") is None
+    assert _extract_lock_request_id("mystery-file.log") is None
+
+
+# ---------------------------------------------------------------------------
+# write_progress lock files — plan_lock_sweep, pure decision tests (#1524)
+# ---------------------------------------------------------------------------
+
+
+def test_plan_lock_removes_lock_when_neither_reply_nor_ack_survives() -> None:
+    """
+    Core acceptance criterion for issue #1524: once a request_id's exchange
+    has aged out of both agent-replies/<id>.json and <id>.ack.json, its
+    write_progress lock has nothing left to guard and is GC'd.
+    """
+    filenames = [".req-gone.progress.lock"]
+    plans = plan_lock_sweep(filenames, surviving_request_ids=set())
+    assert plans[0].action == "remove"
+    assert plans[0].request_id == "req-gone"
+
+
+def test_plan_lock_keeps_lock_while_reply_survives() -> None:
+    """A lock is NEVER removed while the terminal reply file still exists."""
+    filenames = [".req-live.progress.lock"]
+    plans = plan_lock_sweep(filenames, surviving_request_ids={"req-live"})
+    assert plans[0].action == "keep"
+
+
+def test_plan_lock_keeps_lock_while_ack_survives() -> None:
+    """
+    A lock is NEVER removed while only the ack (no reply yet — exchange
+    still in flight) survives — surviving_request_ids is populated from
+    either reply or ack, mirroring plan_pointer_sweep's dangling check.
+    """
+    filenames = [".req-acked.progress.lock"]
+    plans = plan_lock_sweep(filenames, surviving_request_ids={"req-acked"})
+    assert plans[0].action == "keep"
+
+
+def test_plan_lock_excludes_non_lock_filenames_from_result() -> None:
+    """
+    Non-lock filenames (reply/ack files, unrelated files) are silently
+    excluded from plan_lock_sweep's output — plan_sweep already owns their
+    "skip_unrecognized" accounting, so they must not be double-reported here.
+    """
+    filenames = ["req-a.json", "req-a.ack.json", "mystery-file.log", ".req-gone.progress.lock"]
+    plans = plan_lock_sweep(filenames, surviving_request_ids=set())
+    assert len(plans) == 1
+    assert plans[0].filename == ".req-gone.progress.lock"
+
+
+# ---------------------------------------------------------------------------
+# write_progress lock files — apply_lock_sweep, filesystem write tests (#1524)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_lock_sweep_only_removes_planned_locks(tmp_path: Path) -> None:
+    (tmp_path / ".req-gone.progress.lock").write_text("")
+    (tmp_path / ".req-live.progress.lock").write_text("")
+
+    plans = [
+        LockPlan(".req-gone.progress.lock", "remove", "req-gone"),
+        LockPlan(".req-live.progress.lock", "keep", "req-live"),
+    ]
+    removed_count, errors = apply_lock_sweep(tmp_path, plans, dry_run=False)
+
+    assert removed_count == 1
+    assert errors == []
+    assert not (tmp_path / ".req-gone.progress.lock").exists()
+    assert (tmp_path / ".req-live.progress.lock").exists()
+
+
+def test_apply_lock_sweep_dry_run_never_touches_filesystem(tmp_path: Path) -> None:
+    target = tmp_path / ".req-gone.progress.lock"
+    target.write_text("")
+    plans = [LockPlan(".req-gone.progress.lock", "remove", "req-gone")]
+
+    removed_count, errors = apply_lock_sweep(tmp_path, plans, dry_run=True)
+
+    assert removed_count == 1  # reported as "would remove"
+    assert errors == []
+    assert target.exists()  # but nothing was actually deleted
+
+
+# ---------------------------------------------------------------------------
+# main() — write_progress lock file GC end-to-end wiring (#1524)
+# ---------------------------------------------------------------------------
+
+
+def test_main_lock_sweep_removes_lock_only_once_both_reply_and_ack_are_gone(tmp_path: Path) -> None:
+    """
+    Seeds three request_ids covering every liveness state a lock can be in:
+      - req-complete: reply survives (fresh)      -> lock kept
+      - req-inflight: only the ack survives (fresh) -> lock kept
+      - req-aged-out: neither reply nor ack survives (both stale, swept
+        this same run)                              -> lock removed
+
+    Proves the lock is GC'd only when BOTH reply and ack are gone, and never
+    while either still exists — the exact acceptance criterion of #1524.
+    """
+    workspace = tmp_path / "workspace"
+    (workspace / "scheduled-jobs").mkdir(parents=True, exist_ok=True)
+    (workspace / "scheduled-jobs" / "jobs.json").write_text(
+        json.dumps({"jobs": {"agent-replies-sweep": {"enabled": True}}})
+    )
+
+    agent_replies_dir = tmp_path / "messages" / "agent-replies"
+    agent_replies_dir.mkdir(parents=True, exist_ok=True)
+    task_outputs_dir = tmp_path / "messages" / "task-outputs"
+
+    real_now = datetime.now(timezone.utc)
+    fresh_ts = real_now.isoformat()
+    stale_ts = (real_now - timedelta(hours=200)).isoformat()
+
+    # req-complete: reply survives -> its lock must be kept.
+    (agent_replies_dir / "req-complete.json").write_text(
+        json.dumps({"request_id": "req-complete", "text": "done", "ts": fresh_ts})
+    )
+    (agent_replies_dir / ".req-complete.progress.lock").write_text("")
+
+    # req-inflight: no reply yet, but the ack survives -> its lock must be kept.
+    (agent_replies_dir / "req-inflight.ack.json").write_text(
+        json.dumps({"request_id": "req-inflight", "ack": True, "ts": fresh_ts})
+    )
+    (agent_replies_dir / ".req-inflight.progress.lock").write_text("")
+
+    # req-aged-out: both reply and ack are stale -> swept this run -> its
+    # lock is now orphaned and must be removed.
+    (agent_replies_dir / "req-aged-out.json").write_text(
+        json.dumps({"request_id": "req-aged-out", "text": "old", "ts": stale_ts})
+    )
+    (agent_replies_dir / "req-aged-out.ack.json").write_text(
+        json.dumps({"request_id": "req-aged-out", "ack": True, "ts": stale_ts})
+    )
+    (agent_replies_dir / ".req-aged-out.progress.lock").write_text("")
+
+    with (
+        patch.dict("os.environ", {"LOBSTER_WORKSPACE": str(workspace)}),
+        patch.object(_mod, "AGENT_REPLIES_DIR", agent_replies_dir),
+        patch.object(_mod, "MESSAGES_DIR", tmp_path / "messages"),
+    ):
+        result = main(["--retention-hours", "168"])
+
+    assert result == 0
+    assert (agent_replies_dir / ".req-complete.progress.lock").exists()  # reply survives -> kept
+    assert (agent_replies_dir / ".req-inflight.progress.lock").exists()  # ack survives -> kept
+    assert not (agent_replies_dir / ".req-aged-out.progress.lock").exists()  # both gone -> removed
+
+    outputs = list(task_outputs_dir.glob("*-agent-replies-sweep.json"))
+    assert len(outputs) == 1
+    output_data = json.loads(outputs[0].read_text())
+    assert output_data["status"] == "success"
+    assert "Removed 1 orphaned" in output_data["output"]
+
+
+def test_main_dry_run_lock_sweep_never_touches_filesystem(tmp_path: Path) -> None:
+    """--dry-run must not delete an orphaned write_progress lock file."""
+    workspace = tmp_path / "workspace"
+    (workspace / "scheduled-jobs").mkdir(parents=True, exist_ok=True)
+    (workspace / "scheduled-jobs" / "jobs.json").write_text(
+        json.dumps({"jobs": {"agent-replies-sweep": {"enabled": True}}})
+    )
+
+    agent_replies_dir = tmp_path / "messages" / "agent-replies"
+    agent_replies_dir.mkdir(parents=True, exist_ok=True)
+    orphaned_lock = agent_replies_dir / ".req-gone.progress.lock"
+    orphaned_lock.write_text("")
+
+    with (
+        patch.dict("os.environ", {"LOBSTER_WORKSPACE": str(workspace)}),
+        patch.object(_mod, "AGENT_REPLIES_DIR", agent_replies_dir),
+        patch.object(_mod, "MESSAGES_DIR", tmp_path / "messages"),
+    ):
+        result = main(["--retention-hours", "168", "--dry-run"])
+
+    assert result == 0
+    assert orphaned_lock.exists()  # nothing deleted in dry-run
