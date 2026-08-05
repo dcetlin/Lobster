@@ -19,14 +19,21 @@
 # restart doesn't appear to take effect.
 #
 # This script:
-#   1. Writes an mcp-restart warning message to ~/messages/inbox/
-#   2. Waits 2 seconds for the dispatcher to process it
-#   3. Runs `sudo systemctl restart <detected-unit>`
+#   1. Acquires the shared restart-coordination lock (restart-lock-lib.sh)
+#   2. Writes an mcp-restart warning message to ~/messages/inbox/
+#   3. Waits 2 seconds for the dispatcher to process it
+#   4. Runs `sudo systemctl restart <detected-unit>`
 #
 # The inbox message tells the dispatcher the restart is intentional and that
 # it should re-orient after reconnecting.  Combined with Fix 1
 # (session-lost-reminder written on server startup), the dispatcher has two
 # chances to see recovery guidance.
+#
+# Restart coordination (issue #1537): this script and health-check-v3.sh's
+# automatic restart paths (do_restart(), check_session_age()) and
+# dispatcher-refresh.sh all contend for one shared, non-blocking lock so a
+# manual restart never collides with an automatic one. If the lock is already
+# held, this script aborts immediately rather than racing the other restart.
 #
 # Usage:
 #   ~/lobster/scripts/restart-mcp.sh
@@ -34,11 +41,24 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./restart-lock-lib.sh
+source "${SCRIPT_DIR}/restart-lock-lib.sh"
+
 INBOX_DIR="${LOBSTER_MESSAGES:-${HOME}/messages}/inbox"
 REASON="${1:-manual restart}"
 NO_WAIT=false
 if [[ "${1:-}" == "--no-wait" ]]; then
     NO_WAIT=true
+fi
+
+# Restart coordination (issue #1537): refuse to restart if another restart
+# path (health-check-v3.sh's automatic restart, or a concurrently-run
+# dispatcher-refresh.sh) already holds the shared lock. Restarting into an
+# in-flight restart risks two respawn attempts racing each other.
+if ! acquire_restart_coordination_lock; then
+    echo "[restart-mcp] Another restart is already in progress (lock: ${RESTART_COORDINATION_LOCK_FILE}) — aborting to avoid a collision. Try again shortly." >&2
+    exit 1
 fi
 
 # Auto-detect the installed unit name: prefer lobster-mcp-local if it exists
