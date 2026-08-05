@@ -186,6 +186,33 @@ below the bootup-doc layer:
     happen — the fail-closed source invariant holds through both failure
     paths, not just the happy path.
 
+### Error discriminator (`error` / `error_type`)
+
+Added in protocol v1.1+ (issue #1533, proposed by bloom): `send_reply(source="local-claude", ...)`
+accepts two additional optional parameters, `error: bool` and `error_type: str`,
+which are written as extra keys on the **same** reply envelope
+(`agent-replies/<request_id>.json`) — not a second file, not a separate error
+channel, not a different poll target. This is purely a machine-readable
+discriminator so a consumer can check `error == true` instead of parsing
+`text` to tell a failure reply from a successful one.
+
+- `error=True` → the written reply includes `"error": true`.
+- `error=False` or omitted → the written reply has **no** `error` key at
+  all (never `"error": false`) — a normal successful reply is byte-for-byte
+  identical to what this protocol has always produced.
+- `error_type` (e.g. `"processing_failed"`, `"timeout"`, `"internal_error"`)
+  is an independent, purely advisory hint — it may be set with or without
+  `error`.
+
+This does not change the `silence_is_a_sanctioned_failure` principle above:
+there is still no separate error envelope. A failure is still delivered as
+one normal answer in the single-shot reply slot; `error`/`error_type` are
+just optional metadata on that answer, letting a caller skip text-parsing to
+detect it. See `ERROR_AND_ACK_SEMANTICS` in
+`src/protocol/agent_channel_schema.py` for the canonical wording. Consumer-side
+detection logic is the calling agent's responsibility — this repo only
+guarantees the field is written when requested.
+
 ## Observability & retention
 
 The channel's request/ack/reply round trip is audited on the EventBus

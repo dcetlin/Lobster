@@ -83,6 +83,15 @@ class TestSchemaModuleStructure:
         # must NOT be required, so existing callers that omit it keep working.
         assert INBOUND_ENVELOPE["agent"]["required"] is False
 
+    def test_reply_error_discriminator_fields_are_optional(self):
+        """Issue #1533: error/error_type are new REPLY_ENVELOPE fields — both
+        must be optional so a reply written before this feature existed
+        (which has neither key) still validates against this schema."""
+        assert REPLY_ENVELOPE["error"]["required"] is False
+        assert REPLY_ENVELOPE["error"]["type"] == "boolean"
+        assert REPLY_ENVELOPE["error_type"]["required"] is False
+        assert REPLY_ENVELOPE["error_type"]["type"] == "string"
+
 
 class TestJsonSchemaRendering:
     def test_json_schema_is_json_serializable(self):
@@ -116,6 +125,25 @@ class TestJsonSchemaRendering:
     def test_error_and_ack_semantics_nonempty(self):
         s = json_schema()
         assert len(s["error_and_ack_semantics"]) >= 3
+
+    def test_error_discriminator_semantics_entry_present_and_reconciled(self):
+        """Issue #1533: the new error/error_type fields must not contradict
+        'there is no separate error envelope' — both principles must be
+        present and the new entry must explicitly say it is not a second
+        envelope/file/channel."""
+        s = json_schema()
+        names = {item["name"] for item in s["error_and_ack_semantics"]}
+        assert "silence_is_a_sanctioned_failure" in names
+        assert "error_is_an_in_reply_discriminator" in names
+
+        by_name = {item["name"]: item for item in s["error_and_ack_semantics"]}
+        discriminator_detail = by_name["error_is_an_in_reply_discriminator"]["detail"]
+        assert "not a separate envelope" in discriminator_detail
+        assert "single-shot" in discriminator_detail
+
+        # The pre-existing principle must still assert "no separate error
+        # envelope" — this change must not have softened or removed it.
+        assert "no separate" in by_name["silence_is_a_sanctioned_failure"]["detail"]
 
 
 class TestMarkdownRendering:

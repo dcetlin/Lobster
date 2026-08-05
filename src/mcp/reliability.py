@@ -190,6 +190,20 @@ def validate_send_reply_args(args: dict) -> dict:
                 raise ValidationError("request_id is required when source='local-claude'") from e
             raise
 
+    # error / error_type (issue #1533): optional agent-channel reply
+    # discriminator fields. Type-checked here so a malformed value fails at
+    # the validation boundary rather than propagating into the reply file.
+    # Presence is untouched otherwise — the permissive `{**args, ...}` above
+    # already passes them through unchanged when absent or well-typed.
+    if "error" in args and args["error"] is not None and not isinstance(args["error"], bool):
+        raise ValidationError(
+            f"error must be a boolean, got {type(args['error']).__name__}"
+        )
+    if "error_type" in args and args["error_type"] is not None and not isinstance(args["error_type"], str):
+        raise ValidationError(
+            f"error_type must be a string, got {type(args['error_type']).__name__}"
+        )
+
     return normalized_args
 
 

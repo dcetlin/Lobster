@@ -87,6 +87,8 @@ def write_reply(
     request_id: str,
     text: str,
     in_reply_to: str | None,
+    error: bool | None = None,
+    error_type: str | None = None,
 ) -> ReplyOutcome:
     """Write a local-claude answer to its single-shot reply slot.
 
@@ -110,13 +112,28 @@ def write_reply(
     JSON-aware — e.g. one that expects one JSON object per line, or reads
     only the first line of `cat`'s output. Single-line output removes that
     whole class of external-parser failure at zero cost to us.
+
+    ``error``/``error_type`` (issue #1533): optional discriminator keys on
+    this SAME envelope — not a second file, not a separate error channel.
+    "Absent" is the only spelling of success: ``error`` is added to the
+    payload only when truthy (``error=False`` is normalized to "not
+    present," exactly like ``error=None``, so a caller can never accidentally
+    write the disallowed ``"error": false`` into an otherwise-successful
+    reply). ``error_type`` is independent of ``error`` — it is written
+    whenever the caller supplies a non-``None`` value, whether or not
+    ``error`` is also set, since it is documented as a hint rather than a
+    field whose presence is gated on another field's value.
     """
-    agent_reply = {
+    agent_reply: dict[str, Any] = {
         "request_id": request_id,
         "text": text,
         "ts": datetime.now(timezone.utc).isoformat(),
         "in_reply_to": in_reply_to or request_id,
     }
+    if error:
+        agent_reply["error"] = True
+    if error_type is not None:
+        agent_reply["error_type"] = error_type
     reply_path = agent_replies_dir / f"{request_id}.json"
     reply_slot_created = atomic_create_json(reply_path, agent_reply, indent=None)
     if not reply_slot_created:

@@ -115,6 +115,79 @@ class TestWriteReply:
         )
         assert outcome.reply_path == tmp_path / "req-4.json"
 
+    # -- error discriminator (issue #1533) -----------------------------------
+    #
+    # error/error_type are optional keys on the SAME reply envelope — not a
+    # separate error file/channel. Absent means success (today's behavior,
+    # unchanged); `error: true` is a machine-readable discriminator a
+    # consumer can check without parsing `text`.
+
+    def test_normal_reply_has_no_error_or_error_type_keys(self, tmp_path: Path):
+        """Backward-compat proof: a reply written with no error/error_type
+        args has exactly today's four keys — nothing added, nothing changed
+        for the common (success) case."""
+        agent_channel.write_reply(
+            agent_replies_dir=tmp_path,
+            request_id="req-ok",
+            text="all good",
+            in_reply_to=None,
+        )
+        written = json.loads((tmp_path / "req-ok.json").read_text())
+        assert set(written.keys()) == {"request_id", "text", "ts", "in_reply_to"}
+
+    def test_error_true_is_written_when_set(self, tmp_path: Path):
+        agent_channel.write_reply(
+            agent_replies_dir=tmp_path,
+            request_id="req-err",
+            text="something went wrong",
+            in_reply_to=None,
+            error=True,
+        )
+        written = json.loads((tmp_path / "req-err.json").read_text())
+        assert written["error"] is True
+
+    def test_error_type_is_written_when_provided(self, tmp_path: Path):
+        agent_channel.write_reply(
+            agent_replies_dir=tmp_path,
+            request_id="req-err2",
+            text="timed out",
+            in_reply_to=None,
+            error=True,
+            error_type="timeout",
+        )
+        written = json.loads((tmp_path / "req-err2.json").read_text())
+        assert written["error"] is True
+        assert written["error_type"] == "timeout"
+
+    def test_error_false_is_normalized_to_absent_key(self, tmp_path: Path):
+        """Explicitly passing error=False must never write `error: false` —
+        absent is the only spelling of 'success', per the protocol design
+        (issue #1533)."""
+        agent_channel.write_reply(
+            agent_replies_dir=tmp_path,
+            request_id="req-explicit-false",
+            text="fine",
+            in_reply_to=None,
+            error=False,
+        )
+        written = json.loads((tmp_path / "req-explicit-false.json").read_text())
+        assert "error" not in written
+
+    def test_error_type_without_error_is_written_alone(self, tmp_path: Path):
+        """error_type is an independent optional field — a caller may set
+        it without also setting error=True. No `error` key is added as a
+        side effect of setting error_type."""
+        agent_channel.write_reply(
+            agent_replies_dir=tmp_path,
+            request_id="req-hint-only",
+            text="partial result",
+            in_reply_to=None,
+            error_type="processing_failed",
+        )
+        written = json.loads((tmp_path / "req-hint-only.json").read_text())
+        assert written["error_type"] == "processing_failed"
+        assert "error" not in written
+
     def test_control_chars_round_trip_to_valid_single_line_json(self, tmp_path: Path):
         """Regression test for the reported agent-channel JSON-parse bug.
 

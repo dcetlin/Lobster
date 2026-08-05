@@ -523,6 +523,64 @@ class TestSendReplyLocalClaude:
             content = json.loads(files[0].read_text())
             assert content["text"] == "First answer (correct)."
 
+    # -- error discriminator (issue #1533) -----------------------------------
+    #
+    # send_reply(source="local-claude", error=True, error_type=...) threads
+    # through to the same single-shot reply file — not a separate envelope.
+
+    def test_error_true_is_threaded_through_to_written_reply(self, dirs):
+        outbox, sent, agent_replies = dirs
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local",
+                    "text": "The task failed after 3 retries.",
+                    "source": "local-claude",
+                    "request_id": "req-fail-1",
+                    "error": True,
+                    "error_type": "processing_failed",
+                })
+            )
+
+            content = json.loads((agent_replies / "req-fail-1.json").read_text())
+            assert content["error"] is True
+            assert content["error_type"] == "processing_failed"
+            assert content["text"] == "The task failed after 3 retries."
+
+    def test_normal_reply_has_no_error_key_when_not_requested(self, dirs):
+        """Backward-compat proof at the handle_send_reply layer: a reply
+        with no error/error_type args produces the exact same key set as
+        before this feature existed."""
+        outbox, sent, agent_replies = dirs
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local",
+                    "text": "All good.",
+                    "source": "local-claude",
+                    "request_id": "req-normal-1",
+                })
+            )
+
+            content = json.loads((agent_replies / "req-normal-1.json").read_text())
+            assert set(content.keys()) == {"request_id", "text", "ts", "in_reply_to"}
+
 
 class TestSendReplyLocalClaudeByAgentPointer:
     """agent-channel protocol v1, §3.2 — by-agent pointer mailbox.
