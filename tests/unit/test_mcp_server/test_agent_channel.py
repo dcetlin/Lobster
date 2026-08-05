@@ -468,6 +468,70 @@ class TestWriteProgress:
         assert written["pct"] == 60.0
         assert written["text"] == "running tests"
 
+    # -- capability preservation (bloom adversarial review, PR #1530) -------
+
+    def test_capabilities_present_in_a_bare_write_progress_call(self, tmp_path: Path):
+        """write_progress's own payload must carry capabilities — not just
+        write_ack's — since write_progress can be the first (and only)
+        writer of .ack.json for a given request_id in principle."""
+        claims_db = _FakeClaimsDB({"req-1": "processing"})
+
+        agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="working",
+            emit_event=_RecordingEmitter(),
+        )
+
+        written = json.loads((tmp_path / "req-1.ack.json").read_text())
+        assert written["capabilities"] == agent_channel.get_capabilities()
+
+    def test_write_progress_after_claim_does_not_drop_capabilities(self, tmp_path: Path):
+        """Regression test for bloom's finding on PR #1530: write_ack() (the
+        claim-time writer) and write_progress() (the repeatable status
+        writer) both write agent-replies/<request_id>.ack.json. Before this
+        fix, write_progress() built its payload from scratch without a
+        "capabilities" key, so the first progress update after a claim
+        silently overwrote — and lost — the capability list the ack had
+        just advertised. Assert the full sequence a real exchange follows:
+        claim (write_ack) then a status update (write_progress) still
+        leaves capabilities present and correct."""
+        claims_db = _FakeClaimsDB({"req-1": "processing"})
+
+        agent_channel.write_ack(
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            ack_text="claimed",
+            message_id="req-1",
+            emit_event=_RecordingEmitter(),
+        )
+        ack_file = tmp_path / "req-1.ack.json"
+        ack_written = json.loads(ack_file.read_text())
+        assert ack_written["capabilities"] == agent_channel.get_capabilities()
+
+        # Backdate the ack file's mtime past the debounce window (same
+        # pattern as test_second_open_write_overwrites_first_after_debounce_
+        # window above) so the write_progress call below actually lands
+        # instead of being debounced — isolates "does the progress write
+        # preserve capabilities" from unrelated debounce behavior.
+        import os
+
+        old_ts = time.time() - (agent_channel.DEBOUNCE_INTERVAL_SECONDS + 1)
+        os.utime(ack_file, (old_ts, old_ts))
+
+        agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="halfway there",
+            emit_event=_RecordingEmitter(),
+        )
+
+        progress_written = json.loads((tmp_path / "req-1.ack.json").read_text())
+        assert progress_written["capabilities"] == agent_channel.get_capabilities()
+        assert progress_written["text"] == "halfway there"
+
     # -- last-write-wins overwrite -------------------------------------------
 
     def test_second_open_write_overwrites_first_after_debounce_window(self, tmp_path: Path):

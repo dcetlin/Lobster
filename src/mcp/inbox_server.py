@@ -13,6 +13,7 @@ Provides tools for Claude Code to interact with the message queue:
 import asyncio
 import json
 import logging
+from collections import OrderedDict
 from logging.handlers import RotatingFileHandler
 import os
 import re
@@ -1539,7 +1540,22 @@ server.create_initialization_options = _create_initialization_options_advertisin
 # Sessions (keyed by HTTP mcp-session-id, or the sentinel "stdio" for the
 # single stdio-transport session) that have already received their one
 # post-connect list_changed nudge — see _notify_tools_list_changed_once().
-_tools_list_changed_notified_sessions: set[str] = set()
+#
+# Bounded FIFO, not a bare set (Fix 2, bloom adversarial review, PR #1530):
+# this daemon runs for days/weeks and accumulates one entry per distinct
+# HTTP session it has ever served a first tool call for. A bare set has no
+# upper bound, so long-running uptime turns this into a slow, unbounded
+# memory leak. FIFO eviction — not TTL — is the correct bound here: the
+# property we're protecting is "this dict can't grow past N entries," not
+# "entries expire after some meaningful age." Re-notifying a session that
+# gets evicted and later makes another tool call is harmless — the nudge
+# is best-effort and idempotent from the client's point of view (see
+# _notify_tools_list_changed_once()'s docstring) — so there is no
+# correctness cost to evicting the oldest entry once the cap is hit.
+# OrderedDict (rather than a dict relying on 3.7+ insertion order) makes
+# the FIFO-eviction intent explicit at the call site via popitem(last=False).
+_TOOLS_LIST_CHANGED_SESSIONS_MAX = 1000
+_tools_list_changed_notified_sessions: OrderedDict[str, None] = OrderedDict()
 
 
 async def _notify_tools_list_changed_once() -> None:
@@ -1553,7 +1569,12 @@ async def _notify_tools_list_changed_once() -> None:
     session_key = _get_current_http_session_id() or "stdio"
     if session_key in _tools_list_changed_notified_sessions:
         return
-    _tools_list_changed_notified_sessions.add(session_key)
+    _tools_list_changed_notified_sessions[session_key] = None
+    if len(_tools_list_changed_notified_sessions) > _TOOLS_LIST_CHANGED_SESSIONS_MAX:
+        # Evict the oldest (first-inserted) entry — bounds the dict at
+        # _TOOLS_LIST_CHANGED_SESSIONS_MAX regardless of how many distinct
+        # sessions this process serves over its lifetime.
+        _tools_list_changed_notified_sessions.popitem(last=False)
     try:
         from mcp.server.lowlevel.server import request_ctx
         session = request_ctx.get().session

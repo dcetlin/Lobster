@@ -155,3 +155,39 @@ class TestNotifyToolsListChangedOnce:
             await srv._notify_tools_list_changed_once()  # must not raise
         finally:
             request_ctx.reset(token)
+
+    @pytest.mark.asyncio
+    async def test_notified_sessions_set_stays_bounded_past_cap(self, monkeypatch):
+        """Regression test for bloom's finding on PR #1530: this daemon runs
+        for days/weeks and serves one distinct HTTP session id per
+        connection over its lifetime, so a bare, never-evicted set here was
+        an unbounded memory leak. Drive well past
+        _TOOLS_LIST_CHANGED_SESSIONS_MAX distinct sessions and confirm the
+        set never grows past the cap — FIFO eviction of the oldest entries
+        keeps it bounded regardless of how many sessions this process has
+        ever seen."""
+        fake_session = MagicMock()
+        fake_session.send_tool_list_changed = AsyncMock()
+        fake_ctx = MagicMock()
+        fake_ctx.session = fake_session
+
+        cap = srv._TOOLS_LIST_CHANGED_SESSIONS_MAX
+        num_sessions = cap + 250  # comfortably past the cap
+
+        for i in range(num_sessions):
+            monkeypatch.setattr(srv, "_get_current_http_session_id", lambda i=i: f"session-{i}")
+            token = request_ctx.set(fake_ctx)
+            try:
+                await srv._notify_tools_list_changed_once()
+            finally:
+                request_ctx.reset(token)
+            # Never exceeds the cap at any point during the run, not just
+            # at the end — a fix that only truncates after the fact could
+            # still spike unbounded mid-run.
+            assert len(srv._tools_list_changed_notified_sessions) <= cap
+
+        assert len(srv._tools_list_changed_notified_sessions) == cap
+        # FIFO, not arbitrary eviction: the earliest sessions are the ones
+        # gone, the most recent `cap` sessions are still present.
+        assert "session-0" not in srv._tools_list_changed_notified_sessions
+        assert f"session-{num_sessions - 1}" in srv._tools_list_changed_notified_sessions

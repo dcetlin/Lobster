@@ -397,12 +397,17 @@ def write_progress(
     channel protocol v1 §1, the "minimal mechanism" decision).
 
     Structured status shape (agent-channel protocol v1.1): the payload is
-    ``{"phase": ..., "pct": ..., "text": ..., ...}`` rather than a flat
-    ``{"text": ...}``. Only ``text`` (via ``status_text``) is required —
-    ``phase``/``pct`` are optional and default to ``None``/``null``. This
-    shape is shipped now, before write_progress has any live consumers, so
-    a reader never has to handle two different payload shapes for the same
-    file depending on when it was written.
+    ``{"capabilities": ..., "phase": ..., "pct": ..., "text": ..., ...}``
+    rather than a flat ``{"text": ...}``. Only ``text`` (via ``status_text``)
+    is required — ``phase``/``pct`` are optional and default to
+    ``None``/``null``. ``capabilities`` is always re-derived from
+    ``get_capabilities()`` (the same single source write_ack() reads), never
+    carried over from whatever was already on disk — see the inline comment
+    at the write site for why a progress write must never drop the
+    capability list write_ack() set at claim time. This shape is shipped
+    now, before write_progress has any live consumers, so a reader never
+    has to handle two different payload shapes for the same file depending
+    on when it was written.
 
     Three guardrails, in order:
 
@@ -509,6 +514,7 @@ def write_progress(
             ack_payload = {
                 "request_id": request_id,
                 "ack": True,
+                "capabilities": get_capabilities(),
                 "phase": phase,
                 "pct": pct,
                 "text": status_text,
@@ -522,6 +528,18 @@ def write_progress(
             # file write_ack() writes at claim time, so it must match that
             # file's compact-JSON invariant or it would re-break it on the
             # next status update.
+            #
+            # `capabilities` (bloom adversarial review, PR #1530): write_ack()
+            # and write_progress() write the SAME file
+            # (agent-replies/<request_id>.ack.json) — write_ack() sets
+            # "capabilities" at claim time, but write_progress() previously
+            # built its payload from scratch without it, so the very first
+            # progress update after a claim silently dropped the capability
+            # list the ack had just advertised. Re-deriving it here from the
+            # same get_capabilities() single source of truth (rather than,
+            # say, reading the existing file and merging) keeps both writers
+            # producing the identical payload shape for this file — a reader
+            # never has to know which of the two functions wrote it last.
             atomic_write_json(ack_path, ack_payload, indent=None)
         finally:
             fcntl.flock(lockfile.fileno(), fcntl.LOCK_UN)

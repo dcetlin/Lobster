@@ -41,7 +41,7 @@ from typing import Any
 # Protocol identity
 # ---------------------------------------------------------------------------
 
-PROTOCOL_VERSION = "1"
+PROTOCOL_VERSION = "1.1"
 
 # The only value INBOUND_ENVELOPE.source or a reply's source is ever allowed
 # to be on this channel. Everything else described in this module exists to
