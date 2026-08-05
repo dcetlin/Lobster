@@ -10,7 +10,7 @@ other or with server-side validation:
 
 - ``lobster-chat --schema`` / ``lobster-chat --help`` (the embedded block in
   ``scripts/lobster-chat.py``, between the ``BEGIN``/``END GENERATED`` markers)
-- The generated schema doc, ``docs/agent-channel-schema.md``
+- The generated schema doc, ``docs/reference/agent-channel-schema.md``
 
 Both are produced by ``scripts/generate_agent_channel_docs.py``, which imports
 this module and either writes the generated artifacts or (with ``--check``)
@@ -27,7 +27,7 @@ process talking to the VPS over SSH, with none of the rest of this repo
 installed — so it must not accidentally depend on anything that isn't
 available there.
 
-See ``docs/agent-channel.md`` for the prose walkthrough of the whole feature
+See ``docs/reference/agent-channel.md`` for the prose walkthrough of the whole feature
 and ``assessments/agent-channel-protocol-spec-2026-08-04.md`` for the
 principles this schema exists to satisfy.
 """
@@ -358,7 +358,7 @@ def json_schema() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Markdown rendering (for docs/agent-channel-schema.md and --help)
+# Markdown rendering (for docs/reference/agent-channel-schema.md and --help)
 # ---------------------------------------------------------------------------
 
 
@@ -375,7 +375,7 @@ def _render_field_table(envelope: dict[str, dict[str, Any]]) -> str:
 def render_markdown() -> str:
     """Render the full schema as a standalone Markdown document.
 
-    Written verbatim to docs/agent-channel-schema.md by
+    Written verbatim to docs/reference/agent-channel-schema.md by
     scripts/generate_agent_channel_docs.py. Audience: an external agent (or
     a person) with zero prior Lobster context.
     """
@@ -393,7 +393,7 @@ def render_markdown() -> str:
         "the single canonical schema module for this protocol — it is also what "
         "`lobster-chat --schema` prints as JSON and what `lobster-chat --help` "
         "summarizes, so all three stay in sync by construction, not by hand-edit "
-        "discipline. See `docs/agent-channel.md` for the prose walkthrough and "
+        "discipline. See `docs/reference/agent-channel.md` for the prose walkthrough and "
         "operational detail (deploy, retention, observability); this document is "
         "the wire-format reference.",
         "",
@@ -489,12 +489,12 @@ def render_cli_help_epilog() -> str:
 
     Short by design — the CLI's own --help should orient a first-time reader
     in a few lines, not reproduce the full doc. Point them at --schema and
-    docs/agent-channel-schema.md for the rest.
+    docs/reference/agent-channel-schema.md for the rest.
     """
     return "\n".join(
         [
             "Protocol summary (see --schema for the full machine-readable form,",
-            "or docs/agent-channel-schema.md in the lobster repo for the prose version):",
+            "or docs/reference/agent-channel-schema.md in the lobster repo for the prose version):",
             "",
             "  - Every request gets a unique request_id (auto-generated) that is also",
             "    its reply's filename — never reuse one across requests.",

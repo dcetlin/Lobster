@@ -44,7 +44,7 @@ subagents across versions. Both are treated identically.
 Independent of the background-intent checks above, this hook also enforces a
 structural guarantee for the agent channel (`source="local-claude"` — a local
 Claude Code session talking to the dispatcher over SSH, see
-docs/agent-channel.md and the agent-channel protocol spec).
+docs/reference/agent-channel.md and the agent-channel protocol spec).
 
 A subagent delegated to answer a `source: local-claude` request is the only
 thing carrying that request's identity (`request_id`) into the background —
@@ -209,7 +209,7 @@ if _local_claude_error:
         "  request_id: <request_id from the inbound local-claude message>\n"
         "  background: true\n"
         "  ---\n\n"
-        "See docs/agent-channel.md.",
+        "See docs/reference/agent-channel.md.",
         file=sys.stderr,
     )
     sys.exit(2)

@@ -5195,7 +5195,7 @@ PY138
     # Migration 139: Create messages/agent-replies/ directory for the agent
     # channel (source="local-claude"). handle_send_reply() in inbox_server.py
     # writes replies there for the lobster-chat CLI to poll — see
-    # docs/agent-channel.md. Requires an MCP server restart to take effect
+    # docs/reference/agent-channel.md. Requires an MCP server restart to take effect
     # (restart-mcp.sh), since inbox_server.py is a long-lived stdio process.
     local _AGENT_REPLIES_DIR="$MESSAGES_DIR/agent-replies"
     if [ ! -d "$_AGENT_REPLIES_DIR" ]; then

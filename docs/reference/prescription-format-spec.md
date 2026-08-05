@@ -453,13 +453,13 @@ See: [`docs/examples/execution-pass.json`](examples/execution-pass.json)
 To validate a prescription JSON file against the schema:
 
 ```bash
-uv run -m jsonschema -i <prescription.json> docs/prescription-format.schema.json
+uv run -m jsonschema -i <prescription.json> docs/reference/prescription-format.schema.json
 ```
 
 To validate all example files at once:
 
 ```bash
-for f in docs/examples/*.json; do uv run -m jsonschema -i "$f" docs/prescription-format.schema.json && echo "$f OK"; done
+for f in docs/examples/*.json; do uv run -m jsonschema -i "$f" docs/reference/prescription-format.schema.json && echo "$f OK"; done
 ```
 
 A valid prescription produces no output and exits 0. Any schema violation is reported

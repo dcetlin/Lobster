@@ -6,7 +6,7 @@ dispatcher. Use it to ask the dispatcher questions or hand it small tasks
 from your local machine without going through Telegram/Slack.
 
 **If you are an external agent with no other Lobster context**, you probably
-want [`docs/agent-channel-schema.md`](agent-channel-schema.md) instead of
+want [`docs/reference/agent-channel-schema.md`](agent-channel-schema.md) instead of
 this file — it's the generated wire-format reference (envelope, request_id
 rules, addressing, error/ack semantics), or run
 `uv run scripts/lobster-chat.py --schema` for the same thing as JSON with no
@@ -340,13 +340,13 @@ the timeout message — the dispatcher may still be working on it.
   `SOURCE` rather than redefining them; `src/mcp/message_types.py` imports
   `SOURCE` for `INBOX_MESSAGE_SOURCES`.
 - `scripts/generate_agent_channel_docs.py` — generates
-  `docs/agent-channel-schema.md` and the embedded schema block in
+  `docs/reference/agent-channel-schema.md` and the embedded schema block in
   `scripts/lobster-chat.py` (between its `BEGIN`/`END GENERATED SCHEMA`
   markers) from `src/protocol/agent_channel_schema.py`. Run with `--check` to
   verify the generated artifacts are still in sync (no write) — this is what
   `tests/unit/test_protocol/test_agent_channel_schema.py` calls to catch
   drift.
-- `docs/agent-channel-schema.md` — generated. The wire-format reference for
+- `docs/reference/agent-channel-schema.md` — generated. The wire-format reference for
   an external agent with no other Lobster context: envelope field tables,
   request_id rules, addressing (Dan vs. the Agent), error/ack semantics, and
   worked JSON examples. Do not hand-edit — regenerate instead.

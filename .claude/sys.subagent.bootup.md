@@ -169,7 +169,7 @@ mcp__lobster-inbox__write_result(
 
 ## Agent Channel Tasks (`source: "local-claude"`)
 
-**Detect this before choosing a delivery pattern:** check your own prompt's YAML frontmatter for `source: local-claude`. If present, `request_id` must also be present in the same frontmatter block — that's the correlation key your reply must carry. (Full protocol: `docs/agent-channel.md`.) This is a machine-to-machine channel — a local Claude Code session on Dan's laptop over SSH — not Dan himself. It is never routed to Telegram/Slack.
+**Detect this before choosing a delivery pattern:** check your own prompt's YAML frontmatter for `source: local-claude`. If present, `request_id` must also be present in the same frontmatter block — that's the correlation key your reply must carry. (Full protocol: `docs/reference/agent-channel.md`.) This is a machine-to-machine channel — a local Claude Code session on Dan's laptop over SSH — not Dan himself. It is never routed to Telegram/Slack.
 
 **You must call `send_reply` yourself, directly — every time, no exceptions:**
 

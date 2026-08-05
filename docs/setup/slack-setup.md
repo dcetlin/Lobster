@@ -35,7 +35,7 @@ Lobster uses **Socket Mode** for inbound message delivery. Three tokens are requ
 2. Choose **From a manifest**.
 3. Select the target workspace and click **Next**.
 4. In the manifest editor, select the **JSON** tab.
-5. Delete any pre-filled content and paste the entire contents of `docs/slack-app-manifest.json` from this repository.
+5. Delete any pre-filled content and paste the entire contents of `docs/setup/slack-app-manifest.json` from this repository.
 6. Click **Next**, review the summary (you should see Socket Mode enabled and the bot scopes listed), then click **Create**.
 
 You are now on the app's configuration page.
