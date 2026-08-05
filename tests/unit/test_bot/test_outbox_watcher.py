@@ -13,15 +13,24 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import asyncio
 
 
-def get_bot_module():
-    """Import bot module with required environment variables set."""
-    with patch.dict(
-        os.environ,
-        {
-            "TELEGRAM_BOT_TOKEN": "test_token",
-            "TELEGRAM_ALLOWED_USERS": "123456",
-        },
-    ):
+def get_bot_module(messages_dir=None):
+    """Import bot module with required environment variables set.
+
+    Args:
+        messages_dir: If provided, LOBSTER_MESSAGES is pointed at this directory
+            for the duration of the reload, so module-level directory constants
+            (OUTBOX_DIR, SENT_DIR, DEAD_LETTER_DIR, ...) resolve to an isolated
+            temp directory instead of the real ~/messages. Without this, tests
+            that exercise delivery-confirmation writes (SENT_DIR) would write
+            into the live production sent/ directory.
+    """
+    env = {
+        "TELEGRAM_BOT_TOKEN": "test_token",
+        "TELEGRAM_ALLOWED_USERS": "123456",
+    }
+    if messages_dir is not None:
+        env["LOBSTER_MESSAGES"] = str(messages_dir)
+    with patch.dict(os.environ, env):
         import importlib
         import src.bot.lobster_bot as bot_module
         importlib.reload(bot_module)
@@ -39,9 +48,9 @@ class TestOutboxHandler:
         return app
 
     @pytest.fixture
-    def bot_module(self):
-        """Get bot module with environment set up."""
-        return get_bot_module()
+    def bot_module(self, temp_messages_dir):
+        """Get bot module with environment set up, isolated to temp_messages_dir."""
+        return get_bot_module(messages_dir=temp_messages_dir)
 
     @pytest.mark.asyncio
     async def test_processes_reply_file(self, temp_messages_dir, mock_bot_app, bot_module):
@@ -215,8 +224,8 @@ class TestVoiceNoteHandling:
         return app
 
     @pytest.fixture
-    def bot_module(self):
-        return get_bot_module()
+    def bot_module(self, temp_messages_dir):
+        return get_bot_module(messages_dir=temp_messages_dir)
 
     @pytest.mark.asyncio
     async def test_voice_note_sent_successfully(self, tmp_path, temp_messages_dir, mock_bot_app, bot_module):
@@ -422,6 +431,232 @@ class TestVoiceNoteHandling:
             loop.close()
 
 
+class TestSentDeliveryTracking:
+    """Tests for the outbox->sent filesystem audit trail (issue #1538).
+
+    Before this, a delivered outbox file was simply deleted — the only way to
+    confirm a Telegram send had actually happened was to grep journalctl.
+    These tests verify that a confirmed delivery leaves a record in SENT_DIR
+    (mirroring the inbox/ -> processing/ -> processed/ lifecycle pattern) and
+    that failed/dropped/undeliverable replies do NOT get a false "sent" record.
+    """
+
+    @pytest.fixture
+    def mock_bot_app(self):
+        app = MagicMock()
+        app.bot.send_message = AsyncMock()
+        app.bot.send_voice = AsyncMock()
+        app.bot.send_photo = AsyncMock()
+        app.bot.send_document = AsyncMock()
+        return app
+
+    @pytest.fixture
+    def bot_module(self, temp_messages_dir):
+        return get_bot_module(messages_dir=temp_messages_dir)
+
+    @pytest.mark.asyncio
+    async def test_successful_text_delivery_recorded_in_sent_dir(
+        self, temp_messages_dir, mock_bot_app, bot_module
+    ):
+        """A confirmed text send leaves a filesystem-visible record in sent/."""
+        outbox = temp_messages_dir / "outbox"
+        sent = temp_messages_dir / "sent"
+
+        reply = {
+            "id": "reply_sent_1",
+            "chat_id": 123456,
+            "text": "Hello from Lobster!",
+            "source": "telegram",
+        }
+        reply_file = outbox / "reply_sent_1.json"
+        reply_file.write_text(json.dumps(reply))
+
+        handler = bot_module.OutboxHandler()
+        original_bot_app = bot_module.bot_app
+        bot_module.bot_app = mock_bot_app
+        loop = asyncio.new_event_loop()
+        bot_module.main_loop = loop
+
+        try:
+            await handler.process_reply(str(reply_file))
+
+            assert not reply_file.exists(), "Outbox file should be gone after delivery"
+            sent_file = sent / "reply_sent_1.json"
+            assert sent_file.exists(), "Delivered message should be recorded in sent/"
+
+            record = json.loads(sent_file.read_text())
+            assert record["chat_id"] == 123456
+            assert record["text"] == "Hello from Lobster!"
+            assert "delivered_at" in record, "sent/ record must be timestamped"
+        finally:
+            bot_module.bot_app = original_bot_app
+            loop.close()
+
+    @pytest.mark.asyncio
+    async def test_successful_voice_delivery_recorded_in_sent_dir(
+        self, tmp_path, temp_messages_dir, mock_bot_app, bot_module
+    ):
+        """A confirmed voice-note send leaves a record in sent/."""
+        outbox = temp_messages_dir / "outbox"
+        sent = temp_messages_dir / "sent"
+        ogg_file = tmp_path / "voice.ogg"
+        ogg_file.write_bytes(b"fake ogg data")
+
+        reply = {
+            "id": "voice_sent_1",
+            "chat_id": 123456,
+            "type": "voice",
+            "voice_path": str(ogg_file),
+            "text": "Hello in voice",
+        }
+        reply_file = outbox / "voice_sent_1.json"
+        reply_file.write_text(json.dumps(reply))
+
+        handler = bot_module.OutboxHandler()
+        original_bot_app = bot_module.bot_app
+        bot_module.bot_app = mock_bot_app
+        loop = asyncio.new_event_loop()
+        bot_module.main_loop = loop
+
+        try:
+            await handler.process_reply(str(reply_file))
+
+            assert not reply_file.exists()
+            sent_file = sent / "voice_sent_1.json"
+            assert sent_file.exists(), "Delivered voice note should be recorded in sent/"
+            record = json.loads(sent_file.read_text())
+            assert record["chat_id"] == 123456
+            assert "delivered_at" in record
+        finally:
+            bot_module.bot_app = original_bot_app
+            loop.close()
+
+    @pytest.mark.asyncio
+    async def test_successful_photo_delivery_recorded_in_sent_dir(
+        self, temp_messages_dir, mock_bot_app, bot_module
+    ):
+        """A confirmed photo send leaves a record in sent/."""
+        outbox = temp_messages_dir / "outbox"
+        sent = temp_messages_dir / "sent"
+
+        reply = {
+            "id": "photo_sent_1",
+            "chat_id": 123456,
+            "type": "photo",
+            "photo_url": "https://example.com/image.png",
+        }
+        reply_file = outbox / "photo_sent_1.json"
+        reply_file.write_text(json.dumps(reply))
+
+        handler = bot_module.OutboxHandler()
+        original_bot_app = bot_module.bot_app
+        bot_module.bot_app = mock_bot_app
+        loop = asyncio.new_event_loop()
+        bot_module.main_loop = loop
+
+        try:
+            await handler.process_reply(str(reply_file))
+
+            assert not reply_file.exists()
+            sent_file = sent / "photo_sent_1.json"
+            assert sent_file.exists(), "Delivered photo should be recorded in sent/"
+        finally:
+            bot_module.bot_app = original_bot_app
+            loop.close()
+
+    @pytest.mark.asyncio
+    async def test_successful_document_delivery_recorded_in_sent_dir(
+        self, tmp_path, temp_messages_dir, mock_bot_app, bot_module
+    ):
+        """A confirmed document send leaves a record in sent/."""
+        outbox = temp_messages_dir / "outbox"
+        sent = temp_messages_dir / "sent"
+        doc_file = tmp_path / "report.pdf"
+        doc_file.write_bytes(b"fake pdf data")
+
+        reply = {
+            "id": "doc_sent_1",
+            "chat_id": 123456,
+            "type": "document",
+            "document_path": str(doc_file),
+            "filename": "report.pdf",
+        }
+        reply_file = outbox / "doc_sent_1.json"
+        reply_file.write_text(json.dumps(reply))
+
+        handler = bot_module.OutboxHandler()
+        original_bot_app = bot_module.bot_app
+        bot_module.bot_app = mock_bot_app
+        loop = asyncio.new_event_loop()
+        bot_module.main_loop = loop
+
+        try:
+            await handler.process_reply(str(reply_file))
+
+            assert not reply_file.exists()
+            sent_file = sent / "doc_sent_1.json"
+            assert sent_file.exists(), "Delivered document should be recorded in sent/"
+        finally:
+            bot_module.bot_app = original_bot_app
+            loop.close()
+
+    @pytest.mark.asyncio
+    async def test_dropped_reply_not_recorded_as_sent(
+        self, temp_messages_dir, mock_bot_app, bot_module
+    ):
+        """A reply that was never deliverable (missing chat_id) must NOT appear in sent/ —
+        recording it would create a false audit trail claiming delivery happened."""
+        outbox = temp_messages_dir / "outbox"
+        sent = temp_messages_dir / "sent"
+
+        reply = {"id": "never_sent_1", "text": "Hello!"}  # no chat_id
+        reply_file = outbox / "never_sent_1.json"
+        reply_file.write_text(json.dumps(reply))
+
+        handler = bot_module.OutboxHandler()
+        original_bot_app = bot_module.bot_app
+        bot_module.bot_app = mock_bot_app
+        loop = asyncio.new_event_loop()
+        bot_module.main_loop = loop
+
+        try:
+            await handler.process_reply(str(reply_file))
+
+            assert not reply_file.exists()
+            assert not (sent / "never_sent_1.json").exists(), (
+                "A message that was never delivered must not be recorded in sent/"
+            )
+        finally:
+            bot_module.bot_app = original_bot_app
+            loop.close()
+
+    @pytest.mark.asyncio
+    async def test_invalid_json_not_recorded_as_sent(
+        self, temp_messages_dir, mock_bot_app, bot_module
+    ):
+        """A malformed outbox file is dropped, not recorded as delivered."""
+        outbox = temp_messages_dir / "outbox"
+        sent = temp_messages_dir / "sent"
+
+        reply_file = outbox / "bad_json_1.json"
+        reply_file.write_text("not valid json {{{")
+
+        handler = bot_module.OutboxHandler()
+        original_bot_app = bot_module.bot_app
+        bot_module.bot_app = mock_bot_app
+        loop = asyncio.new_event_loop()
+        bot_module.main_loop = loop
+
+        try:
+            await handler.process_reply(str(reply_file))
+
+            assert not reply_file.exists()
+            assert not (sent / "bad_json_1.json").exists()
+        finally:
+            bot_module.bot_app = original_bot_app
+            loop.close()
+
+
 class TestSplitMessage:
     """Tests for the split_message function.
 
@@ -622,8 +857,8 @@ class TestLongMessageSending:
         return app
 
     @pytest.fixture
-    def bot_module(self):
-        return get_bot_module()
+    def bot_module(self, temp_messages_dir):
+        return get_bot_module(messages_dir=temp_messages_dir)
 
     @pytest.mark.asyncio
     async def test_long_message_sends_multiple_chunks(
