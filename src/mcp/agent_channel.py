@@ -13,13 +13,23 @@ tail. Both are genuinely shared infrastructure that every source (including
 this one) goes through — pulling them in here would just relocate the
 "is this local-claude?" branch into a different file rather than dissolve
 it, and would make this module need to know about Telegram/Slack
-mark_processed semantics it has no business knowing about. See
-``~/dancetlin-infra/agent-chat/lobster-003.md`` for the agreed design and
-``glyph-005.md`` / ``glyph-006.md`` for the structural review that prompted
-this extraction. Pure shape change — no behavior change; every correctness
-property from the agent-channel-hardening branch (single-shot atomic slot,
-fail-closed source check, source-aware stale timeout, per-request identity,
-ack != answer, request_id sanitization, audit events) is preserved exactly.
+mark_processed semantics it has no business knowing about.
+
+The agent-channel protocol itself (wire format, envelope shape, source
+value) is owned by ``src/protocol/agent_channel_schema.py`` — the single
+source of truth this module imports ``SOURCE`` from rather than redefining.
+A round trip looks like: ``scripts/lobster-chat.py`` writes a request
+envelope to ``~/messages/inbox/<request_id>.json`` over SSH; the dispatcher
+claims and acks it (``handle_claim_and_ack``, audited via
+``emit_request_audit`` below); a subagent answers by calling ``send_reply``
+with ``source="local-claude"``, which lands here in ``write_reply`` and
+occupies the single-shot slot at
+``~/messages/agent-replies/<request_id>.json``; ``lobster-chat.py`` polls
+that path for the reply. Pure shape change — no behavior change; every
+correctness property from the agent-channel-hardening branch (single-shot
+atomic slot, fail-closed source check, source-aware stale timeout,
+per-request identity, ack != answer, request_id sanitization, audit events)
+is preserved exactly.
 
 Design constraint: functions here take their dependencies (paths, the event
 emitter) as explicit parameters rather than importing them from
