@@ -779,6 +779,75 @@ class TestSendReplyLocalClaudeByAgentPointer:
         # No pointer was written (the failure was swallowed, not silently succeeded).
         assert not (agent_replies / "by-agent").exists()
 
+    def test_request_id_fallback_writes_pointer_when_message_id_absent(self, dirs):
+        """Real-world subagent call pattern (.claude/sys.subagent.bootup.md,
+        "Agent Channel Tasks"): send_reply(chat_id, text, source="local-claude",
+        request_id=..., task_id=...) — no message_id is ever passed. By protocol
+        convention, message_id == request_id for this channel (both are the
+        inbound envelope's `id`), so handle_send_reply must fall back to looking
+        the origin file up by request_id in order to recover the `agent` label
+        and still write the by-agent/<slug>/ pointer."""
+        outbox, sent, agent_replies, processing, inbox = dirs
+        self._write_processing_message(processing, "req-bloom-nomid", agent="bloom")
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "All green.",
+                    "source": "local-claude",
+                    "request_id": "req-bloom-nomid",
+                    # message_id intentionally omitted — matches the documented
+                    # subagent call pattern.
+                })
+            )
+
+        assert "Reply written" in result[0].text
+        pointer = agent_replies / "by-agent" / "bloom" / "req-bloom-nomid"
+        assert pointer.exists()
+        assert pointer.stat().st_size == 0
+
+    def test_request_id_fallback_no_pointer_when_agent_field_absent(self, dirs):
+        """Negative case for the request_id fallback: when message_id is
+        omitted AND the origin envelope carries no `agent` field, the reply
+        must still land (soft-fail cleanly) with no pointer written."""
+        outbox, sent, agent_replies, processing, inbox = dirs
+        self._write_processing_message(processing, "req-anon-nomid", agent=None)
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "All green.",
+                    "source": "local-claude",
+                    "request_id": "req-anon-nomid",
+                })
+            )
+
+        assert "Reply written" in result[0].text
+        assert (agent_replies / "req-anon-nomid.json").exists()
+        assert not (agent_replies / "by-agent").exists()
+
 
 class TestAutoThreading:
     """Tests for automatic reply threading (issue #330).

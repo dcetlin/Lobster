@@ -5484,6 +5484,7 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
     origin_found: Path | None = None
     origin_msg: dict = {}
     message_id_arg = args.get("message_id")
+    is_local_claude = source == agent_channel.SOURCE
     if message_id_arg:
         try:
             _mid_for_check = validate_message_id(message_id_arg)
@@ -5513,9 +5514,39 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
                     "message's source (fail-closed, per agent-channel protocol spec)."
                 ),
             )]
+    elif is_local_claude:
+        # local-claude callers conventionally never pass message_id — the
+        # documented subagent call pattern (.claude/sys.subagent.bootup.md,
+        # "Agent Channel Tasks") is send_reply(chat_id, text,
+        # source="local-claude", request_id=..., task_id=...). Without this
+        # fallback, origin_msg stays empty for every local-claude reply, the
+        # `agent` label below is never recovered, and write_pointer() (the
+        # by-agent/<slug>/ durability mailbox, agent-channel protocol v1
+        # §3.2) silently never fires.
+        #
+        # By protocol convention, message_id == request_id for this channel
+        # (both are the inbound envelope's `id`; see the same convention
+        # documented in agent_channel.write_progress's docstring), so
+        # request_id is a valid stand-in key for the same origin-file lookup
+        # used above. request_id is already required and sanitized by
+        # validate_send_reply_args() for source="local-claude" by the time
+        # this function reaches here, so no extra validation is needed. No
+        # source-mismatch check applies here — source is already known to be
+        # "local-claude" by definition of this branch.
+        try:
+            _request_id_for_lookup = args.get("request_id")
+            if _request_id_for_lookup:
+                origin_found = (
+                    _find_message_file(PROCESSING_DIR, _request_id_for_lookup)
+                    or _find_message_file(INBOX_DIR, _request_id_for_lookup)
+                )
+                if origin_found:
+                    origin_msg = json.loads(origin_found.read_text())
+        except Exception:
+            origin_found = None
+            origin_msg = {}
 
     reply_id = f"{int(time.time() * 1000)}_{source}"
-    is_local_claude = source == agent_channel.SOURCE
     # Only meaningful when is_local_claude; tracks whether *this* call won the
     # single-shot reply slot (see below) so the tail code and final return can
     # skip reply-specific bookkeeping when it didn't.
