@@ -79,6 +79,57 @@ class TestMarkProcessing:
             with pytest.raises(ValidationError):
                 asyncio.run(handle_mark_processing({}))
 
+    def test_refuses_local_claude_source(self, setup_dirs, message_generator):
+        """mark_processing must refuse source='local-claude' messages (issue #1531):
+        claim_and_ack is the sole claim path for the agent channel. The message
+        must be left untouched in inbox/ — no partial claim, no filesystem move."""
+        inbox, processing = setup_dirs
+
+        msg = message_generator.generate_text_message(source="local-claude")
+        msg["request_id"] = msg["id"]
+        msg_id = msg["id"]
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_mark_processing
+
+            result = asyncio.run(handle_mark_processing({"message_id": msg_id}))
+
+            assert "not supported" in result[0].text.lower()
+            assert "claim_and_ack" in result[0].text
+            # Left untouched in inbox/ — no partial claim, no move.
+            assert (inbox / f"{msg_id}.json").exists()
+            assert not (processing / f"{msg_id}.json").exists()
+
+    def test_still_claims_non_local_claude_sources(self, setup_dirs, message_generator):
+        """Regression guard: the source-branch gate must not widen to other
+        sources — mark_processing remains fully supported for human channels."""
+        inbox, processing = setup_dirs
+
+        for source in ("telegram", "slack", "sms"):
+            msg = message_generator.generate_text_message(source=source)
+            msg_id = msg["id"]
+            (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+            with patch.multiple(
+                "src.mcp.inbox_server",
+                INBOX_DIR=inbox,
+                PROCESSING_DIR=processing,
+            ):
+                import asyncio
+                from src.mcp.inbox_server import handle_mark_processing
+
+                result = asyncio.run(handle_mark_processing({"message_id": msg_id}))
+
+                assert "claimed" in result[0].text.lower()
+                assert not (inbox / f"{msg_id}.json").exists()
+                assert (processing / f"{msg_id}.json").exists()
+
 
 class TestMarkProcessedUpdated:
     """Tests for updated mark_processed that checks processing/ first."""

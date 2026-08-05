@@ -120,6 +120,33 @@ to a subagent per the usual 7-second rule, same as any other message type).
 The reply must **never** be sent via `source="telegram"` — that would leak
 agent-channel traffic to Dan's phone.
 
+### Claiming a `local-claude` message
+
+`claim_and_ack` is the **sole** claim path for this source (issue #1531).
+`mark_processing` — the claim tool used for every other source — is refused
+server-side for `source="local-claude"`: `handle_mark_processing` checks the
+message's `source` field before attempting the atomic claim, and if it is
+`agent_channel.SOURCE`, returns an error and leaves the message untouched in
+`inbox/` rather than moving it to `processing/`. This is enforced in
+`src/mcp/inbox_server.py::handle_mark_processing`, not just documented here
+or in the dispatcher's bootup doc — a caller cannot claim this channel's
+traffic through the wrong tool even under context pressure.
+
+The reason `claim_and_ack` is required rather than optional: it claims the
+message and writes the required ack (`agent-replies/<request_id>.ack.json`,
+including the capability advertisement — see "Message schema" above) in one
+atomic step. `mark_processing` has no equivalent ack step, so a message
+claimed through it would silently go without an ack until some unrelated
+code path (e.g. a later `write_progress` call) happened to write one.
+
+This applies everywhere a `local-claude` message is claimed, including the
+dispatcher's startup batch-claim (recovering messages left in `inbox/` across
+a restart) — not just the steady-state delegation path below. The dispatcher
+claims at the same point in the startup sequence `mark_processing` used to,
+so this closes the divergence without widening any unclaimed window: a
+`local-claude` message is claimed exactly once, atomically, the first time
+the dispatcher sees it.
+
 ### Delegating to a subagent
 
 `write_result`'s dispatcher-relay path does not carry `request_id` — only the

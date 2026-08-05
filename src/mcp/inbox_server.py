@@ -2069,7 +2069,13 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="mark_processing",
-            description="Claim a message for processing by moving it from inbox/ to processing/. Call this before starting work on a message to prevent reprocessing.",
+            description=(
+                "Claim a message for processing by moving it from inbox/ to processing/. Call this "
+                "before starting work on a message to prevent reprocessing. "
+                "Not supported for source='local-claude' (the agent channel) — refused with an error "
+                "and the message is left untouched in inbox/. Use claim_and_ack instead for that "
+                "source; it claims the message and writes the required ack in one atomic step."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -6082,7 +6088,14 @@ async def handle_mark_processed(args: dict) -> list[TextContent]:
 
 
 async def handle_mark_processing(args: dict) -> list[TextContent]:
-    """Move message from inbox to processing to claim it."""
+    """Move message from inbox to processing to claim it.
+
+    Not supported for source="local-claude" (agent_channel.SOURCE) — refused
+    before the atomic claim, message left untouched in inbox/. claim_and_ack
+    is the sole claim path for the agent channel (issue #1531): it claims
+    the message and writes the required ack in the same atomic step, which
+    this function has no equivalent for.
+    """
     message_id = validate_message_id(args.get("message_id", ""))
 
     found = _find_message_file(INBOX_DIR, message_id)
@@ -6098,6 +6111,39 @@ async def handle_mark_processing(args: dict) -> list[TextContent]:
     # Normalize type aliases to canonical names before any routing logic sees
     # the message (issue #635). This is the single ingest normalization point.
     msg_data = normalize_message_type(msg_data)
+
+    # Deprecation gate (issue #1531): mark_processing must never claim a
+    # source="local-claude" message — claim_and_ack is the sole claim path
+    # for the agent channel. claim_and_ack claims AND writes the required
+    # ack (agent-replies/<request_id>.ack.json, including the capability
+    # advertisement — see agent_channel.write_ack()) in one atomic step;
+    # mark_processing has no ack step at all, so a local-claude message
+    # claimed through it would silently skip that contract until some other
+    # code path (e.g. write_progress) happened to write the ack
+    # incidentally. Refusing here — server-side, before the atomic claim —
+    # is fail-closed and structural, matching claim_and_ack's own
+    # fail-closed source-mismatch check below, rather than relying solely
+    # on the dispatcher's (LLM) bootup-doc instructions, which can be
+    # missed under context pressure. The message is left untouched in
+    # inbox/: no partial claim, no filesystem move, no widening of any
+    # unclaimed race window relative to today — the caller must retry with
+    # claim_and_ack instead.
+    msg_source_pre_claim = msg_data.get("source", "")
+    if msg_source_pre_claim == agent_channel.SOURCE:
+        log.warning(
+            f"mark_processing: refused for source={agent_channel.SOURCE!r} "
+            f"(message_id={message_id}) — use claim_and_ack instead, the sole "
+            "claim path for the agent channel (issue #1531)."
+        )
+        return [TextContent(
+            type="text",
+            text=(
+                f"Error: mark_processing is not supported for source={agent_channel.SOURCE!r}. "
+                "Use claim_and_ack instead — it claims the message and writes the "
+                "required ack (agent-replies/<request_id>.ack.json) atomically. "
+                f"Message {message_id} was left untouched in inbox/."
+            ),
+        )]
 
     # Atomic claim via SQLite INSERT OR FAIL (issue #1360).
     # This is the claim gate: one caller wins, all others get already_claimed.

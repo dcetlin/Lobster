@@ -54,7 +54,9 @@ When you first start (or after reading this file), follow these steps:
 
 3. **Claim any pending user messages immediately** (stops health-check staleness clock):
     - Call `check_inbox()` to get waiting messages
-    - For each non-system message (`chat_id != 0` and `source != "system"`): call `mark_processing(message_id)`
+    - For each non-system message (`chat_id != 0` and `source != "system"`), branch on `source` (issue #1531 — `mark_processing` is refused server-side for `source == "local-claude"`, so this branch is required, not optional):
+      - `source == "local-claude"` → call `claim_and_ack(message_id, ack_text="Recovered after restart — processing your request.", chat_id=msg["chat_id"], source="local-claude", request_id=msg["request_id"])`. This claims the message AND writes the ack (`agent-replies/<request_id>.ack.json`) in one atomic step, at the same point in the startup sequence `mark_processing` used to claim it — no widening of any unclaimed window.
+      - all other sources → call `mark_processing(message_id)` unchanged.
     - Do NOT process or reply yet — they will be returned by `wait_for_messages()` at step 54. Spawn the `compact-catchup` agent in the background with `task_id: startup-catchup` and `chat_id: 0`. See agent definition at `.claude/agents/compact-catchup.md` for the full prompt — pass it with `task_id: startup-catchup` instead of `compact-catchup`. **Never do catchup inline — it violates the 7-second rule.**
 5. Call `wait_for_messages()` to start listening.
 6. **Triage before acting on queued messages at startup**: read ALL queued messages first, identify anything risky (e.g. large audio transcription that could cause OOM), skip or defer those, then process safe ones.
@@ -178,6 +180,8 @@ Agent registration is fully automatic — a PostToolUse hook fires after each Ta
 3. ... spawn subagent ...
 4. mark_processed(message_id)
 ```
+
+**Not valid for `source == "local-claude"`** (issue #1531): `mark_processing` is refused server-side for this source — it returns an error and leaves the message untouched in `inbox/`. `claim_and_ack` is the sole claim path for the agent channel, ack included, even when no ack text is strictly needed; pass a short generic `ack_text` (e.g. `"On it."`) rather than falling back to this pattern.
 
 Use `get_active_sessions` to answer "what agents are running?" at any time — accurate even across restarts.
 
@@ -1011,6 +1015,8 @@ A local Claude Code session (on Dan's laptop, over SSH) talking to the dispatche
 - `source == "local-claude"` on the inbox message
 - `request_id` present (required — every reply for this source must include it)
 - `chat_id` is required by the schema but is NOT used for routing on this channel; routing is by `request_id` only
+
+**`claim_and_ack` is the sole claim path for this source (issue #1531):** `mark_processing` is refused server-side for `source == "local-claude"` — it returns an error and leaves the message untouched in `inbox/` rather than claiming it. This applies everywhere a claim happens for this source, including the startup batch-claim step (see "Startup Behavior" step 3) — never call bare `mark_processing` against a local-claude message, at startup or otherwise. `claim_and_ack` claims the message AND writes the required ack (with capability advertisement) in the same atomic step, so there is no unclaimed window and no gap where the ack is missing.
 
 **Direct reply (preferred — no subagent needed for fast answers):**
 ```
