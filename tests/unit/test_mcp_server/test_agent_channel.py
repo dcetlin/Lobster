@@ -474,11 +474,22 @@ class TestWriteProgress:
         assert not (tmp_path / "req-1.ack.json").exists()
         assert emitter.calls[-1]["payload"]["outcome"] == "already_complete"
 
-    def test_message_after_complete_race_is_closed_by_the_lock(self, tmp_path: Path, monkeypatch):
+    def test_message_after_complete_race_is_closed_against_concurrent_write_progress(
+        self, tmp_path: Path, monkeypatch
+    ):
         """The terminal-file check and the write happen inside ONE
         flock-guarded critical section — simulate a terminal reply landing
         *during* the check by having reply_path.exists() flip from False to
-        True mid-call, and confirm no ack write follows once it's seen."""
+        True mid-call, and confirm no ack write follows once it's seen.
+
+        Scope note: this only proves the guard is race-free with respect to
+        write_progress's own check-then-write. It does NOT prove the race is
+        closed against write_reply() (the real terminal writer), which holds
+        no lock at all and is not coordinated with write_progress's flock —
+        see the write_progress docstring's "IMPORTANT SCOPE LIMIT" note.
+        That residual write_progress-vs-write_reply window is a documented,
+        accepted limitation, not something this test (or the flock) closes.
+        """
         claims_db = _FakeClaimsDB({"req-1": "processing"})
         emitter = _RecordingEmitter()
 

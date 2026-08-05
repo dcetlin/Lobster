@@ -327,8 +327,27 @@ def write_progress(
        as the claims_db lookup key.
     2. Message-after-complete guard (§2.5) and debounce (§6 dial 5) are both
        evaluated inside ONE flock-guarded critical section scoped to
-       request_id — not two separate filesystem operations — so a late call
-       can never land between "checked, terminal file absent" and "wrote."
+       request_id — not two separate filesystem operations — so a late
+       write_progress call can never land between "checked, terminal file
+       absent" and "wrote" *relative to another write_progress call for the
+       same request_id*. IMPORTANT SCOPE LIMIT: this lock is private to
+       write_progress (`.{request_id}.progress.lock`) — write_reply() (the
+       terminal-reply writer, above) does not take it and is not aware of
+       it. So this guard serializes write_progress against itself; it does
+       NOT make the terminal reply's arrival atomic with respect to this
+       check. A write_progress call can still pass the "terminal file
+       absent" check and then have write_reply() land — completely
+       unlocked — before this call's own atomic_write_json finishes,
+       leaving a stale status in .ack.json after the real answer already
+       exists. That residual window is accepted, not closed: .ack.json is
+       non-authoritative once the terminal reply exists — clients MUST
+       treat agent-replies/<request_id>.json (the reply file) as the sole
+       completion signal, never .ack.json. See
+       ~/lobster-workspace/assessments/agent-channel-protocol-proposal.md
+       for the accepted-risk writeup; closing this fully would require
+       write_reply() to take the same flock, which is a change to the hot
+       terminal-writer path shared by every reply on this channel and is
+       deliberately out of scope here.
     3. Within that same critical section: if agent-replies/<request_id>.json
        (the terminal reply) already exists, refuse (no-op, logged) — the
        exchange is COMPLETE and no further status write is meaningful.
@@ -395,7 +414,15 @@ def write_progress(
                 "text": status_text,
                 "ts": datetime.now(timezone.utc).isoformat(),
             }
-            atomic_write_json(ack_path, ack_payload)
+            # Written compact (indent=None, single line), not pretty-printed —
+            # same reasoning as write_ack/write_reply's compact-JSON fix
+            # (PR #1519): .ack.json is a machine-polled API contract, and a
+            # pretty-printed multi-line payload silently breaks any reader
+            # that isn't fully JSON-aware. write_progress overwrites the same
+            # file write_ack() writes at claim time, so it must match that
+            # file's compact-JSON invariant or it would re-break it on the
+            # next status update.
+            atomic_write_json(ack_path, ack_payload, indent=None)
         finally:
             fcntl.flock(lockfile.fileno(), fcntl.LOCK_UN)
 

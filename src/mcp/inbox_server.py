@@ -5548,6 +5548,15 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
         if reply_slot_created:
             _agent_label = origin_msg.get("agent")
             if _agent_label:
+                # Broad `except Exception` (not just ValidationError) is
+                # deliberate: this guards both sanitize_agent_slug's
+                # validation failures AND write_pointer's filesystem calls
+                # (mkdir/touch), which can raise OSError (e.g. disk full,
+                # permission error, ENOSPC) that has nothing to do with
+                # input validation. The pointer mailbox is a discovery
+                # convenience, never load-bearing for the reply itself —
+                # any failure here must never skip mark_processed, dedup
+                # tracking, or audit emission, nor block the reply path.
                 try:
                     _agent_slug = sanitize_agent_slug(_agent_label)
                     agent_channel.write_pointer(
@@ -5555,12 +5564,12 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
                         agent_slug=_agent_slug,
                         request_id=request_id,
                     )
-                except ValidationError as _slug_err:
+                except Exception as _slug_err:
                     log.warning(
                         f"send_reply(local-claude): agent={_agent_label!r} on "
-                        f"request_id={request_id!r} failed slug sanitization "
-                        f"({_slug_err}) — skipping by-agent pointer write "
-                        "(fail-closed; the terminal reply itself is unaffected)."
+                        f"request_id={request_id!r} failed by-agent pointer "
+                        f"write ({_slug_err}) — skipping (fail-closed; the "
+                        "terminal reply itself is unaffected)."
                     )
     else:
         # Create reply file in outbox

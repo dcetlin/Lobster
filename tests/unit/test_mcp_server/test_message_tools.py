@@ -730,6 +730,55 @@ class TestSendReplyLocalClaudeByAgentPointer:
         assert list(pointer_dir.iterdir()) == [pointer_dir / "req-race-agent"]
         assert (pointer_dir / "req-race-agent").stat().st_mtime == before
 
+    def test_write_pointer_generic_exception_never_blocks_reply_path(self, dirs, temp_messages_dir: Path):
+        """A non-ValidationError failure from write_pointer (e.g. OSError from
+        mkdir/touch — disk full, permission error) must never skip
+        mark_processed, dedup tracking, or audit emission, nor block the
+        reply path. The pointer mailbox is a discovery convenience, not
+        load-bearing — this is the same guarantee as the invalid-agent-value
+        case above, but for filesystem failures rather than validation
+        failures, which only a broad `except Exception` around write_pointer
+        (not `except ValidationError`) can catch."""
+        outbox, sent, agent_replies, processing, inbox = dirs
+        processed = temp_messages_dir / "processed"
+        processed.mkdir(parents=True, exist_ok=True)
+        self._write_processing_message(processing, "req-oserror-agent", agent="bloom")
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            PROCESSED_DIR=processed,
+            INBOX_DIR=inbox,
+        ), patch(
+            "src.mcp.inbox_server.agent_channel.write_pointer",
+            side_effect=OSError("simulated ENOSPC from mkdir/touch"),
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "All green.",
+                    "source": "local-claude",
+                    "request_id": "req-oserror-agent",
+                    "message_id": "req-oserror-agent",
+                })
+            )
+
+        # Reply path completed: terminal reply written, response reports success.
+        assert "Reply written" in result[0].text
+        assert (agent_replies / "req-oserror-agent.json").exists()
+        # mark_processed still ran despite the write_pointer failure.
+        assert "marked processed" in result[0].text
+        assert not (processing / "req-oserror-agent.json").exists()
+        assert (processed / "req-oserror-agent.json").exists()
+        # No pointer was written (the failure was swallowed, not silently succeeded).
+        assert not (agent_replies / "by-agent").exists()
+
 
 class TestAutoThreading:
     """Tests for automatic reply threading (issue #330).
