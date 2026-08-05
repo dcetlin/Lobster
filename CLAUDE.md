@@ -355,3 +355,14 @@ Always use the safe wrapper script instead:
 ```
 
 This script writes a warning to the inbox before restarting, giving the dispatcher a chance to see the notification. Combined with the session-lost-reminder written on server startup (Fix 1), the dispatcher has two opportunities to receive recovery guidance.
+
+## Dispatcher CLI Restart — IMPORTANT
+
+`restart-mcp.sh` restarts only the **MCP server** (`lobster-mcp-local`), NOT the dispatcher CLI — they are separate processes. Restarting the MCP server does **not** refresh the dispatcher's tool-discovery cache or re-read bootup docs. So after a deploy that **adds or changes MCP tools**, the running dispatcher won't see them until the **CLI itself** is bounced — and you should verify a new tool is actually *callable* post-deploy (via ToolSearch), not just that the code merged.
+
+Safe dispatcher refresh (graceful, auto-respawns a fresh session):
+```bash
+PID=$(cat ~/messages/config/dispatcher.pid)
+kill -0 "$PID" && kill -TERM "$PID"   # kill -0 first — skip if already gone
+```
+`lobster-claude.service` (systemd) + `scripts/claude-persistent.sh` relaunch a brand-new `claude` session (never `--continue`), so bootup docs are re-read and the tool cache rebuilds. Same pattern `scripts/health-check-v3.sh:check_session_age()` uses for ~2h session rotation. Do **not** use `tmux kill-session` (no respawn) or `systemctl restart lobster-claude` (hard-restart escalation) for a routine refresh.
