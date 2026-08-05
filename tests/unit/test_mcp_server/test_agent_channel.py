@@ -236,6 +236,9 @@ class TestWriteAck:
         assert written == {
             "request_id": "req-1",
             "ack": True,
+            "capabilities": list(agent_channel.CAPABILITIES),
+            "phase": None,
+            "pct": None,
             "text": "working on it",
             "ts": written["ts"],
         }
@@ -253,7 +256,13 @@ class TestWriteAck:
         }
         assert emitter.calls[0]["severity"] == "info"
 
-    def test_write_failure_returns_warning_and_emits_warn_severity(self, tmp_path: Path, monkeypatch):
+    def test_write_failure_returns_warning_and_escalates_to_error_severity(self, tmp_path: Path, monkeypatch):
+        """Refinement 2 (agent-channel protocol v1.1): the claim must still
+        succeed when the ack write fails (this function raises nothing —
+        handle_claim_and_ack's move to processing/ already happened before
+        write_ack was ever called), but the failure must be LOUD: escalated
+        to severity="error" (tracked in the event bus's errors_last_1h
+        metric) rather than the "warn" this used to emit silently."""
         emitter = _RecordingEmitter()
 
         def _boom(path, data, **kwargs):
@@ -268,15 +277,66 @@ class TestWriteAck:
             message_id="msg-2",
             emit_event=emitter,
         )
+        # Claim-level outcome: still a "claimed, but ack failed" response,
+        # never an exception — the claim itself is never rolled back.
         assert "Warning: message claimed but local-claude ack write failed" in response
         assert "msg-2" in response
         assert "remains in processing/" in response
 
         assert len(emitter.calls) == 1
         assert emitter.calls[0]["event_type"] == "agent_channel.ack"
-        assert emitter.calls[0]["severity"] == "warn"
+        assert emitter.calls[0]["severity"] == "error"
         assert emitter.calls[0]["payload"]["error"] == "disk full"
+        assert emitter.calls[0]["payload"]["request_id"] == "req-2"
         assert not (tmp_path / "req-2.ack.json").exists()
+
+    def test_write_failure_logs_error_with_request_id(self, tmp_path: Path, monkeypatch, caplog):
+        """The request_id must be greppable/correlatable in the log line
+        itself, not only in the (separately-consumed) audit event payload."""
+        import logging
+
+        def _boom(path, data, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(agent_channel, "atomic_write_json", _boom)
+
+        with caplog.at_level(logging.ERROR, logger=agent_channel.log.name):
+            agent_channel.write_ack(
+                agent_replies_dir=tmp_path,
+                request_id="req-3",
+                ack_text="ack text",
+                message_id="msg-3",
+                emit_event=_RecordingEmitter(),
+            )
+
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(error_records) == 1
+        assert "req-3" in error_records[0].message
+
+    def test_capabilities_are_present_and_derived_from_get_capabilities(self, tmp_path: Path):
+        """Refinement 1 (agent-channel protocol v1.1): the ack advertises
+        what this server build actually supports, via the single source-of-
+        truth get_capabilities() — not a literal hardcoded at the call site."""
+        response = agent_channel.write_ack(
+            agent_replies_dir=tmp_path,
+            request_id="req-4",
+            ack_text="working on it",
+            message_id="msg-4",
+            emit_event=_RecordingEmitter(),
+        )
+        written = json.loads((tmp_path / "req-4.ack.json").read_text())
+        assert written["capabilities"] == agent_channel.get_capabilities()
+        assert "write_progress" in written["capabilities"]
+        assert "Claimed and acked (local-claude)" in response
+
+    def test_get_capabilities_returns_a_fresh_list_each_call(self):
+        """A caller mutating the returned list must never corrupt the
+        module's own CAPABILITIES constant — get_capabilities() must copy,
+        not hand out the tuple's own backing list/reference."""
+        a = agent_channel.get_capabilities()
+        a.append("not-a-real-capability")
+        b = agent_channel.get_capabilities()
+        assert "not-a-real-capability" not in b
 
 
 class TestWriteProgress:
@@ -367,6 +427,110 @@ class TestWriteProgress:
         assert emitter.calls[-1]["event_type"] == "agent_channel.progress"
         assert emitter.calls[-1]["severity"] == "info"
         assert emitter.calls[-1]["payload"]["outcome"] == "written"
+
+    # -- Structured status shape (agent-channel protocol v1.1) --------------
+
+    def test_status_text_only_call_writes_null_phase_and_pct(self, tmp_path: Path):
+        """text is the only required field — phase/pct default to null, not
+        absent, so a reader always sees the same three keys regardless of
+        whether the caller supplied them (protocol v1.1: ship the shape
+        now so consumers never have to handle two shapes later)."""
+        claims_db = _FakeClaimsDB({"req-1": "processing"})
+
+        agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="still going",
+            emit_event=_RecordingEmitter(),
+        )
+
+        written = json.loads((tmp_path / "req-1.ack.json").read_text())
+        assert written["text"] == "still going"
+        assert written["phase"] is None
+        assert written["pct"] is None
+
+    def test_phase_and_pct_are_written_when_provided(self, tmp_path: Path):
+        claims_db = _FakeClaimsDB({"req-1": "processing"})
+
+        agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="running tests",
+            emit_event=_RecordingEmitter(),
+            phase="testing",
+            pct=60.0,
+        )
+
+        written = json.loads((tmp_path / "req-1.ack.json").read_text())
+        assert written["phase"] == "testing"
+        assert written["pct"] == 60.0
+        assert written["text"] == "running tests"
+
+    # -- capability preservation (bloom adversarial review, PR #1530) -------
+
+    def test_capabilities_present_in_a_bare_write_progress_call(self, tmp_path: Path):
+        """write_progress's own payload must carry capabilities — not just
+        write_ack's — since write_progress can be the first (and only)
+        writer of .ack.json for a given request_id in principle."""
+        claims_db = _FakeClaimsDB({"req-1": "processing"})
+
+        agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="working",
+            emit_event=_RecordingEmitter(),
+        )
+
+        written = json.loads((tmp_path / "req-1.ack.json").read_text())
+        assert written["capabilities"] == agent_channel.get_capabilities()
+
+    def test_write_progress_after_claim_does_not_drop_capabilities(self, tmp_path: Path):
+        """Regression test for bloom's finding on PR #1530: write_ack() (the
+        claim-time writer) and write_progress() (the repeatable status
+        writer) both write agent-replies/<request_id>.ack.json. Before this
+        fix, write_progress() built its payload from scratch without a
+        "capabilities" key, so the first progress update after a claim
+        silently overwrote — and lost — the capability list the ack had
+        just advertised. Assert the full sequence a real exchange follows:
+        claim (write_ack) then a status update (write_progress) still
+        leaves capabilities present and correct."""
+        claims_db = _FakeClaimsDB({"req-1": "processing"})
+
+        agent_channel.write_ack(
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            ack_text="claimed",
+            message_id="req-1",
+            emit_event=_RecordingEmitter(),
+        )
+        ack_file = tmp_path / "req-1.ack.json"
+        ack_written = json.loads(ack_file.read_text())
+        assert ack_written["capabilities"] == agent_channel.get_capabilities()
+
+        # Backdate the ack file's mtime past the debounce window (same
+        # pattern as test_second_open_write_overwrites_first_after_debounce_
+        # window above) so the write_progress call below actually lands
+        # instead of being debounced — isolates "does the progress write
+        # preserve capabilities" from unrelated debounce behavior.
+        import os
+
+        old_ts = time.time() - (agent_channel.DEBOUNCE_INTERVAL_SECONDS + 1)
+        os.utime(ack_file, (old_ts, old_ts))
+
+        agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="halfway there",
+            emit_event=_RecordingEmitter(),
+        )
+
+        progress_written = json.loads((tmp_path / "req-1.ack.json").read_text())
+        assert progress_written["capabilities"] == agent_channel.get_capabilities()
+        assert progress_written["text"] == "halfway there"
 
     # -- last-write-wins overwrite -------------------------------------------
 

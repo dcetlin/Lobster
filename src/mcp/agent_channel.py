@@ -200,6 +200,40 @@ def emit_request_audit(
     )
 
 
+# =============================================================================
+# Capability advertisement (agent-channel protocol v1.1) — see write_ack().
+# =============================================================================
+#
+# What this server BUILD actually supports, written into the ack payload at
+# claim time so a caller can do version negotiation without a protocol
+# version bump: "what can this exchange do" is answered by reading the ack,
+# not by assuming based on when the client's code was written or which
+# protocol version string it was told about.
+#
+# A function, not a bare tuple inlined at the write_ack() call site: none of
+# these three features happen to be runtime-gated today, but a future
+# feature that IS gated behind a flag/rollout has exactly one place to
+# report its actual availability. Hardcoding a literal list at the call
+# site would keep working right up until the day a feature is gated and the
+# ack silently lies about supporting it — this indirection is what keeps
+# that from being possible by construction rather than by remembering to
+# update two places in sync.
+CAPABILITIES: tuple[str, ...] = (
+    "write_progress",  # write_progress tool — repeatable status updates on an OPEN exchange (protocol v1 §2)
+    "by_agent",  # by-agent pointer mailbox — agent-replies/by-agent/<agent-slug>/<request_id> (protocol v1 §3.2)
+    "compact_json",  # replies/acks/pointers are written as compact single-line JSON, not pretty-printed (#1519)
+)
+
+
+def get_capabilities() -> list[str]:
+    """Return the agent-channel features this server build actually supports.
+
+    See the ``CAPABILITIES`` module constant for what each entry means and
+    why this is a function rather than a literal inlined where it's used.
+    """
+    return list(CAPABILITIES)
+
+
 def write_ack(
     *,
     agent_replies_dir: Path,
@@ -220,10 +254,27 @@ def write_ack(
     Written compact (``indent=None``, single line) for the same reason as
     ``write_reply`` — see its docstring. Same machine-polled-file class,
     same failure mode to avoid.
+
+    The ack write is a hard part of the claim path (agent-channel protocol
+    v1.1): it is always attempted, and a write failure never blocks the
+    claim itself from succeeding — a message that was successfully claimed
+    stays claimed even if this write fails; see the except branch below.
+    What changes on failure is that the degradation is loud rather than
+    silent: a claim whose ack failed is a v0 exchange (no capability
+    advertisement, no progress visibility) masquerading as v1, and that
+    must be visible in logs/metrics, not swallowed.
+
+    Includes ``phase``/``pct`` (both ``None`` here) alongside ``text`` for
+    the same reason write_progress() does — both functions write the SAME
+    file (agent-replies/<request_id>.ack.json), so a reader must never see
+    two different shapes for it depending on which writer landed last.
     """
     ack_payload = {
         "request_id": request_id,
         "ack": True,
+        "capabilities": get_capabilities(),
+        "phase": None,
+        "pct": None,
         "text": ack_text,
         "ts": datetime.now(timezone.utc).isoformat(),
     }
@@ -242,12 +293,35 @@ def write_ack(
             f"Ack: {ack_text[:100]}"
         )
     except Exception as e:
-        # Ack write failed — message stays in processing/, stale recovery handles it
-        log.warning(f"claim_and_ack: local-claude ack write failed (message stays in processing/): {e}")
+        # Ack write failed. The claim itself already succeeded (the message
+        # was moved to processing/ before this function was ever called —
+        # see handle_claim_and_ack) and stays succeeded: never block the
+        # work over a best-effort status write. But this must be LOUD, not a
+        # quiet downgrade to a v0 exchange: log at error level (with
+        # request_id, so it's greppable/correlatable) and escalate the
+        # audit event to severity="error" so it's counted in the event
+        # bus's errors_last_1h metric (MetricsListener) — this is the
+        # existing "metric" mechanism in this codebase for exactly this
+        # kind of internal failure signal.
+        #
+        # write_observation (the user-facing dispatcher-inbox mechanism)
+        # was considered and rejected for this: it requires a chat_id to
+        # route to, and an agent-channel ack failure has none to give it —
+        # by protocol design (agent_channel_schema.ADDRESSING) this
+        # channel's traffic is never routed through Dan's chat_id at all.
+        # severity="error" (not "critical") is deliberate for the same
+        # reason: "critical" pages Dan on Telegram unconditionally
+        # (CriticalAlertListener), which would be exactly the cross-channel
+        # leak the protocol's fail-closed design exists to prevent.
+        log.error(
+            f"claim_and_ack: local-claude ack write FAILED for request_id={request_id!r} "
+            f"(message_id={message_id!r}) — claim still succeeds, message stays in "
+            f"processing/, stale recovery handles it: {e}"
+        )
         emit_event(
             "agent_channel.ack",
             {"request_id": request_id, "message_id": message_id, "error": str(e)},
-            severity="warn",
+            severity="error",
         )
         return (
             f"Warning: message claimed but local-claude ack write failed: {e}\n"
@@ -312,6 +386,8 @@ def write_progress(
     request_id: str,
     status_text: str,
     emit_event: EmitEvent,
+    phase: str | None = None,
+    pct: float | None = None,
 ) -> ProgressOutcome:
     """Write a repeatable current-status update for an OPEN local-claude exchange.
 
@@ -319,6 +395,19 @@ def write_progress(
     write_ack() above writes at claim time — with the latest status text.
     Last-write-wins: this is a status field, not an accumulating log (agent-
     channel protocol v1 §1, the "minimal mechanism" decision).
+
+    Structured status shape (agent-channel protocol v1.1): the payload is
+    ``{"capabilities": ..., "phase": ..., "pct": ..., "text": ..., ...}``
+    rather than a flat ``{"text": ...}``. Only ``text`` (via ``status_text``)
+    is required — ``phase``/``pct`` are optional and default to
+    ``None``/``null``. ``capabilities`` is always re-derived from
+    ``get_capabilities()`` (the same single source write_ack() reads), never
+    carried over from whatever was already on disk — see the inline comment
+    at the write site for why a progress write must never drop the
+    capability list write_ack() set at claim time. This shape is shipped
+    now, before write_progress has any live consumers, so a reader never
+    has to handle two different payload shapes for the same file depending
+    on when it was written.
 
     Three guardrails, in order:
 
@@ -425,6 +514,9 @@ def write_progress(
             ack_payload = {
                 "request_id": request_id,
                 "ack": True,
+                "capabilities": get_capabilities(),
+                "phase": phase,
+                "pct": pct,
                 "text": status_text,
                 "ts": datetime.now(timezone.utc).isoformat(),
             }
@@ -436,6 +528,18 @@ def write_progress(
             # file write_ack() writes at claim time, so it must match that
             # file's compact-JSON invariant or it would re-break it on the
             # next status update.
+            #
+            # `capabilities` (bloom adversarial review, PR #1530): write_ack()
+            # and write_progress() write the SAME file
+            # (agent-replies/<request_id>.ack.json) — write_ack() sets
+            # "capabilities" at claim time, but write_progress() previously
+            # built its payload from scratch without it, so the very first
+            # progress update after a claim silently dropped the capability
+            # list the ack had just advertised. Re-deriving it here from the
+            # same get_capabilities() single source of truth (rather than,
+            # say, reading the existing file and merging) keeps both writers
+            # producing the identical payload shape for this file — a reader
+            # never has to know which of the two functions wrote it last.
             atomic_write_json(ack_path, ack_payload, indent=None)
         finally:
             fcntl.flock(lockfile.fileno(), fcntl.LOCK_UN)

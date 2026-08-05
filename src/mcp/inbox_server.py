@@ -13,6 +13,7 @@ Provides tools for Claude Code to interact with the message queue:
 import asyncio
 import json
 import logging
+from collections import OrderedDict
 from logging.handlers import RotatingFileHandler
 import os
 import re
@@ -412,6 +413,7 @@ except ImportError:
 # MCP SDK
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
+from mcp.server.lowlevel.server import NotificationOptions  # noqa: E402 — same late-import position as the other mcp.server imports directly above
 from mcp.types import Tool, TextContent
 
 # Directories
@@ -1468,6 +1470,119 @@ SOURCES = {
 
 server = Server("lobster-inbox")
 
+# =============================================================================
+# notifications/tools/list_changed (agent-channel protocol v1.1, refinement 4)
+# =============================================================================
+#
+# Problem this closes: a client whose tool cache predates a server-side
+# code change (new tool added, existing session never restarted) has no
+# signal telling it to re-fetch tools/list — it just silently never sees
+# the new tool. The MCP spec's answer to that is the server declaring
+# `tools: {listChanged: true}` in its capabilities and then sending
+# `notifications/tools/list_changed` when the tool set changes.
+#
+# Bug this fixes: `Server.create_initialization_options()` defaults to
+# `NotificationOptions()`, whose `tools_changed` defaults to False — so
+# every session this server has ever started has told its client "I will
+# never send you a list_changed notification" (`tools.listChanged: false`
+# in the capabilities response), regardless of whether anything downstream
+# actually sends one. That's a true statement today (nothing sends one) but
+# is also self-defeating: even a spec-compliant client has no reason to
+# listen for a notification the server told it up front would never come.
+#
+# Fix, and its scope limit: `create_initialization_options` is overridden on
+# this instance (below) to default to `tools_changed=True` so the
+# capability is advertised correctly. Investigation (see PR body / commit
+# message for refinement 4) found the low-level `mcp` SDK's
+# `StreamableHTTPSessionManager` — the transport this server actually runs
+# under in production (see `main()`'s `use_http` branch) — calls
+# `self.app.create_initialization_options()` itself, per new HTTP session,
+# with no arguments and no way to inject `NotificationOptions` from here.
+# Overriding the bound method on this module-level `server` instance is
+# the only interception point available without vendoring or patching the
+# SDK. `NotificationOptions()` (imported above) is reused as the shape;
+# only its default is changed.
+#
+# `ServerSession.send_tool_list_changed()` — the SDK method that actually
+# emits the notification — requires a live `ServerSession` object,
+# obtainable only from `request_ctx` inside an active request handler
+# (`mcp.server.lowlevel.server.request_ctx`, the same pattern
+# `_get_current_http_session_id()` above already uses). Confirmed by
+# reading `StreamableHTTPSessionManager`: `_server_instances` (which
+# `_http_session_manager` already exposes for other purposes in this file)
+# holds only the raw per-session transport, not the `ServerSession` that
+# wraps it — so there is no way, from here, to reach into an arbitrary
+# already-connected session from outside its own request handling and push
+# a notification to it. `_notify_tools_list_changed_once()` below is called
+# from `call_tool()` (this server's one MCP request handler every tool call
+# passes through, for both stdio and HTTP transport) and sends the
+# notification to the CURRENT request's own session, once per session —
+# the closest analogue to "on this session's startup" the SDK's public
+# surface actually allows from this module. See the refinement-4 PR body
+# for the explicit, unresolved question this leaves open: no code change
+# here can broadcast to a session OTHER than the one currently making a
+# request, and it is unverified whether the Claude Code CLI client honors
+# list_changed at all.
+_original_create_initialization_options = server.create_initialization_options
+
+
+def _create_initialization_options_advertising_tools_changed(
+    notification_options: NotificationOptions | None = None,
+    experimental_capabilities: dict | None = None,
+):
+    if notification_options is None:
+        notification_options = NotificationOptions(tools_changed=True)
+    return _original_create_initialization_options(notification_options, experimental_capabilities)
+
+
+server.create_initialization_options = _create_initialization_options_advertising_tools_changed
+
+# Sessions (keyed by HTTP mcp-session-id, or the sentinel "stdio" for the
+# single stdio-transport session) that have already received their one
+# post-connect list_changed nudge — see _notify_tools_list_changed_once().
+#
+# Bounded FIFO, not a bare set (Fix 2, bloom adversarial review, PR #1530):
+# this daemon runs for days/weeks and accumulates one entry per distinct
+# HTTP session it has ever served a first tool call for. A bare set has no
+# upper bound, so long-running uptime turns this into a slow, unbounded
+# memory leak. FIFO eviction — not TTL — is the correct bound here: the
+# property we're protecting is "this dict can't grow past N entries," not
+# "entries expire after some meaningful age." Re-notifying a session that
+# gets evicted and later makes another tool call is harmless — the nudge
+# is best-effort and idempotent from the client's point of view (see
+# _notify_tools_list_changed_once()'s docstring) — so there is no
+# correctness cost to evicting the oldest entry once the cap is hit.
+# OrderedDict (rather than a dict relying on 3.7+ insertion order) makes
+# the FIFO-eviction intent explicit at the call site via popitem(last=False).
+_TOOLS_LIST_CHANGED_SESSIONS_MAX = 1000
+_tools_list_changed_notified_sessions: OrderedDict[str, None] = OrderedDict()
+
+
+async def _notify_tools_list_changed_once() -> None:
+    """Best-effort notifications/tools/list_changed nudge, once per session.
+
+    Sent on the session's first tool call — see the module-level comment
+    above this function's caller (call_tool()) for why that is the
+    furthest-upstream point reachable from here, and what it does and does
+    not solve. Never raises: this must never block or fail a real tool call.
+    """
+    session_key = _get_current_http_session_id() or "stdio"
+    if session_key in _tools_list_changed_notified_sessions:
+        return
+    _tools_list_changed_notified_sessions[session_key] = None
+    if len(_tools_list_changed_notified_sessions) > _TOOLS_LIST_CHANGED_SESSIONS_MAX:
+        # Evict the oldest (first-inserted) entry — bounds the dict at
+        # _TOOLS_LIST_CHANGED_SESSIONS_MAX regardless of how many distinct
+        # sessions this process serves over its lifetime.
+        _tools_list_changed_notified_sessions.popitem(last=False)
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+        session = request_ctx.get().session
+        await session.send_tool_list_changed()
+        log.info(f"[list-changed] Sent notifications/tools/list_changed to session {session_key!r}")
+    except Exception as exc:
+        log.debug(f"[list-changed] Could not send list_changed to session {session_key!r}: {exc}")
+
 
 def touch_heartbeat():
     """Touch heartbeat file to signal Claude is alive and processing."""
@@ -2080,7 +2195,9 @@ async def list_tools() -> list[Tool]:
                 "as the write, so there is no check-then-write race. Debounced: if a "
                 "status was already written for this request_id within the last 10 "
                 "seconds, the call is still accepted (no error) but the filesystem write "
-                "is skipped to bound churn from a spammy caller."
+                "is skipped to bound churn from a spammy caller. "
+                "Payload is structured (protocol v1.1): {phase, pct, text} — only "
+                "status_text is required; phase/pct are optional and default to null."
             ),
             inputSchema={
                 "type": "object",
@@ -2099,6 +2216,21 @@ async def list_tools() -> list[Tool]:
                             "The current-status text to write (e.g. 'still running "
                             "tests, 3/5 done'). Overwrites any previous status for this "
                             "request_id — repeated calls do not accumulate a history."
+                        ),
+                    },
+                    "phase": {
+                        "type": "string",
+                        "description": (
+                            "Optional short phase label (e.g. 'testing', 'writing_pr'). "
+                            "Omit if you have nothing more structured than status_text to "
+                            "report — written as null when absent."
+                        ),
+                    },
+                    "pct": {
+                        "type": "number",
+                        "description": (
+                            "Optional completion percentage (e.g. 60). Omit if unknown — "
+                            "written as null when absent."
                         ),
                     },
                 },
@@ -4092,6 +4224,10 @@ def _track_tool_outcome(name: str, result: list[TextContent]) -> None:
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Handle tool calls with structured audit logging and capability failure tracking."""
     log.info(f"Tool called: {name}")
+    # Best-effort, once-per-session notifications/tools/list_changed nudge —
+    # see the module-level comment above _notify_tools_list_changed_once()
+    # for what this does and does not solve. Never blocks the real call.
+    await _notify_tools_list_changed_once()
     start_time = time.time()
     try:
         result = await _dispatch_tool(name, arguments)
@@ -6179,6 +6315,11 @@ async def handle_write_progress(args: dict) -> list[TextContent]:
     local-claude agent-channel exchange. See agent_channel.write_progress()
     for the full authorization/debounce/message-after-complete design
     (agent-channel protocol v1, §2).
+
+    Structured status shape (agent-channel protocol v1.1): ``phase`` and
+    ``pct`` are optional, nullable fields alongside the required
+    ``status_text`` — see agent_channel.write_progress()'s docstring for why
+    the shape is shipped now rather than left flat.
     """
     try:
         request_id = sanitize_request_id(args.get("request_id"))
@@ -6189,12 +6330,24 @@ async def handle_write_progress(args: dict) -> list[TextContent]:
     if not status_text:
         return [TextContent(type="text", text="Error: status_text is required")]
 
+    phase = args.get("phase")
+    if phase is not None:
+        phase = str(phase).strip() or None
+
+    pct = args.get("pct")
+    if pct is not None:
+        if not isinstance(pct, (int, float)) or isinstance(pct, bool):
+            return [TextContent(type="text", text="Error: pct must be a number (or omitted)")]
+        pct = float(pct)
+
     outcome = agent_channel.write_progress(
         claims_db=_claims_db,
         agent_replies_dir=AGENT_REPLIES_DIR,
         request_id=request_id,
         status_text=status_text,
         emit_event=_emit_mcp_event,
+        phase=phase,
+        pct=pct,
     )
 
     if not outcome.accepted:

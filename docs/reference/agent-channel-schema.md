@@ -5,7 +5,7 @@ Verify in sync: uv run scripts/generate_agent_channel_docs.py --check -->
 
 # Agent Channel Schema (generated)
 
-Protocol version: `1`. Source value: `"local-claude"`.
+Protocol version: `1.1`. Source value: `"local-claude"`.
 
 This document is generated from `src/protocol/agent_channel_schema.py`, the single canonical schema module for this protocol — it is also what `lobster-chat --schema` prints as JSON and what `lobster-chat --help` summarizes, so all three stay in sync by construction, not by hand-edit discipline. See `docs/reference/agent-channel.md` for the prose walkthrough and operational detail (deploy, retention, observability); this document is the wire-format reference.
 
@@ -64,7 +64,10 @@ Written by Lobster to `~/messages/agent-replies/<request_id>.ack.json`. May neve
 |---|---|---|---|
 | `request_id` | string | yes | Echoes the inbound request's request_id. |
 | `text` | string | yes | A short progress note (e.g. "working on it"). NOT an answer — see error/ack semantics. |
+| `phase` | string | no | Optional short phase label (e.g. "testing"), added in protocol v1.1. null when the writer didn't set one — always present as a key, so a reader never has to distinguish "key absent" from "key null" for this file. |
+| `pct` | number | no | Optional completion percentage (e.g. 60), added in protocol v1.1. null when the writer didn't set one — same always-present-as-a-key convention as phase. |
 | `ts` | string | yes | ISO 8601 UTC timestamp of when the ack was written. |
+| `capabilities` | array | no | Added in protocol v1.1: the agent-channel features this server build actually supports, e.g. ["write_progress", "by_agent", "compact_json"] — lets a caller do version negotiation without a protocol version bump. Written by claim_and_ack's ack; write_progress's status updates overwrite the same file without repeating this field (it does not change mid-exchange). |
 
 ## Envelope: reply (the answer, written by Lobster exactly once)
 
