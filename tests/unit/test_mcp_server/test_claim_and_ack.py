@@ -434,6 +434,111 @@ class TestClaimAndAck:
         assert list(outbox.glob("*.json")) == []
         assert "agent-replies" in result[0].text
 
+    def test_local_claude_ack_advertises_capabilities(self, dirs):
+        """Refinement 1 (agent-channel protocol v1.1): the ack written at
+        claim time advertises what this server build actually supports, so
+        a caller can do version negotiation without a protocol version bump."""
+        inbox, processing, outbox, sent = dirs
+        agent_replies = inbox.parent / "agent-replies"
+        agent_replies.mkdir(exist_ok=True)
+
+        msg_id = "1700000000003-mnop3456"
+        msg = {
+            "id": msg_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "what can you do?",
+            "request_id": msg_id,
+            "timestamp": "2026-08-05T10:00:00.000000",
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+            # Bare "agent_channel" (not "src.mcp.agent_channel") — inbox_server.py
+            # imports it via the sibling-import path (`import agent_channel`,
+            # resolved through the src/mcp sys.path entry set up above), which
+            # is a DIFFERENT module object in sys.modules than
+            # "src.mcp.agent_channel". Must patch/read the same one
+            # inbox_server.py actually calls into.
+            import agent_channel
+
+            asyncio.run(handle_claim_and_ack({
+                "message_id": msg_id,
+                "ack_text": "here's what I can do",
+                "chat_id": "local-claude",
+                "source": "local-claude",
+                "request_id": msg_id,
+            }))
+
+        ack = json.loads((agent_replies / f"{msg_id}.ack.json").read_text())
+        assert ack["capabilities"] == agent_channel.get_capabilities()
+        assert "write_progress" in ack["capabilities"]
+
+    def test_local_claude_claim_succeeds_even_when_ack_write_fails(self, dirs):
+        """Refinement 2 (agent-channel protocol v1.1): an ack write failure
+        must never block the claim itself — the message must still move to
+        processing/ and the caller must get a response back, not an
+        exception, even though the ack degrades this to a v0 exchange."""
+        inbox, processing, outbox, sent = dirs
+        agent_replies = inbox.parent / "agent-replies"
+        agent_replies.mkdir(exist_ok=True)
+
+        msg_id = "1700000000004-qrst7890"
+        msg = {
+            "id": msg_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "do the thing",
+            "request_id": msg_id,
+            "timestamp": "2026-08-05T10:00:00.000000",
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+            # Bare "agent_channel" (not "src.mcp.agent_channel") — inbox_server.py
+            # imports it via the sibling-import path (`import agent_channel`,
+            # resolved through the src/mcp sys.path entry set up above), which
+            # is a DIFFERENT module object in sys.modules than
+            # "src.mcp.agent_channel". Must patch/read the same one
+            # inbox_server.py actually calls into.
+            import agent_channel
+
+            def _boom(path, data, **kwargs):
+                raise OSError("disk full")
+
+            with patch.object(agent_channel, "atomic_write_json", side_effect=_boom):
+                result = asyncio.run(handle_claim_and_ack({
+                    "message_id": msg_id,
+                    "ack_text": "On it.",
+                    "chat_id": "local-claude",
+                    "source": "local-claude",
+                    "request_id": msg_id,
+                }))
+
+        # Claim succeeded — message moved to processing/ — despite the ack write failing.
+        assert not (inbox / f"{msg_id}.json").exists()
+        assert (processing / f"{msg_id}.json").exists()
+        assert "Warning: message claimed but local-claude ack write failed" in result[0].text
+        assert not (agent_replies / f"{msg_id}.ack.json").exists()
+
     def test_local_claude_requires_request_id(self, dirs):
         """source='local-claude' without request_id is rejected before claiming —
         the message must remain in inbox/ untouched."""

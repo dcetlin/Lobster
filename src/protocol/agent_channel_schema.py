@@ -213,11 +213,42 @@ ACK_ENVELOPE: dict[str, dict[str, Any]] = {
         "required": True,
         "description": "A short progress note (e.g. \"working on it\"). NOT an answer — see error/ack semantics.",
     },
+    "phase": {
+        "type": "string",
+        "required": False,
+        "description": (
+            "Optional short phase label (e.g. \"testing\"), added in protocol "
+            "v1.1. null when the writer didn't set one — always present as a "
+            "key, so a reader never has to distinguish \"key absent\" from "
+            "\"key null\" for this file."
+        ),
+    },
+    "pct": {
+        "type": "number",
+        "required": False,
+        "description": (
+            "Optional completion percentage (e.g. 60), added in protocol "
+            "v1.1. null when the writer didn't set one — same always-present-"
+            "as-a-key convention as phase."
+        ),
+    },
     "ts": {
         "type": "string",
         "required": True,
         "format": "date-time",
         "description": "ISO 8601 UTC timestamp of when the ack was written.",
+    },
+    "capabilities": {
+        "type": "array",
+        "required": False,
+        "description": (
+            "Added in protocol v1.1: the agent-channel features this server "
+            "build actually supports, e.g. [\"write_progress\", \"by_agent\", "
+            "\"compact_json\"] — lets a caller do version negotiation "
+            "without a protocol version bump. Written by claim_and_ack's "
+            "ack; write_progress's status updates overwrite the same file "
+            "without repeating this field (it does not change mid-exchange)."
+        ),
     },
 }
 

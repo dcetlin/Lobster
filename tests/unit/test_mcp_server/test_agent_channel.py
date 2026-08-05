@@ -236,6 +236,9 @@ class TestWriteAck:
         assert written == {
             "request_id": "req-1",
             "ack": True,
+            "capabilities": list(agent_channel.CAPABILITIES),
+            "phase": None,
+            "pct": None,
             "text": "working on it",
             "ts": written["ts"],
         }
@@ -253,7 +256,13 @@ class TestWriteAck:
         }
         assert emitter.calls[0]["severity"] == "info"
 
-    def test_write_failure_returns_warning_and_emits_warn_severity(self, tmp_path: Path, monkeypatch):
+    def test_write_failure_returns_warning_and_escalates_to_error_severity(self, tmp_path: Path, monkeypatch):
+        """Refinement 2 (agent-channel protocol v1.1): the claim must still
+        succeed when the ack write fails (this function raises nothing —
+        handle_claim_and_ack's move to processing/ already happened before
+        write_ack was ever called), but the failure must be LOUD: escalated
+        to severity="error" (tracked in the event bus's errors_last_1h
+        metric) rather than the "warn" this used to emit silently."""
         emitter = _RecordingEmitter()
 
         def _boom(path, data, **kwargs):
@@ -268,15 +277,66 @@ class TestWriteAck:
             message_id="msg-2",
             emit_event=emitter,
         )
+        # Claim-level outcome: still a "claimed, but ack failed" response,
+        # never an exception — the claim itself is never rolled back.
         assert "Warning: message claimed but local-claude ack write failed" in response
         assert "msg-2" in response
         assert "remains in processing/" in response
 
         assert len(emitter.calls) == 1
         assert emitter.calls[0]["event_type"] == "agent_channel.ack"
-        assert emitter.calls[0]["severity"] == "warn"
+        assert emitter.calls[0]["severity"] == "error"
         assert emitter.calls[0]["payload"]["error"] == "disk full"
+        assert emitter.calls[0]["payload"]["request_id"] == "req-2"
         assert not (tmp_path / "req-2.ack.json").exists()
+
+    def test_write_failure_logs_error_with_request_id(self, tmp_path: Path, monkeypatch, caplog):
+        """The request_id must be greppable/correlatable in the log line
+        itself, not only in the (separately-consumed) audit event payload."""
+        import logging
+
+        def _boom(path, data, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(agent_channel, "atomic_write_json", _boom)
+
+        with caplog.at_level(logging.ERROR, logger=agent_channel.log.name):
+            agent_channel.write_ack(
+                agent_replies_dir=tmp_path,
+                request_id="req-3",
+                ack_text="ack text",
+                message_id="msg-3",
+                emit_event=_RecordingEmitter(),
+            )
+
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(error_records) == 1
+        assert "req-3" in error_records[0].message
+
+    def test_capabilities_are_present_and_derived_from_get_capabilities(self, tmp_path: Path):
+        """Refinement 1 (agent-channel protocol v1.1): the ack advertises
+        what this server build actually supports, via the single source-of-
+        truth get_capabilities() — not a literal hardcoded at the call site."""
+        response = agent_channel.write_ack(
+            agent_replies_dir=tmp_path,
+            request_id="req-4",
+            ack_text="working on it",
+            message_id="msg-4",
+            emit_event=_RecordingEmitter(),
+        )
+        written = json.loads((tmp_path / "req-4.ack.json").read_text())
+        assert written["capabilities"] == agent_channel.get_capabilities()
+        assert "write_progress" in written["capabilities"]
+        assert "Claimed and acked (local-claude)" in response
+
+    def test_get_capabilities_returns_a_fresh_list_each_call(self):
+        """A caller mutating the returned list must never corrupt the
+        module's own CAPABILITIES constant — get_capabilities() must copy,
+        not hand out the tuple's own backing list/reference."""
+        a = agent_channel.get_capabilities()
+        a.append("not-a-real-capability")
+        b = agent_channel.get_capabilities()
+        assert "not-a-real-capability" not in b
 
 
 class TestWriteProgress:
