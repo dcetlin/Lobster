@@ -6128,7 +6128,12 @@ async def handle_mark_processing(args: dict) -> list[TextContent]:
     # inbox/: no partial claim, no filesystem move, no widening of any
     # unclaimed race window relative to today — the caller must retry with
     # claim_and_ack instead.
-    msg_source_pre_claim = msg_data.get("source", "")
+    # Lowercased to match claim_and_ack's own source comparison (which
+    # lowercases the caller-supplied source before comparing to
+    # agent_channel.SOURCE) — a mixed-case "Local-Claude" source field must
+    # trip this gate exactly like claim_and_ack's fail-closed checks do,
+    # not slip through on a case mismatch.
+    msg_source_pre_claim = str(msg_data.get("source", "")).lower()
     if msg_source_pre_claim == agent_channel.SOURCE:
         log.warning(
             f"mark_processing: refused for source={agent_channel.SOURCE!r} "
@@ -6234,7 +6239,45 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
         try:
             request_id = sanitize_request_id(args.get("request_id"))
         except ValidationError as e:
+            # This is the one refusal path in the agent-channel claim flow that
+            # was silent before this fix (issue #1531 review). mark_processing
+            # already logs a warning when it refuses ANY local-claude message
+            # (telling the caller to use claim_and_ack instead), but claim_and_ack
+            # itself had no log call when its own request_id validation failed —
+            # and source="local-claude" is excluded from health-check
+            # USER_FACING_SOURCES, so nothing else ever surfaces this either.
+            # Without a valid request_id, the message can never be claimed by any
+            # path (mark_processing refuses local-claude outright; claim_and_ack
+            # refuses here) and stays stuck in inbox/ forever with no further
+            # signal. Log loudly and alert directly via the existing lightweight
+            # outbox-alert path — claim_and_ack isn't enrolled in the
+            # capability-failure tracker's threshold/cooldown gate, so this
+            # bypasses that gate intentionally rather than waiting for N
+            # consecutive failures — so this can't vanish silently the way it
+            # did pre-fix.
+            log.error(
+                f"claim_and_ack: refused for source={agent_channel.SOURCE!r} "
+                f"(message_id={message_id}) — invalid/missing request_id: {e}. "
+                "Message cannot be claimed by any path and is stuck in inbox/."
+            )
+            _deliver_capability_alert(
+                f"claim_and_ack: local-claude message {message_id!r} refused — "
+                f"invalid/missing request_id ({e}). This message cannot be "
+                "claimed by any path (mark_processing is deprecated for this "
+                "source; claim_and_ack requires a valid request_id) and will "
+                "stay stuck in inbox/ until manually recovered.",
+                "claim_and_ack.request_id",
+            )
             return [TextContent(type="text", text=f"Error: {e}")]
+
+    # (c) ack_text is required for every branch below — both the local-claude
+    # and normal-source paths read it directly. Validated up front, before the
+    # claim, so a caller that omits it gets a clean error instead of a bare
+    # KeyError surfacing after the message has already been moved to
+    # processing/ (same rationale as the request_id pre-check above).
+    ack_text = args.get("ack_text")
+    if not ack_text:
+        return [TextContent(type="text", text="Error: ack_text is required")]
 
     # --- Step 1: Claim the message (must succeed before sending ack) ---
     found = _find_message_file(INBOX_DIR, message_id)
@@ -6316,7 +6359,7 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
         response_text = agent_channel.write_ack(
             agent_replies_dir=AGENT_REPLIES_DIR,
             request_id=request_id,
-            ack_text=args["ack_text"],
+            ack_text=ack_text,
             message_id=message_id,
             emit_event=_emit_mcp_event,
         )
@@ -6324,7 +6367,7 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
 
     ack_args = {
         "chat_id": args["chat_id"],
-        "text": args["ack_text"],
+        "text": ack_text,
         "source": args.get("source", "telegram"),
     }
     if args.get("reply_to_message_id") is not None:
@@ -6334,8 +6377,8 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
 
     try:
         ack_result = await handle_send_reply(ack_args)
-        ack_text_preview = args["ack_text"][:100]
-        ack_suffix = "..." if len(args["ack_text"]) > 100 else ""
+        ack_text_preview = ack_text[:100]
+        ack_suffix = "..." if len(ack_text) > 100 else ""
         log.info(f"claim_and_ack: ack sent to chat {args['chat_id']}")
         return [TextContent(
             type="text",

@@ -106,6 +106,35 @@ class TestMarkProcessing:
             assert (inbox / f"{msg_id}.json").exists()
             assert not (processing / f"{msg_id}.json").exists()
 
+    def test_refuses_local_claude_source_case_insensitive(self, setup_dirs, message_generator):
+        """The deprecation gate must catch a mixed-case source field (e.g.
+        'Local-Claude') exactly like claim_and_ack's own fail-closed source
+        checks do (issue #1532 review fix: align case handling between the two
+        gates so a case mismatch can't slip a local-claude message through
+        mark_processing, which has no ack step for the agent channel)."""
+        inbox, processing = setup_dirs
+
+        msg = message_generator.generate_text_message(source="Local-Claude")
+        msg["request_id"] = msg["id"]
+        msg_id = msg["id"]
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_mark_processing
+
+            result = asyncio.run(handle_mark_processing({"message_id": msg_id}))
+
+            assert "not supported" in result[0].text.lower()
+            assert "claim_and_ack" in result[0].text
+            # Left untouched in inbox/ — no partial claim, no move.
+            assert (inbox / f"{msg_id}.json").exists()
+            assert not (processing / f"{msg_id}.json").exists()
+
     def test_still_claims_non_local_claude_sources(self, setup_dirs, message_generator):
         """Regression guard: the source-branch gate must not widen to other
         sources — mark_processing remains fully supported for human channels."""
