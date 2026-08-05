@@ -47,9 +47,6 @@ data/
 memory/canonical/
 memory/archive/digests/*.md
 
-# Incident reports (generated at runtime by investigate-incident.sh)
-incidents/*.md
-
 # GSD framework (dev tooling, installed per-user)
 .claude/agents/gsd-*.md
 .claude/commands/

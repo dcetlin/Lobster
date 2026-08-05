@@ -232,8 +232,8 @@ Health check runs every 4 minutes via cron: `~/lobster/scripts/health-check-v3.s
 # Last health check result
 tail -50 ~/lobster-workspace/logs/health-check.log
 
-# Any recent incidents collected before restarts
-ls ~/lobster/incidents/
+# Any recent incidents collected before restarts (run scripts/investigate-incident.sh manually)
+ls ~/lobster-workspace/retros/incidents/
 ```
 
 **Rollback via update-lobster.sh:**

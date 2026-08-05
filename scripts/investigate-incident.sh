@@ -2,9 +2,12 @@
 #===============================================================================
 # Lobster Incident Investigator
 #
-# Triggered by health-check-v3.sh BEFORE a restart. Collects diagnostic info
-# and produces a structured incident report. The report is saved to
-# ~/lobster/incidents/ and optionally filed as a GitHub issue.
+# Manual diagnostic tool (not currently auto-triggered by health-check-v3.sh
+# despite this header's prior claim — see structure-hygiene audit Part C2).
+# Collects diagnostic info and produces a structured incident report. The
+# report is saved to ~/lobster-workspace/retros/incidents/ (the same
+# convention already used for curated incident postmortems — see
+# CONVENTIONS.md) and optionally filed as a GitHub issue.
 #
 # Usage:
 #   ~/lobster/scripts/investigate-incident.sh "stale inbox (>3m)"
@@ -15,7 +18,7 @@
 #   $1 - Alert reason string (from health-check-v3.sh)
 #
 # Environment:
-#   INCIDENT_DIR      - Override incident storage (default: ~/lobster/incidents)
+#   INCIDENT_DIR      - Override incident storage (default: ~/lobster-workspace/retros/incidents)
 #   SKIP_GITHUB_ISSUE - Set to "1" to skip filing a GitHub issue
 #
 # Output:
@@ -29,7 +32,7 @@ set -o pipefail
 #===============================================================================
 # Configuration
 #===============================================================================
-INCIDENT_DIR="${INCIDENT_DIR:-${LOBSTER_INSTALL_DIR:-$HOME/lobster}/incidents}"
+INCIDENT_DIR="${INCIDENT_DIR:-${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/retros/incidents}"
 LOGS_DIR="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/logs"
 INBOX_DIR="$HOME/messages/inbox"
 PROCESSING_DIR="$HOME/messages/processing"
