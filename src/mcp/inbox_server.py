@@ -412,6 +412,7 @@ except ImportError:
 # MCP SDK
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
+from mcp.server.lowlevel.server import NotificationOptions  # noqa: E402 — same late-import position as the other mcp.server imports directly above
 from mcp.types import Tool, TextContent
 
 # Directories
@@ -1467,6 +1468,99 @@ SOURCES = {
 }
 
 server = Server("lobster-inbox")
+
+# =============================================================================
+# notifications/tools/list_changed (agent-channel protocol v1.1, refinement 4)
+# =============================================================================
+#
+# Problem this closes: a client whose tool cache predates a server-side
+# code change (new tool added, existing session never restarted) has no
+# signal telling it to re-fetch tools/list — it just silently never sees
+# the new tool. The MCP spec's answer to that is the server declaring
+# `tools: {listChanged: true}` in its capabilities and then sending
+# `notifications/tools/list_changed` when the tool set changes.
+#
+# Bug this fixes: `Server.create_initialization_options()` defaults to
+# `NotificationOptions()`, whose `tools_changed` defaults to False — so
+# every session this server has ever started has told its client "I will
+# never send you a list_changed notification" (`tools.listChanged: false`
+# in the capabilities response), regardless of whether anything downstream
+# actually sends one. That's a true statement today (nothing sends one) but
+# is also self-defeating: even a spec-compliant client has no reason to
+# listen for a notification the server told it up front would never come.
+#
+# Fix, and its scope limit: `create_initialization_options` is overridden on
+# this instance (below) to default to `tools_changed=True` so the
+# capability is advertised correctly. Investigation (see PR body / commit
+# message for refinement 4) found the low-level `mcp` SDK's
+# `StreamableHTTPSessionManager` — the transport this server actually runs
+# under in production (see `main()`'s `use_http` branch) — calls
+# `self.app.create_initialization_options()` itself, per new HTTP session,
+# with no arguments and no way to inject `NotificationOptions` from here.
+# Overriding the bound method on this module-level `server` instance is
+# the only interception point available without vendoring or patching the
+# SDK. `NotificationOptions()` (imported above) is reused as the shape;
+# only its default is changed.
+#
+# `ServerSession.send_tool_list_changed()` — the SDK method that actually
+# emits the notification — requires a live `ServerSession` object,
+# obtainable only from `request_ctx` inside an active request handler
+# (`mcp.server.lowlevel.server.request_ctx`, the same pattern
+# `_get_current_http_session_id()` above already uses). Confirmed by
+# reading `StreamableHTTPSessionManager`: `_server_instances` (which
+# `_http_session_manager` already exposes for other purposes in this file)
+# holds only the raw per-session transport, not the `ServerSession` that
+# wraps it — so there is no way, from here, to reach into an arbitrary
+# already-connected session from outside its own request handling and push
+# a notification to it. `_notify_tools_list_changed_once()` below is called
+# from `call_tool()` (this server's one MCP request handler every tool call
+# passes through, for both stdio and HTTP transport) and sends the
+# notification to the CURRENT request's own session, once per session —
+# the closest analogue to "on this session's startup" the SDK's public
+# surface actually allows from this module. See the refinement-4 PR body
+# for the explicit, unresolved question this leaves open: no code change
+# here can broadcast to a session OTHER than the one currently making a
+# request, and it is unverified whether the Claude Code CLI client honors
+# list_changed at all.
+_original_create_initialization_options = server.create_initialization_options
+
+
+def _create_initialization_options_advertising_tools_changed(
+    notification_options: NotificationOptions | None = None,
+    experimental_capabilities: dict | None = None,
+):
+    if notification_options is None:
+        notification_options = NotificationOptions(tools_changed=True)
+    return _original_create_initialization_options(notification_options, experimental_capabilities)
+
+
+server.create_initialization_options = _create_initialization_options_advertising_tools_changed
+
+# Sessions (keyed by HTTP mcp-session-id, or the sentinel "stdio" for the
+# single stdio-transport session) that have already received their one
+# post-connect list_changed nudge — see _notify_tools_list_changed_once().
+_tools_list_changed_notified_sessions: set[str] = set()
+
+
+async def _notify_tools_list_changed_once() -> None:
+    """Best-effort notifications/tools/list_changed nudge, once per session.
+
+    Sent on the session's first tool call — see the module-level comment
+    above this function's caller (call_tool()) for why that is the
+    furthest-upstream point reachable from here, and what it does and does
+    not solve. Never raises: this must never block or fail a real tool call.
+    """
+    session_key = _get_current_http_session_id() or "stdio"
+    if session_key in _tools_list_changed_notified_sessions:
+        return
+    _tools_list_changed_notified_sessions.add(session_key)
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+        session = request_ctx.get().session
+        await session.send_tool_list_changed()
+        log.info(f"[list-changed] Sent notifications/tools/list_changed to session {session_key!r}")
+    except Exception as exc:
+        log.debug(f"[list-changed] Could not send list_changed to session {session_key!r}: {exc}")
 
 
 def touch_heartbeat():
@@ -4109,6 +4203,10 @@ def _track_tool_outcome(name: str, result: list[TextContent]) -> None:
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Handle tool calls with structured audit logging and capability failure tracking."""
     log.info(f"Tool called: {name}")
+    # Best-effort, once-per-session notifications/tools/list_changed nudge —
+    # see the module-level comment above _notify_tools_list_changed_once()
+    # for what this does and does not solve. Never blocks the real call.
+    await _notify_tools_list_changed_once()
     start_time = time.time()
     try:
         result = await _dispatch_tool(name, arguments)
