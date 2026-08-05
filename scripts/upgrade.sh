@@ -5397,6 +5397,86 @@ PY143
         warn "main-staleness-check.py not found at $MSC_SCRIPT — skipping Migration 143"
     fi
 
+    # Migration 144: Register and schedule agent-channel-abandonment-sweep,
+    # the Type B (cron-direct) sliding-timer abandonment auto-complete
+    # guardrail for the agent channel (source="local-claude"), issue #1525.
+    # The existing 600s claim-liveness timeout (_LOCAL_CLAUDE_STALE_TIMEOUT_SECONDS)
+    # only handles the *reclaim* case — a stale claim is released and the
+    # message moved back to inbox/ for a new claimant. It does not handle a
+    # crashed claimant with no reclaimer: the exchange sits in OPEN forever,
+    # the collaborator polls until its own client-side timeout, and the
+    # server-side state never resolves. This job cross-references
+    # processing/, the claims DB, and agent-replies/ — three data sources
+    # agent-replies-sweep.py's own docstring explicitly disclaims touching —
+    # so it must be a new job, not an extension of that sweep. Runs every 15
+    # minutes; the abandonment window itself defaults to 24h
+    # (LOBSTER_AGENT_CHANNEL_ABANDONMENT_WINDOW_HOURS), so frequent scanning
+    # just keeps the gap between "deadline lapses" and "synthetic reply
+    # exists" small. No MCP restart needed — plain cron script.
+    local _JOBS_FILE_144="$WORKSPACE_DIR/scheduled-jobs/jobs.json"
+    if [ -f "$_JOBS_FILE_144" ]; then
+        if ! uv run python3 -c "import json,sys; d=json.load(open('$_JOBS_FILE_144')); sys.exit(0 if 'agent-channel-abandonment-sweep' in d.get('jobs',{}) else 1)" 2>/dev/null; then
+            substep "Migration 144: adding agent-channel-abandonment-sweep to jobs.json"
+            local _m144_tmp
+            _m144_tmp=$(mktemp)
+            uv run python3 - <<'PY144' "$_JOBS_FILE_144" "$_m144_tmp"
+import json, sys
+from datetime import datetime, timezone
+jobs_path, tmp_path = sys.argv[1], sys.argv[2]
+with open(jobs_path) as f:
+    data = json.load(f)
+data.setdefault("jobs", {})["agent-channel-abandonment-sweep"] = {
+    "name": "agent-channel-abandonment-sweep",
+    "type": "B",
+    "dispatch": "cron-direct",
+    "schedule": "*/15 * * * *",
+    "schedule_human": "Every 15 minutes",
+    "task_file": None,
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+    "enabled": True,
+    "last_run": None,
+    "last_status": None,
+    "description": "Abandonment auto-complete (sliding-timer guardrail, issue #1525) for the agent channel (source=\"local-claude\") — writes a synthetic terminal reply once an OPEN exchange's abandonment deadline (default 24h, env LOBSTER_AGENT_CHANNEL_ABANDONMENT_WINDOW_HOURS) lapses with no write_progress extension and no real reply.",
+}
+with open(tmp_path, "w") as f:
+    json.dump(data, f, indent=2, default=str)
+print("OK")
+PY144
+            if [ -s "$_m144_tmp" ]; then
+                mv "$_m144_tmp" "$_JOBS_FILE_144"
+                substep "Migration 144: agent-channel-abandonment-sweep added to jobs.json"
+                migrated=$((migrated + 1))
+            else
+                rm -f "$_m144_tmp"
+                warn "Migration 144: failed to add agent-channel-abandonment-sweep to jobs.json — add manually"
+            fi
+        else
+            substep "Migration 144: agent-channel-abandonment-sweep already in jobs.json — skipping"
+        fi
+    else
+        substep "Migration 144: $_JOBS_FILE_144 not found — skipping jobs.json registration (will be created at first job run)"
+    fi
+
+    local ABANDONMENT_SWEEP_MARKER="# LOBSTER-AGENT-CHANNEL-ABANDONMENT-SWEEP"
+    local ABANDONMENT_SWEEP_SCRIPT="$LOBSTER_DIR/scheduled-tasks/agent-channel-abandonment-sweep.py"
+    if [ -f "$ABANDONMENT_SWEEP_SCRIPT" ]; then
+        if ! crontab -l 2>/dev/null | grep -qF "$ABANDONMENT_SWEEP_MARKER"; then
+            if ! $DRY_RUN; then
+                "$LOBSTER_DIR/scripts/cron-manage.sh" add "$ABANDONMENT_SWEEP_MARKER" \
+                    "*/15 * * * * cd $LOBSTER_DIR && uv run scheduled-tasks/agent-channel-abandonment-sweep.py >> $WORKSPACE_DIR/scheduled-jobs/logs/agent-channel-abandonment-sweep.log 2>&1 $ABANDONMENT_SWEEP_MARKER"
+                substep "Migration 144: added agent-channel-abandonment-sweep cron entry (every 15 minutes)"
+            else
+                substep "Migration 144 (dry-run): would add agent-channel-abandonment-sweep cron entry"
+            fi
+            migrated=$((migrated + 1))
+        else
+            substep "Migration 144: agent-channel-abandonment-sweep cron entry already present — skipping"
+        fi
+    else
+        substep "Migration 144: agent-channel-abandonment-sweep.py not found — skipping cron entry"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
