@@ -726,6 +726,58 @@ class TestStaleRecoveryExhaustion:
             assert (agent_replies / f"{request_id}.json").exists()
             assert (failed / f"{msg_id}.json").exists()
 
+    def test_fresh_claim_not_finalized_despite_exhausted_count(self, setup_dirs, message_generator):
+        """Regression test for issue #1543 (fast-follow to #1541/#1535).
+
+        A message can legitimately reach `_stale_recovery_count >=
+        _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS` through past stale cycles
+        and then be freshly reclaimed via `claim_and_ack`, which resets
+        `_processing_started_at` on every fresh claim but never resets
+        `_stale_recovery_count`. Gating finalization on the count alone
+        (without checking whether the *current* claim is stale) would close
+        out and archive a message while its 4th, fully live worker is still
+        running — dropping that worker's eventual successful reply. The
+        reaper must leave a fresh, non-stale claim alone regardless of its
+        historical count.
+        """
+        inbox, processing, failed, agent_replies = setup_dirs
+        from src.mcp.inbox_server import _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS
+
+        msg = message_generator.generate_text_message(source="local-claude")
+        msg["request_id"] = msg["id"]
+        msg["_stale_recovery_count"] = _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS
+        # Simulates claim_and_ack's fresh claim: _processing_started_at reset
+        # to "now" (well within the 600s local-claude timeout), while
+        # _stale_recovery_count is carried over from prior stale cycles.
+        msg["_processing_started_at"] = datetime.now(timezone.utc).isoformat()
+        msg_id = msg["id"]
+        request_id = msg["request_id"]
+        msg_file = processing / f"{msg_id}.json"
+        msg_file.write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            FAILED_DIR=failed,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            from src.mcp.inbox_server import _recover_stale_processing
+
+            _recover_stale_processing()
+
+            # Fresh, live claim — must be left alone, not finalized or requeued.
+            assert (processing / f"{msg_id}.json").exists()
+            assert not (inbox / f"{msg_id}.json").exists()
+            assert not (failed / f"{msg_id}.json").exists()
+            assert not (agent_replies / f"{request_id}.json").exists()
+
+            # On-disk message must be unmutated — no premature failure markers.
+            untouched = json.loads((processing / f"{msg_id}.json").read_text())
+            assert untouched.get("_permanently_failed") is not True
+            assert untouched.get("_stale_recovery_exhausted") is not True
+            assert untouched["_stale_recovery_count"] == _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS
+
 
 class TestRetryRecovery:
     """Tests for retry recovery from failed/."""
