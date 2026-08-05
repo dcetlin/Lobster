@@ -2006,6 +2006,26 @@ async def list_tools() -> list[Tool]:
                             "chat_id must still be the real recipient — do not pass chat_id=0."
                         ),
                     },
+                    "error": {
+                        "type": "boolean",
+                        "description": (
+                            "local-claude (agent-channel) only. Set to true when this reply represents a "
+                            "failure, so a polling consumer can detect it without parsing `text`. This is a "
+                            "discriminator on the SAME reply file/slot (~/messages/agent-replies/<request_id>.json) "
+                            "— not a separate error envelope or channel. Omit (or leave false) for a normal "
+                            "successful reply; the written file then has no `error` key at all, unchanged from "
+                            "before this field existed. Ignored for sources other than local-claude."
+                        ),
+                    },
+                    "error_type": {
+                        "type": "string",
+                        "description": (
+                            "local-claude (agent-channel) only. Optional hint about the kind of failure — "
+                            "e.g. \"processing_failed\", \"timeout\", \"internal_error\" — written alongside "
+                            "`error` on the same reply. Purely advisory; any string is accepted. Ignored for "
+                            "sources other than local-claude."
+                        ),
+                    },
                 },
                 "required": ["chat_id", "text"],
             },
@@ -5699,6 +5719,8 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
             request_id=request_id,
             text=text,
             in_reply_to=args.get("message_id"),
+            error=args.get("error"),
+            error_type=args.get("error_type"),
         )
         reply_slot_created = reply_outcome.reply_slot_created
 

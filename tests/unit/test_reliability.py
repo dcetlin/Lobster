@@ -235,6 +235,41 @@ class TestValidateSendReplyArgs:
         assert result["chat_id"] == 123
         assert isinstance(result["chat_id"], int)
 
+    # -- error discriminator (issue #1533) -----------------------------------
+
+    def test_error_field_absent_by_default(self):
+        """No `error` key on input means no `error` key on output — the
+        permissive dict-normalizer pass-through (`{**args, ...}`) must not
+        invent one."""
+        result = validate_send_reply_args({"chat_id": 123, "text": "Hi"})
+        assert "error" not in result
+
+    def test_error_field_bool_passes_through(self):
+        result = validate_send_reply_args({"chat_id": 123, "text": "Hi", "error": True})
+        assert result["error"] is True
+
+    def test_error_field_non_bool_raises(self):
+        with pytest.raises(ValidationError, match="error"):
+            validate_send_reply_args({"chat_id": 123, "text": "Hi", "error": "yes"})
+
+    def test_error_type_field_str_passes_through(self):
+        result = validate_send_reply_args(
+            {"chat_id": 123, "text": "Hi", "error": True, "error_type": "timeout"}
+        )
+        assert result["error_type"] == "timeout"
+
+    def test_error_type_field_non_str_raises(self):
+        with pytest.raises(ValidationError, match="error_type"):
+            validate_send_reply_args({"chat_id": 123, "text": "Hi", "error_type": 123})
+
+    def test_error_type_without_error_is_still_valid(self):
+        """error_type is independent of error — no requirement that error=True
+        accompany it at the validation layer (write_reply decides what to do
+        with the combination)."""
+        result = validate_send_reply_args({"chat_id": 123, "text": "Hi", "error_type": "timeout"})
+        assert result["error_type"] == "timeout"
+        assert "error" not in result
+
 
 class TestValidateMessageId:
     def test_valid_id(self):

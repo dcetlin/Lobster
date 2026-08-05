@@ -76,9 +76,11 @@ Written by Lobster to `~/messages/agent-replies/<request_id>.json`.
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `request_id` | string | yes | Echoes the inbound request's request_id — this is what a polling client matches its own request against. |
-| `text` | string | yes | The answer. This is the ONLY thing written to this file — see error/ack semantics below for what happens when there is no answer to give. |
+| `text` | string | yes | The answer. Always present — see error/ack semantics below for what happens when there is no answer to give, and the `error`/`error_type` fields below for how a failure answer is distinguished from a successful one. |
 | `ts` | string | yes | ISO 8601 UTC timestamp of when the reply was written. |
 | `in_reply_to` | string | yes | The inbound message's id (normally equal to request_id). |
+| `error` | boolean | no | Added for the error discriminator (protocol v1.1+): present and `true` when this reply represents a failure, letting you detect it without parsing `text`. Absent — never `false` — on a normal successful reply, so existing replies and existing readers that only look at `text` are unaffected. This is a field on the SAME reply envelope described above, not a separate error file or channel — see error/ack semantics below. |
+| `error_type` | string | no | Added alongside `error` (protocol v1.1+): an optional, purely advisory hint about the kind of failure, e.g. "processing_failed", "timeout", "internal_error". Independent of `error` — may appear without it. Absent when the writer didn't set one. |
 
 ```json
 {
@@ -101,7 +103,11 @@ If you ever see <request_id>.ack.json appear before <request_id>.json, that is a
 
 ### No reply ever arriving is a legitimate, distinguishable outcome — not a bug to work around.
 
-If Lobster crashes or never gets scheduled before your poll timeout, no reply file is ever written. You cannot distinguish 'still working', 'crashed', and 'never seen' from the client side, and the protocol does not try to make you able to — report a client-side timeout as 'no reply', not as a specific failure reason you cannot actually verify. When Lobster *can* still respond after a failure, it writes one normal reply describing the failure in `text` — there is no separate error envelope; failures are answers, delivered the same way successes are.
+If Lobster crashes or never gets scheduled before your poll timeout, no reply file is ever written. You cannot distinguish 'still working', 'crashed', and 'never seen' from the client side, and the protocol does not try to make you able to — report a client-side timeout as 'no reply', not as a specific failure reason you cannot actually verify. When Lobster *can* still respond after a failure, it writes one normal reply describing the failure in `text` — there is no separate error envelope, file, or channel; failures are answers, delivered the same way successes are, in the same single-shot reply slot described above.
+
+### `error`/`error_type` (protocol v1.1+) let you detect a failure reply without parsing `text` — they do not create a second kind of reply.
+
+The reply is still exactly one JSON object, written once, to the same file (<request_id>.json), via the same single-shot slot described above. `error: true` and `error_type` are optional keys ON that object, not a separate envelope, a different file, or a second thing to poll for — the 'no separate error envelope' rule above still holds. Absent `error` (never `error: false`) means success, exactly as before this field existed; a reply written with neither key is byte-for-byte what this protocol has always produced.
 
 ### If Lobster can't verify a reply's destination matches the request's source, it refuses to send rather than guesses.
 

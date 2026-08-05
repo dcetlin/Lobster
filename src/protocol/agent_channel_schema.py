@@ -187,7 +187,7 @@ REPLY_ENVELOPE: dict[str, dict[str, Any]] = {
     "text": {
         "type": "string",
         "required": True,
-        "description": "The answer. This is the ONLY thing written to this file — see error/ack semantics below for what happens when there is no answer to give.",
+        "description": "The answer. Always present — see error/ack semantics below for what happens when there is no answer to give, and the `error`/`error_type` fields below for how a failure answer is distinguished from a successful one.",
     },
     "ts": {
         "type": "string",
@@ -199,6 +199,26 @@ REPLY_ENVELOPE: dict[str, dict[str, Any]] = {
         "type": "string",
         "required": True,
         "description": "The inbound message's id (normally equal to request_id).",
+    },
+    "error": {
+        "type": "boolean",
+        "required": False,
+        "description": (
+            "Added for the error discriminator (protocol v1.1+): present and `true` when this reply "
+            "represents a failure, letting you detect it without parsing `text`. Absent — never `false` "
+            "— on a normal successful reply, so existing replies and existing readers that only look at "
+            "`text` are unaffected. This is a field on the SAME reply envelope described above, not a "
+            "separate error file or channel — see error/ack semantics below."
+        ),
+    },
+    "error_type": {
+        "type": "string",
+        "required": False,
+        "description": (
+            "Added alongside `error` (protocol v1.1+): an optional, purely advisory hint about the kind "
+            "of failure, e.g. \"processing_failed\", \"timeout\", \"internal_error\". Independent of "
+            "`error` — may appear without it. Absent when the writer didn't set one."
+        ),
     },
 }
 
@@ -347,8 +367,24 @@ ERROR_AND_ACK_SEMANTICS = [
             "failure reason you cannot actually verify. When Lobster *can* "
             "still respond after a failure, it writes one normal reply "
             "describing the failure in `text` — there is no separate "
-            "error envelope; failures are answers, delivered the same way "
-            "successes are."
+            "error envelope, file, or channel; failures are answers, "
+            "delivered the same way successes are, in the same single-shot "
+            "reply slot described above."
+        ),
+    },
+    {
+        "name": "error_is_an_in_reply_discriminator",
+        "summary": "`error`/`error_type` (protocol v1.1+) let you detect a failure reply without parsing `text` — they do not create a second kind of reply.",
+        "detail": (
+            "The reply is still exactly one JSON object, written once, to "
+            "the same file (<request_id>.json), via the same single-shot "
+            "slot described above. `error: true` and `error_type` are "
+            "optional keys ON that object, not a separate envelope, a "
+            "different file, or a second thing to poll for — the "
+            "'no separate error envelope' rule above still holds. Absent "
+            "`error` (never `error: false`) means success, exactly as "
+            "before this field existed; a reply written with neither key "
+            "is byte-for-byte what this protocol has always produced."
         ),
     },
     {
