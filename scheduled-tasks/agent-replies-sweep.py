@@ -2,7 +2,7 @@
 """
 Scheduled job: retention sweep for ~/messages/agent-replies/.
 
-The agent channel (source="local-claude", see docs/agent-channel.md) writes
+The agent channel (source="local-claude", see docs/reference/agent-channel.md) writes
 one reply file per request (`<request_id>.json`) and, for delegated
 requests, one ack file (`<request_id>.ack.json`). Nothing currently deletes
 these — the directory grows without bound as long as the channel is used.

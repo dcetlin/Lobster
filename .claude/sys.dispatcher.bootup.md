@@ -1005,7 +1005,7 @@ The `from` field carries sender identity (e.g. `"AlbertLobster"`). The `chat_id`
 
 ### Agent channel (`source: "local-claude"`)
 
-A local Claude Code session (on Dan's laptop, over SSH) talking to the dispatcher machine-to-machine — never appears on Dan's Telegram/Slack. Full protocol: `docs/agent-channel.md` and the agent-channel protocol spec. Detect it the same way as any other source: `msg.get("source") == "local-claude"`. The inbound message also carries `request_id` (conventionally equal to `id`) — this is the correlation key for the reply, not `chat_id`.
+A local Claude Code session (on Dan's laptop, over SSH) talking to the dispatcher machine-to-machine — never appears on Dan's Telegram/Slack. Full protocol: `docs/reference/agent-channel.md` and the agent-channel protocol spec. Detect it the same way as any other source: `msg.get("source") == "local-claude"`. The inbound message also carries `request_id` (conventionally equal to `id`) — this is the correlation key for the reply, not `chat_id`.
 
 **Detection checklist:**
 - `source == "local-claude"` on the inbox message

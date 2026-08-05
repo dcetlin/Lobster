@@ -431,7 +431,7 @@ TASK_REPLIED_DIR = BASE_DIR / "task-replied"
 TASKS_FILE = BASE_DIR / "tasks.json"
 TASK_OUTPUTS_DIR = BASE_DIR / "task-outputs"
 BISQUE_OUTBOX_DIR = BASE_DIR / "bisque-outbox"
-AGENT_REPLIES_DIR = BASE_DIR / "agent-replies"  # agent channel: dispatcher replies to source="local-claude" land here, keyed by request_id (see docs/agent-channel.md)
+AGENT_REPLIES_DIR = BASE_DIR / "agent-replies"  # agent channel: dispatcher replies to source="local-claude" land here, keyed by request_id (see docs/reference/agent-channel.md)
 MESSAGES_DB_PATH = Path(
     os.environ.get("LOBSTER_MESSAGES_DB", str(BASE_DIR / "messages.db"))
 )

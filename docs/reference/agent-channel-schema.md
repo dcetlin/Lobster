@@ -7,7 +7,7 @@ Verify in sync: uv run scripts/generate_agent_channel_docs.py --check -->
 
 Protocol version: `1`. Source value: `"local-claude"`.
 
-This document is generated from `src/protocol/agent_channel_schema.py`, the single canonical schema module for this protocol — it is also what `lobster-chat --schema` prints as JSON and what `lobster-chat --help` summarizes, so all three stay in sync by construction, not by hand-edit discipline. See `docs/agent-channel.md` for the prose walkthrough and operational detail (deploy, retention, observability); this document is the wire-format reference.
+This document is generated from `src/protocol/agent_channel_schema.py`, the single canonical schema module for this protocol — it is also what `lobster-chat --schema` prints as JSON and what `lobster-chat --help` summarizes, so all three stay in sync by construction, not by hand-edit discipline. See `docs/reference/agent-channel.md` for the prose walkthrough and operational detail (deploy, retention, observability); this document is the wire-format reference.
 
 ## Addressing: Dan vs. the Agent
 

@@ -45,7 +45,7 @@ from src.utils.fs import atomic_write_json, atomic_create_json, safe_move  # noq
 # The agent-channel protocol's request_id rules and source name are owned by
 # src/protocol/agent_channel_schema.py — the single canonical schema module
 # that also generates lobster-chat's --schema/--help and
-# docs/agent-channel-schema.md. Importing them here (rather than redefining
+# docs/reference/agent-channel-schema.md. Importing them here (rather than redefining
 # them) means the value this module actually enforces and the value
 # described to an external agent are the same object, not two copies that
 # could drift apart.

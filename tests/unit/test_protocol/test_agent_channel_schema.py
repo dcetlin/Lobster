@@ -5,7 +5,7 @@ discoverability artifacts generated from it:
 
 - scripts/generate_agent_channel_docs.py (the generator itself, in --check mode)
 - scripts/lobster-chat.py --schema / --help (the embedded, generated block)
-- docs/agent-channel-schema.md (the generated doc)
+- docs/reference/agent-channel-schema.md (the generated doc)
 
 These tests exist to catch drift: if someone edits the schema module but
 forgets to regenerate, or hand-edits one of the generated artifacts directly,
@@ -138,7 +138,7 @@ class TestMarkdownRendering:
 
 class TestGeneratedArtifactsInSync:
     """Drift check: fails if the schema module changed but the generated
-    artifacts (docs/agent-channel-schema.md, the embedded block in
+    artifacts (docs/reference/agent-channel-schema.md, the embedded block in
     scripts/lobster-chat.py) were not regenerated to match."""
 
     def test_generator_check_mode_reports_in_sync(self):

@@ -17,7 +17,7 @@ state is used — the agent IS running at the point this hook fires.
     ---
 
 `request_id` is an additional optional frontmatter field, present only when
-`source: local-claude` (the agent channel — see docs/agent-channel.md). It is
+`source: local-claude` (the agent channel — see docs/reference/agent-channel.md). It is
 the correlation id the dispatcher carries into a delegated subagent so that
 subagent can address `send_reply(source="local-claude", request_id=..., ...)`
 at the correct `agent-replies/<request_id>.json` slot. Recorded here purely

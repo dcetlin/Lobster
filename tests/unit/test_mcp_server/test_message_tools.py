@@ -269,7 +269,7 @@ class TestSendReplyLocalClaude:
     """Tests for the agent channel: send_reply(source='local-claude').
 
     A local Claude Code session (SSH) polls ~/messages/agent-replies/<request_id>.json
-    for its answer instead of receiving a Telegram/Slack message. See docs/agent-channel.md.
+    for its answer instead of receiving a Telegram/Slack message. See docs/reference/agent-channel.md.
     """
 
     @pytest.fixture

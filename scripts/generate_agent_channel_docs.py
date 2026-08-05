@@ -4,12 +4,12 @@ Regenerate the external-agent-facing discoverability artifacts for the agent
 channel protocol (source="local-claude") from the single canonical schema
 module, src/protocol/agent_channel_schema.py.
 
-This exists so `lobster-chat --schema`/`--help` and docs/agent-channel-schema.md
+This exists so `lobster-chat --schema`/`--help` and docs/reference/agent-channel-schema.md
 can never drift from each other or from the protocol module they describe —
 they are text baked from the same data, not three hand-maintained copies.
 
 Generates:
-  1. docs/agent-channel-schema.md — fully generated Markdown doc.
+  1. docs/reference/agent-channel-schema.md — fully generated Markdown doc.
   2. scripts/lobster-chat.py — replaces the content between the
      "BEGIN GENERATED SCHEMA" / "END GENERATED SCHEMA" markers with the
      current schema (as a JSON string constant) and CLI help epilog.
@@ -39,7 +39,7 @@ from src.protocol.agent_channel_schema import (  # noqa: E402
     render_markdown,
 )
 
-DOCS_SCHEMA_PATH = REPO_ROOT / "docs" / "agent-channel-schema.md"
+DOCS_SCHEMA_PATH = REPO_ROOT / "docs" / "reference" / "agent-channel-schema.md"
 LOBSTER_CHAT_PATH = REPO_ROOT / "scripts" / "lobster-chat.py"
 
 _BEGIN_MARKER = "# === BEGIN GENERATED SCHEMA (see scripts/generate_agent_channel_docs.py) ==="
