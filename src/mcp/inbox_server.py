@@ -1244,7 +1244,7 @@ def _clear_dispatcher_state_file() -> None:
 
 
 def _write_session_lost_reminder() -> None:
-    """Write a compact-reminder to the inbox on MCP server startup.
+    """Write a session-reconnect reminder to the inbox on MCP server startup.
 
     When the MCP server restarts (e.g. via systemctl restart lobster-mcp-local),
     any dispatcher blocked in wait_for_messages receives a "Session not found"
@@ -1252,6 +1252,15 @@ def _write_session_lost_reminder() -> None:
     function writes a synthetic inbox message so that when the dispatcher
     reconnects and calls wait_for_messages, it immediately receives a prompt
     to re-orient and resume the main loop.
+
+    Message type: "session_reconnect" (postbounce #5 — previously reused
+    "compact-reminder", which caused the dispatcher to unconditionally spawn
+    the 10-15 min compact-catchup subagent even though nothing was actually
+    lost — the dispatcher process survived, only the MCP session did not).
+    "session_reconnect" is its own P0 type (see _INBOX_P0_TYPES) so it keeps
+    the same immediate-delivery priority the old compact-reminder alias
+    relied on, but routes through the lightweight session-reconnect handler
+    in sys.dispatcher.bootup.md instead — no compact-catchup spawn.
 
     Guard: skipped when the dispatcher PID (from dispatcher.pid) is alive.  A
     live PID means Claude Code auto-updated or the HTTP transport briefly
@@ -1263,8 +1272,9 @@ def _write_session_lost_reminder() -> None:
     file seconds before an MCP restart, making a real session loss look like a
     reconnect.
 
-    Idempotent: writing an extra compact-reminder during a real restart is
-    harmless; the dispatcher processes it as a routine self-check message.
+    Idempotent: writing an extra session-reconnect reminder during a real
+    restart is harmless; the dispatcher processes it as a routine self-check
+    message.
 
     Developer mode: when LOBSTER_DEV_MODE=true (or 1), the session-lost
     reminder is suppressed so the developer isn't interrupted during testing.
@@ -1296,19 +1306,20 @@ def _write_session_lost_reminder() -> None:
         reminder = {
             "id": reminder_id,
             "source": "system",
-            "type": "compact-reminder",
+            "type": "session_reconnect",
             "chat_id": 0,
             "task_origin": "internal",
             "text": (
                 "SESSION LOST — The MCP server restarted and your previous session was "
-                "invalidated. Re-orient now: read sys.dispatcher.bootup.md and resume "
-                "the main loop."
+                "invalidated. This is a lightweight reconnect, not a context compaction — "
+                "situational awareness was NOT lost, so do NOT spawn compact-catchup. "
+                "Re-orient now: read sys.dispatcher.bootup.md and resume the main loop."
             ),
             "timestamp": now_utc.isoformat(),
         }
         inbox_file = INBOX_DIR / f"{reminder_id}.json"
         atomic_write_json(inbox_file, reminder)
-        log.info(f"[session-lost] Wrote session-lost-reminder to inbox: {reminder_id}")
+        log.info(f"[session-lost] Wrote session-reconnect reminder to inbox: {reminder_id}")
     except Exception as exc:  # noqa: BLE001
         log.warning(f"[session-lost] Failed to write session-lost-reminder: {exc}")
 
@@ -4976,7 +4987,12 @@ def _enqueue_recovery_notification(msg: dict) -> None:
 # ---------------------------------------------------------------------------
 
 # P0: dispatcher housekeeping — zero-cost, must run before everything else
-_INBOX_P0_TYPES: frozenset[str] = frozenset()
+# "session_reconnect" (postbounce #5): _write_session_lost_reminder() writes
+# type="session_reconnect" directly (no subtype), so it must be listed here
+# rather than in _INBOX_P0_SUBTYPES — it keeps the same immediate-delivery
+# priority the old "compact-reminder" type alias relied on, without routing
+# through the heavyweight compact-catchup handler.
+_INBOX_P0_TYPES: frozenset[str] = frozenset({"session_reconnect"})
 _INBOX_P0_SUBTYPES: frozenset[str] = frozenset({"compact-reminder", "self_check"})
 _INBOX_P0_TEXT_PREFIXES: tuple[str, ...] = ("compact-reminder",)
 

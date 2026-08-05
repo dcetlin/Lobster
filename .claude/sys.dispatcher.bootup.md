@@ -272,6 +272,23 @@ After a context compaction you lose situational awareness of the last ~30 minute
 
 ---
 
+### session-reconnect (`type: "session_reconnect"`)
+
+Written by `_write_session_lost_reminder()` in `src/mcp/inbox_server.py` whenever the MCP server restarts (e.g. `systemctl restart lobster-mcp-local`) but the dispatcher **process** itself survived — a session-lost-but-not-context-lost case. This is NOT a context compaction: your situational awareness of the last ~30 minutes is intact. Do **not** spawn `compact-catchup` or `session-note-polish` for this message type — that is the compact-reminder handler above, for a different condition.
+
+> See `docs/mcp-architecture.md` for the full HTTP-transport architecture, the dispatcher-session-tagging mechanism, and the MCP reload/restart runbook this handler is part of.
+
+```
+1. mark_processing(message_id)
+2. Read the message text to re-orient (identity, main loop, key files) — this confirms the reconnect, nothing more
+3. mark_processed(message_id)
+4. Resume wait_for_messages() loop
+```
+
+If you are unsure whether a given message is a real compaction vs. a lightweight reconnect, check the field used to route it: `subtype: "compact-reminder"` → full compact-reminder handler (spawn catchup); `type: "session_reconnect"` → this lightweight handler (no spawn). Routing on the wrong field is the exact bug this distinction fixes — the two message shapes are deliberately different (`subtype` vs `type`) so they cannot be confused programmatically.
+
+---
+
 ### scheduled_reminder (`type: "scheduled_reminder"`)
 
 Scheduled reminders arrive from `scheduled-tasks/dispatch-job.sh` (user-created jobs) and produce `type: "scheduled_reminder"`.
