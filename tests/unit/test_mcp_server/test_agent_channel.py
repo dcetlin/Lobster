@@ -428,6 +428,46 @@ class TestWriteProgress:
         assert emitter.calls[-1]["severity"] == "info"
         assert emitter.calls[-1]["payload"]["outcome"] == "written"
 
+    # -- Structured status shape (agent-channel protocol v1.1) --------------
+
+    def test_status_text_only_call_writes_null_phase_and_pct(self, tmp_path: Path):
+        """text is the only required field — phase/pct default to null, not
+        absent, so a reader always sees the same three keys regardless of
+        whether the caller supplied them (protocol v1.1: ship the shape
+        now so consumers never have to handle two shapes later)."""
+        claims_db = _FakeClaimsDB({"req-1": "processing"})
+
+        agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="still going",
+            emit_event=_RecordingEmitter(),
+        )
+
+        written = json.loads((tmp_path / "req-1.ack.json").read_text())
+        assert written["text"] == "still going"
+        assert written["phase"] is None
+        assert written["pct"] is None
+
+    def test_phase_and_pct_are_written_when_provided(self, tmp_path: Path):
+        claims_db = _FakeClaimsDB({"req-1": "processing"})
+
+        agent_channel.write_progress(
+            claims_db=claims_db,
+            agent_replies_dir=tmp_path,
+            request_id="req-1",
+            status_text="running tests",
+            emit_event=_RecordingEmitter(),
+            phase="testing",
+            pct=60.0,
+        )
+
+        written = json.loads((tmp_path / "req-1.ack.json").read_text())
+        assert written["phase"] == "testing"
+        assert written["pct"] == 60.0
+        assert written["text"] == "running tests"
+
     # -- last-write-wins overwrite -------------------------------------------
 
     def test_second_open_write_overwrites_first_after_debounce_window(self, tmp_path: Path):

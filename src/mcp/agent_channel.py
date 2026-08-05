@@ -386,6 +386,8 @@ def write_progress(
     request_id: str,
     status_text: str,
     emit_event: EmitEvent,
+    phase: str | None = None,
+    pct: float | None = None,
 ) -> ProgressOutcome:
     """Write a repeatable current-status update for an OPEN local-claude exchange.
 
@@ -393,6 +395,14 @@ def write_progress(
     write_ack() above writes at claim time — with the latest status text.
     Last-write-wins: this is a status field, not an accumulating log (agent-
     channel protocol v1 §1, the "minimal mechanism" decision).
+
+    Structured status shape (agent-channel protocol v1.1): the payload is
+    ``{"phase": ..., "pct": ..., "text": ..., ...}`` rather than a flat
+    ``{"text": ...}``. Only ``text`` (via ``status_text``) is required —
+    ``phase``/``pct`` are optional and default to ``None``/``null``. This
+    shape is shipped now, before write_progress has any live consumers, so
+    a reader never has to handle two different payload shapes for the same
+    file depending on when it was written.
 
     Three guardrails, in order:
 
@@ -499,6 +509,8 @@ def write_progress(
             ack_payload = {
                 "request_id": request_id,
                 "ack": True,
+                "phase": phase,
+                "pct": pct,
                 "text": status_text,
                 "ts": datetime.now(timezone.utc).isoformat(),
             }

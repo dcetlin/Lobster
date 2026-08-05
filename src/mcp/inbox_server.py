@@ -2080,7 +2080,9 @@ async def list_tools() -> list[Tool]:
                 "as the write, so there is no check-then-write race. Debounced: if a "
                 "status was already written for this request_id within the last 10 "
                 "seconds, the call is still accepted (no error) but the filesystem write "
-                "is skipped to bound churn from a spammy caller."
+                "is skipped to bound churn from a spammy caller. "
+                "Payload is structured (protocol v1.1): {phase, pct, text} — only "
+                "status_text is required; phase/pct are optional and default to null."
             ),
             inputSchema={
                 "type": "object",
@@ -2099,6 +2101,21 @@ async def list_tools() -> list[Tool]:
                             "The current-status text to write (e.g. 'still running "
                             "tests, 3/5 done'). Overwrites any previous status for this "
                             "request_id — repeated calls do not accumulate a history."
+                        ),
+                    },
+                    "phase": {
+                        "type": "string",
+                        "description": (
+                            "Optional short phase label (e.g. 'testing', 'writing_pr'). "
+                            "Omit if you have nothing more structured than status_text to "
+                            "report — written as null when absent."
+                        ),
+                    },
+                    "pct": {
+                        "type": "number",
+                        "description": (
+                            "Optional completion percentage (e.g. 60). Omit if unknown — "
+                            "written as null when absent."
                         ),
                     },
                 },
@@ -6179,6 +6196,11 @@ async def handle_write_progress(args: dict) -> list[TextContent]:
     local-claude agent-channel exchange. See agent_channel.write_progress()
     for the full authorization/debounce/message-after-complete design
     (agent-channel protocol v1, §2).
+
+    Structured status shape (agent-channel protocol v1.1): ``phase`` and
+    ``pct`` are optional, nullable fields alongside the required
+    ``status_text`` — see agent_channel.write_progress()'s docstring for why
+    the shape is shipped now rather than left flat.
     """
     try:
         request_id = sanitize_request_id(args.get("request_id"))
@@ -6189,12 +6211,24 @@ async def handle_write_progress(args: dict) -> list[TextContent]:
     if not status_text:
         return [TextContent(type="text", text="Error: status_text is required")]
 
+    phase = args.get("phase")
+    if phase is not None:
+        phase = str(phase).strip() or None
+
+    pct = args.get("pct")
+    if pct is not None:
+        if not isinstance(pct, (int, float)) or isinstance(pct, bool):
+            return [TextContent(type="text", text="Error: pct must be a number (or omitted)")]
+        pct = float(pct)
+
     outcome = agent_channel.write_progress(
         claims_db=_claims_db,
         agent_replies_dir=AGENT_REPLIES_DIR,
         request_id=request_id,
         status_text=status_text,
         emit_event=_emit_mcp_event,
+        phase=phase,
+        pct=pct,
     )
 
     if not outcome.accepted:

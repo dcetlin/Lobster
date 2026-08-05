@@ -60,6 +60,51 @@ class TestHandleWriteProgress:
         assert "req-1.ack.json" in result[0].text
         ack = json.loads((agent_replies / "req-1.ack.json").read_text())
         assert ack["text"] == "3/5 tests passing"
+        # Structured shape (protocol v1.1): phase/pct default to null when
+        # the caller doesn't supply them, not absent.
+        assert ack["phase"] is None
+        assert ack["pct"] is None
+
+    def test_phase_and_pct_are_forwarded_to_the_ack(self, agent_replies: Path):
+        fake_claims = _FakeClaimsDB({"req-phase": "processing"})
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            AGENT_REPLIES_DIR=agent_replies,
+            _claims_db=fake_claims,
+        ):
+            from src.mcp.inbox_server import handle_write_progress
+
+            result = asyncio.run(handle_write_progress({
+                "request_id": "req-phase",
+                "status_text": "running tests",
+                "phase": "testing",
+                "pct": 60,
+            }))
+
+        assert "Status written" in result[0].text
+        ack = json.loads((agent_replies / "req-phase.ack.json").read_text())
+        assert ack["phase"] == "testing"
+        assert ack["pct"] == 60.0
+        assert ack["text"] == "running tests"
+
+    def test_non_numeric_pct_is_rejected(self, agent_replies: Path):
+        fake_claims = _FakeClaimsDB({"req-badpct": "processing"})
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            AGENT_REPLIES_DIR=agent_replies,
+            _claims_db=fake_claims,
+        ):
+            from src.mcp.inbox_server import handle_write_progress
+
+            result = asyncio.run(handle_write_progress({
+                "request_id": "req-badpct",
+                "status_text": "x",
+                "pct": "sixty",
+            }))
+
+        assert "Error" in result[0].text
+        assert "pct" in result[0].text
+        assert not (agent_replies / "req-badpct.ack.json").exists()
 
     def test_no_open_claim_is_refused(self, agent_replies: Path):
         fake_claims = _FakeClaimsDB()  # no row for "req-2"
