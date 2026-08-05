@@ -617,6 +617,110 @@ class TestClaimAndAck:
         assert not (processing / f"{msg_id}.json").exists()
         assert list(outbox.glob("*.json")) == []
 
+    def test_missing_request_id_logs_error_and_alerts(self, dirs, caplog):
+        """A local-claude message refused for missing/invalid request_id must not
+        vanish silently (issue #1532 review fix): mark_processing's gate refuses
+        ANY local-claude message with a logged warning, but claim_and_ack's own
+        request_id validation previously had no log call at all — and
+        source='local-claude' is excluded from health-check USER_FACING_SOURCES,
+        so nothing else would ever surface a message stuck this way. Verify both
+        restored observability signals: a logged error, and a direct alert
+        written via the existing lightweight outbox-alert path."""
+        import logging
+
+        inbox, processing, outbox, sent = dirs
+        msg_id = "1700000000003-mnop3456"
+        msg = {
+            "id": msg_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "hi",
+            "request_id": msg_id,
+            "timestamp": "2026-08-04T10:00:00.000000",
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+        ), patch(
+            "src.mcp.inbox_server._get_owner_chat_id_and_source",
+            return_value=(99999, "telegram"),
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+
+            with caplog.at_level(logging.ERROR):
+                # request_id omitted from args (the message's own request_id
+                # field is irrelevant here — claim_and_ack validates the
+                # caller-supplied args["request_id"], same as send_reply).
+                result = asyncio.run(handle_claim_and_ack({
+                    "message_id": msg_id,
+                    "ack_text": "On it.",
+                    "chat_id": "local-claude",
+                    "source": "local-claude",
+                }))
+
+        assert "Error" in result[0].text
+        assert "request_id" in result[0].text
+
+        # Signal 1: a clear ERROR-level log naming claim_and_ack and the stuck
+        # message, restoring the observability mark_processing's gate has but
+        # claim_and_ack's own request_id check previously lacked.
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any(
+            "claim_and_ack" in r.getMessage() and msg_id in r.getMessage()
+            for r in error_records
+        ), f"Expected an ERROR log naming claim_and_ack and {msg_id}, got: {[r.getMessage() for r in error_records]}"
+
+        # Signal 2: a direct alert delivered via the existing lightweight
+        # outbox-alert path, so the failure surfaces even though local-claude
+        # is excluded from the staleness/health-check sweep.
+        alert_files = list(outbox.glob("*.json"))
+        assert len(alert_files) == 1
+        alert = json.loads(alert_files[0].read_text())
+        assert alert["type"] == "capability_alert"
+        assert msg_id in alert["text"]
+        assert "request_id" in alert["text"]
+
+        # Never claimed — left untouched in inbox/, matching mark_processing's
+        # gate behavior for the same failure class.
+        assert (inbox / f"{msg_id}.json").exists()
+        assert not (processing / f"{msg_id}.json").exists()
+
+    def test_missing_ack_text_returns_clean_error(self, dirs):
+        """ack_text is read directly (args['ack_text']) in multiple places
+        downstream — omitting it must return a clean, actionable error rather
+        than a bare KeyError surfacing after the message is already claimed."""
+        inbox, processing, outbox, sent = dirs
+        msg_id = self._write_inbox_message(inbox)
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+
+            result = asyncio.run(handle_claim_and_ack({
+                "message_id": msg_id,
+                "chat_id": 123456,
+                "source": "telegram",
+                # ack_text intentionally omitted.
+            }))
+
+        assert "Error" in result[0].text
+        assert "ack_text" in result[0].text
+        assert "KeyError" not in result[0].text
+        # Validated before the claim — message must remain in inbox/, untouched.
+        assert (inbox / f"{msg_id}.json").exists()
+        assert not (processing / f"{msg_id}.json").exists()
+
     def test_counter_does_not_increment_for_system_messages(self, dirs):
         """Claiming a system/subagent message via claim_and_ack must NOT increment the counter."""
         inbox, processing, outbox, sent = dirs
