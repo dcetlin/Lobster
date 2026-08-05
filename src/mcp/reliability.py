@@ -52,6 +52,8 @@ from src.utils.fs import atomic_write_json, atomic_create_json, safe_move  # noq
 from src.protocol.agent_channel_schema import (  # noqa: E402
     REQUEST_ID_MAX_LEN as _CANONICAL_REQUEST_ID_MAX_LEN,
     REQUEST_ID_PATTERN as _CANONICAL_REQUEST_ID_PATTERN,
+    AGENT_SLUG_MAX_LEN as _CANONICAL_AGENT_SLUG_MAX_LEN,
+    AGENT_SLUG_PATTERN as _CANONICAL_AGENT_SLUG_PATTERN,
     SOURCE as AGENT_CHANNEL_SOURCE,
 )
 
@@ -98,6 +100,44 @@ def sanitize_request_id(request_id: Any) -> str:
         raise ValidationError(
             "request_id contains invalid characters — only letters, digits, "
             "'-' and '_' are allowed (no path separators or traversal sequences)"
+        )
+    return value
+
+
+# agent-slug doubles as a filesystem path component
+# (agent-replies/by-agent/<agent-slug>/<request_id>) for the durability
+# layer's by-agent pointer mailbox (agent-channel protocol v1, §3.2). Same
+# charset allowlist as request_id, with exactly one normalization exception:
+# case is folded to lowercase rather than rejected, since case is not
+# semantically load-bearing for an identity label (Open Dial 4, resolved
+# 2026-08-05). Everything else — whitespace, path separators, any other
+# out-of-charset character — fails loudly (fail-closed), never silently
+# stripped or substituted.
+_AGENT_SLUG_MAX_LEN = _CANONICAL_AGENT_SLUG_MAX_LEN
+_AGENT_SLUG_PATTERN = re.compile(_CANONICAL_AGENT_SLUG_PATTERN)
+
+
+def sanitize_agent_slug(agent: Any) -> str:
+    """Validate and normalize an `agent` label into a safe by-agent slug.
+
+    Lowercases first (the one normalization exception), then validates
+    against the same charset/length rules as request_id. Raises
+    ValidationError with a descriptive message on invalid input: missing/
+    empty, too long, or containing anything outside [a-z0-9_-] after
+    lowercasing.
+    """
+    if agent is None or not str(agent).strip():
+        raise ValidationError("agent is required")
+    value = str(agent).strip().lower()
+    if len(value) > _AGENT_SLUG_MAX_LEN:
+        raise ValidationError(
+            f"agent slug exceeds max length of {_AGENT_SLUG_MAX_LEN} characters"
+        )
+    if not _AGENT_SLUG_PATTERN.match(value):
+        raise ValidationError(
+            "agent slug contains invalid characters after lowercasing — only "
+            "letters, digits, '-' and '_' are allowed (no path separators, "
+            "whitespace, or traversal sequences)"
         )
     return value
 
