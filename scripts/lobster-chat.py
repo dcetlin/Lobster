@@ -29,6 +29,10 @@ Usage:
     uv run scripts/lobster-chat.py --schema
     uv run scripts/lobster-chat.py --help
 
+    # Freshly-respawned session, no request_id memory, only your own identity?
+    # Discover everything waiting for you (protocol v1, Rung A durability layer):
+    uv run scripts/lobster-chat.py --for glyph
+
 Config (env var or flag, flag wins):
     --host / LOBSTER_CHAT_HOST       VPS hostname (required)
     --user / LOBSTER_CHAT_USER       SSH user (default: lobster)
@@ -37,17 +41,29 @@ Config (env var or flag, flag wins):
     --agent / LOBSTER_CHAT_AGENT     optional identity label (e.g. "glyph") shown
                                       in the dispatcher's inbox instead of a
                                       generic source label (default: unset)
+    --for <agent>                    discovery mode: list and print everything
+                                      waiting for <agent> in
+                                      agent-replies/by-agent/<agent-slug>/ (both
+                                      in-progress and completed exchanges), then
+                                      exit. No new request is sent.
     --schema                         print the protocol schema as JSON and exit
 
 request_id is always printed to stderr immediately after the inbox message is
 written — not only on timeout — so a dropped SSH connection or crashed CLI
 never loses the correlation key needed to check
 ~/messages/agent-replies/<request_id>.json manually later.
+
+While waiting for a reply, the poll loop also watches the sibling
+<request_id>.ack.json progress file (protocol v1, Rung A) and prints its
+status text to stderr whenever it changes, so a long-running exchange shows
+"working…" progress instead of silence. This is purely observational — the
+terminal reply file remains the sole, authoritative completion signal.
 """
 
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -64,6 +80,104 @@ _SCHEMA_JSON = '{\n  "protocol": "lobster-agent-channel",\n  "version": "1",\n  
 
 _HELP_EPILOG = 'Protocol summary (see --schema for the full machine-readable form,\nor docs/reference/agent-channel-schema.md in the lobster repo for the prose version):\n\n  - Every request gets a unique request_id (auto-generated) that is also\n    its reply\'s filename — never reuse one across requests.\n  - Your reply appears at agent-replies/<request_id>.json, written at most\n    once. An intermediate agent-replies/<request_id>.ack.json, if you see\n    one, is a progress note, not the answer — keep polling.\n  - No reply within --timeout is a legitimate outcome (Lobster may still\n    be working, or may have crashed) — this CLI reports it as "no reply",\n    not as a specific failure, because it cannot tell the difference.\n  - This channel never reaches Dan\'s Telegram/Slack, and nothing you send\n    is shown to Dan unless Lobster separately decides to page him.'
 # === END GENERATED SCHEMA ===
+
+
+# request_id charset/length allowlist, mirrored from the schema's
+# request_id_rules block above (^[A-Za-z0-9_-]+$, max 128) — used defensively
+# when interpolating filenames *listed by the remote host itself* (the
+# by-agent discovery directory) back into a second shell command, so a
+# malformed or hostile entry in that directory can't smuggle shell syntax
+# into the follow-up `cat`.
+_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+# Agent-slug charset allowlist for the --for discovery flag and --agent
+# label, per agent-channel-protocol-proposal.md §6 dial 4: case-fold to
+# lowercase (case is not semantically load-bearing), then strict-reject
+# everything outside request_id's own charset — no silent stripping or
+# substitution of invalid characters.
+_AGENT_SLUG_PATTERN = re.compile(r"^[a-z0-9_-]{1,128}$")
+
+
+def normalize_agent_slug(agent: str) -> str:
+    """Normalize an identity string into its by-agent directory slug.
+
+    Case-folds to lowercase, then strict-validates against the same
+    charset/length allowlist request_id already uses
+    (^[A-Za-z0-9_-]{1,128}$, case-insensitive after folding). Raises
+    ValueError (fail-closed) rather than silently stripping or substituting
+    invalid characters — whitespace and special characters must fail loudly,
+    per the protocol proposal's resolved Open Dial 4.
+    """
+    slug = agent.lower()
+    if not _AGENT_SLUG_PATTERN.match(slug):
+        raise ValueError(
+            f"invalid agent identity {agent!r}: must be 1-128 characters "
+            "matching [A-Za-z0-9_-] (case-insensitive, no whitespace)"
+        )
+    return slug
+
+
+def _safe_json_loads(raw: str | None):
+    """Parse `raw` as JSON, tolerating None/empty/malformed input.
+
+    Returns None instead of raising for anything that isn't a clean JSON
+    document — empty string, whitespace-only, absent file (empty stdout from
+    `cat ... 2>/dev/null`), or malformed JSON. Every caller in this module
+    treats "no parseable content yet" as a legitimate, non-error state: an
+    ack file may never appear at all, and a by-agent pointer may reference a
+    content file that hasn't been written yet — both are normal intermediate
+    states, not corruption.
+    """
+    if not raw or not raw.strip():
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def parse_ack_status(raw_text: str | None) -> str | None:
+    """Extract the progress-note text from a raw <request_id>.ack.json read.
+
+    Pure function over the already-fetched file contents so the read loop's
+    print-on-change logic (below) is testable without a real SSH round trip.
+    Returns None when there is nothing to report: empty/missing file,
+    malformed JSON, non-object payload, or an empty/missing `text` field.
+    """
+    ack = _safe_json_loads(raw_text)
+    if not isinstance(ack, dict):
+        return None
+    text = ack.get("text")
+    if not isinstance(text, str):
+        return None
+    text = text.strip()
+    return text or None
+
+
+def format_for_agent_entry(request_id: str, reply_raw: str | None, ack_raw: str | None) -> str:
+    """Format one `--for <agent>` discovery entry as printable text.
+
+    Pure function over the raw file contents already fetched via ssh, so the
+    formatting logic is testable without a real SSH round trip. Prefers the
+    terminal reply when present (it's the authoritative completion signal);
+    falls back to the ack/progress text when the exchange is still open;
+    falls back to a plain "nothing yet" line when neither file has landed —
+    a bare pointer with no content file yet is a legitimate intermediate
+    state (protocol proposal §3.2), not an error.
+    """
+    lines = [f"=== {request_id} ==="]
+    reply = _safe_json_loads(reply_raw)
+    reply_text = reply.get("text") if isinstance(reply, dict) else None
+    if isinstance(reply_text, str) and reply_text.strip():
+        lines.append(f"[reply] {reply_text.strip()}")
+        return "\n".join(lines)
+
+    ack_text = parse_ack_status(ack_raw)
+    if ack_text:
+        lines.append(f"[status] {ack_text} (no reply yet)")
+    else:
+        lines.append("(no reply or status yet)")
+    return "\n".join(lines)
 
 
 def ssh_run(target: str, remote_cmd: str, stdin_text: str | None = None) -> subprocess.CompletedProcess:
@@ -106,6 +220,17 @@ def build_parser() -> argparse.ArgumentParser:
         "For an external agent with no other Lobster context: this is everything needed to "
         "construct a request and interpret a reply.",
     )
+    p.add_argument(
+        "--for",
+        dest="for_agent",
+        default=None,
+        metavar="AGENT",
+        help="Discovery mode: list and print everything waiting for AGENT in "
+        "agent-replies/by-agent/<agent-slug>/ (both in-progress and completed "
+        "exchanges), then exit. No new request is sent. AGENT is lowercase-"
+        "normalized and strict-validated; invalid characters are rejected, "
+        "not silently stripped.",
+    )
     return p
 
 
@@ -131,6 +256,53 @@ def build_request_message(text: str, request_id: str, agent: str | None = None) 
     return message
 
 
+def run_for_agent_discovery(target: str, agent: str) -> int:
+    """`--for <agent>` discovery mode: print everything waiting for `agent`.
+
+    Read-only. Lists agent-replies/by-agent/<agent-slug>/ — small/zero-byte
+    pointer files, one per request_id, written per the durability layer in
+    agent-channel-protocol-proposal.md §3.2 — then cats each referenced
+    request_id's reply/ack content. This is how a freshly-respawned
+    collaborator session that only knows its own identity string (no
+    request_id memory) recovers what was waiting for it.
+
+    Client-only: this reads a path convention the spec defines
+    (agent-replies/by-agent/<slug>/<request_id>) but does not require the
+    server-side write path for that directory to exist yet — an empty or
+    absent directory is handled the same way as "no messages found".
+    """
+    try:
+        slug = normalize_agent_slug(agent)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    by_agent_dir = f"$HOME/messages/agent-replies/by-agent/{slug}"
+    result = ssh_run(target, f'ls -1 "{by_agent_dir}/" 2>/dev/null')
+    request_ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    if result.returncode != 0 or not request_ids:
+        print(f"No messages found for agent '{slug}'.", file=sys.stderr)
+        return 0
+
+    for request_id in request_ids:
+        if not _REQUEST_ID_PATTERN.match(request_id):
+            # Defensive: skip anything the remote directory listing returns
+            # that isn't a well-formed request_id, rather than interpolating
+            # it into the follow-up `cat` command below.
+            print(f"Skipping malformed entry in by-agent dir: {request_id!r}", file=sys.stderr)
+            continue
+        reply_result = ssh_run(
+            target, f'cat "$HOME/messages/agent-replies/{request_id}.json" 2>/dev/null'
+        )
+        ack_result = ssh_run(
+            target, f'cat "$HOME/messages/agent-replies/{request_id}.ack.json" 2>/dev/null'
+        )
+        print(format_for_agent_entry(request_id, reply_result.stdout, ack_result.stdout))
+
+    return 0
+
+
 def main() -> int:
     p = build_parser()
     args = p.parse_args()
@@ -139,8 +311,14 @@ def main() -> int:
         print(_SCHEMA_JSON)
         return 0
 
+    if args.for_agent:
+        if not args.host:
+            print("Error: no host set. Pass --host or set LOBSTER_CHAT_HOST.", file=sys.stderr)
+            return 1
+        return run_for_agent_discovery(f"{args.user}@{args.host}", args.for_agent)
+
     if not args.text:
-        p.error("the following arguments are required: text (unless --schema is given)")
+        p.error("the following arguments are required: text (unless --schema or --for is given)")
 
     if not args.host:
         print("Error: no host set. Pass --host or set LOBSTER_CHAT_HOST.", file=sys.stderr)
@@ -166,7 +344,9 @@ def main() -> int:
     print(f"request_id={request_id}", file=sys.stderr)
 
     reply_path = f"$HOME/messages/agent-replies/{request_id}.json"
+    ack_path = f"$HOME/messages/agent-replies/{request_id}.ack.json"
     deadline = time.monotonic() + args.timeout
+    last_ack_status: str | None = None
     while time.monotonic() < deadline:
         result = ssh_run(target, f'cat "{reply_path}" 2>/dev/null')
         if result.returncode == 0 and result.stdout.strip():
@@ -177,6 +357,20 @@ def main() -> int:
                 continue
             print(reply.get("text", "").strip())
             return 0
+
+        # Protocol v1, Rung A: alongside the authoritative terminal-reply
+        # check above, also poll the sibling .ack.json progress file and
+        # print its status to stderr whenever it changes, so a long-running
+        # exchange shows "working…" instead of silence. Print-on-change only
+        # (dedupe repeated identical status) — this is purely observational
+        # and never affects the loop's completion condition.
+        ack_result = ssh_run(target, f'cat "{ack_path}" 2>/dev/null')
+        if ack_result.returncode == 0:
+            ack_status = parse_ack_status(ack_result.stdout)
+            if ack_status and ack_status != last_ack_status:
+                print(f"[status] {ack_status}", file=sys.stderr)
+                last_ack_status = ack_status
+
         time.sleep(args.interval)
 
     print(
