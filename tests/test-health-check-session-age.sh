@@ -22,6 +22,8 @@
 #  10. Boot grace suppression: caller suppresses check during boot grace period
 #      (check_session_age itself does not implement boot grace — suppression is in main())
 #  11. No Telegram alert sent on SIGTERM (alert removed — routine rotation is not actionable)
+#  12. Restart-coordination lock (issue #1537): held by another process → SIGTERM
+#      skipped, returns 0, target process survives (manual/automatic restart collision)
 #
 # Usage: bash tests/test-health-check-session-age.sh
 #===============================================================================
@@ -87,6 +89,9 @@ send_telegram_alert_deduped() {
 DISPATCHER_SESSION_START_FILE="$TEST_DATA_DIR/$DISPATCHER_SESSION_START_FILENAME"
 DISPATCHER_PID_FILE="$TEST_CONFIG_DIR/$DISPATCHER_PID_FILENAME"
 ALERT_DEDUP_DIR="$TEST_TMPDIR/alert-dedup"
+# Restart-coordination lock (issue #1537): isolate from the production lock
+# path and from other concurrently-running test suites.
+RESTART_COORDINATION_LOCK_FILE="$TEST_TMPDIR/restart-coordination.lock"
 
 # Load check_session_age() from the health check script.
 # We extract just the function to avoid sourcing the entire ~2000-line file.
@@ -231,6 +236,41 @@ if [[ ! -f "$TELEGRAM_ALERTS_FILE" ]] || ! grep -q "proactive-session-restart" "
     pass
 else
     fail "unexpected Telegram alert fired — routine rotation should produce no Telegram alert"
+fi
+
+# 12. Restart-coordination lock held by another process (issue #1537) →
+#     SIGTERM is skipped, returns 0, and the target process survives. This
+#     is the failure-injection scenario: a manual restart (restart-mcp.sh /
+#     dispatcher-refresh.sh) is in flight and holds the shared lock, so the
+#     automatic session-age SIGTERM must defer rather than race it.
+begin_test "restart_lock_held_skips_sigterm"
+reset_state
+rm -f "$RESTART_COORDINATION_LOCK_FILE"
+sleep 600 &
+target_pid=$!
+echo "$target_pid" > "$DISPATCHER_PID_FILE"
+past_start=$(( $(date +%s) - SESSION_AGE_LIMIT_SECONDS - 60 ))
+echo "$past_start" > "$DISPATCHER_SESSION_START_FILE"
+# Simulate a concurrent manual restart holding the shared lock: a
+# subshell acquires it via flock and sleeps, keeping the fd open.
+(
+    exec 201>"$RESTART_COORDINATION_LOCK_FILE"
+    flock -n 201 || exit 1
+    sleep 5
+) &
+lock_holder_pid=$!
+sleep 0.5  # let the subshell acquire the lock before check_session_age runs
+check_session_age
+rc=$?
+still_alive=false
+kill -0 "$target_pid" 2>/dev/null && still_alive=true
+kill "$target_pid" 2>/dev/null || true
+kill "$lock_holder_pid" 2>/dev/null || true
+wait "$lock_holder_pid" 2>/dev/null || true
+if [[ $rc -eq 0 && "$still_alive" == "true" ]]; then
+    pass
+else
+    fail "expected return 0 and target PID to survive (lock held), got rc=$rc still_alive=$still_alive"
 fi
 
 #===============================================================================

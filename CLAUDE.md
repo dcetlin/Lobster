@@ -356,13 +356,14 @@ Always use the safe wrapper script instead:
 
 This script writes a warning to the inbox before restarting, giving the dispatcher a chance to see the notification. Combined with the session-lost-reminder written on server startup (Fix 1), the dispatcher has two opportunities to receive recovery guidance.
 
+**Restart coordination (issue #1537):** `restart-mcp.sh`, `dispatcher-refresh.sh`, and health-check-v3.sh's automatic restart paths (`do_restart()`, `check_session_age()`) all contend for one shared, non-blocking lock (`scripts/restart-lock-lib.sh`) before acting. A manual restart run while an automatic one is already in flight (or vice versa) aborts immediately instead of racing it — this was a real collision surfaced by failure-injection testing, not a hypothetical.
+
 ## Dispatcher CLI Restart — IMPORTANT
 
 `restart-mcp.sh` restarts only the **MCP server** (`lobster-mcp-local`), NOT the dispatcher CLI — they are separate processes. Restarting the MCP server does **not** refresh the dispatcher's tool-discovery cache or re-read bootup docs. So after a deploy that **adds or changes MCP tools**, the running dispatcher won't see them until the **CLI itself** is bounced — and you should verify a new tool is actually *callable* post-deploy (via ToolSearch), not just that the code merged.
 
-Safe dispatcher refresh (graceful, auto-respawns a fresh session):
+Safe dispatcher refresh (graceful, auto-respawns a fresh session, and coordinates with any concurrent automatic restart via the shared lock — see above):
 ```bash
-PID=$(cat ~/messages/config/dispatcher.pid)
-kill -0 "$PID" && kill -TERM "$PID"   # kill -0 first — skip if already gone
+~/lobster/scripts/dispatcher-refresh.sh
 ```
-`lobster-claude.service` (systemd) + `scripts/claude-persistent.sh` relaunch a brand-new `claude` session (never `--continue`), so bootup docs are re-read and the tool cache rebuilds. Same pattern `scripts/health-check-v3.sh:check_session_age()` uses for ~2h session rotation. Do **not** use `tmux kill-session` (no respawn) or `systemctl restart lobster-claude` (hard-restart escalation) for a routine refresh.
+Under the hood this reads `~/messages/config/dispatcher.pid`, verifies the process is alive, acquires the restart-coordination lock, and sends `kill -TERM` to it. `lobster-claude.service` (systemd) + `scripts/claude-persistent.sh` relaunch a brand-new `claude` session (never `--continue`), so bootup docs are re-read and the tool cache rebuilds. Same pattern `scripts/health-check-v3.sh:check_session_age()` uses for ~2h session rotation. Do **not** use `tmux kill-session` (no respawn) or `systemctl restart lobster-claude` (hard-restart escalation) for a routine refresh, and do **not** hand-run `kill -TERM` on the PID directly — that bypasses the coordination lock and can race an automatic restart.

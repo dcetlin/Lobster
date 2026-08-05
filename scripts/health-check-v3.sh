@@ -209,6 +209,20 @@ OUTBOX_HISTORICAL_CUTOFF=3600        # Skip files > 1 hour (dead-letter candidat
 LOG_FILE="$WORKSPACE_DIR/logs/health-check.log"
 LOCK_FILE="${LOBSTER_HEALTH_LOCK:-$WORKSPACE_DIR/logs/health-check-v3.lock}"
 
+# Restart-coordination lock (issue #1537): shared with scripts/restart-mcp.sh
+# and scripts/dispatcher-refresh.sh (see scripts/restart-lock-lib.sh) so a
+# manual restart and an automatic one (do_restart(), check_session_age())
+# never fire concurrently against the same dispatcher session. This is a
+# DIFFERENT lock from LOCK_FILE above: LOCK_FILE prevents two health-check
+# runs from overlapping; RESTART_COORDINATION_LOCK_FILE prevents a
+# health-check-triggered restart from overlapping a manually-triggered one.
+# Not sourced from restart-lock-lib.sh — the acquire/release sequence is
+# duplicated inline in do_restart() and check_session_age() so those
+# functions remain unit-testable via single-function `sed` extraction (see
+# tests/test-health-check-session-age.sh). Both implementations MUST target
+# the same file path convention to actually contend with one another.
+RESTART_COORDINATION_LOCK_FILE="${LOBSTER_RESTART_LOCK:-$MESSAGES_DIR/config/restart-coordination.lock}"
+
 CLAUDE_SESSION_LOG="$WORKSPACE_DIR/logs/claude-session.log"
 LIMIT_WAIT_STATE_FILE="$WORKSPACE_DIR/logs/health-limit-wait-state"
 
@@ -270,6 +284,7 @@ mkdir -p "$(dirname "$LOG_FILE")"
 mkdir -p "$(dirname "$RESTART_STATE_FILE")"
 mkdir -p "$ALERT_DEDUP_DIR"
 mkdir -p "$(dirname "$LOCK_FILE")"
+mkdir -p "$(dirname "$RESTART_COORDINATION_LOCK_FILE")"
 
 # Dry-run gate: skip all real actions when LOBSTER_HEALTH_CHECK_DRY_RUN=1.
 # Used by tests to exercise parsing/reading logic without executing systemctl,
@@ -1860,6 +1875,21 @@ check_session_age() {
         return 0
     fi
 
+    # Restart coordination (issue #1537): a manual restart (restart-mcp.sh or
+    # dispatcher-refresh.sh) may be sending its own signal to this same
+    # dispatcher process concurrently. Acquire the shared, non-blocking
+    # restart-coordination lock before sending SIGTERM; if another restart
+    # path already holds it, skip this cycle rather than race it — the next
+    # health check run (within 4 minutes) will re-evaluate session age.
+    local _restart_lock_file="${RESTART_COORDINATION_LOCK_FILE:-/tmp/lobster-restart-coordination.lock}"
+    mkdir -p "$(dirname "$_restart_lock_file")" 2>/dev/null
+    exec 201>"$_restart_lock_file"
+    if ! flock -n 201; then
+        log_warn "Session age: another restart is already in progress (lock: $_restart_lock_file) — skipping SIGTERM this cycle"
+        exec 201>&- 2>/dev/null || true
+        return 0
+    fi
+
     # Send SIGTERM. The Stop hook fires, writes the tombstone, and claude-persistent.sh
     # restarts Claude. This is a graceful exit, not a crash.
     if kill -TERM "$dispatcher_pid" 2>/dev/null; then
@@ -1873,9 +1903,11 @@ check_session_age() {
         # Delete the start timestamp so a subsequent health check run (within the
         # next 4 minutes) does not send a second SIGTERM before the restart completes.
         rm -f "$DISPATCHER_SESSION_START_FILE" 2>/dev/null || true
+        exec 201>&- 2>/dev/null || true
         return 1
     else
         log_warn "Session age: SIGTERM to PID $dispatcher_pid failed (process may have exited already)"
+        exec 201>&- 2>/dev/null || true
         return 0
     fi
 }
@@ -1980,6 +2012,27 @@ Manual intervention required:
 \`lobster restart\`"
         fi
         return 1
+    fi
+
+    # Restart coordination (issue #1537): a manual restart (restart-mcp.sh or
+    # dispatcher-refresh.sh) may already be in flight against this same
+    # dispatcher session. Acquire the shared, non-blocking restart-
+    # coordination lock before touching systemd/tmux/PIDs below; if another
+    # restart path already holds it, defer — the next health check run
+    # (within 4 minutes) will re-evaluate whether a restart is still needed.
+    local _restart_lock_file="${RESTART_COORDINATION_LOCK_FILE:-/tmp/lobster-restart-coordination.lock}"
+    mkdir -p "$(dirname "$_restart_lock_file")" 2>/dev/null
+    exec 201>"$_restart_lock_file"
+    if ! flock -n 201; then
+        log_warn "RESTART LOCK: Skipping restart — another restart is already in progress (lock: $_restart_lock_file). Reason: $reason"
+        if [[ "$suppress_alert" != "true" ]]; then
+            send_telegram_alert_deduped "restart-lock-held" "Health check deferred restart: another restart (manual or automatic) is already in progress.
+
+Reason that triggered this restart: $reason
+
+The restart has been skipped to avoid colliding with the in-flight one. If the problem persists, the next health check will re-evaluate."
+        fi
+        return 0
     fi
 
     # If restarting for stale inbox, record which files triggered it
@@ -2171,6 +2224,7 @@ Manual intervention required to kill the process before restarting:
 
 Reason: $reason
 Status: Restarted, but new stale messages detected post-restart"
+                exec 201>&- 2>/dev/null || true
                 return 0
             fi
         fi
@@ -2186,6 +2240,7 @@ Status: Restarted successfully"
         else
             log_info "Post-restart Telegram alert suppressed (compaction window active)"
         fi
+        exec 201>&- 2>/dev/null || true
         return 0
     else
         local svc_timeout_s=$(( max_svc_attempts * 3 ))
@@ -2213,6 +2268,7 @@ Reason: $reason
 Detail: $not_ready_detail
 System may still be initializing. Check \`lobster status\` in a moment."
         fi
+        exec 201>&- 2>/dev/null || true
         return 1
     fi
 }
