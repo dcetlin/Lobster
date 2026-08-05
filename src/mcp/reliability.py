@@ -204,6 +204,15 @@ def validate_send_reply_args(args: dict) -> dict:
             f"error_type must be a string, got {type(args['error_type']).__name__}"
         )
 
+    # Deliberately NOT enforced: consistency between `error`/`error_type` and the
+    # semantic content of `text` (e.g. rejecting error=True with text that reads
+    # like a success, or vice versa). That would require judging free-text prose
+    # against a boolean flag — inherently a content-interpretation problem, not a
+    # type/shape check this validation boundary can do deterministically. Callers
+    # (see sys.subagent.bootup.md "Reporting a failed task" and
+    # sys.dispatcher.bootup.md "Local-claude originated failures") are responsible
+    # for setting `error` consistently with what `text` says.
+
     return normalized_args
 
 
