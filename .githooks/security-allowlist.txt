@@ -45,8 +45,8 @@ uv.lock:Phone number
 
 # iva-deployer documents env var names (HCLOUD_TOKEN, SECRET_KEY) as configuration
 # references — not actual credential values
-agents/iva-deployer.md:Hardcoded token
-agents/iva-deployer.md:Hardcoded secret
+.claude/agents/iva-deployer.md:Hardcoded token
+.claude/agents/iva-deployer.md:Hardcoded secret
 
 # kissinger bins contain a pre-existing email address used as a contact reference
 lobster-shop/kissinger/bin/kissinger:Email address
