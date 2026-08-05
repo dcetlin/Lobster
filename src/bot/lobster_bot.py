@@ -197,6 +197,13 @@ OUTBOX_DIR = _MESSAGES / "outbox"
 AUDIO_DIR = _MESSAGES / "audio"
 IMAGES_DIR = _MESSAGES / "images"
 DEAD_LETTER_DIR = _MESSAGES / "dead-letter"
+# Filesystem-visible delivery audit trail (issue #1538). Mirrors the
+# inbox/ -> processing/ -> processed/ lifecycle convention: once a Telegram
+# send is confirmed, the outbox file is recorded here instead of just being
+# deleted, so delivery is confirmable without shelling into journalctl.
+# Same directory src/mcp/inbox_server.py already writes enqueue-time copies
+# into (SENT_DIR there) — this call site adds the delivery-confirmed record.
+SENT_DIR = _MESSAGES / "sent"
 # Voice messages are written here first; the transcription worker picks them up,
 # runs whisper.cpp, and moves the enriched message to INBOX_DIR automatically.
 PENDING_TRANSCRIPTION_DIR = _MESSAGES / "pending-transcription"
@@ -438,6 +445,7 @@ OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 DEAD_LETTER_DIR.mkdir(parents=True, exist_ok=True)
+SENT_DIR.mkdir(parents=True, exist_ok=True)
 PENDING_TRANSCRIPTION_DIR.mkdir(parents=True, exist_ok=True)
 LOBSTER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1852,6 +1860,38 @@ def build_inline_keyboard(buttons: list) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+def _mark_delivered(filepath: str, reply: dict) -> None:
+    """Record a confirmed Telegram delivery in SENT_DIR, then remove the outbox file.
+
+    Closes the outbox->sent audit-trail gap (issue #1538): previously a delivered
+    outbox file was simply ``os.remove``'d, leaving no filesystem trace that the
+    send succeeded — confirmation was only available via journalctl. This mirrors
+    the inbox/ -> processing/ -> processed/ lifecycle pattern already used
+    elsewhere in the message pipeline.
+
+    Pure side-effecting boundary function: takes the already-successful reply
+    dict, stamps it with a delivery timestamp, and writes it to SENT_DIR under
+    the same filename the outbox file had. If the SENT_DIR write fails for any
+    reason, the outbox file is still removed (a filesystem hiccup recording the
+    audit trail must never block outbox draining or cause duplicate re-delivery).
+
+    Args:
+        filepath: Path to the outbox file that was just successfully delivered.
+        reply: The parsed reply dict that was sent.
+    """
+    try:
+        record = {**reply, "delivered_at": datetime.now(timezone.utc).isoformat()}
+        dest = SENT_DIR / Path(filepath).name
+        atomic_write_json(dest, record)
+    except Exception as exc:
+        log.warning(f"Could not write delivery record to {SENT_DIR} for {filepath}: {exc}")
+    finally:
+        try:
+            os.remove(filepath)
+        except OSError:
+            pass
+
+
 class OutboxHandler(FileSystemEventHandler):
     """Watches outbox for reply files and sends them via Telegram.
 
@@ -1985,7 +2025,7 @@ class OutboxHandler(FileSystemEventHandler):
                     log.info(f"Sent voice note to {chat_id}: {voice_path}")
                     # Delete the OGG temp file now that it's been sent.
                     _cleanup_ogg(voice_path)
-                    os.remove(filepath)
+                    _mark_delivered(filepath, reply)
                     return
                 except Exception as e:
                     log.warning(f"send_voice failed for {chat_id}: {e} — falling back to text")
@@ -2007,7 +2047,7 @@ class OutboxHandler(FileSystemEventHandler):
                         reply_parameters=photo_reply_params,
                     )
                     log.info(f"Sent photo to {chat_id}: {photo_url[:80]}...")
-                    os.remove(filepath)
+                    _mark_delivered(filepath, reply)
                     return
                 except Exception as e:
                     log.warning(f"send_photo failed for {chat_id} ({photo_url[:60]}): {e} — falling back to URL in text")
@@ -2018,7 +2058,7 @@ class OutboxHandler(FileSystemEventHandler):
                     try:
                         await bot_app.bot.send_message(chat_id=chat_id, text=fallback_text)
                         log.info(f"Sent photo URL as text fallback to {chat_id}")
-                        os.remove(filepath)
+                        _mark_delivered(filepath, reply)
                         return
                     except Exception as e2:
                         log.error(f"Fallback text send also failed for {chat_id}: {e2}")
@@ -2046,7 +2086,7 @@ class OutboxHandler(FileSystemEventHandler):
                                 reply_parameters=doc_reply_params,
                             )
                         log.info(f"Sent document to {chat_id}: {doc_path}")
-                        os.remove(filepath)
+                        _mark_delivered(filepath, reply)
                         return
                     except Exception as e:
                         log.error(f"send_document failed for {chat_id} ({doc_path}): {e}", exc_info=True)
@@ -2116,7 +2156,7 @@ class OutboxHandler(FileSystemEventHandler):
                         refresh_session(chat_id)
                     except Exception as _e:
                         log.debug(f"Session refresh failed (non-fatal): {_e}")
-                os.remove(filepath)
+                _mark_delivered(filepath, reply)
             else:
                 log.warning(f"Skipping reply {filepath}: missing chat_id={chat_id}, text={bool(text)}, bot={bool(bot_app)}")
                 os.remove(filepath)
