@@ -1419,6 +1419,79 @@ check_messages_db() {
     return 0
 }
 
+# Check: dancetlin-infra heartbeat cross-monitor (mutual monitoring)
+#
+# ~/dancetlin-infra/health-check.sh writes an epoch timestamp to
+# $DANCETLIN_HEARTBEAT_FILE on every one of its own runs. If that file goes
+# stale, it means the dancetlin-infra monitor itself has stopped running —
+# which is exactly the failure mode a monitor cannot detect about itself.
+# This check lets the Lobster-side monitor watch dancetlin-infra's monitor,
+# and (per the registry entry in watched-things.yaml) dancetlin-infra's
+# monitor is expected to watch Lobster's back the same way.
+#
+# Advisory only — never RED. A stale dancetlin heartbeat means the OTHER
+# monitor is dead, not this one; restarting the Lobster dispatcher would not
+# fix it. Same dedup-throttle shape as check_memory_capability() so a
+# persistent outage doesn't flood Telegram.
+#
+# Returns: 0=OK (or file absent — fresh install, not yet wired up), 1=stale
+# (Telegram alert sent, subject to throttle)
+DANCETLIN_HEARTBEAT_FILE="$WORKSPACE_DIR/dancetlin-health-heartbeat"
+DANCETLIN_HEARTBEAT_STALE_SECONDS=600   # 10 minutes
+DANCETLIN_HEARTBEAT_ALERT_INTERVAL_SECONDS=3600   # Re-alert at most once per hour
+DANCETLIN_HEARTBEAT_FAILURE_FILE="$WORKSPACE_DIR/logs/dancetlin-heartbeat-failures"
+
+check_dancetlin_heartbeat() {
+    if [[ ! -f "$DANCETLIN_HEARTBEAT_FILE" ]]; then
+        log_info "dancetlin heartbeat: file not found at $DANCETLIN_HEARTBEAT_FILE — skipping check (not yet wired up?)"
+        return 0
+    fi
+
+    local raw_ts
+    raw_ts=$(cat "$DANCETLIN_HEARTBEAT_FILE" 2>/dev/null | tr -d '[:space:]')
+    if [[ -z "$raw_ts" ]] || ! [[ "$raw_ts" =~ ^[0-9]+$ ]]; then
+        log_warn "dancetlin heartbeat: unreadable or non-integer content at $DANCETLIN_HEARTBEAT_FILE — skipping check"
+        return 0
+    fi
+
+    local now age
+    now=$(date +%s)
+    age=$(( now - raw_ts ))
+
+    if [[ $age -le $DANCETLIN_HEARTBEAT_STALE_SECONDS ]]; then
+        rm -f "$DANCETLIN_HEARTBEAT_FAILURE_FILE"
+        log_info "dancetlin heartbeat OK: last update ${age}s ago (threshold: ${DANCETLIN_HEARTBEAT_STALE_SECONDS}s)"
+        return 0
+    fi
+
+    # Stale — record failure and decide whether to alert (same dedup shape
+    # as check_memory_capability()'s failure-counter file).
+    local failure_count=0
+    local last_alert_epoch=0
+    if [[ -f "$DANCETLIN_HEARTBEAT_FAILURE_FILE" ]]; then
+        read -r failure_count last_alert_epoch _ < "$DANCETLIN_HEARTBEAT_FAILURE_FILE" 2>/dev/null || true
+    fi
+    failure_count=$(( ${failure_count:-0} + 1 ))
+    local elapsed_since_alert=$(( now - ${last_alert_epoch:-0} ))
+
+    log_error "dancetlin heartbeat STALE: last update ${age}s ago (threshold: ${DANCETLIN_HEARTBEAT_STALE_SECONDS}s, attempt=$failure_count)"
+
+    if [[ $elapsed_since_alert -ge $DANCETLIN_HEARTBEAT_ALERT_INTERVAL_SECONDS ]]; then
+        echo "$failure_count $now" > "$DANCETLIN_HEARTBEAT_FAILURE_FILE"
+        send_telegram_alert "dancetlin-infra heartbeat is stale (${age}s old, attempt $failure_count).
+
+~/dancetlin-infra/health-check.sh has not updated $DANCETLIN_HEARTBEAT_FILE in over ${DANCETLIN_HEARTBEAT_STALE_SECONDS}s. This means the dancetlin-infra monitor itself may be dead — its own checks (Caddy, Postgres, Cal.com, Umami, backups, certs) are not running.
+
+This is not a Lobster problem and will not be fixed by a Lobster restart. Check the dancetlin-infra cron/health-check.sh directly."
+        log_warn "dancetlin heartbeat alert sent (failure_count=$failure_count)"
+    else
+        echo "$failure_count $last_alert_epoch" > "$DANCETLIN_HEARTBEAT_FAILURE_FILE"
+        log_info "dancetlin heartbeat alert suppressed: last alert was ${elapsed_since_alert}s ago (interval: ${DANCETLIN_HEARTBEAT_ALERT_INTERVAL_SECONDS}s)"
+    fi
+
+    return 1
+}
+
 # Check 12: Memory capability probe — verify memory_store actually works
 #
 # The 2026-03-23 outage showed that a silent ImportError at startup leaves
@@ -2592,6 +2665,12 @@ Update CLAUDE_CODE_OAUTH_TOKEN in ~/lobster-config/config.env, then restart lobs
     # --- messages.db liveness (advisory, BIS-167 Slice 6, never RED) ---
 
     check_messages_db
+
+    # --- dancetlin-infra heartbeat cross-monitor (advisory, never RED) ---
+    # Mutual monitoring: dancetlin-infra's health-check.sh watches Lobster,
+    # this checks that dancetlin-infra's own monitor is still alive.
+
+    check_dancetlin_heartbeat
 
     # --- Memory capability probe (advisory — never RED, but Telegram-alerts) ---
     # Verifies memory_store actually works by attempting a live write.
