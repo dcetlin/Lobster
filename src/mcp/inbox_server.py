@@ -4584,6 +4584,19 @@ def _find_all_message_files(directories: list[Path], message_id: str) -> list[Pa
 # path" — a crash/restart must not produce a second racing writer).
 _LOCAL_CLAUDE_STALE_TIMEOUT_SECONDS = 600  # 10 minutes
 
+# Bounded retry count for _recover_stale_processing()'s own recovery loop
+# (issue #1535). Scoped to the agent channel (source="local-claude") only:
+# it is the only source with a single-shot terminal "exchange"
+# (agent-replies/<request_id>.json) that must eventually resolve from the
+# requester's point of view. Without this bound, a local-claude message that
+# never completes (reclaim, get stuck, recover, repeat) left that exchange
+# OPEN forever — no path ever wrote a terminal reply, unlike the
+# retry-count-bounded permanent-failure path in handle_mark_failed. Other
+# sources (Telegram/Slack/etc.) have no equivalent terminal-exchange concept
+# and are unaffected — this bound and its exhaustion handling apply only when
+# msg["source"] == agent_channel.SOURCE.
+_LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS = 3
+
 
 def _stale_timeout_for_message(msg: dict) -> int:
     """Return the stale processing timeout in seconds based on message source/type.
@@ -4626,6 +4639,110 @@ def _processing_age(f: Path, msg: dict) -> tuple[float, str]:
     return age, "mtime"
 
 
+def _requeue_recovered_message(f: Path, msg: dict, is_local_claude_msg: bool) -> None:
+    """Move a recovered message from processing/ back to inbox/.
+
+    For local-claude messages, writes the (possibly mutated) `msg` dict —
+    rather than a bare rename — so the incremented `_stale_recovery_count`
+    field set by the caller actually lands on disk; a plain rename() would
+    silently drop the in-memory mutation and the bound in
+    _recover_stale_processing() would never be enforceable. Other sources
+    have no such field to persist, so a plain rename is unchanged from
+    before this fix.
+    """
+    dest = INBOX_DIR / f.name
+    if is_local_claude_msg:
+        atomic_write_json(dest, msg)
+        f.unlink(missing_ok=True)
+    else:
+        f.rename(dest)
+
+
+def _finalize_exhausted_local_claude_message(f: Path, msg: dict, recovery_count: int) -> None:
+    """Close out a local-claude exchange that exhausted the reaper's stale-recovery bound.
+
+    Issue #1535: without this, _recover_stale_processing() would move the
+    message back to inbox/ forever — reclaim, get stuck, recover, repeat —
+    and the agent-channel exchange never resolved from the requester's point
+    of view (no terminal reply was ever written to
+    agent-replies/<request_id>.json). This is the reaper's own retry-
+    exhaustion path, distinct from #1525 (the write_progress abandonment
+    sliding-timer — a separate mechanism for a separate failure mode).
+
+    Best-effort arc with one mandatory terminal action (mirrors
+    handle_mark_failed's permanent-failure path): release the claim and
+    archive the message to FAILED_DIR are both best-effort — logged and
+    skipped on failure, never blocking the arc. Writing the terminal reply
+    is the one step that must always be attempted, since it's the only
+    action that actually closes the exchange for the requester.
+    """
+    message_id = f.stem
+    request_id = str(msg.get("request_id") or message_id)
+
+    try:
+        _claims_db.release(message_id)
+    except Exception as _release_err:
+        log.warning(
+            f"_recover_stale_processing: claim release failed for exhausted "
+            f"message {message_id!r} — continuing: {_release_err}"
+        )
+
+    msg["_permanently_failed"] = True
+    msg["_stale_recovery_exhausted"] = True
+    msg["_stale_recovery_count"] = recovery_count
+    msg["_last_error"] = (
+        f"_recover_stale_processing exhausted {recovery_count} recovery "
+        "attempts without the message ever completing "
+        f"(max attempts: {_LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS})."
+    )
+    msg["_last_failed_at"] = datetime.now(timezone.utc).isoformat()
+    try:
+        dest = FAILED_DIR / f.name
+        # Write destination FIRST, then remove source (crash-safe ordering) —
+        # same pattern as handle_mark_failed's permanent-failure branch.
+        atomic_write_json(dest, msg)
+        f.unlink(missing_ok=True)
+    except Exception as _archive_err:
+        log.warning(
+            f"_recover_stale_processing: failed to archive exhausted message "
+            f"{message_id!r} to FAILED_DIR — continuing: {_archive_err}"
+        )
+
+    reply_text = (
+        "This request could not be completed: the dispatcher attempted to "
+        f"process it {recovery_count} times but it never finished (stale-"
+        "processing recovery exhausted). Please retry the request."
+    )
+    try:
+        reply_outcome = agent_channel.write_reply(
+            agent_replies_dir=AGENT_REPLIES_DIR,
+            request_id=request_id,
+            text=reply_text,
+            in_reply_to=message_id,
+            error=True,
+            error_type="stale_recovery_exhausted",
+        )
+        agent_channel.emit_reply_audit(
+            request_id=request_id,
+            reply_slot_created=reply_outcome.reply_slot_created,
+            text_len=len(reply_text),
+            emit_event=_emit_mcp_event,
+        )
+        log.error(
+            f"_recover_stale_processing: exhausted retries for local-claude "
+            f"message {message_id!r} (request_id={request_id!r}) after "
+            f"{recovery_count} attempts — terminal reply written "
+            f"(reply_slot_created={reply_outcome.reply_slot_created})."
+        )
+    except Exception as _reply_err:
+        log.error(
+            f"_recover_stale_processing: FAILED to write terminal reply for "
+            f"exhausted local-claude message {message_id!r} "
+            f"(request_id={request_id!r}): {_reply_err}. Exchange remains "
+            "OPEN from the requester's point of view."
+        )
+
+
 def _recover_stale_processing():
     """Move stale messages from processing/ back to inbox/.
 
@@ -4634,12 +4751,28 @@ def _recover_stale_processing():
 
     Releases the SQLite claim row BEFORE moving back to inbox/ so a fresh
     claim is possible on the next dispatch cycle (issue #1360).
+
+    Bounded for the agent channel (issue #1535): a source="local-claude"
+    message that has already been recovered
+    _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS times, and is about to be
+    recovered again, is instead finalized with a terminal reply — see
+    _finalize_exhausted_local_claude_message(). The check runs once per file,
+    ahead of both recovery paths below, so a message can't dodge the bound by
+    repeatedly qualifying for path 1 (pre-restart) instead of path 2
+    (timeout), or vice versa.
     """
     now = time.time()
     server_start_ts = _SERVER_START_TIME.timestamp()
     for f in PROCESSING_DIR.glob("*.json"):
         try:
             msg = json.loads(f.read_text())
+            is_local_claude_msg = msg.get("source") == agent_channel.SOURCE
+
+            if is_local_claude_msg:
+                prior_recovery_count = msg.get("_stale_recovery_count", 0)
+                if prior_recovery_count >= _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS:
+                    _finalize_exhausted_local_claude_message(f, msg, prior_recovery_count)
+                    continue
 
             # Path 1: message was claimed before this server started — definitively abandoned.
             started_at_str = msg.get("_processing_started_at")
@@ -4649,8 +4782,9 @@ def _recover_stale_processing():
                     if started_at.tzinfo is None:
                         started_at = started_at.replace(tzinfo=timezone.utc)
                     if started_at.timestamp() < server_start_ts:
-                        dest = INBOX_DIR / f.name
-                        f.rename(dest)
+                        if is_local_claude_msg:
+                            msg["_stale_recovery_count"] = msg.get("_stale_recovery_count", 0) + 1
+                        _requeue_recovered_message(f, msg, is_local_claude_msg)
                         log.warning(
                             f"Recovered pre-restart message from processing: {f.name} "
                             f"(type: {msg.get('type', 'text')}, "
@@ -4674,8 +4808,9 @@ def _recover_stale_processing():
                 # Release claim BEFORE moving so a concurrent dispatcher cannot
                 # win a new claim while the file is still in processing/.
                 _claims_db.release(message_id)
-                dest = INBOX_DIR / f.name
-                f.rename(dest)
+                if is_local_claude_msg:
+                    msg["_stale_recovery_count"] = msg.get("_stale_recovery_count", 0) + 1
+                _requeue_recovered_message(f, msg, is_local_claude_msg)
                 log.warning(
                     f"Recovered stale message from processing: {f.name} "
                     f"(type: {msg.get('type', 'text')}, age: {int(age)}s, "
