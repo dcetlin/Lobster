@@ -151,7 +151,7 @@ def main() -> int:
     request_id = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
     message = build_request_message(text, request_id, agent=args.agent)
 
-    inbox_path = f"~/messages/inbox/{request_id}.json"
+    inbox_path = f"$HOME/messages/inbox/{request_id}.json"
     write_cmd = f'f="{inbox_path}"; cat > "$f.tmp" && mv "$f.tmp" "$f"'
     result = ssh_run(target, write_cmd, stdin_text=json.dumps(message))
     if result.returncode != 0:
@@ -165,7 +165,7 @@ def main() -> int:
     # failure, but it shouldn't also be an unrecoverable one for the caller).
     print(f"request_id={request_id}", file=sys.stderr)
 
-    reply_path = f"~/messages/agent-replies/{request_id}.json"
+    reply_path = f"$HOME/messages/agent-replies/{request_id}.json"
     deadline = time.monotonic() + args.timeout
     while time.monotonic() < deadline:
         result = ssh_run(target, f'cat "{reply_path}" 2>/dev/null')

@@ -1867,7 +1867,8 @@ if [ -f "$CLAUDE_SETTINGS" ] && command -v jq >/dev/null 2>&1; then
     #
     # Idempotent: skipped if the HTTP registration already exists.
     local mcp_http_already_registered
-    mcp_http_already_registered=$(claude mcp list 2>/dev/null | grep -c "localhost:8766" || echo "0")
+    mcp_http_already_registered=$(claude mcp list 2>/dev/null | grep -c "localhost:8766" || true)
+    mcp_http_already_registered="${mcp_http_already_registered:-0}"
     if [ "${mcp_http_already_registered:-0}" = "0" ]; then
         # Install / refresh the lobster-mcp-local service
         local mcp_local_template="$LOBSTER_DIR/services/lobster-mcp-local.service.template"
