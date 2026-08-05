@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-def atomic_write_json(path: Path, data: Any, indent: int = 2) -> None:
+def atomic_write_json(path: Path, data: Any, indent: int | None = 2) -> None:
     """Atomically write JSON data to a file.
 
     Uses write-to-temp-then-rename pattern. On POSIX, rename() within the
@@ -22,7 +22,13 @@ def atomic_write_json(path: Path, data: Any, indent: int = 2) -> None:
     Args:
         path: Target file path.
         data: JSON-serializable data.
-        indent: JSON indentation level.
+        indent: JSON indentation level. Pass ``None`` for compact,
+            single-line output — the right choice for files a machine
+            client polls and parses (rather than a human reads), since a
+            pretty-printed multi-line payload silently breaks any reader
+            that assumes one JSON object per line (see
+            ``agent_channel.write_reply``/``write_ack``, which pass
+            ``indent=None`` for exactly this reason).
 
     Raises:
         OSError: If the write or rename fails.
@@ -49,7 +55,7 @@ def atomic_write_json(path: Path, data: Any, indent: int = 2) -> None:
         raise
 
 
-def atomic_create_json(path: Path, data: Any, indent: int = 2) -> bool:
+def atomic_create_json(path: Path, data: Any, indent: int | None = 2) -> bool:
     """Atomically create a JSON file only if it does not already exist.
 
     ``atomic_write_json`` makes each individual write atomic (temp file +
@@ -73,7 +79,9 @@ def atomic_create_json(path: Path, data: Any, indent: int = 2) -> bool:
             directory alongside it (uses ``path.parent`` for the temp file,
             same as ``atomic_write_json``).
         data: JSON-serializable data.
-        indent: JSON indentation level.
+        indent: JSON indentation level. Pass ``None`` for compact,
+            single-line output — see ``atomic_write_json`` for why this
+            matters for machine-polled files.
 
     Returns:
         True if this call created ``path``. False if ``path`` already

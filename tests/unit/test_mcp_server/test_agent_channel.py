@@ -98,6 +98,39 @@ class TestWriteReply:
         )
         assert outcome.reply_path == tmp_path / "req-4.json"
 
+    def test_control_chars_round_trip_to_valid_single_line_json(self, tmp_path: Path):
+        """Regression test for the reported agent-channel JSON-parse bug.
+
+        bloom (external agent-channel collaborator) reported that replies
+        broke its JSON parser with "unterminated string" / zsh "character
+        not in range" errors. Investigation (2026-08-05) found the write
+        path already escapes control characters correctly via
+        ``json.dumps`` (spec-correct regardless of a leaked control byte in
+        `text`) — but the file was pretty-printed (`indent=2`, multi-line),
+        which silently breaks any external reader that isn't fully
+        JSON-aware (e.g. one expecting one JSON object per line). This test
+        locks in the fix: the file must be both (a) valid JSON that
+        round-trips a `text` value containing raw control characters, and
+        (b) written on a single line, so a naive line-oriented reader can
+        never see a truncated/partial object.
+        """
+        nasty_text = "line one\tindented\nline two\rcarriage\x00null\x1bescape"
+        agent_channel.write_reply(
+            agent_replies_dir=tmp_path,
+            request_id="req-nasty",
+            text=nasty_text,
+            in_reply_to=None,
+        )
+        raw = (tmp_path / "req-nasty.json").read_text()
+
+        # Single line: no literal newline byte anywhere in the file content
+        # (the escaped \n *inside* the JSON string is fine — this checks
+        # there's no raw structural newline outside a string).
+        assert "\n" not in raw
+
+        written = json.loads(raw)
+        assert written["text"] == nasty_text
+
 
 class TestEmitReplyAudit:
     def test_won_slot_emits_info_severity(self):
@@ -179,7 +212,10 @@ class TestWriteAck:
         assert ack_file.exists()
         assert not answer_file.exists()  # ack != answer — no code path to the answer slot
 
-        written = json.loads(ack_file.read_text())
+        ack_raw = ack_file.read_text()
+        assert "\n" not in ack_raw  # compact single-line write — see write_reply's docstring
+
+        written = json.loads(ack_raw)
         assert written == {
             "request_id": "req-1",
             "ack": True,
@@ -203,7 +239,7 @@ class TestWriteAck:
     def test_write_failure_returns_warning_and_emits_warn_severity(self, tmp_path: Path, monkeypatch):
         emitter = _RecordingEmitter()
 
-        def _boom(path, data):
+        def _boom(path, data, **kwargs):
             raise OSError("disk full")
 
         monkeypatch.setattr(agent_channel, "atomic_write_json", _boom)

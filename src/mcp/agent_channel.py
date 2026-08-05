@@ -98,6 +98,16 @@ def write_reply(
     gap: the first writer's content lands, every later writer for the same
     request_id is told it lost the race and leaves the existing slot
     untouched.
+
+    Written compact (``indent=None``, single line), not pretty-printed:
+    this file is a machine-to-machine API contract polled by an external
+    reader (``lobster-chat.py`` or an agent's own client), never edited by
+    a human. json.dumps's default `indent=2` is otherwise safe (its
+    escaping is spec-correct regardless of indent), but a pretty-printed,
+    multi-line payload silently breaks any reader that isn't fully
+    JSON-aware — e.g. one that expects one JSON object per line, or reads
+    only the first line of `cat`'s output. Single-line output removes that
+    whole class of external-parser failure at zero cost to us.
     """
     agent_reply = {
         "request_id": request_id,
@@ -106,7 +116,7 @@ def write_reply(
         "in_reply_to": in_reply_to or request_id,
     }
     reply_path = agent_replies_dir / f"{request_id}.json"
-    reply_slot_created = atomic_create_json(reply_path, agent_reply)
+    reply_slot_created = atomic_create_json(reply_path, agent_reply, indent=None)
     if not reply_slot_created:
         log.warning(
             "send_reply(local-claude): reply slot already occupied for "
@@ -204,6 +214,10 @@ def write_ack(
     send_reply(source='local-claude', request_id=..., ...) call must still
     write. This bypasses handle_send_reply entirely so there is no code path
     from this ack into the answer slot.
+
+    Written compact (``indent=None``, single line) for the same reason as
+    ``write_reply`` — see its docstring. Same machine-polled-file class,
+    same failure mode to avoid.
     """
     ack_payload = {
         "request_id": request_id,
@@ -212,7 +226,7 @@ def write_ack(
         "ts": datetime.now(timezone.utc).isoformat(),
     }
     try:
-        atomic_write_json(agent_replies_dir / f"{request_id}.ack.json", ack_payload)
+        atomic_write_json(agent_replies_dir / f"{request_id}.ack.json", ack_payload, indent=None)
         log.info(f"claim_and_ack: local-claude ack written for request {request_id}")
         emit_event(
             "agent_channel.ack",
