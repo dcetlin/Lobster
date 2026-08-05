@@ -4699,7 +4699,15 @@ def _finalize_exhausted_local_claude_message(f: Path, msg: dict, recovery_count:
     try:
         dest = FAILED_DIR / f.name
         # Write destination FIRST, then remove source (crash-safe ordering) —
-        # same pattern as handle_mark_failed's permanent-failure branch.
+        # same pattern as handle_mark_failed's permanent-failure branch. If
+        # atomic_write_json raises, f.unlink() never runs, so `f` is left
+        # exactly as it was on disk (this function only mutates the in-memory
+        # `msg` dict — the source file's on-disk content is untouched until
+        # unlink). That is not an orphan: `f` is still in PROCESSING_DIR with
+        # its original _processing_started_at/_stale_recovery_count, so the
+        # next _recover_stale_processing() pass will find it still stale and
+        # still exhausted, and will retry this same finalize path. Sweep-
+        # recoverable by construction — no separate cleanup needed.
         atomic_write_json(dest, msg)
         f.unlink(missing_ok=True)
     except Exception as _archive_err:
@@ -4754,12 +4762,25 @@ def _recover_stale_processing():
 
     Bounded for the agent channel (issue #1535): a source="local-claude"
     message that has already been recovered
-    _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS times, and is about to be
-    recovered again, is instead finalized with a terminal reply — see
-    _finalize_exhausted_local_claude_message(). The check runs once per file,
-    ahead of both recovery paths below, so a message can't dodge the bound by
-    repeatedly qualifying for path 1 (pre-restart) instead of path 2
-    (timeout), or vice versa.
+    _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS times is finalized with a
+    terminal reply instead of being recovered again — see
+    _finalize_exhausted_local_claude_message().
+
+    Issue #1543 (fast-follow to #1541): the exhaustion check is evaluated
+    *inside* each staleness path, only once that path has already
+    established the CURRENT claim is stale (pre-restart for path 1, or
+    age > timeout for path 2) — never on the historical
+    `_stale_recovery_count` alone. `claim_and_ack` resets
+    `_processing_started_at` on every fresh claim but never resets
+    `_stale_recovery_count`, so a message that legitimately earned count>=3
+    across past stale cycles and was then freshly reclaimed must be left
+    alone while that fresh claim is still live: gating on the count alone
+    would finalize (archive + terminal error reply) a message whose current
+    worker is actively and validly running, dropping its eventual real
+    reply. A message is only finalized when it is BOTH exhausted AND stale
+    right now — this still guarantees a message stuck across 3+ genuine
+    stale cycles eventually closes out (the #1535 guarantee), because each
+    additional stale cycle re-runs this check.
     """
     now = time.time()
     server_start_ts = _SERVER_START_TIME.timestamp()
@@ -4767,12 +4788,7 @@ def _recover_stale_processing():
         try:
             msg = json.loads(f.read_text())
             is_local_claude_msg = msg.get("source") == agent_channel.SOURCE
-
-            if is_local_claude_msg:
-                prior_recovery_count = msg.get("_stale_recovery_count", 0)
-                if prior_recovery_count >= _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS:
-                    _finalize_exhausted_local_claude_message(f, msg, prior_recovery_count)
-                    continue
+            prior_recovery_count = msg.get("_stale_recovery_count", 0)
 
             # Path 1: message was claimed before this server started — definitively abandoned.
             started_at_str = msg.get("_processing_started_at")
@@ -4782,8 +4798,16 @@ def _recover_stale_processing():
                     if started_at.tzinfo is None:
                         started_at = started_at.replace(tzinfo=timezone.utc)
                     if started_at.timestamp() < server_start_ts:
+                        # This claim is genuinely stale (pre-restart) — safe to
+                        # check exhaustion now.
+                        if (
+                            is_local_claude_msg
+                            and prior_recovery_count >= _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS
+                        ):
+                            _finalize_exhausted_local_claude_message(f, msg, prior_recovery_count)
+                            continue
                         if is_local_claude_msg:
-                            msg["_stale_recovery_count"] = msg.get("_stale_recovery_count", 0) + 1
+                            msg["_stale_recovery_count"] = prior_recovery_count + 1
                         _requeue_recovered_message(f, msg, is_local_claude_msg)
                         log.warning(
                             f"Recovered pre-restart message from processing: {f.name} "
@@ -4803,13 +4827,21 @@ def _recover_stale_processing():
             age, age_source = _processing_age(f, msg)
             max_age = _stale_timeout_for_message(msg)
             if age > max_age:
+                # This claim is genuinely stale (timeout) — safe to check
+                # exhaustion now, same rule as path 1 above.
+                if (
+                    is_local_claude_msg
+                    and prior_recovery_count >= _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS
+                ):
+                    _finalize_exhausted_local_claude_message(f, msg, prior_recovery_count)
+                    continue
                 # Extract message_id from filename (strip .json suffix)
                 message_id = f.stem
                 # Release claim BEFORE moving so a concurrent dispatcher cannot
                 # win a new claim while the file is still in processing/.
                 _claims_db.release(message_id)
                 if is_local_claude_msg:
-                    msg["_stale_recovery_count"] = msg.get("_stale_recovery_count", 0) + 1
+                    msg["_stale_recovery_count"] = prior_recovery_count + 1
                 _requeue_recovered_message(f, msg, is_local_claude_msg)
                 log.warning(
                     f"Recovered stale message from processing: {f.name} "
