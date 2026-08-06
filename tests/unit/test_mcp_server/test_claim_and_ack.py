@@ -759,3 +759,137 @@ class TestClaimAndAck:
             assert srv._user_message_counter == 0, (
                 "System/subagent messages must not increment _user_message_counter"
             )
+
+
+class TestClaimAndAckRelationshipStamping:
+    """
+    handle_claim_and_ack stamps a claim-time `relationship` fallback (issue
+    #1536, phase 1). This is the only claim-time opportunity for
+    source="local-claude" messages, since mark_processing refuses that
+    source outright (claim_and_ack is its sole claim path). Additive-only:
+    a write-path test — no reader branches on the field yet.
+    """
+
+    @pytest.fixture
+    def dirs(self, temp_messages_dir: Path):
+        inbox = temp_messages_dir / "inbox"
+        processing = temp_messages_dir / "processing"
+        outbox = temp_messages_dir / "outbox"
+        sent = temp_messages_dir / "sent"
+        sent.mkdir(exist_ok=True)
+        return inbox, processing, outbox, sent
+
+    def test_local_claude_message_stamped_peer_agent(self, dirs):
+        """A local-claude agent-channel message gets relationship='peer_agent'."""
+        inbox, processing, outbox, sent = dirs
+        agent_replies = inbox.parent / "agent-replies"
+        agent_replies.mkdir(exist_ok=True)
+
+        msg_id = "1700000000005-peer0001"
+        msg = {
+            "id": msg_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "what's the status?",
+            "request_id": msg_id,
+            "timestamp": "2026-08-05T10:00:00.000000",
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+            asyncio.run(handle_claim_and_ack({
+                "message_id": msg_id,
+                "ack_text": "On it.",
+                "chat_id": "local-claude",
+                "source": "local-claude",
+                "request_id": msg_id,
+            }))
+
+        claimed = json.loads((processing / f"{msg_id}.json").read_text())
+        assert claimed["relationship"] == "peer_agent"
+
+    def test_telegram_message_stamped_user(self, dirs):
+        """A normal telegram message claimed via claim_and_ack gets relationship='user'."""
+        inbox, processing, outbox, sent = dirs
+        msg_id = self._telegram_msg(inbox)
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+            asyncio.run(handle_claim_and_ack({
+                "message_id": msg_id,
+                "ack_text": "On it.",
+                "chat_id": 123456,
+                "source": "telegram",
+            }))
+
+        claimed = json.loads((processing / f"{msg_id}.json").read_text())
+        assert claimed["relationship"] == "user"
+
+    def test_existing_relationship_is_not_overwritten(self, dirs):
+        """An already-stamped `relationship` field is left untouched by the
+        claim-time fallback."""
+        inbox, processing, outbox, sent = dirs
+        agent_replies = inbox.parent / "agent-replies"
+        agent_replies.mkdir(exist_ok=True)
+
+        msg_id = "1700000000006-peer0002"
+        msg = {
+            "id": msg_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "hi",
+            "request_id": msg_id,
+            "timestamp": "2026-08-05T10:00:00.000000",
+            "relationship": "user",  # deliberately "wrong" to prove no overwrite
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+            asyncio.run(handle_claim_and_ack({
+                "message_id": msg_id,
+                "ack_text": "On it.",
+                "chat_id": "local-claude",
+                "source": "local-claude",
+                "request_id": msg_id,
+            }))
+
+        claimed = json.loads((processing / f"{msg_id}.json").read_text())
+        assert claimed["relationship"] == "user"
+
+    @staticmethod
+    def _telegram_msg(inbox: Path) -> str:
+        msg_id = "1700000000007_telegram_relationship"
+        msg = {
+            "id": msg_id,
+            "source": "telegram",
+            "chat_id": 123456,
+            "type": "text",
+            "text": "Please do the thing",
+            "timestamp": "2026-03-16T10:00:00.000000",
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+        return msg_id

@@ -27,6 +27,9 @@ import re
 from datetime import datetime, timezone
 
 from src.mcp.message_types import INBOX_SYSTEM_TYPES as _SYSTEM_TYPES
+from src.mcp.message_types import INBOX_USER_TYPES as _USER_TYPES
+from src.mcp.message_types import MessageRelationship
+from src.protocol.agent_channel_schema import SOURCE as _AGENT_CHANNEL_SOURCE
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +118,59 @@ _USER_FACING_SOURCES: frozenset[str] = frozenset({
     "whatsapp",
     "bisque",
 })
+
+
+# ---------------------------------------------------------------------------
+# Relationship classification (issue #1536, phase 1)
+# ---------------------------------------------------------------------------
+
+# Types produced by the write_result path (handle_write_result in
+# inbox_server.py) that represent a subagent reporting back to the
+# dispatcher. Checked before source below because external producers such as
+# src/utils/inbox_write.py's write_inbox_message() write these types with
+# source="telegram" for delivery purposes even though the sender is not a
+# user — type is the unambiguous signal here, not source.
+_SUBAGENT_RESULT_TYPES: frozenset[str] = frozenset({
+    "subagent_result",
+    "subagent_error",
+    "subagent_notification",  # DEPRECATED alias for subagent_ack — write_result writes this literal string
+    "subagent_ack",
+})
+
+
+def classify_relationship(msg: dict) -> str | None:
+    """Return the relationship hint for a message, or None when ambiguous.
+
+    Claim-time fallback classifier for external producers (issue #1536,
+    phase 1): extends this module's existing precomputed-hints pattern
+    (same pure/no-I/O, no-LLM shape as build_lobster_meta) with a
+    `relationship` hint. Stamped by the caller as its own flat top-level
+    field on the message (not nested under `_lobster_meta`) — see the
+    phase-1 design note on message_types.MessageRelationship. Callers must
+    only apply this fallback when `relationship` is not already present on
+    the message (e.g. handle_write_result's ingestion-time stamp takes
+    precedence over this fallback).
+
+    Priority order (first match wins):
+      1. type is a write_result-path subagent type (_SUBAGENT_RESULT_TYPES)
+         -> MessageRelationship.SUBAGENT.
+      2. source is the local-claude agent channel -> MessageRelationship.PEER_AGENT.
+      3. source is a real user-facing channel AND type is a user-content type
+         -> MessageRelationship.USER.
+      4. Otherwise -> None (ambiguous cases are left unstamped, not guessed).
+
+    Phase 1 is stamp-only: no reader branches on this field yet.
+    """
+    msg_type: str = (msg.get("type") or "").strip()
+    source: str = (msg.get("source") or "").strip()
+
+    if msg_type in _SUBAGENT_RESULT_TYPES:
+        return MessageRelationship.SUBAGENT.value
+    if source == _AGENT_CHANNEL_SOURCE:
+        return MessageRelationship.PEER_AGENT.value
+    if source in _USER_FACING_SOURCES and msg_type in _USER_TYPES:
+        return MessageRelationship.USER.value
+    return None
 
 
 def _classify_intent(text: str, msg_type: str) -> str:

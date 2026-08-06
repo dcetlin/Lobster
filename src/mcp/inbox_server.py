@@ -765,8 +765,9 @@ from message_types import (  # noqa: E402 — placed after path-setup at top of 
     INBOX_MESSAGE_TYPES,
     INBOX_MESSAGE_SOURCES,
     USER_FACING_TYPES,
+    MessageRelationship,
 )
-from lobster_meta import build_lobster_meta  # noqa: E402 — same path-setup above
+from lobster_meta import build_lobster_meta, classify_relationship  # noqa: E402 — same path-setup above
 
 # ---------------------------------------------------------------------------
 # Message type normalization (issue #635)
@@ -6385,6 +6386,16 @@ async def handle_mark_processing(args: dict) -> list[TextContent]:
         # _lobster_meta: fast heuristic classification (<5ms, no LLM calls).
         # Fields are hints only — dispatcher must never trust them blindly.
         msg_data["_lobster_meta"] = build_lobster_meta(msg_data)
+        # relationship (issue #1536, phase 1): claim-time fallback for
+        # external producers whose messages arrive here without an
+        # ingestion-time stamp (e.g. telegram/slack/sms bots). Only applied
+        # when absent — never overwrites an ingestion-time stamp (e.g.
+        # write_result's). Ambiguous cases are left unstamped. Stamp-only:
+        # no reader branches on this field yet.
+        if "relationship" not in msg_data:
+            _relationship_hint = classify_relationship(msg_data)
+            if _relationship_hint:
+                msg_data["relationship"] = _relationship_hint
         atomic_write_json(dest, msg_data)
     except Exception:
         pass  # non-fatal; stale recovery falls back to mtime
@@ -6512,6 +6523,20 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
 
     # Stamp actual processing start time so stale detection uses it
     msg_data["_processing_started_at"] = datetime.now(timezone.utc).isoformat()
+
+    # relationship (issue #1536, phase 1): claim-time fallback. claim_and_ack
+    # is the sole claim path for source="local-claude" (mark_processing
+    # refuses it — see that handler's docstring), so this is also the only
+    # claim-time opportunity to stamp peer_agent messages. Only applied when
+    # absent; ambiguous cases are left unstamped. Stamp-only: no reader
+    # branches on this field yet.
+    if "relationship" not in msg_data:
+        try:
+            _relationship_hint = classify_relationship(msg_data)
+            if _relationship_hint:
+                msg_data["relationship"] = _relationship_hint
+        except Exception:
+            pass  # non-fatal; classification is a best-effort hint
 
     # Atomic move to processing/ (consequence of won claim)
     dest = PROCESSING_DIR / found.name
@@ -8835,6 +8860,12 @@ async def handle_write_result(args: dict) -> list[TextContent]:
         "status": status,
         "sent_reply_to_user": bool(sent_reply_to_user),
         "timestamp": now.isoformat(),
+        # relationship (issue #1536, phase 1): write_result is definitionally
+        # the ingestion point for subagent-to-dispatcher messages, so the
+        # source is unambiguous here — stamp it directly rather than relying
+        # on the claim-time fallback classifier. Stamp-only: no reader
+        # branches on this field yet.
+        "relationship": MessageRelationship.SUBAGENT.value,
     }
     if msg_type == "subagent_notification":
         message["warning"] = "User already received the subagent's reply. Don't summarize it. If you respond, add new value only — a question, a correction, missing context."
