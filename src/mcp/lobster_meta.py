@@ -31,6 +31,14 @@ from src.mcp.message_types import INBOX_USER_TYPES as _USER_TYPES
 from src.mcp.message_types import MessageRelationship
 from src.protocol.agent_channel_schema import SOURCE as _AGENT_CHANNEL_SOURCE
 
+# Cross-Lobster bot-to-bot source (issue #1350). Structurally the same
+# relationship as the local-claude agent channel below (dispatcher talking to
+# another agent, not a human) but the peer is a remote Lobster's dispatcher
+# over the bot-talk HTTP channel rather than a local Claude Code session.
+# message_types.py owns INBOX_MESSAGE_SOURCES but doesn't export this as a
+# named constant (unlike _AGENT_CHANNEL_SOURCE), so it's defined here.
+_BOT_TALK_SOURCE: str = "bot-talk"
+
 
 # ---------------------------------------------------------------------------
 # Intent class — keyword patterns (checked in order; first match wins)
@@ -154,7 +162,11 @@ def classify_relationship(msg: dict) -> str | None:
     Priority order (first match wins):
       1. type is a write_result-path subagent type (_SUBAGENT_RESULT_TYPES)
          -> MessageRelationship.SUBAGENT.
-      2. source is the local-claude agent channel -> MessageRelationship.PEER_AGENT.
+      2. source is a peer-agent channel — either the local-claude agent
+         channel (a local Claude Code session over SSH) or bot-talk (another
+         Lobster's dispatcher talking to this one over HTTP) — both are
+         structurally the same relationship, just local vs. remote
+         -> MessageRelationship.PEER_AGENT.
       3. source is a real user-facing channel AND type is a user-content type
          -> MessageRelationship.USER.
       4. Otherwise -> None (ambiguous cases are left unstamped, not guessed).
@@ -166,7 +178,7 @@ def classify_relationship(msg: dict) -> str | None:
 
     if msg_type in _SUBAGENT_RESULT_TYPES:
         return MessageRelationship.SUBAGENT.value
-    if source == _AGENT_CHANNEL_SOURCE:
+    if source in (_AGENT_CHANNEL_SOURCE, _BOT_TALK_SOURCE):
         return MessageRelationship.PEER_AGENT.value
     if source in _USER_FACING_SOURCES and msg_type in _USER_TYPES:
         return MessageRelationship.USER.value

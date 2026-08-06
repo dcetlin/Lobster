@@ -47,7 +47,7 @@ class MessageRelationship(StrEnum):
 
     USER = "user"        # a human on a real chat channel (telegram, slack, sms, signal, whatsapp, bisque)
     SUBAGENT = "subagent"  # a Lobster subagent reporting back via the write_result path
-    PEER_AGENT = "peer_agent"  # another agent/session on the local-claude agent channel
+    PEER_AGENT = "peer_agent"  # another agent, either local (a session on the local-claude agent channel) or remote (another Lobster's dispatcher over the bot-talk HTTP channel)
 
 
 # ---------------------------------------------------------------------------

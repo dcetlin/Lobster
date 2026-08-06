@@ -289,6 +289,13 @@ class TestClassifyRelationship:
         msg = _msg("what's the status?", "text", "local-claude", "local-claude")
         assert classify_relationship(msg) == "peer_agent"
 
+    def test_bot_talk_source_is_peer_agent(self) -> None:
+        """source='bot-talk' (cross-Lobster dispatcher-to-dispatcher, issue
+        #1350) classifies as 'peer_agent' — same relationship as
+        local-claude, just a remote peer instead of a local session."""
+        msg = _msg("status?", "text", "bot-talk", 0)
+        assert classify_relationship(msg) == "peer_agent"
+
     def test_telegram_text_message_is_user(self) -> None:
         """A normal telegram text message classifies as 'user'."""
         msg = _msg("hello", "text", "telegram", 12345)
