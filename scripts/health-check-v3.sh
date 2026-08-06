@@ -247,6 +247,12 @@ USER_FACING_SOURCES="telegram sms signal slack"
 # not trigger stale-inbox alerts or restarts.
 USER_FACING_TYPES="message photo image voice audio callback text document"
 
+# Agent-channel sources — separate staleness thresholds (issue #1539).
+# Alert-only: agent-channel staleness does NOT trigger restarts.
+AGENT_CHANNEL_SOURCES="local-claude"
+AGENT_CHANNEL_STALE_SECONDS=900      # 15 min RED — agent work is slower than user messages
+AGENT_CHANNEL_YELLOW_SECONDS=600     # 10 min YELLOW
+
 # Circuit breaker: tracks which stale files already triggered a restart
 # to prevent restart loops when the same message persists after restart
 STALE_INBOX_MARKER_DIR="$WORKSPACE_DIR/logs/stale-inbox-markers"
@@ -1007,6 +1013,15 @@ is_user_facing_type() {
     return 1
 }
 
+is_agent_channel_source() {
+    local source="$1"
+    local s
+    for s in $AGENT_CHANNEL_SOURCES; do
+        [[ "$source" == "$s" ]] && return 0
+    done
+    return 1
+}
+
 # Check 4: Inbox drain - THE primary deterministic check
 # Only counts genuine user-originated messages. Two filters are applied:
 #   1. source must be user-facing (telegram, sms, signal, slack)
@@ -1096,6 +1111,53 @@ check_inbox_drain() {
         return 1
     elif [[ $total_count -gt 0 ]]; then
         log_info "Inbox has $total_count user message(s), all fresh (oldest: ${oldest_age}s)"
+        return 0
+    else
+        return 0
+    fi
+}
+
+# Check 4b: Agent-channel drain — local-claude messages in the inbox.
+# Separate from check_inbox_drain because agent-channel messages have different
+# latency profiles (minutes, not seconds) and should NOT trigger restarts.
+# Returns: 0=GREEN, 1=YELLOW, 2=RED
+check_agent_channel_drain() {
+    local now
+    now=$(date +%s)
+    local oldest_age=0
+    local stale_count=0
+    local yellow_count=0
+    local total_count=0
+
+    while IFS= read -r -d '' f; do
+        local source
+        source=$(jq -r '.source // empty' "$f" 2>/dev/null)
+        [[ -z "$source" ]] && continue
+        is_agent_channel_source "$source" || continue
+
+        total_count=$((total_count + 1))
+        local file_time
+        file_time=$(stat -c %Y "$f" 2>/dev/null)
+        [[ -z "$file_time" ]] && continue
+
+        local age=$((now - file_time))
+        [[ $age -gt $oldest_age ]] && oldest_age=$age
+
+        if [[ $age -gt $AGENT_CHANNEL_STALE_SECONDS ]]; then
+            stale_count=$((stale_count + 1))
+        elif [[ $age -gt $AGENT_CHANNEL_YELLOW_SECONDS ]]; then
+            yellow_count=$((yellow_count + 1))
+        fi
+    done < <(find "$INBOX_DIR" -maxdepth 1 -name "*.json" -print0 2>/dev/null)
+
+    if [[ $stale_count -gt 0 ]]; then
+        log_error "RED: $stale_count agent-channel message(s) older than ${AGENT_CHANNEL_STALE_SECONDS}s (oldest: ${oldest_age}s)"
+        return 2
+    elif [[ $yellow_count -gt 0 ]]; then
+        log_warn "YELLOW: $yellow_count agent-channel message(s) older than ${AGENT_CHANNEL_YELLOW_SECONDS}s (oldest: ${oldest_age}s)"
+        return 1
+    elif [[ $total_count -gt 0 ]]; then
+        log_info "Agent channel: $total_count message(s) in inbox, all fresh (oldest: ${oldest_age}s)"
         return 0
     else
         return 0
@@ -2675,6 +2737,21 @@ Update CLAUDE_CODE_OAUTH_TOKEN in ~/lobster-config/config.env, then restart lobs
             level="YELLOW"
         fi
         log_warn "Disk space low - restart won't help, needs manual cleanup"
+    fi
+
+    # --- Agent-channel staleness (alert-only, never triggers restart) ---
+
+    if [[ "$boot_grace" != "true" ]]; then
+        check_agent_channel_drain
+        local agent_rc=$?
+        if [[ $agent_rc -eq 2 ]]; then
+            send_telegram_alert_deduped "agent-channel-stale" "Agent-channel message stuck in inbox for >$((AGENT_CHANNEL_STALE_SECONDS / 60)) minutes.
+
+This does not trigger a restart — agent-channel latency is expected to be higher than user messages. Check whether the dispatcher is processing local-claude messages."
+            [[ "$level" == "GREEN" ]] && level="YELLOW"
+        elif [[ $agent_rc -eq 1 ]]; then
+            [[ "$level" == "GREEN" ]] && level="YELLOW"
+        fi
     fi
 
     # --- Act on level ---

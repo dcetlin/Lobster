@@ -40,6 +40,11 @@ USER_FACING_SOURCES="telegram sms signal slack"
 # Genuine user-originated message types — matches health-check-v3.sh line ~114
 USER_FACING_TYPES="message photo image voice audio callback text document"
 
+# Agent-channel staleness (issue #1539) — separate threshold, separate reminder
+AGENT_CHANNEL_SOURCES="local-claude"
+AGENT_CHANNEL_STALE_THRESHOLD_SECONDS=900   # 15 minutes
+AGENT_CHANNEL_REMINDER_TYPE="agent_channel_staleness_warn"
+
 mkdir -p "$INBOX_DIR"
 
 # ---------------------------------------------------------------------------
@@ -96,11 +101,16 @@ while IFS= read -r -d '' f; do
 done < <(find "$INBOX_DIR" -maxdepth 1 -name "*.json" -print0 2>/dev/null)
 
 # No user-facing messages, or none old enough — nothing to warn about.
-[[ $oldest_age -lt $STALE_THRESHOLD_SECONDS ]] && exit 0
+if [[ $oldest_age -ge $STALE_THRESHOLD_SECONDS ]]; then
+    user_stale=true
+else
+    user_stale=false
+fi
 
 # ---------------------------------------------------------------------------
-# Inject the warning message.
+# Inject the warning message (user-facing).
 # ---------------------------------------------------------------------------
+if [[ "$user_stale" == "true" ]]; then
 TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
 MILLIS="$(date +%s%3N)"
 FILENAME="${INBOX_DIR}/${MILLIS}_reminder_${REMINDER_TYPE}.json"
@@ -115,3 +125,50 @@ cat > "$FILENAME" <<EOF
   "timestamp": "${TIMESTAMP}"
 }
 EOF
+fi
+
+# ---------------------------------------------------------------------------
+# Agent-channel staleness check (issue #1539).
+# Separate scan with its own threshold — agent messages have different latency.
+# ---------------------------------------------------------------------------
+
+# Dedup: skip if an agent-channel warning is already pending
+if grep -rl "\"reminder_type\": \"${AGENT_CHANNEL_REMINDER_TYPE}\"" "$INBOX_DIR" "$PROCESSING_DIR" 2>/dev/null | grep -q .; then
+    exit 0
+fi
+
+agent_oldest_age=0
+
+while IFS= read -r -d '' f; do
+    source=$(jq -r '.source // empty' "$f" 2>/dev/null)
+    [[ -z "$source" ]] && continue
+
+    is_agent=false
+    for s in $AGENT_CHANNEL_SOURCES; do
+        [[ "$source" == "$s" ]] && is_agent=true && break
+    done
+    [[ "$is_agent" == "true" ]] || continue
+
+    file_time=$(stat -c %Y "$f" 2>/dev/null) || continue
+    [[ -z "$file_time" ]] && continue
+
+    age=$(( $(date +%s) - file_time ))
+    [[ $age -gt $agent_oldest_age ]] && agent_oldest_age=$age
+done < <(find "$INBOX_DIR" -maxdepth 1 -name "*.json" -print0 2>/dev/null)
+
+[[ $agent_oldest_age -lt $AGENT_CHANNEL_STALE_THRESHOLD_SECONDS ]] && exit 0
+
+AC_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
+AC_MILLIS="$(date +%s%3N)"
+AC_FILENAME="${INBOX_DIR}/${AC_MILLIS}_reminder_${AGENT_CHANNEL_REMINDER_TYPE}.json"
+
+cat > "$AC_FILENAME" <<ACEOF
+{
+  "type": "scheduled_reminder",
+  "reminder_type": "${AGENT_CHANNEL_REMINDER_TYPE}",
+  "source": "system",
+  "chat_id": 0,
+  "text": "Agent-channel message (local-claude) stuck in inbox for 15+ minutes. Check dispatcher processing.",
+  "timestamp": "${AC_TIMESTAMP}"
+}
+ACEOF
