@@ -18,7 +18,37 @@ recognized here and the one described to an external agent can't drift
 apart.
 """
 
+from enum import StrEnum
+
 from src.protocol.agent_channel_schema import SOURCE as _AGENT_CHANNEL_SOURCE
+
+# ---------------------------------------------------------------------------
+# Message relationship (issue #1536, phase 1 — additive stamping only)
+# ---------------------------------------------------------------------------
+
+
+class MessageRelationship(StrEnum):
+    """Which of the three dispatcher relationships a message belongs to.
+
+    The dispatcher's inbox conflates three distinct relationships into one
+    envelope shape (dispatcher<->user, dispatcher<->subagent,
+    dispatcher<->peer-agent), which today gets reconstructed at read time
+    from incidental fields (request_id presence, sent_reply_to_user, an
+    error/error_type discriminator). This StrEnum names the three
+    relationships explicitly so a future phase can stamp — and eventually
+    route on — the relationship directly instead of re-deriving it.
+
+    Phase 1 is stamp-only (see message_types.py module docstring and
+    lobster_meta.classify_relationship): the field is written wherever the
+    source is unambiguous, or via a claim-time fallback classifier for
+    external producers. No reader branches on this field yet — that is
+    deferred to a later phase of issue #1536.
+    """
+
+    USER = "user"        # a human on a real chat channel (telegram, slack, sms, signal, whatsapp, bisque)
+    SUBAGENT = "subagent"  # a Lobster subagent reporting back via the write_result path
+    PEER_AGENT = "peer_agent"  # another agent/session on the local-claude agent channel
+
 
 # ---------------------------------------------------------------------------
 # User-initiated types  (source = telegram | slack | sms | signal | whatsapp | bisque)

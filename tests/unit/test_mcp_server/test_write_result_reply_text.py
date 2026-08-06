@@ -238,3 +238,46 @@ class TestBackwardCompatibility:
             "text": "Text.",
         })
         assert msg["sent_reply_to_user"] is False
+
+
+# ---------------------------------------------------------------------------
+# Tests: relationship stamping (issue #1536, phase 1)
+# ---------------------------------------------------------------------------
+
+class TestRelationshipStampedAtIngestion:
+    """write_result is the unambiguous ingestion point for subagent-to-
+    dispatcher messages, so it stamps relationship='subagent' directly
+    (issue #1536, phase 1) rather than relying on the claim-time fallback
+    classifier. This is additive-only: no reader branches on the field yet."""
+
+    def test_success_result_stamped_subagent(self, tmp_path):
+        """A normal (status='success') write_result gets relationship='subagent'."""
+        msg = _run_write_result(tmp_path, {
+            "task_id": "my-task",
+            "chat_id": 12345,
+            "text": "PR opened.",
+        })
+        assert msg["relationship"] == "subagent"
+        assert msg["type"] == "subagent_result"
+
+    def test_error_result_stamped_subagent(self, tmp_path):
+        """A failure (status='error') write_result also gets relationship='subagent'."""
+        msg = _run_write_result(tmp_path, {
+            "task_id": "failed-task",
+            "chat_id": 12345,
+            "text": "Ran into a blocker.",
+            "status": "error",
+        })
+        assert msg["relationship"] == "subagent"
+        assert msg["type"] == "subagent_error"
+
+    def test_notification_stamped_subagent(self, tmp_path):
+        """sent_reply_to_user=True (subagent_notification) also gets relationship='subagent'."""
+        msg = _run_write_result(tmp_path, {
+            "task_id": "already-replied-task",
+            "chat_id": 12345,
+            "text": "Already sent directly.",
+            "sent_reply_to_user": True,
+        })
+        assert msg["relationship"] == "subagent"
+        assert msg["type"] == "subagent_notification"

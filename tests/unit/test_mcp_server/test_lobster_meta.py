@@ -21,6 +21,7 @@ if _MCP_DIR not in sys.path:
 
 from lobster_meta import (  # noqa: E402
     build_lobster_meta,
+    classify_relationship,
     _classify_intent,
     _classify_urgency,
     _is_user_facing,
@@ -245,3 +246,81 @@ class TestBuildLobsterMeta:
         assert "intent_class" in result
         assert "is_user_facing" in result
         assert result["is_user_facing"] is False
+
+
+# ---------------------------------------------------------------------------
+# classify_relationship (issue #1536, phase 1 — claim-time fallback classifier)
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyRelationship:
+    """classify_relationship maps messages to user/subagent/peer_agent, or None."""
+
+    def test_subagent_result_type_is_subagent(self) -> None:
+        """type='subagent_result' classifies as 'subagent' regardless of source."""
+        msg = _msg("done", "subagent_result", "telegram", 12345)
+        assert classify_relationship(msg) == "subagent"
+
+    def test_subagent_error_type_is_subagent(self) -> None:
+        """type='subagent_error' classifies as 'subagent'."""
+        msg = _msg("failed", "subagent_error", "telegram", 12345)
+        assert classify_relationship(msg) == "subagent"
+
+    def test_subagent_notification_type_is_subagent(self) -> None:
+        """type='subagent_notification' (the literal string write_result writes)
+        classifies as 'subagent'."""
+        msg = _msg("already replied", "subagent_notification", "telegram", 12345)
+        assert classify_relationship(msg) == "subagent"
+
+    def test_subagent_ack_type_is_subagent(self) -> None:
+        """type='subagent_ack' (canonical name) classifies as 'subagent'."""
+        msg = _msg("already replied", "subagent_ack", "telegram", 12345)
+        assert classify_relationship(msg) == "subagent"
+
+    def test_subagent_type_wins_over_source(self) -> None:
+        """A subagent-result type with source='telegram' (write_inbox_message's
+        delivery-routing convention) is still classified 'subagent', not 'user' —
+        type is the unambiguous signal, source is not."""
+        msg = _msg("job output", "subagent_result", "telegram", 0)
+        assert classify_relationship(msg) == "subagent"
+
+    def test_local_claude_source_is_peer_agent(self) -> None:
+        """source='local-claude' classifies as 'peer_agent'."""
+        msg = _msg("what's the status?", "text", "local-claude", "local-claude")
+        assert classify_relationship(msg) == "peer_agent"
+
+    def test_telegram_text_message_is_user(self) -> None:
+        """A normal telegram text message classifies as 'user'."""
+        msg = _msg("hello", "text", "telegram", 12345)
+        assert classify_relationship(msg) == "user"
+
+    def test_slack_photo_message_is_user(self) -> None:
+        """A slack photo message classifies as 'user'."""
+        msg = _msg("", "photo", "slack", 99999)
+        assert classify_relationship(msg) == "user"
+
+    def test_sms_voice_message_is_user(self) -> None:
+        """An sms voice message classifies as 'user'."""
+        msg = _msg("", "voice", "sms", 555)
+        assert classify_relationship(msg) == "user"
+
+    def test_system_source_is_ambiguous_none(self) -> None:
+        """source='system' with a non-subagent system type is left unstamped (None)."""
+        msg = _msg("reminder", "scheduled_reminder", "system", 0)
+        assert classify_relationship(msg) is None
+
+    def test_unknown_source_is_ambiguous_none(self) -> None:
+        """An unrecognized source is left unstamped (None), not guessed."""
+        msg = _msg("hello", "text", "some_unknown_source", 12345)
+        assert classify_relationship(msg) is None
+
+    def test_user_facing_source_with_system_type_is_ambiguous_none(self) -> None:
+        """A user-facing source paired with a non-user-content type (e.g. a
+        cron_reminder mistakenly carrying source='telegram') is left unstamped —
+        not guessed as 'user'."""
+        msg = _msg("reminder", "cron_reminder", "telegram", 12345)
+        assert classify_relationship(msg) is None
+
+    def test_empty_message_is_ambiguous_none(self) -> None:
+        """An empty/minimal message does not crash and returns None."""
+        assert classify_relationship({}) is None

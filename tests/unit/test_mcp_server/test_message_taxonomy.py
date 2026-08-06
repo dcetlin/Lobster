@@ -151,6 +151,28 @@ class TestTaxonomyConstants:
         assert not bad_sources, f"Sources with whitespace: {bad_sources}"
 
 
+class TestMessageRelationshipEnum:
+    """MessageRelationship (issue #1536, phase 1) is a closed 3-value StrEnum."""
+
+    def test_is_str_enum(self):
+        """MessageRelationship values must behave as plain strings (StrEnum)."""
+        from enum import StrEnum
+        from message_types import MessageRelationship
+        assert issubclass(MessageRelationship, StrEnum)
+
+    def test_has_exactly_three_values(self):
+        """Phase 1 defines exactly three relationships — no more, no fewer."""
+        from message_types import MessageRelationship
+        assert {m.value for m in MessageRelationship} == {"user", "subagent", "peer_agent"}
+
+    def test_values_equal_plain_strings(self):
+        """StrEnum members compare equal to their plain-string value (JSON round-trip safety)."""
+        from message_types import MessageRelationship
+        assert MessageRelationship.USER == "user"
+        assert MessageRelationship.SUBAGENT == "subagent"
+        assert MessageRelationship.PEER_AGENT == "peer_agent"
+
+
 class TestMarkProcessingTypeValidation:
     """
     Verify that handle_mark_processing logs a warning for unknown types/sources.
@@ -270,3 +292,127 @@ class TestMarkProcessingTypeValidation:
             if "unknown message type" in r.message
         ]
         assert not type_warnings, f"Unexpected type warning for known type 'text': {type_warnings}"
+
+
+class TestMarkProcessingRelationshipStamping:
+    """
+    handle_mark_processing stamps a claim-time `relationship` fallback for
+    external producers whose messages arrive without an ingestion-time stamp
+    (issue #1536, phase 1). Additive-only: this is a write-path test — no
+    reader branches on the field yet.
+    """
+
+    @pytest.fixture
+    def setup_dirs(self, temp_messages_dir: Path):
+        inbox = temp_messages_dir / "inbox"
+        processing = temp_messages_dir / "processing"
+        return inbox, processing
+
+    def _claim(self, inbox, processing, msg_id, msg) -> dict:
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+        ):
+            from src.mcp.inbox_server import handle_mark_processing
+            asyncio.run(handle_mark_processing({"message_id": msg_id}))
+        return json.loads((processing / f"{msg_id}.json").read_text())
+
+    def test_telegram_text_message_stamped_user(self, setup_dirs):
+        """A plain telegram text message gets relationship='user' stamped as a fallback."""
+        inbox, processing = setup_dirs
+        msg_id = "1234567890_test_stamp_user"
+        msg = {"id": msg_id, "type": "text", "source": "telegram", "chat_id": 111, "text": "hi"}
+        claimed = self._claim(inbox, processing, msg_id, msg)
+        assert claimed["relationship"] == "user"
+
+    def test_external_subagent_result_producer_stamped_subagent(self, setup_dirs):
+        """A subagent_result message written by an external producer (e.g.
+        src/utils/inbox_write.py's write_inbox_message, which never sets
+        `relationship` and uses source='telegram' for delivery routing) still
+        gets relationship='subagent' via the fallback classifier — type wins
+        over source."""
+        inbox, processing = setup_dirs
+        msg_id = "1234567890_test_stamp_subagent_fallback"
+        msg = {
+            "id": msg_id,
+            "type": "subagent_result",
+            "source": "telegram",
+            "chat_id": 111,
+            "text": "job done",
+        }
+        claimed = self._claim(inbox, processing, msg_id, msg)
+        assert claimed["relationship"] == "subagent"
+
+    def test_existing_relationship_is_not_overwritten(self, setup_dirs):
+        """A message that already carries a `relationship` field (e.g. stamped
+        at ingestion by handle_write_result) is left untouched by the
+        claim-time fallback — ingestion-time stamps take precedence."""
+        inbox, processing = setup_dirs
+        msg_id = "1234567890_test_no_overwrite"
+        msg = {
+            "id": msg_id,
+            "type": "text",
+            "source": "telegram",
+            "chat_id": 111,
+            "text": "hi",
+            "relationship": "peer_agent",  # deliberately "wrong" to prove no overwrite
+        }
+        claimed = self._claim(inbox, processing, msg_id, msg)
+        assert claimed["relationship"] == "peer_agent"
+
+    def test_ambiguous_message_left_unstamped(self, setup_dirs):
+        """An ambiguous message (unrecognized source) is claimed successfully
+        with no `relationship` key added — absence is safe, not guessed."""
+        inbox, processing = setup_dirs
+        msg_id = "1234567890_test_ambiguous"
+        msg = {
+            "id": msg_id,
+            "type": "text",
+            "source": "some_unknown_source",
+            "chat_id": 111,
+            "text": "hi",
+        }
+        claimed = self._claim(inbox, processing, msg_id, msg)
+        assert "relationship" not in claimed
+
+
+class TestMarkProcessingBackCompatWithoutRelationship:
+    """
+    Back-compat guard (issue #1536, phase 1): handle_mark_processing's core
+    claim behavior (move to processing/, return "claimed") is byte-for-byte
+    unaffected by the new relationship stamping — the field is purely
+    additive, and its absence never changes claim outcome.
+    """
+
+    @pytest.fixture
+    def setup_dirs(self, temp_messages_dir: Path):
+        inbox = temp_messages_dir / "inbox"
+        processing = temp_messages_dir / "processing"
+        return inbox, processing
+
+    def test_claim_succeeds_regardless_of_relationship_field(self, setup_dirs):
+        """A message with no relationship field claims exactly as it always has."""
+        inbox, processing = setup_dirs
+        msg_id = "1234567890_test_backcompat"
+        msg = {
+            "id": msg_id,
+            "type": "text",
+            "source": "telegram",
+            "chat_id": 111,
+            "text": "hello",
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+        ):
+            from src.mcp.inbox_server import handle_mark_processing
+            result = asyncio.run(handle_mark_processing({"message_id": msg_id}))
+
+        assert "claimed" in result[0].text.lower()
+        assert not (inbox / f"{msg_id}.json").exists()
+        assert (processing / f"{msg_id}.json").exists()
