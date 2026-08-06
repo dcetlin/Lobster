@@ -180,8 +180,6 @@ class TestTelegramInboundEvent:
                  patch.object(inbox_server, "INBOX_DIR", inbox_dir), \
                  patch.object(inbox_server, "PROCESSING_DIR", processing_dir), \
                  patch.object(inbox_server, "_claims_db") as mock_claims, \
-                 patch.object(inbox_server, "_queue_observation", MagicMock()), \
-                 patch.object(inbox_server, "_user_model", None), \
                  patch.object(inbox_server, "_tick_user_message_counter", MagicMock()), \
                  patch.object(inbox_server, "_get_current_http_session_id", return_value=None):
                 mock_claims.claim.return_value = True
@@ -206,8 +204,6 @@ class TestTelegramInboundEvent:
                  patch.object(inbox_server, "INBOX_DIR", inbox_dir), \
                  patch.object(inbox_server, "PROCESSING_DIR", processing_dir), \
                  patch.object(inbox_server, "_claims_db") as mock_claims, \
-                 patch.object(inbox_server, "_queue_observation", MagicMock()), \
-                 patch.object(inbox_server, "_user_model", None), \
                  patch.object(inbox_server, "_tick_user_message_counter", MagicMock()), \
                  patch.object(inbox_server, "_get_current_http_session_id", return_value=None):
                 mock_claims.claim.return_value = True
