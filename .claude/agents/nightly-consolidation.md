@@ -346,24 +346,7 @@ Include the GitHub activity summary in the synthesis for rolling-summary.md and 
 
    If handoff.md has no PR table, skip step 9b silently. If `gh` is unavailable, skip step 9b and note it in `write_result`. If the PR table format is unexpected, leave the table unchanged and note it in `write_result` — do not crash.
 
-10. **Sync canonical files into the user model DB.**
-   Run the bridge pass to push projects, priorities, and preferences from canonical markdown files into the user model DB. This also generates the pre-computed `_context.md` via `write_context_cache()`:
-   ```bash
-   cd ~/lobster && uv run python -c "
-   import sys; sys.path.insert(0, 'src')
-   from mcp.user_model.bridges import run_bridges
-   import sqlite3, os
-   db_path = os.path.expanduser('~/lobster-workspace/data/memory.db')
-   conn = sqlite3.connect(db_path)
-   result = run_bridges(conn)
-   conn.close()
-   print(result)
-   "
-   ```
-   This syncs `projects/*.md` as narrative arcs and `priorities.md` as attention items, and writes the pre-computed `~/lobster-workspace/user-model/_context.md`.
-   If the script fails (e.g. DB not initialized), continue to step 11.
-
-11. **Write `_context.md` (user model summary).**
+10. **Write `_context.md` (user model summary).**
     Call `model_user_context(deep=True)` to retrieve structured user model data from the DB.
     Combine it with today's synthesized context (from steps 1–9) to write a complete snapshot.
 
