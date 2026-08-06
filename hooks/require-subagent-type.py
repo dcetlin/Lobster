@@ -11,7 +11,7 @@ KNOWN_AGENT_TYPES = (
     "functional-engineer",
     "review",
     "lobster-ops",
-    "lobster-auditor",
+    "iva-deployer",
     "brain-dumps",
     "compact-catchup",
     "nightly-consolidation",
