@@ -13,10 +13,10 @@ Users communicate through a chat interface (Telegram or Slack), typically on mob
 
 When your task is complete, choose the right delivery pattern based on your task type:
 
-- **User-facing tasks (default):** call `send_reply` directly, then `write_result`. This is the crash-safe delivery pattern — the user gets their reply even if the dispatcher has restarted.
-- **Internal tasks (dispatcher-only):** skip `send_reply`. Call `write_result` only. The dispatcher reads your result and decides what to relay.
+- **Internal-work tasks (default for this category):** code review, implementation, verification, issue-filing, research-for-dispatcher-only. Skip `send_reply`. Call `write_result` only. The dispatcher reads your result and decides what to relay. Silence is the safe default here — an unmarked dispatch for these task types should NOT flood the user.
+- **User-facing tasks:** call `send_reply` directly, then `write_result`. This is the crash-safe delivery pattern — the user gets their reply even if the dispatcher has restarted.
 
-Your task prompt will say "do NOT call send_reply" or "Use write_result only" for internal tasks. If it says nothing, treat it as user-facing (call `send_reply`, then `write_result` with `sent_reply_to_user=True`). Only skip `send_reply` when you have active uncertainty about whether the user should see the result — not as the general default for unspecified tasks.
+Your task prompt should carry an explicit `Delivery: internal` or `Delivery: user-facing` field (see CLAUDE.md's Dispatch template gate). If it says nothing and your task is one of the internal-work types above, default to internal (write_result only, silent toward the user). If it says nothing and your task is not one of those types, treat it as user-facing.
 
 See the **"Internal vs. User-Facing Tasks"** section below for full patterns and code examples.
 
@@ -104,8 +104,9 @@ Not all subagent tasks are user-facing. Some are dispatched for internal analysi
 
 **How to tell which kind of task you have:**
 
-- Task prompt says "Use write_result only" or "do NOT call send_reply" → **internal task**
-- Task prompt says "Send the result to the user" or gives no special instruction → **user-facing task (the default)**
+- Task prompt says `Delivery: internal`, "Use write_result only", or "do NOT call send_reply" → **internal task**
+- Task prompt says `Delivery: user-facing` or "Send the result to the user" → **user-facing task**
+- Task prompt gives no delivery instruction at all → default by task type: code review, implementation, verification, issue-filing, and research-for-dispatcher-only default to **internal** (silent); everything else defaults to **user-facing**
 
 **For internal tasks:**
 
@@ -123,9 +124,9 @@ mcp__lobster-inbox__write_result(
 
 The dispatcher will read your result and decide what (if anything) to relay to the user.
 
-**Signal convention note:** This only works if the dispatcher (or whoever spawns you) actually includes the signal phrase ("do NOT call send_reply" or "Use write_result only") in your task prompt. The dispatcher is responsible for adding this signal when spawning internal subagents. If you receive a task prompt without this signal, treat it as user-facing.
+**Signal convention note:** The dispatcher should include an explicit `Delivery: internal` field (see CLAUDE.md's Dispatch template gate) when spawning internal subagents. If you receive a task prompt with no delivery signal at all, fall back to the task-type default above — silent for internal-work types (code review, implementation, verification, issue-filing, research-for-dispatcher-only), user-facing otherwise.
 
-**For user-facing tasks (the default):**
+**For user-facing tasks:**
 
 Call `send_reply` first, then `write_result` with `sent_reply_to_user=True` (you already delivered directly):
 
