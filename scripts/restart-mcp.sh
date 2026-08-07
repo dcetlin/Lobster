@@ -80,9 +80,10 @@ cat > "${MSG_FILE}.tmp" <<EOF
 {
   "id": "${MSG_ID}",
   "source": "system",
-  "type": "compact-reminder",
+  "type": "session_reconnect",
   "chat_id": 0,
-  "text": "MCP RESTART INCOMING — The ${MCP_UNIT} service is about to restart. Your MCP session will be invalidated. Re-orient after reconnecting: read sys.dispatcher.bootup.md and resume the main loop.",
+  "task_origin": "internal",
+  "text": "MCP RESTART INCOMING — The ${MCP_UNIT} service is about to restart. Your MCP session will be invalidated. This is a lightweight reconnect, not a context compaction — situational awareness was NOT lost, so do NOT spawn compact-catchup. Re-orient after reconnecting: read sys.dispatcher.bootup.md and resume the main loop.",
   "timestamp": "${TIMESTAMP}"
 }
 EOF

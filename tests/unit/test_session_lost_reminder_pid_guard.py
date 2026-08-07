@@ -14,6 +14,11 @@ is absent or dead → real session loss → write the reminder.
 These tests exercise _is_dispatcher_alive() in isolation (by loading the function
 from inbox_server.py source) and verify the full _write_session_lost_reminder()
 flow via the inbox_server module (using a minimal patched environment).
+
+Also covers the compact-reminder dedup fix (postbounce #5): the reminder now
+carries type="session_reconnect" instead of reusing type="compact-reminder",
+so the dispatcher routes it through a lightweight re-orient handler instead of
+unconditionally spawning the 10-15 min compact-catchup subagent.
 """
 
 import json
@@ -199,8 +204,17 @@ class TestSessionLostReminderPidGuard:
         reminder_files = list(inbox_dir.glob("session-lost-*.json"))
         assert len(reminder_files) == 1, "Expected exactly one session-lost reminder"
         reminder = json.loads(reminder_files[0].read_text())
-        assert reminder["type"] == "compact-reminder"
+        # postbounce #5: type is "session_reconnect", not "compact-reminder" —
+        # this is the dedup fix. Reusing "compact-reminder" made the dispatcher
+        # unconditionally spawn compact-catchup even though nothing was lost.
+        assert reminder["type"] == "session_reconnect"
+        assert reminder.get("subtype") is None, (
+            "session_reconnect must not also carry subtype='compact-reminder', "
+            "or the dispatcher's compact-reminder handler (keyed on subtype) "
+            "would still match it and spawn compact-catchup"
+        )
         assert "SESSION LOST" in reminder["text"]
+        assert "do NOT spawn compact-catchup" in reminder["text"]
 
     def test_suppresses_reminder_when_dispatcher_alive(self, tmp_path):
         """Live dispatcher PID → mid-session reconnect → reminder suppressed."""
@@ -273,3 +287,42 @@ class TestSessionLostReminderPidGuard:
 
         reminder_files = list(inbox_dir.glob("session-lost-*.json"))
         assert len(reminder_files) == 0, "Dev mode should always suppress session-lost reminder"
+
+
+# ---------------------------------------------------------------------------
+# Dedup fix (postbounce #5): session_reconnect is a registered P0 message
+# type, distinct from compact-reminder, and routes without spawning catchup.
+# ---------------------------------------------------------------------------
+
+class TestSessionReconnectDedupFix:
+    """session_reconnect: registered type, P0 priority, no compact-catchup."""
+
+    def test_session_reconnect_is_registered_message_type(self):
+        """session_reconnect must be a known type in message_types.py.
+
+        Otherwise it would fail any code path that validates msg["type"]
+        against INBOX_MESSAGE_TYPES (e.g. ingest-time schema checks).
+        """
+        from src.mcp.message_types import INBOX_SYSTEM_TYPES, INBOX_MESSAGE_TYPES
+
+        assert "session_reconnect" in INBOX_SYSTEM_TYPES
+        assert "session_reconnect" in INBOX_MESSAGE_TYPES
+
+    def test_session_reconnect_is_p0_priority(self):
+        """session_reconnect must resolve to P0 (0) so it is delivered first,
+        matching the immediate-delivery guarantee _write_session_lost_reminder()
+        previously got for free by reusing type="compact-reminder".
+        """
+        from src.mcp.inbox_server import _inbox_priority
+
+        assert _inbox_priority({"type": "session_reconnect", "text": "SESSION LOST"}) == 0
+
+    def test_session_reconnect_does_not_match_compact_reminder_subtype_gate(self):
+        """A session_reconnect message (type only, no subtype) must NOT match
+        the subtype-keyed compact-reminder P0 gate — confirms the two message
+        shapes are independent and cannot be cross-matched by accident.
+        """
+        from src.mcp.inbox_server import _INBOX_P0_SUBTYPES
+
+        msg = {"type": "session_reconnect", "text": "SESSION LOST", "subtype": None}
+        assert msg.get("subtype") not in _INBOX_P0_SUBTYPES

@@ -83,6 +83,7 @@ INBOX_SYSTEM_TYPES: frozenset[str] = frozenset({
     "agent_failed",           # reconciler/agent-monitor detected dead agent (chat_id=0; dispatcher decides re-queue vs escalate vs drop)
     "compact_group",          # grouped compact messages (internal, produced by check_inbox)
     "compact_reminder",       # on-compact hook reminder (hooks/on-compact.py)
+    "session_reconnect",      # MCP server restarted but dispatcher process survived (_write_session_lost_reminder); lightweight re-orient only, must NOT spawn compact-catchup (postbounce #5)
     "cron_reminder",          # DEPRECATED alias — normalizes to "scheduled_reminder" on ingest
     "scheduled_reminder",     # scheduled reminder (scripts/post-reminder.sh, scheduled-tasks/dispatch-job.sh)
     "update_notification",    # system update available (scripts/check-updates.sh)
