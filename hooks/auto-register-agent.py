@@ -299,7 +299,7 @@ def main() -> None:
 
     # Only handle Agent tool calls
     tool_name = data.get("tool_name", "")
-    if tool_name != "Agent":
+    if tool_name not in ("Agent", "Task"):
         sys.exit(0)
 
     try:
