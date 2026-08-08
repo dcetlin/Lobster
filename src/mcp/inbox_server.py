@@ -768,6 +768,7 @@ from message_types import (  # noqa: E402 — placed after path-setup at top of 
     MessageRelationship,
 )
 from lobster_meta import build_lobster_meta, classify_relationship  # noqa: E402 — same path-setup above
+from thread_registry import ThreadRegistry  # noqa: E402 — same path-setup above; issue #19 phase 1
 
 # ---------------------------------------------------------------------------
 # Message type normalization (issue #635)
@@ -1423,6 +1424,21 @@ except Exception as _claims_err:
         def force_replace_dispatcher_lock(self, *a, **kw) -> None: pass
         def cleanup_old_claims(self, *a, **kw) -> int: return 0
     _claims_db = _NoOpClaimsDB()
+
+# Initialize thread registry (issue #19, phase 1 — deterministic thread_id
+# stamping). JSON-backed, per the design's "start with JSON, migrate to a
+# messages.db column later" recommendation. Degrades to a no-op stub (mints
+# a fresh, unregistered thread_id every call) if the directory cannot be
+# created, so a filesystem hiccup here never blocks message ingestion.
+try:
+    _thread_registry = ThreadRegistry()
+    log.info("Thread registry initialized (issue #19 phase 1)")
+except Exception as _thread_registry_err:
+    log.warning(f"Thread registry init failed — degrading to unregistered stamping: {_thread_registry_err}")
+    class _NoOpThreadRegistry:  # type: ignore[no-redef]
+        def stamp(self, msg, message_id) -> str: return str(uuid.uuid4())
+        def lookup(self, keys) -> str | None: return None
+    _thread_registry = _NoOpThreadRegistry()
 
 # NOTE: Startup cleanup (cleanup_stale_running_sessions) is intentionally NOT
 # called here at module level. This module is imported by inbox_server_http.py
@@ -6412,6 +6428,16 @@ async def handle_mark_processing(args: dict) -> list[TextContent]:
             _relationship_hint = classify_relationship(msg_data)
             if _relationship_hint:
                 msg_data["relationship"] = _relationship_hint
+        # thread_id (issue #19, phase 1): claim-time Tier-0 stamping. Derived
+        # from existing deterministic signals only (explicit reply ->
+        # thread_ts -> shared task_id), never overwrites an ingestion-time
+        # stamp (e.g. write_result's). Additive, stamp-only — no reader
+        # branches on this field yet (mirrors the #1536 discipline above).
+        if "thread_id" not in msg_data:
+            try:
+                msg_data["thread_id"] = _thread_registry.stamp(msg_data, message_id)
+            except Exception as _thread_err:
+                log.warning(f"mark_processing: thread_id stamping failed (non-fatal): {_thread_err}")
         atomic_write_json(dest, msg_data)
     except Exception:
         pass  # non-fatal; stale recovery falls back to mtime
@@ -6553,6 +6579,19 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
                 msg_data["relationship"] = _relationship_hint
         except Exception:
             pass  # non-fatal; classification is a best-effort hint
+
+    # thread_id (issue #19, phase 1): claim-time Tier-0 stamping — same
+    # deterministic-signal precedence and additive discipline as the
+    # relationship stamp above. claim_and_ack is the sole claim path for
+    # source="local-claude", so this is also the only claim-time opportunity
+    # to stamp thread_id for agent-channel messages (in_reply_to is not yet
+    # a Tier-0 signal consulted here — see thread_registry.py module
+    # docstring for the exact precedence implemented in phase 1).
+    if "thread_id" not in msg_data:
+        try:
+            msg_data["thread_id"] = _thread_registry.stamp(msg_data, message_id)
+        except Exception as _thread_err:
+            log.warning(f"claim_and_ack: thread_id stamping failed (non-fatal): {_thread_err}")
 
     # Atomic move to processing/ (consequence of won claim)
     dest = PROCESSING_DIR / found.name
@@ -8896,6 +8935,17 @@ async def handle_write_result(args: dict) -> list[TextContent]:
         message["thread_ts"] = thread_ts
     if outcome_category is not None:
         message["outcome_category"] = outcome_category
+
+    # thread_id (issue #19, phase 1): write_result is definitionally the
+    # ingestion point for subagent-to-dispatcher messages — task_id (and
+    # thread_ts, if set above) are known directly here, so stamp now rather
+    # than relying on a later claim-time lookup. Same additive,
+    # stamp-only discipline as the relationship stamp above: this mints or
+    # inherits a thread_id but no reader branches on it yet.
+    try:
+        message["thread_id"] = _thread_registry.stamp(message, message_id)
+    except Exception as _thread_err:
+        log.warning(f"write_result: thread_id stamping failed (non-fatal): {_thread_err}")
 
     inbox_file = INBOX_DIR / f"{message_id}.json"
     atomic_write_json(inbox_file, message)
