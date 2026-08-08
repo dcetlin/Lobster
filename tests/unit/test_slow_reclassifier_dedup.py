@@ -6,8 +6,6 @@ Covers:
 - Gate returns False when no entry exists
 - Gate returns False when existing entry is older than 12 hours
 - Gate returns False when existing entry has a different pattern_type
-
-WOS-UoW: uow_20260522_121905
 """
 from __future__ import annotations
 

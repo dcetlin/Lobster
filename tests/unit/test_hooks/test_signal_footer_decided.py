@@ -10,8 +10,6 @@ Tests cover:
 - Bare 'decided' with no description falls back to 'decision reached'
 - DB write failure does not block the send_reply (exit 0)
 - Non-send_reply tool calls are skipped
-
-WOS-UoW: uow_20260525_4e9b36
 """
 
 import json

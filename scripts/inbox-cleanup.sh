@@ -9,7 +9,6 @@ CLEANUP_LOG="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/logs/inbox-cleanup.lo
 # TIGHTENED retention policies (internal messages accumulating faster than expected)
 SUBAGENT_RESULT_TTL=0  # DELETE IMMEDIATELY - internal routing only          # 1 hour (was 24h) - accumulating too fast
 SUBAGENT_NOTIF_TTL=0    # DELETE IMMEDIATELY - internal routing only           # 1 hour (was 24h) - accumulating too fast
-WOSROUTER_ALERT_TTL=10800         # 3 hours (was 6h)
 SESSION_LOST_TTL=10800            # 3 hours (was 6h)
 SCHEDULED_JOB_TTL=21600           # 6 hours (was 24h)
 CONSOLIDATION_TTL=21600           # 6 hours (was 24h)
@@ -63,8 +62,6 @@ should_delete() {
         [[ $age -gt $SUBAGENT_RESULT_TTL ]] && return 0 || return 1
     elif [[ "$type" == "subagent_notification" ]]; then
         [[ $age -gt $SUBAGENT_NOTIF_TTL ]] && return 0 || return 1
-    elif [[ "$basename_f" == wos-router-alert* ]]; then
-        [[ $age -gt $WOSROUTER_ALERT_TTL ]] && return 0 || return 1
     elif [[ "$basename_f" == session-lost* ]]; then
         [[ $age -gt $SESSION_LOST_TTL ]] && return 0 || return 1
     elif [[ "$basename_f" == *scheduled* ]]; then

@@ -83,7 +83,7 @@ _INTENT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         re.compile(
             r"\b(schedule|remind|task|todo|calendar|meeting|appointment|"
             r"deadline|status|update|check|run|start|stop|restart|enable|"
-            r"disable|config|setting|turn on|turn off|list|show|wos|"
+            r"disable|config|setting|turn on|turn off|list|show|"
             r"lobster|subagent|job|cron|deploy|upgrade|migrate|backup|"
             r"notification|alert|report|digest|sync)\b",
             re.IGNORECASE,

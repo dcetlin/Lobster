@@ -39,14 +39,14 @@ with an explicit error — it must NOT proceed with an empty result set that loo
 
 Example enforcement (shell):
 ```bash
-gh label list --repo dcetlin/Lobster | grep -q "wos:executing" || { echo "ERROR: label wos:executing missing — aborting sweep"; exit 1; }
+gh label list --repo dcetlin/Lobster | grep -q "needs-triage" || { echo "ERROR: label needs-triage missing — aborting sweep"; exit 1; }
 ```
 
 Example enforcement (Python):
 ```python
 labels = get_github_labels(repo)
-if "wos:executing" not in labels:
-    raise RuntimeError("Contract violation: label 'wos:executing' does not exist in repo — sweep cannot proceed")
+if "needs-triage" not in labels:
+    raise RuntimeError("Contract violation: label 'needs-triage' does not exist in repo — sweep cannot proceed")
 ```
 
 ---
@@ -55,8 +55,10 @@ if "wos:executing" not in labels:
 
 **Harness pattern 2 of 3 — prevents: coherence failure / missing state registry read**
 
-Read `~/lobster-workspace/data/wos-config.json` before any throughput, activity, or health
-classification. Record the posture explicitly. All subsequent interpretations are conditioned on it.
+Read the relevant operational-state file for the system being swept (e.g., the job's
+`enabled` flag in `~/lobster-workspace/scheduled-jobs/jobs.json`, or a system-specific
+state/config file) before any throughput, activity, or health classification. Record the
+posture explicitly. All subsequent interpretations are conditioned on it.
 
 ```
 execution_enabled: [true | false | file absent]
@@ -93,7 +95,7 @@ Classifier: [stalled / healthy]
 Conclusion: [what the sweep concludes when it finds no activity]
 
 States that can produce the no-activity reading:
-  [ ] System deliberately paused (checked: wos-config.json execution_enabled=false)
+  [ ] System deliberately paused (checked: relevant execution-state config, see Harness pattern 2)
   [ ] [Any other legitimate no-activity state for this system]
   [ ] [...]
 
@@ -102,16 +104,17 @@ and ruled out. If any state could not be checked (resource missing, permission e
 conclude — escalate instead.
 ```
 
-**Example — WOS throughput classifier:**
+**Example (historical, pattern illustration only — the queue this classifier describes,
+WOS, was removed in the Aug-4 2026 Slimdown):**
 
 ```
 Classifier: stalled / healthy
-Conclusion: "stalled" when no UoW has been updated in >3 days
+Conclusion: "stalled" when no queue item has been updated in >3 days
 
 States that can produce the no-update reading:
-  [ ] System deliberately paused (checked: wos-config.json execution_enabled=false)
-  [ ] No UoWs currently open (checked: gh issue list --label wos:executing returns zero AND label exists)
-  [ ] Executor heartbeat recently restarted (checked: executor-heartbeat.log last-entry timestamp)
+  [ ] System deliberately paused (checked: execution-state config)
+  [ ] No queue items currently open (checked: relevant label/query returns zero AND label exists)
+  [ ] Processor heartbeat recently restarted (checked: heartbeat log last-entry timestamp)
 
 Elimination rule: only classify as stalled if all three states above are checked and ruled out.
 ```

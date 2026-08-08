@@ -1,10 +1,10 @@
 """
 Tests for LOS callback routing — todo-done-{id}, todo-snooze-{id}, todo-dismiss-{id}.
 
-These callbacks are handled by route_los_callback, which returns the same shape
-dict as route_callback_message in dispatcher_handlers.py (action, text, chat_id,
-handled). The dispatcher integrates by calling route_los_callback before falling
-through to WOS callbacks.
+These callbacks are handled by route_los_callback, which returns a dict shaped
+{action, text, chat_id, handled}. The dispatcher integrates by calling
+route_los_callback first and falling through to other callback handling when
+handled=False.
 """
 from __future__ import annotations
 
@@ -154,7 +154,7 @@ def test_todo_snooze_callback_invalid_date_returns_error(
 
 def test_non_los_callback_returns_handled_false(conn: sqlite3.Connection) -> None:
     """Callbacks that are not LOS patterns must return handled=False for pass-through."""
-    msg = {"callback_data": "decide_retry:some-uow-id", "chat_id": 8075091586}
+    msg = {"callback_data": "some_other_callback:some-id", "chat_id": 8075091586}
     result = route_los_callback(msg, conn=conn)
 
     assert result["handled"] is False

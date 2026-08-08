@@ -674,18 +674,6 @@ def main():
         content = _extract_pre_hook_text(transcript, first_fire_ts, _FALLBACK_TURNS)
         _write_synthetic_inbox_message(data, content, task_id_hint)
 
-        # If this is a WOS executor task, mark the UoW as explicitly failed now
-        # rather than waiting for the TTL orphan sweep (issue: executing_orphan gap).
-        if task_id_hint and task_id_hint.startswith("wos-uow_"):
-            try:
-                hooks_dir = Path(__file__).parent
-                repo_src = hooks_dir.parent / "src"
-                sys.path.insert(0, str(repo_src))
-                from orchestration.wos_completion import maybe_fail_wos_uow  # noqa: PLC0415
-                maybe_fail_wos_uow(task_id_hint, reason="orphan_exit")
-            except Exception:
-                pass  # Never block the hook's exit path
-
         # Clean up the fire-count temp file.
         key = _agent_key(data)
         _cleanup_fire_state(_fire_count_path(key))

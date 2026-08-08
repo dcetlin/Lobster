@@ -145,12 +145,6 @@ The Telegram bot sends "📨 Message received. Processing..." automatically at t
 
 ---
 
-## wos_execute — Why Import, Not Prose
-
-**Do not re-implement WOS routing logic in prose here.** The WOS Execute Gate in CLAUDE.md (`src/orchestration/dispatcher_handlers.py` → `route_wos_message`) is the single source of truth. Python imports survive context compaction; prose does not.
-
----
-
 ## Context Recovery — Extended
 
 **Step 2 — Read recent processed messages on disk:**

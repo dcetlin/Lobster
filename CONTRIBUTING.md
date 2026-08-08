@@ -17,8 +17,3 @@ will be blocked at review.
 
 See [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for environment setup and
 local testing instructions.
-
-## PR Sequence (WOS Phase 2)
-
-PRs in the WOS Phase 2 sequence (#302–#307) must be opened and merged in order.
-The integration test harness (issue #318) must pass for each PR before merge.

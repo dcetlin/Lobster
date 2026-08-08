@@ -13,8 +13,8 @@ state coverage checks.
 - The document is long-lived and will be edited across many sessions
 - The document has formal section coverage tracking (`addressed` flags per section)
 - Section IDs must be stable across all renders (they are never renumbered)
-- The document is an architecture spec, WOS evolution plan, or system design document
-- Examples: html-doc-model-spec, wos-evolution-spec, implementation plans
+- The document is an architecture spec or system design document
+- Examples: html-doc-model-spec, implementation plans
 
 **When not to use:**
 - The document is primarily narrative and won't be tracked for section coverage

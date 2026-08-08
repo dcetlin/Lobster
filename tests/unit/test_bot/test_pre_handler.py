@@ -1,6 +1,4 @@
 """Smoke tests for the bot pre-handler module.
-
-WOS-UoW: uow_20260515_b782a7
 """
 import sys
 from pathlib import Path

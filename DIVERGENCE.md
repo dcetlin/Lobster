@@ -8,15 +8,15 @@ Each entry records the file, what we kept vs. what upstream has, the rationale, 
 
 ## Divergence 1: `.claude/sys.dispatcher.bootup.md`
 
-**Our version:** ~127KB — includes Tier-1 gate table, WOS handlers, posture temperature system, IFTTT rule loading, task system integration, epistemic hooks, and dcetlin-specific operational context.
+**Our version:** ~127KB — includes Tier-1 gate table, posture temperature system, IFTTT rule loading, task system integration, epistemic hooks, and dcetlin-specific operational context.
 
 **Upstream version:** ~41KB — trimmed to core dispatcher loop; all dcetlin-specific features removed.
 
-**Decision:** Keep ours. The Tier-1 gate table, WOS handlers, posture temperature, and IFTTT loading are all operationally active in this install. Removing them would break running behavior.
+**Decision:** Keep ours. The Tier-1 gate table, posture temperature, and IFTTT loading are all operationally active in this install. Removing them would break running behavior.
 
 **Future work:** A future pass should trim prose sections that are now redundant with the gate table, to reduce context load without losing behavioral coverage.
 
-**Date audited:** 2026-03-31
+**Date audited:** 2026-03-31 (note added 2026-08-08: the WOS handlers this entry originally described were removed in the Aug-4 2026 Slimdown — see `CLAUDE.md` and `vision.yaml`. The remaining divergence content above still holds.)
 
 ---
 

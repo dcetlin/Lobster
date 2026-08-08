@@ -66,7 +66,6 @@ from src.htmlgen.components import get_component  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Bisque upload helpers
-# (copied from wos_dashboard.py pattern — originals are not changed)
 # ---------------------------------------------------------------------------
 
 def _uploads_dir() -> Path:

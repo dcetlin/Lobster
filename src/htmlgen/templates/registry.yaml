@@ -10,7 +10,7 @@ templates:
 
   - id: dashboard-class
     name: Dashboard (data-driven)
-    description: WOS dashboard, status pages, interactive tools with live data.
+    description: Status pages, interactive tools with live data.
     content_format: json
     components:
       - dashboard-filter-bar

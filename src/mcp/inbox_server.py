@@ -2778,42 +2778,6 @@ async def list_tools() -> list[Tool]:
                 "required": ["job_name", "output"],
             },
         ),
-        # WOS Agent Heartbeat — allows executing subagents to prove liveness
-        # without needing to import Python modules or resolve the registry path.
-        Tool(
-            name="write_wos_heartbeat",
-            description=(
-                "Write a liveness heartbeat for a WOS unit of work. "
-                "Call this every 60–90 seconds during WOS task execution to prove the agent is alive. "
-                "Without periodic heartbeats, the Observation Loop will detect a stall and re-queue "
-                "the UoW for re-execution. "
-                "Pass token_usage (cumulative input+output tokens from Claude API responses so far) "
-                "so the steward can detect stuck agents that heartbeat without making progress. "
-                "Returns: {\"rowcount\": 1} on success, {\"rowcount\": 0} if the UoW status has "
-                "already changed (e.g. recovered by the Observation Loop — stop execution immediately "
-                "and call write_result with outcome=failed)."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "uow_id": {
-                        "type": "string",
-                        "description": "The WOS unit-of-work ID to write a heartbeat for (e.g. 'uow_abc123').",
-                    },
-                    "token_usage": {
-                        "type": "integer",
-                        "description": (
-                            "Optional cumulative token count at the time of this heartbeat "
-                            "(sum of input_tokens + output_tokens from all Claude API responses "
-                            "received so far in this execution). Pass your running total each time. "
-                            "The steward uses consecutive token deltas to detect stuck agents. "
-                            "Omit if you are not tracking token usage."
-                        ),
-                    },
-                },
-                "required": ["uow_id"],
-            },
-        ),
         # Subagent Result Relay
         Tool(
             name="write_result",
@@ -2910,7 +2874,7 @@ async def list_tools() -> list[Tool]:
                             "Optional total token count consumed by this subagent (input + output tokens combined). "
                             "Report what the Claude API returned in response metadata across all tool calls and turns. "
                             "Accumulate usage.input_tokens + usage.output_tokens across turns and report the total here. "
-                            "Used for per-UoW cost telemetry in the WOS registry. "
+                            "Used for per-task cost telemetry. "
                             "Omit if token counts were not available or not tracked."
                         ),
                     },
@@ -4410,8 +4374,6 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         return await handle_check_task_outputs(arguments)
     elif name == "write_task_output":
         return await handle_write_task_output(arguments)
-    elif name == "write_wos_heartbeat":
-        return await handle_write_wos_heartbeat(arguments)
     elif name == "write_result":
         return await handle_write_result(arguments)
     elif name == "write_observation":
@@ -5658,16 +5620,9 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
         chat_id = msg.get("chat_id") or ("n/a" if _agent_channel_schema else "")
         msg_type = msg.get("type", "text")
         # Synthesize a meaningful text summary for structured system messages
-        # that carry no text field (e.g. wos_execute). This prevents the
-        # dispatcher from seeing '(no text)' and failing to recognise the type.
-        if msg_type == "wos_execute":
-            _uow_id = msg.get("uow_id", "?")
-            text = f"wos_execute: uow_id={_uow_id}"
-        elif msg_type == "wos_prescribe":
-            _uow_id = msg.get("uow_id", "?")
-            _summary = str(msg.get("uow_summary", "?"))[:60]
-            text = f"wos_prescribe: uow_id={_uow_id}, summary={_summary}"
-        elif _agent_channel_schema:
+        # that carry no text field. This prevents the dispatcher from seeing
+        # '(no text)' and failing to recognise the type.
+        if _agent_channel_schema:
             text = msg.get("body") or msg.get("subject") or "(no text)"
         else:
             text = msg.get("text", "(no text)")
@@ -5706,12 +5661,6 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
         elif msg_type == "subagent_recovered":
             task_id = msg.get("task_id", "?")
             output += f"⚠️ **[SUBAGENT RECOVERY]** task `{task_id}` exited without calling write_result — salvaged content logged\n"
-        elif msg_type == "wos_execute":
-            uow_id = msg.get("uow_id", "?")
-            output += f"🔧 **[WOS EXECUTE]** uow_id=`{uow_id}`\n"
-        elif msg_type == "wos_prescribe":
-            uow_id = msg.get("uow_id", "?")
-            output += f"📋 **[WOS PRESCRIBE]** uow_id=`{uow_id}`\n"
         elif msg_type == "reaction":
             emoji = msg.get("emoji", "?")
             reacted_to_text = msg.get("reacted_to_text", "")
@@ -5735,16 +5684,6 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
             output += "dispatcher_hint: SUBAGENT_NOTIFICATION — user already received the subagent's reply. Don't summarize it. If you respond, add new value only — a question, a correction, missing context. Call mark_processed when done.\n"
         if msg_type == "subagent_recovered":
             output += "dispatcher_hint: SUBAGENT_RECOVERED — agent exited without calling write_result; content was salvaged from transcript. The owner has been notified via inbox. Do NOT relay the raw dump to the user. Call mark_processed when done.\n"
-        if msg_type == "wos_execute":
-            uow_id = msg.get("uow_id", "?")
-            output += f"dispatcher_hint: WOS_EXECUTE — call route_wos_message(msg) from src/orchestration/dispatcher_handlers.py. uow_id={uow_id}. Do not read prose — use the structural route.\n"
-        if msg_type == "wos_prescribe":
-            _uow_id = msg.get("uow_id", "?")
-            output += (
-                f"dispatcher_hint: WOS_PRESCRIBE — call route_wos_message(msg) from "
-                f"src/orchestration/dispatcher_handlers.py. uow_id={_uow_id}. "
-                f"Spawns prescription subagent.\n"
-            )
         _has_file = msg_type in ("voice", "photo", "document") or bool(
             msg.get("image_file") or msg.get("image_files") or
             msg.get("file_path") or msg.get("audio_file")
@@ -8673,109 +8612,6 @@ async def handle_write_task_output(args: dict) -> list[TextContent]:
 
 
 # =============================================================================
-# WOS registry completion helper (issue #669)
-# =============================================================================
-
-def _maybe_complete_wos_uow(
-    task_id: str,
-    status: str,
-    result_text: str | None = None,
-    token_usage: int | None = None,
-    outcome_category: str | None = None,
-) -> None:
-    """
-    Transition a WOS UoW from 'executing' to 'ready-for-steward' when its subagent
-    calls write_result with status='success'.
-
-    Delegates to orchestration.wos_completion.maybe_complete_wos_uow — see that
-    module for full documentation. Imported lazily so inbox_server's heavy import
-    chain does not block if the orchestration package is unavailable.
-
-    result_text is forwarded to maybe_complete_wos_uow so the output classifier
-    can distinguish pearl (PR opened), heat (nothing to do), and seed (default)
-    outcomes when building the GitHub close-out comment.
-
-    token_usage is forwarded to record per-UoW cost telemetry in the registry
-    (issue #990). NULL when the subagent did not report usage.
-
-    outcome_category is forwarded to record the metabolic taxonomy label in the
-    registry (issue #998). Already validated as a member of VALID_OUTCOME_CATEGORIES
-    by the write_result handler before this function is called. NULL when the
-    subagent did not report an outcome_category.
-
-    Errors are logged but never raised — write_result delivery must not be blocked
-    by registry update failures.
-    """
-    try:
-        import sys as _sys
-        import os
-        from pathlib import Path as _Path
-        _src = str(_Path(__file__).resolve().parent.parent)
-        if _src not in _sys.path:
-            _sys.path.insert(0, _src)
-        from orchestration.wos_completion import maybe_complete_wos_uow
-        maybe_complete_wos_uow(task_id, status, result_text=result_text, token_usage=token_usage,
-                               outcome_category=outcome_category)
-    except Exception as exc:
-        log.warning("_maybe_complete_wos_uow: unexpected error — %s: %s", type(exc).__name__, exc)
-
-
-# =============================================================================
-# WOS Heartbeat Handler (issue #849)
-# =============================================================================
-
-async def handle_write_wos_heartbeat(args: dict) -> list[TextContent]:
-    """
-    Write a liveness heartbeat for a WOS unit of work.
-
-    Called by executing WOS subagents every 60–90 seconds to prove they are
-    alive. Without periodic heartbeats, the Observation Loop (steward-heartbeat
-    Phase 2b) detects a stall and re-queues the UoW for re-execution.
-
-    Delegates to Registry.write_heartbeat() — a fire-and-forget SQL UPDATE that
-    sets heartbeat_at to the current UTC timestamp for UoWs in 'active' or
-    'executing' status. Returns rowcount=0 when the UoW is no longer in an
-    executing state, which signals the agent to stop.
-
-    Errors are logged and returned as an error response — never raised — so the
-    agent's execution continues and the heartbeat sidecar provides backup coverage.
-    """
-    uow_id = (args.get("uow_id") or "").strip()
-    if not uow_id:
-        return [TextContent(type="text", text='{"error": "uow_id is required"}')]
-
-    # token_usage: optional cumulative token count for stuck-agent detection.
-    # Accept integers and floats (MCP may transmit numbers as float); reject strings
-    # and negative values. None is the backwards-compatible default.
-    _token_usage_raw = args.get("token_usage")
-    token_usage: int | None = None
-    if _token_usage_raw is not None:
-        if isinstance(_token_usage_raw, (int, float)) and int(_token_usage_raw) >= 0:
-            token_usage = int(_token_usage_raw)
-
-    try:
-        import sys as _sys
-        import os
-        from pathlib import Path as _Path
-        _src = str(_Path(__file__).resolve().parent.parent)
-        if _src not in _sys.path:
-            _sys.path.insert(0, _src)
-        from orchestration.registry import WOSRegistry
-        rowcount = WOSRegistry().write_heartbeat(uow_id, token_usage=token_usage)
-        log.debug(
-            "write_wos_heartbeat: uow_id=%s rowcount=%d token_usage=%s",
-            uow_id, rowcount, token_usage,
-        )
-        return [TextContent(type="text", text=f'{{"rowcount": {rowcount}}}')]
-    except Exception as exc:
-        log.warning(
-            "write_wos_heartbeat: failed for uow_id=%s — %s: %s",
-            uow_id, type(exc).__name__, exc,
-        )
-        return [TextContent(type="text", text=f'{{"error": "{type(exc).__name__}: {exc}"}}')]
-
-
-# =============================================================================
 # Subagent Result Relay Handler
 # =============================================================================
 
@@ -8940,21 +8776,6 @@ async def handle_write_result(args: dict) -> list[TextContent]:
         _session_store.set_notified(task_id)
     except Exception as exc:
         log.warning(f"write_result auto-unregister failed for task_id={task_id!r}: {exc}")
-
-    # WOS registry completion (issue #669): when a subagent writes its result for a
-    # wos_execute task, transition the UoW from 'executing' → 'ready-for-steward'.
-    # The executor transitions active → executing at dispatch time (fire-and-forget inbox
-    # dispatch). The execution_complete audit entry and status transition happen here —
-    # only after the subagent confirms completion via write_result — preventing the
-    # false-complete bug where UoWs appeared done before any work was done.
-    #
-    # task_id convention: "wos-{uow_id}" (set by route_wos_message in dispatcher_handlers.py)
-    # result_text is forwarded so the output classifier can build an accurate close-out
-    # comment (pearl for PR opened, heat for nothing to do, seed as default).
-    # token_usage is forwarded for per-UoW cost telemetry (issue #990).
-    # outcome_category is forwarded to persist metabolic taxonomy in the registry (issue #998).
-    _maybe_complete_wos_uow(task_id, status, result_text=text or None, token_usage=token_usage,
-                            outcome_category=outcome_category)
 
     # Notify wire server so SSE clients update within 40ms
     asyncio.create_task(_notify_wire_server())

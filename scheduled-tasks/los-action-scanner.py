@@ -103,7 +103,7 @@ def _load_processed_messages(since: datetime) -> list[dict]:
                 continue
             # Only scan actual user messages
             msg_type = msg.get("type", "")
-            if msg_type in ("subagent_result", "subagent_notification", "wos_execute"):
+            if msg_type in ("subagent_result", "subagent_notification"):
                 continue
             text = msg.get("text", "").strip()
             if not text:

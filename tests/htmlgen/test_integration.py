@@ -6,7 +6,6 @@ End-to-end integration tests for the Phase 1 HTML document model.
 Verifies:
   1. Layers A (conventions), B (templates), C (components) import together without conflicts.
   2. Renderer produces valid HTML from a minimal content fixture.
-  3. wos_dashboard.py and wos_uow_detail_gen.py are unmodified and still importable.
 
 Run with: uv run pytest tests/html/test_integration.py -v
 """
