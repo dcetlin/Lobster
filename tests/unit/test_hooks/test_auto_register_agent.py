@@ -3,11 +3,13 @@ Unit tests for hooks/auto-register-agent.py
 
 Tests cover:
 - Non-Agent tool calls are ignored (exit 0, no DB write)
+- Both "Agent" and "Task" tool_name values register (matcher-gap coverage)
 - YAML frontmatter: task_id, chat_id, source, reply_to_message_id parsed correctly
 - Legacy text format: task_id extracted from "task_id is: X"
 - agentId extracted from tool_response dict and list forms
 - output_file extracted from tool_response
 - DB row inserted with correct values
+- dispatcher_pid/pid_captured_at populated via process-tree PID capture (issue #2148)
 - INSERT OR IGNORE: existing row not overwritten
 - Missing agentId: exits 0 without DB write
 - DB failure: logs to hook-failures.log and exits 0
@@ -244,6 +246,135 @@ class TestHookNonAgentTool:
                 pass  # table doesn't exist — no rows written, test passes
             finally:
                 conn.close()
+
+
+class TestHookTaskToolName:
+    """tool_name == "Task" must register exactly like "Agent" (matcher-gap fix)."""
+
+    def test_task_tool_name_registers_row(self, tmp_path):
+        """A Task-tool call inserts a row, not just an Agent-tool call."""
+        prompt = "---\ntask_id: t-task-tool\nchat_id: 55555\nsource: telegram\n---\nDo task-tool work."
+        hook_input = _make_hook_input(
+            tool_name="Task",
+            prompt=prompt,
+            tool_response={"agentId": "agent-task-tool"},
+        )
+        exit_code, _, _ = _run_hook(hook_input, tmp_path)
+        assert exit_code == 0
+
+        row = _get_row(tmp_path, "agent-task-tool")
+        assert row is not None
+        assert row["task_id"] == "t-task-tool"
+        assert row["status"] == "running"
+
+    def test_task_tool_name_missing_agent_id_no_write(self, tmp_path):
+        """Task-tool calls still respect the missing-agentId no-op path."""
+        hook_input = _make_hook_input(
+            tool_name="Task",
+            prompt="---\ntask_id: t-task-noid\n---",
+            tool_response={"result": "no id here"},
+        )
+        exit_code, _, _ = _run_hook(hook_input, tmp_path)
+        assert exit_code == 0
+        db_path = tmp_path / "messages" / "config" / "agent_sessions.db"
+        if db_path.exists():
+            conn = sqlite3.connect(str(db_path))
+            try:
+                rows = conn.execute("SELECT COUNT(*) FROM agent_sessions").fetchone()
+                assert rows[0] == 0
+            except sqlite3.OperationalError:
+                pass
+            finally:
+                conn.close()
+
+
+class TestHookDispatcherPidCapture:
+    """dispatcher_pid/pid_captured_at are populated via process-tree PID capture (issue #2148)."""
+
+    def test_dispatcher_pid_and_captured_at_populated_when_ancestor_found(self, tmp_path):
+        """When find_dispatcher_ancestor_pid() finds a real PID, both columns are set."""
+        prompt = "---\ntask_id: t-pid\nchat_id: 12345\n---\nDo work."
+        hook_input = _make_hook_input(
+            prompt=prompt,
+            tool_response={"agentId": "agent-pid"},
+        )
+        with patch("agents.pid_liveness.find_dispatcher_ancestor_pid", return_value=4242):
+            exit_code, _, _ = _run_hook(hook_input, tmp_path)
+        assert exit_code == 0
+
+        row = _get_row(tmp_path, "agent-pid")
+        assert row is not None
+        assert row["dispatcher_pid"] == 4242
+        assert row["pid_captured_at"] is not None
+
+    def test_dispatcher_pid_null_when_ancestor_not_found(self, tmp_path):
+        """When no dispatcher ancestor is found, both columns stay NULL (never blocks registration)."""
+        prompt = "---\ntask_id: t-nopid\nchat_id: 12345\n---\nDo work."
+        hook_input = _make_hook_input(
+            prompt=prompt,
+            tool_response={"agentId": "agent-nopid"},
+        )
+        with patch("agents.pid_liveness.find_dispatcher_ancestor_pid", return_value=None):
+            exit_code, _, _ = _run_hook(hook_input, tmp_path)
+        assert exit_code == 0
+
+        row = _get_row(tmp_path, "agent-nopid")
+        assert row is not None
+        assert row["dispatcher_pid"] is None
+        assert row["pid_captured_at"] is None
+
+    def test_pid_capture_failure_never_blocks_registration(self, tmp_path):
+        """A raising PID-capture call is swallowed — registration still succeeds."""
+        prompt = "---\ntask_id: t-pidfail\nchat_id: 12345\n---\nDo work."
+        hook_input = _make_hook_input(
+            prompt=prompt,
+            tool_response={"agentId": "agent-pidfail"},
+        )
+        with patch(
+            "agents.pid_liveness.find_dispatcher_ancestor_pid",
+            side_effect=OSError("no /proc"),
+        ):
+            exit_code, _, _ = _run_hook(hook_input, tmp_path)
+        assert exit_code == 0
+
+        row = _get_row(tmp_path, "agent-pidfail")
+        assert row is not None
+        assert row["dispatcher_pid"] is None
+
+    def test_dispatcher_pid_column_added_to_pre_existing_db(self, tmp_path):
+        """A DB created before dispatcher_pid/pid_captured_at existed gets the columns via ALTER TABLE."""
+        db_dir = tmp_path / "messages" / "config"
+        db_dir.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_dir / "agent_sessions.db"))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_sessions (
+                id TEXT PRIMARY KEY, task_id TEXT, agent_type TEXT,
+                description TEXT NOT NULL, chat_id TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'telegram',
+                status TEXT NOT NULL DEFAULT 'running',
+                output_file TEXT, timeout_minutes INTEGER,
+                input_summary TEXT, result_summary TEXT, parent_id TEXT,
+                spawned_at TEXT NOT NULL, completed_at TEXT,
+                last_seen_at TEXT, notified_at TEXT,
+                trigger_message_id TEXT, trigger_snippet TEXT,
+                reply_message_ids TEXT, request_id TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        prompt = "---\ntask_id: t-pidmigrate\nchat_id: 12345\n---"
+        hook_input = _make_hook_input(
+            prompt=prompt,
+            tool_response={"agentId": "agent-pidmigrate"},
+        )
+        with patch("agents.pid_liveness.find_dispatcher_ancestor_pid", return_value=9999):
+            exit_code, _, _ = _run_hook(hook_input, tmp_path)
+        assert exit_code == 0
+
+        row = _get_row(tmp_path, "agent-pidmigrate")
+        assert row is not None
+        assert row["dispatcher_pid"] == 9999
 
 
 class TestHookAgentWithAgentId:
