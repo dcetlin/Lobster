@@ -286,6 +286,57 @@ or acked request and nothing previously removed them. `scheduled-tasks/agent-rep
 
 Standalone: `uv run scheduled-tasks/agent-replies-sweep.py [--dry-run] [--retention-hours N]`.
 
+**Abandonment auto-complete (sliding-timer guardrail, issue #1525).**
+`_LOCAL_CLAUDE_STALE_TIMEOUT_SECONDS` (600s) only handles the *reclaim*
+case: a stale claim is released and the message moved back to `inbox/` so a
+new claimant can pick it up. It does not handle the case where nobody ever
+reclaims it — a crashed claimant with no reclaimer would otherwise leave the
+exchange sitting in `OPEN` forever, with the collaborator polling until its
+own client-side timeout and the server-side state never resolving.
+
+`scheduled-tasks/agent-channel-abandonment-sweep.py` (a Type B cron-direct
+job, job name `agent-channel-abandonment-sweep`, every 15 minutes) closes
+this gap. Unlike `agent-replies-sweep.py`, it is a genuinely new job — it
+cross-references three data sources the flat sweep's own docstring
+disclaims touching: `processing/`, the claims DB, and `agent-replies/`.
+
+- **Sliding timer, not a fixed guillotine** (Hydra timer+extension pattern,
+  spec §3.3). For each exchange, the deadline is `max(claimed_at, last
+  accepted .ack.json write) + ABANDONMENT_WINDOW_HOURS` (default 24h, env
+  `LOBSTER_AGENT_CHANNEL_ABANDONMENT_WINDOW_HOURS` / `--window-hours`).
+  Every accepted `write_progress` call overwrites `.ack.json`, moving that
+  timestamp forward — a claimant that keeps calling `write_progress` never
+  trips the guardrail, however long the work takes. A configured window
+  below `MIN_ABANDONMENT_WINDOW_HOURS` (2h) is clamped up rather than
+  honored, so it can never race the 600s reclaim timeout.
+- **Candidate discovery is conservative by construction.** A request_id is
+  only ever considered if it has an `<request_id>.ack.json` file in
+  `agent-replies/` (written exclusively by `write_ack`/`write_progress` —
+  unambiguously local-claude) or a `processing/` file whose own `source`
+  field is `"local-claude"`. The claims DB is never scanned in bulk — it is
+  shared by every source, not just this channel — it is only ever queried
+  by `request_id` (`get_claimed_at()`, `src/mcp/claims.py`) for candidates
+  already known to be local-claude via one of the two sources above.
+- **The deadline anchor is always the MAX of available signals**, never the
+  min — a live claim row or a recent `.ack.json` write is sufficient on its
+  own to keep an exchange out of the auto-complete path, so a request that
+  was just reclaimed by a new, actively-working claimant is never
+  auto-completed out from under it.
+- **Auto-complete writes a synthetic terminal reply** via the same
+  `agent_channel.write_reply()` single-shot, first-writer-wins primitive the
+  real reply path uses — a real reply landing concurrently is never
+  clobbered; the synthetic write is simply a no-op lost race, exactly like
+  any other double-write attempt on this channel.
+- **Known, accepted scope limit:** an exchange whose `write_ack` call failed
+  at claim time (rare filesystem error) AND whose claim row was later
+  released by `_recover_stale_processing()` becomes undiscoverable to this
+  job — it reverts to plain "Requested, unclaimed" state with no OPEN-
+  exchange signal anywhere, outside the sliding timer's scope by
+  construction (same as any other never-claimed message sitting in
+  `inbox/`).
+
+Standalone: `uv run scheduled-tasks/agent-channel-abandonment-sweep.py [--dry-run] [--window-hours N]`.
+
 ## Deploy: does this need an MCP restart?
 
 **Yes.** The routing lives in `handle_send_reply()` inside
@@ -384,9 +435,18 @@ the timeout message — the dispatcher may still be working on it.
   entirely). See "Observability & retention" above.
 - `scheduled-tasks/agent-replies-sweep.py` — Type B cron-direct retention
   sweep for `~/messages/agent-replies/`. See "Observability & retention" above.
+- `scheduled-tasks/agent-channel-abandonment-sweep.py` — Type B cron-direct
+  sliding-timer abandonment auto-complete guardrail (issue #1525). See
+  "Observability & retention" above.
+- `src/mcp/claims.py` — `AtomicClaimDB.get_claimed_at()` added, giving the
+  abandonment-sweep job a targeted (never bulk) claims-DB lookup for the
+  claim-time half of the sliding-timer's `max(claimed_at, last .ack.json
+  write)` deadline anchor.
 - `scripts/upgrade.sh` — Migration 139 creates `~/messages/agent-replies/` on
   existing installs; Migration 140 registers `agent-replies-sweep` in
-  `jobs.json` and adds its daily cron entry.
+  `jobs.json` and adds its daily cron entry; Migration 144 registers
+  `agent-channel-abandonment-sweep` in `jobs.json` and adds its 15-minute
+  cron entry.
 - `src/protocol/agent_channel_schema.py` — the single canonical schema module
   for the protocol's envelopes, request_id rules, addressing model, and
   error/ack semantics. Stdlib-only, no other Lobster-internal imports.

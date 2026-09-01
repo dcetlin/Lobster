@@ -289,6 +289,32 @@ class AtomicClaimDB:
         except Exception:
             return None
 
+    def get_claimed_at(self, message_id: str) -> str | None:
+        """Return the claimed_at ISO timestamp for message_id's current claim
+        row, or None if no claim row exists (never claimed, or the row was
+        deleted by release() — e.g. _recover_stale_processing() reclaiming a
+        stale local-claude exchange past _LOCAL_CLAUDE_STALE_TIMEOUT_SECONDS).
+
+        Used by the agent-channel abandonment-sweep job (agent-channel
+        protocol v1 §3.3, sliding-timer guardrail) as one of two candidate
+        signals feeding the abandonment deadline — the other being the
+        timestamp of the most recent accepted write_progress call
+        (agent-replies/<request_id>.ack.json's own ts/mtime). The sweep takes
+        max(claimed_at, last .ack.json write) as the deadline anchor: a claim
+        row that still exists always contributes at least its original claim
+        time, even for an exchange that was claimed but has had no
+        write_progress call yet.
+        """
+        try:
+            conn = self._conn()
+            row = conn.execute(
+                "SELECT claimed_at FROM message_claims WHERE message_id=?",
+                (message_id,),
+            ).fetchone()
+            return row["claimed_at"] if row is not None else None
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------
     # Dispatcher lock operations (Phase 2)
     # ------------------------------------------------------------------

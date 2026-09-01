@@ -92,6 +92,43 @@ class TestMessageClaim:
         """release() is a no-op on an unclaimed message_id — no exception."""
         db.release("never-claimed")
 
+    def test_get_claim_status_processing_after_claim(self, db):
+        """get_claim_status() returns 'processing' right after a successful claim."""
+        db.claim("msg-008", "dispatcher")
+        assert db.get_claim_status("msg-008") == "processing"
+
+    def test_get_claim_status_none_for_unknown_id(self, db):
+        """get_claim_status() returns None when no claim row exists."""
+        assert db.get_claim_status("nonexistent") is None
+
+    def test_get_claim_status_reflects_update_status(self, db):
+        """get_claim_status() reflects a later update_status() call."""
+        db.claim("msg-009", "dispatcher")
+        db.update_status("msg-009", "processed")
+        assert db.get_claim_status("msg-009") == "processed"
+
+    def test_get_claimed_at_returns_timestamp_after_claim(self, db):
+        """get_claimed_at() returns a non-empty ISO timestamp string right after claim()."""
+        db.claim("msg-010", "dispatcher")
+        claimed_at = db.get_claimed_at("msg-010")
+        assert claimed_at is not None
+        # Round-trips through datetime.fromisoformat without raising.
+        from datetime import datetime
+        datetime.fromisoformat(claimed_at)
+
+    def test_get_claimed_at_none_for_unknown_id(self, db):
+        """get_claimed_at() returns None when no claim row exists."""
+        assert db.get_claimed_at("nonexistent") is None
+
+    def test_get_claimed_at_none_after_release(self, db):
+        """get_claimed_at() returns None once the claim row has been released
+        (e.g. by _recover_stale_processing() reclaiming a stale exchange) —
+        the abandonment-sweep job relies on this to fall back to the
+        .ack.json signal alone once a claim row is gone."""
+        db.claim("msg-011", "dispatcher")
+        db.release("msg-011")
+        assert db.get_claimed_at("msg-011") is None
+
 
 class TestConcurrentClaim:
     """Verify that concurrent callers get exactly one winner.
