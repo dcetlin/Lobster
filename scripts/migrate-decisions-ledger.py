@@ -2,8 +2,6 @@
 """
 One-off migration: parse decisions-ledger.md and insert entries into the
 decisions table in memory.db. Re-runnable safely via INSERT OR IGNORE.
-
-WOS-UoW: uow_20260502_a1a5e3
 """
 
 import os

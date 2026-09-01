@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """One-time ET→PT timezone transition. Scheduled to run 2026-05-29T12:00Z.
-
-WOS-UoW: uow_20260524_b0f331
 """
 
 import os

@@ -72,7 +72,7 @@ class TestIsNonUrgent:
         assert is_non_urgent(msg) is False
 
     def test_urgent_keyword_error_colon(self):
-        msg = _make_scheduled_msg(text="Error: health check failed — 3 UoWs stale.")
+        msg = _make_scheduled_msg(text="Error: health check failed — 3 jobs stale.")
         assert is_non_urgent(msg) is False
 
     def test_urgent_keyword_incident(self):
@@ -80,7 +80,7 @@ class TestIsNonUrgent:
         assert is_non_urgent(msg) is False
 
     def test_urgent_keyword_starvation(self):
-        msg = _make_scheduled_msg(text="Starvation detected: UoW uow_abc123 stuck for 72h.")
+        msg = _make_scheduled_msg(text="Starvation detected: session sess_abc123 stuck for 72h.")
         assert is_non_urgent(msg) is False
 
     def test_daily_digest_is_non_urgent(self):

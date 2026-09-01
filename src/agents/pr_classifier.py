@@ -1,8 +1,7 @@
 """
 PR Classifier — classify open pull requests for automated review routing.
 
-Called by the WOS Steward when prescribing a `review_pr:*` UoW.
-Also callable standalone for manual classification.
+Callable standalone for manual classification.
 
 Usage:
     from src.agents.pr_classifier import classify, PRReviewType
@@ -33,11 +32,10 @@ def classify(pr_number: int, repo: str = "dcetlin/Lobster") -> PRReviewType:
     Classify a PR for automated review routing.
 
     Routing order (first match wins):
-    1. Files include src/wos/ or src/orchestration/ → oracle_deep
-    2. Labels contain 'documentation' or title starts with 'docs:' → docs_quality
-    3. Labels contain 'bug' or title starts with 'fix:' → bug_regression
-    4. Files include .claude/skills/ or src/skills/ → skill_compliance
-    5. Default → oracle_only
+    1. Labels contain 'documentation' or title starts with 'docs:' → docs_quality
+    2. Labels contain 'bug' or title starts with 'fix:' → bug_regression
+    3. Files include .claude/skills/ or src/skills/ → skill_compliance
+    4. Default → oracle_only
 
     On failure (GitHub API unavailable, malformed response), defaults to
     oracle_only with an error note in rationale.
@@ -68,18 +66,7 @@ def classify(pr_number: int, repo: str = "dcetlin/Lobster") -> PRReviewType:
     title: str = data.get("title", "")
     files: list[str] = [f.get("path", "") for f in data.get("files", [])]
 
-    # Rule 1: orchestration / wos files → deep oracle
-    if any(
-        f.startswith("src/wos/") or f.startswith("src/orchestration/")
-        for f in files
-    ):
-        return PRReviewType(
-            review_type="oracle_deep",
-            prescribed_skills=["lobster-oracle", "typing-auditor"],
-            rationale="touches src/wos/ or src/orchestration/ — elevated scrutiny",
-        )
-
-    # Rule 2: docs label or docs: title prefix
+    # Rule 1: docs label or docs: title prefix
     if "documentation" in labels or title.startswith("docs:"):
         return PRReviewType(
             review_type="docs_quality",
@@ -87,7 +74,7 @@ def classify(pr_number: int, repo: str = "dcetlin/Lobster") -> PRReviewType:
             rationale="documentation label or docs: title prefix",
         )
 
-    # Rule 3: bug label or fix: title prefix
+    # Rule 2: bug label or fix: title prefix
     if "bug" in labels or title.startswith("fix:"):
         return PRReviewType(
             review_type="bug_regression",
@@ -95,7 +82,7 @@ def classify(pr_number: int, repo: str = "dcetlin/Lobster") -> PRReviewType:
             rationale="bug label or fix: title prefix",
         )
 
-    # Rule 4: skill files
+    # Rule 3: skill files
     if any(
         f.startswith(".claude/skills/") or f.startswith("src/skills/")
         for f in files

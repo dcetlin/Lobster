@@ -2,9 +2,9 @@
 name: engineering-sensibilities
 description: >
   Engineering principles as a PR-review checklist. Use when reviewing PRs,
-  assessing implementation work, or discussing code structure — especially for
-  WOS pipeline work. Enforces four principles: fractal organizational structure,
-  gardens of golden patterns, maximal elegance, and cognitive clarity.
+  assessing implementation work, or discussing code structure. Enforces four
+  principles: fractal organizational structure, gardens of golden patterns,
+  maximal elegance, and cognitive clarity.
 ---
 
 # Engineering Sensibilities

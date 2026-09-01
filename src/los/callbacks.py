@@ -6,7 +6,7 @@ Handles inline keyboard button presses for the /todos interface:
     todo-dismiss-{id}           → archive item (status='dismissed', not deleted)
     todo-snooze-{id}-{date}     → snooze until custom date (YYYY-MM-DD)
 
-Returns the same shape dict as route_callback_message in dispatcher_handlers.py:
+Returns:
     {"action": "send_reply", "text": ..., "chat_id": ..., "handled": bool}
 
 Dispatcher integration:
@@ -17,7 +17,8 @@ Dispatcher integration:
         if los_result["handled"]:
             # send reply and mark processed
         else:
-            result = route_callback_message(msg, registry=registry)
+            # pass through to whatever other callback handling applies
+            ...
 """
 from __future__ import annotations
 

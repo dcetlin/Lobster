@@ -125,7 +125,7 @@ HEARTBEAT_FILE="$WORKSPACE_DIR/logs/claude-heartbeat"   # legacy WFM-touch signa
 # Threshold is generous enough to cover compaction + catchup without suppression.
 DISPATCHER_HEARTBEAT_FILE="${LOBSTER_DISPATCHER_HEARTBEAT_OVERRIDE:-$WORKSPACE_DIR/logs/dispatcher-heartbeat}"
 DISPATCHER_HEARTBEAT_STALE_SECONDS=1800   # TEMPORARY BUFFER (2026-06-05): raised from 1200s to 1800s while structural
-                                           # WOS quota_wait fixes land. 1800s = 30 min, covers the worst-case compaction
+                                           # quota_wait fixes land. 1800s = 30 min, covers the worst-case compaction
                                            # + catchup window observed during the Jun 4-5 quota storm. Revert to 1200s
                                            # once quota_wait mode correctly suppresses heartbeat checks in production.
 

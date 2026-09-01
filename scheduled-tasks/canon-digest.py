@@ -29,8 +29,7 @@ canon-reconciler job ran on):
 
 Type B dispatch: cron calls this script directly (no inbox message, no LLM
 round-trip). The jobs.json `enabled` gate is checked at the top of main() so
-`wos start/stop`-style runtime toggling (direct jobs.json edits) is respected
-without touching cron.
+runtime toggling via direct jobs.json edits is respected without touching cron.
 """
 
 from __future__ import annotations

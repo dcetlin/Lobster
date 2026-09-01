@@ -53,7 +53,7 @@ class TestClassifyIntent:
 
     def test_system_type_returns_system(self) -> None:
         """Any system message type maps to 'system'."""
-        assert _classify_intent("whatever text", "wos_execute") == "system"
+        assert _classify_intent("whatever text", "health_check") == "system"
         assert _classify_intent("scheduled task", "scheduled_reminder") == "system"
         assert _classify_intent("done", "subagent_result") == "system"
 
@@ -72,7 +72,7 @@ class TestClassifyIntent:
         """Messages that are questions map to 'question'."""
         assert _classify_intent("What is the status?", "text") == "question"
         assert _classify_intent("How do I restart the dispatcher?", "text") == "question"
-        assert _classify_intent("Can you explain the WOS pipeline?", "text") == "question"
+        assert _classify_intent("Can you explain the billing pipeline?", "text") == "question"
         assert _classify_intent("Is there a log for this?", "text") == "question"
 
     def test_emotional_keywords(self) -> None:
@@ -84,7 +84,7 @@ class TestClassifyIntent:
     def test_operational_keywords(self) -> None:
         """Messages with operational keywords map to 'operational'."""
         assert _classify_intent("Schedule a reminder for tomorrow", "text") == "operational"
-        assert _classify_intent("Check the WOS status", "text") == "operational"
+        assert _classify_intent("Check the billing status", "text") == "operational"
         assert _classify_intent("Update the config settings", "text") == "operational"
 
     def test_fallback_to_operational(self) -> None:
@@ -135,7 +135,7 @@ class TestClassifyUrgency:
     def test_system_messages_are_normal(self) -> None:
         """System message types always return 'normal'."""
         assert _classify_urgency("urgent fix needed", "subagent_result") == "normal"
-        assert _classify_urgency("broken", "wos_execute") == "normal"
+        assert _classify_urgency("broken", "health_check") == "normal"
 
     def test_reaction_messages_are_normal(self) -> None:
         """Reaction type always returns 'normal'."""
@@ -168,7 +168,7 @@ class TestIsUserFacing:
 
     def test_system_type_is_not_user_facing(self) -> None:
         """System message types are never user-facing regardless of source."""
-        assert _is_user_facing("telegram", 12345, "wos_execute") is False
+        assert _is_user_facing("telegram", 12345, "health_check") is False
         assert _is_user_facing("telegram", 12345, "subagent_result") is False
         assert _is_user_facing("telegram", 12345, "scheduled_reminder") is False
 
@@ -220,7 +220,7 @@ class TestBuildLobsterMeta:
     def test_system_type_intent_class(self) -> None:
         """System message type gets intent_class='system'."""
         result = build_lobster_meta(
-            _msg("execute now", "wos_execute", "system", 0)
+            _msg("execute now", "health_check", "system", 0)
         )
         assert result["intent_class"] == "system"
 

@@ -194,13 +194,13 @@ class TestForwardReferences:
 
     def test_detects_undefined_acronym_before_definition(self):
         text = (
-            "The WOS pipeline handles this automatically.\n\n"
-            "Work Orchestration System (WOS) is our execution engine."
+            "The ETL pipeline handles this automatically.\n\n"
+            "Extract, Transform, Load (ETL) is our data ingestion process."
         )
         signal = _check_forward_references(text)
         assert signal is not None
         assert signal.kind == "forward_reference"
-        assert "WOS" in signal.description
+        assert "ETL" in signal.description
 
     def test_skips_common_acronyms(self):
         text = (

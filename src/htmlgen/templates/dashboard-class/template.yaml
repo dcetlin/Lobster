@@ -1,6 +1,6 @@
 id: dashboard-class
 name: Dashboard (data-driven)
-description: WOS dashboard, status pages, interactive tools with live data.
+description: Status pages, interactive tools with live data.
 content_format: json
 components:
   - id: dashboard-filter-bar
@@ -17,7 +17,7 @@ selection_rules:
   use_when:
     - Document is data-driven and regenerated frequently (e.g., every few minutes or hours)
     - Document has interactive elements: filter bars, action buttons, status toggles
-    - Document is the WOS dashboard or a similar operational status page
+    - Document is an operational status page
     - Document aggregates structured data across many entities
   avoid_when:
     - Document is primarily narrative prose read linearly

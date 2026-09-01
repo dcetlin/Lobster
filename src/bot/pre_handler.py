@@ -11,8 +11,6 @@ Commands handled here (bypasses inbox entirely):
   /subagents  — active subagent sessions from session store
   /jobs       — scheduled jobs from jobs.json
   /restart    — restart dispatcher (with confirmation) or warn for mcp/all
-
-WOS-UoW: uow_20260515_75d522
 """
 
 from __future__ import annotations

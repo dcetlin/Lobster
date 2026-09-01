@@ -1,7 +1,7 @@
 # dashboard-class template
 
 Use this template for data-driven documents that are regenerated frequently and
-include interactive elements: the WOS dashboard, status pages, operational views.
+include interactive elements: status pages, operational views.
 
 **What it produces:** A compact HTML dashboard with automatic dark/light theme (via
 `@media prefers-color-scheme` — no toggle button), optional filter bar, and a
@@ -10,7 +10,7 @@ structured layout optimized for dense data presentation.
 **When to use:**
 - The document is regenerated frequently (every few minutes to hours)
 - The document has interactive elements: filter dropdowns, status toggles, action buttons
-- Examples: WOS dashboard, executor status, agent session view, health report
+- Examples: agent session view, health report, operational status page
 
 **When not to use:**
 - The document is primarily prose read linearly → use `document-class`

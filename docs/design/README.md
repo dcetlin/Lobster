@@ -1,1 +1,1 @@
-Active proposals for non-WOS features not yet promoted to spec.
+Active proposals for features not yet promoted to spec.
