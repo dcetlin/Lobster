@@ -876,3 +876,159 @@ LEARNINGS_PROPOSALS_TASK
         substep "garden-caretaker cron entry not found — skipping d12"
     fi
 
+    # d13: Register ledger-db-backup scheduled job (task #20 item 4).
+    # Nightly pg_dump+gzip backup of ledger_db (Dan's ledger app, private.ledger.dancetlin.com)
+    # to ~/backups/ledger/, 14-day retention. Prior to this, ledger_db had NO backup
+    # coverage at all (last dump on disk predated this migration by weeks).
+    local LEDGER_BACKUP_MARKER="# LOBSTER-LEDGER-DB-BACKUP"
+    if ! crontab -l 2>/dev/null | grep -q "$LEDGER_BACKUP_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$LEDGER_BACKUP_MARKER" \
+            "15 3 * * * cd $LOBSTER_DIR && uv run scheduled-tasks/ledger-db-backup.py >> $WORKSPACE_DIR/scheduled-jobs/logs/ledger-db-backup.log 2>&1 $LEDGER_BACKUP_MARKER"
+        substep "Added ledger-db-backup cron entry (daily at 03:15 UTC)"
+        migrated=$((migrated + 1))
+    else
+        substep "ledger-db-backup crontab entry already present"
+    fi
+    if [ -f "$JOBS_FILE" ] && command -v jq >/dev/null 2>&1; then
+        if ! jq -e '.jobs["ledger-db-backup"]' "$JOBS_FILE" > /dev/null 2>&1; then
+            local lb_now_iso
+            lb_now_iso=$(date -u +"%Y-%m-%dT%H:%M:%S.%6N+00:00")
+            TMP_JOBS=$(mktemp)
+            jq --arg now "$lb_now_iso" '.jobs["ledger-db-backup"] = {
+                "name": "ledger-db-backup",
+                "type": "B",
+                "dispatch": "cron-direct",
+                "schedule": "15 3 * * *",
+                "schedule_human": "Daily at 03:15 UTC",
+                "task_file": null,
+                "created_at": $now,
+                "updated_at": $now,
+                "enabled": true,
+                "last_run": null,
+                "last_status": null,
+                "description": "Nightly pg_dump+gzip backup of ledger_db to ~/backups/ledger/, 14-day retention (task #20 item 4)"
+            }' "$JOBS_FILE" > "$TMP_JOBS" && mv "$TMP_JOBS" "$JOBS_FILE"
+            substep "Registered ledger-db-backup job in jobs.json (Type B, daily at 03:15 UTC)"
+            migrated=$((migrated + 1))
+        fi
+    fi
+
+    # d14: Register unauth-route-probe scheduled job (task #20 item 1).
+    # Generic probe (script is reusable; config is instance-specific) that GETs an
+    # allowlist of API paths on private.ledger.dancetlin.com with no credentials and
+    # alerts Dan if any path expected to require auth (401) instead returns 2xx with
+    # a body. Seeds the host->allowlist config consumed by
+    # scheduled-tasks/unauth-route-probe.py.
+    local UNAUTH_PROBE_MARKER="# LOBSTER-UNAUTH-ROUTE-PROBE"
+    local UNAUTH_PROBE_CONFIG="$WORKSPACE_DIR/data/unauth-route-probe-config.json"
+    if [ ! -f "$UNAUTH_PROBE_CONFIG" ]; then
+        mkdir -p "$WORKSPACE_DIR/data"
+        cat > "$UNAUTH_PROBE_CONFIG" << 'UNAUTH_PROBE_CONFIG_EOF'
+{
+  "hosts": {
+    "private.ledger.dancetlin.com": {
+      "expect_401": [
+        "/api/review/summary",
+        "/api/review/pull",
+        "/api/transactions",
+        "/api/accounts",
+        "/api/dashboard",
+        "/api/categories",
+        "/api/plaid/items",
+        "/api/households"
+      ],
+      "expect_200": [
+        "/",
+        "/health",
+        "/api/auth/get-session"
+      ]
+    }
+  }
+}
+UNAUTH_PROBE_CONFIG_EOF
+        substep "Seeded unauth-route-probe-config.json (private.ledger.dancetlin.com allowlist)"
+        migrated=$((migrated + 1))
+    fi
+    if ! crontab -l 2>/dev/null | grep -q "$UNAUTH_PROBE_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$UNAUTH_PROBE_MARKER" \
+            "*/15 * * * * cd $LOBSTER_DIR && uv run scheduled-tasks/unauth-route-probe.py >> $WORKSPACE_DIR/scheduled-jobs/logs/unauth-route-probe.log 2>&1 $UNAUTH_PROBE_MARKER"
+        substep "Added unauth-route-probe cron entry (every 15 min)"
+        migrated=$((migrated + 1))
+    else
+        substep "unauth-route-probe crontab entry already present"
+    fi
+    if [ -f "$JOBS_FILE" ] && command -v jq >/dev/null 2>&1; then
+        if ! jq -e '.jobs["unauth-route-probe"]' "$JOBS_FILE" > /dev/null 2>&1; then
+            local urp_now_iso
+            urp_now_iso=$(date -u +"%Y-%m-%dT%H:%M:%S.%6N+00:00")
+            TMP_JOBS=$(mktemp)
+            jq --arg now "$urp_now_iso" '.jobs["unauth-route-probe"] = {
+                "name": "unauth-route-probe",
+                "type": "B",
+                "dispatch": "cron-direct",
+                "schedule": "*/15 * * * *",
+                "schedule_human": "Every 15 minutes",
+                "task_file": null,
+                "created_at": $now,
+                "updated_at": $now,
+                "enabled": true,
+                "last_run": null,
+                "last_status": null,
+                "description": "Probes expect-401 API paths with no credentials; alerts on any 2xx-with-body exposure (task #20 item 1)"
+            }' "$JOBS_FILE" > "$TMP_JOBS" && mv "$TMP_JOBS" "$JOBS_FILE"
+            substep "Registered unauth-route-probe job in jobs.json (Type B, every 15 min)"
+            migrated=$((migrated + 1))
+        fi
+    fi
+
+    # d15: Register plaid-sync-freshness scheduled job (task #20 item 3).
+    # Hourly check of max(last_synced) in ledger_db's plaid_items table; alerts Dan
+    # if the newest sync is older than 7h (ledger_api's sync job may have stalled).
+    local PLAID_FRESHNESS_MARKER="# LOBSTER-PLAID-SYNC-FRESHNESS"
+    if ! crontab -l 2>/dev/null | grep -q "$PLAID_FRESHNESS_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$PLAID_FRESHNESS_MARKER" \
+            "0 * * * * cd $LOBSTER_DIR && uv run scheduled-tasks/plaid-sync-freshness.py >> $WORKSPACE_DIR/scheduled-jobs/logs/plaid-sync-freshness.log 2>&1 $PLAID_FRESHNESS_MARKER"
+        substep "Added plaid-sync-freshness cron entry (hourly)"
+        migrated=$((migrated + 1))
+    else
+        substep "plaid-sync-freshness crontab entry already present"
+    fi
+    if [ -f "$JOBS_FILE" ] && command -v jq >/dev/null 2>&1; then
+        if ! jq -e '.jobs["plaid-sync-freshness"]' "$JOBS_FILE" > /dev/null 2>&1; then
+            local psf_now_iso
+            psf_now_iso=$(date -u +"%Y-%m-%dT%H:%M:%S.%6N+00:00")
+            TMP_JOBS=$(mktemp)
+            jq --arg now "$psf_now_iso" '.jobs["plaid-sync-freshness"] = {
+                "name": "plaid-sync-freshness",
+                "type": "B",
+                "dispatch": "cron-direct",
+                "schedule": "0 * * * *",
+                "schedule_human": "Hourly",
+                "task_file": null,
+                "created_at": $now,
+                "updated_at": $now,
+                "enabled": true,
+                "last_run": null,
+                "last_status": null,
+                "description": "Alerts if newest plaid_items.last_synced is older than 7h (task #20 item 3)"
+            }' "$JOBS_FILE" > "$TMP_JOBS" && mv "$TMP_JOBS" "$JOBS_FILE"
+            substep "Registered plaid-sync-freshness job in jobs.json (Type B, hourly)"
+            migrated=$((migrated + 1))
+        fi
+    fi
+
+    # d16: Ensure the private.ledger.dancetlin.com block in the LIVE Caddyfile
+    # (~/dancetlin-infra/Caddyfile, bind-mounted into dancetlin-infra-caddy-1) has
+    # an access-log block (task #20 item 2). Idempotent text check — does not
+    # touch the cal/analytics host blocks. This only fixes the file ON DISK; if
+    # the Caddyfile is already present but missing the log block, it appends one
+    # and reminds the operator to `caddy reload` (not done automatically here,
+    # since upgrade.sh may run while Dan is not watching and a reload mistake
+    # should be visible, not silent).
+    local DANCETLIN_CADDYFILE="$HOME/dancetlin-infra/Caddyfile"
+    if [ -f "$DANCETLIN_CADDYFILE" ] && ! grep -q "ledger-access.log" "$DANCETLIN_CADDYFILE"; then
+        warn "private.ledger.dancetlin.com Caddyfile block is missing its access-log directive — re-apply manually and run: docker exec dancetlin-infra-caddy-1 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && docker exec dancetlin-infra-caddy-1 caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile"
+    else
+        substep "dancetlin-infra Caddyfile already has ledger access-log block (or file not found) — skipping d16"
+    fi
+

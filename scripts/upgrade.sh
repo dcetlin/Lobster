@@ -2316,17 +2316,23 @@ else:
     # report → fix → track. State is persisted in data/ralph-state.json.
     # TODO: rename ralph-state.json → wos-health-state.json, ralph-reports/ → wos-health-reports/,
     # and update cron marker in a future coordinated migration.
+    # Guarded by script existence (added 2026-11, Migration 145 cleanup): this
+    # migration used to unconditionally re-add the cron entry and jobs.json
+    # key even after ralph-loop.py was deleted, which would silently
+    # resurrect a dead job on every upgrade run. See Migration 145 below.
     local RALPH_LOOP_MARKER="# LOBSTER-RALPH-LOOP"
-    if ! crontab -l 2>/dev/null | grep -q "$RALPH_LOOP_MARKER"; then
-        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$RALPH_LOOP_MARKER" \
-            "0 */3 * * * cd $HOME && $HOME/.local/bin/uv run $LOBSTER_DIR/scheduled-tasks/ralph-loop.py >> $WORKSPACE_DIR/scheduled-jobs/logs/ralph-loop.log 2>&1 $RALPH_LOOP_MARKER"
-        substep "Added WOS pipeline health loop cron entry (ralph-loop.py, every 3 hours)"
-        migrated=$((migrated + 1))
-    fi
-    # Upsert the ralph-loop entry into jobs.json if not present.
-    local _jobs_file="$WORKSPACE_DIR/scheduled-jobs/jobs.json"
-    if [ -f "$_jobs_file" ] && ! uv run python3 -c "import json,sys; d=json.load(open('$_jobs_file')); sys.exit(0 if 'ralph-loop' in d.get('jobs',{}) else 1)" 2>/dev/null; then
-        uv run python3 - <<'PYEOF'
+    local _RALPH_LOOP_SCRIPT="$LOBSTER_DIR/scheduled-tasks/ralph-loop.py"
+    if [ -f "$_RALPH_LOOP_SCRIPT" ]; then
+        if ! crontab -l 2>/dev/null | grep -q "$RALPH_LOOP_MARKER"; then
+            "$LOBSTER_DIR/scripts/cron-manage.sh" add "$RALPH_LOOP_MARKER" \
+                "0 */3 * * * cd $HOME && $HOME/.local/bin/uv run $LOBSTER_DIR/scheduled-tasks/ralph-loop.py >> $WORKSPACE_DIR/scheduled-jobs/logs/ralph-loop.log 2>&1 $RALPH_LOOP_MARKER"
+            substep "Added WOS pipeline health loop cron entry (ralph-loop.py, every 3 hours)"
+            migrated=$((migrated + 1))
+        fi
+        # Upsert the ralph-loop entry into jobs.json if not present.
+        local _jobs_file="$WORKSPACE_DIR/scheduled-jobs/jobs.json"
+        if [ -f "$_jobs_file" ] && ! uv run python3 -c "import json,sys; d=json.load(open('$_jobs_file')); sys.exit(0 if 'ralph-loop' in d.get('jobs',{}) else 1)" 2>/dev/null; then
+            uv run python3 - <<'PYEOF'
 import json, os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2357,7 +2363,10 @@ if "ralph-loop" not in data["jobs"]:
 else:
     print("ralph-loop already in jobs.json — skipped")
 PYEOF
-        migrated=$((migrated + 1))
+            migrated=$((migrated + 1))
+        fi
+    else
+        substep "Migration 67: ralph-loop.py not found — skipping (retired by Migration 145)"
     fi
 
     # Source instance-specific migration steps if user-update.sh exists
@@ -2900,25 +2909,35 @@ CREATE TABLE IF NOT EXISTS dispatcher_lock (
 
     # Migration 83: Add cron entries for wos-health-check and wos-metabolic-digest
     # (issue #849). Both are Type C cron-direct scripts committed to scheduled-tasks/.
+    # Guarded by script existence (added 2026-11, Migration 145 cleanup) — both
+    # scripts are gone as of the WOS teardown, so these are permanent no-ops now.
     local WOS_HEALTH_MARKER="# LOBSTER-WOS-HEALTH-CHECK"
     local WOS_DIGEST_MARKER="# LOBSTER-WOS-METABOLIC-DIGEST"
-    if ! crontab -l 2>/dev/null | grep -qF "$WOS_HEALTH_MARKER"; then
-        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$WOS_HEALTH_MARKER" \
-            "0 */6 * * * cd $LOBSTER_DIR && uv run scheduled-tasks/wos-health-check.py >> $LOBSTER_WORKSPACE/scheduled-jobs/logs/wos-health-check.log 2>&1 $WOS_HEALTH_MARKER" \
-            && substep "Added wos-health-check cron entry (Migration 83)" \
-            || warn "Could not add wos-health-check cron entry — check cron-manage.sh"
-        migrated=$((migrated + 1))
+    if [ -f "$LOBSTER_DIR/scheduled-tasks/wos-health-check.py" ]; then
+        if ! crontab -l 2>/dev/null | grep -qF "$WOS_HEALTH_MARKER"; then
+            "$LOBSTER_DIR/scripts/cron-manage.sh" add "$WOS_HEALTH_MARKER" \
+                "0 */6 * * * cd $LOBSTER_DIR && uv run scheduled-tasks/wos-health-check.py >> $LOBSTER_WORKSPACE/scheduled-jobs/logs/wos-health-check.log 2>&1 $WOS_HEALTH_MARKER" \
+                && substep "Added wos-health-check cron entry (Migration 83)" \
+                || warn "Could not add wos-health-check cron entry — check cron-manage.sh"
+            migrated=$((migrated + 1))
+        else
+            substep "wos-health-check cron entry already present — skipping"
+        fi
     else
-        substep "wos-health-check cron entry already present — skipping"
+        substep "Migration 83: wos-health-check.py not found — skipping (retired by Migration 145)"
     fi
-    if ! crontab -l 2>/dev/null | grep -qF "$WOS_DIGEST_MARKER"; then
-        "$LOBSTER_DIR/scripts/cron-manage.sh" add "$WOS_DIGEST_MARKER" \
-            "0 9 * * * cd $LOBSTER_DIR && uv run scheduled-tasks/wos-metabolic-digest.py >> $LOBSTER_WORKSPACE/scheduled-jobs/logs/wos-metabolic-digest.log 2>&1 $WOS_DIGEST_MARKER" \
-            && substep "Added wos-metabolic-digest cron entry (Migration 83)" \
-            || warn "Could not add wos-metabolic-digest cron entry — check cron-manage.sh"
-        migrated=$((migrated + 1))
+    if [ -f "$LOBSTER_DIR/scheduled-tasks/wos-metabolic-digest.py" ]; then
+        if ! crontab -l 2>/dev/null | grep -qF "$WOS_DIGEST_MARKER"; then
+            "$LOBSTER_DIR/scripts/cron-manage.sh" add "$WOS_DIGEST_MARKER" \
+                "0 9 * * * cd $LOBSTER_DIR && uv run scheduled-tasks/wos-metabolic-digest.py >> $LOBSTER_WORKSPACE/scheduled-jobs/logs/wos-metabolic-digest.log 2>&1 $WOS_DIGEST_MARKER" \
+                && substep "Added wos-metabolic-digest cron entry (Migration 83)" \
+                || warn "Could not add wos-metabolic-digest cron entry — check cron-manage.sh"
+            migrated=$((migrated + 1))
+        else
+            substep "wos-metabolic-digest cron entry already present — skipping"
+        fi
     else
-        substep "wos-metabolic-digest cron entry already present — skipping"
+        substep "Migration 83: wos-metabolic-digest.py not found — skipping (retired by Migration 145)"
     fi
 
     # Migration 84: Register wos-execute-gate.py PostToolUse hook (issue #855).
@@ -4159,6 +4178,11 @@ PYEOF
     # outcome_category from the registry (real-time classification at write_result
     # time) instead of heuristic re-classification, per the WOS completion report
     # spec (docs/wos/wos-completion-report-spec.md).
+    # Guarded by script existence (added 2026-11, Migration 145 cleanup) —
+    # wos-metabolic-digest.py is gone as of the WOS teardown, so this whole
+    # reschedule migration (which would otherwise re-add the cron entry
+    # outright on a system where it's missing) is now a permanent no-op.
+    if [ -f "$LOBSTER_DIR/scheduled-tasks/wos-metabolic-digest.py" ]; then
     local WOS_DIGEST_OLD="0 9 * * * cd $LOBSTER_DIR && uv run scheduled-tasks/wos-metabolic-digest.py"
     local WOS_DIGEST_NEW="0 10 * * * cd $LOBSTER_DIR && uv run scheduled-tasks/wos-metabolic-digest.py >> $LOBSTER_WORKSPACE/scheduled-jobs/logs/wos-metabolic-digest.log 2>&1 # LOBSTER-WOS-METABOLIC-DIGEST"
     local WOS_DIGEST_MARKER_118="# LOBSTER-WOS-METABOLIC-DIGEST"
@@ -4187,6 +4211,9 @@ PYEOF
         else
             substep "Migration 118: wos-metabolic-digest already at correct schedule — skipping"
         fi
+    fi
+    else
+        substep "Migration 118: wos-metabolic-digest.py not found — skipping (retired by Migration 145)"
     fi
 
     # Migration 119: Re-enable disabled systemd timers for WOS-core jobs (issue #1179).
@@ -4714,7 +4741,11 @@ except Exception:
     # It starts disabled so it does not fire until explicitly enabled with `wos start`.
     local WOS_EVENT_POLLER_MARKER="# LOBSTER-WOS-EVENT-POLLER"
     local WOS_EVENT_POLLER_30S_MARKER="# LOBSTER-WOS-EVENT-POLLER-30S"
-    if [ -f "$_JOBS_FILE" ]; then
+    # Guarded by script existence (added 2026-11, Migration 145 cleanup) — the
+    # jobs.json-add branch below previously had no existence check (only the
+    # cron-add branch further down did), so it would silently resurrect the
+    # jobs.json key after wos-event-poller.py was deleted. Now a no-op.
+    if [ -f "$_JOBS_FILE" ] && [ -f "$LOBSTER_DIR/scheduled-tasks/wos-event-poller.py" ]; then
         if ! uv run python3 -c "import json,sys; d=json.load(open('$_JOBS_FILE')); sys.exit(0 if 'wos-event-poller' in d.get('jobs',{}) else 1)" 2>/dev/null; then
             substep "Migration 131: adding wos-event-poller to jobs.json"
             local _m131_tmp
@@ -4938,6 +4969,7 @@ finally:
     # analysis flagged as a real, confirmed risk — so canon-reconciler is
     # disabled here rather than left enabled alongside its replacement.
     local _JOBS_FILE_135="$WORKSPACE_DIR/scheduled-jobs/jobs.json"
+    local CANON_DIGEST_SCRIPT="$LOBSTER_DIR/scheduled-tasks/canon-digest.py"
     if [ -f "$_JOBS_FILE_135" ]; then
         if uv run python3 -c "import json,sys; d=json.load(open('$_JOBS_FILE_135')); sys.exit(0 if d.get('jobs',{}).get('canon-reconciler',{}).get('enabled') else 1)" 2>/dev/null; then
             substep "Migration 136: disabling canon-reconciler in jobs.json (superseded by lobster-meta/hygiene)"
@@ -4974,7 +5006,14 @@ PY136A
             substep "Migration 136: canon-reconciler already disabled or absent — skipping"
         fi
 
-        if ! uv run python3 -c "import json,sys; d=json.load(open('$_JOBS_FILE_135')); sys.exit(0 if 'canon-digest' in d.get('jobs',{}) else 1)" 2>/dev/null; then
+        # Guarded by script existence (added 2026-11, Migration 145 cleanup) —
+        # this branch had no existence check and would silently resurrect the
+        # canon-digest jobs.json key (enabled: true!) plus, further below, the
+        # LOBSTER-CANON-DIGEST cron entry on every upgrade run after
+        # canon-digest.py was deleted. The cron-add branch below was already
+        # guarded by this same file check; this makes the jobs.json branch
+        # consistent with it.
+        if [ -f "$CANON_DIGEST_SCRIPT" ] && ! uv run python3 -c "import json,sys; d=json.load(open('$_JOBS_FILE_135')); sys.exit(0 if 'canon-digest' in d.get('jobs',{}) else 1)" 2>/dev/null; then
             substep "Migration 136: adding canon-digest to jobs.json"
             local _m136b_tmp
             _m136b_tmp=$(mktemp)
@@ -5016,7 +5055,6 @@ PY136B
     fi
 
     local CANON_DIGEST_MARKER="# LOBSTER-CANON-DIGEST"
-    local CANON_DIGEST_SCRIPT="$LOBSTER_DIR/scheduled-tasks/canon-digest.py"
     if [ -f "$CANON_DIGEST_SCRIPT" ]; then
         if ! crontab -l 2>/dev/null | grep -qF "$CANON_DIGEST_MARKER"; then
             local CANON_DIGEST_ENTRY="0 3 * * 0 cd $LOBSTER_DIR && uv run scheduled-tasks/canon-digest.py >> $WORKSPACE_DIR/scheduled-jobs/logs/canon-digest.log 2>&1 $CANON_DIGEST_MARKER"
@@ -5395,6 +5433,232 @@ PY143
         fi
     else
         warn "main-staleness-check.py not found at $MSC_SCRIPT — skipping Migration 143"
+    fi
+
+    # Migration 144: Remove the dead cc-usage-poller cron entry and jobs.json
+    # registry entry (bloat-audit 2026-10-31, Priority 2 / Tier A item 1).
+    #
+    # cc-usage-poller.py polled claude.ai via a session cookie that is already
+    # broken/expired. jobs.json already had it disabled (enabled: false), but
+    # the crontab entry kept firing every 30 minutes as a pure no-op (the
+    # script's own is_job_enabled() gate short-circuits every run). The script
+    # file itself was removed from the repo in the same change; this migration
+    # cleans up the two pieces of instance-local state (crontab, jobs.json)
+    # that git alone can't touch. local-session-parser.py remains the live,
+    # cookie-free data source for /quota, /status, and the morning briefing —
+    # not touched by this migration.
+    local CC_POLLER_MARKER="# LOBSTER-CC-USAGE-POLLER"
+    if crontab -l 2>/dev/null | grep -qF "$CC_POLLER_MARKER"; then
+        "$LOBSTER_DIR/scripts/cron-manage.sh" remove "$CC_POLLER_MARKER" 2>/dev/null && {
+            substep "Migration 144: removed dead LOBSTER-CC-USAGE-POLLER cron entry"
+            migrated=$((migrated + 1))
+        } || warn "Migration 144: could not remove LOBSTER-CC-USAGE-POLLER cron entry — check cron-manage.sh"
+    else
+        substep "Migration 144: LOBSTER-CC-USAGE-POLLER cron entry already absent — skipping"
+    fi
+
+    local _M144_JOBS_FILE="$WORKSPACE_DIR/scheduled-jobs/jobs.json"
+    if [ -f "$_M144_JOBS_FILE" ]; then
+        if uv run python3 -c "import json,sys; d=json.load(open('$_M144_JOBS_FILE')); sys.exit(0 if 'cc-usage-poller' in d.get('jobs',{}) else 1)" 2>/dev/null; then
+            substep "Migration 144: removing cc-usage-poller from jobs.json"
+            local _m144_tmp
+            _m144_tmp=$(mktemp)
+            uv run python3 - <<'PY144' "$_M144_JOBS_FILE" "$_m144_tmp"
+import json, sys
+jobs_path, tmp_path = sys.argv[1], sys.argv[2]
+with open(jobs_path) as f:
+    data = json.load(f)
+data.get("jobs", {}).pop("cc-usage-poller", None)
+with open(tmp_path, "w") as f:
+    json.dump(data, f, indent=2, default=str)
+print("OK")
+PY144
+            if [ -s "$_m144_tmp" ]; then
+                mv "$_m144_tmp" "$_M144_JOBS_FILE"
+                substep "Migration 144: cc-usage-poller removed from jobs.json"
+                migrated=$((migrated + 1))
+            else
+                rm -f "$_m144_tmp"
+                warn "Migration 144: failed to update jobs.json — remove cc-usage-poller entry manually"
+            fi
+        else
+            substep "Migration 144: cc-usage-poller already absent from jobs.json — skipping"
+        fi
+    else
+        warn "Migration 144: jobs.json not found at $_M144_JOBS_FILE — skipping"
+    fi
+
+    # Migration 145: Canon/registry/WOS bookkeeping teardown (approved by Dan
+    # 2026-11-01). The process layer this apparatus tracked (WOS orchestration
+    # engine, oracle review gate, philosophy/discovery system, scripts/agent-defs)
+    # was already deleted 2026-08-03 (commit f53cea71, Migration 138), which
+    # disabled-in-place but did not remove the jobs.json entries, crontab lines,
+    # and task definition files left behind — nor the registry/canon bookkeeping
+    # files that had no backing process left to read them. This migration
+    # finishes that teardown on every existing install.
+    #
+    # It also closes the resurrection path: Migrations 67, 83, 118, 131, and 136
+    # previously had jobs.json/cron "add if missing" branches with no guard on
+    # the backing script's existence, so once this migration deletes a jobs.json
+    # key, an earlier migration running on the *next* upgrade would silently
+    # re-add it. Those five migrations were patched in place (above, in this
+    # same file) to guard on script existence — see their inline comments dated
+    # 2026-11. This migration's removals are therefore permanent, not something
+    # the next upgrade run undoes.
+    #
+    # Files removed (repo-tracked; present here if this instance still has them):
+    #   CANON.md, data/artifact-registry.json, src/utils/artifact_registry.py,
+    #   scripts/normalize-artifact-registry.py, scheduled-tasks/canon-digest.py,
+    #   and their two orphaned unit tests (test_normalize_artifact_registry.py,
+    #   test_canon_digest.py) which would otherwise fail to import.
+    # jobs.json: removes the 39 canon/WOS/philosophy job entries (see
+    #   _M145_JOBS below); force-disables issue-sweeper (retired — duplicates
+    #   the preserve-listed issue-triage — but left on disk for easy reversal).
+    # Crontab: removes the still-active LOBSTER-CANON-DIGEST entry and strips
+    #   the SLIMDOWN-DISABLED-20260803 / SLIMDOWN-DISABLED-138 commented lines
+    #   entirely (Migration 138 only commented these out).
+    # Deliberately NOT touched: council-note-check, weekly-epistemic-retro,
+    #   operativity-quarterly-review (not part of this approval), and every
+    #   job on the operational preserve list (dispatcher, issue-triage,
+    #   async-deep-work, etc.) — this migration contains its own preserve-list
+    #   check as a second line of defense.
+    local _M145_REPO_FILES=(
+        "$WORKSPACE_DIR/CANON.md"
+        "$WORKSPACE_DIR/data/artifact-registry.json"
+        "$LOBSTER_DIR/src/utils/artifact_registry.py"
+        "$LOBSTER_DIR/scripts/normalize-artifact-registry.py"
+        "$LOBSTER_DIR/scheduled-tasks/canon-digest.py"
+        "$LOBSTER_DIR/tests/unit/test_scripts/test_normalize_artifact_registry.py"
+        "$LOBSTER_DIR/tests/unit/test_scheduled_tasks/test_canon_digest.py"
+    )
+    local _m145_files_removed=0
+    for _f in "${_M145_REPO_FILES[@]}"; do
+        if [ -e "$_f" ]; then
+            rm -f "$_f"
+            _m145_files_removed=$((_m145_files_removed + 1))
+        fi
+    done
+    if [ "$_m145_files_removed" -gt 0 ]; then
+        substep "Migration 145: removed $_m145_files_removed dead canon/registry file(s)"
+        migrated=$((migrated + 1))
+    else
+        substep "Migration 145: canon/registry files already absent — skipping"
+    fi
+
+    local _M145_TASK_FILES=(
+        lobster-meta.md lobster-hygiene.md lobster-hygiene-biweekly.md
+        negentropic-sweep.md decay-detector.md epistemic-drift-sweep.md
+        structural-hygiene-audit.md philosophy-explore-1.md
+        philosophy-explore-weekly-synthesis.md philosophy-discovery-scorer.md
+        wos-hourly-observation.md wos-overnight-loop.md wos-sprint-cycle.md
+        wos-health-monitor.sh
+    )
+    local _m145_tasks_removed=0
+    for _t in "${_M145_TASK_FILES[@]}"; do
+        local _tp="$WORKSPACE_DIR/scheduled-jobs/tasks/$_t"
+        if [ -e "$_tp" ]; then
+            rm -f "$_tp"
+            _m145_tasks_removed=$((_m145_tasks_removed + 1))
+        fi
+    done
+    if [ "$_m145_tasks_removed" -gt 0 ]; then
+        substep "Migration 145: removed $_m145_tasks_removed dead task definition file(s)"
+        migrated=$((migrated + 1))
+    else
+        substep "Migration 145: task definition files already absent — skipping"
+    fi
+
+    local _M145_JOBS_FILE="$WORKSPACE_DIR/scheduled-jobs/jobs.json"
+    if [ -f "$_M145_JOBS_FILE" ]; then
+        local _M145_JOBS="canon-digest,canon-reconciler,lobster-meta,lobster-hygiene,lobster-hygiene-biweekly,negentropic-sweep,decay-detector,epistemic-drift-sweep,structural-hygiene-audit,garden-caretaker,registry-vacuum,orchestration-artifacts-cleanup,pr-review-sweeper,proposals-digest,learnings-proposals,philosophy-explore-1,philosophy-explore-weekly-synthesis,philosophy-harvest,quick-classifier-loop,slow-reclassifier-loop,ralph-loop,phase2-design-review,surface-queue-delivery,wos-audit-9am-delivery,tz-transition-et-to-pt,pattern-candidate-sweep,uow-reflection,wos-hourly-observation,wos-queue-monitor,github-issue-cultivator,steward-heartbeat,executor-heartbeat,wos-overnight-loop,wos-sprint-cycle,wos-event-poller,proposals-authorship,wos-health-check,wos-metabolic-digest,wos-pr-sweeper"
+        local _M145_PRESERVE="dispatcher,lobster-mcp-local,agent-monitor,agent-replies-sweep,auto-router,cc-usage-scraper,check-inflight-reminders,daily-metrics,export-logs,issue-triage,local-session-parser,los-action-scanner,los-weekly-review,main-staleness-check,morning-briefing,morning-delivery-flush,morning-reminder-open-items,oom-monitor,pending-actions-nudge,transcription-monitor,upstream-sync,usage-alert,watched-things-audit,async-deep-work"
+        local _m145_tmp
+        _m145_tmp=$(mktemp)
+        local _m145_removed
+        _m145_removed=$(uv run python3 - "$_M145_JOBS_FILE" "$_m145_tmp" "$_M145_JOBS" "$_M145_PRESERVE" <<'PY145'
+import json, sys
+jobs_path, tmp_path, names_csv, preserve_csv = sys.argv[1:5]
+names = [n for n in names_csv.split(",") if n]
+preserve = set(n for n in preserve_csv.split(",") if n)
+with open(jobs_path) as f:
+    data = json.load(f)
+jobs = data.get("jobs", {})
+removed = 0
+for name in names:
+    if name in preserve:
+        # Should never happen (disjoint by construction) — refuse to touch
+        # a preserve-listed job even if a future edit adds it to both lists.
+        continue
+    if name in jobs:
+        del jobs[name]
+        removed += 1
+with open(tmp_path, "w") as f:
+    json.dump(data, f, indent=2, default=str)
+print(removed)
+PY145
+        )
+        if [ -s "$_m145_tmp" ] && [ "${_m145_removed:-0}" -gt 0 ] 2>/dev/null; then
+            mv "$_m145_tmp" "$_M145_JOBS_FILE"
+            substep "Migration 145: removed $_m145_removed dead canon/WOS job(s) from jobs.json"
+            migrated=$((migrated + 1))
+        else
+            rm -f "$_m145_tmp"
+            substep "Migration 145: no canon/WOS jobs.json entries found — skipping"
+        fi
+
+        # Force-disable issue-sweeper (retired 2026-11 — duplicates the
+        # preserve-listed issue-triage; kept on disk, not deleted, for easy
+        # reversal if Dan objects).
+        if uv run python3 -c "import json,sys; d=json.load(open('$_M145_JOBS_FILE')); sys.exit(0 if d.get('jobs',{}).get('issue-sweeper',{}).get('enabled') else 1)" 2>/dev/null; then
+            local _m145b_tmp
+            _m145b_tmp=$(mktemp)
+            uv run python3 - "$_M145_JOBS_FILE" "$_m145b_tmp" <<'PY145B'
+import json, sys
+from datetime import datetime, timezone
+jobs_path, tmp_path = sys.argv[1], sys.argv[2]
+with open(jobs_path) as f:
+    data = json.load(f)
+job = data.get("jobs", {}).get("issue-sweeper")
+if job is not None:
+    job["enabled"] = False
+    job["updated_at"] = datetime.now(timezone.utc).isoformat()
+with open(tmp_path, "w") as f:
+    json.dump(data, f, indent=2, default=str)
+print("OK")
+PY145B
+            if [ -s "$_m145b_tmp" ]; then
+                mv "$_m145b_tmp" "$_M145_JOBS_FILE"
+                substep "Migration 145: disabled issue-sweeper (retired, duplicates issue-triage)"
+                migrated=$((migrated + 1))
+            else
+                rm -f "$_m145b_tmp"
+                warn "Migration 145: failed to disable issue-sweeper — disable manually"
+            fi
+        else
+            substep "Migration 145: issue-sweeper already disabled or absent — skipping"
+        fi
+    else
+        warn "Migration 145: jobs.json not found at $_M145_JOBS_FILE — skipping jobs.json cleanup"
+    fi
+
+    if crontab -l >/dev/null 2>&1; then
+        local _m145_cron_before _m145_cron_after _m145_cron_tmp
+        _m145_cron_tmp=$(mktemp)
+        _m145_cron_before=$(crontab -l 2>/dev/null | wc -l)
+        crontab -l 2>/dev/null \
+            | grep -v "# LOBSTER-CANON-DIGEST$" \
+            | grep -v "SLIMDOWN-DISABLED-20260803" \
+            | grep -v "SLIMDOWN-DISABLED-138" \
+            > "$_m145_cron_tmp"
+        _m145_cron_after=$(wc -l < "$_m145_cron_tmp")
+        if [ "$_m145_cron_after" -lt "$_m145_cron_before" ]; then
+            crontab "$_m145_cron_tmp"
+            substep "Migration 145: removed $((_m145_cron_before - _m145_cron_after)) dead canon/WOS crontab line(s)"
+            migrated=$((migrated + 1))
+        else
+            substep "Migration 145: no dead canon/WOS crontab lines found — skipping"
+        fi
+        rm -f "$_m145_cron_tmp"
     fi
 
     if [ "$migrated" -eq 0 ]; then

@@ -130,5 +130,23 @@ else
     log "No static GH_TOKEN= line in config.env (token loaded via token file at source time)"
 fi
 
+# --- Refresh gh CLI's own auth (hosts.yml) ---
+# The App installation token expires in 60 minutes, same as everything else
+# here, but gh CLI auth is a separate credential store (~/.config/gh/hosts.yml)
+# that does NOT automatically pick up GH_TOKEN/token-file changes — it only
+# reads hosts.yml at the start of each `gh` invocation. Without this step,
+# `gh` silently reverts to whatever static/manual token was last logged in
+# (e.g. a human PAT), which can expire independently and break `gh` even
+# though the App token mechanism above is healthy. Keep both in sync.
+if command -v gh >/dev/null 2>&1; then
+    if printf '%s' "$NEW_GH_TOKEN" | gh auth login --with-token --hostname github.com 2>>"$LOG_FILE"; then
+        log "gh CLI auth (hosts.yml) refreshed with new App token"
+    else
+        log "WARNING: gh auth login --with-token failed; gh CLI credentials may be stale"
+    fi
+else
+    log "WARNING: gh CLI not found on PATH; skipped hosts.yml refresh"
+fi
+
 log "SUCCESS: GitHub App token refreshed (expires: $EXPIRES_AT)"
 exit 0
