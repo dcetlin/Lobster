@@ -2,9 +2,16 @@
 """
 Kernel-patch monitor for CVE-2026-98432 (Linux IPv4 TCP UAF, CVSS 9.8).
 
-Context: this VPS runs Ubuntu 24.04.5 / kernel 6.8.0-110-generic. The fix
-lands in linux-image-generic >= 6.8.0-149; as of 2026-11-01 apt only offers
-6.8.0-147 (unpatched). Dan approved install-instantly / reboot-on-GO:
+Context: this VPS runs Ubuntu 24.04.5 / kernel 6.8.0-110-generic, tracking
+the VIRTUAL kernel flavor (`dpkg -l` shows only `linux-image-virtual`
+installed — `linux-image-generic`, `linux-generic`, and the
+`linux-headers-*` metapackages are NOT installed on this box, and nothing
+on it builds kernel modules, so headers are not needed). The fix lands in
+linux-image-virtual >= 6.8.0-149 (it depends on the same underlying
+linux-image-<ver>-generic binary that linux-image-generic would pull, just
+without dragging in linux-modules-extra/firmware the VPS doesn't use); as
+of 2026-11-01 apt only offers 6.8.0-147 (unpatched). Dan approved
+install-instantly / reboot-on-GO:
 
   - Lobster owns this watch + auto-install the moment the fix ships.
   - atlas owns the immediate stopgap (nft rule + net.mptcp.enabled=0) and
@@ -13,16 +20,23 @@ lands in linux-image-generic >= 6.8.0-149; as of 2026-11-01 apt only offers
     is safe without a blind unattended reboot — Dan still gates the reboot
     itself via an explicit GO.
 
-Detection condition: a linux-image-generic kernel >= 6.8.0-149 is either
+Detection condition: a linux-image-virtual kernel >= 6.8.0-149 is either
 already installed (`dpkg -l`) or available as the apt candidate
-(`apt-cache policy linux-image-generic`) after `apt-get update`.
+(`apt-cache policy linux-image-virtual`) after `apt-get update`. The
+underlying installed kernel binary is still named `linux-image-<ver>-generic`
+regardless of which metapackage (virtual vs. generic) pulled it in — see
+_KERNEL_VERSION_RE / get_installed_kernel_versions(), which intentionally
+match that binary package name, not the metapackage.
 
 On first detection: `apt-get install -y` the fixed kernel (install only,
 never reboot), then notify Dan via Telegram. Idempotency is state-file
 based (see STATE_FILE) so the install + GO-request notification fires
 exactly once; while reboot is still pending, at most one reminder/24h goes
 out. Once the running kernel (`uname -r`) is itself >= 6.8.0-149, a single
-"resolved" notice fires and the monitor goes permanently quiet.
+"resolved" notice fires and the monitor goes permanently quiet. Note
+`uname -r` reports a `-generic`-suffixed image name even on the virtual
+flavor (virtual is a thin metapackage over the same generic-named binary),
+which is exactly what get_running_kernel()'s suffix-strip handles.
 
 Known limitation (by design, not a bug): there is no proactive-push path
 to atlas from this script. The local-claude agent channel
@@ -91,12 +105,20 @@ log = logging.getLogger("kernel-patch-monitor")
 JOB_NAME = "kernel-patch-monitor"
 CVE_ID = "CVE-2026-98432"
 TARGET_VERSION = "6.8.0-149"  # dpkg-comparable threshold; fix is >= this
-APT_PACKAGE = "linux-image-generic"
-INSTALL_PACKAGES = ["linux-image-generic", "linux-headers-generic"]
+# This box tracks the virtual kernel flavor (only linux-image-virtual is
+# installed; generic/headers metapackages are not, and nothing here builds
+# modules) — see module docstring. Do not switch this back to
+# linux-image-generic without re-verifying `dpkg -l | grep linux-image` on
+# the box first.
+APT_PACKAGE = "linux-image-virtual"
+INSTALL_PACKAGES = ["linux-image-virtual"]
 STATE_FILE = Path.home() / "lobster-workspace" / "data" / "kernel-patch-monitor-state.json"
 ADMIN_CHAT_ID = 8075091586
 REMINDER_INTERVAL = timedelta(hours=24)
 
+# Matches the underlying installed kernel *binary* package name, which is
+# always "-generic"-suffixed regardless of which metapackage (virtual or
+# generic) pulled it in — intentional, not a leftover generic-flavor ref.
 _KERNEL_VERSION_RE = re.compile(r"^linux-image-(\d[\w.]*-\d+)-generic$")
 
 
