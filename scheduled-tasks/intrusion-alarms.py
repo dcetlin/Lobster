@@ -84,9 +84,8 @@ JOB_NAME = "intrusion-alarms"
 ADMIN_CHAT_ID = 8075091586
 
 # SSH: trusted IP (configurable).
-# Note: This value appears to be a placeholder (IP octet > 255) and should be
-# corrected with Dan's actual IP address. Update in config or pass via env var.
-TRUSTED_SSH_IP = os.environ.get("INTRUSION_ALARM_TRUSTED_SSH_IP", "107.208.10.557")
+# Note: May be overridden via INTRUSION_ALARM_TRUSTED_SSH_IP env var.
+TRUSTED_SSH_IP = os.environ.get("INTRUSION_ALARM_TRUSTED_SSH_IP", "107.208.10.157")
 
 # Data paths
 STATE_DIR = Path.home() / "lobster-workspace" / "data" / "intrusion-alarms"
