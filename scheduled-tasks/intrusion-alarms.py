@@ -114,17 +114,47 @@ def save_state(state_file: Path, state: dict) -> None:
     tmp.replace(state_file)
 
 
-def sha256_file(path: Path) -> str | None:
-    """Return SHA-256 hash of file contents, or None if file doesn't exist."""
+def sha256_file(path: Path, use_sudo: bool = False) -> str | None:
+    """Return SHA-256 hash of file contents, or None if file doesn't exist.
+
+    If use_sudo=True, attempts to read via sudo if normal file access fails.
+    This is needed for root-owned files like /root/.ssh/authorized_keys and
+    /etc/sudoers.d/* files.
+    """
     if not path.exists():
         return None
+
+    content_bytes = None
+    try:
+        # Try reading as regular user first
+        with open(path, "rb") as f:
+            content_bytes = f.read()
+    except (OSError, IOError) as e:
+        if not use_sudo:
+            return None
+        # Fall back to sudo if permission denied
+        try:
+            result = subprocess.run(
+                ["sudo", "cat", str(path)],
+                capture_output=True, timeout=5,
+            )
+            if result.returncode == 0:
+                content_bytes = result.stdout
+            else:
+                log.debug("sudo cat %s failed: %s", path, result.stderr.decode(errors='ignore').strip())
+                return None
+        except (OSError, subprocess.TimeoutExpired) as sudo_e:
+            log.debug("Failed to read %s with sudo: %s", path, sudo_e)
+            return None
+
+    if content_bytes is None:
+        return None
+
     try:
         h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for block in iter(lambda: f.read(65536), b""):
-                h.update(block)
+        h.update(content_bytes)
         return h.hexdigest()
-    except (OSError, IOError):
+    except Exception:
         return None
 
 
@@ -134,25 +164,56 @@ def sha256_shadow_hash(path: Path) -> str | None:
     /etc/shadow lines are: login:hash:lastchanged:mindays:maxdays:warndays:inactivedays:expiredate:reserved
     We hash only the hash field (field 1, 0-indexed) to detect password changes
     without leaking password hashes in our state files.
+
+    Uses sudo to read /etc/shadow if normal file access fails.
     """
     if not path.exists():
         return None
+
+    content = None
+    try:
+        # Try reading as regular user first
+        with open(path, "r") as f:
+            content = f.read()
+    except (OSError, IOError):
+        # Fall back to sudo if permission denied
+        try:
+            result = subprocess.run(
+                ["sudo", "cat", str(path)],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                content = result.stdout
+            else:
+                log.debug("sudo cat %s failed: %s", path, result.stderr.strip())
+                return None
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log.debug("Failed to read %s with sudo: %s", path, e)
+            return None
+
+    if not content:
+        return None
+
     try:
         h = hashlib.sha256()
-        with open(path, "r") as f:
-            for line in f:
-                parts = line.rstrip("\n").split(":")
-                if len(parts) >= 2:
-                    # Include login + hash (field 0 + field 1)
-                    h.update(f"{parts[0]}:{parts[1]}\n".encode())
+        for line in content.splitlines():
+            parts = line.rstrip("\n").split(":")
+            if len(parts) >= 2:
+                # Include login + hash (field 0 + field 1)
+                h.update(f"{parts[0]}:{parts[1]}\n".encode())
         return h.hexdigest()
-    except (OSError, IOError):
+    except Exception:
         return None
 
 
 def alert(text: str) -> str:
-    """Send an intrusion alert to Dan via Telegram."""
-    return write_inbox_message(JOB_NAME, ADMIN_CHAT_ID, text, datetime.now(timezone.utc).isoformat())
+    """Send an intrusion alert to Dan via Telegram.
+
+    Prepends "ALERT:" to ensure the message is recognized as urgent by the
+    circadian delivery system and bypasses quiet-hours deferral.
+    """
+    urgent_text = f"ALERT: {text}"
+    return write_inbox_message(JOB_NAME, ADMIN_CHAT_ID, urgent_text, datetime.now(timezone.utc).isoformat())
 
 
 # ---------------------------------------------------------------------------
@@ -218,48 +279,67 @@ def check_unauthorized_ssh_logins() -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def get_listening_sockets(netns: str | None = None) -> set[str]:
-    """Get set of listening TCP/UDP sockets for a network namespace.
+def get_listening_sockets(container_name: str | None = None) -> set[str]:
+    """Get set of listening TCP/UDP sockets for the host or a docker container.
 
     Format: 'protocol:port' (e.g., 'tcp:22', 'udp:53').
-    netns=None means the host namespace.
+    container_name=None means the host namespace.
+
+    For containers, uses nsenter to enter the container's network namespace
+    instead of docker exec, as netstat may not be installed in containers.
+    Uses `ss` (socket statistics) which is more likely to be available.
     """
     sockets = set()
     try:
-        if netns:
-            # docker exec <netns_container> netstat -tuln
-            cmd = ["sudo", "docker", "exec", netns, "netstat", "-tuln"]
+        if container_name:
+            # Get container PID via docker inspect
+            inspect_result = subprocess.run(
+                ["docker", "inspect", "-f", "{{.State.Pid}}", container_name],
+                capture_output=True, text=True, timeout=5,
+            )
+            if inspect_result.returncode != 0:
+                log.warning("Failed to get PID for container %s", container_name)
+                return set()
+
+            container_pid = inspect_result.stdout.strip()
+            if not container_pid or container_pid == "0":
+                log.warning("Container %s is not running or has invalid PID", container_name)
+                return set()
+
+            # Use nsenter to enter the container's network namespace and run ss
+            cmd = ["sudo", "nsenter", "-t", container_pid, "-n", "ss", "-tulnH"]
         else:
-            cmd = ["netstat", "-tuln"]
+            # Host namespace: use ss directly
+            cmd = ["ss", "-tulnH"]
 
         result = subprocess.run(
             cmd,
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode != 0:
-            log.warning("netstat command failed for %s: %s", netns or "host", result.stderr.strip())
+            log.warning("ss command failed for %s: %s", container_name or "host", result.stderr.strip())
             return set()
 
-        # netstat -tuln output: "Proto ... Local Address ... State"
-        # Lines with LISTEN state: "tcp  0  0 0.0.0.0:22  0.0.0.0:* LISTEN"
+        # ss -tulnH output format: "Netid  State  Recv-Q Send-Q Local Address:Port  Peer Address:Port"
+        # Lines with LISTEN state: "tcp    LISTEN  0      128    0.0.0.0:22         0.0.0.0:*"
         for line in result.stdout.splitlines():
             if "LISTEN" not in line:
                 continue
             parts = line.split()
-            if len(parts) < 4:
+            if len(parts) < 5:
                 continue
             proto = parts[0].lower()  # tcp, udp, tcp6, udp6
             if not proto.startswith(("tcp", "udp")):
                 continue
-            # Extract port from "address:port"
-            local_addr = parts[3]
+            # Extract port from "address:port" (typically the 5th field in ss output)
+            local_addr = parts[4]
             if ":" in local_addr:
                 port = local_addr.rsplit(":", 1)[-1]
                 sockets.add(f"{proto.replace('6', '')}:{port}")  # normalize tcp6 -> tcp
     except subprocess.TimeoutExpired:
-        log.warning("netstat timeout for %s", netns or "host")
+        log.warning("ss/nsenter timeout for %s", container_name or "host")
     except (OSError, IOError) as e:
-        log.error("Failed to get sockets for %s: %s", netns or "host", e)
+        log.error("Failed to get sockets for %s: %s", container_name or "host", e)
 
     return sockets
 
@@ -282,8 +362,11 @@ def check_new_listening_sockets(dry_run: bool = False) -> str | None:
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
-            for container in result.stdout.strip().splitlines():
-                container_sockets[container] = get_listening_sockets(container)
+            for container_name in result.stdout.strip().splitlines():
+                sockets = get_listening_sockets(container_name)
+                # Only record if we got sockets (skip failed containers silently)
+                if sockets:
+                    container_sockets[container_name] = sockets
     except (subprocess.TimeoutExpired, OSError):
         log.warning("Failed to enumerate docker containers")
 
@@ -352,28 +435,30 @@ def check_identity_file_changes(dry_run: bool = False) -> str | None:
     - /etc/group
     - /etc/shadow (hash only, not plaintext)
     - /etc/sudoers
-    - /etc/sudoers.d/* (all files)
-    - ~/.ssh/authorized_keys (all users' home dirs)
+    - /etc/sudoers.d/* (all files, read with sudo if needed)
+    - ~/.ssh/authorized_keys (all users' home dirs, including root with sudo)
 
     Gracefully skips files that cannot be read (permission denied).
     """
     BASELINES_DIR.mkdir(parents=True, exist_ok=True)
     baseline_file = BASELINES_DIR / "identity_files.json"
 
+    # Map of filepath -> (hash_function, use_sudo_flag)
+    # Most files don't need sudo, but some do
     files_to_check = {
-        "/etc/passwd": sha256_file,
-        "/etc/group": sha256_file,
-        "/etc/shadow": sha256_shadow_hash,
-        "/etc/sudoers": sha256_file,
+        "/etc/passwd": (sha256_file, False),
+        "/etc/group": (sha256_file, False),
+        "/etc/shadow": (sha256_shadow_hash, False),  # sha256_shadow_hash handles sudo internally
+        "/etc/sudoers": (sha256_file, False),  # Usually readable without sudo; fall back if needed
     }
 
-    # Add /etc/sudoers.d/* files
+    # Add /etc/sudoers.d/* files (typically need sudo)
     try:
         sudoers_d = Path("/etc/sudoers.d")
         if sudoers_d.exists():
             for f in sudoers_d.glob("*"):
                 if f.is_file():
-                    files_to_check[str(f)] = sha256_file
+                    files_to_check[str(f)] = (sha256_file, True)  # Use sudo for sudoers.d files
     except (OSError, IOError):
         pass
 
@@ -385,24 +470,25 @@ def check_identity_file_changes(dry_run: bool = False) -> str | None:
                 if home.is_dir():
                     ak = home / ".ssh" / "authorized_keys"
                     if ak.exists():
-                        files_to_check[str(ak)] = sha256_file
+                        files_to_check[str(ak)] = (sha256_file, False)  # Regular users' keys usually readable
     except (OSError, IOError):
         pass
 
-    # Also check root's authorized_keys if readable (skip if permission denied)
-    try:
-        root_ak = Path("/root/.ssh/authorized_keys")
-        if root_ak.exists():
-            files_to_check[str(root_ak)] = sha256_file
-    except (OSError, IOError):
-        # Root's SSH dir may not be readable; skip it
-        pass
+    # Also check root's authorized_keys (requires sudo)
+    files_to_check["/root/.ssh/authorized_keys"] = (sha256_file, True)
 
     # Compute current hashes, skipping files we can't read
     current_hashes = {}
-    for filepath, hash_fn in files_to_check.items():
+    for filepath, (hash_fn, use_sudo) in files_to_check.items():
         try:
-            h = hash_fn(Path(filepath))
+            if hash_fn == sha256_shadow_hash:
+                # sha256_shadow_hash has its own sudo handling
+                h = hash_fn(Path(filepath))
+            elif use_sudo:
+                # Pass use_sudo flag to sha256_file
+                h = hash_fn(Path(filepath), use_sudo=use_sudo)
+            else:
+                h = hash_fn(Path(filepath))
             if h:
                 current_hashes[filepath] = h
         except (OSError, IOError) as e:
@@ -429,7 +515,10 @@ def check_identity_file_changes(dry_run: bool = False) -> str | None:
     for filepath, h in current_hashes.items():
         prev_h = prev_hashes.get(filepath)
         if prev_h != h:
-            changes[filepath] = f"was {prev_h[:16]}... now {h[:16]}..."
+            if prev_h is None:
+                changes[filepath] = f"NEW: {h[:16]}..."
+            else:
+                changes[filepath] = f"was {prev_h[:16]}... now {h[:16]}..."
 
     # Also detect deleted files (were in baseline, now gone)
     deleted = set(prev_hashes.keys()) - set(current_hashes.keys())
@@ -628,7 +717,17 @@ def run(dry_run: bool = False) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="Report only, don't write baselines/state")
+    parser.add_argument("--test-alert", action="store_true", help="Send a synthetic TEST alert (bypass dry-run)")
     args = parser.parse_args()
+
+    if args.test_alert:
+        # Send a test alert to verify immediate delivery (not queued)
+        test_msg = alert(
+            "[TEST] This is a synthetic test alert to verify urgent message delivery.\n\n"
+            "If received immediately, the ALERT: prefix correctly bypasses quiet-hours deferral."
+        )
+        log.info("Test alert sent: %s", test_msg)
+        return 0
 
     if not args.dry_run and not is_job_enabled(JOB_NAME):
         log.info("Job disabled in jobs.json — skipping")
