@@ -334,7 +334,10 @@ def get_listening_sockets(container_name: str | None = None) -> set[str]:
             # Extract port from "address:port" (typically the 5th field in ss output)
             local_addr = parts[4]
             if ":" in local_addr:
-                port = local_addr.rsplit(":", 1)[-1]
+                addr, port = local_addr.rsplit(":", 1)
+                # Skip Docker embedded DNS resolver (127.0.0.11) — port changes on every container restart
+                if addr == "127.0.0.11":
+                    continue
                 sockets.add(f"{proto.replace('6', '')}:{port}")  # normalize tcp6 -> tcp
     except subprocess.TimeoutExpired:
         log.warning("ss/nsenter timeout for %s", container_name or "host")
