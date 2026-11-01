@@ -51,6 +51,8 @@ import os
 import re
 import subprocess
 import sys
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -82,6 +84,7 @@ log = logging.getLogger("intrusion-alarms")
 
 JOB_NAME = "intrusion-alarms"
 ADMIN_CHAT_ID = 8075091586
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
 # SSH: trusted IP (configurable).
 # Note: May be overridden via INTRUSION_ALARM_TRUSTED_SSH_IP env var.
@@ -206,14 +209,73 @@ def sha256_shadow_hash(path: Path) -> str | None:
         return None
 
 
+def send_alert_via_telegram(text: str) -> bool:
+    """Send alert directly to Telegram via Bot API.
+
+    Returns True if successful, False otherwise.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        log.warning("TELEGRAM_BOT_TOKEN not configured; cannot send alert directly")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = json.dumps({
+        "chat_id": ADMIN_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            if result.get("ok"):
+                log.info("Alert sent directly via Telegram API (message_id=%s)", result.get("result", {}).get("message_id"))
+                return True
+            else:
+                log.warning("Telegram API returned error: %s", result.get("description", "unknown"))
+                return False
+    except urllib.error.URLError as e:
+        log.error("Failed to send alert via Telegram API: %s", e)
+        return False
+    except (json.JSONDecodeError, OSError, TimeoutError) as e:
+        log.error("Error communicating with Telegram API: %s", e)
+        return False
+
+
 def alert(text: str) -> str:
     """Send an intrusion alert to Dan via Telegram.
 
-    Prepends "ALERT:" to ensure the message is recognized as urgent by the
-    circadian delivery system and bypasses quiet-hours deferral.
+    Attempts direct Bot API send first (immediate, not dispatcher-dependent).
+    Falls back to write_inbox_message if direct send fails.
+    Prepends "🚨" emoji for visual urgency.
     """
-    urgent_text = f"ALERT: {text}"
-    return write_inbox_message(JOB_NAME, ADMIN_CHAT_ID, urgent_text, datetime.now(timezone.utc).isoformat())
+    urgent_text = f"🚨 {text}"
+
+    # Try direct Telegram API send first
+    if send_alert_via_telegram(urgent_text):
+        # Direct send succeeded; optionally write a non-urgent inbox note
+        # so dispatcher has context without re-sending.
+        # For now, skip inbox note to avoid clutter on successful sends.
+        return "direct-send"
+
+    # Fall back to dispatcher queue
+    log.warning("Direct Telegram send failed, falling back to inbox queue")
+    try:
+        msg_id = write_inbox_message(
+            JOB_NAME, ADMIN_CHAT_ID,
+            f"ALERT: {text}",  # Keep ALERT: for dispatcher queue marking
+            datetime.now(timezone.utc).isoformat()
+        )
+        return msg_id
+    except Exception as e:
+        log.error("Failed to queue alert via inbox: %s", e)
+        return "failed"
 
 
 # ---------------------------------------------------------------------------
@@ -720,17 +782,22 @@ def run(dry_run: bool = False) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="Report only, don't write baselines/state")
-    parser.add_argument("--test-alert", action="store_true", help="Send a synthetic TEST alert (bypass dry-run)")
+    parser.add_argument("--test-alert", action="store_true", help="Send a synthetic TEST alert via direct Bot API (bypass dry-run)")
     args = parser.parse_args()
 
     if args.test_alert:
-        # Send a test alert to verify immediate delivery (not queued)
-        test_msg = alert(
-            "[TEST] This is a synthetic test alert to verify urgent message delivery.\n\n"
-            "If received immediately, the ALERT: prefix correctly bypasses quiet-hours deferral."
+        # Send a test alert to verify direct Bot API delivery path
+        test_text = (
+            "[TEST — direct path] Synthetic intrusion alert to verify immediate delivery.\n\n"
+            "If received now, direct Telegram Bot API send is working."
         )
-        log.info("Test alert sent: %s", test_msg)
-        return 0
+        result = alert(test_text)
+        if result == "direct-send":
+            log.info("Test alert delivered via direct Telegram Bot API")
+            return 0
+        else:
+            log.warning("Test alert fell back to inbox queue or failed: %s", result)
+            return 0
 
     if not args.dry_run and not is_job_enabled(JOB_NAME):
         log.info("Job disabled in jobs.json — skipping")
