@@ -5661,6 +5661,60 @@ PY145B
         rm -f "$_m145_cron_tmp"
     fi
 
+    # Migration 146: Install Tier 2 intrusion detection (auditd + AIDE)
+    # Minimal auditd rules + daily AIDE baseline check
+    local _M146_AUDIT_RULES_SRC="$LOBSTER_DIR/config/auditd-rules.conf"
+    local _M146_AIDE_CONF_SRC="$LOBSTER_DIR/config/aide.conf"
+    local _M146_AIDE_SCRIPT="$LOBSTER_DIR/scheduled-tasks/aide-daily-check.py"
+
+    if [ ! -f "$_M146_AUDIT_RULES_SRC" ] || [ ! -f "$_M146_AIDE_CONF_SRC" ] || [ ! -f "$_M146_AIDE_SCRIPT" ]; then
+        info "Migration 146: Tier 2 intrusion detection files not present in repo — skipping"
+    else
+        if ! command -v auditctl >/dev/null 2>&1; then
+            substep "Migration 146: Installing auditd and aide packages (--no-install-recommends)..."
+            sudo apt-get install --no-install-recommends -y auditd aide aide-common >/dev/null 2>&1 || \
+                die "Migration 146: Failed to install auditd/aide — check apt status" 1
+            migrated=$((migrated + 1))
+        else
+            substep "Migration 146: auditd already installed"
+        fi
+
+        if [ -f "/etc/audit/rules.d/audit.rules" ]; then
+            substep "Migration 146: Deploying auditd rules..."
+            sudo cp "$_M146_AUDIT_RULES_SRC" /etc/audit/rules.d/audit.rules
+            sudo auditctl -R /etc/audit/rules.d/audit.rules >/dev/null 2>&1 || warn "Migration 146: auditctl reload failed"
+            sudo systemctl enable auditd >/dev/null 2>&1
+            sudo systemctl start auditd >/dev/null 2>&1
+            migrated=$((migrated + 1))
+        fi
+
+        if [ -f "/etc/aide/aide.conf" ]; then
+            substep "Migration 146: Deploying AIDE configuration..."
+            sudo cp "$_M146_AIDE_CONF_SRC" /etc/aide/aide.conf
+
+            # Initialize AIDE database if missing
+            if [ ! -f "/var/lib/aide/aide.db" ]; then
+                substep "Migration 146: Initializing AIDE database (this may take a minute)..."
+                sudo rm -f /var/lib/aide/aide.db* 2>/dev/null || true
+                timeout 300 sudo aide --init --config=/etc/aide/aide.conf >/dev/null 2>&1 || \
+                    warn "Migration 146: AIDE initialization failed — run 'sudo aide --init --config=/etc/aide/aide.conf' manually"
+                if [ -f "/var/lib/aide/aide.db.new" ]; then
+                    sudo mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db || warn "Migration 146: Failed to promote AIDE database"
+                fi
+            fi
+            migrated=$((migrated + 1))
+        fi
+
+        # Add cron entry for daily AIDE check
+        if ! (crontab -l 2>/dev/null | grep -q "LOBSTER-AIDE-DAILY-CHECK"); then
+            substep "Migration 146: Adding aide-daily-check cron entry (daily at 2:00 UTC)..."
+            "$LOBSTER_DIR/scripts/cron-manage.sh" add "# LOBSTER-AIDE-DAILY-CHECK" \
+                "0 2 * * * cd ~/lobster && uv run scheduled-tasks/aide-daily-check.py >> ~/lobster-workspace/scheduled-jobs/logs/aide-daily-check.log 2>&1 # LOBSTER-AIDE-DAILY-CHECK" || \
+                warn "Migration 146: Failed to add cron entry"
+            migrated=$((migrated + 1))
+        fi
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
