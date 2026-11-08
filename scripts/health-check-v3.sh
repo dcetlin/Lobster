@@ -922,7 +922,32 @@ check_services() {
     router_state=$(systemctl is-active "$SERVICE_ROUTER" 2>/dev/null || true)
     case "$router_state" in
         active)
-            # OK — router is running normally
+            # Process is running — now check Telegram API liveness (issue #1563).
+            # A running process does not prove messages are being consumed.
+            # The deterministic liveness check queries getWebhookInfo for
+            # pending_update_count: 0 = HEALTHY, >0 = UNHEALTHY.
+            local liveness_json liveness_exit liveness_verdict
+            liveness_json=$(uv run "${LOBSTER_INSTALL_DIR:-$HOME/lobster}/scripts/router-liveness-check.py" 2>/dev/null) || true
+            liveness_exit=$?
+            liveness_verdict=$(echo "$liveness_json" | jq -r '.verdict // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
+
+            case "$liveness_verdict" in
+                HEALTHY)
+                    log_info "Service $SERVICE_ROUTER is active, Telegram API confirms HEALTHY (pending_update_count=0)"
+                    ;;
+                UNHEALTHY)
+                    local pending_count
+                    pending_count=$(echo "$liveness_json" | jq -r '.pending_update_count // "?"' 2>/dev/null || echo "?")
+                    log_warn "Service $SERVICE_ROUTER is active but Telegram API shows UNHEALTHY (pending_update_count=$pending_count)"
+                    # YELLOW — the router process is up but not consuming updates.
+                    # Do not escalate to RED from here; let inbox-staleness drive restarts.
+                    [[ $rc -lt 1 ]] && rc=1
+                    ;;
+                *)
+                    # UNKNOWN — API unreachable or token missing. Not actionable.
+                    log_info "Service $SERVICE_ROUTER is active, Telegram API liveness check returned UNKNOWN"
+                    ;;
+            esac
             ;;
         activating|reloading|deactivating)
             # Transient state during router restart — not alarming
