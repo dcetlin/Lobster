@@ -926,9 +926,8 @@ check_services() {
             # A running process does not prove messages are being consumed.
             # The deterministic liveness check queries getWebhookInfo for
             # pending_update_count: 0 = HEALTHY, >0 = UNHEALTHY.
-            local liveness_json liveness_exit liveness_verdict
+            local liveness_json liveness_verdict
             liveness_json=$(uv run "${LOBSTER_INSTALL_DIR:-$HOME/lobster}/scripts/router-liveness-check.py" 2>/dev/null) || true
-            liveness_exit=$?
             liveness_verdict=$(echo "$liveness_json" | jq -r '.verdict // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
 
             case "$liveness_verdict" in
