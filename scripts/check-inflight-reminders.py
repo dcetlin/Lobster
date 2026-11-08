@@ -138,24 +138,94 @@ def build_reminder_message(entry: dict[str, Any], now: datetime) -> dict[str, An
     }
 
 
+def resolve_final_states(
+    entries: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Resolve the final state of each task_id from an append-only entry list.
+
+    The inflight-work.jsonl file is append-only: a task_id may appear multiple
+    times (first as "running", then as "done").  This function determines the
+    final state per task_id using last-entry-wins semantics (matching
+    dispatcher-state-stop.py).
+
+    Returns a dict mapping task_id -> last entry for that task_id.
+    Entries without a task_id are not included (they cannot be grouped).
+
+    Pure function — no side effects.
+    """
+    final_by_tid: dict[str, dict[str, Any]] = {}
+
+    for entry in entries:
+        tid = entry.get("task_id")
+        if tid:
+            final_by_tid[tid] = entry
+
+    return final_by_tid
+
+
+def is_task_done(final_entry: dict[str, Any]) -> bool:
+    """Return True if the final entry for a task_id indicates completion.
+
+    Uses last-entry-wins: only the final entry's status matters, matching
+    dispatcher-state-stop.py semantics.
+
+    Pure function — no side effects.
+    """
+    return final_entry.get("status") == "done" or "completed_at" in final_entry
+
+
 def process_entries(
     entries: list[dict[str, Any]],
     now: datetime,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Process all entries, returning (reminder_messages, updated_entries).
 
-    For each stale entry, builds a reminder message and marks the entry as
-    reminded. All other entries are returned unchanged.
+    Resolves the final state per task_id first (so a "done" entry suppresses
+    reminders for earlier "running" entries of the same task), but preserves
+    ALL original entries in updated_entries to avoid truncating the append-only
+    JSONL file.
+
+    Only the entry selected for reminder gets reminded_at added. Entries whose
+    task_id has a final "done" state are skipped entirely.
 
     Pure function — no I/O.
     """
+    # Resolve final states to know which task_ids are done
+    final_by_tid = resolve_final_states(entries)
+
+    # Build set of task_ids that are done (last entry is done)
+    done_task_ids: set[str] = {
+        tid for tid, final in final_by_tid.items() if is_task_done(final)
+    }
+
     messages: list[dict[str, Any]] = []
     updated_entries: list[dict[str, Any]] = []
+    # Track which task_ids already got a reminder (only remind once per task_id)
+    reminded_task_ids: set[str] = set()
 
     for entry in entries:
+        tid = entry.get("task_id")
+
+        # Skip staleness check if this task_id's final state is "done"
+        if tid and tid in done_task_ids:
+            updated_entries.append(entry)
+            continue
+
+        # For entries with a task_id, only check the final entry for staleness
+        if tid and final_by_tid.get(tid) is not entry:
+            updated_entries.append(entry)
+            continue
+
+        # Only remind once per task_id
+        if tid and tid in reminded_task_ids:
+            updated_entries.append(entry)
+            continue
+
         if should_remind(entry, now):
             messages.append(build_reminder_message(entry, now))
             updated_entries.append(mark_reminded(entry, now))
+            if tid:
+                reminded_task_ids.add(tid)
         else:
             updated_entries.append(entry)
 
