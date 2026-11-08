@@ -287,6 +287,104 @@ class TestProcessEntries:
         messages, _ = ir.process_entries([bad_entry], NOW)
         assert messages == []
 
+    def test_running_then_done_for_same_task_id_not_reminded(self) -> None:
+        """A task_id with a 'running' entry followed by a 'done' entry is completed.
+
+        This is the core bug from issue #1562: the append-only JSONL file has both
+        entries, and the old code checked each independently — generating a false
+        reminder for the 'running' entry even though a 'done' entry existed.
+        """
+        running = _entry("startup-catchup", started_minutes_ago=62, expected_done_in_minutes=30)
+        done = _entry("startup-catchup", started_minutes_ago=60, expected_done_in_minutes=30, completed=True)
+        messages, updated = ir.process_entries([running, done], NOW)
+        assert messages == [], "No reminder should fire for a task_id that has a 'done' entry"
+
+    def test_done_entry_anywhere_in_list_suppresses_reminder(self) -> None:
+        """Even if 'done' entry appears before 'running' (unlikely but defensive)."""
+        done = _entry("ledger-backup", started_minutes_ago=70, expected_done_in_minutes=10, completed=True)
+        running = _entry("ledger-backup", started_minutes_ago=65, expected_done_in_minutes=10)
+        messages, _ = ir.process_entries([done, running], NOW)
+        # The final state for this task_id should be the last entry — 'running'.
+        # However, because a 'done' entry exists anywhere for this task_id, it
+        # should still not fire. In practice, last-entry-wins means the 'running'
+        # entry is the final state, but the resolve step should detect the done.
+        # Actually: in append-only semantics, last entry wins. If "running" is last,
+        # the task may have been re-dispatched. But per the issue spec, any 'done'
+        # entry for the same task_id means the original work completed.
+        # Using last-entry-wins: last is "running" at 65min ago with 10min expected → stale.
+        # But the issue says: "A task is 'done' if any entry with same task_id has
+        # 'status': 'done'." So we suppress.
+        assert messages == [], "Any 'done' entry for a task_id suppresses reminders"
+
+    def test_multiple_task_ids_only_truly_stale_reminded(self) -> None:
+        """Mix of completed and genuinely stale tasks — only the stale one fires."""
+        # Task A: running then done
+        a_running = _entry("task-a", started_minutes_ago=62, expected_done_in_minutes=30)
+        a_done = _entry("task-a", started_minutes_ago=60, expected_done_in_minutes=30, completed=True)
+        # Task B: genuinely stale (running only, no done)
+        b_running = _entry("task-b", started_minutes_ago=65, expected_done_in_minutes=10)
+        messages, _ = ir.process_entries([a_running, a_done, b_running], NOW)
+        assert len(messages) == 1
+        assert messages[0]["task_id"] == "task-b"
+
+    def test_entries_without_task_id_processed_independently(self) -> None:
+        """Entries missing task_id cannot be grouped — each stands alone."""
+        e1 = {"description": "no-tid-1", "started_at": (
+            datetime.fromtimestamp(NOW.timestamp() - 65 * 60, tz=timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+        ), "status": "running"}
+        messages, _ = ir.process_entries([e1], NOW)
+        # Uses default expected_done_in_minutes=30 → threshold=60 → 65 > 60 → stale
+        assert len(messages) == 1
+
+
+# ---------------------------------------------------------------------------
+# resolve_final_states — task_id deduplication
+# ---------------------------------------------------------------------------
+
+
+class TestResolveFinalStates:
+    def test_single_running_entry_preserved(self) -> None:
+        entry = _entry("t1", started_minutes_ago=5, expected_done_in_minutes=10)
+        result = ir.resolve_final_states([entry])
+        assert len(result) == 1
+        assert result[0]["task_id"] == "t1"
+
+    def test_last_entry_wins_for_same_task_id(self) -> None:
+        first = _entry("t1", started_minutes_ago=30, expected_done_in_minutes=10)
+        second = _entry("t1", started_minutes_ago=25, expected_done_in_minutes=10, completed=True)
+        result = ir.resolve_final_states([first, second])
+        assert len(result) == 1
+        assert result[0].get("status") == "done"
+
+    def test_done_anywhere_marks_task_completed(self) -> None:
+        """If any entry for a task_id has status='done', the task is done."""
+        running = _entry("t1", started_minutes_ago=30, expected_done_in_minutes=10)
+        done = _entry("t1", started_minutes_ago=28, expected_done_in_minutes=10, completed=True)
+        later_running = _entry("t1", started_minutes_ago=25, expected_done_in_minutes=10)
+        result = ir.resolve_final_states([running, done, later_running])
+        # Any done entry means completed
+        assert len(result) == 1
+        assert result[0].get("status") == "done" or "completed_at" in result[0]
+
+    def test_different_task_ids_kept_separate(self) -> None:
+        a = _entry("task-a", started_minutes_ago=10, expected_done_in_minutes=10)
+        b = _entry("task-b", started_minutes_ago=10, expected_done_in_minutes=10)
+        result = ir.resolve_final_states([a, b])
+        assert len(result) == 2
+        task_ids = {e["task_id"] for e in result}
+        assert task_ids == {"task-a", "task-b"}
+
+    def test_entries_without_task_id_each_standalone(self) -> None:
+        """Entries missing task_id cannot be grouped — each stands alone."""
+        e1 = {"description": "no-tid-1", "started_at": "2026-04-19T11:00:00Z", "status": "running"}
+        e2 = {"description": "no-tid-2", "started_at": "2026-04-19T11:30:00Z", "status": "running"}
+        result = ir.resolve_final_states([e1, e2])
+        assert len(result) == 2
+
+    def test_empty_list_returns_empty(self) -> None:
+        assert ir.resolve_final_states([]) == []
+
 
 # ---------------------------------------------------------------------------
 # parse_entries — reading jsonl with mixed formats

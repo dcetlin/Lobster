@@ -138,21 +138,79 @@ def build_reminder_message(entry: dict[str, Any], now: datetime) -> dict[str, An
     }
 
 
+def resolve_final_states(
+    entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Resolve the final state of each task_id from an append-only entry list.
+
+    The inflight-work.jsonl file is append-only: a task_id may appear multiple
+    times (first as "running", then as "done").  This function collapses entries
+    by task_id, keeping only the representative final state for each.
+
+    A task_id is considered done if *any* entry for it has status="done" or
+    contains a "completed_at" key — matching the documented invariant in
+    sys.dispatcher.bootup.md.
+
+    Entries without a task_id cannot be grouped and are included as-is.
+
+    Pure function — no side effects.
+    """
+    if not entries:
+        return []
+
+    # Track per-task_id: last entry seen and whether any entry is "done"
+    task_last: dict[str, dict[str, Any]] = {}
+    task_has_done: dict[str, bool] = {}
+    # Preserve insertion order for deterministic output
+    task_order: list[str] = []
+    # Entries without task_id — standalone, ungroupable
+    standalone: list[dict[str, Any]] = []
+
+    for entry in entries:
+        tid = entry.get("task_id")
+        if not tid:
+            standalone.append(entry)
+            continue
+
+        if tid not in task_last:
+            task_order.append(tid)
+            task_has_done[tid] = False
+
+        task_last[tid] = entry
+
+        if entry.get("status") == "done" or "completed_at" in entry:
+            task_has_done[tid] = True
+
+    result: list[dict[str, Any]] = []
+    for tid in task_order:
+        final = task_last[tid]
+        # If any entry for this task_id was "done", mark the representative as done
+        if task_has_done[tid] and final.get("status") != "done" and "completed_at" not in final:
+            final = {**final, "status": "done", "completed_at": final.get("started_at", "")}
+        result.append(final)
+
+    result.extend(standalone)
+    return result
+
+
 def process_entries(
     entries: list[dict[str, Any]],
     now: datetime,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Process all entries, returning (reminder_messages, updated_entries).
 
-    For each stale entry, builds a reminder message and marks the entry as
-    reminded. All other entries are returned unchanged.
+    First resolves the final state per task_id (so a "done" entry suppresses
+    reminders for earlier "running" entries of the same task).  Then checks
+    each resolved entry for staleness.
 
     Pure function — no I/O.
     """
+    resolved = resolve_final_states(entries)
+
     messages: list[dict[str, Any]] = []
     updated_entries: list[dict[str, Any]] = []
 
-    for entry in entries:
+    for entry in resolved:
         if should_remind(entry, now):
             messages.append(build_reminder_message(entry, now))
             updated_entries.append(mark_reminded(entry, now))
