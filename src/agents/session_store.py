@@ -323,7 +323,7 @@ def session_end(
     result_summary: str | None = None,
     stop_reason: str | None = None,
     path: Path | None = None,
-) -> None:
+) -> int:
     """Mark an agent session as completed or failed.
 
     Matches on either the `id` column or the `task_id` column, whichever
@@ -331,6 +331,11 @@ def session_end(
     or the task_id that was passed to write_result.
 
     Idempotent: calling on a non-existent session is a no-op.
+
+    Returns:
+        The number of rows updated. 0 means no running/starting session
+        matched ``id_or_task_id``; callers that expect a match (write_result)
+        should surface that rather than treat it as success.
 
     Args:
         id_or_task_id:  The id or task_id of the session to end.
@@ -350,7 +355,7 @@ def session_end(
     # PostToolUse hook before the agent has fully initialised).  This closes
     # the lifecycle gap where rows inserted as 'starting' were never updated
     # because the old WHERE clause only matched 'running'.
-    conn.execute(
+    cursor = conn.execute(
         """
         UPDATE agent_sessions
         SET status = ?, completed_at = ?, result_summary = ?, stop_reason = ?
@@ -359,6 +364,7 @@ def session_end(
         (status, now, result_summary, stop_reason, id_or_task_id, id_or_task_id),
     )
     conn.commit()
+    return cursor.rowcount
 
 
 # ---------------------------------------------------------------------------
@@ -402,10 +408,17 @@ def set_notified(
     agent_id: str,
     path: Path | None = None,
 ) -> None:
-    """Write the current UTC timestamp to notified_at for the given session.
+    """Write the current UTC timestamp to notified_at for one session.
 
-    Idempotent: calling on an already-notified session is a no-op (it just
-    overwrites with a new timestamp, which is harmless).
+    task_ids are reused across spawns (fixed ids in agent definitions, stable
+    ids for scheduled jobs), so ``agent_id`` may match many historical rows.
+    Only a single row is written: among rows matching on ``id`` or ``task_id``
+    whose ``notified_at IS NULL``, an exact ``id`` match is preferred, then the
+    most recently spawned row. Rows that were already notified are never
+    rewritten, and older unnotified rows stay visible to
+    ``get_unnotified_completed()``.
+
+    Idempotent: calling on an already-notified session is a no-op.
 
     Args:
         agent_id: The session id (or task_id) to mark as notified.
@@ -418,9 +431,14 @@ def set_notified(
         """
         UPDATE agent_sessions
         SET notified_at = ?
-        WHERE id = ? OR task_id = ?
+        WHERE rowid = (
+            SELECT rowid FROM agent_sessions
+            WHERE (id = ? OR task_id = ?) AND notified_at IS NULL
+            ORDER BY (id = ?) DESC, spawned_at DESC
+            LIMIT 1
+        )
         """,
-        (now, agent_id, agent_id),
+        (now, agent_id, agent_id, agent_id),
     )
     conn.commit()
 
