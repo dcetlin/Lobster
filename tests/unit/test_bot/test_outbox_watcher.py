@@ -8,6 +8,7 @@ split_message utility that enforces Telegram's 4096-character limit.
 import json
 import os
 import pytest
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
 import asyncio
@@ -1070,3 +1071,335 @@ class TestPrepareSendItems:
             # <pre><code> and </code></pre> tags must be balanced
             assert html.count("<pre>") == html.count("</pre>") or True  # HTML tags may differ
             assert len(html) <= bot_module.TELEGRAM_HARD_LIMIT
+
+
+class TestBuildInlineKeyboard:
+    """Tests for build_inline_keyboard — the three supported button formats.
+
+    Covers:
+    - Dict format: {"text": ..., "callback_data": ...} (the documented format)
+    - Dict format with URL: {"text": ..., "url": ...}
+    - List/tuple format: [label, data] (legacy shorthand)
+    - Plain string format (label == callback_data)
+    - Oversized callback_data (>64 bytes) truncation with hash suffix
+    """
+
+    @pytest.fixture
+    def bot_module(self):
+        return get_bot_module()
+
+    def test_dict_buttons_text_and_callback_data(self, bot_module):
+        """Dict buttons extract text and callback_data correctly."""
+        buttons = [[{"text": "Approve", "callback_data": "approve-42"}]]
+        markup = bot_module.build_inline_keyboard(buttons)
+        kb = markup.inline_keyboard
+        assert len(kb) == 1
+        assert len(kb[0]) == 1
+        btn = kb[0][0]
+        assert btn.text == "Approve"
+        assert btn.callback_data == "approve-42"
+
+    def test_dict_buttons_text_only_defaults_callback_to_text(self, bot_module):
+        """Dict buttons with text only use text as callback_data."""
+        buttons = [[{"text": "Click me"}]]
+        markup = bot_module.build_inline_keyboard(buttons)
+        btn = markup.inline_keyboard[0][0]
+        assert btn.text == "Click me"
+        assert btn.callback_data == "Click me"
+
+    def test_dict_buttons_with_url(self, bot_module):
+        """Dict buttons with a url key produce a URL button (no callback_data)."""
+        buttons = [[{"text": "Open Docs", "url": "https://example.com"}]]
+        markup = bot_module.build_inline_keyboard(buttons)
+        btn = markup.inline_keyboard[0][0]
+        assert btn.text == "Open Docs"
+        assert btn.url == "https://example.com"
+        # URL buttons should not have callback_data
+        assert btn.callback_data is None
+
+    def test_list_tuple_buttons_still_work(self, bot_module):
+        """Legacy [label, data] format still produces correct buttons."""
+        buttons = [[["Yes", "yes-confirm"], ["No", "no-cancel"]]]
+        markup = bot_module.build_inline_keyboard(buttons)
+        kb = markup.inline_keyboard
+        assert kb[0][0].text == "Yes"
+        assert kb[0][0].callback_data == "yes-confirm"
+        assert kb[0][1].text == "No"
+        assert kb[0][1].callback_data == "no-cancel"
+
+    def test_plain_string_buttons_still_work(self, bot_module):
+        """Plain string buttons use the string as both label and callback_data."""
+        buttons = [["OK", "Cancel"]]
+        markup = bot_module.build_inline_keyboard(buttons)
+        kb = markup.inline_keyboard
+        assert kb[0][0].text == "OK"
+        assert kb[0][0].callback_data == "OK"
+        assert kb[0][1].text == "Cancel"
+        assert kb[0][1].callback_data == "Cancel"
+
+    def test_mixed_formats_in_same_row(self, bot_module):
+        """A row can mix dict, list, and string button formats."""
+        buttons = [[
+            {"text": "Dict", "callback_data": "d1"},
+            ["List", "l1"],
+            "String",
+        ]]
+        markup = bot_module.build_inline_keyboard(buttons)
+        kb = markup.inline_keyboard
+        assert kb[0][0].text == "Dict"
+        assert kb[0][0].callback_data == "d1"
+        assert kb[0][1].text == "List"
+        assert kb[0][1].callback_data == "l1"
+        assert kb[0][2].text == "String"
+        assert kb[0][2].callback_data == "String"
+
+    def test_multiple_rows(self, bot_module):
+        """Multiple rows are preserved in the keyboard layout."""
+        buttons = [
+            [{"text": "Row1-A", "callback_data": "r1a"}],
+            [{"text": "Row2-A", "callback_data": "r2a"}, {"text": "Row2-B", "callback_data": "r2b"}],
+        ]
+        markup = bot_module.build_inline_keyboard(buttons)
+        kb = markup.inline_keyboard
+        assert len(kb) == 2
+        assert len(kb[0]) == 1
+        assert len(kb[1]) == 2
+
+    def test_oversized_callback_data_truncated(self, bot_module):
+        """callback_data exceeding 64 bytes is truncated with a hash suffix."""
+        long_data = "x" * 100  # 100 bytes, well over 64-byte limit
+        buttons = [[{"text": "Big", "callback_data": long_data}]]
+        markup = bot_module.build_inline_keyboard(buttons)
+        btn = markup.inline_keyboard[0][0]
+        assert btn.text == "Big"
+        encoded = btn.callback_data.encode("utf-8")
+        assert len(encoded) <= bot_module.CALLBACK_DATA_MAX_BYTES
+
+    def test_exactly_64_byte_callback_data_not_truncated(self, bot_module):
+        """callback_data of exactly 64 bytes is not modified."""
+        exact_data = "a" * 64
+        buttons = [[{"text": "Exact", "callback_data": exact_data}]]
+        markup = bot_module.build_inline_keyboard(buttons)
+        btn = markup.inline_keyboard[0][0]
+        assert btn.callback_data == exact_data
+
+
+class TestSanitizeCallbackData:
+    """Tests for _sanitize_callback_data — the 64-byte guard."""
+
+    @pytest.fixture
+    def bot_module(self):
+        return get_bot_module()
+
+    def test_short_data_unchanged(self, bot_module):
+        """Data within the limit is returned unchanged."""
+        assert bot_module._sanitize_callback_data("short") == "short"
+
+    def test_truncation_is_deterministic(self, bot_module):
+        """Same oversized input always produces the same truncated output."""
+        long = "callback-data-that-is-way-too-long-for-telegram-" + "x" * 50
+        result1 = bot_module._sanitize_callback_data(long)
+        result2 = bot_module._sanitize_callback_data(long)
+        assert result1 == result2
+
+    def test_truncated_data_within_limit(self, bot_module):
+        """Truncated result is within the 64-byte limit."""
+        long = "y" * 200
+        result = bot_module._sanitize_callback_data(long)
+        assert len(result.encode("utf-8")) <= bot_module.CALLBACK_DATA_MAX_BYTES
+
+    def test_truncated_data_contains_hash_suffix(self, bot_module):
+        """Truncated result ends with a hash suffix for uniqueness."""
+        long = "z" * 200
+        result = bot_module._sanitize_callback_data(long)
+        # The result should contain the ellipsis separator
+        assert "…" in result  # "…" character
+
+
+class TestButtonBadRequestFallback:
+    """Tests for the button BadRequest -> resend-without-buttons fallback path.
+
+    When Telegram rejects a message due to Button_data_invalid (or similar),
+    the bot should strip buttons and resend the text immediately rather than
+    dead-lettering. This ensures the user always gets the content.
+    """
+
+    @pytest.fixture
+    def mock_bot_app(self):
+        app = MagicMock()
+        app.bot.send_message = AsyncMock()
+        return app
+
+    @pytest.fixture
+    def bot_module(self, temp_messages_dir):
+        return get_bot_module(messages_dir=temp_messages_dir)
+
+    @pytest.mark.asyncio
+    async def test_button_bad_request_resends_without_buttons(
+        self, temp_messages_dir, mock_bot_app, bot_module
+    ):
+        """On Button_data_invalid, the message is resent without buttons."""
+        from telegram.error import BadRequest
+
+        outbox = temp_messages_dir / "outbox"
+
+        reply = {
+            "chat_id": 123456,
+            "text": "Here is your answer.",
+            "source": "telegram",
+            "buttons": [["Yes", "No"]],
+        }
+        reply_file = outbox / "reply_bad_btn.json"
+        reply_file.write_text(json.dumps(reply))
+
+        # First call (with buttons) raises BadRequest; second call (without) succeeds
+        mock_bot_app.bot.send_message.side_effect = [
+            BadRequest("Button_data_invalid"),
+            MagicMock(message_id=999),  # successful resend without buttons
+        ]
+
+        handler = bot_module.OutboxHandler()
+        original_bot_app = bot_module.bot_app
+        bot_module.bot_app = mock_bot_app
+        loop = asyncio.new_event_loop()
+        bot_module.main_loop = loop
+
+        try:
+            await handler.process_reply(str(reply_file))
+
+            # Should have been called twice: once with buttons (failed), once without
+            assert mock_bot_app.bot.send_message.call_count == 2
+            # Second call should have reply_markup=None
+            second_call = mock_bot_app.bot.send_message.call_args_list[1]
+            assert second_call.kwargs.get("reply_markup") is None
+            # File should be delivered (not dead-lettered)
+            assert not reply_file.exists()
+        finally:
+            bot_module.bot_app = original_bot_app
+            loop.close()
+
+    @pytest.mark.asyncio
+    async def test_non_button_error_falls_through_to_plain_text(
+        self, temp_messages_dir, mock_bot_app, bot_module
+    ):
+        """A non-button error still triggers the plain-text fallback path."""
+        outbox = temp_messages_dir / "outbox"
+
+        reply = {
+            "chat_id": 123456,
+            "text": "Some message.",
+            "source": "telegram",
+        }
+        reply_file = outbox / "reply_html_fail.json"
+        reply_file.write_text(json.dumps(reply))
+
+        # First call fails (HTML parse error); second call succeeds (plain text)
+        mock_bot_app.bot.send_message.side_effect = [
+            Exception("Can't parse entities"),
+            MagicMock(message_id=888),
+        ]
+
+        handler = bot_module.OutboxHandler()
+        original_bot_app = bot_module.bot_app
+        bot_module.bot_app = mock_bot_app
+        loop = asyncio.new_event_loop()
+        bot_module.main_loop = loop
+
+        try:
+            await handler.process_reply(str(reply_file))
+            assert mock_bot_app.bot.send_message.call_count == 2
+            # Second call should be plain text (no parse_mode)
+            second_call = mock_bot_app.bot.send_message.call_args_list[1]
+            assert second_call.kwargs.get("parse_mode") is None
+        finally:
+            bot_module.bot_app = original_bot_app
+            loop.close()
+
+
+class TestNonRetryableSweep:
+    """Tests for sweep_outbox handling of non-retryable BadRequest errors.
+
+    A deterministic BadRequest should be dead-lettered immediately (no retries)
+    and a delivery-failure notice written to the inbox.
+    """
+
+    @pytest.fixture
+    def bot_module(self, temp_messages_dir):
+        return get_bot_module(messages_dir=temp_messages_dir)
+
+    def test_is_non_retryable_bad_request(self, bot_module):
+        """_is_non_retryable_bad_request returns True for BadRequest."""
+        from telegram.error import BadRequest
+        assert bot_module._is_non_retryable_bad_request(BadRequest("test"))
+
+    def test_is_non_retryable_false_for_generic_exception(self, bot_module):
+        """_is_non_retryable_bad_request returns False for non-BadRequest."""
+        assert not bot_module._is_non_retryable_bad_request(RuntimeError("oops"))
+
+    def test_is_button_bad_request_true(self, bot_module):
+        """_is_button_bad_request detects button-related BadRequest errors."""
+        from telegram.error import BadRequest
+        assert bot_module._is_button_bad_request(BadRequest("Button_data_invalid"))
+        assert bot_module._is_button_bad_request(BadRequest("BUTTON_URL_INVALID"))
+
+    def test_is_button_bad_request_false_for_other_bad_request(self, bot_module):
+        """_is_button_bad_request returns False for non-button BadRequest."""
+        from telegram.error import BadRequest
+        assert not bot_module._is_button_bad_request(BadRequest("Chat not found"))
+
+    def test_write_delivery_failure_notice(self, temp_messages_dir, bot_module):
+        """_write_delivery_failure_notice writes a system message to inbox."""
+        inbox = temp_messages_dir / "inbox"
+        bot_module._write_delivery_failure_notice("test_file.json", "Button_data_invalid")
+        notices = list(inbox.glob("delivery_failure_*.json"))
+        assert len(notices) == 1
+        data = json.loads(notices[0].read_text())
+        assert data["type"] == "delivery_failure"
+        assert "Button_data_invalid" in data["error"]
+        assert data["source"] == "system"
+
+
+class TestFileLoggingNotAttachedOnImport:
+    """Test that importing lobster_bot does NOT attach a file handler (#1567).
+
+    The production RotatingFileHandler must only be attached when main() runs,
+    not at import time. This prevents pytest from polluting the production log.
+    """
+
+    def test_import_does_not_attach_file_handler(self):
+        """After importing the module, no RotatingFileHandler is on the logger."""
+        bot = get_bot_module()
+        logger = bot.log
+        file_handlers = [
+            h for h in logger.handlers
+            if isinstance(h, RotatingFileHandler)
+        ]
+        assert len(file_handlers) == 0, (
+            f"Expected no RotatingFileHandler after import, found {len(file_handlers)}. "
+            "The file handler should only be attached when main() runs."
+        )
+
+    def test_configure_file_logging_attaches_handler(self):
+        """Calling _configure_file_logging() attaches the file handler."""
+        bot = get_bot_module()
+        logger = bot.log
+        # Should start with no file handlers
+        initial_file_handlers = [
+            h for h in logger.handlers
+            if isinstance(h, RotatingFileHandler)
+        ]
+        assert len(initial_file_handlers) == 0
+
+        # Call the function
+        bot._configure_file_logging()
+
+        file_handlers = [
+            h for h in logger.handlers
+            if isinstance(h, RotatingFileHandler)
+        ]
+        assert len(file_handlers) >= 1
+
+        # Clean up: remove the handler so other tests aren't affected
+        for h in file_handlers:
+            logger.removeHandler(h)
+            h.close()
