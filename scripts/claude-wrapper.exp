@@ -21,8 +21,8 @@
 #   the first render cycle contains the character before the UI is fully settled.
 # - A 60s timeout gives plenty of headroom for slow startup (API calls,
 #   auth checks, initial render).
-# - We send the init prompt, then resend Enter (max 10x) until the dispatcher
-#   heartbeat updates or Claude shows it is working (see below).
+# - We send the init prompt, sleep, then send a bare Enter in case the first
+#   carriage return didn't register (observed intermittently on some terminals).
 # - LOBSTER_MAIN_SESSION=1 is required by the MCP inbox_server session guard.
 # - CLAUDE_CODE_SUBAGENT_MODEL and CLAUDE_AUTOCOMPACT_PCT_OVERRIDE set cost
 #   and quality defaults inherited by all subagents.
@@ -98,32 +98,6 @@ catch {
     close $fh
 }
 
-# Write the dispatcher.pid file, mirroring scripts/claude-persistent.sh
-# (which writes $MESSAGES_DIR/config/dispatcher.pid right before exec-ing
-# claude). health-check-v3.sh's check_session_age() reads this file to find
-# the PID to send a graceful SIGTERM to once the session passes
-# SESSION_AGE_LIMIT_SECONDS.
-#
-# Before this fix, claude-wrapper.exp never wrote dispatcher.pid, so the
-# graceful SESSION AGE LIMIT restart path could never find a PID while
-# running in debug mode (LOBSTER_DEBUG=true) — it silently logged
-# "no dispatcher.pid — cannot send SIGTERM" and took no action, every
-# 4-minute health-check tick, for as long as the session stayed over-age
-# (see issue #2196: 4,148 occurrences in health-check.log since 2026-06-07).
-#
-# Same LOBSTER_MESSAGES fallback as claude-persistent.sh/health-check-v3.sh
-# (MESSAGES_DIR="${LOBSTER_MESSAGES:-$HOME/messages}") — must stay in sync
-# with both so the writer and reader always agree on the path.
-set messages_dir [expr {[info exists ::env(LOBSTER_MESSAGES)] ? $::env(LOBSTER_MESSAGES) : "$::env(HOME)/messages"}]
-set dispatcher_pid_dir [file join $messages_dir "config"]
-set dispatcher_pid_file [file join $dispatcher_pid_dir "dispatcher.pid"]
-catch { file mkdir $dispatcher_pid_dir }
-catch {
-    set pid_fh [open $dispatcher_pid_file w]
-    puts $pid_fh [exp_pid]
-    close $pid_fh
-}
-
 # Wait for either the permissions dialog OR the ready prompt.
 #
 # The ❯ (U+276F) character appears in the prompt area surrounded by ANSI escape
@@ -165,56 +139,16 @@ expect {
 
 # Send the initialization command.
 # This instructs Claude to read the project instructions and enter its main loop.
-# Remember when we sent the prompt: a dispatcher-heartbeat newer than this
-# proves the prompt was submitted (see below).
-set prompt_sent_at [clock seconds]
-send "Read CLAUDE.md and begin your main loop. Call wait_for_messages to start listening for Telegram messages. Never exit."
-sleep 1
-send "\r"
+send "Read CLAUDE.md and begin your main loop. Call wait_for_messages to start listening for Telegram messages. Never exit.\r"
 
-# Verify the prompt was actually submitted, resending Enter if not. A restart
-# once left the prompt sitting unsubmitted (Enter dropped while startup hooks
-# kept the UI busy) and the dispatcher dead until someone pressed Enter; one
-# blind retry is not enough.
-#
-# Two ways to confirm, either one stops the loop:
-#  1. The dispatcher-heartbeat file (written by hooks/thinking-heartbeat.py after
-#     every dispatcher tool call) is newer than prompt_sent_at. The startup
-#     prompt makes Claude call tools within seconds of being submitted. This
-#     does not depend on Claude Code's UI wording. Caveat: the hook only skips
-#     subagents, so a tool call in some other Claude session on this machine
-#     during the retry window could also refresh it.
-#  2. Claude's status line shows "esc to interrupt" (it is working). UI text, so
-#     a fallback only.
-# Capped (10 tries, 10s apart): if neither signal ever shows up (e.g. the UI
-# wording changed and the heartbeat hook is broken) we send at most 10 extra
-# Enters, which Claude Code ignores on an empty input box, then continue.
-set heartbeat_file [file join $workspace "logs" "dispatcher-heartbeat"]
-set submitted 0
-for {set i 0} {$i < 10} {incr i} {
-    expect {
-        -timeout 10 "esc to interrupt" { set submitted 1; break }
-        timeout {
-            if {![catch {file mtime $heartbeat_file} hb_mtime] && $hb_mtime >= $prompt_sent_at} {
-                set submitted 1
-                break
-            }
-            send "\r"
-        }
-    }
-}
-if {!$submitted} {
-    puts "WARNING: startup prompt not confirmed submitted after 10 attempts"
-}
+# Wait briefly for Claude to accept the input and begin processing.
+# The render cycle after sending is ~100-300 ms; 3 s is generous.
+sleep 3
+
+# Safety: send a bare Enter in case the carriage return above was dropped
+# (observed intermittently when the terminal emulator is still initialising).
+send "\r"
 
 # Hand over terminal control — Claude runs indefinitely.
 # The expect process stays alive so the spawned claude process is not orphaned.
 interact
-
-# interact returns once the spawned claude process exits (or EOF). Clean up
-# dispatcher.pid now that the PID it names is gone — mirrors
-# claude-persistent.sh's `rm -f "$dispatcher_pid_file"` after its claude
-# process exits. Leaving a stale dispatcher.pid around risks a future,
-# unrelated process being assigned the same PID and incorrectly targeted by
-# health-check-v3.sh's check_session_age() SIGTERM.
-catch { file delete $dispatcher_pid_file }

@@ -46,7 +46,7 @@ def _make_fake_memory_provider(result_count: int = 3):
         def store(self, event) -> int:
             return 42
 
-        def search(self, query, limit=10, project=None):
+        def search(self, query, limit=10, project=None, valence=None):
             return [FakeEvent() for _ in range(result_count)]
 
     return FakeMemoryProvider()
@@ -55,7 +55,7 @@ def _make_fake_memory_provider(result_count: int = 3):
 class MemoryEvent:
     """Thin stand-in so handle_memory_store can construct an event."""
 
-    def __init__(self, *, id, timestamp, type, source, project, content, metadata):
+    def __init__(self, *, id, timestamp, type, source, project, content, metadata, valence="neutral"):
         self.id = id
         self.timestamp = timestamp
         self.type = type
@@ -63,6 +63,7 @@ class MemoryEvent:
         self.project = project
         self.content = content
         self.metadata = metadata
+        self.valence = valence
 
 
 # ---------------------------------------------------------------------------

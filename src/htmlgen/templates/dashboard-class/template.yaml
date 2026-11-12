@@ -1,0 +1,39 @@
+id: dashboard-class
+name: Dashboard (data-driven)
+description: WOS dashboard, status pages, interactive tools with live data.
+content_format: json
+components:
+  - id: dashboard-filter-bar
+    config: {}  # configured per-document in manifest
+  - id: theme-toggle
+    config:
+      mode: media-query  # use @media prefers-color-scheme, not JS toggle button
+conventions_overrides:
+  theme_toggle_mode: media-query
+scaffold: content-scaffold.json
+
+# Agent selection rules
+selection_rules:
+  use_when:
+    - Document is data-driven and regenerated frequently (e.g., every few minutes or hours)
+    - Document has interactive elements: filter bars, action buttons, status toggles
+    - Document is the WOS dashboard or a similar operational status page
+    - Document aggregates structured data across many entities
+  avoid_when:
+    - Document is primarily narrative prose read linearly
+    - Document is a long-lived spec with section coverage tracking
+
+# Required sections (every dashboard-class doc must include at least one)
+required_sections:
+  - id: s1
+    label: "§1"
+    title: Status
+    addressed: true  # dashboards are always "addressed" — they are generated, not reviewed
+
+# Rendering parameters
+render_params:
+  inject_section_labels: false  # dashboards don't use §N labels
+  auto_populate_clipboard_sections: false
+  header_pattern: dashboard-header  # compact header for dashboard context
+  footer: true
+  theme_toggle_mode: media-query

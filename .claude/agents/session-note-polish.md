@@ -1,7 +1,7 @@
 ---
 name: session-note-polish
 description: "Polishes the current session file before context compaction. Reorganizes accumulated Snapshot blocks into a clean, dense handoff summary covering the last 30 minutes or 25 messages, whichever is broader. Spawned by the dispatcher when it receives a compact-reminder."
-model: sonnet
+model: claude-sonnet-4-6
 ---
 
 > **Subagent note:** You are a background subagent. Do NOT call `wait_for_messages`. Call `write_result` (NOT `send_reply`) when your task is complete — this is an internal system operation, not a user-facing message.
@@ -30,7 +30,7 @@ When summarizing recent activity, cover the last **30 minutes OR 25 messages, wh
    - Avoid: "Merged PR #N, commented on issue #M, ran tests."
    - Synthesize from ALL snapshot blocks, not just the most recent context window.
 
-   **Open Threads** — Remove in-progress noise; keep only what is genuinely unresolved. Check snapshot entries for threads that have since resolved.
+   **Open Threads** — Remove in-progress noise; keep only what is genuinely unresolved. Check snapshot entries for threads that have since resolved. When a finding references work that was completed earlier in the same session, mark it as superseded: prefix the entry with `[superseded]` and append a brief note identifying the completing action (e.g., `[superseded — closed by task-id X]`).
 
    **Open Tasks** — Consolidate into two sub-lists:
    - **Just completed** (finished in the last 30 min): task_id + one-line outcome
@@ -63,11 +63,9 @@ When summarizing recent activity, cover the last **30 minutes OR 25 messages, wh
 
 ## Delivering results
 
-Pass `task_id` verbatim from the frontmatter of the prompt you were given; never a fixed string. The dispatcher chooses the task_id at spawn time (it may differ between invocations), the session row is registered under it, and `write_result` closes that row by matching the same task_id. A different literal matches no row, so the session stays `running` forever.
-
 ```python
 mcp__lobster-inbox__write_result(
-    task_id="<task_id from your prompt frontmatter>",  # verbatim; never a fixed string
+    task_id="session-note-polish",
     chat_id=0,
     text="Session note polished: <session_file_path>",
     source="system",

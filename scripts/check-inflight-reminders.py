@@ -9,16 +9,15 @@ Staleness condition: (now - started_at) > expected_done_in_minutes * STALENESS_M
 
 Entries with completed_at or reminded_at are skipped to prevent duplicate pings.
 The jsonl file is rewritten atomically with reminded_at timestamps on triggered entries.
-
-Because inflight-work.jsonl is append-only, a task's completion is recorded as
-a *separate* "done" line rather than an in-place update of its original
-"running" line (see hooks/require-write-result.py). Before evaluating
-staleness, this script cross-references "done" entries by task_id across the
-whole file (see `collect_done_task_ids`) so an already-completed task's
-"running" line is never flagged as stale, no matter how old it is (issue #2084).
 """
 
 from __future__ import annotations
+
+import sys
+import os
+_REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import json
 import os
@@ -65,36 +64,11 @@ def is_stale(entry: dict[str, Any], now: datetime) -> bool:
     return elapsed_minutes > threshold
 
 
-def collect_done_task_ids(entries: list[dict[str, Any]]) -> set[str]:
-    """Return the set of task_ids that have at least one 'done' entry anywhere in entries.
-
-    inflight-work.jsonl is an append-only log: a task's completion is recorded
-    as a *separate* JSONL line (written by hooks/require-write-result.py) rather
-    than as an in-place update of the original "running" line. Any staleness
-    check that only inspects a single entry in isolation will therefore never
-    see that the task actually finished — it has to cross-reference by task_id
-    across the whole file, the same way hooks/on-fresh-start.py's
-    `_compact_inflight_entries` already does.
-
-    Pure function — no side effects, no I/O.
-    """
-    return {
-        entry["task_id"]
-        for entry in entries
-        if "task_id" in entry and (entry.get("status") == "done" or "completed_at" in entry)
-    }
-
-
-def should_remind(
-    entry: dict[str, Any],
-    now: datetime,
-    done_task_ids: frozenset[str] | set[str] = frozenset(),
-) -> bool:
+def should_remind(entry: dict[str, Any], now: datetime) -> bool:
     """Return True if this entry should generate a reminder.
 
     Conditions:
-    - No completed_at on this entry (not done)
-    - task_id has no 'done' entry anywhere else in the file (not done)
+    - No completed_at (not done)
     - No reminded_at (not already reminded)
     - is_stale() is True
 
@@ -103,8 +77,6 @@ def should_remind(
     if "completed_at" in entry:
         return False
     if entry.get("status") == "done":
-        return False
-    if entry.get("task_id") in done_task_ids:
         return False
     if "reminded_at" in entry:
         return False
@@ -166,30 +138,94 @@ def build_reminder_message(entry: dict[str, Any], now: datetime) -> dict[str, An
     }
 
 
+def resolve_final_states(
+    entries: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Resolve the final state of each task_id from an append-only entry list.
+
+    The inflight-work.jsonl file is append-only: a task_id may appear multiple
+    times (first as "running", then as "done").  This function determines the
+    final state per task_id using last-entry-wins semantics (matching
+    dispatcher-state-stop.py).
+
+    Returns a dict mapping task_id -> last entry for that task_id.
+    Entries without a task_id are not included (they cannot be grouped).
+
+    Pure function — no side effects.
+    """
+    final_by_tid: dict[str, dict[str, Any]] = {}
+
+    for entry in entries:
+        tid = entry.get("task_id")
+        if tid:
+            final_by_tid[tid] = entry
+
+    return final_by_tid
+
+
+def is_task_done(final_entry: dict[str, Any]) -> bool:
+    """Return True if the final entry for a task_id indicates completion.
+
+    Uses last-entry-wins: only the final entry's status matters, matching
+    dispatcher-state-stop.py semantics.
+
+    Pure function — no side effects.
+    """
+    return final_entry.get("status") == "done" or "completed_at" in final_entry
+
+
 def process_entries(
     entries: list[dict[str, Any]],
     now: datetime,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Process all entries, returning (reminder_messages, updated_entries).
 
-    For each stale entry, builds a reminder message and marks the entry as
-    reminded. All other entries are returned unchanged.
+    Resolves the final state per task_id first (so a "done" entry suppresses
+    reminders for earlier "running" entries of the same task), but preserves
+    ALL original entries in updated_entries to avoid truncating the append-only
+    JSONL file.
 
-    A task_id with a 'done' entry anywhere in `entries` is never reminded,
-    even if its original 'running' entry has no completed_at/status of its
-    own — see `collect_done_task_ids`.
+    Only the entry selected for reminder gets reminded_at added. Entries whose
+    task_id has a final "done" state are skipped entirely.
 
     Pure function — no I/O.
     """
-    done_task_ids = collect_done_task_ids(entries)
+    # Resolve final states to know which task_ids are done
+    final_by_tid = resolve_final_states(entries)
+
+    # Build set of task_ids that are done (last entry is done)
+    done_task_ids: set[str] = {
+        tid for tid, final in final_by_tid.items() if is_task_done(final)
+    }
 
     messages: list[dict[str, Any]] = []
     updated_entries: list[dict[str, Any]] = []
+    # Track which task_ids already got a reminder (only remind once per task_id)
+    reminded_task_ids: set[str] = set()
 
     for entry in entries:
-        if should_remind(entry, now, done_task_ids):
+        tid = entry.get("task_id")
+
+        # Skip staleness check if this task_id's final state is "done"
+        if tid and tid in done_task_ids:
+            updated_entries.append(entry)
+            continue
+
+        # For entries with a task_id, only check the final entry for staleness
+        if tid and final_by_tid.get(tid) is not entry:
+            updated_entries.append(entry)
+            continue
+
+        # Only remind once per task_id
+        if tid and tid in reminded_task_ids:
+            updated_entries.append(entry)
+            continue
+
+        if should_remind(entry, now):
             messages.append(build_reminder_message(entry, now))
             updated_entries.append(mark_reminded(entry, now))
+            if tid:
+                reminded_task_ids.add(tid)
         else:
             updated_entries.append(entry)
 
@@ -278,6 +314,9 @@ def drop_inbox_message(
 
 def main() -> None:
     now = datetime.now(tz=timezone.utc)
+    from src.utils.jobs import is_job_enabled
+    if not is_job_enabled("check-inflight-reminders"):
+        return
 
     data_dir = os.environ.get("LOBSTER_DATA_DIR", os.path.expanduser("~/lobster-workspace/data"))
     jsonl_path = os.path.join(data_dir, "inflight-work.jsonl")

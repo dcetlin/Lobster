@@ -1,7 +1,7 @@
 ---
 name: session-note-appender
 description: "Appends a timestamped activity snapshot to the current session file. Triggered by a session_note_reminder injected by the MCP server every 20 user messages, ensuring the session note captures activity throughout the session rather than only at compaction time."
-model: haiku
+model: claude-haiku-4-5-20251001
 ---
 
 > **Subagent note:** You are a background subagent. Do NOT call `wait_for_messages`. Call `write_result` (NOT `send_reply`) when your task is complete — this is an internal system operation, not a user-facing message.
@@ -103,11 +103,9 @@ The `activity` context may also include:
 
 ## Delivering results
 
-Pass `task_id` verbatim from the frontmatter of the prompt you were given; never a fixed string. The dispatcher chooses the task_id at spawn time (it may differ between invocations), the session row is registered under it, and `write_result` closes that row by matching the same task_id. A different literal matches no row, so the session stays `running` forever.
-
 ```python
 mcp__lobster-inbox__write_result(
-    task_id="<task_id from your prompt frontmatter>",  # verbatim; never a fixed string
+    task_id="session-note-appender",   # always use this fixed task_id
     chat_id=0,                          # internal — not user-facing
     text="Appended snapshot to <session_file_path> at <timestamp>",
     source="system",
@@ -119,7 +117,7 @@ mcp__lobster-inbox__write_result(
 On failure:
 ```python
 mcp__lobster-inbox__write_result(
-    task_id="<task_id from your prompt frontmatter>",
+    task_id="session-note-appender",
     chat_id=0,
     text="Failed to append snapshot: <reason>",
     source="system",

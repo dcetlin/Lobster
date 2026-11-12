@@ -49,8 +49,7 @@ else
 fi
 
 # Atomic update: read existing state, add/update field, write back via tmp file.
-# Uses python3 (not uv) because this script runs outside the Claude/uv context.
-python3 - <<PYEOF
+uv run python3 - <<PYEOF
 import json, os, sys
 
 state_path = "${STATE_FILE}"

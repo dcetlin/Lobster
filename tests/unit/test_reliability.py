@@ -20,14 +20,19 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src" / "mcp"))
 
 from reliability import (
     atomic_write_json,
+    atomic_create_json,
     safe_move,
     validate_send_reply_args,
     validate_message_id,
+    sanitize_agent_slug,
     ValidationError,
     init_audit_log,
     audit_log,
     IdempotencyTracker,
     CircuitBreaker,
+    CapabilityFailureTracker,
+    _response_is_failure,
+    DEFAULT_MONITORED_TOOLS,
 )
 
 
@@ -88,6 +93,44 @@ class TestAtomicWriteJson:
         assert len(tmp_files) == 0
 
 
+class TestAtomicCreateJson:
+    def test_creates_when_absent(self, tmp_path):
+        """First call creates the file and returns True."""
+        path = tmp_path / "slot.json"
+        created = atomic_create_json(path, {"answer": "first"})
+
+        assert created is True
+        assert json.loads(path.read_text()) == {"answer": "first"}
+
+    def test_second_call_does_not_overwrite(self, tmp_path):
+        """Single-shot semantics: a second call for the same path is a no-op
+        that leaves the first writer's content untouched and reports False."""
+        path = tmp_path / "slot.json"
+        first = atomic_create_json(path, {"answer": "first"})
+        second = atomic_create_json(path, {"answer": "second"})
+
+        assert first is True
+        assert second is False
+        assert json.loads(path.read_text()) == {"answer": "first"}
+
+    def test_no_temp_files_left_on_success_or_loss(self, tmp_path):
+        """Temp files are cleaned up whether this call wins or loses the race."""
+        path = tmp_path / "slot.json"
+        atomic_create_json(path, {"answer": "first"})
+        atomic_create_json(path, {"answer": "second"})
+
+        tmp_files = [f for f in tmp_path.iterdir() if f.suffix == ".tmp"]
+        assert len(tmp_files) == 0
+
+    def test_fails_on_unserializable_data(self, tmp_path):
+        """Non-serializable data raises TypeError and creates nothing."""
+        path = tmp_path / "slot.json"
+        with pytest.raises(TypeError):
+            atomic_create_json(path, {"bad": object()})
+
+        assert not path.exists()
+
+
 class TestSafeMove:
     def test_moves_file(self, tmp_path):
         """safe_move moves an existing file."""
@@ -146,6 +189,28 @@ class TestValidateSendReplyArgs:
         with pytest.raises(ValidationError, match="Invalid source"):
             validate_send_reply_args({"chat_id": 123, "text": "Hi", "source": "carrier_pigeon"})
 
+    def test_local_claude_requires_request_id(self):
+        """source='local-claude' without request_id raises ValidationError."""
+        with pytest.raises(ValidationError, match="request_id"):
+            validate_send_reply_args({"chat_id": "local", "text": "Hi", "source": "local-claude"})
+
+    def test_local_claude_rejects_path_traversal_request_id(self):
+        """request_id containing path-traversal characters is rejected."""
+        with pytest.raises(ValidationError, match="invalid characters"):
+            validate_send_reply_args({
+                "chat_id": "local",
+                "text": "Hi",
+                "source": "local-claude",
+                "request_id": "../../etc/passwd",
+            })
+
+    def test_valid_local_claude_args(self):
+        """Valid local-claude reply args pass validation."""
+        args = {"chat_id": "local", "text": "Hello", "source": "local-claude", "request_id": "abc123"}
+        result = validate_send_reply_args(args)
+        assert result["source"] == "local-claude"
+        assert result["request_id"] == "abc123"
+
     def test_does_not_truncate_below_sanity_cap(self):
         """Text longer than 4096 chars is NOT truncated — chunking handles it.
 
@@ -169,6 +234,41 @@ class TestValidateSendReplyArgs:
         result = validate_send_reply_args({"chat_id": 123.0, "text": "Hi"})
         assert result["chat_id"] == 123
         assert isinstance(result["chat_id"], int)
+
+    # -- error discriminator (issue #1533) -----------------------------------
+
+    def test_error_field_absent_by_default(self):
+        """No `error` key on input means no `error` key on output — the
+        permissive dict-normalizer pass-through (`{**args, ...}`) must not
+        invent one."""
+        result = validate_send_reply_args({"chat_id": 123, "text": "Hi"})
+        assert "error" not in result
+
+    def test_error_field_bool_passes_through(self):
+        result = validate_send_reply_args({"chat_id": 123, "text": "Hi", "error": True})
+        assert result["error"] is True
+
+    def test_error_field_non_bool_raises(self):
+        with pytest.raises(ValidationError, match="error"):
+            validate_send_reply_args({"chat_id": 123, "text": "Hi", "error": "yes"})
+
+    def test_error_type_field_str_passes_through(self):
+        result = validate_send_reply_args(
+            {"chat_id": 123, "text": "Hi", "error": True, "error_type": "timeout"}
+        )
+        assert result["error_type"] == "timeout"
+
+    def test_error_type_field_non_str_raises(self):
+        with pytest.raises(ValidationError, match="error_type"):
+            validate_send_reply_args({"chat_id": 123, "text": "Hi", "error_type": 123})
+
+    def test_error_type_without_error_is_still_valid(self):
+        """error_type is independent of error — no requirement that error=True
+        accompany it at the validation layer (write_reply decides what to do
+        with the combination)."""
+        result = validate_send_reply_args({"chat_id": 123, "text": "Hi", "error_type": "timeout"})
+        assert result["error_type"] == "timeout"
+        assert "error" not in result
 
 
 class TestValidateMessageId:
@@ -195,6 +295,66 @@ class TestValidateMessageId:
         """Slashes in message ID are rejected."""
         with pytest.raises(ValidationError, match="invalid characters"):
             validate_message_id("foo/bar")
+
+
+class TestSanitizeAgentSlug:
+    """agent-channel protocol v1, §3.2 / Open Dial 4: normalize case,
+    strict-reject everything else."""
+
+    def test_lowercase_passes_through_unchanged(self):
+        assert sanitize_agent_slug("bloom") == "bloom"
+
+    def test_uppercase_is_lowercased(self):
+        assert sanitize_agent_slug("Bloom") == "bloom"
+        assert sanitize_agent_slug("BLOOM") == "bloom"
+
+    def test_mixed_case_and_digits_and_dashes_lowercased(self):
+        assert sanitize_agent_slug("Glyph-Session_42") == "glyph-session_42"
+
+    def test_none_raises(self):
+        with pytest.raises(ValidationError, match="required"):
+            sanitize_agent_slug(None)
+
+    def test_empty_string_raises(self):
+        with pytest.raises(ValidationError, match="required"):
+            sanitize_agent_slug("")
+
+    def test_whitespace_only_raises(self):
+        with pytest.raises(ValidationError, match="required"):
+            sanitize_agent_slug("   ")
+
+    def test_internal_whitespace_rejected_not_stripped(self):
+        # Fail-closed, not silently mangled: "bloom " -> reject, not "bloom".
+        with pytest.raises(ValidationError, match="invalid characters"):
+            sanitize_agent_slug("bloom two words")
+
+    def test_path_traversal_rejected(self):
+        with pytest.raises(ValidationError, match="invalid characters"):
+            sanitize_agent_slug("../../etc/passwd")
+
+    def test_slash_rejected(self):
+        with pytest.raises(ValidationError, match="invalid characters"):
+            sanitize_agent_slug("bloom/session")
+
+    def test_dot_rejected(self):
+        with pytest.raises(ValidationError, match="invalid characters"):
+            sanitize_agent_slug("bloom.session")
+
+    def test_too_long_raises(self):
+        with pytest.raises(ValidationError, match="exceeds max length"):
+            sanitize_agent_slug("a" * 129)
+
+    def test_max_length_boundary_passes(self):
+        assert sanitize_agent_slug("a" * 128) == "a" * 128
+
+    def test_case_collision_normalizes_to_same_slug(self):
+        # "Bloom" vs "bloom" vs "BLOOM" must never split one collaborator's
+        # history across different by-agent/ directories.
+        assert (
+            sanitize_agent_slug("Bloom")
+            == sanitize_agent_slug("bloom")
+            == sanitize_agent_slug("BLOOM")
+        )
 
 
 # =============================================================================
@@ -347,3 +507,178 @@ class TestCircuitBreaker:
         assert status["name"] == "telegram"
         assert status["state"] == "closed"
         assert status["failure_threshold"] == 5
+
+
+# =============================================================================
+# Response Failure Detection Tests
+# =============================================================================
+
+
+class TestResponseIsFailure:
+    def test_memory_not_available(self):
+        """'Memory system is not available.' is a failure."""
+        assert _response_is_failure("Memory system is not available.") is True
+
+    def test_error_storing_memory(self):
+        """'Error storing memory: ...' is a failure."""
+        assert _response_is_failure("Error storing memory: connection refused") is True
+
+    def test_error_in_memory_store(self):
+        """'Error in memory_store: ...' is a failure."""
+        assert _response_is_failure("Error in memory_store: disk full") is True
+
+    def test_stored_memory_event_is_success(self):
+        """Normal memory_store success response is not a failure."""
+        assert _response_is_failure("Stored memory event #42 (type=note, source=internal)") is False
+
+    def test_empty_response_is_not_failure(self):
+        """Empty string is not a failure."""
+        assert _response_is_failure("") is False
+
+    def test_validation_error_is_not_capability_failure(self):
+        """Validation errors (bad input) are not capability failures."""
+        assert _response_is_failure("Validation error: chat_id is required") is False
+
+    def test_no_new_messages_is_not_failure(self):
+        """'No new messages' is healthy inbox behavior, not a failure."""
+        assert _response_is_failure("No new messages") is False
+
+    def test_zero_messages_is_not_failure(self):
+        """'0 messages' variants are healthy inbox behavior."""
+        assert _response_is_failure("0 messages in inbox") is False
+        assert _response_is_failure("0 new messages") is False
+
+    def test_case_insensitive(self):
+        """Failure detection is case-insensitive."""
+        assert _response_is_failure("MEMORY SYSTEM IS NOT AVAILABLE") is True
+        assert _response_is_failure("memory system is not available") is True
+
+    def test_failed_fragment(self):
+        """'failed:' fragment triggers failure detection."""
+        assert _response_is_failure("memory_store failed: vector DB unreachable") is True
+
+    def test_not_available_fragment_does_not_trigger(self):
+        """Bare 'not available' does NOT trigger failure detection.
+
+        The phrase is too broad — tool responses that mention unavailability
+        of optional features (e.g. "Slack integration not available") would
+        false-positive. Tool-specific patterns already cover real failures.
+        """
+        assert _response_is_failure("Feature X is not available in this version") is False
+        assert _response_is_failure("Slack integration not available") is False
+
+    def test_non_failure_takes_precedence(self):
+        """Non-failure patterns take precedence over failure patterns."""
+        # "no new messages" overrides any failure pattern even if both match
+        assert _response_is_failure("No new messages (memory_store failed: unreachable)") is False
+
+
+# =============================================================================
+# Capability Failure Tracker Tests
+# =============================================================================
+
+
+class TestCapabilityFailureTracker:
+    def test_no_alert_below_threshold(self):
+        """Failures below threshold produce no alert."""
+        tracker = CapabilityFailureTracker(failure_threshold=3)
+        d1 = tracker.record_failure("memory_store", "Memory system is not available.")
+        d2 = tracker.record_failure("memory_store", "Memory system is not available.")
+        assert d1.should_alert is False
+        assert d2.should_alert is False
+
+    def test_alert_at_threshold(self):
+        """Alert fires exactly when consecutive failures reach threshold."""
+        tracker = CapabilityFailureTracker(failure_threshold=3)
+        tracker.record_failure("memory_store", "Memory system is not available.")
+        tracker.record_failure("memory_store", "Memory system is not available.")
+        d3 = tracker.record_failure("memory_store", "Memory system is not available.")
+        assert d3.should_alert is True
+        assert "memory_store" in d3.alert_message
+        assert d3.consecutive_failures == 3
+
+    def test_alert_message_contains_response_snippet(self):
+        """Alert message includes a snippet of the failure response."""
+        tracker = CapabilityFailureTracker(failure_threshold=1)
+        decision = tracker.record_failure("memory_store", "Memory system is not available.")
+        assert "Memory system is not available" in decision.alert_message
+
+    def test_success_resets_counter(self):
+        """A success resets the failure counter; subsequent failures start fresh."""
+        tracker = CapabilityFailureTracker(failure_threshold=3)
+        tracker.record_failure("memory_store", "err")
+        tracker.record_failure("memory_store", "err")
+        tracker.record_success("memory_store")  # reset
+        # One more failure should not trigger alert (counter reset to 0 then +1 = 1)
+        d = tracker.record_failure("memory_store", "err")
+        assert d.should_alert is False
+        assert d.consecutive_failures == 1
+
+    def test_no_alert_for_unmonitored_tool(self):
+        """Failures on unmonitored tools are silently ignored."""
+        monitored = frozenset({"memory_store"})
+        tracker = CapabilityFailureTracker(monitored_tools=monitored, failure_threshold=1)
+        decision = tracker.record_failure("some_other_tool", "err")
+        assert decision.should_alert is False
+        assert decision.consecutive_failures == 0
+
+    def test_tools_tracked_independently(self):
+        """Failures on different tools are tracked independently."""
+        tracker = CapabilityFailureTracker(failure_threshold=3)
+        tracker.record_failure("memory_store", "err")
+        tracker.record_failure("memory_store", "err")
+        # send_reply hasn't failed yet — should not trigger
+        d = tracker.record_failure("send_reply", "err")
+        assert d.should_alert is False
+        assert d.consecutive_failures == 1
+
+    def test_no_repeat_alert_within_cooldown(self):
+        """A 4th consecutive failure within cooldown does NOT re-alert."""
+        tracker = CapabilityFailureTracker(failure_threshold=3, alert_cooldown_seconds=3600)
+        for _ in range(3):
+            tracker.record_failure("memory_store", "err")
+        # 4th failure — within cooldown, no re-alert
+        d4 = tracker.record_failure("memory_store", "err")
+        assert d4.should_alert is False
+        assert d4.consecutive_failures == 4
+
+    def test_repeat_alert_after_cooldown(self):
+        """Re-alert fires after cooldown period elapses."""
+        tracker = CapabilityFailureTracker(failure_threshold=3, alert_cooldown_seconds=0)
+        for _ in range(3):
+            tracker.record_failure("memory_store", "err")
+        # With cooldown=0, next failure should re-alert immediately
+        d4 = tracker.record_failure("memory_store", "err")
+        assert d4.should_alert is True
+
+    def test_success_returns_no_alert(self):
+        """record_success always returns should_alert=False."""
+        tracker = CapabilityFailureTracker(failure_threshold=3)
+        decision = tracker.record_success("memory_store")
+        assert decision.should_alert is False
+        assert decision.consecutive_failures == 0
+
+    def test_status_returns_all_monitored_tools(self):
+        """status() includes all monitored tools with their failure counts."""
+        tracker = CapabilityFailureTracker(failure_threshold=3)
+        tracker.record_failure("memory_store", "err")
+        status = tracker.status()
+        assert "memory_store" in status
+        assert status["memory_store"]["consecutive_failures"] == 1
+
+    def test_default_monitored_tools(self):
+        """Default monitored tools include the critical-path tools."""
+        assert "memory_store" in DEFAULT_MONITORED_TOOLS
+        assert "send_reply" in DEFAULT_MONITORED_TOOLS
+        assert "check_inbox" in DEFAULT_MONITORED_TOOLS
+        assert "wait_for_messages" in DEFAULT_MONITORED_TOOLS
+
+    def test_alert_message_truncates_long_response(self):
+        """Alert message truncates response texts longer than 200 chars."""
+        tracker = CapabilityFailureTracker(failure_threshold=1)
+        long_response = "X" * 300
+        decision = tracker.record_failure("memory_store", long_response)
+        assert decision.should_alert is True
+        # The snippet in the alert should be capped at 200 + "..."
+        assert "X" * 200 in decision.alert_message
+        assert "..." in decision.alert_message

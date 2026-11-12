@@ -79,6 +79,86 @@ class TestMarkProcessing:
             with pytest.raises(ValidationError):
                 asyncio.run(handle_mark_processing({}))
 
+    def test_refuses_local_claude_source(self, setup_dirs, message_generator):
+        """mark_processing must refuse source='local-claude' messages (issue #1531):
+        claim_and_ack is the sole claim path for the agent channel. The message
+        must be left untouched in inbox/ — no partial claim, no filesystem move."""
+        inbox, processing = setup_dirs
+
+        msg = message_generator.generate_text_message(source="local-claude")
+        msg["request_id"] = msg["id"]
+        msg_id = msg["id"]
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_mark_processing
+
+            result = asyncio.run(handle_mark_processing({"message_id": msg_id}))
+
+            assert "not supported" in result[0].text.lower()
+            assert "claim_and_ack" in result[0].text
+            # Left untouched in inbox/ — no partial claim, no move.
+            assert (inbox / f"{msg_id}.json").exists()
+            assert not (processing / f"{msg_id}.json").exists()
+
+    def test_refuses_local_claude_source_case_insensitive(self, setup_dirs, message_generator):
+        """The deprecation gate must catch a mixed-case source field (e.g.
+        'Local-Claude') exactly like claim_and_ack's own fail-closed source
+        checks do (issue #1532 review fix: align case handling between the two
+        gates so a case mismatch can't slip a local-claude message through
+        mark_processing, which has no ack step for the agent channel)."""
+        inbox, processing = setup_dirs
+
+        msg = message_generator.generate_text_message(source="Local-Claude")
+        msg["request_id"] = msg["id"]
+        msg_id = msg["id"]
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_mark_processing
+
+            result = asyncio.run(handle_mark_processing({"message_id": msg_id}))
+
+            assert "not supported" in result[0].text.lower()
+            assert "claim_and_ack" in result[0].text
+            # Left untouched in inbox/ — no partial claim, no move.
+            assert (inbox / f"{msg_id}.json").exists()
+            assert not (processing / f"{msg_id}.json").exists()
+
+    def test_still_claims_non_local_claude_sources(self, setup_dirs, message_generator):
+        """Regression guard: the source-branch gate must not widen to other
+        sources — mark_processing remains fully supported for human channels."""
+        inbox, processing = setup_dirs
+
+        for source in ("telegram", "slack", "sms"):
+            msg = message_generator.generate_text_message(source=source)
+            msg_id = msg["id"]
+            (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+            with patch.multiple(
+                "src.mcp.inbox_server",
+                INBOX_DIR=inbox,
+                PROCESSING_DIR=processing,
+            ):
+                import asyncio
+                from src.mcp.inbox_server import handle_mark_processing
+
+                result = asyncio.run(handle_mark_processing({"message_id": msg_id}))
+
+                assert "claimed" in result[0].text.lower()
+                assert not (inbox / f"{msg_id}.json").exists()
+                assert (processing / f"{msg_id}.json").exists()
+
 
 class TestMarkProcessedUpdated:
     """Tests for updated mark_processed that checks processing/ first."""
@@ -402,6 +482,301 @@ class TestStaleRecovery:
             # Should still be in processing
             assert (processing / f"{msg_id}.json").exists()
             assert not (inbox / f"{msg_id}.json").exists()
+
+    def test_local_claude_survives_generic_text_timeout(self, setup_dirs, message_generator):
+        """A source='local-claude' message past the generic 90s text timeout, but
+        still under the agent-channel's own budget, must NOT be recovered — recovering
+        it would let a second execution path claim the same request_id while the
+        first is still working (protocol spec: no racing writers to one reply slot).
+        """
+        inbox, processing = setup_dirs
+
+        msg = message_generator.generate_text_message(source="local-claude")
+        msg["request_id"] = msg["id"]
+        msg_id = msg["id"]
+        msg_file = processing / f"{msg_id}.json"
+        msg_file.write_text(json.dumps(msg))
+
+        # 5 minutes old: past the generic 90s text timeout, under the 600s
+        # local-claude timeout.
+        old_time = time.time() - 300
+        os.utime(msg_file, (old_time, old_time))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+        ):
+            from src.mcp.inbox_server import _recover_stale_processing
+
+            _recover_stale_processing()
+
+            assert (processing / f"{msg_id}.json").exists()
+            assert not (inbox / f"{msg_id}.json").exists()
+
+    def test_local_claude_recovered_past_its_own_timeout(self, setup_dirs, message_generator):
+        """A source='local-claude' message DOES get recovered once it exceeds the
+        agent channel's own (longer) stale-processing budget."""
+        inbox, processing = setup_dirs
+
+        msg = message_generator.generate_text_message(source="local-claude")
+        msg["request_id"] = msg["id"]
+        msg_id = msg["id"]
+        msg_file = processing / f"{msg_id}.json"
+        msg_file.write_text(json.dumps(msg))
+
+        old_time = time.time() - 700  # past the 600s local-claude timeout
+        os.utime(msg_file, (old_time, old_time))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+        ):
+            from src.mcp.inbox_server import _recover_stale_processing
+
+            _recover_stale_processing()
+
+            assert not (processing / f"{msg_id}.json").exists()
+            assert (inbox / f"{msg_id}.json").exists()
+
+
+class TestStaleRecoveryExhaustion:
+    """Tests for issue #1535: the agent-channel reaper must close (not abandon)
+    an OPEN exchange once its own stale-recovery loop is exhausted.
+
+    Distinct from #1525 (write_progress abandonment sliding timer) — this is
+    the reaper's own bounded-retry behavior in _recover_stale_processing().
+    """
+
+    @pytest.fixture
+    def setup_dirs(self, temp_messages_dir: Path):
+        inbox = temp_messages_dir / "inbox"
+        processing = temp_messages_dir / "processing"
+        failed = temp_messages_dir / "failed"
+        agent_replies = temp_messages_dir / "agent-replies"
+        agent_replies.mkdir(parents=True, exist_ok=True)
+        return inbox, processing, failed, agent_replies
+
+    def _stale_local_claude_message(self, processing, message_generator, *, recovery_count=0, age_seconds=700):
+        """Write a source='local-claude' message into processing/, stale by age_seconds
+        and already carrying `recovery_count` prior stale-recovery attempts."""
+        msg = message_generator.generate_text_message(source="local-claude")
+        msg["request_id"] = msg["id"]
+        if recovery_count:
+            msg["_stale_recovery_count"] = recovery_count
+        msg_id = msg["id"]
+        msg_file = processing / f"{msg_id}.json"
+        msg_file.write_text(json.dumps(msg))
+        old_time = time.time() - age_seconds
+        os.utime(msg_file, (old_time, old_time))
+        return msg, msg_file
+
+    def test_recovery_count_increments_and_message_still_requeued_below_bound(
+        self, setup_dirs, message_generator
+    ):
+        """Below the bound, a stale local-claude message is still recovered to
+        inbox/ (existing behavior) but now carries an incremented
+        `_stale_recovery_count` so the reaper can eventually detect exhaustion."""
+        inbox, processing, failed, agent_replies = setup_dirs
+        msg, msg_file = self._stale_local_claude_message(processing, message_generator, recovery_count=0)
+        msg_id = msg["id"]
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            FAILED_DIR=failed,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            from src.mcp.inbox_server import _recover_stale_processing
+
+            _recover_stale_processing()
+
+            assert not (processing / f"{msg_id}.json").exists()
+            recovered = json.loads((inbox / f"{msg_id}.json").read_text())
+            assert recovered["_stale_recovery_count"] == 1
+            # Exchange must still be OPEN — no terminal reply written yet.
+            assert not (agent_replies / f"{msg_id}.json").exists()
+
+    def test_finalizes_and_writes_terminal_reply_after_max_attempts(self, setup_dirs, message_generator):
+        """Once a local-claude message has already been recovered
+        _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS times, the next stale pass must
+        close the exchange with a terminal reply instead of requeuing it again."""
+        inbox, processing, failed, agent_replies = setup_dirs
+        from src.mcp.inbox_server import _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS
+
+        msg, msg_file = self._stale_local_claude_message(
+            processing, message_generator, recovery_count=_LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS
+        )
+        msg_id = msg["id"]
+        request_id = msg["request_id"]
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            FAILED_DIR=failed,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            from src.mcp.inbox_server import _recover_stale_processing
+
+            _recover_stale_processing()
+
+            # No longer bounces back to inbox/ — the loop is closed.
+            assert not (processing / f"{msg_id}.json").exists()
+            assert not (inbox / f"{msg_id}.json").exists()
+
+            # Terminal reply closes the exchange for the requester.
+            reply_path = agent_replies / f"{request_id}.json"
+            assert reply_path.exists()
+            reply = json.loads(reply_path.read_text())
+            assert reply["error"] is True
+            assert reply["error_type"] == "stale_recovery_exhausted"
+            assert reply["request_id"] == request_id
+
+    def test_finalized_message_archived_to_failed_dir(self, setup_dirs, message_generator):
+        """The exhausted message itself is archived to failed/ (permanently failed),
+        mirroring handle_mark_failed's own retry-count-bounded permanent-failure path."""
+        inbox, processing, failed, agent_replies = setup_dirs
+        from src.mcp.inbox_server import _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS
+
+        msg, msg_file = self._stale_local_claude_message(
+            processing, message_generator, recovery_count=_LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS
+        )
+        msg_id = msg["id"]
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            FAILED_DIR=failed,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            from src.mcp.inbox_server import _recover_stale_processing
+
+            _recover_stale_processing()
+
+            archived_path = failed / f"{msg_id}.json"
+            assert archived_path.exists()
+            archived = json.loads(archived_path.read_text())
+            assert archived["_permanently_failed"] is True
+            assert archived["_stale_recovery_exhausted"] is True
+
+    def test_non_local_claude_source_unaffected_by_bound(self, setup_dirs, message_generator):
+        """The bound and its finalization path are scoped to source='local-claude'
+        only — a non-agent-channel message stays on the pre-existing unbounded
+        recover-to-inbox behavior."""
+        inbox, processing, failed, agent_replies = setup_dirs
+
+        msg = message_generator.generate_text_message(source="telegram")
+        msg_id = msg["id"]
+        msg_file = processing / f"{msg_id}.json"
+        msg_file.write_text(json.dumps(msg))
+        old_time = time.time() - 600
+        os.utime(msg_file, (old_time, old_time))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            FAILED_DIR=failed,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            from src.mcp.inbox_server import _recover_stale_processing
+
+            _recover_stale_processing()
+
+            assert not (processing / f"{msg_id}.json").exists()
+            assert (inbox / f"{msg_id}.json").exists()
+            assert not (failed / f"{msg_id}.json").exists()
+            # No _stale_recovery_count bookkeeping for non-agent-channel sources.
+            assert "_stale_recovery_count" not in json.loads((inbox / f"{msg_id}.json").read_text())
+
+    def test_pre_restart_path_also_bounded_for_local_claude(self, setup_dirs, message_generator):
+        """Path 1 (pre-restart recovery) shares the same bound as path 2 (timeout)
+        — a message can't dodge exhaustion by always qualifying for the
+        pre-restart branch instead of the timeout branch."""
+        inbox, processing, failed, agent_replies = setup_dirs
+        from src.mcp.inbox_server import _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS
+
+        msg = message_generator.generate_text_message(source="local-claude")
+        msg["request_id"] = msg["id"]
+        msg["_stale_recovery_count"] = _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS
+        # _processing_started_at before "server start" triggers path 1.
+        msg["_processing_started_at"] = datetime(2020, 1, 1, tzinfo=timezone.utc).isoformat()
+        msg_id = msg["id"]
+        request_id = msg["request_id"]
+        msg_file = processing / f"{msg_id}.json"
+        msg_file.write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            FAILED_DIR=failed,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            from src.mcp.inbox_server import _recover_stale_processing
+
+            _recover_stale_processing()
+
+            assert not (processing / f"{msg_id}.json").exists()
+            assert not (inbox / f"{msg_id}.json").exists()
+            assert (agent_replies / f"{request_id}.json").exists()
+            assert (failed / f"{msg_id}.json").exists()
+
+    def test_fresh_claim_not_finalized_despite_exhausted_count(self, setup_dirs, message_generator):
+        """Regression test for issue #1543 (fast-follow to #1541/#1535).
+
+        A message can legitimately reach `_stale_recovery_count >=
+        _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS` through past stale cycles
+        and then be freshly reclaimed via `claim_and_ack`, which resets
+        `_processing_started_at` on every fresh claim but never resets
+        `_stale_recovery_count`. Gating finalization on the count alone
+        (without checking whether the *current* claim is stale) would close
+        out and archive a message while its 4th, fully live worker is still
+        running — dropping that worker's eventual successful reply. The
+        reaper must leave a fresh, non-stale claim alone regardless of its
+        historical count.
+        """
+        inbox, processing, failed, agent_replies = setup_dirs
+        from src.mcp.inbox_server import _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS
+
+        msg = message_generator.generate_text_message(source="local-claude")
+        msg["request_id"] = msg["id"]
+        msg["_stale_recovery_count"] = _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS
+        # Simulates claim_and_ack's fresh claim: _processing_started_at reset
+        # to "now" (well within the 600s local-claude timeout), while
+        # _stale_recovery_count is carried over from prior stale cycles.
+        msg["_processing_started_at"] = datetime.now(timezone.utc).isoformat()
+        msg_id = msg["id"]
+        request_id = msg["request_id"]
+        msg_file = processing / f"{msg_id}.json"
+        msg_file.write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            FAILED_DIR=failed,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            from src.mcp.inbox_server import _recover_stale_processing
+
+            _recover_stale_processing()
+
+            # Fresh, live claim — must be left alone, not finalized or requeued.
+            assert (processing / f"{msg_id}.json").exists()
+            assert not (inbox / f"{msg_id}.json").exists()
+            assert not (failed / f"{msg_id}.json").exists()
+            assert not (agent_replies / f"{request_id}.json").exists()
+
+            # On-disk message must be unmutated — no premature failure markers.
+            untouched = json.loads((processing / f"{msg_id}.json").read_text())
+            assert untouched.get("_permanently_failed") is not True
+            assert untouched.get("_stale_recovery_exhausted") is not True
+            assert untouched["_stale_recovery_count"] == _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS
 
 
 class TestRetryRecovery:

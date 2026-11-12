@@ -14,12 +14,6 @@
 #   2. Only fires if there isn't already a self-check in the inbox (no spam)
 #   3. Rate-limited: won't inject if last self-check was < 2 minutes ago
 #   4. Max inbox depth: won't inject if inbox already has 20+ messages (backpressure)
-#
-# Config (config.env):
-#   LOBSTER_SELF_CHECK_STATUS_PINGS=true   default; false or 0 turns the
-#       "status?" message off. Completion still reaches the dispatcher through
-#       write_result, so only turn this off where every subagent reports that
-#       way (the SubagentStop hook require-write-result.py enforces it).
 #===============================================================================
 
 set -e
@@ -33,17 +27,7 @@ if [ -f "$_LOBSTER_CONFIG" ]; then
         exit 0
     fi
 fi
-
-# Status pings: "false" or "0" disables the status? message. Anything else,
-# including an unset key or a missing config.env, keeps the default (on).
-SELF_CHECK_STATUS_PINGS=true
-if [ -f "$_LOBSTER_CONFIG" ]; then
-    _PINGS=$(grep -m1 '^LOBSTER_SELF_CHECK_STATUS_PINGS=' "$_LOBSTER_CONFIG" 2>/dev/null | cut -d= -f2)
-    if [ "$_PINGS" = "false" ] || [ "$_PINGS" = "0" ]; then
-        SELF_CHECK_STATUS_PINGS=false
-    fi
-fi
-unset _LOBSTER_CONFIG _DEV_MODE _PINGS
+unset _LOBSTER_CONFIG _DEV_MODE
 
 INBOX_DIR="${LOBSTER_MESSAGES:-$HOME/messages}/inbox"
 MESSAGES_DIR="${LOBSTER_MESSAGES:-$HOME/messages}"
@@ -100,73 +84,71 @@ fi
 # If claude count is <= 1, only the main session exists (no subagents to check on)
 CLAUDE_COUNT=$(pgrep -c -f "claude" 2>/dev/null || echo "0")
 
-# Source agent status scanner (running-agent summary for the status? text).
-#
-# Completion is NOT reported from here. Subagents report completion through
-# write_result, which writes a subagent_result inbox file the dispatcher
-# relays; the SubagentStop hook require-write-result.py enforces that call.
-# A completion message derived from task output files would be a second,
-# lower-fidelity notification of the same event.
+# Source agent status scanner for both status and completion detection
 AGENT_STATUS_SCRIPT="${LOBSTER_INSTALL_DIR:-$HOME/lobster}/scripts/agent-status.sh"
 source "$AGENT_STATUS_SCRIPT"
 
-# Query SQLite agent_sessions DB for pending (running/starting) agents.
-# pending-agents.json was migrated to SQLite and is no longer authoritative.
-# Exclude agent_type='dispatcher' — the dispatcher's own session is always
-# registered as running/starting and would otherwise be counted as a
-# "pending agent" on every firing, producing a permanent false positive.
-# DISPATCHER_EXCLUSION_SQL is the shared single source of truth (BIS-723,
-# scripts/lib/agent_sessions.sh) for this check — it must match
-# DISPATCHER_EXCLUSION_SQL in src/utils/agent_types.py, used by the
-# equivalent Python-side checks in session_store.py and inbox_server.py
-# (see #781 / PR #2099 / PR #2103 for the history of this filter being
-# fixed independently at each call site before consolidation).
-source "${LOBSTER_INSTALL_DIR:-$HOME/lobster}/scripts/lib/agent_sessions.sh"
-PENDING_COUNT=$(sqlite3 "$MESSAGES_DIR/config/agent_sessions.db" \
-    "SELECT COUNT(*) FROM agent_sessions WHERE status IN ('running','starting') AND ${DISPATCHER_EXCLUSION_SQL}" \
-    2>/dev/null || echo "0")
+# Check for completed tasks first (works even if subagents already exited)
+COMPLETED_TASKS=$(scan_completed_tasks)
 
-# Only inject a status check if subagents are still running. The DB session
-# count is authoritative: if there are zero pending (non-dispatcher) sessions,
-# do nothing. CLAUDE_COUNT is not reliable here because the dispatcher itself
-# is always running (count >= 1 even with no subagents).
-if [ "$PENDING_COUNT" -eq 0 ] 2>/dev/null; then
-    exit 0
-fi
+if [ -n "$COMPLETED_TASKS" ]; then
+    # Completed task found — inject structured completion message.
+    # This replaces the generic "status?" prompt with actionable info,
+    # so the dispatcher can relay results directly without LLM reasoning
+    # about what to check.
+    SELF_CHECK_TEXT="[Task Completed] ${COMPLETED_TASKS}"
+else
+    # Query SQLite agent_sessions DB for pending (running/starting) agents.
+    # pending-agents.json was migrated to SQLite and is no longer authoritative.
+    # Exclude agent_type='dispatcher' — the dispatcher's own session is always
+    # registered as running/starting and would otherwise be counted as a
+    # "pending agent" on every firing, producing a permanent false positive.
+    # Mirrors the fix applied in session_store.py's cleanup_stale_running_sessions()
+    # and get_unnotified_completed() (see #781 / PR #2099); this script queries
+    # the DB directly via sqlite3 rather than through session_store.py, so it
+    # was not covered by that PR and needs the same filter applied here.
+    PENDING_COUNT=$(sqlite3 "$MESSAGES_DIR/config/agent_sessions.db" \
+        "SELECT COUNT(*) FROM agent_sessions WHERE status IN ('running','starting') AND COALESCE(agent_type, '') != 'dispatcher'" \
+        2>/dev/null || echo "0")
 
-# Pings turned off: subagents are still running, but the dispatcher is not
-# woken for them. Exit before the message and the rate-limit timestamp.
-if [ "$SELF_CHECK_STATUS_PINGS" = "false" ]; then
-    exit 0
-fi
+    # No completed tasks — only inject status check if subagents are still
+    # running. The DB session count is authoritative: if there are zero pending
+    # (non-dispatcher) sessions, do nothing. CLAUDE_COUNT is not reliable here
+    # because the dispatcher itself is always running (count >= 1 even with no
+    # subagents).
+    if [ "$PENDING_COUNT" -eq 0 ] 2>/dev/null; then
+        exit 0
+    fi
 
-AGENT_SUMMARY=$(scan_agent_status)
+    AGENT_SUMMARY=$(scan_agent_status)
 
-SELF_CHECK_TEXT="status? (Self-check)"
-if [ -n "$AGENT_SUMMARY" ]; then
-    SELF_CHECK_TEXT="status? (Self-check) | ${AGENT_SUMMARY}"
-fi
-if [ "$PENDING_COUNT" -gt 0 ] 2>/dev/null; then
-    SELF_CHECK_TEXT="${SELF_CHECK_TEXT} [${PENDING_COUNT} agents pending]"
+    SELF_CHECK_TEXT="status? (Self-check)"
+    if [ -n "$AGENT_SUMMARY" ]; then
+        SELF_CHECK_TEXT="status? (Self-check) | ${AGENT_SUMMARY}"
+    fi
+    if [ "$PENDING_COUNT" -gt 0 ] 2>/dev/null; then
+        SELF_CHECK_TEXT="${SELF_CHECK_TEXT} [${PENDING_COUNT} agents pending]"
+    fi
 fi
 
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%S.%6N)
 EPOCH_MS=$(date +%s%3N)
 MSG_ID="${EPOCH_MS}_self"
 
-# Shared jq --arg JSON builder (BIS-724, scripts/lib/json_message.sh) — single
-# source of truth for jq-arg-safe JSON construction, see PR history for #2004.
-source "${LOBSTER_INSTALL_DIR:-$HOME/lobster}/scripts/lib/json_message.sh"
-_json_build_message \
+jq -n \
     --arg id "${MSG_ID}" \
-    --arg source "system" \
-    --argjson chat_id 0 \
-    --argjson user_id 0 \
-    --arg username "lobster-system" \
-    --arg user_name "Self-Check" \
     --arg text "${SELF_CHECK_TEXT}" \
     --arg timestamp "${TIMESTAMP}" \
-    > "${INBOX_DIR}/${MSG_ID}.json"
+    '{
+        "id": $id,
+        "source": "system",
+        "chat_id": 0,
+        "user_id": 0,
+        "username": "lobster-system",
+        "user_name": "Self-Check",
+        "text": $text,
+        "timestamp": $timestamp
+    }' > "${INBOX_DIR}/${MSG_ID}.json"
 
 # Record timestamp
 date +%s > "$LAST_CHECK_FILE"

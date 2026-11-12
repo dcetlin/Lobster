@@ -6,6 +6,5 @@ __pycache__/
 .planning/
 .claude/
 data/
-incidents/
 node_modules/
 *.log

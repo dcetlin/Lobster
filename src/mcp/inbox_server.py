@@ -13,6 +13,7 @@ Provides tools for Claude Code to interact with the message queue:
 import asyncio
 import json
 import logging
+from collections import OrderedDict
 from logging.handlers import RotatingFileHandler
 import os
 import re
@@ -22,6 +23,7 @@ import time
 import threading
 import uuid
 import httpx
+import yaml
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -58,12 +60,18 @@ except ImportError:
 _SRC_DIR = str(Path(__file__).resolve().parent.parent)
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
+# Re-insert _MCP_SRC_DIR at front so src/mcp/memory wins over src/memory.
+# src/memory/__init__.py is empty (added in ea623f8); the real memory module
+# is src/mcp/memory/. Without this, the import at line ~117 silently fails
+# and _memory_provider stays None forever.
+if sys.path[0] != _MCP_SRC_DIR:
+    sys.path.insert(0, _MCP_SRC_DIR)
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 # IFTTT behavioral rules store
-from utils.ifttt_rules import (
+from src.utils.ifttt_rules import (
     load_rules as _ifttt_load_rules,
     save_rules as _ifttt_save_rules,
     add_rule as _ifttt_add_rule,
@@ -71,32 +79,44 @@ from utils.ifttt_rules import (
     find_rule as _ifttt_find_rule,
     get_enabled_rules as _ifttt_get_enabled_rules,
 )
-
-# Dispatcher-exclusion: shared single source of truth (BIS-723)
-from utils.agent_types import is_dispatcher_row
 import uuid as _uuid_mod
 
 # Reliability utilities (atomic writes, validation, audit logging)
 from reliability import (
     atomic_write_json,
+    atomic_create_json,
     validate_send_reply_args,
     validate_message_id,
+    sanitize_request_id,
+    sanitize_agent_slug,
     ValidationError,
     init_audit_log,
     audit_log,
 )
 
+# Agent channel (source="local-claude"): envelope construction, the
+# single-shot reply-slot write, the ack write, and the agent_channel.*
+# audit emits. See src/mcp/agent_channel.py module docstring for the
+# extraction's boundary (what stays here vs. what moved).
+import agent_channel
+
 # Self-update system
 from update_manager import UpdateManager
+
+# Bot-talk mirroring — fire-and-forget relay to the shared SaharLobster/AlbertLobster channel
+# mirror_inbound was removed from bot_talk_mirror (cross-Lobster messages only; owner messages
+# are never logged here). Only mirror_outbound is used in this module.
+try:
+    from bot_talk.mirror import mirror_outbound as _mirror_outbound
+except ImportError:
+    from bot_talk_mirror import mirror_outbound as _mirror_outbound
+
 
 # Pending agent tracker (thin adapter over session_store)
 from agents.tracker import add_pending_agent as _add_pending_agent, remove_pending_agent as _remove_pending_agent
 
 # Agent session store — SQLite-backed, used directly for new MCP tools
 import agents.session_store as _session_store
-
-# PID ground truth (issue #2148, Phase 1) — dispatcher self-registration capture
-from agents.pid_liveness import find_dispatcher_ancestor_pid as _find_dispatcher_ancestor_pid
 
 # Atomic claim DB — SQLite INSERT OR FAIL claim gate (issue #1360)
 from claims import AtomicClaimDB as _AtomicClaimDB
@@ -129,6 +149,22 @@ try:
 except Exception as _db_reader_import_err:
     _startup_log.warning('DB reader module unavailable: %s', _db_reader_import_err)
 
+def _db_writes_enabled() -> bool:
+    """True when LOBSTER_USE_DB=1 — i.e. the write path is actively persisting
+    inbound/outbound messages to messages.db (see persist_inbound/persist_outbound
+    below, BIS-167 Slice 6).
+
+    When this is False, messages.db can only ever reflect whatever it was
+    seeded with at some point in the past — it never receives live writes.
+    DB-first read paths must treat that as "not authoritative" rather than
+    silently trusting a non-empty-but-stale table (issue #1471: a five-row
+    test-fixture seed from 2026-05-22 was served as real conversation history
+    indefinitely, because the DB-vs-filesystem fallback trigger was
+    `total_count == 0`, which a stale-but-nonempty DB never satisfies).
+    """
+    return os.environ.get("LOBSTER_USE_DB", "0") == "1"
+
+
 # BIS-167 Slice 6: Live DB write path — persist messages to messages.db
 _db_persist_inbound = None
 _db_persist_outbound = None
@@ -139,120 +175,28 @@ try:
         persist_outbound as _db_persist_outbound,
         persist_agent_event as _db_persist_agent_event,
     )
-    _db_flag = os.environ.get("LOBSTER_USE_DB", "0")
-    _db_status = "ENABLED" if _db_flag == "1" else "DISABLED (set LOBSTER_USE_DB=1 to enable)"
+    _db_status = "ENABLED" if _db_writes_enabled() else "DISABLED (set LOBSTER_USE_DB=1 to enable)"
     _startup_log.info('[DB] message_store loaded — DB writes %s', _db_status)
-    del _db_flag, _db_status
+    del _db_status
 except Exception as _db_import_err:
     _startup_log.warning('messages.db write path unavailable: %s', _db_import_err)
 
 
 # Memory system (optional — gracefully degrades to static file search)
 _memory_provider = None
+# VALID_SIGNAL_TYPES is imported here so the memory_store tool schema enum
+# is derived from the single source of truth in provider.py rather than
+# duplicated as a raw string list. See learnings.md mirror-constant pattern.
+_VALID_SIGNAL_TYPES_FOR_SCHEMA: list[str] = []
 try:
     from memory import create_memory_provider, MemoryEvent
+    from memory.provider import VALID_SIGNAL_TYPES as _VALID_SIGNAL_TYPES
+    _VALID_SIGNAL_TYPES_FOR_SCHEMA = sorted(_VALID_SIGNAL_TYPES)
     _memory_provider = create_memory_provider(use_vector=True)
 except Exception as _mem_err:
     # Memory system is optional; log and continue
     import traceback as _tb
     _startup_log.warning('Memory system unavailable: %s', _mem_err)
-
-# User Model subsystem
-_user_model = None
-_user_model_tool_names: set[str] = set()
-USER_MODEL_TOOL_DEFINITIONS: list = []
-try:
-    from user_model import create_user_model, USER_MODEL_TOOL_DEFINITIONS
-    _user_model = create_user_model()
-    _user_model_tool_names = _user_model.tool_names
-    _startup_log.info('User Model subsystem initialized.')
-except Exception as _um_err:
-    import traceback as _um_tb
-    _startup_log.warning('User Model subsystem unavailable: %s', _um_err)
-
-# ---------------------------------------------------------------------------
-# Background observation worker — fire-and-forget, zero main-thread blocking
-# ---------------------------------------------------------------------------
-import queue as _queue_mod
-
-_observation_queue: _queue_mod.Queue = _queue_mod.Queue(maxsize=500)
-_observation_thread: threading.Thread | None = None
-
-
-def _observation_worker() -> None:
-    """Daemon thread: drain observation queue, call user_model.observe()."""
-    while True:
-        try:
-            item = _observation_queue.get(timeout=10)
-        except _queue_mod.Empty:
-            continue
-        if item is None:  # shutdown sentinel
-            break
-        try:
-            msg_text, msg_id, source, ts = item
-            if _user_model is not None:
-                obs_ids = _user_model.observe(msg_text, msg_id, context=source or "", message_ts=ts)
-                # Debug: emit Tier 1 signal summary when LOBSTER_DEBUG=true.
-                # _emit_event is a no-op when LOBSTER_DEBUG != true (bus filter).
-                if obs_ids:
-                    try:
-                        from user_model.observation import extract_signals
-                        signals = extract_signals(msg_text, msg_id, context=source or "")
-                        if signals:
-                            signal_parts = []
-                            for sig in signals:
-                                sig_type = (
-                                    sig.signal_type.value
-                                    if hasattr(sig.signal_type, "value")
-                                    else str(sig.signal_type)
-                                )
-                                signal_parts.append(
-                                    f"{sig_type}={sig.content[:30]!r} ({sig.confidence:.2f})"
-                                )
-                            summary = ", ".join(signal_parts[:6])  # cap at 6
-                            short_id = msg_id[:20] if len(msg_id) > 20 else msg_id
-                            _emit_event(
-                                f"\U0001f50d [tier 1 fired] msg={short_id} "
-                                f"extracted {len(signals)} signal(s): {summary}",
-                                event_type="user_model.tier1",
-                                severity="debug",
-                                source="observation-worker",
-                            )
-                    except Exception:
-                        pass  # never block observation on debug emit
-        except Exception as _obs_exc:
-            import traceback as _tb
-            _emit_event(
-                f"\U0001f50d [observation worker error] {type(_obs_exc).__name__}: {_obs_exc}\n"
-                + _tb.format_exc()[-800:],
-                event_type="system.error",
-                severity="error",
-                source="observation-worker",
-            )
-            # never crash the worker
-
-
-def _ensure_observation_worker() -> None:
-    """Start the background observation thread if not already running."""
-    global _observation_thread
-    if _user_model is None:
-        return
-    if _observation_thread is not None and _observation_thread.is_alive():
-        return
-    _observation_thread = threading.Thread(
-        target=_observation_worker, daemon=True, name="um-observer"
-    )
-    _observation_thread.start()
-
-
-def _queue_observation(msg_text: str, msg_id: str, source: str | None = None, ts: str | None = None) -> None:
-    """Non-blocking: enqueue a message for background observation. Drops if full."""
-    if _user_model is None:
-        return
-    try:
-        _observation_queue.put_nowait((msg_text, msg_id, source, ts))
-    except _queue_mod.Full:
-        pass  # drop silently — observation is best-effort
 
 # ---------------------------------------------------------------------------
 # Debug observability — LOBSTER_DEBUG=true push notifications
@@ -366,6 +310,63 @@ def _resolve_debug_config() -> None:
     pass
 
 
+# ---------------------------------------------------------------------------
+# Capability failure alert delivery
+# ---------------------------------------------------------------------------
+
+def _deliver_capability_alert(alert_message: str, tool: str) -> None:
+    """Write a capability failure alert directly to the outbox.
+
+    This bypasses the dispatcher inbox entirely — no dispatcher tokens are
+    burned, and the alert is unconditional (not gated on LOBSTER_DEBUG).
+    The bot watchdog delivers it to Telegram in the same way as a normal
+    send_reply response.
+
+    Resolves the owner chat_id from config using _get_owner_chat_id_and_source().
+    If the chat_id cannot be resolved, logs a warning and drops the alert
+    rather than crashing the MCP server.
+
+    Never raises — must be safe to call from any context.
+    """
+    try:
+        owner_chat_id, owner_source = _get_owner_chat_id_and_source()
+        if owner_chat_id is None:
+            log.warning(
+                "_deliver_capability_alert: owner chat_id not resolvable — "
+                "dropping alert for tool=%s", tool
+            )
+            return
+
+        from datetime import datetime, timezone as _timezone
+        now = datetime.now(_timezone.utc)
+        ts_ms = int(now.timestamp() * 1000)
+        safe_tool = "".join(c if c.isalnum() or c in "-_" else "_" for c in tool)[:40]
+        message_id = f"{ts_ms}_capability_alert_{safe_tool}"
+        message = {
+            "id": message_id,
+            "type": "capability_alert",
+            "source": owner_source,
+            "chat_id": owner_chat_id,
+            "text": alert_message,
+            "timestamp": now.isoformat(),
+        }
+        if owner_source == "bisque":
+            outbox_file = BISQUE_OUTBOX_DIR / f"{message_id}.json"
+        else:
+            outbox_file = OUTBOX_DIR / f"{message_id}.json"
+        atomic_write_json(outbox_file, message)
+        log.warning(
+            "Capability alert delivered for tool=%s (chat_id=%s, source=%s)",
+            tool, owner_chat_id, owner_source,
+        )
+    except Exception:
+        log.warning(
+            "_deliver_capability_alert: unexpected error delivering alert for tool=%s",
+            tool,
+            exc_info=True,
+        )
+
+
 def _emit_mcp_event(
     event_type: str,
     payload: dict,
@@ -409,41 +410,10 @@ except ImportError:
     _VALID_SEVERITIES = frozenset({"debug", "info", "warn", "error", "critical"})  # type: ignore[assignment]
 
 
-# ---------------------------------------------------------------------------
-# User model context injection heuristic
-# ---------------------------------------------------------------------------
-_USER_CONTEXT_TRIGGERS = re.compile(
-    r'(?i)(?:'
-    r'(?:what|where)\s+should\s+i'             # "what should I focus on"
-    r'|priorit(?:y|ies|ize)'                    # priorities
-    r'|what\s+(?:matters|do\s+i\s+care)'        # "what matters to me"
-    r'|help\s+me\s+(?:decide|choose|think)'     # decision-making
-    r'|(?:my|the)\s+(?:values?|principles?|preferences?|constraints?)' # explicit model refs
-    r'|what.{0,8}(?:on\s+my\s+plate|next)'     # "what's on my plate"
-    r'|big\s+picture'                           # stepping back
-    r'|step(?:ping)?\s+back'                    # reflection
-    r'|how\s+am\s+i\s+doing'                    # self-check
-    r'|(?:over|under)whelm'                     # emotional state
-    r'|burn.?out|stressed\s+(?:about|out)'      # stress
-    r'|life\s+(?:situation|direction|goals?)'    # life-level
-    r'|introspect|self.?reflect'                # introspection
-    r'|what\s+(?:do\s+i|did\s+i)\s+think'      # recall preferences
-    r'|remind\s+me\s+(?:what|why)\s+i'          # recall motivations
-    r'|(?:deprioritize|reprioritize|reorder)'   # attention management
-    r'|what.{0,8}(?:important|urgent)'          # importance queries
-    r'|good\s+(?:morning|evening|night)'        # greetings that often start reflective exchanges
-    r')',
-)
-
-def _should_inject_user_context(text: str) -> bool:
-    """Fast heuristic: does this message benefit from user model context?"""
-    if not text or len(text) < 8:
-        return False
-    return bool(_USER_CONTEXT_TRIGGERS.search(text))
-
 # MCP SDK
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
+from mcp.server.lowlevel.server import NotificationOptions  # noqa: E402 — same late-import position as the other mcp.server imports directly above
 from mcp.types import Tool, TextContent
 
 # Directories
@@ -464,15 +434,19 @@ TASK_REPLIED_DIR = BASE_DIR / "task-replied"
 TASKS_FILE = BASE_DIR / "tasks.json"
 TASK_OUTPUTS_DIR = BASE_DIR / "task-outputs"
 BISQUE_OUTBOX_DIR = BASE_DIR / "bisque-outbox"
+AGENT_REPLIES_DIR = BASE_DIR / "agent-replies"  # agent channel: dispatcher replies to source="local-claude" land here, keyed by request_id (see docs/reference/agent-channel.md)
 MESSAGES_DB_PATH = Path(
     os.environ.get("LOBSTER_MESSAGES_DB", str(BASE_DIR / "messages.db"))
 )
 LOBSTER_TMUX_SESSION = os.environ.get("LOBSTER_TMUX_SESSION", "lobster")
 
-# Subtype tagging "your MCP session is about to be / has been invalidated"
-# warnings (issue #2279).  Kept in sync with the literal written by
-# scripts/restart-mcp.sh; grants P0 via _INBOX_P0_SUBTYPES.
-SESSION_RESTART_SUBTYPE = "session-restart"
+# Valid metabolic value categories for write_result outcome_category field (issue #754).
+# Self-assessed by the completing subagent; stored alongside the result for flamegraph queries.
+VALID_OUTCOME_CATEGORIES: frozenset[str] = frozenset({"heat", "shit", "seed", "pearl"})
+# Outcome category ledger: append-only JSONL recording {task_id, outcome_category, source, ts}
+# for every write_result call that includes outcome_category. Used by token-flamegraph.sh
+# to render the category breakdown axis without touching the token-ledger schema.
+OUTCOME_LEDGER_FILE = _WORKSPACE / "data" / "outcome-ledger.jsonl"
 
 # Instance identity for multi-instance deployments (BIS-85).
 # Prefer an explicit observability token; fall back to hostname so reports are
@@ -498,7 +472,7 @@ _REPLY_TRACK_MAX = 100
 # ---------------------------------------------------------------------------
 
 try:
-    from utils.timezone import (
+    from src.utils.timezone import (
         format_for_user as _tz_format_for_user,
         format_iso_for_user as _tz_format_iso_for_user,
         format_with_utc_and_local as _tz_format_with_utc_and_local,
@@ -515,7 +489,7 @@ def _get_display_tz():
         return _tz_get_owner_zoneinfo()
     import zoneinfo as _zoneinfo
     try:
-        from user_model.owner import get_owner_timezone as _get_owner_tz
+        from src.utils.owner_config import get_owner_timezone as _get_owner_tz
         return _zoneinfo.ZoneInfo(_get_owner_tz())
     except Exception:
         return _zoneinfo.ZoneInfo("UTC")
@@ -565,8 +539,27 @@ def _format_ts_with_et(ts_str: str) -> str:
         return ts_str
 
 
+def _reply_track_key(chat_id: Any, source: str = "", request_id: Any = None) -> str:
+    """Return the key used by the dropped-reply guard / reply-tracking dict.
+
+    Per-request identity, not per-client identity (agent-channel protocol spec,
+    principle 3): every local-claude client shares the constant chat_id="local-claude"
+    (see scripts/lobster-chat.py), so keying the dropped-reply guard on chat_id alone
+    would let one client's successful reply mask the fact that a *different*
+    client's request was silently dropped. For source="local-claude", key on
+    request_id instead — it's already the per-request correlation id the CLI
+    polls on, so it is genuinely unique per request. All other sources keep
+    keying on chat_id (unchanged behavior).
+    """
+    if source == "local-claude" and request_id:
+        return f"local-claude:{request_id}"
+    return str(chat_id)
+
+
 def _track_reply(chat_id: Any) -> None:
-    """Record that a reply was sent to chat_id."""
+    """Record that a reply was sent, keyed by `chat_id` (or an equivalent
+    per-request identity produced by `_reply_track_key`).
+    """
     global _recent_replies
     key = str(chat_id)
     _recent_replies[key] = time.time()
@@ -772,7 +765,9 @@ from message_types import (  # noqa: E402 — placed after path-setup at top of 
     INBOX_MESSAGE_TYPES,
     INBOX_MESSAGE_SOURCES,
     USER_FACING_TYPES,
+    MessageRelationship,
 )
+from lobster_meta import build_lobster_meta, classify_relationship  # noqa: E402 — same path-setup above
 
 # ---------------------------------------------------------------------------
 # Message type normalization (issue #635)
@@ -784,7 +779,7 @@ TYPE_ALIASES: dict[str, str] = {
     "message": "text",
     "audio": "voice",
     "image": "photo",
-    "cron_reminder": "scheduled_reminder",
+    # "cron_reminder" is no longer aliased — it is its own canonical type handled separately from "scheduled_reminder"
     "task-output": "health_check",
     "system": "health_check",  # when type="system" from health check scripts
 }
@@ -946,7 +941,7 @@ CANONICAL_DIR = _USER_CONFIG / "memory" / "canonical"
 
 # Ensure directories exist
 for d in [INBOX_DIR, OUTBOX_DIR, PROCESSED_DIR, PROCESSING_DIR, FAILED_DIR, SENT_DIR, SENT_REPLIES_DIR,
-          TASK_REPLIED_DIR, CONFIG_DIR, AUDIO_DIR, TASK_OUTPUTS_DIR, BISQUE_OUTBOX_DIR,
+          TASK_REPLIED_DIR, CONFIG_DIR, AUDIO_DIR, TASK_OUTPUTS_DIR, BISQUE_OUTBOX_DIR, AGENT_REPLIES_DIR,
           SCHEDULED_TASKS_TASKS_DIR, SCHEDULED_JOBS_DIR, SCHEDULED_TASKS_LOGS_DIR, CANONICAL_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
@@ -1253,7 +1248,7 @@ def _clear_dispatcher_state_file() -> None:
 
 
 def _write_session_lost_reminder() -> None:
-    """Write a compact-reminder to the inbox on MCP server startup.
+    """Write a session-reconnect reminder to the inbox on MCP server startup.
 
     When the MCP server restarts (e.g. via systemctl restart lobster-mcp-local),
     any dispatcher blocked in wait_for_messages receives a "Session not found"
@@ -1261,6 +1256,15 @@ def _write_session_lost_reminder() -> None:
     function writes a synthetic inbox message so that when the dispatcher
     reconnects and calls wait_for_messages, it immediately receives a prompt
     to re-orient and resume the main loop.
+
+    Message type: "session_reconnect" (postbounce #5 — previously reused
+    "compact-reminder", which caused the dispatcher to unconditionally spawn
+    the 10-15 min compact-catchup subagent even though nothing was actually
+    lost — the dispatcher process survived, only the MCP session did not).
+    "session_reconnect" is its own P0 type (see _INBOX_P0_TYPES) so it keeps
+    the same immediate-delivery priority the old compact-reminder alias
+    relied on, but routes through the lightweight session-reconnect handler
+    in sys.dispatcher.bootup.md instead — no compact-catchup spawn.
 
     Guard: skipped when the dispatcher PID (from dispatcher.pid) is alive.  A
     live PID means Claude Code auto-updated or the HTTP transport briefly
@@ -1272,8 +1276,9 @@ def _write_session_lost_reminder() -> None:
     file seconds before an MCP restart, making a real session loss look like a
     reconnect.
 
-    Idempotent: writing an extra compact-reminder during a real restart is
-    harmless; the dispatcher processes it as a routine self-check message.
+    Idempotent: writing an extra session-reconnect reminder during a real
+    restart is harmless; the dispatcher processes it as a routine self-check
+    message.
 
     Developer mode: when LOBSTER_DEV_MODE=true (or 1), the session-lost
     reminder is suppressed so the developer isn't interrupted during testing.
@@ -1305,22 +1310,20 @@ def _write_session_lost_reminder() -> None:
         reminder = {
             "id": reminder_id,
             "source": "system",
-            "type": "compact-reminder",
-            # Priority is derived from `subtype`, not `type` — without this the
-            # warning sinks to P4, the lowest tier (issue #2279).
-            "subtype": SESSION_RESTART_SUBTYPE,
+            "type": "session_reconnect",
             "chat_id": 0,
             "task_origin": "internal",
             "text": (
                 "SESSION LOST — The MCP server restarted and your previous session was "
-                "invalidated. Re-orient now: read sys.dispatcher.bootup.md and resume "
-                "the main loop."
+                "invalidated. This is a lightweight reconnect, not a context compaction — "
+                "situational awareness was NOT lost, so do NOT spawn compact-catchup. "
+                "Re-orient now: read sys.dispatcher.bootup.md and resume the main loop."
             ),
             "timestamp": now_utc.isoformat(),
         }
         inbox_file = INBOX_DIR / f"{reminder_id}.json"
         atomic_write_json(inbox_file, reminder)
-        log.info(f"[session-lost] Wrote session-lost-reminder to inbox: {reminder_id}")
+        log.info(f"[session-lost] Wrote session-reconnect reminder to inbox: {reminder_id}")
     except Exception as exc:  # noqa: BLE001
         log.warning(f"[session-lost] Failed to write session-lost-reminder: {exc}")
 
@@ -1391,6 +1394,19 @@ except Exception as _ss_err:
 try:
     _claims_db = _AtomicClaimDB()
     log.info("Atomic claim DB initialized (message_claims + dispatcher_lock tables)")
+    # One-shot startup cleanup: remove claim rows older than 7 days.
+    # message_claims accumulates one row per processed message and is never
+    # pruned between restarts, so we do a bulk cleanup here on every server
+    # start before any new claims are recorded (issue #1436).
+    try:
+        _claims_pruned = _claims_db.cleanup_old_claims()
+        if _claims_pruned > 0:
+            log.info(
+                "[claims] startup: pruned %d stale claim row(s) from message_claims",
+                _claims_pruned,
+            )
+    except Exception as _claims_prune_err:
+        log.warning(f"[claims] startup pruning failed (non-fatal): {_claims_prune_err}")
 except Exception as _claims_err:
     # Degrade gracefully: create a no-op stub so the rest of the module
     # continues to work even if the DB cannot be opened.
@@ -1400,10 +1416,12 @@ except Exception as _claims_err:
         def release(self, *a, **kw) -> None: pass
         def update_status(self, *a, **kw) -> None: pass
         def is_claimed(self, *a, **kw) -> bool: return False
+        def get_claim_status(self, *a, **kw): return None
         def acquire_dispatcher_lock(self, *a, **kw) -> bool: return True
         def get_dispatcher_lock(self, *a, **kw): return None
         def release_dispatcher_lock(self, *a, **kw) -> None: pass
         def force_replace_dispatcher_lock(self, *a, **kw) -> None: pass
+        def cleanup_old_claims(self, *a, **kw) -> int: return 0
     _claims_db = _NoOpClaimsDB()
 
 # NOTE: Startup cleanup (cleanup_stale_running_sessions) is intentionally NOT
@@ -1463,6 +1481,119 @@ SOURCES = {
 }
 
 server = Server("lobster-inbox")
+
+# =============================================================================
+# notifications/tools/list_changed (agent-channel protocol v1.1, refinement 4)
+# =============================================================================
+#
+# Problem this closes: a client whose tool cache predates a server-side
+# code change (new tool added, existing session never restarted) has no
+# signal telling it to re-fetch tools/list — it just silently never sees
+# the new tool. The MCP spec's answer to that is the server declaring
+# `tools: {listChanged: true}` in its capabilities and then sending
+# `notifications/tools/list_changed` when the tool set changes.
+#
+# Bug this fixes: `Server.create_initialization_options()` defaults to
+# `NotificationOptions()`, whose `tools_changed` defaults to False — so
+# every session this server has ever started has told its client "I will
+# never send you a list_changed notification" (`tools.listChanged: false`
+# in the capabilities response), regardless of whether anything downstream
+# actually sends one. That's a true statement today (nothing sends one) but
+# is also self-defeating: even a spec-compliant client has no reason to
+# listen for a notification the server told it up front would never come.
+#
+# Fix, and its scope limit: `create_initialization_options` is overridden on
+# this instance (below) to default to `tools_changed=True` so the
+# capability is advertised correctly. Investigation (see PR body / commit
+# message for refinement 4) found the low-level `mcp` SDK's
+# `StreamableHTTPSessionManager` — the transport this server actually runs
+# under in production (see `main()`'s `use_http` branch) — calls
+# `self.app.create_initialization_options()` itself, per new HTTP session,
+# with no arguments and no way to inject `NotificationOptions` from here.
+# Overriding the bound method on this module-level `server` instance is
+# the only interception point available without vendoring or patching the
+# SDK. `NotificationOptions()` (imported above) is reused as the shape;
+# only its default is changed.
+#
+# `ServerSession.send_tool_list_changed()` — the SDK method that actually
+# emits the notification — requires a live `ServerSession` object,
+# obtainable only from `request_ctx` inside an active request handler
+# (`mcp.server.lowlevel.server.request_ctx`, the same pattern
+# `_get_current_http_session_id()` above already uses). Confirmed by
+# reading `StreamableHTTPSessionManager`: `_server_instances` (which
+# `_http_session_manager` already exposes for other purposes in this file)
+# holds only the raw per-session transport, not the `ServerSession` that
+# wraps it — so there is no way, from here, to reach into an arbitrary
+# already-connected session from outside its own request handling and push
+# a notification to it. `_notify_tools_list_changed_once()` below is called
+# from `call_tool()` (this server's one MCP request handler every tool call
+# passes through, for both stdio and HTTP transport) and sends the
+# notification to the CURRENT request's own session, once per session —
+# the closest analogue to "on this session's startup" the SDK's public
+# surface actually allows from this module. See the refinement-4 PR body
+# for the explicit, unresolved question this leaves open: no code change
+# here can broadcast to a session OTHER than the one currently making a
+# request, and it is unverified whether the Claude Code CLI client honors
+# list_changed at all.
+_original_create_initialization_options = server.create_initialization_options
+
+
+def _create_initialization_options_advertising_tools_changed(
+    notification_options: NotificationOptions | None = None,
+    experimental_capabilities: dict | None = None,
+):
+    if notification_options is None:
+        notification_options = NotificationOptions(tools_changed=True)
+    return _original_create_initialization_options(notification_options, experimental_capabilities)
+
+
+server.create_initialization_options = _create_initialization_options_advertising_tools_changed
+
+# Sessions (keyed by HTTP mcp-session-id, or the sentinel "stdio" for the
+# single stdio-transport session) that have already received their one
+# post-connect list_changed nudge — see _notify_tools_list_changed_once().
+#
+# Bounded FIFO, not a bare set (Fix 2, bloom adversarial review, PR #1530):
+# this daemon runs for days/weeks and accumulates one entry per distinct
+# HTTP session it has ever served a first tool call for. A bare set has no
+# upper bound, so long-running uptime turns this into a slow, unbounded
+# memory leak. FIFO eviction — not TTL — is the correct bound here: the
+# property we're protecting is "this dict can't grow past N entries," not
+# "entries expire after some meaningful age." Re-notifying a session that
+# gets evicted and later makes another tool call is harmless — the nudge
+# is best-effort and idempotent from the client's point of view (see
+# _notify_tools_list_changed_once()'s docstring) — so there is no
+# correctness cost to evicting the oldest entry once the cap is hit.
+# OrderedDict (rather than a dict relying on 3.7+ insertion order) makes
+# the FIFO-eviction intent explicit at the call site via popitem(last=False).
+_TOOLS_LIST_CHANGED_SESSIONS_MAX = 1000
+_tools_list_changed_notified_sessions: OrderedDict[str, None] = OrderedDict()
+
+
+async def _notify_tools_list_changed_once() -> None:
+    """Best-effort notifications/tools/list_changed nudge, once per session.
+
+    Sent on the session's first tool call — see the module-level comment
+    above this function's caller (call_tool()) for why that is the
+    furthest-upstream point reachable from here, and what it does and does
+    not solve. Never raises: this must never block or fail a real tool call.
+    """
+    session_key = _get_current_http_session_id() or "stdio"
+    if session_key in _tools_list_changed_notified_sessions:
+        return
+    _tools_list_changed_notified_sessions[session_key] = None
+    if len(_tools_list_changed_notified_sessions) > _TOOLS_LIST_CHANGED_SESSIONS_MAX:
+        # Evict the oldest (first-inserted) entry — bounds the dict at
+        # _TOOLS_LIST_CHANGED_SESSIONS_MAX regardless of how many distinct
+        # sessions this process serves over its lifetime.
+        _tools_list_changed_notified_sessions.popitem(last=False)
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+        session = request_ctx.get().session
+        await session.send_tool_list_changed()
+        log.info(f"[list-changed] Sent notifications/tools/list_changed to session {session_key!r}")
+    except Exception as exc:
+        log.debug(f"[list-changed] Could not send list_changed to session {session_key!r}: {exc}")
 
 
 def touch_heartbeat():
@@ -1548,6 +1679,7 @@ def _clear_wfm_active_signal() -> None:
         pass  # Never propagate errors from a finally-block cleanup
 
 
+
 # ---------------------------------------------------------------------------
 # Session Guard
 #
@@ -1582,6 +1714,7 @@ _SESSION_GUARDED_TOOLS = frozenset({
     "mark_processing",
     "mark_failed",
     "claim_and_ack",
+    "write_progress",
 })
 
 
@@ -1614,8 +1747,8 @@ def _check_tmux_ancestry() -> bool:
             if ppid <= 1:
                 break
             pid = ppid
-    except Exception:
-        pass
+    except Exception as _tmux_err:
+        log.warning("_check_tmux_ancestry: unexpected error checking tmux ancestry — defaulting to False: %s", _tmux_err)
     return False  # Fail closed — not the main session
 
 
@@ -1810,7 +1943,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="send_reply",
-            description="Send a reply to a message. The reply will be routed back to the original source (Telegram, Slack, SMS, etc.). Supports optional inline keyboard buttons for Telegram and thread replies for Slack.",
+            description="Send a reply to a message. The reply will be routed back to the original source (Telegram, Slack, SMS, etc.). Supports optional inline keyboard buttons for Telegram and thread replies for Slack. For source='local-claude' (the agent channel — a local Claude Code session talking to the dispatcher over SSH), the reply is written to ~/messages/agent-replies/<request_id>.json instead of any chat channel; request_id is required in that case.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1819,7 +1952,7 @@ async def list_tools() -> list[Tool]:
                             {"type": "integer"},
                             {"type": "string"}
                         ],
-                        "description": "The chat/channel ID to reply to (from the original message). Integer for Telegram, string for Slack.",
+                        "description": "The chat/channel ID to reply to (from the original message). Integer for Telegram, string for Slack. For source='local-claude' this is not used for routing (routing is by request_id) but is still required — pass the value from the inbound local-claude message.",
                     },
                     "text": {
                         "type": "string",
@@ -1827,8 +1960,12 @@ async def list_tools() -> list[Tool]:
                     },
                     "source": {
                         "type": "string",
-                        "description": "The source to reply via (telegram, slack, sms, signal, whatsapp, bisque). Default: telegram.",
+                        "description": "The source to reply via (telegram, slack, sms, signal, whatsapp, bisque, local-claude). Default: telegram.",
                         "default": "telegram",
+                    },
+                    "request_id": {
+                        "type": "string",
+                        "description": "Required when source='local-claude'. The request_id from the inbound local-claude message; the reply is written to ~/messages/agent-replies/<request_id>.json for the lobster-chat CLI to pick up.",
                     },
                     "thread_ts": {
                         "type": "string",
@@ -1875,11 +2012,30 @@ async def list_tools() -> list[Tool]:
                     "proactive": {
                         "type": "boolean",
                         "description": (
-                            "If true, marks this as a proactive send (not a reply to a user message). "
-                            "Proactive sends are exempt from the require-reply-to-message-id hook enforcement — "
-                            "they do not need a reply_to_message_id. Use for startup status messages, "
-                            "graceful restart notifications, scheduled job summaries, and other sends that are "
-                            "not in response to a specific incoming message."
+                            "Set to true for proactive/system sends that have no originating user message "
+                            "and therefore no reply_to_message_id to thread against. "
+                            "Bypasses the require-reply-to-message-id hook without corrupting chat_id. "
+                            "chat_id must still be the real recipient — do not pass chat_id=0."
+                        ),
+                    },
+                    "error": {
+                        "type": "boolean",
+                        "description": (
+                            "local-claude (agent-channel) only. Set to true when this reply represents a "
+                            "failure, so a polling consumer can detect it without parsing `text`. This is a "
+                            "discriminator on the SAME reply file/slot (~/messages/agent-replies/<request_id>.json) "
+                            "— not a separate error envelope or channel. Omit (or leave false) for a normal "
+                            "successful reply; the written file then has no `error` key at all, unchanged from "
+                            "before this field existed. Ignored for sources other than local-claude."
+                        ),
+                    },
+                    "error_type": {
+                        "type": "string",
+                        "description": (
+                            "local-claude (agent-channel) only. Optional hint about the kind of failure — "
+                            "e.g. \"processing_failed\", \"timeout\", \"internal_error\" — written alongside "
+                            "`error` on the same reply. Purely advisory; any string is accepted. Ignored for "
+                            "sources other than local-claude."
                         ),
                     },
                 },
@@ -1945,7 +2101,13 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="mark_processing",
-            description="Claim a message for processing by moving it from inbox/ to processing/. Call this before starting work on a message to prevent reprocessing.",
+            description=(
+                "Claim a message for processing by moving it from inbox/ to processing/. Call this "
+                "before starting work on a message to prevent reprocessing. "
+                "Not supported for source='local-claude' (the agent channel) — refused with an error "
+                "and the message is left untouched in inbox/. Use claim_and_ack instead for that "
+                "source; it claims the message and writes the required ack in one atomic step."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1990,7 +2152,12 @@ async def list_tools() -> list[Tool]:
                 "means the user already received the ack. "
                 "If the message is not found in inbox/ (already claimed or missing), returns an error "
                 "without sending the ack. If the ack send fails after claiming, the message stays in "
-                "processing/ and stale recovery handles it."
+                "processing/ and stale recovery handles it. "
+                "For source='local-claude' (the agent channel): request_id is required, and the ack is "
+                "written to ~/messages/agent-replies/<request_id>.ack.json — NOT to "
+                "agent-replies/<request_id>.json, which is the single-shot answer slot that a later "
+                "send_reply(source='local-claude', request_id=..., ...) call must still write. The ack "
+                "never consumes the answer slot (ack != answer)."
             ),
             inputSchema={
                 "type": "object",
@@ -2014,6 +2181,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "The source to reply via (telegram, slack, etc.). Default: telegram.",
                         "default": "telegram",
+                    },
+                    "request_id": {
+                        "type": "string",
+                        "description": "Required when source='local-claude'. The request_id from the inbound local-claude message; the ack is written to ~/messages/agent-replies/<request_id>.ack.json (never the answer slot).",
                     },
                     "reply_to_message_id": {
                         "type": "integer",
@@ -2041,6 +2212,67 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["message_id", "ack_text", "chat_id"],
+            },
+        ),
+        Tool(
+            name="write_progress",
+            description=(
+                "Write a repeatable current-status update for an OPEN local-claude "
+                "agent-channel exchange (source='local-claude'; agent-channel protocol "
+                "v1, Rung A). Overwrites agent-replies/<request_id>.ack.json — the SAME "
+                "file claim_and_ack's ack write uses — with the latest status text. "
+                "Last-write-wins: this is a current-status field, not an appended log; "
+                "an earlier write is silently superseded by a later one. "
+                "Claim-bound authorization: refused unless request_id currently has an "
+                "OPEN claim (claimed and not yet completed/failed) — NOT session-identity-"
+                "based, since session_id collapses to the literal string 'dispatcher' "
+                "across distinct delegated subagents and cannot tell them apart. "
+                "Refused as a no-op (not an error) if the exchange has already reached "
+                "COMPLETE (agent-replies/<request_id>.json exists) — message-after-"
+                "complete guard, evaluated inside the same lock-guarded critical section "
+                "as the write, so there is no check-then-write race. Debounced: if a "
+                "status was already written for this request_id within the last 10 "
+                "seconds, the call is still accepted (no error) but the filesystem write "
+                "is skipped to bound churn from a spammy caller. "
+                "Payload is structured (protocol v1.1): {phase, pct, text} — only "
+                "status_text is required; phase/pct are optional and default to null."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "request_id": {
+                        "type": "string",
+                        "description": (
+                            "The request_id of the OPEN local-claude exchange to update "
+                            "— the same request_id from the original inbound message / "
+                            "the claim_and_ack call that opened this exchange."
+                        ),
+                    },
+                    "status_text": {
+                        "type": "string",
+                        "description": (
+                            "The current-status text to write (e.g. 'still running "
+                            "tests, 3/5 done'). Overwrites any previous status for this "
+                            "request_id — repeated calls do not accumulate a history."
+                        ),
+                    },
+                    "phase": {
+                        "type": "string",
+                        "description": (
+                            "Optional short phase label (e.g. 'testing', 'writing_pr'). "
+                            "Omit if you have nothing more structured than status_text to "
+                            "report — written as null when absent."
+                        ),
+                    },
+                    "pct": {
+                        "type": "number",
+                        "description": (
+                            "Optional completion percentage (e.g. 60). Omit if unknown — "
+                            "written as null when absent."
+                        ),
+                    },
+                },
+                "required": ["request_id", "status_text"],
             },
         ),
         Tool(
@@ -2546,6 +2778,42 @@ async def list_tools() -> list[Tool]:
                 "required": ["job_name", "output"],
             },
         ),
+        # WOS Agent Heartbeat — allows executing subagents to prove liveness
+        # without needing to import Python modules or resolve the registry path.
+        Tool(
+            name="write_wos_heartbeat",
+            description=(
+                "Write a liveness heartbeat for a WOS unit of work. "
+                "Call this every 60–90 seconds during WOS task execution to prove the agent is alive. "
+                "Without periodic heartbeats, the Observation Loop will detect a stall and re-queue "
+                "the UoW for re-execution. "
+                "Pass token_usage (cumulative input+output tokens from Claude API responses so far) "
+                "so the steward can detect stuck agents that heartbeat without making progress. "
+                "Returns: {\"rowcount\": 1} on success, {\"rowcount\": 0} if the UoW status has "
+                "already changed (e.g. recovered by the Observation Loop — stop execution immediately "
+                "and call write_result with outcome=failed)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "uow_id": {
+                        "type": "string",
+                        "description": "The WOS unit-of-work ID to write a heartbeat for (e.g. 'uow_abc123').",
+                    },
+                    "token_usage": {
+                        "type": "integer",
+                        "description": (
+                            "Optional cumulative token count at the time of this heartbeat "
+                            "(sum of input_tokens + output_tokens from all Claude API responses "
+                            "received so far in this execution). Pass your running total each time. "
+                            "The steward uses consecutive token deltas to detect stuck agents. "
+                            "Omit if you are not tracking token usage."
+                        ),
+                    },
+                },
+                "required": ["uow_id"],
+            },
+        ),
         # Subagent Result Relay
         Tool(
             name="write_result",
@@ -2622,6 +2890,29 @@ async def list_tools() -> list[Tool]:
                             "result to the user."
                         ),
                         "default": False,
+                    },
+                    "outcome_category": {
+                        "type": "string",
+                        "description": (
+                            "Optional metabolic value tag for this result. Self-assessed by the subagent — "
+                            "the completing agent has the most context to categorize honestly. "
+                            "heat: pure dissipation, no residue (empty checks, healthy no-ops). "
+                            "shit: organic waste that persists and must be processed (stale notes, unread accumulation). "
+                            "seed: intentional investment in future capability (infra fixes, tooling, instrumentation). "
+                            "pearl: direct high-value output (bugs caught, frameworks encoded, analysis acted on). "
+                            "Omit if the outcome does not fit any category."
+                        ),
+                        "enum": ["heat", "shit", "seed", "pearl"],
+                    },
+                    "token_usage": {
+                        "type": "integer",
+                        "description": (
+                            "Optional total token count consumed by this subagent (input + output tokens combined). "
+                            "Report what the Claude API returned in response metadata across all tool calls and turns. "
+                            "Accumulate usage.input_tokens + usage.output_tokens across turns and report the total here. "
+                            "Used for per-UoW cost telemetry in the WOS registry. "
+                            "Omit if token counts were not available or not tracked."
+                        ),
                     },
                 },
                 "required": ["task_id", "chat_id", "text"],
@@ -3115,6 +3406,10 @@ async def list_tools() -> list[Tool]:
                         "description": "Optional labels to apply (e.g., ['urgent', 'project:xyz']).",
                         "items": {"type": "string"},
                     },
+                    "item_owner": {
+                        "type": "string",
+                        "description": "Who owns this action item: 'dan' (Dan needs to do this) or 'lobster' (Lobster will execute this). Defaults to 'dan' if omitted.",
+                    },
                 },
                 "required": ["owner", "repo", "brain_dump_issue", "title"],
             },
@@ -3232,6 +3527,30 @@ async def list_tools() -> list[Tool]:
                         "items": {"type": "string"},
                         "description": "Optional tags for categorization.",
                     },
+                    "valence": {
+                        "type": "string",
+                        "enum": ["golden", "smell", "neutral"],
+                        "description": (
+                            "Observation valence: 'golden' for patterns that work well and should be reinforced, "
+                            "'smell' for problematic patterns that should be addressed, "
+                            "'neutral' for observations with no strong directional signal (default)."
+                        ),
+                        "default": "neutral",
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Short noun-phrase label for what this event is about (e.g. 'OAuth implementation', 'hiking trip planning').",
+                    },
+                    "signal_type_hint": {
+                        "type": "string",
+                        # Derived from VALID_SIGNAL_TYPES in memory/provider.py — do not hardcode here.
+                        # _VALID_SIGNAL_TYPES_FOR_SCHEMA is populated at server startup from the same
+                        # frozenset that runtime validation uses. If memory is unavailable, the enum
+                        # key is omitted and the schema accepts any string (runtime validation still
+                        # applies via handle_memory_store).
+                        **( {"enum": _VALID_SIGNAL_TYPES_FOR_SCHEMA} if _VALID_SIGNAL_TYPES_FOR_SCHEMA else {} ),
+                        "description": "Caller's pre-classification of the event's signal type. When provided, the slow-reclassifier will use this value and skip content inference.",
+                    },
                     "task_id": {
                         "type": "string",
                         "description": "Optional subagent task identifier. Included in debug alerts when LOBSTER_DEBUG=true so the caller is visible in the memory write notification.",
@@ -3263,6 +3582,14 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Optional project filter.",
                     },
+                    "valence": {
+                        "type": "string",
+                        "enum": ["golden", "smell", "neutral"],
+                        "description": (
+                            "Optional valence filter. Pass 'golden' to retrieve only golden patterns, "
+                            "'smell' to retrieve only smell patterns, or omit to search all observations."
+                        ),
+                    },
                     "task_id": {
                         "type": "string",
                         "description": "Optional subagent task identifier. Included in debug alerts when LOBSTER_DEBUG=true so the caller is visible in the memory search notification.",
@@ -3293,6 +3620,102 @@ async def list_tools() -> list[Tool]:
                     "chat_id": {
                         "type": "string",
                         "description": "Optional: filter results to memories attributed to this chat_id (plus unattributed legacy memories).",
+                    },
+                },
+            },
+        ),
+        # Proprioceptive Memory Tools
+        Tool(
+            name="record_mirroring_instance",
+            description=(
+                "Record a specific proprioceptive instance — a concrete moment where Lobster's "
+                "semantic alignment with Dan was notably good or notably bad. Use this when Dan "
+                "flags an interaction ('note that as a good mirroring example' / 'that was "
+                "AI-normalized'), or when you detect a clear alignment signal yourself. "
+                "Do not use for general notes — use memory_store for that. "
+                "Instances are stored in both the vector DB (for retro search) and "
+                "~/lobster-user-config/memory/proprioceptive/ (for human review)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "alignment_signal": {
+                        "type": "string",
+                        "enum": ["positive", "negative", "uncertain"],
+                        "description": (
+                            "positive: Lobster worked from within Dan's frame, mirrored his "
+                            "register, reflected his framing back faithfully. "
+                            "negative: Lobster drifted — AI-normalized, basin-captured, "
+                            "smoothed Dan's framing into generic language. "
+                            "uncertain: notable moment but alignment direction is unclear."
+                        ),
+                    },
+                    "context_snippet": {
+                        "type": "string",
+                        "description": (
+                            "A brief excerpt or description of the interaction moment — "
+                            "what Dan said, what Lobster said, what made this notable. "
+                            "Include specific language where possible."
+                        ),
+                    },
+                    "assessment": {
+                        "type": "string",
+                        "description": (
+                            "Why this instance matters. What it reveals about alignment "
+                            "trajectory. Specific behavioral signature (a phrase, a "
+                            "structural choice, a framing decision) that reveals alignment state."
+                        ),
+                    },
+                    "source": {
+                        "type": "string",
+                        "enum": ["human-noted", "retro-surfaced", "self-detected"],
+                        "description": (
+                            "human-noted: Dan flagged it explicitly. "
+                            "retro-surfaced: weekly audit identified it. "
+                            "self-detected: Lobster noticed it without Dan flagging it."
+                        ),
+                        "default": "human-noted",
+                    },
+                    "topic": {
+                        "type": "string",
+                        "description": "Optional: the topic or domain of the conversation (e.g. 'ergonomics', 'code review', 'system design').",
+                    },
+                    "chat_id": {
+                        "oneOf": [
+                            {"type": "integer"},
+                            {"type": "string"},
+                        ],
+                        "description": "Optional: the chat/channel ID this instance occurred in.",
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Optional subagent task identifier.",
+                    },
+                },
+                "required": ["alignment_signal", "context_snippet", "assessment"],
+            },
+        ),
+        Tool(
+            name="get_proprioceptive_context",
+            description=(
+                "Retrieve recent proprioceptive instances — concrete alignment/misalignment "
+                "moments from past conversations. Use at session start when Dan's epistemic "
+                "principles are likely to be relevant, or before a retro. Returns the N most "
+                "recent instances across all alignment signals."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of instances to return. Default: 5.",
+                        "default": 5,
+                    },
+                    "alignment_signal": {
+                        "type": "string",
+                        "enum": ["positive", "negative", "uncertain", "all"],
+                        "description": "Filter by alignment signal. Default: all.",
+                        "default": "all",
                     },
                 },
             },
@@ -3447,6 +3870,32 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["email"],
+            },
+        ),
+        # Meta-Thread Tools
+        Tool(
+            name="get_meta_thread_context",
+            description=(
+                "Search active meta-threads for context relevant to the given message text. "
+                "Returns a formatted block suitable for prepending to the dispatcher's context "
+                "before processing the message. Returns an empty string if no threads match or "
+                "the meta-threads directory does not exist. Call this at message processing start "
+                "for any non-trivial text message. Completes in <100ms for typical thread counts."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "message_text": {
+                        "type": "string",
+                        "description": "The incoming message text to match against active meta-threads.",
+                    },
+                    "threshold": {
+                        "type": "number",
+                        "description": "Minimum cosine similarity to include a thread (0–1). Default: 0.7.",
+                        "default": 0.7,
+                    },
+                },
+                "required": ["message_text"],
             },
         ),
         # Skill Management Tools
@@ -3758,25 +4207,41 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
-    ] + (
-        # User Model Tools (only registered when feature flag is enabled)
-        [
-            Tool(
-                name=t["name"],
-                description=t["description"],
-                inputSchema=t["inputSchema"],
-            )
-            for t in USER_MODEL_TOOL_DEFINITIONS
-        ]
-        if _user_model is not None
-        else []
-    )
+    ]
+
+
+def _track_tool_outcome(name: str, result: list[TextContent]) -> None:
+    """Update capability failure tracker based on a tool's response.
+
+    Records a success or failure for monitored tools by inspecting the first
+    TextContent text in the result. If a failure threshold is crossed, delivers
+    a direct Telegram alert via _deliver_capability_alert.
+
+    Pure side-effect isolation: all I/O (alert delivery) happens here, keeping
+    CapabilityFailureTracker itself free of I/O.
+
+    Never raises — must not interfere with normal tool response delivery.
+    """
+    try:
+        response_text = result[0].text if result else ""
+        if _response_is_failure(response_text):
+            decision = _capability_tracker.record_failure(name, response_text)
+            if decision.should_alert:
+                _deliver_capability_alert(decision.alert_message, name)
+        else:
+            _capability_tracker.record_success(name)
+    except Exception:
+        pass  # tracking must never crash tool dispatch
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    """Handle tool calls with structured audit logging."""
+    """Handle tool calls with structured audit logging and capability failure tracking."""
     log.info(f"Tool called: {name}")
+    # Best-effort, once-per-session notifications/tools/list_changed nudge —
+    # see the module-level comment above _notify_tools_list_changed_once()
+    # for what this does and does not solve. Never blocks the real call.
+    await _notify_tools_list_changed_once()
     start_time = time.time()
     try:
         result = await _dispatch_tool(name, arguments)
@@ -3784,6 +4249,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         # Audit log all tool calls (except wait_for_messages which is too noisy)
         if name != "wait_for_messages":
             audit_log(tool=name, args=arguments, result="ok", duration_ms=elapsed_ms)
+        # Track capability health — alert on consecutive failures for monitored tools
+        _track_tool_outcome(name, result)
         return result
     except ValidationError as e:
         elapsed_ms = int((time.time() - start_time) * 1000)
@@ -3793,6 +4260,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         elapsed_ms = int((time.time() - start_time) * 1000)
         audit_log(tool=name, args=arguments, error=str(e), duration_ms=elapsed_ms)
         log.error(f"Tool {name} failed: {e}", exc_info=True)
+        # Unhandled exceptions in monitored tools also count as failures
+        _track_tool_outcome(name, [TextContent(type="text", text=f"Error in {name}: {str(e)}")])
         return [TextContent(type="text", text=f"Error in {name}: {str(e)}")]
 
 
@@ -3860,6 +4329,8 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         return await handle_mark_processing(arguments)
     elif name == "claim_and_ack":
         return await handle_claim_and_ack(arguments)
+    elif name == "write_progress":
+        return await handle_write_progress(arguments)
     elif name == "mark_failed":
         return await handle_mark_failed(arguments)
     elif name == "list_sources":
@@ -3915,6 +4386,8 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         return await handle_check_task_outputs(arguments)
     elif name == "write_task_output":
         return await handle_write_task_output(arguments)
+    elif name == "write_wos_heartbeat":
+        return await handle_write_wos_heartbeat(arguments)
     elif name == "write_result":
         return await handle_write_result(arguments)
     elif name == "write_observation":
@@ -3955,6 +4428,10 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         return await handle_memory_search(arguments)
     elif name == "memory_recent":
         return await handle_memory_recent(arguments)
+    elif name == "record_mirroring_instance":
+        return await handle_record_mirroring_instance(arguments)
+    elif name == "get_proprioceptive_context":
+        return await handle_get_proprioceptive_context(arguments)
     elif name == "get_handoff":
         return await handle_get_handoff(arguments)
     elif name == "mark_consolidated":
@@ -3987,6 +4464,9 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         return await handle_get_bisque_connection_url(arguments)
     elif name == "generate_bisque_login_token":
         return await handle_generate_bisque_login_token(arguments)
+    # Meta-Thread Tools
+    elif name == "get_meta_thread_context":
+        return await handle_get_meta_thread_context(arguments)
     # Skill Management Tools
     elif name == "get_skill_context":
         return await handle_get_skill_context(arguments)
@@ -4019,12 +4499,6 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
         return await handle_update_session_file(arguments)
     elif name == "list_session_files":
         return await handle_list_session_files(arguments)
-    # User Model Tools (dispatched to user_model subsystem)
-    elif name in _user_model_tool_names and _user_model is not None:
-        result_json = _user_model.dispatch(name, arguments)
-        return [TextContent(type="text", text=result_json)]
-    elif name in _user_model_tool_names and _user_model is None:
-        return [TextContent(type="text", text='{"error": "User model subsystem not initialized."}')]
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -4084,15 +4558,183 @@ def _find_all_message_files(directories: list[Path], message_id: str) -> list[Pa
     return matches
 
 
-def _stale_timeout_for_message(msg: dict) -> int:
-    """Return the stale processing timeout in seconds based on message type.
+# Stale-processing timeout for the agent channel (source="local-claude"). This
+# source is source-aware, not type-aware (its inbound messages are always
+# type="text"): its explicit use case is multi-step work — e.g. "what's the
+# status of PR 1234?" routed through a delegated subagent — which routinely
+# exceeds the generic 90s text timeout below. Using the generic timeout here
+# would let _recover_stale_processing() reclaim an in-flight request and
+# re-dispatch it to a second execution path while the first is still writing
+# its answer, producing two racing writers to the same
+# agent-replies/<request_id>.json (see agent-channel protocol spec, "fail
+# path" — a crash/restart must not produce a second racing writer).
+_LOCAL_CLAUDE_STALE_TIMEOUT_SECONDS = 600  # 10 minutes
 
-    Text messages are expected to complete quickly; media types (voice, audio,
-    photo, document) may take longer due to transcription or download time.
+# Bounded retry count for _recover_stale_processing()'s own recovery loop
+# (issue #1535). Scoped to the agent channel (source="local-claude") only:
+# it is the only source with a single-shot terminal "exchange"
+# (agent-replies/<request_id>.json) that must eventually resolve from the
+# requester's point of view. Without this bound, a local-claude message that
+# never completes (reclaim, get stuck, recover, repeat) left that exchange
+# OPEN forever — no path ever wrote a terminal reply, unlike the
+# retry-count-bounded permanent-failure path in handle_mark_failed. Other
+# sources (Telegram/Slack/etc.) have no equivalent terminal-exchange concept
+# and are unaffected — this bound and its exhaustion handling apply only when
+# msg["source"] == agent_channel.SOURCE.
+_LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS = 3
+
+
+def _stale_timeout_for_message(msg: dict) -> int:
+    """Return the stale processing timeout in seconds based on message source/type.
+
+    Source-aware first: the agent channel (source="local-claude") gets its own,
+    longer budget regardless of type — see _LOCAL_CLAUDE_STALE_TIMEOUT_SECONDS.
+    Otherwise, type-aware: text messages are expected to complete quickly; media
+    types (voice, audio, photo, document) may take longer due to transcription
+    or download time.
     """
+    if msg.get("source") == "local-claude":
+        return _LOCAL_CLAUDE_STALE_TIMEOUT_SECONDS
     slow_types = {"voice", "photo", "document"}  # "audio" removed: normalized to "voice" at ingest
     msg_type = msg.get("type", "text")
     return 300 if msg_type in slow_types else 90
+
+
+def _processing_age(f: Path, msg: dict) -> tuple[float, str]:
+    """Return (age_seconds, age_source) for a message in processing/.
+
+    Prefers the _processing_started_at field written at claim time over file
+    mtime, because mtime is refreshed by atomic_write_json when the timestamp
+    is stamped.  Falls back to mtime when the field is absent or unparseable.
+
+    Returns a 2-tuple so callers can include the source in log messages.
+    """
+    started_at_str = msg.get("_processing_started_at")
+    if started_at_str:
+        try:
+            started_at = datetime.fromisoformat(started_at_str)
+            # Ensure timezone-aware for comparison
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - started_at).total_seconds()
+            return age, "_processing_started_at"
+        except Exception:
+            pass
+    # Fall back to file mtime
+    age = time.time() - f.stat().st_mtime
+    return age, "mtime"
+
+
+def _requeue_recovered_message(f: Path, msg: dict, is_local_claude_msg: bool) -> None:
+    """Move a recovered message from processing/ back to inbox/.
+
+    For local-claude messages, writes the (possibly mutated) `msg` dict —
+    rather than a bare rename — so the incremented `_stale_recovery_count`
+    field set by the caller actually lands on disk; a plain rename() would
+    silently drop the in-memory mutation and the bound in
+    _recover_stale_processing() would never be enforceable. Other sources
+    have no such field to persist, so a plain rename is unchanged from
+    before this fix.
+    """
+    dest = INBOX_DIR / f.name
+    if is_local_claude_msg:
+        atomic_write_json(dest, msg)
+        f.unlink(missing_ok=True)
+    else:
+        f.rename(dest)
+
+
+def _finalize_exhausted_local_claude_message(f: Path, msg: dict, recovery_count: int) -> None:
+    """Close out a local-claude exchange that exhausted the reaper's stale-recovery bound.
+
+    Issue #1535: without this, _recover_stale_processing() would move the
+    message back to inbox/ forever — reclaim, get stuck, recover, repeat —
+    and the agent-channel exchange never resolved from the requester's point
+    of view (no terminal reply was ever written to
+    agent-replies/<request_id>.json). This is the reaper's own retry-
+    exhaustion path, distinct from #1525 (the write_progress abandonment
+    sliding-timer — a separate mechanism for a separate failure mode).
+
+    Best-effort arc with one mandatory terminal action (mirrors
+    handle_mark_failed's permanent-failure path): release the claim and
+    archive the message to FAILED_DIR are both best-effort — logged and
+    skipped on failure, never blocking the arc. Writing the terminal reply
+    is the one step that must always be attempted, since it's the only
+    action that actually closes the exchange for the requester.
+    """
+    message_id = f.stem
+    request_id = str(msg.get("request_id") or message_id)
+
+    try:
+        _claims_db.release(message_id)
+    except Exception as _release_err:
+        log.warning(
+            f"_recover_stale_processing: claim release failed for exhausted "
+            f"message {message_id!r} — continuing: {_release_err}"
+        )
+
+    msg["_permanently_failed"] = True
+    msg["_stale_recovery_exhausted"] = True
+    msg["_stale_recovery_count"] = recovery_count
+    msg["_last_error"] = (
+        f"_recover_stale_processing exhausted {recovery_count} recovery "
+        "attempts without the message ever completing "
+        f"(max attempts: {_LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS})."
+    )
+    msg["_last_failed_at"] = datetime.now(timezone.utc).isoformat()
+    try:
+        dest = FAILED_DIR / f.name
+        # Write destination FIRST, then remove source (crash-safe ordering) —
+        # same pattern as handle_mark_failed's permanent-failure branch. If
+        # atomic_write_json raises, f.unlink() never runs, so `f` is left
+        # exactly as it was on disk (this function only mutates the in-memory
+        # `msg` dict — the source file's on-disk content is untouched until
+        # unlink). That is not an orphan: `f` is still in PROCESSING_DIR with
+        # its original _processing_started_at/_stale_recovery_count, so the
+        # next _recover_stale_processing() pass will find it still stale and
+        # still exhausted, and will retry this same finalize path. Sweep-
+        # recoverable by construction — no separate cleanup needed.
+        atomic_write_json(dest, msg)
+        f.unlink(missing_ok=True)
+    except Exception as _archive_err:
+        log.warning(
+            f"_recover_stale_processing: failed to archive exhausted message "
+            f"{message_id!r} to FAILED_DIR — continuing: {_archive_err}"
+        )
+
+    reply_text = (
+        "This request could not be completed: the dispatcher attempted to "
+        f"process it {recovery_count} times but it never finished (stale-"
+        "processing recovery exhausted). Please retry the request."
+    )
+    try:
+        reply_outcome = agent_channel.write_reply(
+            agent_replies_dir=AGENT_REPLIES_DIR,
+            request_id=request_id,
+            text=reply_text,
+            in_reply_to=message_id,
+            error=True,
+            error_type="stale_recovery_exhausted",
+        )
+        agent_channel.emit_reply_audit(
+            request_id=request_id,
+            reply_slot_created=reply_outcome.reply_slot_created,
+            text_len=len(reply_text),
+            emit_event=_emit_mcp_event,
+        )
+        log.error(
+            f"_recover_stale_processing: exhausted retries for local-claude "
+            f"message {message_id!r} (request_id={request_id!r}) after "
+            f"{recovery_count} attempts — terminal reply written "
+            f"(reply_slot_created={reply_outcome.reply_slot_created})."
+        )
+    except Exception as _reply_err:
+        log.error(
+            f"_recover_stale_processing: FAILED to write terminal reply for "
+            f"exhausted local-claude message {message_id!r} "
+            f"(request_id={request_id!r}): {_reply_err}. Exchange remains "
+            "OPEN from the requester's point of view."
+        )
 
 
 def _recover_stale_processing():
@@ -4103,26 +4745,100 @@ def _recover_stale_processing():
 
     Releases the SQLite claim row BEFORE moving back to inbox/ so a fresh
     claim is possible on the next dispatch cycle (issue #1360).
+
+    Bounded for the agent channel (issue #1535): a source="local-claude"
+    message that has already been recovered
+    _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS times is finalized with a
+    terminal reply instead of being recovered again — see
+    _finalize_exhausted_local_claude_message().
+
+    Issue #1543 (fast-follow to #1541): the exhaustion check is evaluated
+    *inside* each staleness path, only once that path has already
+    established the CURRENT claim is stale (pre-restart for path 1, or
+    age > timeout for path 2) — never on the historical
+    `_stale_recovery_count` alone. `claim_and_ack` resets
+    `_processing_started_at` on every fresh claim but never resets
+    `_stale_recovery_count`, so a message that legitimately earned count>=3
+    across past stale cycles and was then freshly reclaimed must be left
+    alone while that fresh claim is still live: gating on the count alone
+    would finalize (archive + terminal error reply) a message whose current
+    worker is actively and validly running, dropping its eventual real
+    reply. A message is only finalized when it is BOTH exhausted AND stale
+    right now — this still guarantees a message stuck across 3+ genuine
+    stale cycles eventually closes out (the #1535 guarantee), because each
+    additional stale cycle re-runs this check.
     """
     now = time.time()
+    server_start_ts = _SERVER_START_TIME.timestamp()
     for f in PROCESSING_DIR.glob("*.json"):
         try:
-            age = now - f.stat().st_mtime
             msg = json.loads(f.read_text())
+            is_local_claude_msg = msg.get("source") == agent_channel.SOURCE
+            prior_recovery_count = msg.get("_stale_recovery_count", 0)
+
+            # Path 1: message was claimed before this server started — definitively abandoned.
+            started_at_str = msg.get("_processing_started_at")
+            if started_at_str:
+                try:
+                    started_at = datetime.fromisoformat(started_at_str)
+                    if started_at.tzinfo is None:
+                        started_at = started_at.replace(tzinfo=timezone.utc)
+                    if started_at.timestamp() < server_start_ts:
+                        # This claim is genuinely stale (pre-restart) — safe to
+                        # check exhaustion now.
+                        if (
+                            is_local_claude_msg
+                            and prior_recovery_count >= _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS
+                        ):
+                            _finalize_exhausted_local_claude_message(f, msg, prior_recovery_count)
+                            continue
+                        if is_local_claude_msg:
+                            msg["_stale_recovery_count"] = prior_recovery_count + 1
+                        _requeue_recovered_message(f, msg, is_local_claude_msg)
+                        log.warning(
+                            f"Recovered pre-restart message from processing: {f.name} "
+                            f"(type: {msg.get('type', 'text')}, "
+                            f"started_at: {started_at_str}, "
+                            f"server_start: {_SERVER_START_TIME.isoformat()})"
+                        )
+                        continue
+                except Exception as _parse_err:
+                    log.warning(
+                        "_recover_stale_processing: could not parse _processing_started_at "
+                        "for %s — skipping pre-restart check, falling through to timeout: %s",
+                        f.name, _parse_err,
+                    )
+
+            # Path 2: timeout-based recovery using _processing_started_at or mtime.
+            age, age_source = _processing_age(f, msg)
             max_age = _stale_timeout_for_message(msg)
             if age > max_age:
+                # This claim is genuinely stale (timeout) — safe to check
+                # exhaustion now, same rule as path 1 above.
+                if (
+                    is_local_claude_msg
+                    and prior_recovery_count >= _LOCAL_CLAUDE_STALE_RECOVERY_MAX_ATTEMPTS
+                ):
+                    _finalize_exhausted_local_claude_message(f, msg, prior_recovery_count)
+                    continue
                 # Extract message_id from filename (strip .json suffix)
                 message_id = f.stem
                 # Release claim BEFORE moving so a concurrent dispatcher cannot
                 # win a new claim while the file is still in processing/.
                 _claims_db.release(message_id)
-                dest = INBOX_DIR / f.name
-                f.rename(dest)
+                if is_local_claude_msg:
+                    msg["_stale_recovery_count"] = prior_recovery_count + 1
+                _requeue_recovered_message(f, msg, is_local_claude_msg)
                 log.warning(
                     f"Recovered stale message from processing: {f.name} "
-                    f"(type: {msg.get('type', 'text')}, age: {int(age)}s, timeout: {max_age}s)"
+                    f"(type: {msg.get('type', 'text')}, age: {int(age)}s, "
+                    f"timeout: {max_age}s, age_source: {age_source})"
                 )
-        except Exception:
+        except Exception as _stale_err:
+            log.warning(
+                "_recover_stale_processing: error processing file %s — skipping: %s",
+                f.name, _stale_err,
+            )
             continue
 
 
@@ -4305,6 +5021,7 @@ async def handle_wait_for_messages(args: dict) -> list[TextContent]:
         # started above — they no longer depend on this event-loop coroutine.
         heartbeat_interval = WAIT_HEARTBEAT_INTERVAL
         elapsed = 0
+        _write_wfm_active_signal()
 
         while elapsed < timeout:
             wait_time = min(heartbeat_interval, timeout - elapsed)
@@ -4428,8 +5145,8 @@ async def _handle_report_slash_command(msg: dict, msg_file: Path) -> None:
     try:
         active = _session_store.get_active_sessions()
         active_session_ids = [s.get("id", "") for s in active if s.get("id")]
-    except Exception:
-        pass
+    except Exception as _sessions_err:
+        log.warning("Failed to fetch active sessions for report snapshot: %s", _sessions_err)
 
     snapshot_state = {
         "active_session_count": len(active_session_ids),
@@ -4547,13 +5264,6 @@ def _get_owner_chat_id_and_source() -> tuple[int | str | None, str]:
         return None, "telegram"
 
 
-# Marker inserted by hooks/require-write-result.py's _write_synthetic_inbox_message
-# to separate the fixed preamble from actual salvaged transcript content. Its
-# presence/absence in a subagent_recovered message's text is the single source of
-# truth for whether anything real was recovered — see _enqueue_recovery_notification.
-_RECOVERY_CONTENT_MARKER = "Recovered content:\n\n"
-
-
 def _enqueue_recovery_notification(msg: dict) -> None:
     """Write a subagent_notification to the owner's inbox when a subagent_recovered event arrives.
 
@@ -4562,30 +5272,9 @@ def _enqueue_recovery_notification(msg: dict) -> None:
     to the owner's chat_id (resolved from config.env) — not to the original
     chat_id carried by the recovery message, which is always 0 (unknown).
 
-    Suppression (issue #2175): when the salvaged transcript content is empty —
-    i.e. the SubagentStop fallback found nothing worth recovering — no owner-facing
-    Telegram notification is written. This is the case for phantom/harness-noise
-    SubagentStop fires (no real agent work was ever lost) and was, empirically, the
-    entire content of a ~140-notification overnight spam incident. The internal
-    subagent_recovered message this is derived from is written unconditionally by
-    the hook regardless of this suppression, and still flows through the dispatcher
-    for mark_processed as before — only the owner-facing push is suppressed here.
-    When there IS salvaged content, the notification is still sent unchanged: that
-    case represents real, potentially-lost work the owner should know about.
-
     Best-effort: any failure is logged but never raises.
     """
     try:
-        task_id = msg.get("task_id") or "unknown"
-        raw_text = msg.get("text", "")
-
-        if _RECOVERY_CONTENT_MARKER not in raw_text:
-            log.info(
-                f"subagent_recovered: task {task_id!r} had no salvageable transcript "
-                "content — suppressing owner Telegram notification (issue #2175)"
-            )
-            return
-
         owner_chat_id, owner_source = _get_owner_chat_id_and_source()
         if owner_chat_id is None:
             log.warning(
@@ -4594,12 +5283,20 @@ def _enqueue_recovery_notification(msg: dict) -> None:
             )
             return
 
-        # Extract a brief summary (first 300 chars of salvaged content).
-        salvaged = raw_text.split(_RECOVERY_CONTENT_MARKER, 1)[1]
-        summary = salvaged[:300].strip()
-        if len(salvaged) > 300:
-            summary += "…"
-        summary_line = f"Last known activity: {summary}"
+        task_id = msg.get("task_id") or "unknown"
+        raw_text = msg.get("text", "")
+
+        # Extract a brief summary (first 300 chars of salvaged content, if any).
+        summary_marker = "Recovered content:\n\n"
+        summary: str
+        if summary_marker in raw_text:
+            salvaged = raw_text.split(summary_marker, 1)[1]
+            summary = salvaged[:300].strip()
+            if len(salvaged) > 300:
+                summary += "…"
+            summary_line = f"Last known activity: {summary}"
+        else:
+            summary_line = "No recoverable transcript content was found."
 
         notification_text = (
             f"Agent `{task_id}` failed to write a result (exited without calling write_result).\n"
@@ -4643,18 +5340,13 @@ def _enqueue_recovery_notification(msg: dict) -> None:
 # ---------------------------------------------------------------------------
 
 # P0: dispatcher housekeeping — zero-cost, must run before everything else
-_INBOX_P0_TYPES: frozenset[str] = frozenset()
-_INBOX_P0_SUBTYPES: frozenset[str] = frozenset(
-    {
-        "compact-reminder",
-        "self_check",
-        # MCP restart / session-loss warnings (issue #2279).  Written by
-        # scripts/restart-mcp.sh and _write_session_lost_reminder(); the
-        # dispatcher must see them before anything else it might try to answer
-        # with a session that is about to be (or already has been) invalidated.
-        SESSION_RESTART_SUBTYPE,
-    }
-)
+# "session_reconnect" (postbounce #5): _write_session_lost_reminder() writes
+# type="session_reconnect" directly (no subtype), so it must be listed here
+# rather than in _INBOX_P0_SUBTYPES — it keeps the same immediate-delivery
+# priority the old "compact-reminder" type alias relied on, without routing
+# through the heavyweight compact-catchup handler.
+_INBOX_P0_TYPES: frozenset[str] = frozenset({"session_reconnect"})
+_INBOX_P0_SUBTYPES: frozenset[str] = frozenset({"compact-reminder", "self_check"})
 _INBOX_P0_TEXT_PREFIXES: tuple[str, ...] = ("compact-reminder",)
 
 # P1: real-user messages — latency-sensitive
@@ -4767,11 +5459,6 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
             "compact-reminder",
             "compact_catchup",
             "subagent_notification",
-            # Restart warnings are dispatcher plumbing, not catch-up context.
-            # They were excluded implicitly while they carried the
-            # "compact-reminder" subtype; keep them excluded now that they
-            # carry their own (issue #2279).
-            SESSION_RESTART_SUBTYPE,
         })
 
         all_files = sorted(
@@ -4913,12 +5600,51 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
     output = f"📬 **{len(messages)} new message(s):**\n\n"
     for msg in messages:
         source = msg.get("source", "unknown").upper()
-        user = msg.get("user_name", msg.get("username", "Unknown"))
-        text = msg.get("text", "(no text)")
+        # Agent-channel / non-standard-schema messages (id/subject/body instead
+        # of chat_id/message_id/text — e.g. glyph's health_check pings) have no
+        # user_name/username field, so they'd otherwise fall through to the
+        # literal "Unknown" default below and render as "[SYSTEM] from Unknown"
+        # with the body content invisible. Detect them and derive a legible
+        # identity/text instead. Additive/defensive: standard telegram/slack/
+        # system text messages (which have neither field) are unaffected.
+        _agent_channel_schema = bool(
+            (msg.get("subject") or msg.get("body"))
+            and not msg.get("user_name")
+            and not msg.get("username")
+        )
+        if _agent_channel_schema:
+            # No dedicated identity field exists yet for these producers —
+            # fall back to the raw source string (e.g. "system") rather than
+            # the misleading literal "Unknown".
+            user = msg.get("agent") or msg.get("source") or "agent-channel"
+        elif msg.get("source") == "local-claude" and msg.get("agent"):
+            # Optional cosmetic identity field on the AgentChannelRequest
+            # envelope (src/protocol/agent_channel_schema.py, INBOUND_ENVELOPE
+            # "agent"), populated via lobster-chat's --agent flag /
+            # LOBSTER_CHAT_AGENT env var. Distinct from the subject/body
+            # branch above: this is the standard text/chat_id request shape.
+            # Absent, this falls through to the Unknown default unchanged.
+            user = msg["agent"]
+        else:
+            user = msg.get("user_name", msg.get("username", "Unknown"))
         ts = msg.get("timestamp", "")
         msg_id = msg.get("id", msg.get("_filename", ""))
-        chat_id = msg.get("chat_id", "")
+        chat_id = msg.get("chat_id") or ("n/a" if _agent_channel_schema else "")
         msg_type = msg.get("type", "text")
+        # Synthesize a meaningful text summary for structured system messages
+        # that carry no text field (e.g. wos_execute). This prevents the
+        # dispatcher from seeing '(no text)' and failing to recognise the type.
+        if msg_type == "wos_execute":
+            _uow_id = msg.get("uow_id", "?")
+            text = f"wos_execute: uow_id={_uow_id}"
+        elif msg_type == "wos_prescribe":
+            _uow_id = msg.get("uow_id", "?")
+            _summary = str(msg.get("uow_summary", "?"))[:60]
+            text = f"wos_prescribe: uow_id={_uow_id}, summary={_summary}"
+        elif _agent_channel_schema:
+            text = msg.get("body") or msg.get("subject") or "(no text)"
+        else:
+            text = msg.get("text", "(no text)")
 
         output += f"---\n"
         # Add type-specific indicators
@@ -4954,6 +5680,12 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
         elif msg_type == "subagent_recovered":
             task_id = msg.get("task_id", "?")
             output += f"⚠️ **[SUBAGENT RECOVERY]** task `{task_id}` exited without calling write_result — salvaged content logged\n"
+        elif msg_type == "wos_execute":
+            uow_id = msg.get("uow_id", "?")
+            output += f"🔧 **[WOS EXECUTE]** uow_id=`{uow_id}`\n"
+        elif msg_type == "wos_prescribe":
+            uow_id = msg.get("uow_id", "?")
+            output += f"📋 **[WOS PRESCRIBE]** uow_id=`{uow_id}`\n"
         elif msg_type == "reaction":
             emoji = msg.get("emoji", "?")
             reacted_to_text = msg.get("reacted_to_text", "")
@@ -4961,6 +5693,10 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
                 output += f"**[{source}]** {emoji} reaction from **{user}** (on: '{reacted_to_text}')\n"
             else:
                 output += f"**[{source}]** {emoji} reaction from **{user}**\n"
+        elif _agent_channel_schema:
+            _subject = msg.get("subject", "")
+            _heading = f": {_subject}" if _subject else ""
+            output += f"**[{source}]** \U0001f517 agent-channel message from **{user}**{_heading}\n"
         else:
             output += f"**[{source}]** from **{user}**\n"
         output += f"Chat ID: `{chat_id}` | Message ID: `{msg_id}`\n"
@@ -4973,6 +5709,16 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
             output += "dispatcher_hint: SUBAGENT_NOTIFICATION — user already received the subagent's reply. Don't summarize it. If you respond, add new value only — a question, a correction, missing context. Call mark_processed when done.\n"
         if msg_type == "subagent_recovered":
             output += "dispatcher_hint: SUBAGENT_RECOVERED — agent exited without calling write_result; content was salvaged from transcript. The owner has been notified via inbox. Do NOT relay the raw dump to the user. Call mark_processed when done.\n"
+        if msg_type == "wos_execute":
+            uow_id = msg.get("uow_id", "?")
+            output += f"dispatcher_hint: WOS_EXECUTE — call route_wos_message(msg) from src/orchestration/dispatcher_handlers.py. uow_id={uow_id}. Do not read prose — use the structural route.\n"
+        if msg_type == "wos_prescribe":
+            _uow_id = msg.get("uow_id", "?")
+            output += (
+                f"dispatcher_hint: WOS_PRESCRIBE — call route_wos_message(msg) from "
+                f"src/orchestration/dispatcher_handlers.py. uow_id={_uow_id}. "
+                f"Spawns prescription subagent.\n"
+            )
         _has_file = msg_type in ("voice", "photo", "document") or bool(
             msg.get("image_file") or msg.get("image_files") or
             msg.get("file_path") or msg.get("audio_file")
@@ -5001,12 +5747,12 @@ async def handle_check_inbox(args: dict) -> list[TextContent]:
             else:
                 output += f"**Attached file**: {doc_file_name} (file not downloaded)\n\n"
         # Show full reply-to context if present
-        reply_to = _coerce_reply_to(msg.get("reply_to"))
+        reply_to = msg.get("reply_to")
         if reply_to:
             reply_text = reply_to.get("reply_to_text") or reply_to.get("text")
             reply_type = reply_to.get("reply_to_type", "text")
             reply_msg_id = reply_to.get("reply_to_message_id") or reply_to.get("message_id")
-            reply_from = _reply_to_sender(reply_to)
+            reply_from = reply_to.get("reply_to_from_user") or reply_to.get("from_user")
 
             # Build the reply header line
             type_label = f" [{reply_type}]" if reply_type and reply_type != "text" else ""
@@ -5043,73 +5789,229 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
     buttons = args.get("buttons")
     thread_ts = args.get("thread_ts")
 
-    # Create reply file in outbox
+    # Fail-closed source verification (agent-channel protocol spec, principle 5):
+    # when message_id is provided and resolves to the originating inbox/processing
+    # message, that message's `source` field is ground truth for where this reply
+    # must go. A mismatch means the caller (or a stale "telegram" default) is about
+    # to route a reply to the wrong channel — most critically, a local-claude
+    # agent-channel reply falling back to the Telegram/Slack outbox, which the
+    # protocol spec guarantees can never happen (principle 2). Refuse rather than
+    # guess. Verification *failure* (message not found / unreadable / no source
+    # field) is deliberately NOT treated as a mismatch — the guard only fires on a
+    # confirmed disagreement, so it never blocks the many callers that pass
+    # message_id for messages without a `source` field or that the guard can't
+    # resolve for unrelated reasons.
+    origin_found: Path | None = None
+    origin_msg: dict = {}
+    message_id_arg = args.get("message_id")
+    is_local_claude = source == agent_channel.SOURCE
+    if message_id_arg:
+        try:
+            _mid_for_check = validate_message_id(message_id_arg)
+            origin_found = (
+                _find_message_file(PROCESSING_DIR, _mid_for_check)
+                or _find_message_file(INBOX_DIR, _mid_for_check)
+            )
+            if origin_found:
+                origin_msg = json.loads(origin_found.read_text())
+        except Exception:
+            origin_found = None
+            origin_msg = {}
+
+        origin_source = origin_msg.get("source")
+        if origin_source and origin_source != source:
+            log.error(
+                f"send_reply: source mismatch — message {message_id_arg} originated "
+                f"from source={origin_source!r} but reply requested source={source!r}. "
+                "Refusing to send (fail-closed on source mismatch)."
+            )
+            return [TextContent(
+                type="text",
+                text=(
+                    f"Error: source mismatch — message {message_id_arg} originated from "
+                    f"source={origin_source!r} but this reply requested source={source!r}. "
+                    "Refusing to send: a reply's source must match the originating "
+                    "message's source (fail-closed, per agent-channel protocol spec)."
+                ),
+            )]
+    elif is_local_claude:
+        # local-claude callers conventionally never pass message_id — the
+        # documented subagent call pattern (.claude/sys.subagent.bootup.md,
+        # "Agent Channel Tasks") is send_reply(chat_id, text,
+        # source="local-claude", request_id=..., task_id=...). Without this
+        # fallback, origin_msg stays empty for every local-claude reply, the
+        # `agent` label below is never recovered, and write_pointer() (the
+        # by-agent/<slug>/ durability mailbox, agent-channel protocol v1
+        # §3.2) silently never fires.
+        #
+        # By protocol convention, message_id == request_id for this channel
+        # (both are the inbound envelope's `id`; see the same convention
+        # documented in agent_channel.write_progress's docstring), so
+        # request_id is a valid stand-in key for the same origin-file lookup
+        # used above. request_id is already required and sanitized by
+        # validate_send_reply_args() for source="local-claude" by the time
+        # this function reaches here, so no extra validation is needed. No
+        # source-mismatch check applies here — source is already known to be
+        # "local-claude" by definition of this branch.
+        try:
+            _request_id_for_lookup = args.get("request_id")
+            if _request_id_for_lookup:
+                origin_found = (
+                    _find_message_file(PROCESSING_DIR, _request_id_for_lookup)
+                    or _find_message_file(INBOX_DIR, _request_id_for_lookup)
+                )
+                if origin_found:
+                    origin_msg = json.loads(origin_found.read_text())
+        except Exception:
+            origin_found = None
+            origin_msg = {}
+
     reply_id = f"{int(time.time() * 1000)}_{source}"
-    reply_data = {
-        "id": reply_id,
-        "source": source,
-        "chat_id": chat_id,
-        "text": text,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    # Only meaningful when is_local_claude; tracks whether *this* call won the
+    # single-shot reply slot (see below) so the tail code and final return can
+    # skip reply-specific bookkeeping when it didn't.
+    reply_slot_created = True
 
-    # Include buttons if provided (Telegram only)
-    if buttons and source == "telegram":
-        reply_data["buttons"] = buttons
+    if is_local_claude:
+        # Agent channel: local Claude Code session (SSH) <-> dispatcher. This is a
+        # machine-to-machine request/reply, not a Dan-facing chat message — it must
+        # never touch the Telegram/Slack/SMS outbox. validate_send_reply_args()
+        # already confirmed request_id is present and safe.
+        request_id = str(args["request_id"]).strip()
+        reply_outcome = agent_channel.write_reply(
+            agent_replies_dir=AGENT_REPLIES_DIR,
+            request_id=request_id,
+            text=text,
+            in_reply_to=args.get("message_id"),
+            error=args.get("error"),
+            error_type=args.get("error_type"),
+        )
+        reply_slot_created = reply_outcome.reply_slot_created
 
-    # Include thread_ts if provided (Slack only)
-    if thread_ts and source == "slack":
-        reply_data["thread_ts"] = thread_ts
-
-    # Include reply_to_message_id if explicitly provided (Telegram only).
-    # No auto-threading fallback: if reply_to_message_id is absent, the reply is
-    # sent standalone. Auto-threading was removed because it caused replies to
-    # thread under the wrong message when multiple messages were in-flight for
-    # the same chat simultaneously.
-    reply_to_msg_id = args.get("reply_to_message_id")
-    if source == "telegram" and reply_to_msg_id:
-        reply_data["reply_to_message_id"] = int(reply_to_msg_id)
-
-    # Route bisque replies to the bisque-outbox so the relay server picks them up.
-    # All other sources go to the standard outbox for the bot process.
-    if source == "bisque":
-        outbox_file = BISQUE_OUTBOX_DIR / f"{reply_id}.json"
+        # by-agent pointer mailbox (agent-channel protocol v1, §3.2 —
+        # durability layer). Purely additive: only fires when (a) this call
+        # actually won the reply slot (a lost-race no-op didn't write
+        # anything new, so it gets no pointer either) and (b) the original
+        # inbound message carried a non-empty `agent` field. origin_msg was
+        # already resolved above (from message_id_arg) for the source-
+        # mismatch check, so no extra file read is needed here. A malformed
+        # `agent` value fails loudly (logged) but never blocks or fails the
+        # reply write itself — the pointer is a discovery convenience, not
+        # load-bearing for the reply itself reaching its single-shot slot.
+        if reply_slot_created:
+            _agent_label = origin_msg.get("agent")
+            if _agent_label:
+                # Broad `except Exception` (not just ValidationError) is
+                # deliberate: this guards both sanitize_agent_slug's
+                # validation failures AND write_pointer's filesystem calls
+                # (mkdir/touch), which can raise OSError (e.g. disk full,
+                # permission error, ENOSPC) that has nothing to do with
+                # input validation. The pointer mailbox is a discovery
+                # convenience, never load-bearing for the reply itself —
+                # any failure here must never skip mark_processed, dedup
+                # tracking, or audit emission, nor block the reply path.
+                try:
+                    _agent_slug = sanitize_agent_slug(_agent_label)
+                    agent_channel.write_pointer(
+                        agent_replies_dir=AGENT_REPLIES_DIR,
+                        agent_slug=_agent_slug,
+                        request_id=request_id,
+                    )
+                except Exception as _slug_err:
+                    log.warning(
+                        f"send_reply(local-claude): agent={_agent_label!r} on "
+                        f"request_id={request_id!r} failed by-agent pointer "
+                        f"write ({_slug_err}) — skipping (fail-closed; the "
+                        "terminal reply itself is unaffected)."
+                    )
     else:
-        outbox_file = OUTBOX_DIR / f"{reply_id}.json"
+        # Create reply file in outbox
+        reply_data = {
+            "id": reply_id,
+            "source": source,
+            "chat_id": chat_id,
+            "text": text,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
 
-    # Atomic write: temp file + fsync + rename to prevent watchdog race condition
-    atomic_write_json(outbox_file, reply_data)
+        # Include buttons if provided (Telegram only)
+        if buttons and source == "telegram":
+            reply_data["buttons"] = buttons
 
-    # Save a copy to sent directory for conversation history
-    sent_file = SENT_DIR / f"{reply_id}.json"
-    atomic_write_json(sent_file, reply_data)
+        # Include thread_ts if provided (Slack only)
+        if thread_ts and source == "slack":
+            reply_data["thread_ts"] = thread_ts
 
-    # BIS-167 Slice 6: persist outbound reply to messages.db (no-op when LOBSTER_USE_DB!=1)
-    if _db_persist_outbound is not None:
-        _db_persist_outbound(reply_data)
+        # Include reply_to_message_id if explicitly provided (Telegram only).
+        # No auto-threading fallback: if reply_to_message_id is absent, the reply is
+        # sent standalone. Auto-threading was removed because it caused replies to
+        # thread under the wrong message when multiple messages were in-flight for
+        # the same chat simultaneously.
+        reply_to_msg_id = args.get("reply_to_message_id")
+        if source == "telegram" and reply_to_msg_id:
+            reply_data["reply_to_message_id"] = int(reply_to_msg_id)
 
-    # Track reply for mark_processed guard
-    _track_reply(chat_id)
+        # Route bisque replies to the bisque-outbox so the relay server picks them up.
+        # All other sources go to the standard outbox for the bot process.
+        if source == "bisque":
+            outbox_file = BISQUE_OUTBOX_DIR / f"{reply_id}.json"
+        else:
+            outbox_file = OUTBOX_DIR / f"{reply_id}.json"
 
-    # Record direct send for write_result deduplication (suppress duplicate relays)
-    _record_direct_send(chat_id, text)
+        # Atomic write: temp file + fsync + rename to prevent watchdog race condition
+        atomic_write_json(outbox_file, reply_data)
 
-    # Task-ID-based dedup (primary): if task_id provided, record so write_result can
-    # auto-set sent_reply_to_user=True even when texts differ (e.g. full reply vs short summary).
-    task_id_param = args.get("task_id", "").strip() if args.get("task_id") else ""
-    if task_id_param:
-        _record_task_replied(task_id_param, chat_id)
-        log.debug(f"Recorded task_id dedup for task={task_id_param!r} chat={chat_id}")
+        # Save a copy to sent directory for conversation history
+        sent_file = SENT_DIR / f"{reply_id}.json"
+        atomic_write_json(sent_file, reply_data)
 
-    log.info(f"Reply sent to {source} chat {chat_id}")
+        # BIS-167 Slice 6: persist outbound reply to messages.db (no-op when LOBSTER_USE_DB!=1)
+        if _db_persist_outbound is not None:
+            _db_persist_outbound(reply_data)
 
-    # Emit telegram.outbound to EventBus for audit trail (issue #1352).
-    # Skipped for bot-talk — that source already emits via bot_talk_mirror.
-    if source != "bot-talk":
-        _emit_mcp_event(
-            "telegram.outbound",
-            {"source": source, "chat_id": chat_id, "text_len": len(text)},
-            chat_id=chat_id,
+    # The block below is "a new reply was sent" bookkeeping (dedup tracking,
+    # audit event). Skip it when this call lost the single-shot reply-slot
+    # race above — nothing new was actually delivered, so recording it as a
+    # send would be misleading (e.g. it would let a losing duplicate mask a
+    # different, later-arriving reply for the same request_id).
+    if reply_slot_created:
+        # Track reply for mark_processed guard. Per-request identity for local-claude
+        # (see _reply_track_key) — every local-claude client shares the same constant
+        # chat_id, so keying on chat_id alone would let one client's reply mask another
+        # client's dropped reply.
+        _track_reply(_reply_track_key(chat_id, source=source, request_id=args.get("request_id") if is_local_claude else None))
+
+        # Record direct send for write_result deduplication (suppress duplicate relays)
+        _record_direct_send(chat_id, text)
+
+        # Task-ID-based dedup (primary): if task_id provided, record so write_result can
+        # auto-set sent_reply_to_user=True even when texts differ (e.g. full reply vs short summary).
+        task_id_param = args.get("task_id", "").strip() if args.get("task_id") else ""
+        if task_id_param:
+            _record_task_replied(task_id_param, chat_id)
+            log.debug(f"Recorded task_id dedup for task={task_id_param!r} chat={chat_id}")
+
+        log.info(f"Reply sent to {source} chat {chat_id}")
+
+        # Emit telegram.outbound to EventBus for audit trail (issue #1352).
+        # Skipped for bot-talk — that source already emits via bot_talk_mirror.
+        # local-claude gets its own distinct category (agent_channel.reply, below)
+        # rather than the shared telegram.outbound stream — it isn't a chat delivery.
+        if source not in ("bot-talk", "local-claude"):
+            _emit_mcp_event(
+                "telegram.outbound",
+                {"source": source, "chat_id": chat_id, "text_len": len(text)},
+                chat_id=chat_id,
+            )
+
+    # Agent-channel audit trail (agent-channel-hardening) — see
+    # agent_channel.emit_reply_audit() for what this covers and why.
+    if is_local_claude:
+        agent_channel.emit_reply_audit(
+            request_id=request_id,
+            reply_slot_created=reply_slot_created,
+            text_len=len(text),
+            emit_event=_emit_mcp_event,
         )
 
     # Mirror outbound bot-talk messages to the EventBus so TelegramOutboxListener
@@ -5121,13 +6023,15 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
         except Exception as _bt_exc:
             log.warning(f"bot-talk mirror_outbound failed (non-fatal): {_bt_exc}")
 
-    # Atomic mark_processed: if message_id provided, move message to processed/ in same call
+    # Atomic mark_processed: if message_id provided, move message to processed/ in same call.
+    # Reuses `origin_found` from the fail-closed source check above (same message_id) so the
+    # message is only located once.
     mark_info = ""
     message_id = args.get("message_id")
     if message_id:
         try:
             mid = validate_message_id(message_id)
-            found = _find_message_file(PROCESSING_DIR, mid)
+            found = origin_found if origin_found is not None else _find_message_file(PROCESSING_DIR, mid)
             if not found:
                 found = _find_message_file(INBOX_DIR, mid)
             if found:
@@ -5153,6 +6057,14 @@ async def handle_send_reply(args: dict) -> list[TextContent]:
         except Exception as e:
             mark_info = f" | ⚠️ mark_processed failed: {e}"
             log.warning(f"Atomic mark_processed failed for {message_id}: {e}")
+
+    if is_local_claude:
+        return [TextContent(type="text", text=agent_channel.format_reply_response(
+            request_id=request_id,
+            text=text,
+            reply_slot_created=reply_slot_created,
+            mark_info=mark_info,
+        ))]
 
     button_info = f" with {sum(len(row) for row in buttons)} button(s)" if buttons else ""
     thread_info = f" (thread reply)" if thread_ts and source == "slack" else ""
@@ -5289,7 +6201,7 @@ async def handle_mark_processed(args: dict) -> list[TextContent]:
                     except (ValueError, TypeError):
                         pass
 
-                chat_key = str(chat_id)
+                chat_key = _reply_track_key(chat_id, source=msg.get("source", ""), request_id=msg.get("request_id"))
                 reply_ts = _recent_replies.get(chat_key, 0.0)
                 if reply_ts < msg_epoch:
                     # No reply was sent for this human message — log and proceed silently.
@@ -5356,7 +6268,14 @@ async def handle_mark_processed(args: dict) -> list[TextContent]:
 
 
 async def handle_mark_processing(args: dict) -> list[TextContent]:
-    """Move message from inbox to processing to claim it."""
+    """Move message from inbox to processing to claim it.
+
+    Not supported for source="local-claude" (agent_channel.SOURCE) — refused
+    before the atomic claim, message left untouched in inbox/. claim_and_ack
+    is the sole claim path for the agent channel (issue #1531): it claims
+    the message and writes the required ack in the same atomic step, which
+    this function has no equivalent for.
+    """
     message_id = validate_message_id(args.get("message_id", ""))
 
     found = _find_message_file(INBOX_DIR, message_id)
@@ -5372,6 +6291,44 @@ async def handle_mark_processing(args: dict) -> list[TextContent]:
     # Normalize type aliases to canonical names before any routing logic sees
     # the message (issue #635). This is the single ingest normalization point.
     msg_data = normalize_message_type(msg_data)
+
+    # Deprecation gate (issue #1531): mark_processing must never claim a
+    # source="local-claude" message — claim_and_ack is the sole claim path
+    # for the agent channel. claim_and_ack claims AND writes the required
+    # ack (agent-replies/<request_id>.ack.json, including the capability
+    # advertisement — see agent_channel.write_ack()) in one atomic step;
+    # mark_processing has no ack step at all, so a local-claude message
+    # claimed through it would silently skip that contract until some other
+    # code path (e.g. write_progress) happened to write the ack
+    # incidentally. Refusing here — server-side, before the atomic claim —
+    # is fail-closed and structural, matching claim_and_ack's own
+    # fail-closed source-mismatch check below, rather than relying solely
+    # on the dispatcher's (LLM) bootup-doc instructions, which can be
+    # missed under context pressure. The message is left untouched in
+    # inbox/: no partial claim, no filesystem move, no widening of any
+    # unclaimed race window relative to today — the caller must retry with
+    # claim_and_ack instead.
+    # Lowercased to match claim_and_ack's own source comparison (which
+    # lowercases the caller-supplied source before comparing to
+    # agent_channel.SOURCE) — a mixed-case "Local-Claude" source field must
+    # trip this gate exactly like claim_and_ack's fail-closed checks do,
+    # not slip through on a case mismatch.
+    msg_source_pre_claim = str(msg_data.get("source", "")).lower()
+    if msg_source_pre_claim == agent_channel.SOURCE:
+        log.warning(
+            f"mark_processing: refused for source={agent_channel.SOURCE!r} "
+            f"(message_id={message_id}) — use claim_and_ack instead, the sole "
+            "claim path for the agent channel (issue #1531)."
+        )
+        return [TextContent(
+            type="text",
+            text=(
+                f"Error: mark_processing is not supported for source={agent_channel.SOURCE!r}. "
+                "Use claim_and_ack instead — it claims the message and writes the "
+                "required ack (agent-replies/<request_id>.ack.json) atomically. "
+                f"Message {message_id} was left untouched in inbox/."
+            ),
+        )]
 
     # Atomic claim via SQLite INSERT OR FAIL (issue #1360).
     # This is the claim gate: one caller wins, all others get already_claimed.
@@ -5405,68 +6362,30 @@ async def handle_mark_processing(args: dict) -> list[TextContent]:
             "Add to INBOX_MESSAGE_SOURCES in message_types.py if this is intentional."
         )
 
-    # Queue background observation (non-blocking, best-effort)
     msg_text = msg_data.get("text", "") or msg_data.get("transcription", "")
-    if msg_text and msg_type in USER_FACING_TYPES:
-        _queue_observation(
-            msg_text, message_id,
-            source=msg_data.get("source"),
-            ts=msg_data.get("timestamp"),
-        )
-
-    # Conditionally inject user model context for messages that would benefit
     context_block = ""
-    short_msg_id = message_id[:20] if len(message_id) > 20 else message_id
-    if _user_model is not None and msg_text and msg_type in USER_FACING_TYPES:
-        if _should_inject_user_context(msg_text):
-            try:
-                ctx = _user_model.get_context()
-                if ctx and ctx.strip():
-                    context_block = (
-                        "\n\n---\n"
-                        "**User Model Context** (auto-injected for this message):\n\n"
-                        f"{ctx}"
-                    )
-                    # Debug: notify context was injected
-                    _emit_event(
-                        f"\U0001f50d [context injected] msg={short_msg_id} "
-                        f"trigger matched, injected {len(ctx)} chars of user model context",
-                        event_type="user_model.context_inject",
-                        severity="debug",
-                        source="mark-processing",
-                    )
-                else:
-                    # Debug: trigger matched but no context available.
-                    _emit_event(
-                        f"\U0001f50d [context skipped] msg={short_msg_id} "
-                        "trigger matched but user model returned empty context",
-                        event_type="user_model.context_skip",
-                        severity="debug",
-                        source="mark-processing",
-                    )
-            except Exception as _ctx_exc:
-                import traceback as _tb
-                _emit_event(
-                    f"\U0001f50d [context inject error] msg={short_msg_id} "
-                    f"{type(_ctx_exc).__name__}: {_ctx_exc}\n"
-                    + _tb.format_exc()[-600:],
-                    event_type="system.error",
-                    severity="error",
-                    source="mark-processing",
-                )
-                # never block mark_processing
-        else:
-            # No trigger match — context injection skipped. No notification emitted;
-            # this is the common case and emitting on every no-match is pure noise.
-            pass
 
     # User message counter — session-note-appender trigger (issue #1159)
     # Shared helper handles filtering, incrementing, and reminder injection.
     _tick_user_message_counter(msg_type, msg_source)
 
-    # Stamp _processing_started_at so stale detection uses actual claim time, not file mtime.
+    # Stamp _processing_started_at and _lobster_meta (issue #1023) so stale detection
+    # uses actual claim time and downstream consumers have pre-computed routing hints.
     try:
         msg_data["_processing_started_at"] = datetime.now(timezone.utc).isoformat()
+        # _lobster_meta: fast heuristic classification (<5ms, no LLM calls).
+        # Fields are hints only — dispatcher must never trust them blindly.
+        msg_data["_lobster_meta"] = build_lobster_meta(msg_data)
+        # relationship (issue #1536, phase 1): claim-time fallback for
+        # external producers whose messages arrive here without an
+        # ingestion-time stamp (e.g. telegram/slack/sms bots). Only applied
+        # when absent — never overwrites an ingestion-time stamp (e.g.
+        # write_result's). Ambiguous cases are left unstamped. Stamp-only:
+        # no reader branches on this field yet.
+        if "relationship" not in msg_data:
+            _relationship_hint = classify_relationship(msg_data)
+            if _relationship_hint:
+                msg_data["relationship"] = _relationship_hint
         atomic_write_json(dest, msg_data)
     except Exception:
         pass  # non-fatal; stale recovery falls back to mtime
@@ -5490,13 +6409,94 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
     fails (message not found or already claimed), the ack is never sent.
     If the ack fails after claiming, the message remains in processing/ and
     stale recovery handles it.
+
+    For source="local-claude" (the agent channel): request_id is required, and
+    the ack is written to agent-replies/<request_id>.ack.json — a distinct file
+    from agent-replies/<request_id>.json, the single-shot answer slot that
+    send_reply(source="local-claude", ...) writes. The ack never touches the
+    answer slot (agent-channel protocol spec, principle 4: ack != answer).
     """
     message_id = validate_message_id(args.get("message_id", ""))
+    source = str(args.get("source", "telegram")).lower()
+    is_local_claude = source == agent_channel.SOURCE
+
+    # --- Step 0: source-specific pre-checks, before we ever claim the message ---
+    # (a) local-claude requires a sanitized request_id up front — same rule as
+    #     send_reply, enforced before the atomic claim so a malformed request never
+    #     leaves a message stuck in processing/ with no way to answer it.
+    request_id: str | None = None
+    if is_local_claude:
+        try:
+            request_id = sanitize_request_id(args.get("request_id"))
+        except ValidationError as e:
+            # This is the one refusal path in the agent-channel claim flow that
+            # was silent before this fix (issue #1531 review). mark_processing
+            # already logs a warning when it refuses ANY local-claude message
+            # (telling the caller to use claim_and_ack instead), but claim_and_ack
+            # itself had no log call when its own request_id validation failed —
+            # and source="local-claude" is excluded from health-check
+            # USER_FACING_SOURCES, so nothing else ever surfaces this either.
+            # Without a valid request_id, the message can never be claimed by any
+            # path (mark_processing refuses local-claude outright; claim_and_ack
+            # refuses here) and stays stuck in inbox/ forever with no further
+            # signal. Log loudly and alert directly via the existing lightweight
+            # outbox-alert path — claim_and_ack isn't enrolled in the
+            # capability-failure tracker's threshold/cooldown gate, so this
+            # bypasses that gate intentionally rather than waiting for N
+            # consecutive failures — so this can't vanish silently the way it
+            # did pre-fix.
+            log.error(
+                f"claim_and_ack: refused for source={agent_channel.SOURCE!r} "
+                f"(message_id={message_id}) — invalid/missing request_id: {e}. "
+                "Message cannot be claimed by any path and is stuck in inbox/."
+            )
+            _deliver_capability_alert(
+                f"claim_and_ack: local-claude message {message_id!r} refused — "
+                f"invalid/missing request_id ({e}). This message cannot be "
+                "claimed by any path (mark_processing is deprecated for this "
+                "source; claim_and_ack requires a valid request_id) and will "
+                "stay stuck in inbox/ until manually recovered.",
+                "claim_and_ack.request_id",
+            )
+            return [TextContent(type="text", text=f"Error: {e}")]
+
+    # (c) ack_text is required for every branch below — both the local-claude
+    # and normal-source paths read it directly. Validated up front, before the
+    # claim, so a caller that omits it gets a clean error instead of a bare
+    # KeyError surfacing after the message has already been moved to
+    # processing/ (same rationale as the request_id pre-check above).
+    ack_text = args.get("ack_text")
+    if not ack_text:
+        return [TextContent(type="text", text="Error: ack_text is required")]
 
     # --- Step 1: Claim the message (must succeed before sending ack) ---
     found = _find_message_file(INBOX_DIR, message_id)
     if not found:
         return [TextContent(type="text", text=f"Error: Message not found in inbox: {message_id}")]
+
+    # (b) Fail-closed source verification (principle 5), same rule as send_reply:
+    # the message's own `source` field is ground truth. Checked BEFORE claiming
+    # so a mismatched ack never wins a claim it can't legitimately service.
+    try:
+        _pre_claim_msg = json.loads(found.read_text())
+    except Exception:
+        _pre_claim_msg = {}
+    _origin_source = _pre_claim_msg.get("source")
+    if _origin_source and _origin_source != source:
+        log.error(
+            f"claim_and_ack: source mismatch — message {message_id} originated "
+            f"from source={_origin_source!r} but ack requested source={source!r}. "
+            "Refusing to claim (fail-closed on source mismatch)."
+        )
+        return [TextContent(
+            type="text",
+            text=(
+                f"Error: source mismatch — message {message_id} originated from "
+                f"source={_origin_source!r} but this ack requested source={source!r}. "
+                "Refusing to claim: the ack's source must match the originating "
+                "message's source (fail-closed, per agent-channel protocol spec)."
+            ),
+        )]
 
     # Atomic claim via SQLite INSERT OR FAIL (issue #1360).
     # Must succeed before any filesystem move or ack is sent.
@@ -5514,6 +6514,20 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
     # Stamp actual processing start time so stale detection uses it
     msg_data["_processing_started_at"] = datetime.now(timezone.utc).isoformat()
 
+    # relationship (issue #1536, phase 1): claim-time fallback. claim_and_ack
+    # is the sole claim path for source="local-claude" (mark_processing
+    # refuses it — see that handler's docstring), so this is also the only
+    # claim-time opportunity to stamp peer_agent messages. Only applied when
+    # absent; ambiguous cases are left unstamped. Stamp-only: no reader
+    # branches on this field yet.
+    if "relationship" not in msg_data:
+        try:
+            _relationship_hint = classify_relationship(msg_data)
+            if _relationship_hint:
+                msg_data["relationship"] = _relationship_hint
+        except Exception:
+            pass  # non-fatal; classification is a best-effort hint
+
     # Atomic move to processing/ (consequence of won claim)
     dest = PROCESSING_DIR / found.name
     found.rename(dest)
@@ -5524,18 +6538,7 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
     except Exception:
         pass  # non-fatal; stale recovery falls back to mtime
 
-    # Queue background observation (non-blocking, best-effort)
-    msg_text = msg_data.get("text", "") or msg_data.get("transcription", "")
     msg_type = msg_data.get("type", "")
-    _SKIP_OBSERVATION_TYPES = (
-        "subagent_result", "subagent_error", "self_check", "subagent_observation"
-    )
-    if msg_text and msg_type not in _SKIP_OBSERVATION_TYPES:
-        _queue_observation(
-            msg_text, message_id,
-            source=msg_data.get("source"),
-            ts=msg_data.get("timestamp"),
-        )
 
     # User message counter — session-note-appender trigger (issue #1159)
     # Shared helper handles filtering, incrementing, and reminder injection.
@@ -5543,10 +6546,32 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
 
     log.info(f"claim_and_ack: message claimed: {message_id}")
 
-    # --- Step 2: Send the ack reply ---
+    # Agent-channel audit trail (agent-channel-hardening) — see
+    # agent_channel.emit_request_audit() for what this covers and why.
+    if is_local_claude:
+        agent_channel.emit_request_audit(
+            request_id=request_id,
+            message_id=message_id,
+            emit_event=_emit_mcp_event,
+        )
+
+    # --- Step 2: Send the ack ---
+    if is_local_claude:
+        # Ack != answer — see agent_channel.write_ack() docstring. Bypasses
+        # handle_send_reply entirely so there is no code path from this ack
+        # into the answer slot.
+        response_text = agent_channel.write_ack(
+            agent_replies_dir=AGENT_REPLIES_DIR,
+            request_id=request_id,
+            ack_text=ack_text,
+            message_id=message_id,
+            emit_event=_emit_mcp_event,
+        )
+        return [TextContent(type="text", text=response_text)]
+
     ack_args = {
         "chat_id": args["chat_id"],
-        "text": args["ack_text"],
+        "text": ack_text,
         "source": args.get("source", "telegram"),
     }
     if args.get("reply_to_message_id") is not None:
@@ -5556,8 +6581,8 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
 
     try:
         ack_result = await handle_send_reply(ack_args)
-        ack_text_preview = args["ack_text"][:100]
-        ack_suffix = "..." if len(args["ack_text"]) > 100 else ""
+        ack_text_preview = ack_text[:100]
+        ack_suffix = "..." if len(ack_text) > 100 else ""
         log.info(f"claim_and_ack: ack sent to chat {args['chat_id']}")
         return [TextContent(
             type="text",
@@ -5576,6 +6601,81 @@ async def handle_claim_and_ack(args: dict) -> list[TextContent]:
                 f"Message {message_id} remains in processing/. Stale recovery will handle it."
             ),
         )]
+
+
+async def handle_write_progress(args: dict) -> list[TextContent]:
+    """Write a repeatable, claim-bound current-status update for an OPEN
+    local-claude agent-channel exchange. See agent_channel.write_progress()
+    for the full authorization/debounce/message-after-complete design
+    (agent-channel protocol v1, §2).
+
+    Structured status shape (agent-channel protocol v1.1): ``phase`` and
+    ``pct`` are optional, nullable fields alongside the required
+    ``status_text`` — see agent_channel.write_progress()'s docstring for why
+    the shape is shipped now rather than left flat.
+    """
+    try:
+        request_id = sanitize_request_id(args.get("request_id"))
+    except ValidationError as e:
+        return [TextContent(type="text", text=f"Error: {e}")]
+
+    status_text = str(args.get("status_text", "")).strip()
+    if not status_text:
+        return [TextContent(type="text", text="Error: status_text is required")]
+
+    phase = args.get("phase")
+    if phase is not None:
+        phase = str(phase).strip() or None
+
+    pct = args.get("pct")
+    if pct is not None:
+        if not isinstance(pct, (int, float)) or isinstance(pct, bool):
+            return [TextContent(type="text", text="Error: pct must be a number (or omitted)")]
+        pct = float(pct)
+
+    outcome = agent_channel.write_progress(
+        claims_db=_claims_db,
+        agent_replies_dir=AGENT_REPLIES_DIR,
+        request_id=request_id,
+        status_text=status_text,
+        emit_event=_emit_mcp_event,
+        phase=phase,
+        pct=pct,
+    )
+
+    if not outcome.accepted:
+        return [TextContent(
+            type="text",
+            text=(
+                f"Error: write_progress refused for request_id={request_id!r} — no OPEN "
+                "claim currently held for this request_id (claim-bound authorization; "
+                "the exchange must be actively claimed via claim_and_ack and not yet "
+                "COMPLETE — agent-channel protocol v1, §2.2). Nothing was written."
+            ),
+        )]
+    if outcome.reason == "already_complete":
+        return [TextContent(
+            type="text",
+            text=(
+                f"No-op: agent-replies/{request_id}.json already exists (exchange "
+                "COMPLETE) — refusing to write a status update to a closed exchange "
+                "(message-after-complete guard)."
+            ),
+        )]
+    if outcome.reason == "debounced":
+        return [TextContent(
+            type="text",
+            text=(
+                f"Accepted (debounced): a status write for request_id={request_id!r} "
+                f"landed within the last {int(agent_channel.DEBOUNCE_INTERVAL_SECONDS)}s "
+                "— skipping the filesystem write to bound churn; the most recent status "
+                "on disk is still current."
+            ),
+        )]
+    return [TextContent(
+        type="text",
+        text=f"Status written to agent-replies/{request_id}.ack.json: {status_text[:100]}",
+    )]
 
 
 async def handle_mark_failed(args: dict) -> list[TextContent]:
@@ -5877,158 +6977,6 @@ def _apply_filters_and_paginate(
 
 
 _HISTORY_TEXT_DISPLAY_LIMIT = 4000  # Max chars shown per message in get_conversation_history
-_REPLY_QUOTE_DISPLAY_LIMIT = 300    # Max chars of the replied-to message quoted inline
-
-# Issue #2269 — confirmation safety.
-#
-# A short affirmative reply ("Sure", "yes", "do it") only confirms the message
-# it is a Telegram reply_to of.  Conversation history is ordered newest-first,
-# so without the threading metadata the only available pairing signal is
-# adjacency — and adjacency is not confirmation.  These constants drive the
-# classification of "this looks like a bare confirmation" so the renderer can
-# say explicitly when the pairing is unverifiable.
-_CONFIRMATION_MAX_WORDS = 4
-
-_AFFIRMATIVE_TOKENS = frozenset({
-    "yes", "yep", "yeah", "yup", "ya", "yea", "aye", "sure", "ok", "okay", "k", "y",
-    "affirmative", "approved", "approve", "confirm", "confirmed", "lgtm",
-    "sgtm", "proceed", "go", "ahead", "do", "it", "ship", "send", "merge",
-    "deploy", "run", "please", "fine", "good", "great", "perfect", "cool",
-    "alright", "roger", "totally", "indeed", "certainly",
-    "absolutely", "definitely", "sounds", "correct", "right",
-    "\U0001f44d", "✅", "\U0001f680",
-})
-
-# Presence of any of these flips a short phrase out of "bare confirmation":
-# "no", "don't", "not yet" must never be read as approval.
-_NEGATION_TOKENS = frozenset({
-    "no", "nope", "not", "dont", "don't", "never", "stop", "cancel",
-    "wait", "hold", "abort", "revert",
-})
-
-_UNTHREADED_CONFIRMATION_WARNING = (
-    "⚠️ UNTHREADED SHORT REPLY — this message carries no Telegram "
-    "reply_to metadata, so it is NOT linked to any earlier message. Do NOT treat "
-    "it as confirmation of a preceding question; adjacency is not confirmation. "
-    "Ask for explicit re-confirmation before any side-effecting action."
-)
-
-
-def _confirmation_tokens(text: str) -> list[str]:
-    """Split *text* into lowercase word tokens for confirmation classification.
-
-    Pure function.  Punctuation is stripped from each token so that "Sure!"
-    and "yes." classify the same as "sure" and "yes".  Emoji are preserved as
-    their own tokens because a bare thumbs-up is itself an affirmative.
-    """
-    if not isinstance(text, str):
-        return []
-    raw = text.strip().split()
-    tokens = [t.strip(".,!?;:\"'()[]").lower() for t in raw]
-    return [t for t in tokens if t]
-
-
-def _is_short_affirmative(text: str) -> bool:
-    """Return True when *text* reads as a bare confirmation and nothing more.
-
-    Pure function.  A phrase qualifies only when it is at most
-    _CONFIRMATION_MAX_WORDS long, contains at least one affirmative token, and
-    contains no negation.  Anything longer carries its own subject matter and
-    is not a context-free "yes" that could be mis-paired.
-    """
-    tokens = _confirmation_tokens(text)
-    if not tokens or len(tokens) > _CONFIRMATION_MAX_WORDS:
-        return False
-    if any(t in _NEGATION_TOKENS for t in tokens):
-        return False
-    return any(t in _AFFIRMATIVE_TOKENS for t in tokens)
-
-
-def _coerce_reply_to(value: Any) -> dict | None:
-    """Normalise a stored reply_to value into a dict, or None if unusable.
-
-    Pure function.  The two read paths disagree on representation: the
-    filesystem scan yields the decoded dict written by the bot, while the SQL
-    path (db/reader.py) returns the raw `reply_to` TEXT column as a JSON
-    string.  Callers must not have to care which path produced the row.
-    """
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str) and value.strip():
-        try:
-            decoded = json.loads(value)
-        except (json.JSONDecodeError, TypeError):
-            return None
-        if isinstance(decoded, dict):
-            return decoded
-    return None
-
-
-def _reply_to_sender(reply_to: dict) -> str:
-    """Return the best-available username for a coerced reply_to dict, or ''.
-
-    Pure function. Single source of truth for the key-fallback chain — the
-    bot, the DB path, and the filesystem path have historically disagreed on
-    which key carries the replied-to message's sender, so every call site
-    must go through this rather than reimplementing the fallback list
-    (issue #2269 follow-up: three call sites had drifted out of sync).
-    """
-    return (
-        reply_to.get("reply_to_from_user")
-        or reply_to.get("from_user")
-        or reply_to.get("username")
-        or reply_to.get("user_name")
-        or ""
-    )
-
-
-def _format_reply_to_block(msg: dict) -> str:
-    """Render the threading provenance for one message, or '' when there is none.
-
-    Pure function.  Three outcomes:
-      - The message is a Telegram reply: name the message_id it replied to and
-        quote that message's text, so the pairing can be verified rather than
-        inferred.
-      - The message is a bare confirmation with no threading metadata: emit
-        _UNTHREADED_CONFIRMATION_WARNING, because adjacency alone must not be
-        read as approval (issue #2269).
-      - Anything else: emit nothing, leaving ordinary history unchanged.
-    """
-    reply_to = _coerce_reply_to(msg.get("reply_to"))
-    reply_msg_id = msg.get("reply_to_message_id")
-
-    if reply_to:
-        target_id = (
-            reply_to.get("reply_to_message_id")
-            or reply_to.get("message_id")
-            or reply_msg_id
-            or "?"
-        )
-        from_user = _reply_to_sender(reply_to)
-        quoted = reply_to.get("reply_to_text") or reply_to.get("text") or ""
-        from_label = f" from @{from_user}" if from_user else ""
-        block = f"↩️ In reply to msg_id=`{target_id}`{from_label}:\n"
-        if quoted:
-            was_truncated = len(quoted) > _REPLY_QUOTE_DISPLAY_LIMIT
-            snippet = quoted[:_REPLY_QUOTE_DISPLAY_LIMIT] + (
-                " [truncated]" if was_truncated else ""
-            )
-            block += f">> {snippet}\n"
-        else:
-            block += ">> (no text content)\n"
-        return block
-
-    if reply_msg_id:
-        # Threaded, but the quoted blob is absent (outbound sends record only
-        # the id they threaded to).  The id alone is still verifiable.
-        return f"↩️ In reply to msg_id=`{reply_msg_id}`\n"
-
-    if msg.get("_direction") == "received" and _is_short_affirmative(
-        msg.get("text", "")
-    ):
-        return f"{_UNTHREADED_CONFIRMATION_WARNING}\n"
-
-    return ""
 
 
 def _format_history_output(
@@ -6062,26 +7010,17 @@ def _format_history_output(
 
         was_truncated = len(text) > _HISTORY_TEXT_DISPLAY_LIMIT
         truncated = text[:_HISTORY_TEXT_DISPLAY_LIMIT] + (" [truncated]" if was_truncated else "")
-
-        # Issue #2269: threading provenance must travel with the message text.
-        # Without it the reader can only pair messages by adjacency.
-        tg_id = msg.get("telegram_message_id")
-        id_label = f" | msg_id: `{tg_id}`" if tg_id else ""
-        reply_block = _format_reply_to_block(msg)
-
         if msg["_direction"] == "received":
             user = msg.get("user_name", msg.get("username", "Unknown"))
             output += "---\n"
-            output += f"{direction_icon} **{direction_label}** [{source}] from **{user}** | Chat: `{chat_id}`{id_label}\n"
+            output += f"{direction_icon} **{direction_label}** [{source}] from **{user}** | Chat: `{chat_id}`\n"
             output += f"Time: {ts_display}\n\n"
+            output += f"> {truncated}\n\n"
         else:
             output += "---\n"
-            output += f"{direction_icon} **{direction_label}** [{source}] to chat `{chat_id}`{id_label}\n"
+            output += f"{direction_icon} **{direction_label}** [{source}] to chat `{chat_id}`\n"
             output += f"Time: {ts_display}\n\n"
-
-        if reply_block:
-            output += reply_block
-        output += f"> {truncated}\n\n"
+            output += f"> {truncated}\n\n"
 
     if total_count > offset + limit:
         next_offset = offset + limit
@@ -6095,8 +7034,9 @@ async def handle_get_conversation_history(args: dict) -> list[TextContent]:
 
     BIS-165 Slice 4: SQL-first read path with extracted pure-function helpers.
     Queries messages.db when available; falls back to the legacy filesystem scan
-    (processed/ + sent/ JSON files) when the DB is unavailable or returns zero
-    results for the given filters.
+    (processed/ + sent/ JSON files) when the DB is unavailable, DB writes are
+    disabled (LOBSTER_USE_DB != 1 — see _db_writes_enabled, issue #1471), or the
+    DB query returns zero results for the given filters.
     """
     chat_id_filter = args.get("chat_id")
     search_text = args.get("search", "").strip()
@@ -6112,8 +7052,20 @@ async def handle_get_conversation_history(args: dict) -> list[TextContent]:
 
     # ------------------------------------------------------------------
     # Primary path: SQL query against messages.db (BIS-165 Slice 4)
+    #
+    # Gated on _db_writes_enabled(): when LOBSTER_USE_DB != 1, the write path
+    # (persist_inbound/persist_outbound) never runs, so messages.db cannot
+    # reflect real conversation history — only whatever it was seeded with.
+    # Skipping the DB path entirely in that case (rather than trusting a
+    # non-empty-but-stale table) prevents issue #1471: a stale seed row count
+    # > 0 permanently masked the real filesystem archive because the old
+    # fallback trigger was `total_count == 0`.
     # ------------------------------------------------------------------
-    if _db_get_conversation_history is not None and _db_count_conversation_history is not None:
+    if (
+        _db_get_conversation_history is not None
+        and _db_count_conversation_history is not None
+        and _db_writes_enabled()
+    ):
         conn = _open_messages_db_conn()
         if conn is not None:
             try:
@@ -6233,18 +7185,11 @@ async def handle_get_message_by_telegram_id(args: dict) -> list[TextContent]:
                     output += f"Time: {ts_display}\n\n"
                     output += f"**Text:**\n> {text}\n"
 
-                    # Issue #2269: the DB returns reply_to as a raw JSON string,
-                    # so the old isinstance(dict) guard silently rendered an
-                    # empty quote for every DB-path lookup.
-                    reply_to = _coerce_reply_to(msg.get("reply_to"))
+                    reply_to = msg.get("reply_to")
                     if reply_to:
-                        reply_text = reply_to.get("reply_to_text") or reply_to.get("text", "")
-                        reply_from = _reply_to_sender(reply_to)
-                        reply_msg_id = (
-                            msg.get("reply_to_message_id")
-                            or reply_to.get("message_id")
-                            or ""
-                        )
+                        reply_text = reply_to.get("reply_to_text") or reply_to.get("text", "") if isinstance(reply_to, dict) else ""
+                        reply_from = reply_to.get("reply_to_from_user") or reply_to.get("from_user", "") if isinstance(reply_to, dict) else ""
+                        reply_msg_id = msg.get("reply_to_message_id", "")
                         output += f"\n**Reply to** (TG ID `{reply_msg_id}`, from {reply_from}):\n> {str(reply_text)[:300]}{'...' if len(str(reply_text)) > 300 else ''}\n"
 
                     for field in ("image_file", "file_path", "audio_file"):
@@ -6306,10 +7251,10 @@ async def handle_get_message_by_telegram_id(args: dict) -> list[TextContent]:
             output += f"Time: {ts_display}\n\n"
             output += f"**Text:**\n> {text}\n"
 
-            reply_to = _coerce_reply_to(msg.get("reply_to"))
+            reply_to = msg.get("reply_to")
             if reply_to:
                 reply_text = reply_to.get("reply_to_text") or reply_to.get("text", "")
-                reply_from = _reply_to_sender(reply_to)
+                reply_from = reply_to.get("reply_to_from_user") or reply_to.get("from_user", "")
                 reply_msg_id = reply_to.get("reply_to_message_id") or reply_to.get("message_id", "")
                 output += f"\n**Reply to** (TG ID `{reply_msg_id}`, from {reply_from}):\n> {reply_text[:300]}{'...' if len(reply_text) > 300 else ''}\n"
 
@@ -7702,6 +8647,109 @@ async def handle_write_task_output(args: dict) -> list[TextContent]:
 
 
 # =============================================================================
+# WOS registry completion helper (issue #669)
+# =============================================================================
+
+def _maybe_complete_wos_uow(
+    task_id: str,
+    status: str,
+    result_text: str | None = None,
+    token_usage: int | None = None,
+    outcome_category: str | None = None,
+) -> None:
+    """
+    Transition a WOS UoW from 'executing' to 'ready-for-steward' when its subagent
+    calls write_result with status='success'.
+
+    Delegates to orchestration.wos_completion.maybe_complete_wos_uow — see that
+    module for full documentation. Imported lazily so inbox_server's heavy import
+    chain does not block if the orchestration package is unavailable.
+
+    result_text is forwarded to maybe_complete_wos_uow so the output classifier
+    can distinguish pearl (PR opened), heat (nothing to do), and seed (default)
+    outcomes when building the GitHub close-out comment.
+
+    token_usage is forwarded to record per-UoW cost telemetry in the registry
+    (issue #990). NULL when the subagent did not report usage.
+
+    outcome_category is forwarded to record the metabolic taxonomy label in the
+    registry (issue #998). Already validated as a member of VALID_OUTCOME_CATEGORIES
+    by the write_result handler before this function is called. NULL when the
+    subagent did not report an outcome_category.
+
+    Errors are logged but never raised — write_result delivery must not be blocked
+    by registry update failures.
+    """
+    try:
+        import sys as _sys
+        import os
+        from pathlib import Path as _Path
+        _src = str(_Path(__file__).resolve().parent.parent)
+        if _src not in _sys.path:
+            _sys.path.insert(0, _src)
+        from orchestration.wos_completion import maybe_complete_wos_uow
+        maybe_complete_wos_uow(task_id, status, result_text=result_text, token_usage=token_usage,
+                               outcome_category=outcome_category)
+    except Exception as exc:
+        log.warning("_maybe_complete_wos_uow: unexpected error — %s: %s", type(exc).__name__, exc)
+
+
+# =============================================================================
+# WOS Heartbeat Handler (issue #849)
+# =============================================================================
+
+async def handle_write_wos_heartbeat(args: dict) -> list[TextContent]:
+    """
+    Write a liveness heartbeat for a WOS unit of work.
+
+    Called by executing WOS subagents every 60–90 seconds to prove they are
+    alive. Without periodic heartbeats, the Observation Loop (steward-heartbeat
+    Phase 2b) detects a stall and re-queues the UoW for re-execution.
+
+    Delegates to Registry.write_heartbeat() — a fire-and-forget SQL UPDATE that
+    sets heartbeat_at to the current UTC timestamp for UoWs in 'active' or
+    'executing' status. Returns rowcount=0 when the UoW is no longer in an
+    executing state, which signals the agent to stop.
+
+    Errors are logged and returned as an error response — never raised — so the
+    agent's execution continues and the heartbeat sidecar provides backup coverage.
+    """
+    uow_id = (args.get("uow_id") or "").strip()
+    if not uow_id:
+        return [TextContent(type="text", text='{"error": "uow_id is required"}')]
+
+    # token_usage: optional cumulative token count for stuck-agent detection.
+    # Accept integers and floats (MCP may transmit numbers as float); reject strings
+    # and negative values. None is the backwards-compatible default.
+    _token_usage_raw = args.get("token_usage")
+    token_usage: int | None = None
+    if _token_usage_raw is not None:
+        if isinstance(_token_usage_raw, (int, float)) and int(_token_usage_raw) >= 0:
+            token_usage = int(_token_usage_raw)
+
+    try:
+        import sys as _sys
+        import os
+        from pathlib import Path as _Path
+        _src = str(_Path(__file__).resolve().parent.parent)
+        if _src not in _sys.path:
+            _sys.path.insert(0, _src)
+        from orchestration.registry import WOSRegistry
+        rowcount = WOSRegistry().write_heartbeat(uow_id, token_usage=token_usage)
+        log.debug(
+            "write_wos_heartbeat: uow_id=%s rowcount=%d token_usage=%s",
+            uow_id, rowcount, token_usage,
+        )
+        return [TextContent(type="text", text=f'{{"rowcount": {rowcount}}}')]
+    except Exception as exc:
+        log.warning(
+            "write_wos_heartbeat: failed for uow_id=%s — %s: %s",
+            uow_id, type(exc).__name__, exc,
+        )
+        return [TextContent(type="text", text=f'{{"error": "{type(exc).__name__}: {exc}"}}')]
+
+
+# =============================================================================
 # Subagent Result Relay Handler
 # =============================================================================
 
@@ -7721,6 +8769,20 @@ async def handle_write_result(args: dict) -> list[TextContent]:
     status = args.get("status", "success")
     artifacts = args.get("artifacts") or []
     thread_ts = args.get("thread_ts")
+    outcome_category_raw = args.get("outcome_category")
+    outcome_category = (
+        outcome_category_raw
+        if outcome_category_raw in VALID_OUTCOME_CATEGORIES
+        else None
+    )
+    # token_usage: optional integer reported by the subagent (input + output tokens).
+    # Validated as a positive integer; ignored if absent, None, or non-integer.
+    _token_usage_raw = args.get("token_usage")
+    token_usage: int | None = (
+        int(_token_usage_raw)
+        if _token_usage_raw is not None and isinstance(_token_usage_raw, (int, float)) and int(_token_usage_raw) > 0
+        else None
+    )
     # Accept new name (sent_reply_to_user) with backward-compat alias (forward).
     # Semantics: sent_reply_to_user=True means subagent already called send_reply →
     # dispatcher should NOT relay. This is the inverse of the old `forward` field.
@@ -7788,6 +8850,12 @@ async def handle_write_result(args: dict) -> list[TextContent]:
         "status": status,
         "sent_reply_to_user": bool(sent_reply_to_user),
         "timestamp": now.isoformat(),
+        # relationship (issue #1536, phase 1): write_result is definitionally
+        # the ingestion point for subagent-to-dispatcher messages, so the
+        # source is unambiguous here — stamp it directly rather than relying
+        # on the claim-time fallback classifier. Stamp-only: no reader
+        # branches on this field yet.
+        "relationship": MessageRelationship.SUBAGENT.value,
     }
     if msg_type == "subagent_notification":
         message["warning"] = "User already received the subagent's reply. Don't summarize it. If you respond, add new value only — a question, a correction, missing context."
@@ -7800,9 +8868,28 @@ async def handle_write_result(args: dict) -> list[TextContent]:
         message["artifacts"] = artifacts
     if thread_ts:
         message["thread_ts"] = thread_ts
+    if outcome_category is not None:
+        message["outcome_category"] = outcome_category
 
     inbox_file = INBOX_DIR / f"{message_id}.json"
     atomic_write_json(inbox_file, message)
+
+    # Issue #754: persist outcome_category to the outcome ledger for flamegraph queries.
+    # Append-only JSONL; failures are non-fatal (observability, not correctness).
+    if outcome_category is not None:
+        try:
+            import time as _time
+            ledger_entry = json.dumps({
+                "ts": int(_time.time()),
+                "task_id": task_id,
+                "outcome_category": outcome_category,
+                "source": source,
+            })
+            OUTCOME_LEDGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(OUTCOME_LEDGER_FILE, "a") as _lf:
+                _lf.write(ledger_entry + "\n")
+        except Exception as _exc:
+            log.warning(f"write_result: failed to append outcome_category to ledger: {_exc}")
 
     # BIS-167 Slice 6: persist agent event immediately on write_result.
     # Before auto-unregister so the record is in the DB even if the dispatcher crashes.
@@ -7814,20 +8901,12 @@ async def handle_write_result(args: dict) -> list[TextContent]:
     # This is the atomic "result delivered → agent done" guarantee described in issue #295.
     # Uses session_store.session_end directly so the completion status is recorded in history.
     try:
-        ended_rows = _session_store.session_end(
+        _session_store.session_end(
             id_or_task_id=task_id,
             status="completed",
             result_summary=(text[:200] if text else None),
             stop_reason="end_turn",
         )
-        if ended_rows == 0:
-            # No running/starting row has id or task_id == task_id: the
-            # spawned session's row stays 'running' until something else
-            # reconciles it. Surface the mismatch instead of no-op'ing silently.
-            log.warning(
-                f"write_result: session_end matched no running session for "
-                f"task_id={task_id!r}; the spawned agent's row was not closed"
-            )
         # Mark notified immediately so the reconciler's startup sweep does not
         # re-enqueue this session on the next MCP restart.  The startup sweep
         # queries for completed/dead rows where notified_at IS NULL — leaving it
@@ -7835,6 +8914,21 @@ async def handle_write_result(args: dict) -> list[TextContent]:
         _session_store.set_notified(task_id)
     except Exception as exc:
         log.warning(f"write_result auto-unregister failed for task_id={task_id!r}: {exc}")
+
+    # WOS registry completion (issue #669): when a subagent writes its result for a
+    # wos_execute task, transition the UoW from 'executing' → 'ready-for-steward'.
+    # The executor transitions active → executing at dispatch time (fire-and-forget inbox
+    # dispatch). The execution_complete audit entry and status transition happen here —
+    # only after the subagent confirms completion via write_result — preventing the
+    # false-complete bug where UoWs appeared done before any work was done.
+    #
+    # task_id convention: "wos-{uow_id}" (set by route_wos_message in dispatcher_handlers.py)
+    # result_text is forwarded so the output classifier can build an accurate close-out
+    # comment (pearl for PR opened, heat for nothing to do, seed as default).
+    # token_usage is forwarded for per-UoW cost telemetry (issue #990).
+    # outcome_category is forwarded to persist metabolic taxonomy in the registry (issue #998).
+    _maybe_complete_wos_uow(task_id, status, result_text=text or None, token_usage=token_usage,
+                            outcome_category=outcome_category)
 
     # Notify wire server so SSE clients update within 40ms
     asyncio.create_task(_notify_wire_server())
@@ -8179,24 +9273,6 @@ async def handle_session_start(args: dict) -> list[TextContent]:
         except (TypeError, ValueError):
             timeout_minutes = None
 
-    # PID ground truth (issue #2148, Phase 1) — dispatcher self-registration.
-    # handle_session_start() executes inside the stdio `lobster-inbox` MCP
-    # server child process (spawned by the `claude` binary per .mcp.json),
-    # which is NOT the same OS PID as the dispatcher's own `claude` process.
-    # A flat os.getpid() here would record the MCP server child's PID, not
-    # the dispatcher's — so we walk the process tree to the nearest ancestor
-    # process named "claude" instead (same technique hooks/session_role.py
-    # already uses to detect dispatcher sessions). Best-effort: any failure
-    # (missing /proc, no "claude" ancestor found) yields pid=None, which
-    # falls back to the pre-migration heuristics untouched — registration
-    # must never be blocked by a PID-capture failure.
-    dispatcher_pid: int | None = None
-    if agent_type == "dispatcher":
-        try:
-            dispatcher_pid = _find_dispatcher_ancestor_pid()
-        except Exception:  # noqa: BLE001
-            dispatcher_pid = None
-
     try:
         _session_store.session_start(
             id=agent_id,
@@ -8213,7 +9289,6 @@ async def handle_session_start(args: dict) -> list[TextContent]:
             trigger_snippet=trigger_snippet,
             idempotency=idempotency,
             task_origin=task_origin,
-            pid=dispatcher_pid,
         )
     except Exception as exc:
         log.error(f"session_start failed: {exc}", exc_info=True)
@@ -8496,6 +9571,7 @@ async def handle_create_action_item(args: dict) -> list[TextContent]:
     title = args.get("title", "").strip()
     body = args.get("body", "").strip()
     labels = args.get("labels", [])
+    item_owner = args.get("item_owner", "dan").strip().lower() or "dan"
 
     if not owner or not repo:
         return [TextContent(type="text", text="Error: owner and repo are required.")]
@@ -8513,6 +9589,8 @@ async def handle_create_action_item(args: dict) -> list[TextContent]:
         issue_body_lines.append(body)
         issue_body_lines.append("")
 
+    issue_body_lines.append(f"owner: {item_owner}")
+    issue_body_lines.append("")
     issue_body_lines.append("---")
     issue_body_lines.append(f"**Source:** Brain dump #{brain_dump_issue}")
     issue_body_lines.append("")
@@ -8746,6 +9824,32 @@ CANONICAL_DIR = _USER_CONFIG / "memory" / "canonical"
 HANDOFF_PATH = CANONICAL_DIR / "handoff.md"
 
 
+
+# ---------------------------------------------------------------------------
+# Memory ingestion filter — noise event exclusion
+#
+# These event types are pure operational noise for semantic retrieval.
+# health_check fires ~380 times/day (health-check-v3 every 4 min).
+# Exclude them before any embedding computation or DB insertion.
+# ---------------------------------------------------------------------------
+MEMORY_EXCLUDED_TYPES: frozenset[str] = frozenset({
+    "health_check",      # canonical type written by health-check-v3.sh and daily-health-check.sh
+    "health_probe",      # forward-compat alias in case producers adopt this name
+    "cron_heartbeat",    # executor/steward heartbeat noise
+})
+MEMORY_EXCLUDED_SUBTYPES: frozenset[str] = frozenset({
+    "health_check",      # subtype variant from some producers
+})
+
+
+def _should_skip_memory_write(event_type: str, event_subtype: str | None) -> bool:
+    """Return True if this event should be silently dropped from memory ingestion."""
+    return (
+        event_type in MEMORY_EXCLUDED_TYPES
+        or (event_subtype is not None and event_subtype in MEMORY_EXCLUDED_SUBTYPES)
+    )
+
+
 async def handle_memory_store(arguments: dict[str, Any]) -> list[TextContent]:
     """Store an event in memory."""
     if _memory_provider is None:
@@ -8755,10 +9859,34 @@ async def handle_memory_store(arguments: dict[str, Any]) -> list[TextContent]:
     if not content:
         return [TextContent(type="text", text="Error: content is required.")]
 
+    # Filter gate: drop operational noise events before embedding or DB write.
+    event_type = arguments.get("type", "note")
+    event_subtype = arguments.get("subtype")
+    if _should_skip_memory_write(event_type, event_subtype):
+        log.debug(
+            "memory_store: skipping noise event (type=%r, subtype=%r)",
+            event_type, event_subtype,
+        )
+        return [TextContent(type="text", text=f"Skipped: event type '{event_type}' is excluded from memory ingestion.")]
+
+    from memory.provider import VALENCE_VALUES, VALID_SIGNAL_TYPES
+    raw_valence = arguments.get("valence", "neutral")
+    valence = raw_valence if raw_valence in VALENCE_VALUES else "neutral"
+
+    # Validate signal_type_hint if provided
+    signal_type_hint = arguments.get("signal_type_hint")
+    if signal_type_hint is not None and signal_type_hint not in VALID_SIGNAL_TYPES:
+        return [TextContent(
+            type="text",
+            text=f"Error: invalid signal_type_hint '{signal_type_hint}'. Must be one of: {', '.join(sorted(VALID_SIGNAL_TYPES))}"
+        )]
+
+    subject = arguments.get("subject")
+
     metadata = {"tags": arguments.get("tags", [])}
-    chat_id = arguments.get("chat_id")
-    if chat_id is not None:
-        metadata["source_chat_id"] = chat_id
+    chat_id_arg = arguments.get("chat_id")
+    if chat_id_arg is not None:
+        metadata["source_chat_id"] = chat_id_arg
 
     event = MemoryEvent(
         id=None,
@@ -8768,11 +9896,14 @@ async def handle_memory_store(arguments: dict[str, Any]) -> list[TextContent]:
         project=arguments.get("project"),
         content=content,
         metadata=metadata,
+        valence=valence,
+        subject=subject,
+        signal_type_hint=signal_type_hint,
     )
 
     try:
         event_id = _memory_provider.store(event)
-        result_text = f"Stored memory event #{event_id} (type={event.type}, source={event.source})"
+        result_text = f"Stored memory event #{event_id} (type={event.type}, source={event.source}, valence={event.valence})"
     except Exception as e:
         log.error(f"memory_store failed: {e}", exc_info=True)
         return [TextContent(type="text", text=f"Error storing memory: {e}")]
@@ -8810,8 +9941,12 @@ async def handle_memory_search(arguments: dict[str, Any]) -> list[TextContent]:
     limit = arguments.get("limit", 10)
     project = arguments.get("project")
 
+    from memory.provider import VALENCE_VALUES
+    raw_valence = arguments.get("valence")
+    valence = raw_valence if raw_valence in VALENCE_VALUES else None
+
     try:
-        results = _memory_provider.search(query, limit=limit, project=project)
+        results = _memory_provider.search(query, limit=limit, project=project, valence=valence)
     except Exception as e:
         log.error(f"memory_search failed: {e}", exc_info=True)
         return [TextContent(type="text", text=f"Error searching memory: {e}")]
@@ -8844,16 +9979,19 @@ async def handle_memory_search(arguments: dict[str, Any]) -> list[TextContent]:
         pass
 
     if not results:
-        return [TextContent(type="text", text=f"No memory events found for: {query}")]
+        valence_note = f" with valence={valence}" if valence else ""
+        return [TextContent(type="text", text=f"No memory events found for: {query}{valence_note}")]
 
-    lines = [f"**Memory Search Results** ({len(results)} found for \"{query}\"):"]
+    valence_label = f", valence={valence}" if valence else ""
+    lines = [f"**Memory Search Results** ({len(results)} found for \"{query}\"{valence_label}):"]
     for i, event in enumerate(results, 1):
         ts = _format_display_ts(event.timestamp, "%Y-%m-%d %I:%M %p %Z") if event.timestamp else "?"
         proj = f" [{event.project}]" if event.project else ""
         eid = f"#{event.id}" if event.id else ""
+        valence_tag = f" [{event.valence}]" if event.valence != "neutral" else ""
         # Truncate content for display
         content_preview = event.content[:200] + "..." if len(event.content) > 200 else event.content
-        lines.append(f"\n{i}. {eid} ({event.type}/{event.source}{proj}) {ts}")
+        lines.append(f"\n{i}. {eid} ({event.type}/{event.source}{proj}{valence_tag}) {ts}")
         lines.append(f"   {content_preview}")
 
     return [TextContent(type="text", text="\n".join(lines))]
@@ -8895,6 +10033,268 @@ async def handle_memory_recent(arguments: dict[str, Any]) -> list[TextContent]:
     except Exception as e:
         log.error(f"memory_recent failed: {e}", exc_info=True)
         return [TextContent(type="text", text=f"Error getting recent events: {e}")]
+
+
+def _proprioceptive_dir() -> Path:
+    """Return the proprioceptive memory directory, creating it if needed."""
+    user_config = Path(os.environ.get("LOBSTER_USER_CONFIG", Path.home() / "lobster-user-config"))
+    d = user_config / "memory" / "proprioceptive"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _write_proprioceptive_file(
+    timestamp: str,
+    alignment_signal: str,
+    context_snippet: str,
+    assessment: str,
+    source: str,
+    topic: str | None,
+    chat_id: str | None,
+) -> Path:
+    """Write a structured markdown file for a proprioceptive instance.
+
+    Format: YAML frontmatter + markdown body, stored at
+    ~/lobster-user-config/memory/proprioceptive/<timestamp>-<signal>.md
+
+    Returns the path written.
+    """
+    # Slug the timestamp for a safe filename: 2026-03-22T14:05:00+00:00 -> 2026-03-22T140500
+    ts_slug = timestamp[:19].replace(":", "").replace("-", "").replace("T", "T")
+    filename = f"{ts_slug[:15]}-{alignment_signal}.md"
+    path = _proprioceptive_dir() / filename
+
+    frontmatter_lines = [
+        "---",
+        f"timestamp: {timestamp}",
+        f"alignment_signal: {alignment_signal}",
+        f"source: {source}",
+    ]
+    if topic:
+        frontmatter_lines.append(f"topic: {topic}")
+    if chat_id:
+        frontmatter_lines.append(f"chat_id: {chat_id}")
+    frontmatter_lines.append("---")
+
+    body_lines = [
+        "",
+        "## Context",
+        "",
+        context_snippet.strip(),
+        "",
+        "## Assessment",
+        "",
+        assessment.strip(),
+    ]
+
+    content = "\n".join(frontmatter_lines + body_lines) + "\n"
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+async def handle_record_mirroring_instance(arguments: dict[str, Any]) -> list[TextContent]:
+    """Record a proprioceptive instance — a concrete semantic mirroring moment.
+
+    Dual-writes to:
+    1. The vector DB via memory_store (type=proprioceptive, project=proprioceptive)
+       for hybrid search and retro retrieval.
+    2. A structured markdown file at ~/lobster-user-config/memory/proprioceptive/
+       for human review and durability across DB rebuilds.
+    """
+    alignment_signal = arguments.get("alignment_signal", "").strip()
+    context_snippet = arguments.get("context_snippet", "").strip()
+    assessment = arguments.get("assessment", "").strip()
+    source = arguments.get("source", "human-noted").strip()
+    topic = arguments.get("topic", "").strip() or None
+    chat_id_raw = arguments.get("chat_id")
+    task_id = arguments.get("task_id", "").strip() or None
+
+    if not alignment_signal:
+        return [TextContent(type="text", text="Error: alignment_signal is required")]
+    if alignment_signal not in ("positive", "negative", "uncertain"):
+        return [TextContent(type="text", text="Error: alignment_signal must be positive, negative, or uncertain")]
+    if not context_snippet:
+        return [TextContent(type="text", text="Error: context_snippet is required")]
+    if not assessment:
+        return [TextContent(type="text", text="Error: assessment is required")]
+
+    now = datetime.now(timezone.utc)
+    timestamp = now.isoformat()
+    chat_id_str = str(chat_id_raw) if chat_id_raw is not None else None
+
+    # Compose rich content for the vector DB — include all fields so
+    # semantic search can find instances by any angle.
+    topic_line = f"\ntopic: {topic}" if topic else ""
+    memory_content = (
+        f"proprioceptive instance | signal: {alignment_signal} | source: {source}{topic_line}\n\n"
+        f"context: {context_snippet}\n\n"
+        f"assessment: {assessment}"
+    )
+
+    errors: list[str] = []
+    memory_event_id: int | None = None
+    file_path: Path | None = None
+
+    # 1. Store to vector DB
+    if _memory_provider is not None:
+        try:
+            event = MemoryEvent(
+                id=None,
+                timestamp=now,
+                type="proprioceptive",
+                source="internal",
+                project="proprioceptive",
+                content=memory_content,
+                metadata={
+                    "tags": ["proprioceptive", alignment_signal, source],
+                    "alignment_signal": alignment_signal,
+                    "source": source,
+                    **({"topic": topic} if topic else {}),
+                    **({"chat_id": chat_id_str} if chat_id_str else {}),
+                },
+            )
+            memory_event_id = _memory_provider.store(event)
+        except Exception as e:
+            log.error(f"record_mirroring_instance: vector DB write failed: {e}", exc_info=True)
+            errors.append(f"vector DB write failed: {e}")
+    else:
+        errors.append("memory system unavailable — vector DB write skipped")
+
+    # 2. Write to file-based proprioceptive log
+    try:
+        file_path = _write_proprioceptive_file(
+            timestamp=timestamp,
+            alignment_signal=alignment_signal,
+            context_snippet=context_snippet,
+            assessment=assessment,
+            source=source,
+            topic=topic,
+            chat_id=chat_id_str,
+        )
+    except Exception as e:
+        log.error(f"record_mirroring_instance: file write failed: {e}", exc_info=True)
+        errors.append(f"file write failed: {e}")
+
+    if errors and memory_event_id is None and file_path is None:
+        return [TextContent(type="text", text="Error: both storage paths failed: " + "; ".join(errors))]
+
+    parts: list[str] = []
+    if memory_event_id is not None:
+        parts.append(f"vector DB event #{memory_event_id}")
+    if file_path is not None:
+        parts.append(f"file: {file_path.name}")
+    if errors:
+        parts.append(f"warnings: {'; '.join(errors)}")
+
+    result_text = (
+        f"Recorded proprioceptive instance ({alignment_signal}): {', '.join(parts)}. "
+        f"Retrievable via memory_search(query='proprioceptive') or get_proprioceptive_context()."
+    )
+
+    log.info(
+        f"Proprioceptive instance recorded: signal={alignment_signal} source={source}"
+        + (f" event_id={memory_event_id}" if memory_event_id else "")
+        + (f" file={file_path.name}" if file_path else "")
+        + (f" task_id={task_id}" if task_id else "")
+    )
+    return [TextContent(type="text", text=result_text)]
+
+
+async def handle_get_proprioceptive_context(arguments: dict[str, Any]) -> list[TextContent]:
+    """Return recent proprioceptive instances for session context injection.
+
+    Reads from the file-based log (~/lobster-user-config/memory/proprioceptive/)
+    rather than the vector DB, so it works even when the DB is unavailable and
+    returns instances in strict recency order without semantic scoring.
+    """
+    limit = int(arguments.get("limit", 5))
+    filter_signal = arguments.get("alignment_signal", "all")
+
+    prop_dir = _proprioceptive_dir()
+    try:
+        files = sorted(prop_dir.glob("*.md"), key=lambda p: p.name, reverse=True)
+    except Exception as e:
+        return [TextContent(type="text", text=f"Error reading proprioceptive directory: {e}")]
+
+    if not files:
+        return [TextContent(type="text", text="No proprioceptive instances recorded yet.")]
+
+    selected: list[tuple[Path, dict]] = []
+    for f in files:
+        if len(selected) >= limit:
+            break
+        try:
+            raw = f.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        # Parse minimal YAML frontmatter (simple line-by-line, no external dep)
+        meta: dict = {}
+        in_front = False
+        body_lines: list[str] = []
+        front_done = False
+        for line in raw.splitlines():
+            if line.strip() == "---":
+                if not in_front and not front_done:
+                    in_front = True
+                    continue
+                elif in_front:
+                    in_front = False
+                    front_done = True
+                    continue
+            if in_front:
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    meta[k.strip()] = v.strip()
+            elif front_done:
+                body_lines.append(line)
+        if filter_signal != "all" and meta.get("alignment_signal") != filter_signal:
+            continue
+        selected.append((f, meta))
+
+    if not selected:
+        signal_note = f" (signal={filter_signal})" if filter_signal != "all" else ""
+        return [TextContent(type="text", text=f"No proprioceptive instances found{signal_note}.")]
+
+    lines = [f"**Proprioceptive Context** ({len(selected)} recent instance(s)):"]
+    for f, meta in selected:
+        signal = meta.get("alignment_signal", "?")
+        ts = meta.get("timestamp", "?")[:10]  # date only
+        src = meta.get("source", "?")
+        topic = meta.get("topic", "")
+        topic_note = f" [{topic}]" if topic else ""
+
+        # Extract context and assessment from body
+        raw = f.read_text(encoding="utf-8")
+        context_text = ""
+        assessment_text = ""
+        current_section = None
+        for line in raw.splitlines():
+            if line.startswith("## Context"):
+                current_section = "context"
+                continue
+            elif line.startswith("## Assessment"):
+                current_section = "assessment"
+                continue
+            elif line.startswith("---"):
+                continue
+            elif line.startswith("## "):
+                current_section = None
+                continue
+            if current_section == "context" and line.strip():
+                context_text = line.strip()[:200]
+                current_section = None  # take first non-empty line only
+            elif current_section == "assessment" and line.strip():
+                assessment_text = line.strip()[:200]
+                current_section = None
+
+        signal_marker = "+" if signal == "positive" else ("-" if signal == "negative" else "~")
+        lines.append(
+            f"\n[{signal_marker}] {ts} ({src}){topic_note}"
+            f"\n  context: {context_text}"
+            f"\n  assessment: {assessment_text}"
+        )
+
+    return [TextContent(type="text", text="\n".join(lines))]
 
 
 async def handle_get_handoff(arguments: dict[str, Any]) -> list[TextContent]:
@@ -9352,10 +10752,11 @@ async def handle_get_bisque_connection_url(arguments: dict[str, Any]) -> list[Te
     # Read token
     token_file = _MESSAGES / "config" / "dashboard-token"
     if not token_file.exists():
+        venv_python = _REPO_DIR / ".venv" / "bin" / "python3"
+        dashboard_server = _REPO_DIR / "src" / "dashboard" / "server.py"
         return [TextContent(type="text", text=(
             "Dashboard token not found. Start the dashboard server first:\n"
-            f"nohup {_REPO_DIR}/.venv/bin/python3 "
-            f"{_REPO_DIR}/src/dashboard/server.py --host 0.0.0.0 --port 9100 &"
+            f"nohup {venv_python} {dashboard_server} --host 0.0.0.0 --port 9100 &"
         ))]
     token = token_file.read_text().strip()
     if not token:
@@ -9488,6 +10889,58 @@ async def handle_generate_bisque_login_token(arguments: dict[str, Any]) -> list[
         "Paste this token into the bisque-chat login screen."
     )
     return [TextContent(type="text", text=instructions)]
+
+
+# =============================================================================
+# Meta-Thread Handler
+# =============================================================================
+
+async def handle_get_meta_thread_context(args: dict) -> list[TextContent]:
+    """Search active meta-threads and return formatted context for the dispatcher.
+
+    Calls meta_threads.search() + inject_context() from scripts/meta_threads.py.
+    Returns an empty string when no threads match or the storage directory does
+    not exist — the dispatcher proceeds normally with zero overhead in that case.
+
+    The handler imports meta_threads lazily so the MCP server starts without
+    requiring fastembed to be installed (fastembed is only needed at call time).
+    """
+    message_text = args.get("message_text", "").strip()
+    if not message_text:
+        return [TextContent(type="text", text="")]
+
+    threshold = float(args.get("threshold", 0.7))
+
+    try:
+        import sys as _sys
+        import importlib
+        # LOBSTER_SCRIPTS_DIR overrides the default install path for non-standard installs
+        _meta_threads_script = os.environ.get(
+            "LOBSTER_SCRIPTS_DIR",
+            str(Path.home() / "lobster" / "scripts"),
+        )
+        if _meta_threads_script not in _sys.path:
+            _sys.path.insert(0, _meta_threads_script)
+        meta_threads = importlib.import_module("meta_threads")
+
+        threads = meta_threads.search(message_text, threshold=threshold)
+        if not threads:
+            return [TextContent(type="text", text="")]
+
+        context = meta_threads.inject_context(threads)
+        # Include thread IDs so the dispatcher can reference them for async updates
+        thread_ids = ",".join(t["id"] for t in threads)
+        header = f"<!-- meta-thread-ids: {thread_ids} -->\n"
+        return [TextContent(type="text", text=header + context)]
+
+    except ModuleNotFoundError:
+        # fastembed or meta_threads.py not available — graceful no-op
+        log.debug("meta_threads not available; skipping meta-thread context")
+        return [TextContent(type="text", text="")]
+    except Exception as e:
+        # Any other failure is a silent no-op — meta-threads must never block the dispatcher
+        log.warning(f"get_meta_thread_context failed (non-fatal): {e}")
+        return [TextContent(type="text", text="")]
 
 
 # =============================================================================
@@ -9944,8 +11397,8 @@ def _build_reconciler_message(
         # The dispatcher sees type='agent_failed' and decides whether to re-queue,
         # escalate to the user, or drop silently. Never relay raw failure noise to
         # the user's Telegram.
-        last_output = _read_last_output(output_file)
         original_chat_id = session.get("chat_id", "")
+        last_output = _read_last_output(output_file)
         return {
             "id": message_id,
             "type": "agent_failed",
@@ -9959,12 +11412,33 @@ def _build_reconciler_message(
             "task_id": task_id,
             "agent_id": agent_id,
             "original_chat_id": original_chat_id,
+            # The session's own source (e.g. "local-claude"), distinct from this
+            # notification's own source="system" above. Needed so the dispatcher
+            # can tell a crashed local-claude request apart from a crashed
+            # Telegram/Slack one — a generic send_reply(chat_id=original_chat_id)
+            # escalation is only valid for the latter (see agent_failed handler,
+            # "Local-claude originated failures").
+            "original_source": session.get("source", "telegram"),
             "original_prompt": input_summary,
             "last_output": last_output,
             "status": "error",
             "sent_reply_to_user": False,
             "timestamp": now.isoformat(),
         }
+
+
+def _is_internal_agent(session: dict) -> bool:
+    """Return True when the session belongs to a system/internal agent (chat_id=0/empty).
+
+    Internal agents (chat_id=0) have no real user to notify.  Reconciler
+    notifications for these sessions would land in the inbox as no-ops —
+    the dispatcher must read each one only to discover there is nothing to relay.
+
+    Pure function: reads session dict, no side effects.
+    """
+    raw = session.get("chat_id")
+    chat_id_str = str(raw).strip() if raw is not None else ""
+    return chat_id_str in ("0", "", "None")
 
 
 def _enqueue_reconciler_notification(session: dict, outcome: str) -> None:
@@ -9978,6 +11452,10 @@ def _enqueue_reconciler_notification(session: dict, outcome: str) -> None:
     the user's Telegram — the dispatcher decides whether to re-queue, escalate,
     or drop silently.
 
+    Internal/system agents (chat_id=0) are silently dropped for both outcomes —
+    no real user exists to notify, and writing a no-op inbox message forces the
+    dispatcher to read and discard it on every cycle.
+
     Also marks the session as notified_at to prevent duplicate notifications
     on the next reconciler cycle.
 
@@ -9985,9 +11463,22 @@ def _enqueue_reconciler_notification(session: dict, outcome: str) -> None:
         session: Session dict from get_active_sessions() or get_unnotified_completed().
         outcome: 'completed' or 'dead'.
     """
+    # System agents (chat_id=0/empty) have no real user — skip inbox for all outcomes.
+    # Logging preserves observability without polluting the dispatcher inbox.
+    if _is_internal_agent(session):
+        _agent_id = session.get("id", "")
+        _chat_id = session.get("chat_id")
+        log.debug(
+            "[reconciler] Session %r is internal (chat_id=%r, outcome=%r) — "
+            "skipping inbox notification",
+            _agent_id, _chat_id, outcome,
+        )
+        return
+
     # Idempotency guard — if already notified, skip
     if session.get("notified_at"):
         return
+
 
     # Dead sessions with no real user don't need dispatcher action — route to
     # debug log only, not the inbox. The dispatcher cannot notify a user
@@ -10014,6 +11505,7 @@ def _enqueue_reconciler_notification(session: dict, outcome: str) -> None:
                 )
             return
 
+
     agent_id = session.get("id", "")
     now = datetime.now(timezone.utc)
     message = _build_reconciler_message(session, outcome, now)
@@ -10035,66 +11527,293 @@ def _enqueue_reconciler_notification(session: dict, outcome: str) -> None:
         # Do NOT mark notified — next cycle will retry (at-least-once guarantee)
 
 
-def _inbox_already_has_agent(agent_id: str) -> bool:
-    """Return True if any file in the inbox already references agent_id.
+# Maximum sessions to enqueue individually during a startup sweep (defense-in-depth
+# per issue #464). Beyond this cap, sessions are still marked notified but are
+# included only in the summary rather than individual messages. This cap is only
+# relevant when the summary grouping produces a single chat_id with many sessions —
+# in normal operation the summary approach makes it structurally impossible to flood.
+#
+# Root-cause fix (#469): the startup sweep groups all unnotified sessions by chat_id
+# and writes ONE summary message per user. This makes the N-task → N-message flood
+# structurally impossible. The batch cap is defense-in-depth for edge cases where
+# a single user has an unusually large backlog.
+_STARTUP_SWEEP_BATCH_CAP = 20
 
-    Used by _startup_sweep() as an idempotency guard: if the server crashed
-    after writing the inbox file but before set_notified() was called, the
-    file is already there and re-enqueuing would deliver the notification twice.
 
-    Pure check — reads existing inbox files, no writes.
+def _write_internal_sessions_to_task_outputs(
+    sessions: list[dict],
+    now: datetime,
+) -> None:
+    """Route chat_id=0 sessions to task-outputs/ (per issue #462).
+
+    Internal/system agents have no real user to notify, so they skip the inbox
+    and go directly to task-outputs/ for observability without dispatcher noise.
+
+    Args:
+        sessions: List of internal sessions (chat_id=0/empty).
+        now:      Current UTC datetime.
     """
-    if not agent_id:
-        return False
-    for path in INBOX_DIR.glob("*.json"):
-        try:
-            data = json.loads(path.read_text())
-            if data.get("agent_id") == agent_id:
-                return True
-        except (OSError, json.JSONDecodeError):
+    if not sessions:
+        return
+
+    completed = [s for s in sessions if s.get("status") == "completed"]
+    dead = [s for s in sessions if s.get("status") != "completed"]
+
+    lines: list[str] = []
+    if completed:
+        lines.append(f"{len(completed)} internal task(s) completed:")
+        for s in completed:
+            desc = s.get("description", "unknown task")
+            task_id = s.get("task_id") or s.get("id", "")
+            elapsed_raw = s.get("elapsed_seconds")
+            try:
+                elapsed_min = int(elapsed_raw) // 60 if elapsed_raw is not None else 0
+            except (TypeError, ValueError):
+                elapsed_min = 0
+            lines.append(f"  - {desc} (task_id={task_id}, {elapsed_min}m)")
+    if dead:
+        lines.append(f"{len(dead)} internal task(s) disappeared (no output):")
+        for s in dead:
+            desc = s.get("description", "unknown task")
+            task_id = s.get("task_id") or s.get("id", "")
+            lines.append(f"  - {desc} (task_id={task_id})")
+
+    output_text = "\n".join(lines)
+    timestamp_str = now.strftime("%Y%m%d-%H%M%S")
+
+    output_data = {
+        "job_name": "reconciler-sweep-internal",
+        "timestamp": now.isoformat(),
+        "status": "success",
+        "output": output_text,
+        "completed_count": len(completed),
+        "dead_count": len(dead),
+        "session_ids": [s.get("id", "") for s in sessions],
+    }
+
+    # Use the module-level TASK_OUTPUTS_DIR (allows test patching)
+    import src.mcp.inbox_server as _this_mod
+    task_outputs_dir = _this_mod.TASK_OUTPUTS_DIR
+
+    output_file = task_outputs_dir / f"{timestamp_str}-reconciler-sweep-internal.json"
+    try:
+        task_outputs_dir.mkdir(parents=True, exist_ok=True)
+        with open(output_file, "w") as f:
+            json.dump(output_data, f, indent=2)
+        log.info(
+            "[reconciler] Wrote %d internal session(s) to task-outputs/ (%d completed, %d dead)",
+            len(sessions), len(completed), len(dead),
+        )
+    except Exception as exc:
+        log.error(
+            "[reconciler] Failed to write internal sessions to task-outputs/: %s",
+            exc, exc_info=True,
+        )
+
+
+def _build_startup_sweep_summary(
+    chat_id: str,
+    sessions: list[dict],
+    now: datetime,
+) -> dict:
+    """Return a single inbox summary message for all unnotified sessions for one chat_id.
+
+    Groups all completed/dead sessions into a single 'reconciler_sweep_summary'
+    message so a restart with N in-flight tasks produces 1 inbox message, not N.
+
+    Args:
+        chat_id: The originating chat (user) to route this summary to.
+        sessions: All unnotified sessions for this chat_id (completed or dead).
+        now:      Current UTC datetime (injected for testability).
+
+    Returns:
+        A structured inbox message dict.
+    """
+    completed = [s for s in sessions if s.get("status") == "completed"]
+    dead = [s for s in sessions if s.get("status") != "completed"]
+
+    lines: list[str] = []
+    if completed:
+        lines.append(f"{len(completed)} task(s) completed while Lobster was compacted:")
+        for s in completed:
+            desc = s.get("description", "unknown task")
+            task_id = s.get("task_id") or s.get("id", "")
+            elapsed_raw = s.get("elapsed_seconds")
+            try:
+                elapsed_min = int(elapsed_raw) // 60 if elapsed_raw is not None else 0
+            except (TypeError, ValueError):
+                elapsed_min = 0
+            lines.append(f"  - {desc} (task_id={task_id}, {elapsed_min}m)")
+    if dead:
+        lines.append(f"{len(dead)} task(s) disappeared (no output):")
+        for s in dead:
+            desc = s.get("description", "unknown task")
+            task_id = s.get("task_id") or s.get("id", "")
+            lines.append(f"  - {desc} (task_id={task_id})")
+
+    # Use the source from the first session; fall back to "system"
+    source = next(
+        (s.get("source") for s in sessions if s.get("source") not in (None, "")),
+        "system",
+    )
+
+    ts_ms = int(now.timestamp() * 1000)
+    message_id = f"{ts_ms}_reconciler_sweep_{str(chat_id)[:20]}"
+
+    # Collect all task_ids so the dispatcher can correlate with write_result calls
+    task_ids = [s.get("task_id") or s.get("id", "") for s in sessions]
+
+    return {
+        "id": message_id,
+        "type": "reconciler_sweep_summary",
+        "source": source,
+        "chat_id": chat_id,
+        "text": "\n".join(lines),
+        "task_ids": task_ids,
+        "completed_count": len(completed),
+        "dead_count": len(dead),
+        "sent_reply_to_user": False,
+        "timestamp": now.isoformat(),
+    }
+
+
+def _enqueue_startup_sweep_summaries(sessions: list[dict]) -> None:
+    """Group unnotified sessions by chat_id and write one summary per user.
+
+    Implements the fix for issues #459 and #469: the startup sweep produces
+    one inbox message per originating chat, not one per task.  This makes the
+    N-task → N-message flood structurally impossible.
+
+    Sessions with chat_id=0/empty are routed to task-outputs/ (per issue #462)
+    rather than inbox — internal agents have no real user to notify, but their
+    completion is still recorded for observability.
+
+    All sessions are marked notified regardless of destination, preventing
+    accumulation across restarts.
+
+    Args:
+        sessions: All unnotified completed/dead sessions from the last 24 hours.
+    """
+    from collections import defaultdict
+
+    now = datetime.now(timezone.utc)
+
+    # Group by chat_id, separating internal agents (chat_id=0/empty) for task-outputs/
+    by_chat: dict[str, list[dict]] = defaultdict(list)
+    internal_sessions: list[dict] = []
+    for session in sessions:
+        raw = session.get("chat_id")
+        chat_id_str = str(raw).strip() if raw is not None else ""
+        if chat_id_str in ("0", "", "None"):
+            internal_sessions.append(session)
+            # Mark notified so these don't accumulate across restarts
+            agent_id = session.get("id", "")
+            try:
+                _session_store.set_notified(agent_id)
+            except Exception as exc:
+                log.warning(
+                    "[reconciler] Failed to mark internal session %r notified: %s",
+                    agent_id, exc,
+                )
             continue
-    return False
+        by_chat[chat_id_str].append(session)
+
+    # Route internal sessions to task-outputs/ (per issue #462)
+    if internal_sessions:
+        _write_internal_sessions_to_task_outputs(internal_sessions, now)
+        log.debug(
+            "[reconciler] Startup sweep: routed %d internal sessions (chat_id=0) "
+            "to task-outputs/",
+            len(internal_sessions),
+        )
+
+    total_sessions = sum(len(v) for v in by_chat.values())
+    log.info(
+        "[reconciler] Startup sweep: %d session(s) across %d chat(s) → "
+        "writing %d summary message(s)",
+        total_sessions, len(by_chat), len(by_chat),
+    )
+
+    for chat_id, chat_sessions in by_chat.items():
+        # Defense-in-depth (#464): cap how many sessions feed into a single summary.
+        # Beyond the cap, sessions are still marked notified to prevent accumulation,
+        # but only the first _STARTUP_SWEEP_BATCH_CAP sessions appear in the summary.
+        if len(chat_sessions) > _STARTUP_SWEEP_BATCH_CAP:
+            log.warning(
+                "[reconciler] Startup sweep: chat_id=%r has %d unnotified sessions "
+                "(cap=%d) — truncating summary, marking all as notified",
+                chat_id, len(chat_sessions), _STARTUP_SWEEP_BATCH_CAP,
+            )
+            overflow = chat_sessions[_STARTUP_SWEEP_BATCH_CAP:]
+            chat_sessions = chat_sessions[:_STARTUP_SWEEP_BATCH_CAP]
+            # Mark overflow sessions notified without including them in the summary
+            for s in overflow:
+                agent_id = s.get("id", "")
+                try:
+                    _session_store.set_notified(agent_id)
+                except Exception as exc:
+                    log.warning(
+                        "[reconciler] Failed to mark overflow session %r notified: %s",
+                        agent_id, exc,
+                    )
+
+        message = _build_startup_sweep_summary(chat_id, chat_sessions, now)
+        try:
+            inbox_file = INBOX_DIR / f"{message['id']}.json"
+            atomic_write_json(inbox_file, message)
+            # Mark all sessions in this group notified
+            for s in chat_sessions:
+                agent_id = s.get("id", "")
+                _session_store.set_notified(agent_id)
+            log.info(
+                "[reconciler] Startup sweep summary written for chat_id=%r "
+                "(%d completed, %d dead, inbox=%r)",
+                chat_id,
+                message["completed_count"],
+                message["dead_count"],
+                message["id"],
+            )
+        except Exception as exc:
+            log.error(
+                "[reconciler] Failed to write startup sweep summary for chat_id=%r: %s",
+                chat_id, exc,
+                exc_info=True,
+            )
+            # Do NOT mark sessions notified — next restart will retry (at-least-once)
 
 
 async def _startup_sweep() -> None:
     """Send missed notifications for sessions that completed while server was down.
 
     Queries for completed/dead sessions where notified_at IS NULL and enqueues
-    a synthetic inbox message for each. Called once at server startup before
-    entering the reconciler loop.
+    ONE summary message per originating chat_id (not one message per task).
 
     This implements the restart-safety guarantee: if the server was killed between
     marking a session completed and writing notified_at, the notification is
     re-sent on the next startup. The at-most-once property is upheld by
     set_notified() being called immediately after enqueueing.
 
-    An additional idempotency guard checks whether an inbox file for the agent
-    already exists (handles the crash-after-write-before-set_notified race).
+    Fix (#459, #469): Previously produced one inbox message per completed task,
+    causing inbox floods of 500+ messages after busy sessions. Now groups all
+    unnotified sessions by chat_id and writes a single summary per user.
+    Defense-in-depth (#464): Caps at _STARTUP_SWEEP_BATCH_CAP sessions per chat.
     """
     try:
         unnotified = _session_store.get_unnotified_completed(since_hours=24)
-        if unnotified:
-            log.info(
-                f"[reconciler] Startup sweep: found {len(unnotified)} unnotified "
-                f"completed/dead session(s) — re-enqueuing notifications"
-            )
-        for session in unnotified:
-            agent_id = session.get("id", "")
-            # #781 Fix 2 (extended): the dispatcher is never a dead subagent (its
-            # output_file is legitimately NULL) — mirror reconcile_agent_sessions();
-            # never re-notify it as agent_failed. See utils/agent_types.py (BIS-723)
-            # for the shared single source of truth for this check.
-            if is_dispatcher_row(session):
-                continue
-            if _inbox_already_has_agent(agent_id):
-                log.debug(
-                    "[reconciler] Startup sweep: inbox file already exists for "
-                    "agent %r — skipping re-enqueue (idempotency guard)",
-                    agent_id,
-                )
-                continue
-            outcome = session.get("status", "completed")
-            _enqueue_reconciler_notification(session, outcome=outcome)
+        if not unnotified:
+            return
+        log.info(
+            f"[reconciler] Startup sweep: found {len(unnotified)} unnotified "
+            f"completed/dead session(s) — grouping into per-chat summaries"
+        )
+        # Note: upstream #781 added a per-session `agent_type == "dispatcher"` skip
+        # and an `_inbox_already_has_agent` idempotency guard here. Both are
+        # superseded on this fork: get_unnotified_completed() already excludes
+        # dispatcher/hook sessions at the SQL layer (#781/#1472/#1473), and
+        # _enqueue_startup_sweep_summaries() groups all sessions into one summary
+        # per chat_id (#459/#469) rather than one notification per session, so the
+        # per-agent idempotency check doesn't apply the same way.
+        _enqueue_startup_sweep_summaries(unnotified)
     except Exception as exc:
         log.error(f"[reconciler] Startup sweep error: {exc}", exc_info=True)
 
@@ -10138,7 +11857,7 @@ async def reconcile_agent_sessions() -> None:
     that does not exist on this system — and even if fixed, Claude Code places
     output symlinks in project-specific subdirectories, not a flat tasks dir.
     """
-    from agents.session_store import check_output_file_status, get_output_file_mtime
+    from agents.session_store import check_output_file_status, get_output_file_mtime, get_workstream_status_mtime
 
     DEFAULT_DEAD_THRESHOLD_SECONDS = 90 * 60   # 90 minutes — fallback for missing output files (raised from 30 in issue #1922)
     DEFAULT_DEAD_THRESHOLD_RUNNING_SECONDS = 120 * 60  # 120 minutes — fallback for stuck tool_use files
@@ -10149,6 +11868,7 @@ async def reconcile_agent_sessions() -> None:
     # immediately. 15 minutes gives ample margin to avoid false positives during slow
     # tool calls, while cutting the misclassification window from 120 min → 90 min.
     MTIME_STALE_THRESHOLD_SECONDS = 15 * 60    # 15 minutes
+    WORKSTREAM_STATUS_STALE_SECONDS = 600       # 10 min stale threshold for status.md liveness
 
     # Startup sweep: re-send notifications for sessions that completed while down
     await _startup_sweep()
@@ -10166,10 +11886,8 @@ async def reconcile_agent_sessions() -> None:
                 # The SessionStart hook may register the dispatcher itself in
                 # agent_sessions.db with agent_type='dispatcher' (on crash-restart
                 # before the marker file is cleared).  The dispatcher is never a
-                # "dead agent" — never emit agent_failed for it. See
-                # utils/agent_types.py (BIS-723) for the shared single source of
-                # truth for this check.
-                if is_dispatcher_row(session):
+                # "dead agent" — never emit agent_failed for it.
+                if (session.get("agent_type") or "") == "dispatcher":
                     log.debug(
                         f"[reconciler] Skipping dispatcher session {agent_id!r} "
                         "(agent_type='dispatcher' — not a subagent)"
@@ -10257,27 +11975,36 @@ async def reconcile_agent_sessions() -> None:
                     #      stops updating immediately; detectable within 15 minutes.
                     #   2. Legitimately slow tool call — mtime keeps ticking; leave alone.
                     #
-                    # Mtime gate (issue #868): if the output file has been idle for
-                    # MTIME_STALE_THRESHOLD_SECONDS, use the short threshold (same as
-                    # the "missing file" branch) rather than the generous 120-minute cap.
-                    # This closes the gap where interrupted agents are misclassified as
-                    # "still running" for up to 120 minutes.
+                    # Two staleness signals feed the same short-threshold gate:
+                    # - Mtime gate (issue #868): output file idle >15 min.
+                    # - Workstream gate: workstream/status.md idle >10 min (earlier signal
+                    #   for long-running dispatches that update status.md every ~5 min).
+                    # Either signal is sufficient; output_file logic is fallback when
+                    # no workstream directory exists.
+                    task_id = session.get("task_id")
+                    ws_mtime = get_workstream_status_mtime(task_id) if task_id else None
                     output_mtime = get_output_file_mtime(output_file)
                     now_ts = time.time()
+                    ws_is_stale = (
+                        ws_mtime is not None
+                        and (now_ts - ws_mtime) > WORKSTREAM_STATUS_STALE_SECONDS
+                    )
                     file_is_stale = (
                         output_mtime is not None
                         and (now_ts - output_mtime) > MTIME_STALE_THRESHOLD_SECONDS
                     )
+                    effective_stale = ws_is_stale or file_is_stale
                     effective_running_threshold = (
-                        dead_threshold_missing if file_is_stale else dead_threshold_running
+                        dead_threshold_missing if effective_stale else dead_threshold_running
                     )
 
                     if elapsed > effective_running_threshold:
-                        stale_note = (
-                            f", file idle {int(now_ts - output_mtime)}s (mtime gate active)"
-                            if file_is_stale
-                            else ""
-                        )
+                        if ws_is_stale:
+                            stale_note = f", workstream/status.md idle {int(now_ts - ws_mtime)}s (ws gate active)"
+                        elif file_is_stale:
+                            stale_note = f", file idle {int(now_ts - output_mtime)}s (mtime gate active)"
+                        else:
+                            stale_note = ""
                         log.warning(
                             f"[reconciler] Agent {agent_id!r} output stuck at tool_use "
                             f"after {elapsed}s (>{effective_running_threshold}s{stale_note}) "
@@ -10287,8 +12014,8 @@ async def reconcile_agent_sessions() -> None:
                             id_or_task_id=agent_id,
                             status="dead",
                             result_summary=(
-                                f"Auto-closed by reconciler: output idle "
-                                f"after {elapsed}s"
+                                f"Auto-closed by reconciler: output idle after {elapsed}s"
+                                + (f" (workstream/status.md stale {int(now_ts - ws_mtime)}s)" if ws_is_stale else "")
                                 + (f" (mtime stale {int(now_ts - output_mtime)}s)" if file_is_stale else "")
                             ),
                         )
@@ -10304,7 +12031,6 @@ async def reconcile_agent_sessions() -> None:
 async def main():
     """Run the MCP server."""
     setup_logging()
-    _ensure_observation_worker()
 
     # Clear the dispatcher state file on startup so a stale session ID from a
     # previous run cannot linger and mislead hooks into thinking the old session
@@ -10351,6 +12077,21 @@ async def main():
             log.info("[startup] No stale 'running' sessions found at startup")
     except Exception as _cleanup_err:
         log.warning(f"[startup] Stale session cleanup failed (non-fatal): {_cleanup_err}")
+
+    # Startup recovery: move any messages abandoned in processing/ back to inbox/
+    # immediately on server start, before the dispatcher calls wait_for_messages.
+    # This complements the per-call recovery in handle_wait_for_messages: messages
+    # that entered processing/ before _SERVER_START_TIME are returned immediately
+    # (path 1 in _recover_stale_processing); timeout-based recovery runs later as
+    # the dispatcher loops. Running this at startup ensures the first
+    # wait_for_messages call sees a clean inbox/ with any pre-restart messages
+    # already surfaced, rather than waiting for them to age out in processing/.
+    try:
+        _recover_stale_processing()
+        _recover_retryable_messages()
+        log.info("[startup] Ran pre-restart message recovery (processing/ and failed/)")
+    except Exception as _recovery_err:
+        log.warning(f"[startup] Pre-restart message recovery failed (non-fatal): {_recovery_err}")
 
     asyncio.create_task(reconcile_agent_sessions())
 

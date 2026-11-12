@@ -1,0 +1,11 @@
+/home/lobster/lobster-workspace/logs/dispatch-boundary.jsonl {
+    weekly
+    rotate 4
+    size 10M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    create 644 lobster lobster
+}

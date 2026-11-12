@@ -20,10 +20,23 @@ Do NOT add per-test mocks for:
     LOBSTER_STATE_FILE, INBOX_DIR, OUTBOX_DIR, PROCESSED_DIR, PROCESSING_DIR,
     FAILED_DIR, CONFIG_DIR, AUDIO_DIR, SENT_DIR, SENT_REPLIES_DIR,
     TASK_REPLIED_DIR, TASKS_FILE, TASK_OUTPUTS_DIR, BISQUE_OUTBOX_DIR,
-    SCHEDULED_JOBS_DIR, SCHEDULED_JOBS_FILE, SCHEDULED_TASKS_TASKS_DIR,
-    SCHEDULED_TASKS_LOGS_DIR, LOG_DIR
+    AGENT_REPLIES_DIR, SCHEDULED_JOBS_DIR, SCHEDULED_JOBS_FILE,
+    SCHEDULED_TASKS_TASKS_DIR, SCHEDULED_TASKS_LOGS_DIR, LOG_DIR,
+    LOBSTER_INBOX_DIR (env var)
 
 These are all redirected automatically.
+
+LOBSTER_INBOX_DIR isolation
+----------------------------
+The ``isolate_lobster_inbox_dir`` fixture (autouse=True, session-scoped) sets the
+``LOBSTER_INBOX_DIR`` environment variable to a temporary directory for the entire
+test session.  This prevents any code that reads ``LOBSTER_INBOX_DIR`` at call time
+(e.g. ``_write_steward_trigger()`` in wos_completion.py) from writing to the live
+``~/messages/inbox/`` directory.
+
+Issue #915: without this fixture, tests that trigger the executing → ready-for-steward
+transition write ghost ``steward_trigger`` messages to the live inbox.  82 such messages
+were written across 5 pytest runs on 2026-04-24 before this guard was added.
 """
 
 import asyncio
@@ -37,32 +50,6 @@ from typing import Any, AsyncGenerator, Generator
 from unittest.mock import MagicMock, patch
 
 import pytest
-
-# ---------------------------------------------------------------------------
-# Force LOBSTER_WORKSPACE to an isolated temp dir for the whole test session,
-# BEFORE any test module can import src.bot.lobster_bot.
-#
-# Root cause this fixes: src/bot/lobster_bot.py resolves LOG_DIR from
-# LOBSTER_WORKSPACE at *module import time* and immediately attaches a
-# RotatingFileHandler to the shared "lobster" logger pointing at
-# LOG_DIR/telegram-bot.log. The isolate_inbox_server_paths fixture below only
-# patches src.mcp.inbox_server's path globals -- it has no equivalent guard
-# for src.bot.lobster_bot. On a machine where LOBSTER_WORKSPACE is set in the
-# environment (e.g. this host, where the always-on Lobster process exports
-# it), running pytest in that same shell/session causes lobster_bot.py to
-# import with the *real* production LOBSTER_WORKSPACE, and any test that
-# imports or exercises lobster_bot (handle_audio_message, handle_photo_message,
-# etc.) writes synthetic pytest/MagicMock log lines straight into the
-# production ~/lobster-workspace/logs/telegram-bot.log.
-#
-# Overriding (not just defaulting) LOBSTER_WORKSPACE here, unconditionally,
-# before any src.* module is imported, ensures lobster_bot.py's module-level
-# LOG_DIR always resolves to a throwaway temp directory during tests. This
-# does not affect tests that explicitly monkeypatch LOBSTER_WORKSPACE for
-# subprocess envs (env=os.environ.copy()-style dicts) -- those are unaffected
-# since they build their own env mapping.
-# ---------------------------------------------------------------------------
-os.environ["LOBSTER_WORKSPACE"] = tempfile.mkdtemp(prefix="lobster-test-workspace-")
 
 # Add source and tests directories to path
 SRC_DIR = Path(__file__).parent.parent / "src"
@@ -118,7 +105,7 @@ def isolate_inbox_server_paths(tmp_path: Path):
         messages/
             inbox/, outbox/, processed/, processing/, failed/,
             config/, audio/, sent/, sent-replies/, task-replied/,
-            task-outputs/, bisque-outbox/
+            task-outputs/, bisque-outbox/, agent-replies/
         workspace/
             logs/
             scheduled-jobs/
@@ -130,7 +117,7 @@ def isolate_inbox_server_paths(tmp_path: Path):
     for subdir in [
         "inbox", "outbox", "processed", "processing", "failed",
         "config", "audio", "sent", "sent-replies", "task-replied",
-        "task-outputs", "bisque-outbox",
+        "task-outputs", "bisque-outbox", "agent-replies",
     ]:
         (messages / subdir).mkdir(parents=True, exist_ok=True)
 
@@ -147,6 +134,9 @@ def isolate_inbox_server_paths(tmp_path: Path):
     state_file = messages / "config" / "lobster-state.json"
     log_dir = workspace / "logs"
 
+    outcome_ledger = workspace / "data" / "outcome-ledger.jsonl"
+    (workspace / "data").mkdir(parents=True, exist_ok=True)
+
     dirs_result = {
         "base": messages,
         "inbox": messages / "inbox",
@@ -162,6 +152,7 @@ def isolate_inbox_server_paths(tmp_path: Path):
         "tasks_file": messages / "tasks.json",
         "task_outputs": messages / "task-outputs",
         "bisque_outbox": messages / "bisque-outbox",
+        "agent_replies": messages / "agent-replies",
         "state_file": state_file,
         "log_dir": log_dir,
         "scheduled_jobs_dir": sched,
@@ -170,6 +161,8 @@ def isolate_inbox_server_paths(tmp_path: Path):
         "scheduled_tasks_logs": sched / "logs",
         # BIS-165 Slice 4: redirected DB path for tests that write to messages.db
         "messages_db": messages / "messages.db",
+        # Issue #754: outcome category ledger
+        "outcome_ledger": outcome_ledger,
     }
 
     # Ensure the module is in sys.modules before patching.  patch.multiple
@@ -210,6 +203,7 @@ def isolate_inbox_server_paths(tmp_path: Path):
             TASKS_FILE=messages / "tasks.json",
             TASK_OUTPUTS_DIR=messages / "task-outputs",
             BISQUE_OUTBOX_DIR=messages / "bisque-outbox",
+            AGENT_REPLIES_DIR=messages / "agent-replies",
             LOBSTER_STATE_FILE=state_file,
             LOG_DIR=log_dir,
             SCHEDULED_JOBS_DIR=sched,
@@ -218,6 +212,8 @@ def isolate_inbox_server_paths(tmp_path: Path):
             SCHEDULED_TASKS_LOGS_DIR=sched / "logs",
             # BIS-165 Slice 4: isolate DB path so tests never touch production messages.db
             MESSAGES_DB_PATH=messages / "messages.db",
+            # Issue #754: isolate outcome ledger so tests never write to production data/
+            OUTCOME_LEDGER_FILE=outcome_ledger,
         )
         if _test_claims_db is not None:
             # Issue #1360: isolate claim DB so SQLite claim rows don't bleed
@@ -232,80 +228,6 @@ def isolate_inbox_server_paths(tmp_path: Path):
         yield dirs_result
 
 
-# =============================================================================
-# Production Path Isolation for inbox_server_http.py (BIS-744)
-# =============================================================================
-# Sibling of isolate_inbox_server_paths above, for the separate
-# src/mcp/inbox_server_http.py module (the HTTP bridge that hosts the
-# push-calendar/gmail/workspace-token endpoints). This module resolves its
-# outbox/token/inbox directories via its own ``_MESSAGES_DIR`` global, which
-# defaults to the ``LOBSTER_MESSAGES`` env var (or ``~/messages`` if unset)
-# -- NOT the tmp_path-redirected globals patched above, since it is a
-# different module object entirely.
-#
-# Root cause this fixes: on any machine where LOBSTER_MESSAGES is set in the
-# real process environment (true of this VPS, where the live dispatcher/MCP
-# services export it), running this repo's push-token endpoint tests without
-# this fixture silently writes real confirmation files (and, for tests that
-# don't patch the token-dir globals, real token files) into the production
-# ``~/messages`` tree. This was caught during BIS-743/744 development: ~200
-# stray confirmation files with fake test chat_ids were found sitting in this
-# machine's real dead-letter queue, produced by ordinary `pytest` runs of the
-# pre-existing (BIS-728/730) push-endpoint characterization tests, which
-# never needed outbox isolation before BIS-743 added a confirmation step.
-_INBOX_SERVER_HTTP_MODULE = "src.mcp.inbox_server_http"
-
-
-@pytest.fixture(autouse=True)
-def isolate_inbox_server_http_paths(tmp_path: Path):
-    """Redirect inbox_server_http.py's path globals to tmp_path for every test.
-
-    Like ``isolate_inbox_server_paths``, this is autouse and requires no
-    per-test opt-in. Tests that need finer control (e.g. asserting file
-    contents) may still add their own narrower ``patch(...)`` on top of these
-    globals within a test body -- that composes safely, since the inner patch
-    simply overrides for the duration of its own ``with`` block and reverts
-    to this fixture's tmp_path afterward, never to the real production path.
-    """
-    http_messages = tmp_path / "http_messages"
-    gcal_dir = http_messages / "config" / "gcal-tokens"
-    gmail_dir = http_messages / "config" / "gmail-tokens"
-    workspace_dir = http_messages / "config" / "workspace-tokens"
-    inbox_dir = http_messages / "inbox"
-    outbox_dir = http_messages / "outbox"
-    for d in (gcal_dir, gmail_dir, workspace_dir, inbox_dir, outbox_dir):
-        d.mkdir(parents=True, exist_ok=True)
-
-    # inbox_server_http.py calls sys.exit(1) at import time if MCP_HTTP_TOKEN
-    # is unset. setdefault never overrides a real value already present in
-    # the environment (e.g. the live service's actual token) -- it only fills
-    # in a harmless placeholder when nothing is set, so import doesn't abort.
-    os.environ.setdefault("MCP_HTTP_TOKEN", "test-placeholder-conftest-isolation")
-
-    try:
-        import importlib
-        importlib.import_module(_INBOX_SERVER_HTTP_MODULE)
-    except BaseException:
-        # Catches SystemExit (the module's own sys.exit(1) guard) as well as
-        # ordinary import errors. Either way, degrade gracefully instead of
-        # aborting the entire test run for tests that never touch this module.
-        yield http_messages
-        return
-
-    try:
-        with patch.multiple(
-            _INBOX_SERVER_HTTP_MODULE,
-            _MESSAGES_DIR=http_messages,
-            _GCAL_TOKEN_DIR=gcal_dir,
-            _GMAIL_TOKEN_DIR=gmail_dir,
-            _WORKSPACE_TOKEN_DIR=workspace_dir,
-            _INBOX_DIR=inbox_dir,
-        ):
-            yield http_messages
-    except Exception:
-        yield http_messages
-
-
 @pytest.fixture
 def inbox_server_dirs(isolate_inbox_server_paths):
     """Expose the redirected inbox_server paths for tests that need to verify them.
@@ -314,6 +236,66 @@ def inbox_server_dirs(isolate_inbox_server_paths):
     when your test needs to know which tmp_path the server is writing to.
     """
     return isolate_inbox_server_paths
+
+
+@pytest.fixture(autouse=True)
+def isolate_executor_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect WOS executor output files away from the production outputs dir.
+
+    Sets the WOS_OUTPUTS_DIR environment variable to a per-test tmpdir so that
+    ``_output_ref_path()`` in executor.py writes to tmp_path instead of
+    ``~/lobster-workspace/orchestration/outputs/``.
+
+    This prevents test artifacts (including intentional failure cases) from
+    contaminating the production record.  See issue #819.
+
+    The redirect is transparent to tests: they can still inspect the output
+    files via the returned path if needed.  Tests that already monkeypatch
+    ``_OUTPUT_DIR_TEMPLATE`` directly continue to work — the env var is only
+    the *default* fallback inside ``_output_ref_path``.
+    """
+    outputs_dir = tmp_path / "orchestration" / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("WOS_OUTPUTS_DIR", str(outputs_dir))
+    return outputs_dir
+
+
+@pytest.fixture(autouse=True, scope="session")
+def isolate_lobster_inbox_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Redirect LOBSTER_INBOX_DIR to a temporary directory for the entire test session.
+
+    Any code that writes to the inbox by reading LOBSTER_INBOX_DIR from the
+    environment at call time (e.g. ``_write_steward_trigger()`` in wos_completion.py)
+    will write to this temp directory instead of the live ~/messages/inbox/.
+
+    The fixture creates the standard inbox subdirectory layout that production code
+    may expect:
+        <tmp>/inbox/
+        <tmp>/processing/
+        <tmp>/processed/
+        <tmp>/failed/
+
+    Restores (or unsets) the original env var value after the session ends.
+
+    See: Issue #915 — 82 ghost steward_trigger messages written to live inbox during
+    5 pytest runs because tests only patched REGISTRY_DB_PATH, not LOBSTER_INBOX_DIR.
+    """
+    # Create a session-level temp directory so it persists across all tests.
+    session_tmp = tmp_path_factory.mktemp("lobster_inbox_session", numbered=True)
+
+    for subdir in ("inbox", "processing", "processed", "failed"):
+        (session_tmp / subdir).mkdir(parents=True, exist_ok=True)
+
+    original_value = os.environ.get("LOBSTER_INBOX_DIR")
+    os.environ["LOBSTER_INBOX_DIR"] = str(session_tmp)
+
+    yield session_tmp
+
+    # Restore: unset if it wasn't set before, otherwise put the original back.
+    if original_value is None:
+        os.environ.pop("LOBSTER_INBOX_DIR", None)
+    else:
+        os.environ["LOBSTER_INBOX_DIR"] = original_value
 
 
 # =============================================================================

@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily pending-actions nudge — age-based Telegram ping for Dan-owned action items
+# LOBSTER-MANAGED
+
+[Timer]
+OnCalendar=*-*-* 15:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

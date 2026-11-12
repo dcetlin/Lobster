@@ -38,7 +38,8 @@ LOBSTER_DIR="$(dirname "$SCRIPT_DIR")"
 MESSAGES_DIR="${LOBSTER_MESSAGES:-$HOME/messages}"
 INBOX="$MESSAGES_DIR/inbox"
 TIMESTAMP=$(date +%s%3N)
-LOG_DIR="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/logs"
+WORKSPACE_DIR="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}"
+LOG_DIR="$WORKSPACE_DIR/logs"
 LOG_FILE="$LOG_DIR/nightly-consolidation.log"
 
 # Ensure directories exist

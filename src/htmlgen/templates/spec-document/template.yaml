@@ -1,0 +1,40 @@
+id: spec-document
+name: Spec (structured, versioned)
+description: Long-lived specs edited across many sessions. Section tracking, comment threads.
+content_format: json
+components:
+  - id: theme-toggle
+    config:
+      mode: js-toggle
+conventions_overrides: {}
+scaffold: content-scaffold.json
+
+# Agent selection rules
+selection_rules:
+  use_when:
+    - Document is long-lived and will be edited across many sessions
+    - Document has formal section coverage tracking (addressed flags)
+    - Document is an architecture spec, evolution plan, or system design document
+    - Document may grow to many sections with stable IDs that must not be renumbered
+    - Document requires machine-readable section structure (JSON manifest)
+  avoid_when:
+    - Document is primarily narrative and will not be tracked for section coverage
+    - Document is a dashboard or operational status page
+
+# Required sections (spec documents must have at least an overview)
+required_sections:
+  - id: s1
+    label: "§1"
+    title: Overview
+    addressed: false
+    tags: ["overview"]
+
+# Rendering parameters
+render_params:
+  inject_section_labels: true
+  auto_populate_clipboard_sections: false  # clipboard-copy-widget removed
+  header_pattern: doc-header  # doc-header with doc-title + doc-subtitle
+  footer: true
+  # Section ID stability: IDs in the manifest are permanent. Never renumber.
+  # When a section is removed, its ID is retired, not reassigned.
+  section_id_persistence: true

@@ -49,6 +49,7 @@ PENDING_DIR = _MESSAGES / "pending-transcription"
 INBOX_DIR = _MESSAGES / "inbox"
 AUDIO_DIR = _MESSAGES / "audio"
 DEAD_LETTER_DIR = _MESSAGES / "dead-letter"
+OUTBOX_DIR = _MESSAGES / "outbox"
 
 FFMPEG_PATH = Path.home() / ".local" / "bin" / "ffmpeg"
 WHISPER_CPP_PATH = _WORKSPACE / "whisper.cpp" / "build" / "bin" / "whisper-cli"
@@ -170,8 +171,38 @@ async def convert_ogg_to_wav(ogg_path: Path, wav_path: Path, timeout_s: int = TR
     return True
 
 
-async def run_whisper_cpp(audio_path: Path, timeout_s: int = TRANSCRIPTION_TIMEOUT_S) -> tuple[bool, str]:
-    """Run whisper.cpp CLI. Returns (success, transcription_or_error)."""
+# Matches a whisper-cli segment line and captures the end timestamp.
+# Example: [00:00:00.000 --> 00:00:05.120]  First segment text
+_SEGMENT_END_RE = re.compile(r"^\[[\d:.,]+ --> ([\d:.]+)\]")
+# Strips the full timestamp bracket for transcript extraction.
+_TIMESTAMP_RE = re.compile(r"^\[[\d:.,\s\-–>]+\]\s*")
+
+
+def _parse_ts_to_seconds(ts: str) -> float | None:
+    """Parse a HH:MM:SS.mmm or MM:SS.mmm timestamp string to seconds."""
+    try:
+        parts = ts.split(":")
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+    except Exception:
+        pass
+    return None
+
+
+async def run_whisper_cpp(
+    audio_path: Path,
+    timeout_s: int = TRANSCRIPTION_TIMEOUT_S,
+    progress_file: Path | None = None,
+) -> tuple[bool, str]:
+    """Run whisper.cpp CLI. Returns (success, transcription_or_error).
+
+    When progress_file is given, each completed segment's end timestamp (in
+    audio-seconds) is written to that file as a plain float.  The transcription
+    monitor reads this file to display a real completion percentage instead of
+    the 3x-realtime heuristic.
+    """
     if not WHISPER_CPP_PATH.exists():
         return False, f"whisper.cpp binary not found at {WHISPER_CPP_PATH}"
     if not WHISPER_MODEL_PATH.exists():
@@ -187,20 +218,45 @@ async def run_whisper_cpp(audio_path: Path, timeout_s: int = TRANSCRIPTION_TIMEO
         # last one, silently truncating long audio.  We let whisper output the
         # default "[HH:MM:SS.mmm --> HH:MM:SS.mmm]  text" format; the
         # post-processing below strips timestamp lines to produce clean text.
-        "--no-prints",  # suppress progress noise
+        "--print-progress",  # emit segment timestamps for real progress tracking
     ]
 
     proc: asyncio.subprocess.Process | None = None
+    stdout_lines: list[str] = []
+    stderr_chunks: list[bytes] = []
+
+    async def _drain_stdout(stream: asyncio.StreamReader) -> None:
+        async for line_bytes in stream:
+            line = line_bytes.decode(errors="replace").rstrip("\n")
+            stdout_lines.append(line)
+            if progress_file is not None:
+                m = _SEGMENT_END_RE.match(line)
+                if m:
+                    end_s = _parse_ts_to_seconds(m.group(1))
+                    if end_s is not None:
+                        try:
+                            progress_file.write_text(str(end_s))
+                        except Exception:
+                            pass
+
+    async def _drain_stderr(stream: asyncio.StreamReader) -> None:
+        async for chunk in stream:
+            stderr_chunks.append(chunk)
+
     try:
-        # Use a single deadline for both spawn and communicate so the effective
-        # wall-clock limit is exactly TRANSCRIPTION_TIMEOUT_S, not 2x.
+        # Use a single deadline for spawn + streaming so the effective
+        # wall-clock limit is exactly timeout_s.
         async with asyncio.timeout(timeout_s):
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
+            await asyncio.gather(
+                _drain_stdout(proc.stdout),
+                _drain_stderr(proc.stderr),
+            )
+            await proc.wait()
     except asyncio.TimeoutError:
         # Kill the child and reap it so it doesn't become a zombie.
         if proc is not None:
@@ -215,16 +271,15 @@ async def run_whisper_cpp(audio_path: Path, timeout_s: int = TRANSCRIPTION_TIMEO
         return False, f"whisper.cpp timed out after {timeout_s}s"
 
     if proc.returncode != 0:
-        error_msg = stderr.decode().strip() if stderr else "unknown error"
+        error_msg = b"".join(stderr_chunks).decode(errors="replace").strip() if stderr_chunks else "unknown error"
         return False, f"whisper.cpp exited {proc.returncode}: {error_msg}"
 
-    raw = stdout.decode().strip()
+    raw = "\n".join(stdout_lines).strip()
     # whisper-cli emits lines in the form:
     #   [HH:MM:SS.mmm --> HH:MM:SS.mmm]   transcription text here
     # The transcription text lives on the same line as the timestamp bracket,
     # so we must extract the text after "]" rather than discard the whole line.
     # Lines that contain no timestamp (e.g. blank lines) are included as-is.
-    _TIMESTAMP_RE = re.compile(r"^\[[\d:.,\s\-–>]+\]\s*")
     lines = []
     for ln in raw.split("\n"):
         stripped = ln.strip()
@@ -315,6 +370,46 @@ def notify_dispatcher_dead_letter(msg_data: dict, reason: str) -> None:
         log.warning(f"notify_dispatcher_dead_letter failed (non-fatal): {e}")
 
 
+def notify_transcription_complete(msg_data: dict) -> None:
+    """Write an outbox reply signalling that transcription is done and processing is starting.
+
+    Drops a reply JSON into ~/messages/outbox/ so lobster_bot.py picks it up
+    and sends it to the user via Telegram. This gives the user a visible ping
+    between the "Transcribing..." ack and the actual substantive reply, which
+    may arrive seconds later after Claude processes the transcript.
+
+    Silent on any failure — this feedback ping must never block the main
+    transcription pipeline.
+    """
+    try:
+        chat_id = msg_data.get("chat_id")
+        if not chat_id:
+            log.warning("notify_transcription_complete: no chat_id in msg_data, skipping ping")
+            return
+
+        reply_to_message_id = msg_data.get("telegram_message_id")
+        now = datetime.now(timezone.utc)
+        ts_ms = int(now.timestamp() * 1000)
+        reply_id = f"{ts_ms}_transcription_done_{uuid.uuid4().hex[:8]}"
+
+        reply: dict = {
+            "id": reply_id,
+            "source": msg_data.get("source", "telegram"),
+            "chat_id": chat_id,
+            "text": "✅ Transcription done — processing your message",
+            "timestamp": now.isoformat(),
+        }
+        if reply_to_message_id:
+            reply["reply_to_message_id"] = reply_to_message_id
+
+        OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
+        dest = OUTBOX_DIR / f"{reply_id}.json"
+        atomic_write_json(dest, reply)
+        log.info(f"Transcription-complete ping queued for chat_id={chat_id}: {reply_id}")
+    except Exception as e:
+        log.warning(f"notify_transcription_complete failed (non-fatal): {e}")
+
+
 def move_to_dead_letter(pending_file: Path, msg_data: dict, reason: str) -> None:
     """Move a failed file to dead-letter, annotating with failure reason."""
     DEAD_LETTER_DIR.mkdir(parents=True, exist_ok=True)
@@ -399,12 +494,18 @@ async def transcribe_pending_file(pending_file: Path) -> None:
                 return
     transcribe_path = wav_path if wav_path else audio_path
 
+    # Progress file: worker writes audio-seconds-processed here as a plain float
+    # so the transcription monitor can display a real completion percentage.
+    progress_file = PENDING_DIR / f"{pending_file.stem}.progress"
+
     # Retry loop
     last_error = ""
     try:
         for attempt in range(1, MAX_RETRIES + 1):
             log.info(f"  whisper attempt {attempt}/{MAX_RETRIES} for {pending_file.name}")
-            success, result = await run_whisper_cpp(transcribe_path, timeout_s=timeout_s)
+            success, result = await run_whisper_cpp(
+                transcribe_path, timeout_s=timeout_s, progress_file=progress_file
+            )
 
             if success and result:
                 # --- SUCCESS ---
@@ -423,6 +524,11 @@ async def transcribe_pending_file(pending_file: Path) -> None:
                 atomic_write_json(inbox_file, msg_data)
                 pending_file.unlink(missing_ok=True)
                 log.info(f"  Transcription done → inbox/{pending_file.name}")
+
+                # Ping the user so they know transcription finished and
+                # Claude is now processing — visible feedback before the
+                # substantive reply arrives.
+                notify_transcription_complete(msg_data)
                 return
 
             elif success and not result:
@@ -446,6 +552,8 @@ async def transcribe_pending_file(pending_file: Path) -> None:
         # Clean up the WAV file we created; the original OGG/OPUS is kept as-is.
         if wav_path is not None:
             wav_path.unlink(missing_ok=True)
+        # Clean up progress file regardless of outcome (success, dead-letter, or error).
+        progress_file.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------

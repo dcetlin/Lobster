@@ -142,7 +142,7 @@ write_boot_stamp() {
     # If state file already exists, merge booted_at in without losing other fields.
     # Fall back to writing a minimal JSON if the file is absent or unreadable.
     if [[ -f "$STATE_FILE" ]]; then
-        python3 -c "
+        uv run python3 -c "
 import json, sys
 path = '$STATE_FILE'
 now = '$now'
@@ -172,7 +172,7 @@ EOF
 
 read_state_mode() {
     if [[ -f "$STATE_FILE" ]]; then
-        python3 -c "
+        uv run python3 -c "
 import json, sys
 try:
     d = json.load(open('$STATE_FILE'))
@@ -377,41 +377,8 @@ kill_orphaned_mcp_processes() {
         # Skip systemd-managed services — they are independently lifecycle-managed,
         # not orphans. Killing them causes a restart race where Claude initializes
         # before the MCP server comes back up, leaving the session without MCP tools.
-        #
-        # NOTE: `systemctl status` has no `--pid` option. `systemctl status --pid
-        # "$pid"` always fails with "Unknown option '--pid'." (exit 1), which
-        # silently defeated this guard for every PID since it was added in #1551:
-        # the "systemd-managed" branch never triggered, so lobster-mcp-local.service
-        # was always treated as an orphan and SIGTERM'd here on every dispatcher
-        # restart (including the routine ~2h proactive session-age restart from
-        # #2060). RestartSec=0 masked the user-visible impact of the restart
-        # itself, but the service bounce still wiped in-memory session/lock state,
-        # producing spurious session-lost-reminder / dispatcher-marked-dead
-        # notifications with no actual dispatcher crash. See investigation for
-        # issues #2124 / #2142.
-        #
-        # #1551's fix ("pass the PID as a bare positional argument") replaced one
-        # bug with a subtler one (issue #2119): `systemctl status <pid>` does not
-        # ask "is this PID itself a systemd service" — it resolves the PID's
-        # cgroup to whichever unit owns that cgroup and reports THAT unit's
-        # status, exit 0, for *any* PID living anywhere inside it. Every process
-        # under lobster-claude.service's tmux session (the dispatcher, every MCP
-        # child it spawns, and any orphan reparented to PID 1 that still carries
-        # the same cgroup membership from when it was forked) resolves to
-        # lobster-claude.service and returns exit 0 — so this check has always
-        # treated every single MCP child, including hung/orphaned obsidian-mcp
-        # processes, as "systemd-managed" and skipped it. Confirmed empirically
-        # against live orphaned obsidian-mcp PIDs (PPID=1, one per session-age
-        # restart, accumulating indefinitely — see issue #2119).
-        #
-        # Fix: only the process that is actually the recorded MainPID of the
-        # protected unit should be skipped. Compare against MainPID directly
-        # instead of asking "does this PID's cgroup resolve to some unit".
-        local protected_service="${LOBSTER_MCP_SERVICE_NAME:-lobster-mcp.service}"
-        local protected_main_pid
-        protected_main_pid=$(systemctl show -p MainPID --value "$protected_service" 2>/dev/null || true)
-        if [[ -n "$protected_main_pid" && "$protected_main_pid" != "0" && "$pid" == "$protected_main_pid" ]]; then
-            log "CLEANUP: MCP PID $pid is the systemd-managed ${protected_service} MainPID — skipping"
+        if systemctl status --pid "$pid" >/dev/null 2>&1; then
+            log "CLEANUP: MCP PID $pid is a systemd-managed service — skipping"
             skipped=$((skipped + 1))
             continue
         fi
@@ -575,7 +542,7 @@ launch_claude() {
     # the background write would overwrite "hibernate" with "active", causing
     # the health check to see mode=active + no WFM heartbeat → false restart.
     # Only write "active" if the current mode is NOT "hibernate".
-    ( sleep 5 && current_mode=$(read_state_mode 2>/dev/null || echo "unknown"); [[ "$current_mode" != "hibernate" ]] && write_state "active" "claude running, attempt=$attempt" ) &
+    ( sleep 5 && current_mode=$(read_state_mode 2>/dev/null || echo "unknown"); [[ "$current_mode" != "hibernate" && "$current_mode" != "quota_wait" ]] && write_state "active" "claude running, attempt=$attempt" ) &
 
     # Write the dispatcher PID file so the health check can target this specific
     # process for cleanup without relying on ambiguous pgrep matches.
@@ -586,6 +553,17 @@ launch_claude() {
     # shell's PID in bash, so $BASHPID is required here.
     local dispatcher_pid_file="$MESSAGES_DIR/config/dispatcher.pid"
     mkdir -p "$(dirname "$dispatcher_pid_file")"
+
+    # Write a session-start sentinel to the session log BEFORE launching Claude.
+    # The quota-exhaustion check reads this log after Claude exits; without a
+    # per-session boundary the check can match "You've hit your limit" lines
+    # that were written by a previous session (the log is append-only and never
+    # rotated), producing a false-positive that puts the system to sleep until
+    # midnight even when the current quota is fine.  The sentinel is a fixed
+    # string that awk uses to reset its scan window, so only lines from the
+    # current session are tested.
+    echo "=== SESSION_START attempt=$attempt ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) ===" \
+        >> "$LOG_DIR/claude-session.log"
 
     (
         echo "$BASHPID" > "$dispatcher_pid_file"
@@ -598,8 +576,27 @@ launch_claude() {
         # injects dispatcher bootup context. Stale flags (dead PID) are ignored.
         mkdir -p "$WORKSPACE_DIR/data"
         echo "$BASHPID" > "$WORKSPACE_DIR/data/dispatcher-startup-flag"
+        local _dispatcher_model="${LOBSTER_DISPATCHER_MODEL:-sonnet}"
+        if [[ "$_dispatcher_model" == "auto" ]]; then
+            # Auto-fallback: if cc-usage-poller has fresh data showing Sonnet
+            # weekly >= 95%, fall back to opus. Otherwise default to sonnet.
+            # Stale data (>2h) is treated as "unknown" → keep sonnet.
+            local _budget="$HOME/.claude/cc-budget/state.json"
+            _dispatcher_model="sonnet"
+            if [[ -f "$_budget" ]]; then
+                local _sonnet_pct _ts _age
+                _sonnet_pct=$(jq -r '.rate_limits.seven_day_sonnet.pct // empty' "$_budget" 2>/dev/null)
+                _ts=$(jq -r '.ts // 0' "$_budget" 2>/dev/null)
+                _age=$(( $(date +%s) - ${_ts:-0} ))
+                if [[ -n "$_sonnet_pct" && $_age -lt 7200 ]]; then
+                    if awk -v p="$_sonnet_pct" 'BEGIN{exit !(p+0 >= 95)}'; then
+                        _dispatcher_model="opus"
+                    fi
+                fi
+            fi
+        fi
         exec claude --dangerously-skip-permissions \
-            --model sonnet \
+            --model "$_dispatcher_model" \
             --max-turns 150 \
             -p "$init_prompt"
     ) 2>&1 | tee -a "$LOG_DIR/claude-session.log" || claude_exit_code=$?
@@ -640,7 +637,7 @@ handle_exit() {
             now=$(date -Iseconds)
             local tmp_state
             tmp_state=$(mktemp "${STATE_FILE}.tmp.XXXXXX")
-            python3 -c "
+            uv run python3 -c "
 import json
 path = '$STATE_FILE'
 now = '$now'
@@ -676,8 +673,110 @@ with open('$tmp_state', 'w') as f:
         log "Claude exited with code $exit_code. Will restart after backoff."
         write_state "restarting" "exit_code=$exit_code"
 
-        # Detect auth failures from session log
-        if tail -5 "$LOG_DIR/claude-session.log" 2>/dev/null | grep -q "authentication_error\|OAuth token has expired\|API usage limits"; then
+        # Detect quota exhaustion — sleep until midnight UTC before retrying.
+        # Only scan output from the *current* session to avoid false positives
+        # from stale quota messages left in the append-only log by prior sessions.
+        # awk resets its capture window each time it sees a SESSION_START sentinel,
+        # so `current_session_output` contains only what this session wrote.
+        #
+        # Two distinct quota message patterns observed in practice:
+        #   "You've hit your limit · resets Xam (UTC)"   — 5-hour session window
+        #   "You're out of extra usage · resets ..."     — weekly quota exhausted
+        # The phrase is the discriminator; the reset timestamp in the message
+        # is human-readable only and not used for sleep calculation here.
+        local current_session_output
+        current_session_output=$(awk '/^=== SESSION_START /{buf=""} {buf=buf"\n"$0} END{print buf}' \
+            "$LOG_DIR/claude-session.log" 2>/dev/null)
+        if echo "$current_session_output" | grep -qiE "out of extra usage|hit your ([A-Za-z]+ )?limit|you.re out of"; then
+            # Classify quota type from the message text to send a specific alert.
+            local quota_type="unknown"
+            if echo "$current_session_output" | grep -qi "out of extra usage\|you.re out of"; then
+                quota_type="weekly"
+            elif echo "$current_session_output" | grep -qiE "hit your ([A-Za-z]+ )?limit"; then
+                quota_type="session"
+            fi
+
+            log "QUOTA EXHAUSTED: Detected usage quota error (type=$quota_type). Parsing actual reset time."
+            local now reset_ts sleep_secs wake_time_et
+            now=$(date +%s)
+            
+            # Extract reset time from error like "resets 6pm (UTC)"
+            local reset_str=$(echo "$current_session_output" | grep -oP 'resets \K[^(]+' | head -1 | xargs)
+            
+            if [[ -n "$reset_str" ]]; then
+                reset_ts=$(date -u -d "$reset_str" +%s 2>/dev/null || echo "")
+                if [[ -z "$reset_ts" ]] || [[ $reset_ts -lt $now ]]; then
+                    reset_ts=$(date -u -d "tomorrow $reset_str" +%s 2>/dev/null || echo "")
+                fi
+            fi
+            
+            if [[ -z "$reset_ts" ]] || [[ $reset_ts -lt $now ]]; then
+                reset_ts=$(date -u -d 'tomorrow 00:00:00' +%s)
+                log "QUOTA: Using midnight UTC fallback"
+            else
+                log "QUOTA: Parsed reset time from error: $reset_str"
+            fi
+            
+            sleep_secs=$(( reset_ts - now ))
+            wake_time_et=$(TZ="America/New_York" date -d "@$reset_ts" "+%-I:%M %p ET")
+            write_state "quota_wait" "sleeping until quota reset time ($wake_time_et), ${sleep_secs}s, type=$quota_type"
+
+            local quota_alert_text
+            if [[ "$quota_type" == "session" ]]; then
+                quota_alert_text="⏸ *Session Quota Hit*
+
+Usage quota hit (5h session limit). Sleeping until quota resets. Will auto-restart."
+            elif [[ "$quota_type" == "weekly" ]]; then
+                quota_alert_text="⏸ *Weekly Quota Hit*
+
+Usage quota hit (weekly limit). Sleeping until midnight UTC ($wake_time_et). Will auto-restart at quota reset."
+            else
+                quota_alert_text="⏸ *Lobster Quota Exhausted*
+
+Usage quota hit. Sleeping until midnight UTC ($wake_time_et).
+Will auto-restart at quota reset. No action needed."
+            fi
+            send_telegram_alert "$quota_alert_text"
+            sleep "$sleep_secs"
+            log "QUOTA WAIT COMPLETE: Midnight UTC reached, resuming restart."
+
+            # Pre-flight drain check: after a quota-exhaustion midnight restart,
+            # the inbox may contain many stale messages that piled up overnight.
+            # The health checker fires every 4 minutes — if it sees a large inbox
+            # immediately after restart it will attempt another restart, creating
+            # the same feedback loop that caused the 2026-04 restart storm (433
+            # restarts in 3 hours). Wait until the inbox drops below
+            # INBOX_DRAIN_THRESHOLD before writing "restarting" so Claude can
+            # start processing the backlog rather than being killed again.
+            local INBOX_DRAIN_THRESHOLD=5
+            local INBOX_DRAIN_POLL_INTERVAL=30
+            local INBOX_DRAIN_TIMEOUT=600  # 10 minutes
+            local drain_elapsed=0
+            log "QUOTA PREFLIGHT: Waiting for inbox to drain to < $INBOX_DRAIN_THRESHOLD messages before restart..."
+            while true; do
+                local inbox_count
+                inbox_count=$(ls "$MESSAGES_DIR/inbox/" 2>/dev/null | wc -l)
+                log "QUOTA PREFLIGHT: inbox count = $inbox_count (threshold: $INBOX_DRAIN_THRESHOLD, elapsed: ${drain_elapsed}s)"
+                if [[ "$inbox_count" -lt "$INBOX_DRAIN_THRESHOLD" ]]; then
+                    log "QUOTA PREFLIGHT: Inbox drained (count=$inbox_count) — proceeding with restart."
+                    break
+                fi
+                if [[ "$drain_elapsed" -ge "$INBOX_DRAIN_TIMEOUT" ]]; then
+                    log "QUOTA PREFLIGHT: Drain timeout (${INBOX_DRAIN_TIMEOUT}s) reached with inbox_count=$inbox_count — proceeding anyway."
+                    break
+                fi
+                sleep "$INBOX_DRAIN_POLL_INTERVAL"
+                drain_elapsed=$(( drain_elapsed + INBOX_DRAIN_POLL_INTERVAL ))
+            done
+
+            write_state "restarting" "quota_wait_complete"
+            AUTH_FAIL_COUNT=0
+            AUTH_FAIL_ALERTED=false
+            return 1
+        fi
+
+        # Detect auth failures from session log (current session only)
+        if echo "$current_session_output" | grep -q "authentication_error\|OAuth token has expired\|API usage limits"; then
             AUTH_FAIL_COUNT=$((AUTH_FAIL_COUNT + 1))
             if [[ $AUTH_FAIL_COUNT -ge 3 ]] && [[ "$AUTH_FAIL_ALERTED" != "true" ]]; then
                 AUTH_FAIL_ALERTED=true
@@ -718,26 +817,6 @@ wait_for_wake() {
 }
 
 #===============================================================================
-# Startup alert
-#
-# The "Lobster Starting" alert is sent once per main() invocation, i.e. on
-# every lobster-claude.service start: manual restarts, deploys, scheduled
-# recycles and every iteration of a crash/restart loop alike. During a restart
-# loop this produces many near-identical messages in a short window, and
-# LOBSTER_DEBUG does not control this path. LOBSTER_STARTUP_NOTIFY (default
-# true, preserving the original behavior) lets an operator silence it; when
-# false, the suppression is recorded in the log instead.
-#===============================================================================
-maybe_send_startup_alert() {
-    if [[ "${LOBSTER_STARTUP_NOTIFY:-true}" == "true" ]]; then
-        send_telegram_alert "🔄 *Lobster Starting*
-Claude persistent session initializing."
-    else
-        log "Startup Telegram alert suppressed (LOBSTER_STARTUP_NOTIFY=false)"
-    fi
-}
-
-#===============================================================================
 # Main Loop
 #===============================================================================
 main() {
@@ -768,7 +847,8 @@ main() {
     # expecting a running Claude process or a drained inbox.
     write_boot_stamp
 
-    maybe_send_startup_alert
+    send_telegram_alert "🔄 *Lobster Starting*
+Claude persistent session initializing."
 
     local attempt=0
     local max_rapid_restarts=5
@@ -829,10 +909,4 @@ main() {
 trap 'log "Received SIGTERM, shutting down..."; write_state "stopped" "sigterm"; exit 0' SIGTERM
 trap 'log "Received SIGINT, shutting down..."; write_state "stopped" "sigint"; exit 0' SIGINT
 
-# Only run main when executed directly. When sourced (e.g. by a test harness
-# exercising kill_orphaned_mcp_processes/kill_orphaned_claude_processes in
-# isolation), skip the auto-run so the caller controls exactly what runs.
-# No behavior change for the normal systemd/tmux launch path.
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main "$@"
-fi
+main "$@"

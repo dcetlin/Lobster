@@ -6,21 +6,27 @@ Injects a reminder if write_result was not called during the session.
 Dispatcher sessions (detected via session_role.is_dispatcher()) are exempt —
 the dispatcher never calls write_result, so the check only applies to subagents.
 
-Built-in helper agents are exempt too: a SubagentStop whose agent type is on
-the allowlist in hooks/helper_agent_types.py (default ``Explore,Plan``) exits
-0 without write_result. The type comes from the payload's ``agent_type``
-field, falling back to the sibling ``.meta.json`` Claude Code writes next to
-the agent transcript.
-
 When write_result was called, this hook also marks the session completed in
 agent_sessions.db synchronously — without relying on the unreliable server-side
 auto-unregister path in inbox_server.py.
 
-It also appends a "done" entry to inflight-work.jsonl for each task_id seen in
-a valid write_result call (see `_append_inflight_done_entry`), automating the
-bookkeeping step documented in .claude/sys.dispatcher.bootup.md's "In-Flight
-Work Tracking" section that previously depended on the dispatcher manually
-running a Bash append after every subagent_result message.
+## Auto-archive-on-completion (structural, not preamble-only)
+
+On a successful write_result call (status == "success"), this hook also
+attempts to archive the subagent's workstream directory:
+`workstreams/<task_id>/` -> `workstreams/archive/<task_id>/`.
+
+This mechanizes assessments/workstreams-canonicity-model-20260704.md §4 at
+the tooling layer rather than relying on the agent remembering the
+documentation-only preamble step in CLAUDE.md's Long-Running Dispatch
+Preamble (step 6). The hook fires whenever CC observes a SubagentStop/Stop
+event with a valid write_result call — regardless of whether the agent's
+prompt included the preamble, or whether the agent "remembered" to archive.
+
+The archive attempt is a no-op (not an error) when no workstream directory
+exists for the task_id — most subagents never create one. See
+`_archive_workstream_dir` for the path-safety checks applied before any
+filesystem move.
 
 ## Session ID strategy
 
@@ -39,14 +45,11 @@ To close both rows we call session_end() with up to three identifiers:
      when the dispatcher set task_id in register_agent, or when the subagent uses
      a stable task_id that both parties know).
   b. The session_id from hook data (matches the auto-register stub by `id`).
-  c. The agent_id from SubagentStop hook data (matches the proper row by
-     `id`). This reaches the row even when the write_result task_id differs
-     from the spawn task_id; the row's spawn task_id is then also marked done
-     in inflight-work.jsonl (see `_plan_agent_id_close`).
 
-When none of these reach the proper row (e.g. a Stop event, which carries
-no agent_id), the reconciler in inbox_server.py will close it when it
-detects stop_reason=end_turn in the output file.
+The proper hex-ID row is the primary target but is only reachable when
+task_id matches. When it is not reachable via this hook, the reconciler in
+inbox_server.py will close it when it detects stop_reason=end_turn in the
+output file.
 
 ## SubagentStop vs Stop transcript handling
 
@@ -93,6 +96,8 @@ The file is cleaned up after the fallback emit.
 """
 import json
 import os
+import re
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -101,7 +106,6 @@ from pathlib import Path
 # Import shared session role utility.
 sys.path.insert(0, str(Path(__file__).parent))
 from session_role import is_dispatcher, get_session_id
-from helper_agent_types import is_helper_agent_type, subagent_stop_agent_type
 
 # JSON to emit on every successful (allow) exit — suppresses the
 # "Stop hook feedback: No stderr output" injection that CC 2.1.76+ produces
@@ -141,50 +145,6 @@ def _extract_write_result_task_ids(all_tool_use_items: list) -> list[str]:
                 seen.add(tid)
                 result.append(tid)
     return result
-
-
-# inflight-work.jsonl path -- override via env var for testability, matching
-# the convention used by scripts/save-inflight-prompt.py and on-fresh-start.py.
-INFLIGHT_WORK_FILE = Path(
-    os.environ.get(
-        "LOBSTER_INFLIGHT_WORK_FILE_OVERRIDE",
-        os.path.expanduser("~/lobster-workspace/data/inflight-work.jsonl"),
-    )
-)
-
-
-def _append_inflight_done_entry(task_id: str) -> None:
-    """Best-effort: append a 'done' entry to inflight-work.jsonl for task_id.
-
-    Automates the "done" bookkeeping write that was previously a manual
-    dispatcher step performed inline while handling subagent_result messages
-    (see .claude/sys.dispatcher.bootup.md, "In-Flight Work Tracking") --
-    confirmed unreliable in production (no new entries since 2026-05-31
-    despite many subsequent agent completions). This hook fires at the exact
-    moment write_result was confirmed called with a valid chat_id, which is
-    the same reliable trigger point the manual instructions described, but no
-    longer dependent on the dispatcher's own later processing of the
-    subagent_result message.
-
-    Idempotent by construction: inflight-work.jsonl is an append-only log and
-    consumers (on-fresh-start.py, dispatcher-state-stop.py) treat a task_id as
-    "done" if *any* entry has status == "done", so appending a duplicate
-    "done" line for the same task_id (e.g. hook re-fire) is harmless.
-
-    Never raises -- mirrors _mark_session_completed's best-effort failure
-    policy so a bookkeeping problem never blocks the subagent from exiting.
-    """
-    try:
-        entry = {
-            "task_id": task_id,
-            "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "status": "done",
-        }
-        INFLIGHT_WORK_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(INFLIGHT_WORK_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception:  # noqa: BLE001
-        pass  # Best-effort; never block exit
 
 
 def _mark_session_completed(id_or_task_id: str) -> None:
@@ -229,59 +189,82 @@ def _mark_session_notified(id_or_task_id: str) -> None:
         pass  # DB update is best-effort; never block exit
 
 
-def _own_agent_row(row: dict | None, agent_id: str) -> dict | None:
-    """Return row only if it is the spawned agent's own, non-dispatcher row.
+# ---------------------------------------------------------------------------
+# Auto-archive-on-completion (canonicity-model-20260704.md §4, mechanized)
+# ---------------------------------------------------------------------------
 
-    Pure. find_session() matches on `id` OR `task_id`, so a row is accepted
-    only when its `id` equals agent_id exactly. The dispatcher's own row is
-    never closed from a subagent stop (Dispatcher-Exclusion invariant,
-    docs/INVARIANTS.md).
+_SAFE_SLUG_RE = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _archive_workstream_dir(task_id: str, workspace_root: "Path | None" = None) -> bool:
+    """Move workspace_root/workstreams/<task_id>/ to .../workstreams/archive/<task_id>/.
+
+    Returns True if a move happened, False otherwise (no-op or skipped).
+    Never raises — any failure is swallowed so the hook always exits 0.
+
+    Safety checks, in order:
+    - task_id must be a non-empty string matching a safe slug pattern
+      (alphanumerics, dash, underscore only) — rejects path-traversal payloads
+      like "../../etc" outright, before any path is constructed.
+    - The resolved source directory must be a direct child of workstreams_root
+      (defense in depth in case the slug check is ever weakened).
+    - Source must exist and be a directory; if absent, this is the normal case
+      for the vast majority of subagents (no workstream dir was ever created)
+      and is a silent no-op, not a failure.
+    - Destination must not already exist — never overwrite an existing archive
+      entry; skip instead (idempotent re-fires of this hook do nothing after
+      the first successful move).
     """
-    if not row or row.get("id") != agent_id:
-        return None
-    if (row.get("agent_type") or "") == "dispatcher":
-        return None
-    return row
+    if not task_id or not _SAFE_SLUG_RE.fullmatch(task_id):
+        return False
 
-
-def _plan_agent_id_close(
-    write_result_task_ids: list[str],
-    agent_id: str | None,
-    spawn_task_id: str | None,
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Return (ids_to_close, done_task_ids) for the agent_id close path.
-
-    Pure. The SubagentStop payload's agent_id is the `id` of the row that
-    auto-register-agent.py inserted at spawn, while that row's `task_id` (and
-    the matching inflight-work "running" entry) comes from the prompt
-    frontmatter. When the task_id passed to write_result differs from the
-    spawn task_id, the write_result-keyed close matches no row, so:
-
-    - ids_to_close: agent_id, unless it was already tried as a write_result
-      task_id.
-    - done_task_ids: the spawn task_id, unless a write_result task_id already
-      covered it.
-    """
-    if not agent_id:
-        return (), ()
-    already = set(write_result_task_ids)
-    ids_to_close = () if agent_id in already else (agent_id,)
-    done_task_ids = (
-        (spawn_task_id,) if spawn_task_id and spawn_task_id not in already else ()
-    )
-    return ids_to_close, done_task_ids
-
-
-def _find_session_row(agent_id: str) -> dict | None:
-    """Best-effort read of the session row for agent_id. None on any failure."""
     try:
-        hooks_dir = Path(__file__).parent
-        repo_src = hooks_dir.parent / "src"
-        sys.path.insert(0, str(repo_src))
-        from agents.session_store import find_session  # noqa: PLC0415
-        return find_session(agent_id)
+        if workspace_root is None:
+            workspace_root = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace"))
+
+        workstreams_root = (workspace_root / "workstreams").resolve()
+        src = (workstreams_root / task_id)
+        dst_root = workstreams_root / "archive"
+        dst = dst_root / task_id
+
+        if not src.exists():
+            return False  # nothing to archive — normal case, not an error
+
+        if src.resolve().parent != workstreams_root:
+            return False  # defense in depth; should be unreachable given the slug check
+
+        if not src.is_dir():
+            return False  # not a directory — leave whatever this is alone
+
+        if dst.exists():
+            return False  # already archived, or name collision — never overwrite
+
+        dst_root.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+        return True
     except Exception:
-        return None  # DB read is best-effort; never block exit
+        return False  # best-effort; never block hook exit
+
+
+def _maybe_auto_archive_workstreams(
+    write_result_items: list, workspace_root: "Path | None" = None
+) -> None:
+    """Auto-archive the workstream dir for each successful write_result call.
+
+    Structural enforcement, not documentation: this runs from the SubagentStop/
+    Stop hook whenever CC observes a valid write_result tool call, independent
+    of whether the dispatched agent's prompt included (or the agent honored)
+    the CLAUDE.md Long-Running Dispatch Preamble's auto-archive step. Failed
+    tasks (status == "error") are left alone, matching the preamble's own
+    "skip if failed" guidance — the reconciler should still be able to find
+    an in-progress or failed task's workstream dir in the active namespace.
+    """
+    for item in write_result_items:
+        inp = item.get("input", {})
+        status = inp.get("status", "success")
+        task_id = inp.get("task_id", "")
+        if status == "success":
+            _archive_workstream_dir(task_id, workspace_root=workspace_root)
 
 
 def _load_transcript_from_jsonl(path: str) -> list:
@@ -524,28 +507,10 @@ def _write_synthetic_inbox_message(
             f"Content recovered from transcript after {MAX_HOOK_FIRES} hook fires."
         )
 
-        if not content:
-            # No recoverable content means there is nothing actionable for the
-            # dispatcher to relay or decide on. Writing this to inbox/ forces a
-            # full dispatcher turn (wait_for_messages wake + mark_processed) for
-            # zero information — this fires every ~3-4 min from the known
-            # phantom-hook issue (GitHub #2175), so route it to a log file
-            # instead of burning a dispatcher turn on an empty message.
-            try:
-                log_dir = Path(os.path.expanduser("~/lobster-workspace/logs"))
-                log_dir.mkdir(parents=True, exist_ok=True)
-                log_line = (
-                    f"[{now.isoformat()}] {recovery_note} "
-                    f"task_id_hint={task_id_hint!r} agent_id={data.get('agent_id')!r} "
-                    f"session_id={data.get('session_id')!r}\n"
-                )
-                with open(log_dir / "ghost-agent-recovery.log", "a") as f:
-                    f.write(log_line)
-            except Exception:
-                pass
-            return
-
-        text = f"{recovery_note}\n\nRecovered content:\n\n{content}"
+        if content:
+            text = f"{recovery_note}\n\nRecovered content:\n\n{content}"
+        else:
+            text = f"{recovery_note}\n\n(No recoverable transcript content found.)"
 
         message = {
             "id": message_id,
@@ -585,12 +550,6 @@ def main():
     hook_event = data.get("hook_event_name", "")
     is_subagentstop = hook_event == "SubagentStop"
 
-    # Built-in helper agents (Explore, Plan) never run the write_result
-    # protocol and were never registered, so there is nothing to enforce.
-    if is_subagentstop and is_helper_agent_type(subagent_stop_agent_type(data)):
-        _cleanup_fire_state(_fire_count_path(_agent_key(data)))
-        _exit_ok()
-
     if is_subagentstop:
         # SubagentStop: transcript is in a JSONL file at agent_transcript_path.
         # CC does NOT include an inline transcript field for this event.
@@ -598,61 +557,6 @@ def main():
         if not transcript_path:
             # No path provided — can't verify; allow exit to avoid blocking.
             _exit_ok()
-
-        # --- Ghost fast-path (issue #2175) -----------------------------------
-        # Investigation on 2026-08-10 confirmed: every real Task-tool subagent
-        # gets an agent-<agent_id>.jsonl (and sibling .meta.json) file created
-        # under .claude/projects/<project>/<dispatcher-session-id>/subagents/
-        # at SPAWN time — before the subagent produces a single turn. Dozens of
-        # "phantom" SubagentStop fires were sampled (agent_ids with no row in
-        # agent_sessions.db, no register_agent call, no meta.json, and — this is
-        # the new finding — no transcript file on disk AT ALL, not merely an
-        # empty one). These ghosts cluster in tight ~20-40s bursts strictly
-        # during periods when a real session (dispatcher or subagent) is
-        # actively making tool calls, and go completely silent for hours during
-        # idle windows — ruling out a periodic cron/systemd timer (checked:
-        # crontab, systemd timers, nothing matches). This points to a Claude
-        # Code harness-internal mechanism (not a Lobster-side bug) that
-        # allocates an agent_id and fires SubagentStop for something that was
-        # never a real Agent/Task-tool spawn.
-        #
-        # Previously the hook would blindly retry-block (exit 2) up to
-        # MAX_HOOK_FIRES=5 times over ~2-3 minutes before giving up — for a
-        # session that structurally can never call write_result because it was
-        # never running Lobster's system prompt. Since a missing transcript
-        # file (FileNotFoundError, not just an empty/malformed one) is now a
-        # reliable, cheap, first-fire signal for "this is not a real Lobster
-        # subagent", short-circuit immediately: log once and exit clean instead
-        # of paying for 5 rounds of blocking retries per ghost.
-        if not os.path.exists(transcript_path):
-            try:
-                log_dir = Path(os.path.expanduser("~/lobster-workspace/logs"))
-                log_dir.mkdir(parents=True, exist_ok=True)
-                now = datetime.now(timezone.utc)
-                log_line = (
-                    f"[{now.isoformat()}] Ghost SubagentStop fast-path: "
-                    f"agent_transcript_path does not exist on disk (never a real "
-                    f"Task-tool spawn). agent_id={data.get('agent_id')!r} "
-                    f"session_id={data.get('session_id')!r} "
-                    f"transcript_path={transcript_path!r}\n"
-                )
-                with open(log_dir / "ghost-agent-recovery.log", "a") as f:
-                    f.write(log_line)
-                # Also append the full raw hook payload to a rolling debug log
-                # so a future investigation can inspect whatever additional
-                # fields CC sends for these ghosts (e.g. to finally confirm
-                # which internal CC mechanism produces them).
-                debug_path = log_dir / "ghost-agent-raw-input.jsonl"
-                with open(debug_path, "a") as f:
-                    f.write(json.dumps({"logged_at": now.isoformat(), "hook_input": data}) + "\n")
-            except Exception:
-                pass  # Best-effort diagnostics; never block exit
-            # Clean up any fire-count temp file that may exist for this key
-            # (defensive — normally none exists yet on the fast path).
-            key = _agent_key(data)
-            _cleanup_fire_state(_fire_count_path(key))
-            _exit_ok()
-
         transcript = _load_transcript_from_jsonl(transcript_path)
     else:
         # Stop hook: CC 2.1.76+ passes transcript_path (JSONL file), not inline.
@@ -703,15 +607,6 @@ def main():
             if session_id:
                 _mark_session_completed(session_id)
 
-            # Append inflight-work.jsonl "done" entries (issue: automate-
-            # inflight-work-writes). Only task_ids from write_result inputs
-            # are used here -- not session_id -- because inflight-work.jsonl
-            # "running" entries are keyed by the dispatcher's task_id (see
-            # auto-register-agent.py's write_inflight_running_entry), the same
-            # value a well-behaved subagent passes back to write_result.
-            for tid in write_result_task_ids:
-                _append_inflight_done_entry(tid)
-
             # Set notified_at on all rows so the reconciler never sees them as
             # unnotified and enqueues duplicate subagent_notification messages.
             # Order: complete first, notify second (terminal state before marking
@@ -731,28 +626,17 @@ def main():
             if session_id:
                 _mark_session_notified(session_id)
 
-            # Close the spawned agent's own row by the payload agent_id (its
-            # `id` column), and mark its spawn task_id done in inflight-work.
-            # The write_result task_id may differ from the spawn task_id (fixed
-            # string in an agent definition, typo, per-invocation suffix), in
-            # which case the task_id-keyed calls above match nothing.
-            agent_id = data.get("agent_id") or ""
-            if agent_id:
-                row = _own_agent_row(_find_session_row(agent_id), agent_id)
-                if row is not None:
-                    ids_to_close, done_task_ids = _plan_agent_id_close(
-                        write_result_task_ids, agent_id, row.get("task_id")
-                    )
-                    for aid in ids_to_close:
-                        _mark_session_completed(aid)
-                        _mark_session_notified(aid)
-                    for tid in done_task_ids:
-                        _append_inflight_done_entry(tid)
-
             # Clean up any fire-count temp file — the agent eventually called
             # write_result, so reset the counter for this session.
             key = _agent_key(data)
             _cleanup_fire_state(_fire_count_path(key))
+
+            # Structural auto-archive-on-completion (canonicity-model-20260704.md
+            # §4): move workstreams/<task_id>/ to workstreams/archive/<task_id>/
+            # for each successful write_result call. Best-effort and a no-op for
+            # the common case (no workstream dir ever created) — see
+            # _archive_workstream_dir for the safety checks.
+            _maybe_auto_archive_workstreams(valid_calls)
 
             _exit_ok()
         else:
@@ -789,6 +673,18 @@ def main():
 
         content = _extract_pre_hook_text(transcript, first_fire_ts, _FALLBACK_TURNS)
         _write_synthetic_inbox_message(data, content, task_id_hint)
+
+        # If this is a WOS executor task, mark the UoW as explicitly failed now
+        # rather than waiting for the TTL orphan sweep (issue: executing_orphan gap).
+        if task_id_hint and task_id_hint.startswith("wos-uow_"):
+            try:
+                hooks_dir = Path(__file__).parent
+                repo_src = hooks_dir.parent / "src"
+                sys.path.insert(0, str(repo_src))
+                from orchestration.wos_completion import maybe_fail_wos_uow  # noqa: PLC0415
+                maybe_fail_wos_uow(task_id_hint, reason="orphan_exit")
+            except Exception:
+                pass  # Never block the hook's exit path
 
         # Clean up the fire-count temp file.
         key = _agent_key(data)

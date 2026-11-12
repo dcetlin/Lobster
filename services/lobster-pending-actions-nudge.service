@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily pending-actions nudge — age-based Telegram ping for Dan-owned action items
+# LOBSTER-MANAGED
+
+[Service]
+Type=oneshot
+User=lobster
+ExecStart=/home/lobster/.local/bin/uv run /home/lobster/lobster/scheduled-tasks/pending-actions-nudge.py
+StandardOutput=append:/home/lobster/lobster-workspace/scheduled-jobs/logs/pending-actions-nudge.log
+StandardError=append:/home/lobster/lobster-workspace/scheduled-jobs/logs/pending-actions-nudge.log

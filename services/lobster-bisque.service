@@ -1,0 +1,31 @@
+[Unit]
+Description=Lobster Bisque Relay Server - WebSocket relay and file server
+After=network.target
+
+[Service]
+Type=simple
+User=lobster
+Group=lobster
+WorkingDirectory=/home/lobster/lobster
+Environment=PATH=/home/lobster/.local/bin:/home/lobster/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=/home/lobster/lobster/src
+Environment=LOBSTER_CONFIG_DIR=/home/lobster/lobster-config
+Environment=LOBSTER_INSTALL_DIR=/home/lobster/lobster
+Environment=LOBSTER_MESSAGES=/home/lobster/messages
+Environment=LOBSTER_WORKSPACE=/home/lobster/lobster-workspace
+EnvironmentFile=-/home/lobster/lobster/config/config.env
+EnvironmentFile=-/home/lobster/lobster-config/config.env
+EnvironmentFile=-/home/lobster/lobster-config/global.env
+ExecStart=/home/lobster/lobster/.venv/bin/python /home/lobster/lobster/src/bisque/relay_server.py --host 0.0.0.0 --port 9101
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lobster-bisque
+
+NoNewPrivileges=true
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target

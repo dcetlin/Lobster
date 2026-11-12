@@ -1,0 +1,48 @@
+id: document-class
+name: Document (narrative)
+description: Design docs, proposals, audits, synthesis. Narrative-primary.
+content_format: markdown
+components:
+  - id: theme-toggle
+    config:
+      mode: js-toggle
+conventions_overrides: {}
+scaffold: content-scaffold.md
+
+# Agent selection rules
+selection_rules:
+  use_when:
+    - Document is narrative-first and will be read linearly
+    - Document may have comment threads (e.g., design review, proposal)
+    - Document is a design doc, proposal, audit, synthesis, or report
+  avoid_when:
+    - Document is data-driven and regenerated frequently
+    - Document requires action buttons, filter bars, or live data
+    - Document is long-lived and will be edited across many sessions with section coverage tracking
+  fallback: true  # Use this template when no other template clearly fits
+
+# Required sections (every document-class doc must include these)
+required_sections:
+  - id: s1
+    label: "§1"
+    title: Overview
+    addressed: false
+
+# Optional sections (scaffold includes these as placeholders)
+optional_sections:
+  - id: s2
+    label: "§2"
+    title: Background
+  - id: s3
+    label: "§3"
+    title: Details
+  - id: s4
+    label: "§4"
+    title: Open Questions
+
+# Rendering parameters
+render_params:
+  inject_section_labels: true
+  auto_populate_clipboard_sections: false  # clipboard-copy-widget removed
+  header_pattern: doc-header  # doc-header with doc-title + doc-subtitle
+  footer: true

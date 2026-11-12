@@ -6,7 +6,7 @@ Full development context for working on Lobster itself.
 
 ### Staging Docker Setup
 
-**Full documentation:** `~/lobster/docs/DOCKER-STAGING.md`
+**Full documentation:** `~/lobster/docs/setup/DOCKER-STAGING.md`
 
 | Item | Value |
 |------|-------|
@@ -232,8 +232,8 @@ Health check runs every 4 minutes via cron: `~/lobster/scripts/health-check-v3.s
 # Last health check result
 tail -50 ~/lobster-workspace/logs/health-check.log
 
-# Any recent incidents collected before restarts
-ls ~/lobster/incidents/
+# Any recent incidents collected before restarts (run scripts/investigate-incident.sh manually)
+ls ~/lobster-workspace/retros/incidents/
 ```
 
 **Rollback via update-lobster.sh:**
@@ -260,7 +260,7 @@ Restores from the most recent backup created during the last upgrade.
 
 | Doc | Path | What it covers |
 |-----|------|----------------|
-| Staging Docker | `~/lobster/docs/DOCKER-STAGING.md` | Full staging container setup, credentials, tailing logs |
+| Staging Docker | `~/lobster/docs/setup/DOCKER-STAGING.md` | Full staging container setup, credentials, tailing logs |
 | Docker Testing | `~/lobster/docs/DOCKER-TESTING.md` | Automated integration test approach (uses mock Telegram) |
 | Dispatcher spec | `~/lobster-workspace/.claude/sys.dispatcher.bootup.md` | Main loop pseudocode, 7-second rule, message flow |
 | Debug supplement | `~/lobster-workspace/.claude/sys.debug.bootup.md` | install.sh completeness rule, PR self-check prompt, verbose logging |

@@ -51,7 +51,7 @@ def _entry(
     completed: bool = False,
     reminded: bool = False,
     description: str = "test task",
-    chat_id: int = 1234567890,
+    chat_id: int = 8305714125,
 ) -> dict:
     started_at = datetime.fromtimestamp(
         NOW.timestamp() - started_minutes_ago * 60, tz=timezone.utc
@@ -111,41 +111,6 @@ class TestIsStale:
 
 
 # ---------------------------------------------------------------------------
-# collect_done_task_ids
-# ---------------------------------------------------------------------------
-
-
-class TestCollectDoneTaskIds:
-    def test_empty_entries_yields_empty_set(self) -> None:
-        assert ir.collect_done_task_ids([]) == set()
-
-    def test_entry_with_status_done_is_collected(self) -> None:
-        entries = [{"task_id": "t1", "status": "done"}]
-        assert ir.collect_done_task_ids(entries) == {"t1"}
-
-    def test_entry_with_completed_at_is_collected_even_without_status_done(self) -> None:
-        entries = [{"task_id": "t1", "completed_at": "2026-04-19T10:00:00Z"}]
-        assert ir.collect_done_task_ids(entries) == {"t1"}
-
-    def test_running_only_entries_are_not_collected(self) -> None:
-        entries = [{"task_id": "t1", "status": "running"}]
-        assert ir.collect_done_task_ids(entries) == set()
-
-    def test_done_entry_correlates_across_separate_lines_for_same_task_id(self) -> None:
-        # The append-only-log shape from issue #2084: a "running" line and a
-        # separate "done" line for the same task_id.
-        entries = [
-            {"task_id": "deploy-check-654", "status": "running", "started_at": "2026-04-20T21:51:40Z"},
-            {"task_id": "deploy-check-654", "status": "done", "completed_at": "2026-04-20T21:52:28Z"},
-        ]
-        assert ir.collect_done_task_ids(entries) == {"deploy-check-654"}
-
-    def test_entries_without_task_id_are_ignored(self) -> None:
-        entries = [{"status": "done"}]
-        assert ir.collect_done_task_ids(entries) == set()
-
-
-# ---------------------------------------------------------------------------
 # should_remind
 # ---------------------------------------------------------------------------
 
@@ -171,18 +136,6 @@ class TestShouldRemind:
         entry = _entry("t5", started_minutes_ago=100, expected_done_in_minutes=10, completed=True)
         assert ir.should_remind(entry, NOW) is False
 
-    def test_entry_whose_task_id_is_in_done_task_ids_is_skipped(self) -> None:
-        # This is the append-only-log scenario (issue #2084): the "running" entry
-        # itself carries no completed_at/status=="done" of its own -- the task's
-        # completion is a *separate* line elsewhere in the file. done_task_ids
-        # is how that cross-reference gets passed in.
-        entry = _entry("t6", started_minutes_ago=100, expected_done_in_minutes=10)
-        assert ir.should_remind(entry, NOW, done_task_ids={"t6"}) is False
-
-    def test_entry_not_in_done_task_ids_still_evaluated_normally(self) -> None:
-        entry = _entry("t7", started_minutes_ago=21, expected_done_in_minutes=10)
-        assert ir.should_remind(entry, NOW, done_task_ids={"some-other-task"}) is True
-
 
 # ---------------------------------------------------------------------------
 # build_reminder_message
@@ -204,7 +157,7 @@ class TestBuildReminderMessage:
     def test_message_routed_to_dispatcher_not_user(self) -> None:
         # Reminders go to chat_id=0 (dispatcher) regardless of entry's chat_id
         entry = _entry("t1", started_minutes_ago=25, expected_done_in_minutes=10,
-                        chat_id=1234567890)
+                        chat_id=8305714125)
         msg = ir.build_reminder_message(entry, NOW)
         assert msg["chat_id"] == 0
 
@@ -334,25 +287,152 @@ class TestProcessEntries:
         messages, _ = ir.process_entries([bad_entry], NOW)
         assert messages == []
 
-    def test_running_entry_with_separate_done_line_generates_no_reminder(self) -> None:
-        # Regression test for issue #2084: a task that finished long ago via a
-        # separate "done" line (append-only log) must never be flagged as
-        # stale just because its original "running" line individually looks
-        # old and carries no completed_at/reminded_at of its own.
-        running = _entry("deploy-check-654", started_minutes_ago=60 * 24 * 30, expected_done_in_minutes=10)
-        done = {"task_id": "deploy-check-654", "status": "done", "completed_at": "2026-04-20T21:52:28Z"}
-        messages, updated = ir.process_entries([running, done], NOW)
-        assert messages == []
-        # The running entry is left untouched -- no spurious reminded_at stamp.
-        running_updated = next(e for e in updated if e["task_id"] == "deploy-check-654" and e.get("status") == "running")
-        assert "reminded_at" not in running_updated
+    def test_running_then_done_for_same_task_id_not_reminded(self) -> None:
+        """A task_id with a 'running' entry followed by a 'done' entry is completed.
 
-    def test_done_correlation_does_not_suppress_genuinely_stale_unrelated_task(self) -> None:
-        stale = _entry("still-running-1", started_minutes_ago=25, expected_done_in_minutes=10)
-        done = {"task_id": "other-task", "status": "done", "completed_at": "2026-04-20T21:52:28Z"}
-        messages, _ = ir.process_entries([stale, done], NOW)
+        This is the core bug from issue #1562: the append-only JSONL file has both
+        entries, and the old code checked each independently — generating a false
+        reminder for the 'running' entry even though a 'done' entry existed.
+        """
+        running = _entry("startup-catchup", started_minutes_ago=62, expected_done_in_minutes=30)
+        done = _entry("startup-catchup", started_minutes_ago=60, expected_done_in_minutes=30, completed=True)
+        messages, updated = ir.process_entries([running, done], NOW)
+        assert messages == [], "No reminder should fire for a task_id that has a 'done' entry"
+
+    def test_retry_after_done_is_still_tracked(self) -> None:
+        """A 'running' entry after a 'done' entry means a retry — last entry wins."""
+        done = _entry("ledger-backup", started_minutes_ago=70, expected_done_in_minutes=10, completed=True)
+        running = _entry("ledger-backup", started_minutes_ago=65, expected_done_in_minutes=10)
+        messages, _ = ir.process_entries([done, running], NOW)
+        # Last entry is "running" at 65min ago with 10min expected → stale (threshold=20).
+        # Last-entry-wins means this is a retry in progress, not a completed task.
+        assert len(messages) == 1, "A retry (running after done) should still be tracked for staleness"
+        assert messages[0]["task_id"] == "ledger-backup"
+
+    def test_multiple_task_ids_only_truly_stale_reminded(self) -> None:
+        """Mix of completed and genuinely stale tasks — only the stale one fires."""
+        # Task A: running then done
+        a_running = _entry("task-a", started_minutes_ago=62, expected_done_in_minutes=30)
+        a_done = _entry("task-a", started_minutes_ago=60, expected_done_in_minutes=30, completed=True)
+        # Task B: genuinely stale (running only, no done)
+        b_running = _entry("task-b", started_minutes_ago=65, expected_done_in_minutes=10)
+        messages, _ = ir.process_entries([a_running, a_done, b_running], NOW)
         assert len(messages) == 1
-        assert messages[0]["task_id"] == "still-running-1"
+        assert messages[0]["task_id"] == "task-b"
+
+    def test_entries_without_task_id_processed_independently(self) -> None:
+        """Entries missing task_id cannot be grouped — each stands alone."""
+        e1 = {"description": "no-tid-1", "started_at": (
+            datetime.fromtimestamp(NOW.timestamp() - 65 * 60, tz=timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+        ), "status": "running"}
+        messages, _ = ir.process_entries([e1], NOW)
+        # Uses default expected_done_in_minutes=30 → threshold=60 → 65 > 60 → stale
+        assert len(messages) == 1
+
+
+# ---------------------------------------------------------------------------
+# resolve_final_states — task_id deduplication (returns dict)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveFinalStates:
+    def test_single_running_entry_preserved(self) -> None:
+        entry = _entry("t1", started_minutes_ago=5, expected_done_in_minutes=10)
+        result = ir.resolve_final_states([entry])
+        assert "t1" in result
+        assert result["t1"]["task_id"] == "t1"
+
+    def test_last_entry_wins_for_same_task_id(self) -> None:
+        first = _entry("t1", started_minutes_ago=30, expected_done_in_minutes=10)
+        second = _entry("t1", started_minutes_ago=25, expected_done_in_minutes=10, completed=True)
+        result = ir.resolve_final_states([first, second])
+        assert len(result) == 1
+        assert result["t1"].get("status") == "done"
+
+    def test_running_after_done_means_retry(self) -> None:
+        """Last-entry-wins: a 'running' after 'done' = retry in progress."""
+        done = _entry("t1", started_minutes_ago=28, expected_done_in_minutes=10, completed=True)
+        later_running = _entry("t1", started_minutes_ago=25, expected_done_in_minutes=10)
+        result = ir.resolve_final_states([done, later_running])
+        assert len(result) == 1
+        # Last entry is "running" — retry is in progress
+        assert result["t1"].get("status") == "running"
+
+    def test_different_task_ids_kept_separate(self) -> None:
+        a = _entry("task-a", started_minutes_ago=10, expected_done_in_minutes=10)
+        b = _entry("task-b", started_minutes_ago=10, expected_done_in_minutes=10)
+        result = ir.resolve_final_states([a, b])
+        assert len(result) == 2
+        assert "task-a" in result
+        assert "task-b" in result
+
+    def test_entries_without_task_id_excluded(self) -> None:
+        """Entries missing task_id are not included in the result dict."""
+        e1 = {"description": "no-tid-1", "started_at": "2026-04-19T11:00:00Z", "status": "running"}
+        e2 = _entry("has-tid", started_minutes_ago=10, expected_done_in_minutes=10)
+        result = ir.resolve_final_states([e1, e2])
+        assert len(result) == 1
+        assert "has-tid" in result
+
+    def test_empty_list_returns_empty(self) -> None:
+        assert ir.resolve_final_states([]) == {}
+
+
+# ---------------------------------------------------------------------------
+# is_task_done — final entry status check
+# ---------------------------------------------------------------------------
+
+
+class TestIsTaskDone:
+    def test_done_status(self) -> None:
+        entry = _entry("t1", started_minutes_ago=10, expected_done_in_minutes=10, completed=True)
+        assert ir.is_task_done(entry) is True
+
+    def test_running_status(self) -> None:
+        entry = _entry("t1", started_minutes_ago=10, expected_done_in_minutes=10)
+        assert ir.is_task_done(entry) is False
+
+    def test_completed_at_present(self) -> None:
+        entry = {"task_id": "t1", "completed_at": "2026-04-19T12:00:00Z", "status": "running"}
+        assert ir.is_task_done(entry) is True
+
+
+# ---------------------------------------------------------------------------
+# No truncation — updated_entries preserves all original entries
+# ---------------------------------------------------------------------------
+
+
+class TestNoTruncation:
+    def test_updated_entries_count_matches_input(self) -> None:
+        """process_entries must never return fewer entries than the input.
+
+        The JSONL file is append-only; other consumers (dispatcher-state-stop.py,
+        save-inflight-prompt.py) depend on all historical entries being preserved.
+        """
+        running = _entry("t1", started_minutes_ago=62, expected_done_in_minutes=30)
+        done = _entry("t1", started_minutes_ago=60, expected_done_in_minutes=30, completed=True)
+        fresh = _entry("t2", started_minutes_ago=5, expected_done_in_minutes=10)
+        stale = _entry("t3", started_minutes_ago=25, expected_done_in_minutes=10)
+
+        _, updated = ir.process_entries([running, done, fresh, stale], NOW)
+        assert len(updated) == 4, "All 4 entries must be preserved (no truncation)"
+
+    def test_reminded_at_only_on_final_stale_entry(self) -> None:
+        """Only the final entry for a stale task_id gets reminded_at."""
+        running = _entry("t1", started_minutes_ago=62, expected_done_in_minutes=30)
+        done = _entry("t1", started_minutes_ago=60, expected_done_in_minutes=30, completed=True)
+        stale = _entry("t2", started_minutes_ago=25, expected_done_in_minutes=10)
+
+        _, updated = ir.process_entries([running, done, stale], NOW)
+        assert len(updated) == 3
+        # t1's entries should not have reminded_at (task is done)
+        t1_entries = [e for e in updated if e.get("task_id") == "t1"]
+        for e in t1_entries:
+            assert "reminded_at" not in e
+        # t2's entry should have reminded_at (genuinely stale)
+        t2_entry = next(e for e in updated if e.get("task_id") == "t2")
+        assert "reminded_at" in t2_entry
 
 
 # ---------------------------------------------------------------------------

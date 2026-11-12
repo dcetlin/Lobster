@@ -22,20 +22,9 @@ Design principles:
 import logging
 import os
 import sqlite3
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-# Ensure the parent src/ directory is on sys.path so the sibling `utils`
-# package is importable regardless of how this module is loaded (as part of
-# the `agents` package, or directly via sys.path manipulation in tests).
-_SRC_DIR = str(Path(__file__).resolve().parents[1])
-if _SRC_DIR not in sys.path:
-    sys.path.insert(0, _SRC_DIR)
-
-from utils.agent_types import DISPATCHER_EXCLUSION_SQL  # noqa: E402
-from agents.pid_liveness import is_pid_alive  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -82,10 +71,7 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
     reply_message_ids   TEXT,
     stop_reason         TEXT,
     idempotency         TEXT DEFAULT 'unknown',
-    task_origin         TEXT DEFAULT 'user',
-    pid                 INTEGER,
-    dispatcher_pid      INTEGER,
-    pid_captured_at     TEXT
+    task_origin         TEXT DEFAULT 'user'
 );
 """
 
@@ -131,10 +117,6 @@ _MIGRATION_STMTS = [
     "ALTER TABLE agent_sessions ADD COLUMN stop_reason TEXT",
     "ALTER TABLE agent_sessions ADD COLUMN idempotency TEXT DEFAULT 'unknown'",
     "ALTER TABLE agent_sessions ADD COLUMN task_origin TEXT DEFAULT 'user'",
-    # issue #2148 (Phase 1: PID ground truth) — additive, NULL on pre-migration rows.
-    "ALTER TABLE agent_sessions ADD COLUMN pid INTEGER",
-    "ALTER TABLE agent_sessions ADD COLUMN dispatcher_pid INTEGER",
-    "ALTER TABLE agent_sessions ADD COLUMN pid_captured_at TEXT",
 ]
 
 # Additive migrations for the reports table (BIS-85 multi-instance prep).
@@ -261,8 +243,6 @@ def session_start(
     trigger_snippet: str | None = None,
     idempotency: str | None = None,
     task_origin: str | None = None,
-    pid: int | None = None,
-    dispatcher_pid: int | None = None,
     path: Path | None = None,
 ) -> None:
     """Record a newly-spawned agent session.
@@ -295,18 +275,6 @@ def session_start(
                             'internal'  — system-initiated, no user involved (reconciler,
                                           health check, session management, etc.).
                             Defaults to 'user' when not specified.
-        pid:                Real OS PID, when one exists for this session (docker-worker
-                            subprocess, or dispatcher self-registration). NULL when no
-                            real process boundary exists (e.g. an in-process Agent-tool
-                            subagent — see dispatcher_pid instead). Callers are
-                            responsible for capturing a real PID (e.g. via
-                            agents.pid_liveness.find_dispatcher_ancestor_pid()) —
-                            this function only persists whatever it is given.
-        dispatcher_pid:     PID of the parent dispatcher process this session is running
-                            under, for sessions with no real PID of their own (in-process
-                            Agent-tool subagents). Used as a weaker-but-real ground truth:
-                            if the dispatcher process is confirmed dead, every subagent
-                            registered under it is necessarily dead too.
         path:               DB path override (for tests).
     """
     resolved = path if path is not None else _DEFAULT_DB_PATH
@@ -315,7 +283,6 @@ def session_start(
     snippet = trigger_snippet[:200] if trigger_snippet else None
     idempotency_val = idempotency if idempotency in ("safe", "unsafe", "unknown") else "unknown"
     task_origin_val = task_origin if task_origin in ("user", "scheduled", "internal") else "user"
-    pid_captured_at = now if (pid is not None or dispatcher_pid is not None) else None
 
     conn.execute(
         """
@@ -324,10 +291,10 @@ def session_start(
              output_file, timeout_minutes, input_summary, result_summary,
              parent_id, spawned_at, completed_at, last_seen_at,
              notified_at, trigger_message_id, trigger_snippet, reply_message_ids,
-             idempotency, task_origin, pid, dispatcher_pid, pid_captured_at)
+             idempotency, task_origin)
         VALUES
             (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, NULL, ?, ?, NULL, NULL,
-             NULL, ?, ?, NULL, ?, ?, ?, ?, ?)
+             NULL, ?, ?, NULL, ?, ?)
         """,
         (
             id,
@@ -345,9 +312,6 @@ def session_start(
             snippet,
             idempotency_val,
             task_origin_val,
-            pid,
-            dispatcher_pid,
-            pid_captured_at,
         ),
     )
     conn.commit()
@@ -359,7 +323,7 @@ def session_end(
     result_summary: str | None = None,
     stop_reason: str | None = None,
     path: Path | None = None,
-) -> int:
+) -> None:
     """Mark an agent session as completed or failed.
 
     Matches on either the `id` column or the `task_id` column, whichever
@@ -367,11 +331,6 @@ def session_end(
     or the task_id that was passed to write_result.
 
     Idempotent: calling on a non-existent session is a no-op.
-
-    Returns:
-        The number of rows updated. 0 means no running/starting session
-        matched ``id_or_task_id``; callers that expect a match (write_result)
-        should surface that rather than treat it as success.
 
     Args:
         id_or_task_id:  The id or task_id of the session to end.
@@ -391,7 +350,7 @@ def session_end(
     # PostToolUse hook before the agent has fully initialised).  This closes
     # the lifecycle gap where rows inserted as 'starting' were never updated
     # because the old WHERE clause only matched 'running'.
-    cursor = conn.execute(
+    conn.execute(
         """
         UPDATE agent_sessions
         SET status = ?, completed_at = ?, result_summary = ?, stop_reason = ?
@@ -400,7 +359,6 @@ def session_end(
         (status, now, result_summary, stop_reason, id_or_task_id, id_or_task_id),
     )
     conn.commit()
-    return cursor.rowcount
 
 
 # ---------------------------------------------------------------------------
@@ -444,17 +402,10 @@ def set_notified(
     agent_id: str,
     path: Path | None = None,
 ) -> None:
-    """Write the current UTC timestamp to notified_at for one session.
+    """Write the current UTC timestamp to notified_at for the given session.
 
-    task_ids are reused across spawns (fixed ids in agent definitions, stable
-    ids for scheduled jobs), so ``agent_id`` may match many historical rows.
-    Only a single row is written: among rows matching on ``id`` or ``task_id``
-    whose ``notified_at IS NULL``, an exact ``id`` match is preferred, then the
-    most recently spawned row. Rows that were already notified are never
-    rewritten, and older unnotified rows stay visible to
-    ``get_unnotified_completed()``.
-
-    Idempotent: calling on an already-notified session is a no-op.
+    Idempotent: calling on an already-notified session is a no-op (it just
+    overwrites with a new timestamp, which is harmless).
 
     Args:
         agent_id: The session id (or task_id) to mark as notified.
@@ -467,14 +418,9 @@ def set_notified(
         """
         UPDATE agent_sessions
         SET notified_at = ?
-        WHERE rowid = (
-            SELECT rowid FROM agent_sessions
-            WHERE (id = ? OR task_id = ?) AND notified_at IS NULL
-            ORDER BY (id = ?) DESC, spawned_at DESC
-            LIMIT 1
-        )
+        WHERE id = ? OR task_id = ?
         """,
-        (now, agent_id, agent_id, agent_id),
+        (now, agent_id, agent_id),
     )
     conn.commit()
 
@@ -560,6 +506,15 @@ def cleanup_stale_running_sessions(
     4. ``output_file`` absent, elapsed > timeout → dead (fallback heuristic)
     5. ``output_file`` absent, elapsed ≤ timeout → leave running
 
+    Rows with ``agent_type`` in ('dispatcher', 'hook') are excluded entirely
+    (issue #1472). The dispatcher registers its own long-running session with
+    no ``output_file`` and no ``timeout_minutes``, so rule 4's fallback
+    elapsed-time heuristic (default limit 120 minutes) would otherwise mark
+    the dispatcher's own row dead shortly after the routine ~2h graceful
+    session-age restart on every MCP server startup — the same guard already
+    applied in ``get_active_sessions()`` and the reconciler's dead-session
+    sweep in ``inbox_server.py``.
+
     Args:
         server_start_time: UTC datetime when the current server process started
                            (kept for logging; no longer used for mtime comparison).
@@ -572,11 +527,11 @@ def cleanup_stale_running_sessions(
     conn = _get_connection(resolved)
 
     cursor = conn.execute(
-        f"""
-        SELECT id, output_file, spawned_at, timeout_minutes, pid, dispatcher_pid
+        """
+        SELECT id, output_file, spawned_at, timeout_minutes
         FROM agent_sessions
         WHERE status IN ('running', 'starting')
-          AND {DISPATCHER_EXCLUSION_SQL}  -- #781: never reconcile the dispatcher (output_file is legitimately NULL) as a dead subagent
+          AND (agent_type IS NULL OR agent_type NOT IN ('dispatcher', 'hook'))  -- #781/#1472/#1473: never reconcile the dispatcher (output_file is legitimately NULL) or a hook session as a dead subagent
         """
     )
     rows = cursor.fetchall()
@@ -589,86 +544,14 @@ def cleanup_stale_running_sessions(
         output_file: str | None = row["output_file"]
         spawned_at_raw: str | None = row["spawned_at"]
         timeout_minutes: int | None = row["timeout_minutes"]
-        pid: int | None = row["pid"]
-        dispatcher_pid: int | None = row["dispatcher_pid"]
-
-        # Pre-compute file_status once (needed both by the PID precedence
-        # check below and by the legacy heuristics further down).
-        file_status: str | None = (
-            _read_stop_reason_from_path(Path(output_file)) if output_file else None
-        )
-
-        # -----------------------------------------------------------------
-        # PID ground truth (issue #2148, Phase 1) — PRIMARY signal whenever a
-        # real PID was captured for this session. Overrides the output_file/
-        # elapsed-time heuristics below, *except* when the output file
-        # explicitly reports the agent finished (stop_reason=end_turn) — that
-        # self-reported completion signal outranks a process-existence check.
-        # Rows with no pid/dispatcher_pid (pre-migration, or no real process
-        # boundary — e.g. Agent-tool subagents never registered a dispatcher_pid)
-        # fall through entirely unchanged to the legacy heuristics below.
-        # -----------------------------------------------------------------
-        if file_status != "done" and pid is not None:
-            if not is_pid_alive(pid):
-                conn.execute(
-                    """
-                    UPDATE agent_sessions
-                    SET status = 'dead', completed_at = ?, result_summary = ?
-                    WHERE id = ? AND status = 'running'
-                    """,
-                    (
-                        completed_at,
-                        f"Marked dead at startup: pid {pid} is not alive",
-                        agent_id,
-                    ),
-                )
-                changed_ids.append(agent_id)
-                log.warning(
-                    "[startup-cleanup] session %r marked dead: pid %d is not alive "
-                    "(PID ground truth override)",
-                    agent_id,
-                    pid,
-                )
-            else:
-                log.debug(
-                    "[startup-cleanup] session %r left running: pid %d is alive "
-                    "(PID ground truth override)",
-                    agent_id,
-                    pid,
-                )
-            continue
-
-        if file_status != "done" and pid is None and dispatcher_pid is not None:
-            if not is_pid_alive(dispatcher_pid):
-                conn.execute(
-                    """
-                    UPDATE agent_sessions
-                    SET status = 'dead', completed_at = ?, result_summary = ?
-                    WHERE id = ? AND status = 'running'
-                    """,
-                    (
-                        completed_at,
-                        (
-                            f"Marked dead at startup: dispatcher_pid {dispatcher_pid} "
-                            "is not alive (dispatcher confirmed dead)"
-                        ),
-                        agent_id,
-                    ),
-                )
-                changed_ids.append(agent_id)
-                log.warning(
-                    "[startup-cleanup] session %r marked dead: dispatcher_pid %d is "
-                    "not alive — dispatcher confirmed dead, subagent necessarily dead too",
-                    agent_id,
-                    dispatcher_pid,
-                )
-                continue
-            # dispatcher_pid alive does NOT prove this subagent itself is still
-            # alive (the dispatcher process being up says nothing about any one
-            # in-process conversation thread) — fall through to the legacy
-            # output_file/elapsed-time heuristics below, unchanged.
 
         if output_file:
+            # Read the stop_reason from the output file to determine liveness.
+            # "missing" → file gone, safe to mark dead.
+            # "done"    → agent finished, mark completed.
+            # "running" → agent may still be alive, leave it running.
+            file_status = _read_stop_reason_from_path(Path(output_file))
+
             if file_status == "missing":
                 # Apply a 2-minute grace period before marking dead for a missing
                 # output file.  The file may not yet exist if the agent was just
@@ -814,6 +697,14 @@ def get_unnotified_completed(
     Used by the startup sweep to re-send notifications that were enqueued but
     not delivered before a crash or restart.
 
+    Rows with ``agent_type`` in ('dispatcher', 'hook') are excluded (issue
+    #1472). Without this guard, a dispatcher row marked 'dead' by
+    ``cleanup_stale_running_sessions()``'s fallback heuristic would immediately
+    be picked up here and folded into the startup sweep summary as a
+    "task(s) disappeared (no output)" notification — a false alarm on every
+    routine graceful restart whose timing happened to tip the dispatcher's own
+    session row past the fallback elapsed-time limit.
+
     Args:
         since_hours: Only return sessions completed within this many hours.
                      Prevents re-notifying ancient sessions on a fresh install.
@@ -830,12 +721,12 @@ def get_unnotified_completed(
     cutoff_str = cutoff_dt.isoformat()
 
     cursor = conn.execute(
-        f"""
+        """
         SELECT * FROM agent_sessions
         WHERE status IN ('completed', 'dead')
           AND notified_at IS NULL
           AND completed_at >= ?
-          AND {DISPATCHER_EXCLUSION_SQL}  -- #781: belt-and-suspenders, never re-notify the dispatcher as a failed agent
+          AND (agent_type IS NULL OR agent_type NOT IN ('dispatcher', 'hook'))  -- #781/#1473: belt-and-suspenders, never re-notify the dispatcher or a hook session as a failed agent
         ORDER BY completed_at ASC
         """,
         (cutoff_str,),
@@ -871,6 +762,7 @@ def get_active_sessions(
             """
             SELECT * FROM agent_sessions
             WHERE status IN ('running', 'starting')
+              AND (agent_type IS NULL OR agent_type NOT IN ('dispatcher', 'hook'))
               AND chat_id = ?
             ORDER BY spawned_at ASC
             """,
@@ -881,6 +773,7 @@ def get_active_sessions(
             """
             SELECT * FROM agent_sessions
             WHERE status IN ('running', 'starting')
+              AND (agent_type IS NULL OR agent_type NOT IN ('dispatcher', 'hook'))
             ORDER BY spawned_at ASC
             """
         )
@@ -994,12 +887,20 @@ def _elapsed_minutes_str(elapsed_seconds: int | None) -> str:
     return f"{minutes}m ago"
 
 
+_ACTIVE_SESSIONS_DISPLAY_CAP = 5
+
+
 def format_active_sessions_block(sessions: list[dict]) -> str:
     """Format a list of active sessions as a compact context block.
 
     Distinguishes user-facing agents from system agents (chat_id=0 or None).
     System agents are background tasks (scheduled jobs, startup-catchup, etc.)
     that do not correspond to a user conversation in the IDE panel.
+
+    Renders at most _ACTIVE_SESSIONS_DISPLAY_CAP entries (user sessions first,
+    then system). When the total exceeds the cap, a trailing "...and N more"
+    line is appended so the dispatcher knows the full count without paying the
+    per-token cost of every entry.
 
     Produces output like:
         [1 agent running, 1 system]
@@ -1025,8 +926,13 @@ def format_active_sessions_block(sessions: list[dict]) -> str:
         header += f", {system_count} {sys_label}"
     header += "]"
 
+    all_sessions = user_sessions + system_sessions
+    total = len(all_sessions)
+    displayed = all_sessions[:_ACTIVE_SESSIONS_DISPLAY_CAP]
+    hidden = total - len(displayed)
+
     lines = [header]
-    for s in user_sessions + system_sessions:
+    for s in displayed:
         agent_type = s.get("agent_type") or "agent"
         desc = s.get("description", "")
         # Truncate long descriptions
@@ -1038,6 +944,10 @@ def format_active_sessions_block(sessions: list[dict]) -> str:
             lines.append(f'- {agent_type}: "{desc}" (system, {elapsed})')
         else:
             lines.append(f'- {agent_type}: "{desc}" (chat: {chat_id}, {elapsed})')
+
+    if hidden > 0:
+        lines.append(f"...and {hidden} more")
+
     return "\n".join(lines)
 
 
@@ -1138,6 +1048,24 @@ def get_output_file_mtime(output_file: str) -> float | None:
     try:
         real_path = Path(output_file).resolve()
         return real_path.stat().st_mtime
+    except OSError:
+        return None
+
+
+WORKSTREAM_BASE = Path.home() / "lobster-workspace" / "workstreams"
+WORKSTREAM_STATUS_STALE_SECONDS = 600  # 10 min — matches ~5 min update cadence with buffer
+
+
+def get_workstream_status_mtime(task_id: str) -> float | None:
+    """Return mtime of workstream/{task_id}/status.md, or None if absent.
+
+    Pure function: reads filesystem metadata only, no side effects.
+    """
+    if not task_id:
+        return None
+    status_file = WORKSTREAM_BASE / task_id / "status.md"
+    try:
+        return status_file.stat().st_mtime
     except OSError:
         return None
 

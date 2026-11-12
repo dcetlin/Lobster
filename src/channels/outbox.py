@@ -31,7 +31,7 @@ import logging
 from pathlib import Path
 from typing import Callable
 
-from utils.fs import atomic_write_json
+from src.utils.fs import atomic_write_json
 
 try:
     from watchdog.events import FileSystemEventHandler as _FSEHandler
@@ -50,7 +50,7 @@ class OutboxFileHandler(_FSEHandler):
     Can be used in two modes:
 
     **Writer mode** (original BIS-159 interface):
-        handler = OutboxFileHandler(outbox_dir=Path("~/messages/outbox").expanduser())
+        handler = OutboxFileHandler(outbox_dir=Path("/home/lobster/messages/outbox"))
         handler.write({"id": "12345_telegram", "chat_id": 1234567890, "text": "Hi"})
 
     **Watchdog mode** (BIS-166 router interface):

@@ -3,11 +3,13 @@ Unit tests for hooks/auto-register-agent.py
 
 Tests cover:
 - Non-Agent tool calls are ignored (exit 0, no DB write)
+- Both "Agent" and "Task" tool_name values register (matcher-gap coverage)
 - YAML frontmatter: task_id, chat_id, source, reply_to_message_id parsed correctly
 - Legacy text format: task_id extracted from "task_id is: X"
 - agentId extracted from tool_response dict and list forms
 - output_file extracted from tool_response
 - DB row inserted with correct values
+- dispatcher_pid/pid_captured_at populated via process-tree PID capture (issue #2148)
 - INSERT OR IGNORE: existing row not overwritten
 - Missing agentId: exits 0 without DB write
 - DB failure: logs to hook-failures.log and exits 0
@@ -162,6 +164,18 @@ class TestExtractMetadata:
         # Frontmatter parse fails, legacy text used
         assert meta["task_id"] == "textid"
 
+    def test_request_id_from_frontmatter(self):
+        """request_id (agent-channel field) is parsed like any other frontmatter key."""
+        prompt = "---\ntask_id: t-001\nchat_id: local-claude\nsource: local-claude\nrequest_id: 1732900000-a1b2c3d4\n---\nbody"
+        meta = extract_metadata(prompt)
+        assert meta["request_id"] == "1732900000-a1b2c3d4"
+
+    def test_request_id_absent_is_none(self):
+        """Normal telegram/slack tasks have no request_id — must be None, not empty string."""
+        prompt = "---\ntask_id: t-002\nchat_id: 123\nsource: telegram\n---\nbody"
+        meta = extract_metadata(prompt)
+        assert meta["request_id"] is None
+
 
 # ---------------------------------------------------------------------------
 # extract_agent_id: pure function tests
@@ -232,6 +246,135 @@ class TestHookNonAgentTool:
                 pass  # table doesn't exist — no rows written, test passes
             finally:
                 conn.close()
+
+
+class TestHookTaskToolName:
+    """tool_name == "Task" must register exactly like "Agent" (matcher-gap fix)."""
+
+    def test_task_tool_name_registers_row(self, tmp_path):
+        """A Task-tool call inserts a row, not just an Agent-tool call."""
+        prompt = "---\ntask_id: t-task-tool\nchat_id: 55555\nsource: telegram\n---\nDo task-tool work."
+        hook_input = _make_hook_input(
+            tool_name="Task",
+            prompt=prompt,
+            tool_response={"agentId": "agent-task-tool"},
+        )
+        exit_code, _, _ = _run_hook(hook_input, tmp_path)
+        assert exit_code == 0
+
+        row = _get_row(tmp_path, "agent-task-tool")
+        assert row is not None
+        assert row["task_id"] == "t-task-tool"
+        assert row["status"] == "running"
+
+    def test_task_tool_name_missing_agent_id_no_write(self, tmp_path):
+        """Task-tool calls still respect the missing-agentId no-op path."""
+        hook_input = _make_hook_input(
+            tool_name="Task",
+            prompt="---\ntask_id: t-task-noid\n---",
+            tool_response={"result": "no id here"},
+        )
+        exit_code, _, _ = _run_hook(hook_input, tmp_path)
+        assert exit_code == 0
+        db_path = tmp_path / "messages" / "config" / "agent_sessions.db"
+        if db_path.exists():
+            conn = sqlite3.connect(str(db_path))
+            try:
+                rows = conn.execute("SELECT COUNT(*) FROM agent_sessions").fetchone()
+                assert rows[0] == 0
+            except sqlite3.OperationalError:
+                pass
+            finally:
+                conn.close()
+
+
+class TestHookDispatcherPidCapture:
+    """dispatcher_pid/pid_captured_at are populated via process-tree PID capture (issue #2148)."""
+
+    def test_dispatcher_pid_and_captured_at_populated_when_ancestor_found(self, tmp_path):
+        """When find_dispatcher_ancestor_pid() finds a real PID, both columns are set."""
+        prompt = "---\ntask_id: t-pid\nchat_id: 12345\n---\nDo work."
+        hook_input = _make_hook_input(
+            prompt=prompt,
+            tool_response={"agentId": "agent-pid"},
+        )
+        with patch("agents.pid_liveness.find_dispatcher_ancestor_pid", return_value=4242):
+            exit_code, _, _ = _run_hook(hook_input, tmp_path)
+        assert exit_code == 0
+
+        row = _get_row(tmp_path, "agent-pid")
+        assert row is not None
+        assert row["dispatcher_pid"] == 4242
+        assert row["pid_captured_at"] is not None
+
+    def test_dispatcher_pid_null_when_ancestor_not_found(self, tmp_path):
+        """When no dispatcher ancestor is found, both columns stay NULL (never blocks registration)."""
+        prompt = "---\ntask_id: t-nopid\nchat_id: 12345\n---\nDo work."
+        hook_input = _make_hook_input(
+            prompt=prompt,
+            tool_response={"agentId": "agent-nopid"},
+        )
+        with patch("agents.pid_liveness.find_dispatcher_ancestor_pid", return_value=None):
+            exit_code, _, _ = _run_hook(hook_input, tmp_path)
+        assert exit_code == 0
+
+        row = _get_row(tmp_path, "agent-nopid")
+        assert row is not None
+        assert row["dispatcher_pid"] is None
+        assert row["pid_captured_at"] is None
+
+    def test_pid_capture_failure_never_blocks_registration(self, tmp_path):
+        """A raising PID-capture call is swallowed — registration still succeeds."""
+        prompt = "---\ntask_id: t-pidfail\nchat_id: 12345\n---\nDo work."
+        hook_input = _make_hook_input(
+            prompt=prompt,
+            tool_response={"agentId": "agent-pidfail"},
+        )
+        with patch(
+            "agents.pid_liveness.find_dispatcher_ancestor_pid",
+            side_effect=OSError("no /proc"),
+        ):
+            exit_code, _, _ = _run_hook(hook_input, tmp_path)
+        assert exit_code == 0
+
+        row = _get_row(tmp_path, "agent-pidfail")
+        assert row is not None
+        assert row["dispatcher_pid"] is None
+
+    def test_dispatcher_pid_column_added_to_pre_existing_db(self, tmp_path):
+        """A DB created before dispatcher_pid/pid_captured_at existed gets the columns via ALTER TABLE."""
+        db_dir = tmp_path / "messages" / "config"
+        db_dir.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_dir / "agent_sessions.db"))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_sessions (
+                id TEXT PRIMARY KEY, task_id TEXT, agent_type TEXT,
+                description TEXT NOT NULL, chat_id TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'telegram',
+                status TEXT NOT NULL DEFAULT 'running',
+                output_file TEXT, timeout_minutes INTEGER,
+                input_summary TEXT, result_summary TEXT, parent_id TEXT,
+                spawned_at TEXT NOT NULL, completed_at TEXT,
+                last_seen_at TEXT, notified_at TEXT,
+                trigger_message_id TEXT, trigger_snippet TEXT,
+                reply_message_ids TEXT, request_id TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        prompt = "---\ntask_id: t-pidmigrate\nchat_id: 12345\n---"
+        hook_input = _make_hook_input(
+            prompt=prompt,
+            tool_response={"agentId": "agent-pidmigrate"},
+        )
+        with patch("agents.pid_liveness.find_dispatcher_ancestor_pid", return_value=9999):
+            exit_code, _, _ = _run_hook(hook_input, tmp_path)
+        assert exit_code == 0
+
+        row = _get_row(tmp_path, "agent-pidmigrate")
+        assert row is not None
+        assert row["dispatcher_pid"] == 9999
 
 
 class TestHookAgentWithAgentId:
@@ -318,6 +461,72 @@ class TestHookAgentWithAgentId:
 
         row = _get_row(tmp_path, "agent-of")
         assert row["output_file"] == "/tmp/result.json"
+
+    def test_request_id_stored_for_local_claude_task(self, tmp_path):
+        """request_id from frontmatter is persisted to the agent_sessions row (audit trail)."""
+        prompt = (
+            "---\ntask_id: t-agent-channel\nchat_id: local-claude\n"
+            "source: local-claude\nrequest_id: req-abc123\n---\nDo the local-claude task."
+        )
+        hook_input = _make_hook_input(
+            prompt=prompt,
+            tool_response={"agentId": "agent-local-claude"},
+        )
+        exit_code, _, _ = _run_hook(hook_input, tmp_path)
+        assert exit_code == 0
+
+        row = _get_row(tmp_path, "agent-local-claude")
+        assert row is not None
+        assert row["request_id"] == "req-abc123"
+        assert row["source"] == "local-claude"
+
+    def test_request_id_null_for_non_agent_channel_task(self, tmp_path):
+        """Ordinary telegram tasks store NULL request_id, not an empty string."""
+        prompt = "---\ntask_id: t-plain\nchat_id: 12345\nsource: telegram\n---\nDo normal work."
+        hook_input = _make_hook_input(
+            prompt=prompt,
+            tool_response={"agentId": "agent-plain"},
+        )
+        exit_code, _, _ = _run_hook(hook_input, tmp_path)
+        assert exit_code == 0
+
+        row = _get_row(tmp_path, "agent-plain")
+        assert row is not None
+        assert row["request_id"] is None
+
+    def test_request_id_column_added_to_pre_existing_db(self, tmp_path):
+        """A DB created before request_id existed gets the column via additive ALTER TABLE."""
+        db_dir = tmp_path / "messages" / "config"
+        db_dir.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_dir / "agent_sessions.db"))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_sessions (
+                id TEXT PRIMARY KEY, task_id TEXT, agent_type TEXT,
+                description TEXT NOT NULL, chat_id TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'telegram',
+                status TEXT NOT NULL DEFAULT 'running',
+                output_file TEXT, timeout_minutes INTEGER,
+                input_summary TEXT, result_summary TEXT, parent_id TEXT,
+                spawned_at TEXT NOT NULL, completed_at TEXT,
+                last_seen_at TEXT, notified_at TEXT,
+                trigger_message_id TEXT, trigger_snippet TEXT,
+                reply_message_ids TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        prompt = "---\ntask_id: t-migrate\nsource: local-claude\nrequest_id: req-migrated\n---"
+        hook_input = _make_hook_input(
+            prompt=prompt,
+            tool_response={"agentId": "agent-migrated"},
+        )
+        exit_code, _, _ = _run_hook(hook_input, tmp_path)
+        assert exit_code == 0
+
+        row = _get_row(tmp_path, "agent-migrated")
+        assert row is not None
+        assert row["request_id"] == "req-migrated"
 
     def test_no_chat_id_defaults_to_zero(self, tmp_path):
         """Missing chat_id stores '0' to satisfy NOT NULL constraint."""
@@ -424,76 +633,6 @@ class TestHookAgentWithAgentId:
         assert row["input_summary"] is None
 
 
-class TestDispatcherPidCapture:
-    """issue #2148 (Phase 1: PID ground truth) — dispatcher_pid capture.
-
-    This hook fires as a direct child of the dispatcher's `claude` OS process
-    for every Agent-tool call (verified via live process-tree inspection —
-    see PR description). It has no PID of its own to record for the spawned
-    subagent (Agent-tool subagents run in-process, as threads of the
-    dispatcher — see pid_liveness.py docstring), so it instead records the
-    dispatcher's own PID as `dispatcher_pid`, found via a process-tree walk
-    (agents.pid_liveness.find_dispatcher_ancestor_pid), NOT a flat os.getppid()
-    or os.getpid() call.
-    """
-
-    def test_dispatcher_pid_captured_via_process_tree_walk(self, tmp_path):
-        """A successful ancestor-walk result is persisted as dispatcher_pid."""
-        prompt = "---\ntask_id: t-dpid\n---"
-        hook_input = _make_hook_input(
-            prompt=prompt,
-            tool_response={"agentId": "agent-dpid"},
-        )
-        with patch(
-            "agents.pid_liveness.find_dispatcher_ancestor_pid",
-            return_value=424242,
-        ):
-            exit_code, _, _ = _run_hook(hook_input, tmp_path)
-        assert exit_code == 0
-
-        row = _get_row(tmp_path, "agent-dpid")
-        assert row is not None
-        assert row["dispatcher_pid"] == 424242
-        assert row["pid_captured_at"] is not None
-
-    def test_dispatcher_pid_null_when_walk_finds_no_ancestor(self, tmp_path):
-        """No 'claude' ancestor found (e.g. non-standard process tree) → NULL, not a crash."""
-        prompt = "---\ntask_id: t-dpid-none\n---"
-        hook_input = _make_hook_input(
-            prompt=prompt,
-            tool_response={"agentId": "agent-dpid-none"},
-        )
-        with patch(
-            "agents.pid_liveness.find_dispatcher_ancestor_pid",
-            return_value=None,
-        ):
-            exit_code, _, _ = _run_hook(hook_input, tmp_path)
-        assert exit_code == 0
-
-        row = _get_row(tmp_path, "agent-dpid-none")
-        assert row is not None
-        assert row["dispatcher_pid"] is None
-        assert row["pid_captured_at"] is None
-
-    def test_dispatcher_pid_capture_failure_does_not_block_hook(self, tmp_path):
-        """If the ancestor walk raises, the hook still registers the agent (dispatcher_pid=NULL)."""
-        prompt = "---\ntask_id: t-dpid-err\n---"
-        hook_input = _make_hook_input(
-            prompt=prompt,
-            tool_response={"agentId": "agent-dpid-err"},
-        )
-        with patch(
-            "agents.pid_liveness.find_dispatcher_ancestor_pid",
-            side_effect=OSError("simulated /proc read failure"),
-        ):
-            exit_code, _, _ = _run_hook(hook_input, tmp_path)
-        assert exit_code == 0
-
-        row = _get_row(tmp_path, "agent-dpid-err")
-        assert row is not None, "Agent must still be registered even if PID capture fails"
-        assert row["dispatcher_pid"] is None
-
-
 class TestHookNoAgentId:
     def test_missing_agent_id_exits_0_no_write(self, tmp_path):
         """If tool response has no agentId, exit 0 without writing agent_sessions rows."""
@@ -589,339 +728,3 @@ class TestHookFailureSafety:
         assert log_path.exists(), "Expected failure to be logged"
         log_content = log_path.read_text()
         assert "auto-register-agent" in log_content
-
-
-# ---------------------------------------------------------------------------
-# inflight-work.jsonl "running" entry automation
-# (issue: automate-inflight-work-writes)
-# ---------------------------------------------------------------------------
-
-def _make_hook_input_with_tool_input(
-    tool_input: dict,
-    tool_response: object = None,
-    session_id: str = "sess-123",
-) -> dict:
-    return {
-        "hook_event_name": "PostToolUse",
-        "session_id": session_id,
-        "tool_name": "Agent",
-        "tool_input": tool_input,
-        "tool_response": tool_response,
-    }
-
-
-def _read_jsonl(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-
-
-class TestInflightRunningEntry:
-    """Automates the 'running' entry that was previously a manual dispatcher
-    Bash-piped-to-save-inflight-prompt.py step (see .claude/sys.dispatcher.bootup.md,
-    'In-Flight Work Tracking'). Confirmed unreliable in production: no new
-    inflight-work.jsonl entries were written since 2026-05-31 despite many
-    subsequent agent spawns.
-    """
-
-    def _inflight_work_file(self, tmp_path: Path) -> Path:
-        return tmp_path / "workspace" / "data" / "inflight-work.jsonl"
-
-    def _inflight_prompts_dir(self, tmp_path: Path) -> Path:
-        return tmp_path / "workspace" / "data" / "inflight-prompts"
-
-    def test_running_entry_written_on_real_agent_spawn(self, tmp_path):
-        """A real Agent call (agentId present) writes a 'running' entry with
-        the exact schema save-inflight-prompt.py produces -- prompt_file
-        reference, never the raw prompt inline."""
-        prompt = (
-            "---\ntask_id: t-inflight\nchat_id: 12345\nsource: telegram\n---\n"
-            "Do the thing."
-        )
-        hook_input = _make_hook_input_with_tool_input(
-            tool_input={
-                "prompt": prompt,
-                "subagent_type": "lobster-generalist",
-                "description": "Do the thing for the user",
-            },
-            tool_response={"agentId": "agent-inflight"},
-        )
-        exit_code, _, _ = _run_hook(hook_input, tmp_path)
-        assert exit_code == 0
-
-        entries = _read_jsonl(self._inflight_work_file(tmp_path))
-        assert len(entries) == 1
-        entry = entries[0]
-        assert entry["task_id"] == "t-inflight"
-        assert entry["status"] == "running"
-        assert entry["chat_id"] == 12345
-        assert entry["subagent_type"] == "lobster-generalist"
-        assert entry["description"] == "Do the thing for the user"
-        assert "started_at" in entry
-        # Raw prompt must NEVER appear inline in the JSONL entry.
-        assert "prompt" not in entry
-        assert entry["prompt_file"] == str(
-            self._inflight_prompts_dir(tmp_path) / "t-inflight.txt"
-        )
-
-        # The full prompt is persisted to the referenced prompt_file.
-        prompt_file = Path(entry["prompt_file"])
-        assert prompt_file.exists()
-        assert prompt_file.read_text(encoding="utf-8") == prompt
-
-    def test_no_task_id_skips_inflight_write(self, tmp_path):
-        """A spawn with no task_id in the frontmatter writes no inflight entry
-        (agent_sessions.db registration still happens independently)."""
-        prompt = "No frontmatter here, just a prompt."
-        hook_input = _make_hook_input_with_tool_input(
-            tool_input={"prompt": prompt, "subagent_type": "lobster-generalist"},
-            tool_response={"agentId": "agent-no-task-id"},
-        )
-        exit_code, _, _ = _run_hook(hook_input, tmp_path)
-        assert exit_code == 0
-
-        assert not self._inflight_work_file(tmp_path).exists()
-        # agent_sessions.db registration is unaffected.
-        row = _get_row(tmp_path, "agent-no-task-id")
-        assert row is not None
-
-    def test_missing_agent_id_skips_inflight_write_too(self, tmp_path):
-        """No agentId in tool_response -- neither DB nor inflight-work.jsonl written."""
-        prompt = "---\ntask_id: t-noagentid\n---\nDo work."
-        hook_input = _make_hook_input_with_tool_input(
-            tool_input={"prompt": prompt},
-            tool_response={"result": "no agent id here"},
-        )
-        exit_code, _, _ = _run_hook(hook_input, tmp_path)
-        assert exit_code == 0
-        assert not self._inflight_work_file(tmp_path).exists()
-
-    def test_inflight_write_failure_does_not_block_hook(self, tmp_path):
-        """If save-inflight-prompt.py's module can't be loaded, the hook still
-        exits 0 and still registers the DB row -- inflight bookkeeping is
-        best-effort, never blocking."""
-        import os
-
-        prompt = "---\ntask_id: t-inflight-fail\n---\nDo work."
-        hook_input = _make_hook_input_with_tool_input(
-            tool_input={"prompt": prompt},
-            tool_response={"agentId": "agent-inflight-fail"},
-        )
-        # The hook is exec'd fresh each time (see _run_hook), so failure-safety
-        # is verified by pointing LOBSTER_WORKSPACE at a read-only directory
-        # that blocks the inflight-prompts/ mkdir inside write_prompt_file.
-        ro_workspace = tmp_path / "ro-workspace"
-        (ro_workspace / "data").mkdir(parents=True)
-        os.chmod(str(ro_workspace / "data"), 0o444)
-
-        stdout_cap = StringIO()
-        stderr_cap = StringIO()
-        exit_code = None
-        with (
-            patch("sys.stdin", StringIO(json.dumps(hook_input))),
-            patch("sys.stdout", stdout_cap),
-            patch("sys.stderr", stderr_cap),
-            patch.dict("os.environ", {
-                "LOBSTER_MESSAGES": str(tmp_path / "messages"),
-                "LOBSTER_WORKSPACE": str(ro_workspace),
-            }),
-        ):
-            try:
-                hook_globals = {"__name__": "__main__", "__file__": str(HOOK_PATH)}
-                exec(compile(HOOK_PATH.read_text(), str(HOOK_PATH), "exec"), hook_globals)
-            except SystemExit as e:
-                exit_code = e.code
-
-        os.chmod(str(ro_workspace / "data"), 0o755)  # restore for cleanup
-        assert exit_code == 0
-
-        # DB registration still succeeded despite inflight-work.jsonl failure.
-        row = _get_row(tmp_path, "agent-inflight-fail")
-        assert row is not None
-
-
-# ---------------------------------------------------------------------------
-# task_origin persistence
-#
-# The spawn-prompt frontmatter may declare where the work came from:
-# task_origin: user | scheduled | internal (the same three values the MCP
-# session_start tool accepts). Without this, every auto-registered row looks
-# like user-originated work, so dispatcher-spawned work cannot be told apart
-# from scheduled or internal work, and nothing downstream can enforce "a
-# user-originated spawn must carry a real chat_id".
-# ---------------------------------------------------------------------------
-
-class TestTaskOriginPersistence:
-    def test_task_origin_scheduled_persisted(self, tmp_path):
-        """Frontmatter task_origin: scheduled is stored on the row as-is."""
-        prompt = (
-            "---\ntask_id: scheduled-fixture-a\nchat_id: 0\n"
-            "source: system\ntask_origin: scheduled\n---\nRun the job."
-        )
-        hook_input = _make_hook_input(
-            prompt=prompt,
-            tool_response={"agentId": "agent-fixture-01"},
-        )
-        exit_code, _, _ = _run_hook(hook_input, tmp_path)
-        assert exit_code == 0
-
-        row = _get_row(tmp_path, "agent-fixture-01")
-        assert row is not None
-        assert row["task_origin"] == "scheduled"
-        assert row["source"] == "system"
-
-    def test_task_origin_defaults_to_user(self, tmp_path):
-        """A spawn whose frontmatter omits task_origin is recorded as 'user'."""
-        prompt = "---\ntask_id: user-fixture-a\nchat_id: 1000001\nsource: telegram\n---\nDo work."
-        hook_input = _make_hook_input(
-            prompt=prompt,
-            tool_response={"agentId": "agent-fixture-02"},
-        )
-        exit_code, _, _ = _run_hook(hook_input, tmp_path)
-        assert exit_code == 0
-
-        row = _get_row(tmp_path, "agent-fixture-02")
-        assert row is not None
-        assert row["task_origin"] == _mod.DEFAULT_TASK_ORIGIN == "user"
-
-    def test_task_origin_invalid_falls_back_to_user(self, tmp_path):
-        """An unrecognised task_origin is stored as 'user' and a warning is logged."""
-        prompt = "---\ntask_id: bogus-fixture-a\nchat_id: 1000001\ntask_origin: cron-ish\n---\nDo work."
-        hook_input = _make_hook_input(
-            prompt=prompt,
-            tool_response={"agentId": "agent-fixture-03"},
-        )
-        exit_code, _, _ = _run_hook(hook_input, tmp_path)
-        assert exit_code == 0
-
-        row = _get_row(tmp_path, "agent-fixture-03")
-        assert row is not None
-        assert row["task_origin"] == "user"
-
-        log_path = tmp_path / "workspace" / "logs" / "hook-failures.log"
-        assert log_path.exists(), "Expected an invalid task_origin to be logged"
-        log_content = log_path.read_text()
-        assert "task_origin" in log_content
-        assert "cron-ish" in log_content
-
-    def test_task_origin_column_added_to_preexisting_table(self, tmp_path):
-        """A DB created before the column existed is migrated additively."""
-        db_dir = tmp_path / "messages" / "config"
-        db_dir.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(db_dir / "agent_sessions.db"))
-        conn.execute("""
-            CREATE TABLE agent_sessions (
-                id TEXT PRIMARY KEY, task_id TEXT, agent_type TEXT,
-                description TEXT NOT NULL, chat_id TEXT NOT NULL,
-                source TEXT NOT NULL DEFAULT 'telegram',
-                status TEXT NOT NULL DEFAULT 'running',
-                output_file TEXT, input_summary TEXT, spawned_at TEXT NOT NULL
-            )
-        """)
-        conn.commit()
-        conn.close()
-
-        prompt = "---\ntask_id: internal-fixture-a\nchat_id: 0\ntask_origin: internal\n---"
-        hook_input = _make_hook_input(
-            prompt=prompt,
-            tool_response={"agentId": "agent-fixture-04"},
-        )
-        exit_code, _, _ = _run_hook(hook_input, tmp_path)
-        assert exit_code == 0
-
-        row = _get_row(tmp_path, "agent-fixture-04")
-        assert row is not None
-        assert row["task_origin"] == "internal"
-
-
-class TestNormalizeTaskOrigin:
-    """Pure normalisation: valid values pass through, anything else -> 'user'."""
-
-    @pytest.mark.parametrize("raw", ["user", "scheduled", "internal"])
-    def test_valid_values_pass_through(self, raw):
-        origin, warning = _mod.normalize_task_origin(raw)
-        assert origin == raw
-        assert warning is None
-
-    @pytest.mark.parametrize("raw,expected", [
-        ("Scheduled", "scheduled"),
-        ('"internal"', "internal"),
-        ("  user  ", "user"),
-    ])
-    def test_case_and_quotes_tolerated(self, raw, expected):
-        origin, warning = _mod.normalize_task_origin(raw)
-        assert origin == expected
-        assert warning is None
-
-    @pytest.mark.parametrize("raw", [None, ""])
-    def test_absent_defaults_to_user_without_warning(self, raw):
-        origin, warning = _mod.normalize_task_origin(raw)
-        assert origin == "user"
-        assert warning is None
-
-    def test_unknown_value_defaults_to_user_with_warning(self):
-        origin, warning = _mod.normalize_task_origin("nightly")
-        assert origin == "user"
-        assert warning is not None and "nightly" in warning
-
-    def test_extract_metadata_carries_task_origin(self):
-        meta = extract_metadata("---\ntask_id: t\ntask_origin: internal\n---\n")
-        assert meta["task_origin"] == "internal"
-
-
-# ---------------------------------------------------------------------------
-# Built-in read-only helper agents (Explore, Plan) are not registered
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("helper_type", ["Explore", "Plan"])
-def test_helper_type_not_registered(monkeypatch, tmp_path, helper_type):
-    """A helper spawn writes no agent_sessions row and no inflight-work line,
-    so the reconciler never reports it as a completion or ghost — even when
-    its prompt happens to carry a task_id."""
-    monkeypatch.delenv("LOBSTER_HELPER_AGENT_TYPES", raising=False)
-    hook_input = _make_hook_input_with_tool_input(
-        tool_input={
-            "prompt": "---\ntask_id: helper-fixture-01\nchat_id: 1000001\n---\nFind X.",
-            "subagent_type": helper_type,
-            "description": "search",
-        },
-        tool_response={"agentId": "agent-fixture-helper-01"},
-    )
-    exit_code, _, _ = _run_hook(hook_input, tmp_path)
-    assert exit_code == 0
-
-    # A conftest fixture may pre-create the DB file without the table, so
-    # "no row" means: no DB, no table, or no matching row.
-    db_path = tmp_path / "messages" / "config" / "agent_sessions.db"
-    if db_path.exists():
-        conn = _open_db(tmp_path)
-        try:
-            has_table = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_sessions'"
-            ).fetchone()
-        finally:
-            conn.close()
-        if has_table:
-            assert _get_row(tmp_path, "agent-fixture-helper-01") is None
-    inflight = tmp_path / "workspace" / "data" / "inflight-work.jsonl"
-    assert _read_jsonl(inflight) == []
-
-
-def test_non_helper_type_still_registered(monkeypatch, tmp_path):
-    monkeypatch.delenv("LOBSTER_HELPER_AGENT_TYPES", raising=False)
-    hook_input = _make_hook_input_with_tool_input(
-        tool_input={
-            "prompt": "---\ntask_id: worker-fixture-01\nchat_id: 1000001\n---\nDo X.",
-            "subagent_type": "lobster-generalist",
-        },
-        tool_response={"agentId": "agent-fixture-worker-01"},
-    )
-    exit_code, _, _ = _run_hook(hook_input, tmp_path)
-    assert exit_code == 0
-    assert _get_row(tmp_path, "agent-fixture-worker-01") is not None
-    inflight = tmp_path / "workspace" / "data" / "inflight-work.jsonl"
-    assert len(_read_jsonl(inflight)) == 1

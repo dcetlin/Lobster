@@ -59,7 +59,6 @@ decode_base64url = _gp.decode_base64url
 extract_body = _gp.extract_body
 should_skip_message = _gp.should_skip_message
 build_inbox_message = _gp.build_inbox_message
-SKIP_LABEL_IDS = _gp.SKIP_LABEL_IDS
 
 
 # ---------------------------------------------------------------------------
@@ -212,8 +211,8 @@ class TestExtractBody:
 
 ACCOUNT_EMAIL = "owner@example.com"
 
-# SKIP_LABEL_IDS is a frozenset defined in the module.
-PROMO_LABEL = next(iter(SKIP_LABEL_IDS))  # any one skip label
+# SKIP_LABEL_IDS is a frozenset defined in the production module.
+PROMO_LABEL = next(iter(_gp.SKIP_LABEL_IDS))  # any one skip label
 
 
 class TestShouldSkipMessage:

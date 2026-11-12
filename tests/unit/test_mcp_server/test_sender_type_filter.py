@@ -15,6 +15,7 @@ All DB tests use an in-memory SQLite connection — no on-disk state required.
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -358,11 +359,14 @@ class TestHandleGetConversationHistorySenderType:
     """Verify sender_type is threaded through to _db_get_conversation_history."""
 
     def test_sender_type_propagated_to_db_call(self):
+        # DB path is only attempted when LOBSTER_USE_DB=1 (issue #1471: a
+        # disabled write path means messages.db can't be trusted, so the
+        # handler skips straight to the filesystem otherwise).
         mock_get = MagicMock(return_value=[])
         mock_count = MagicMock(return_value=0)
         mock_conn = MagicMock()
 
-        with patch.multiple(
+        with patch.dict(os.environ, {"LOBSTER_USE_DB": "1"}), patch.multiple(
             "src.mcp.inbox_server",
             _db_get_conversation_history=mock_get,
             _db_count_conversation_history=mock_count,
@@ -380,7 +384,7 @@ class TestHandleGetConversationHistorySenderType:
         mock_count = MagicMock(return_value=0)
         mock_conn = MagicMock()
 
-        with patch.multiple(
+        with patch.dict(os.environ, {"LOBSTER_USE_DB": "1"}), patch.multiple(
             "src.mcp.inbox_server",
             _db_get_conversation_history=mock_get,
             _db_count_conversation_history=mock_count,
@@ -399,7 +403,7 @@ class TestHandleGetConversationHistorySenderType:
         mock_count = MagicMock(return_value=0)
         mock_conn = MagicMock()
 
-        with patch.multiple(
+        with patch.dict(os.environ, {"LOBSTER_USE_DB": "1"}), patch.multiple(
             "src.mcp.inbox_server",
             _db_get_conversation_history=mock_get,
             _db_count_conversation_history=mock_count,

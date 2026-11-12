@@ -8,7 +8,7 @@
 #   ~/lobster/scripts/list-incidents.sh --today   # Today's incidents
 #===============================================================================
 
-INCIDENT_DIR="${INCIDENT_DIR:-${LOBSTER_INSTALL_DIR:-$HOME/lobster}/incidents}"
+INCIDENT_DIR="${INCIDENT_DIR:-${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}/retros/incidents}"
 
 if [[ ! -d "$INCIDENT_DIR" ]]; then
     echo "No incidents directory found at $INCIDENT_DIR"

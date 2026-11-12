@@ -41,7 +41,7 @@ _HOOK_PATH = _HOOKS_DIR / "inject-bootup-context.py"
 
 # Named constant matching the variable name in config.env
 LOBSTER_ADMIN_CHAT_ID_VAR = "LOBSTER_ADMIN_CHAT_ID"
-SAMPLE_CHAT_ID = "1234567890"  # ADMIN_CHAT_ID_REDACTED placeholder, matches convention used elsewhere in this suite
+SAMPLE_CHAT_ID = "8305714125"
 PREAMBLE_PREFIX = "ADMIN_CHAT_ID="
 
 

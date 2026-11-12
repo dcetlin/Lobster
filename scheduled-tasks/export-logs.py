@@ -11,8 +11,19 @@ is chosen (see GitHub issue #730).
 import json
 import os
 import shutil
+import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Path setup — allow running as a script from any working directory
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from src.utils.jobs import is_job_enabled
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +224,9 @@ def write_task_output(task_outputs_dir: Path, job_name: str, summary: str, statu
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    if not is_job_enabled("export-logs"):
+        return 0
+
     paths = resolve_paths()
 
     copy_results = [

@@ -11,7 +11,7 @@ KNOWN_AGENT_TYPES = (
     "functional-engineer",
     "review",
     "lobster-ops",
-    "lobster-auditor",
+    "iva-deployer",
     "brain-dumps",
     "compact-catchup",
     "nightly-consolidation",
@@ -23,7 +23,7 @@ data = json.load(sys.stdin)
 tool = data.get("tool_name", "")
 inp = data.get("tool_input", {})
 
-if tool != "Agent":
+if tool not in ("Agent", "Task"):
     sys.exit(0)
 
 subagent_type = inp.get("subagent_type")

@@ -11,6 +11,14 @@ from typing import Protocol, Optional
 from datetime import datetime
 
 
+VALENCE_VALUES = frozenset({"golden", "smell", "neutral"})
+
+VALID_SIGNAL_TYPES = frozenset({
+    "task_request", "design_question", "voice_note", "status_check",
+    "system_observation", "meta_reflection", "philosophy", "casual"
+})
+
+
 @dataclass
 class MemoryEvent:
     """A single event stored in memory.
@@ -18,6 +26,18 @@ class MemoryEvent:
     Events represent messages, tasks, decisions, notes, or links
     that Lobster should remember. Each event is stored with its
     embedding for vector search and indexed for keyword search.
+
+    The ``valence`` field classifies an observation as a golden pattern
+    (something that works well and should be reinforced), a smell (something
+    problematic that should be addressed), or neutral (no strong signal).
+    Valid values: 'golden' | 'smell' | 'neutral' (default).
+
+    The ``subject`` field is a short noun-phrase label for what this event is about.
+
+    The ``signal_type_hint`` field is the caller's pre-classification of the event's
+    signal type. When provided, the slow-reclassifier will use this value and skip
+    content inference. Valid values: 'task_request' | 'design_question' | 'voice_note' |
+    'status_check' | 'system_observation' | 'meta_reflection' | 'philosophy' | 'casual'.
     """
     id: Optional[int]
     timestamp: datetime
@@ -27,6 +47,9 @@ class MemoryEvent:
     content: str
     metadata: dict = field(default_factory=dict)
     consolidated: bool = False
+    valence: str = "neutral"   # 'golden' | 'smell' | 'neutral'
+    subject: Optional[str] = None
+    signal_type_hint: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Serialize to a dictionary."""
@@ -39,6 +62,9 @@ class MemoryEvent:
             "content": self.content,
             "metadata": self.metadata,
             "consolidated": self.consolidated,
+            "valence": self.valence,
+            "subject": self.subject,
+            "signal_type_hint": self.signal_type_hint,
         }
 
     @classmethod
@@ -58,6 +84,9 @@ class MemoryEvent:
             content=data.get("content", ""),
             metadata=data.get("metadata", {}),
             consolidated=data.get("consolidated", False),
+            valence=data.get("valence", "neutral"),
+            subject=data.get("subject"),
+            signal_type_hint=data.get("signal_type_hint"),
         )
 
 
@@ -73,11 +102,20 @@ class MemoryProvider(Protocol):
         """Store an event and return its ID."""
         ...
 
-    def search(self, query: str, limit: int = 10, project: str = None) -> list[MemoryEvent]:
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        project: str = None,
+        valence: str = None,
+    ) -> list[MemoryEvent]:
         """Search memory for events matching the query.
 
         Uses hybrid search (vector + keyword) when available,
         falls back to keyword-only search otherwise.
+
+        Pass ``valence='golden'`` or ``valence='smell'`` to restrict results
+        to observations with that classification.
         """
         ...
 

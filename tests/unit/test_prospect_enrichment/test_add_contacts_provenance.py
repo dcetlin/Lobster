@@ -19,14 +19,8 @@ sys.path.insert(
     str(Path(__file__).parent.parent.parent.parent
         / "lobster-shop" / "prospect-enrichment" / "bin"),
 )
-sys.path.insert(
-    0,
-    str(Path(__file__).parent.parent.parent.parent
-        / "lobster-shop" / "prospect-enrichment" / "provenance"),
-)
 
 from add_contacts_provenance import add_contacts_provenance
-from constants import ASSISTANT_NAME
 
 
 # ---------------------------------------------------------------------------
@@ -95,8 +89,8 @@ class TestAddContactsProvenance:
         assert "supply-chain" in tags
         assert "prospect-enrichment" in tags
 
-    def test_provenance_meta_matches_assistant_name(self):
-        """Provenance meta entry has value equal to the configured assistant name."""
+    def test_provenance_meta_is_wallace(self):
+        """Provenance meta entry has value 'wallace'."""
         contacts = [
             {
                 "name": "Alice Lee",
@@ -113,7 +107,7 @@ class TestAddContactsProvenance:
         meta = first_call[0][1]["input"]["meta"]
         prov = next((m for m in meta if m["key"] == "provenance"), None)
         assert prov is not None
-        assert prov["value"] == ASSISTANT_NAME
+        assert prov["value"] == "wallace"
 
     def test_enriched_at_is_set(self):
         """enriched_at meta entry is present and looks like ISO-8601."""

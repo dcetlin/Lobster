@@ -31,8 +31,7 @@ Token schema on disk::
         "access_token":  "<string>",
         "expires_at":    "<ISO 8601 UTC>",
         "scope":         "<space-separated scopes>",
-        "refresh_token": "<string or null>",
-        "email":         "<string or null -- authenticated account, issue #2153>"
+        "refresh_token": "<string or null>"
     }
 
 Design principles
@@ -63,8 +62,6 @@ from integrations.google_calendar.oauth import (
     TokenData,
     is_token_valid,
 )
-from integrations.google_workspace import token_store as _workspace_token_store
-from integrations.google_workspace.config import WORKSPACE_TOKEN_DIR
 
 log = logging.getLogger(__name__)
 
@@ -76,14 +73,6 @@ _HOME: Path = Path.home()
 _MESSAGES_DIR: Path = Path(os.environ.get("LOBSTER_MESSAGES", str(_HOME / "messages")))
 _TOKEN_DIR: Path = _MESSAGES_DIR / "config" / "gmail-tokens"
 _GMAIL_CONFIG_PATH: Path = _MESSAGES_DIR / "config" / "gmail-config.json"
-
-# BIS-731 / Slice 3: fallback token store for users who ran the `workspace`
-# consent flow instead of the gmail-specific one. `WORKSPACE_SCOPES` in
-# google_workspace/config.py includes the gmail.modify scope "for
-# unified-token support" — this is what lets a workspace grant substitute
-# for a dedicated one.
-_WORKSPACE_TOKEN_DIR: Path = WORKSPACE_TOKEN_DIR
-_WORKSPACE_GMAIL_SCOPE_SUBSTRING: str = "gmail.modify"
 
 # File permissions: owner read+write only (octal 0o600)
 _TOKEN_FILE_MODE: int = stat.S_IRUSR | stat.S_IWUSR
@@ -155,7 +144,6 @@ def _token_to_dict(token: TokenData) -> dict:
         "expires_at": token.expires_at.isoformat(),
         "scope": token.scope,
         "refresh_token": token.refresh_token,
-        "email": token.email,
     }
 
 
@@ -169,7 +157,6 @@ def _dict_to_token(data: dict) -> TokenData:
         expires_at=expires_at,
         scope=data.get("scope", ""),
         refresh_token=data.get("refresh_token"),
-        email=data.get("email"),
     )
 
 
@@ -360,75 +347,23 @@ def load_token(
     return _load_token_local(user_id, token_dir)
 
 
-def _get_workspace_fallback_token(
-    user_id: str,
-    workspace_token_dir: Path,
-) -> Optional[TokenData]:
-    """Fall back to the shared Google Workspace token store.
-
-    A user who ran the `workspace` consent flow (not the gmail-specific one)
-    already holds a token whose scope bundle includes gmail.modify "for
-    unified-token support" (google_workspace/config.py WORKSPACE_SCOPES).
-    Rather than re-implement load/validate/refresh here, delegate to
-    google_workspace.token_store.get_valid_token, which already owns that
-    lifecycle for its own store — this only decides whether the result it
-    returns is usable for Gmail, based on the granted scope.
-
-    Args:
-        user_id:             Unique identifier for the user.
-        workspace_token_dir: Workspace token directory (injectable for testing).
-
-    Returns:
-        The workspace TokenData if it exists, is valid (or refreshable), and
-        its scope includes gmail.modify; otherwise None.
-    """
-    workspace_token = _workspace_token_store.get_valid_token(
-        user_id, token_dir=workspace_token_dir
-    )
-    if workspace_token is None:
-        return None
-
-    if _WORKSPACE_GMAIL_SCOPE_SUBSTRING not in workspace_token.scope:
-        log.info(
-            "Workspace token for user_id=%r does not grant gmail.modify scope "
-            "(scope=%r) — not using it as a Gmail fallback.",
-            user_id,
-            workspace_token.scope,
-        )
-        return None
-
-    log.info(
-        "No Gmail-specific token for user_id=%r — using workspace token "
-        "fallback (scope includes gmail.modify).",
-        user_id,
-    )
-    return workspace_token
-
-
 def get_valid_token(
     user_id: str,
     token_dir: Path = _TOKEN_DIR,
-    workspace_token_dir: Path = _WORKSPACE_TOKEN_DIR,
 ) -> Optional[TokenData]:
     """Return a valid Gmail access token for the user, refreshing if necessary.
 
     Workflow:
     1. Load token from local disk.
-    2. If no token -> fall back to the workspace token store (BIS-731); if
-       that also yields nothing usable -> return None (user must
-       authenticate via consent link).
+    2. If no token -> return None (user must authenticate via consent link).
     3. If token is still valid -> return it.
     4. If token is expired -> call myownlobster refresh proxy.
     5. Persist the refreshed token (preserving the original refresh_token).
     6. If refresh fails -> log and return None.
 
     Args:
-        user_id:             Unique identifier for the user (Telegram chat_id as str).
-        token_dir:           Local token directory (injectable for testing).
-        workspace_token_dir: Workspace token directory (injectable for testing).
-                             Only consulted when no gmail-specific token file
-                             exists at all — an existing gmail token is
-                             always used as-is, workspace is never checked.
+        user_id:   Unique identifier for the user (Telegram chat_id as str).
+        token_dir: Local token directory (injectable for testing).
 
     Returns:
         A valid TokenData, or None if no valid token is available.
@@ -436,7 +371,7 @@ def get_valid_token(
     token = _load_token_local(user_id, token_dir)
     if token is None:
         log.info("No local Gmail token found for user_id=%r.", user_id)
-        return _get_workspace_fallback_token(user_id, workspace_token_dir)
+        return None
 
     if is_token_valid(token):
         return token
@@ -460,13 +395,12 @@ def get_valid_token(
         )
         return None
 
-    # Merge: preserve scope, refresh_token, and email from the stored token
+    # Merge: preserve scope and refresh_token from the stored token
     refreshed = TokenData(
         access_token=refreshed_partial.access_token,
         expires_at=refreshed_partial.expires_at,
         scope=token.scope,           # preserve original scope
         refresh_token=token.refresh_token,  # Google doesn't return new refresh_token here
-        email=token.email,           # preserve identity metadata across refresh
     )
 
     _save_token_local(user_id, refreshed, token_dir)

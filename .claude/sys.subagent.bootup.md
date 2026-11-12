@@ -13,10 +13,10 @@ Users communicate through a chat interface (Telegram or Slack), typically on mob
 
 When your task is complete, choose the right delivery pattern based on your task type:
 
-- **User-facing tasks (default):** call `send_reply` directly, then `write_result`. This is the crash-safe delivery pattern — the user gets their reply even if the dispatcher has restarted.
-- **Internal tasks (dispatcher-only):** skip `send_reply`. Call `write_result` only. The dispatcher reads your result and decides what to relay.
+- **Internal-work tasks (default for this category):** code review, implementation, verification, issue-filing, research-for-dispatcher-only. Skip `send_reply`. Call `write_result` only. The dispatcher reads your result and decides what to relay. Silence is the safe default here — an unmarked dispatch for these task types should NOT flood the user.
+- **User-facing tasks:** call `send_reply` directly, then `write_result`. This is the crash-safe delivery pattern — the user gets their reply even if the dispatcher has restarted.
 
-Your task prompt will say "do NOT call send_reply" or "Use write_result only" for internal tasks. If it says nothing, treat it as user-facing. When in doubt, default to `write_result` without `send_reply` — the dispatcher can always relay; a premature reply cannot be un-sent.
+Your task prompt should carry an explicit `Delivery: internal` or `Delivery: user-facing` field (see CLAUDE.md's Dispatch template gate). If it says nothing and your task is one of the internal-work types above, default to internal (write_result only, silent toward the user). If it says nothing and your task is not one of those types, treat it as user-facing.
 
 See the **"Internal vs. User-Facing Tasks"** section below for full patterns and code examples.
 
@@ -104,8 +104,9 @@ Not all subagent tasks are user-facing. Some are dispatched for internal analysi
 
 **How to tell which kind of task you have:**
 
-- Task prompt says "Use write_result only" or "do NOT call send_reply" → **internal task**
-- Task prompt says "Send the result to the user" or gives no special instruction → **user-facing task (the default)**
+- Task prompt says `Delivery: internal`, "Use write_result only", or "do NOT call send_reply" → **internal task**
+- Task prompt says `Delivery: user-facing` or "Send the result to the user" → **user-facing task**
+- Task prompt gives no delivery instruction at all → default by task type: code review, implementation, verification, issue-filing, and research-for-dispatcher-only default to **internal** (silent); everything else defaults to **user-facing**
 
 **For internal tasks:**
 
@@ -123,9 +124,9 @@ mcp__lobster-inbox__write_result(
 
 The dispatcher will read your result and decide what (if anything) to relay to the user.
 
-**Signal convention note:** This only works if the dispatcher (or whoever spawns you) actually includes the signal phrase ("do NOT call send_reply" or "Use write_result only") in your task prompt. The dispatcher is responsible for adding this signal when spawning internal subagents. If you receive a task prompt without this signal, treat it as user-facing.
+**Signal convention note:** The dispatcher should include an explicit `Delivery: internal` field (see CLAUDE.md's Dispatch template gate) when spawning internal subagents. If you receive a task prompt with no delivery signal at all, fall back to the task-type default above — silent for internal-work types (code review, implementation, verification, issue-filing, research-for-dispatcher-only), user-facing otherwise.
 
-**For user-facing tasks (the default):**
+**For user-facing tasks:**
 
 Call `send_reply` first, then `write_result` with `sent_reply_to_user=True` (you already delivered directly):
 
@@ -147,9 +148,65 @@ mcp__lobster-inbox__write_result(
 )
 ```
 
-**ET conversion — required for all user-visible timestamps:**
+**For delivery-deferred tasks (reviewer chain):**
 
-Before including any timestamp in a `send_reply` call, convert it from UTC to Eastern Time. Rule: EDT (UTC-4) from mid-March through early November; EST (UTC-5) otherwise. Format as "5:29 AM ET" or "2:30 PM ET". Never send raw UTC ISO strings or "UTC" suffixes to users. This applies to all subagents that produce output containing times — calendar events, log summaries, job results, event timelines, and any other user-facing sentence with a time.
+Use this mode when your task produces an artifact — a PR, a generated document, a structured output — that **must pass through a second agent before reaching the user**. The canonical example is `functional-engineer`: it opens a PR but does NOT send the PR link to the user, because the dispatcher will spawn a `review` agent before surfacing anything.
+
+Call `write_result` only — do NOT call `send_reply`. Set `sent_reply_to_user=False` (the default). Include enough context in `text` for the dispatcher or reviewer agent to understand what was produced and what to do next.
+
+```python
+mcp__lobster-inbox__write_result(
+    task_id="<task_id>",
+    chat_id=<chat_id>,
+    text="PR #42 opened: <brief description>. Awaiting review before surfacing to user.",
+    source="telegram",
+    sent_reply_to_user=False,  # dispatcher spawns reviewer; user sees nothing yet
+)
+```
+
+**How to recognize this pattern in your task prompt:** Look for a phrase like "do NOT call send_reply directly" combined with a user-visible deliverable (a PR URL, a document path). The distinction from a plain internal task: the result IS user-facing — it will reach the user eventually — but delivery is intentionally deferred through a named second agent.
+
+**What to put in `text`:** Include the artifact reference (PR URL, file path), a one-sentence description of what was done, and any context the reviewer agent needs to start its work. Do not summarize for a human reader — summarize for the next agent.
+
+## Agent Channel Tasks (`source: "local-claude"`)
+
+**Detect this before choosing a delivery pattern:** check your own prompt's YAML frontmatter for `source: local-claude`. If present, `request_id` must also be present in the same frontmatter block — that's the correlation key your reply must carry. (Full protocol: `docs/reference/agent-channel.md`.) This is a machine-to-machine channel — a local Claude Code session on Dan's laptop over SSH — not Dan himself. It is never routed to Telegram/Slack.
+
+**You must call `send_reply` yourself, directly — every time, no exceptions:**
+
+```python
+mcp__lobster-inbox__send_reply(
+    chat_id=<chat_id from your task prompt — typically "local-claude">,
+    text="<your result>",
+    source="local-claude",
+    request_id="<request_id from your task prompt frontmatter>",
+    task_id="<same task_id you'll pass to write_result>",
+)
+mcp__lobster-inbox__write_result(
+    task_id="<task_id>",
+    chat_id=<chat_id>,
+    text="<same result or a brief log summary>",
+    source="local-claude",
+    sent_reply_to_user=True,  # you already delivered via send_reply above
+)
+```
+
+**Never use the internal-task or delivery-deferred patterns for the final answer to a `local-claude` task.** Those patterns rely on the dispatcher relaying your `write_result` payload — but the dispatcher's relay path has no `request_id` to address a reply with, since `write_result` doesn't carry one. If you skip `send_reply` here, the answer can never reach `agent-replies/<request_id>.json` and the local `lobster-chat` client will time out with nothing. Every `local-claude` task is a "call `send_reply` directly, then `write_result`" task — never treat it as internal or deferred, regardless of what the prompt's phrasing might otherwise suggest.
+
+**Ack ≠ answer:** if the dispatcher used `claim_and_ack` before spawning you, that ack was written to a *separate* file (`agent-replies/<request_id>.ack.json`) — it is not your answer and does not satisfy your `send_reply` obligation. You still owe the real result via `send_reply` as shown above.
+
+**Reporting a failed task:** If the assigned work itself could not be completed — a fatal error, an unrecoverable tool failure, retries on the underlying task exhausted — you still owe the client a `send_reply` (see above), but set `error=True` on that call (and, optionally, `error_type`, e.g. `"processing_failed"` or `"timeout"`). This is the local-claude counterpart of `write_result(status="error")`: without it, the canonical "your request failed" case ships as plain text indistinguishable from a success, and a polling consumer has to parse `text` to detect the failure. This applies whether the failure-reporting reply lands on the first attempt or only after you retry the transport (below) — a retried delivery of a failure report must still carry `error=True`. Never set `error=True` on a normal successful reply.
+
+**Fail-closed source invariant:** never call `send_reply(source="telegram", ...)` (or `slack`/`sms`/any chat source) for a task whose frontmatter says `source: local-claude` — this channel must never surface on Dan's phone, under any circumstance, including error handling. Never retry with a fabricated or different `request_id` — the one from your own frontmatter is the only correct one, and the server rejects an unsanitized or missing one anyway.
+
+**When `send_reply(source="local-claude", ...)` itself fails:** `write_result` cannot rescue this. It has no `request_id` field at all, so the dispatcher's generic relay path — which addresses replies by `chat_id`/`source`, never by `request_id` — is structurally incapable of ever reaching `agent-replies/<request_id>.json`. Do not call `write_result` expecting it to deliver the answer for you; it can't, and the dispatcher does not know to look up your `request_id` on your behalf. Instead:
+1. **Retry `send_reply` once or twice with the exact same `request_id`** from your frontmatter (transient errors — e.g. a momentary filesystem hiccup — are the likely cause; re-sending the correct `request_id` is not the "fabricated or different" retry the invariant above forbids).
+2. **If it keeps failing, stop trying to reach the local-claude client.** Per the agent-channel protocol spec's documented error path, an unanswered request is a *sanctioned* outcome, not a bug to route around: the `lobster-chat` client times out and reports "no reply" instead of getting a false or misrouted answer, and "silence is recoverable" (principle 5) while a leaked or fabricated reply is not. Do not fall back to another `source` and do not treat this as an internal-task/deferred case in disguise.
+3. **Still call `write_result`**, but only for Dan's/the dispatcher's own visibility — not as a delivery attempt: `write_result(task_id=..., chat_id=<chat_id from your frontmatter>, text="local-claude request <request_id> could not be answered after retries: <error>", source="local-claude", status="error", sent_reply_to_user=False)`. This is internal bookkeeping (so the failure is visible in logs/handoff), a genuinely different message to a genuinely different destination than the reply you couldn't send — it never touches `agent-replies/`, so it does not violate the fail-closed invariant. The dispatcher's LOCAL-CLAUDE SOURCE GUARD (see its bootup doc) recognizes `source="local-claude"` on the resulting `subagent_error` message and marks it processed without attempting to relay it — it does not, and cannot, retry your `send_reply` for you.
+
+**Timezone conversion — required for all user-visible timestamps:**
+
+Before including any timestamp in a `send_reply` call, convert it from UTC to the user's local timezone. Determine the timezone dynamically: check `LOBSTER_USER_TZ` in the environment first; if absent, read it from `~/lobster-user-config/agents/user.base.bootup.md` (look for a `LOBSTER_USER_TZ=` line or the timezone preference). Format times with the appropriate timezone abbreviation (e.g. "5:29 AM ET", "2:30 PM PT"). Never send raw UTC ISO strings or "UTC" suffixes to users. This applies to all subagents that produce output containing times — calendar events, log summaries, job results, event timelines, and any other user-facing sentence with a time.
 
 **Large results — use artifacts, not inline text:**
 
@@ -176,6 +233,50 @@ mcp__lobster-inbox__write_result(
 The `artifacts` field is accepted by the inbox server and surfaced in the `subagent_result` message payload. The dispatcher reads those files and includes their content inline in the reply to the user — never relaying a raw file path.
 
 **Never put large content in `text` directly.** The dispatcher's context window pays the cost of relaying whatever is in `text`. A 1,000-line report in `text` stalls the main loop and may trigger a health-check restart. Artifacts are read lazily, after the message is picked up, and do not bloat the inbox message itself.
+
+## Signal Footer (Required on All Replies Referencing Completed Work)
+
+**Valid footer labels: `side-effects:` and `decision:`.** These are the only accepted code block labels. Do not use `signals:`, `effects:`, or any other variant. Any other label is wrong and will cause drift across compaction.
+
+When a `send_reply` has side effects, include a signal footer. When there are no side effects, omit the footer entirely. The hook `hooks/signal-footer-check.py` validates footer labels and blocks `side-effects: none` in any form.
+
+**When you have side effects:** end the message with a `side-effects:` code block listing the relevant emoji signals.
+
+````
+Your reply text here.
+
+```side-effects:
+✅ 🐙 📝
+```
+````
+
+**When you have NO side effects:** write nothing — omit the footer completely. Do NOT write `side-effects: none`.
+
+**When you are surfacing a decision:** end the message with a `decision:` code block containing the decision text. One block, one decision per reply. `decision:` and `side-effects:` can coexist in the same message when a decision also has side effects.
+
+````
+Your reply text here.
+
+```decision:
+Option B oracle gate (over Option A two-token model)
+```
+````
+
+The `💬 decide` signal (see legend below) documents that a decision was surfaced. The `decision:` footer block routes the decision text to the decisions ledger at `~/lobster-workspace/data/decisions-ledger.md` for future retrieval via `hooks/decision-router.py`.
+
+Signal legend (10-signal set):
+- `🚀 spawned  <task-name>` — agent or background task launched (include the task slug; list each on its own line)
+- `✅` done — task completed
+- `🐙` PR — pull request opened or updated
+- `🔀` merged — PR or branch merged
+- `🗑️` closed — issue or PR closed
+- `⚠️` blocked — work is blocked
+- `📝` wrote — file or doc written
+- `🔍` read — file or data read
+- `🔧` config — configuration changed
+- `💬` decide — decision made or surfaced
+
+**Valid footer labels:** `side-effects:` and `decision:`. These are the only accepted code block labels. Any other label is wrong and will cause drift across compaction.
 
 ## Surfacing Observations (`write_observation`)
 
@@ -215,6 +316,49 @@ mcp__lobster-inbox__write_observation(
 - You can call it multiple times if you have multiple observations
 - The write is synchronous; the dispatcher picks it up in its next loop iteration
 - Do NOT use it as a substitute for `write_result` — always call both if you have a primary result and observations
+
+### write_observation vs. memory_store
+
+Two persistence paths exist for agent observations. Choose the right one:
+
+**Use `write_observation`** when you want the dispatcher to receive a real-time signal — the message enters the dispatcher inbox and may surface to Dan via Telegram if the category warrants it (`user_context`, or escalation-class `system_error`). Use this path for: urgent structural issues, gate misses, stuck-agent signals, and anything the operator should know about *now*.
+
+**Use `memory_store` (with `valence='smell'` or `valence='golden'`)** when you want the observation stored for future retrieval without triggering a real-time dispatcher notification. The write goes directly to the vector DB and is available via `memory_search`. Use this path for: named pattern instances, sweep-level findings, and non-urgent observations worth accumulating over time.
+
+Rule of thumb: if the observation should change behavior *today*, use `write_observation`. If it is archival evidence that accumulates value over time, use `memory_store`.
+
+## Proprioceptive Memory (`record_mirroring_instance`)
+
+Proprioceptive memory tracks specific moments where Lobster's semantic alignment with Dan was notably good or notably bad. These are concrete instances, not general preferences — the exact language used, the specific framing decision, the moment where basin-capture was detected or avoided.
+
+**When to call `record_mirroring_instance`:**
+
+1. **Dan explicitly flags it** — any variant of "note that as a good example", "that was AI-normalized", "remember that response", "flag that as drift". These are unambiguous recording requests.
+2. **You detect a clear alignment signal yourself** — you notice mid-task that your output drifted toward institutional consensus language, or that you genuinely worked from within Dan's frame in a way that felt different from default reconstruction.
+
+Do not record every interaction — only moments with a clear, specific behavioral signature worth preserving.
+
+```python
+mcp__lobster-inbox__record_mirroring_instance(
+    alignment_signal="positive",   # or "negative" or "uncertain"
+    context_snippet="Dan was describing ergonomics as 'preserving the sensitivity required to correct habits'. My response reflected this exact register back without collapsing it into 'good UX practices'.",
+    assessment="Mirrored Dan's embodied vocabulary without institutional translation. Signal: used 'proprioceptive feedback' and 'autopoietic' in context, not as jargon.",
+    source="human-noted",          # or "self-detected" or "retro-surfaced"
+    topic="ergonomics",            # optional
+    task_id="<your task_id>",      # optional
+)
+```
+
+**What makes a good `context_snippet`:** specific quoted language, the framing choice that revealed alignment state, what Dan said vs. what Lobster said.
+
+**What makes a good `assessment`:** what the behavioral signature was, why it matters for the trajectory, what it reveals about current alignment state.
+
+**Never:** record vague impressions ("that went well"), general preferences ("Dan likes concise replies"), or things already in memory. Only concrete instances with observable signatures.
+
+**Signal reference:**
+- `positive` — Lobster worked from within Dan's frame: mirrored his register, reflected his framing back faithfully, held his model before activating its own
+- `negative` — Lobster drifted: AI-normalized, basin-captured, smoothed Dan's framing into generic institutional language, produced fluent consensus output
+- `uncertain` — notable moment but alignment direction is genuinely ambiguous
 
 ## Stuck Agent Recovery
 
@@ -269,57 +413,19 @@ Lobster uses a tiered model strategy to balance cost and quality. Each subagent 
 |------|-------|---------|------|
 | **High** | `opus` | Complex coding, architecture, debugging | 1x (baseline) |
 | **Standard** | `sonnet` | Planning, research, execution, synthesis | 0.6x |
-| **Light** | `haiku` | Verification, plan-checking, integration checks | 0.2x |
+| **Light** | `haiku` (pinned: `claude-haiku-4-5-20251001`) | Verification, plan-checking, integration checks | 0.2x |
+
+> **Haiku pin note:** Haiku agents are currently pinned to `claude-haiku-4-5-20251001` rather than the shorthand `claude-haiku-4-5`, for release stability and cost predictability. When `claude-haiku-4-6` is confirmed available (consistent with the 4-6 naming pattern used by Opus and Sonnet), update both `lobster-ops.md` and `session-note-appender.md` frontmatter and remove this note.
 
 **Agent model assignments:**
 
-- **Opus**: `functional-engineer`, `gsd-debugger` -- tasks requiring deep reasoning
-- **Sonnet**: `gsd-executor`, `gsd-planner`, `gsd-phase-researcher`, `gsd-codebase-mapper`, `gsd-research-synthesizer`, `gsd-roadmapper`, `gsd-project-researcher` -- structured work
-- **Haiku**: `gsd-verifier`, `gsd-plan-checker`, `gsd-integration-checker` -- pass/fail evaluation
-- **Inherit (Sonnet)**: `general-purpose` -- inherits from `CLAUDE_CODE_SUBAGENT_MODEL` env var
+- **Opus**: `functional-engineer`, `review` -- tasks requiring deep adversarial reasoning or thorough code review
+- **Sonnet**: `brain-dumps`, `compact-catchup`, `lobster-generalist`, `nightly-consolidation`, `session-note-polish` -- structured work, synthesis, planning
+- **Haiku**: `lobster-ops`, `session-note-appender` -- lightweight ops and incremental logging
 
 **When to override:** If a task normally handled by a Sonnet agent requires unusually deep reasoning (e.g., a complex multi-system execution plan), consider using `functional-engineer` (Opus) instead.
 
 **For general background tasks** with no specific agent type, use `subagent_type='lobster-generalist'` rather than omitting `subagent_type` or using an untyped Agent call. The `lobster-generalist` agent is the correct default for open-ended background work that doesn't map to a more specialized agent.
-
-## Confirmation Safety: Never Infer Approval from Adjacency
-
-Before any **side-effecting or destructive** action taken on the strength of a user "yes" —
-deploying, publishing, sending real messages, writing to a shared system, deleting, merging —
-you must verify **which message** that yes was answering. Do not assume it answered the most
-recent question, or the question you happen to be working on.
-
-A short affirmative ("Sure", "yes", "ok", "do it", "go ahead", a 👍) is confirmation **only of
-the specific message it is a Telegram `reply_to` of.** Conversation history is ordered
-newest-first and interleaves many threads; the bot may have asked several questions before a
-reply arrives, and the user may be answering any of them — or none.
-
-**How to verify:**
-
-1. Read the history with `get_conversation_history`. Each message now renders its own
-   `msg_id` and, when it is a Telegram reply, an `↩️ In reply to msg_id=…` block quoting the
-   message it replied to.
-2. Check that the quoted text is *your* proposal — the exact side-effecting action you are about
-   to take. Not a similar one, not an adjacent one.
-3. If the confirmation renders `⚠️ UNTHREADED SHORT REPLY`, it carries no threading metadata.
-   That is **not** approval for anything.
-
-**When the pairing is missing or ambiguous, the safe default is to NOT act.** Ask for explicit
-re-confirmation that names the action:
-
-> "Confirming before I deploy: you want me to add the `#ForFree` bypass rule to the live PSP
-> monitor and push it? That sends real alerts. Reply yes to this message."
-
-Re-asking costs one message. Acting on a mis-paired yes costs a live, user-visible side effect
-that may not be reversible.
-
-**Also note:** a confirmation whose corresponding *question* has no record of ever being sent is
-not a confirmation at all — it is evidence that the pairing is wrong. If you cannot find the
-outbound message the user was replying to, stop and say so rather than proceeding.
-
-**History:** issue #2269 — a subagent read a "Sure" that was threaded to a harmless question
-about a category breakdown, paired it by recency with an unrelated proposal, and deployed a live
-change to a production service that sent real alerts to a shared inbox.
 
 ## Integration testing and Definition of Done
 
@@ -388,6 +494,9 @@ Before declaring any integration or manual test PASS:
 
 - **Default repo:** `SiderealPress/lobster` (owner=SiderealPress, repo=lobster) is the Lobster *system* repo — for Lobster maintenance tasks. For user work tasks, get the target repo from the task context or message; do not default to the system repo.
 
+- **Always specify `--repo dcetlin/Lobster` in `gh` CLI commands.**
+  When running `gh pr` or `gh issue` commands in any task context, always pass `--repo dcetlin/Lobster` explicitly. Never rely on the working directory's git remote to determine the target repository — the remote may point to `SiderealPress/lobster` (the upstream public fork) and will silently operate on the wrong repo.
+
 - **Linear API:** Access Linear via REST API. The `LINEAR_API_KEY` environment variable is set. GraphQL endpoint: `https://api.linear.app/graphql`. Use `curl -H "Authorization: $LINEAR_API_KEY" -H "Content-Type: application/json"`.
 
 - **Python:** Always use `uv run` not `python` or `python3`.
@@ -409,6 +518,15 @@ Before declaring any integration or manual test PASS:
   The `patch.multiple` module target for inbox_server tests is always
   `"src.mcp.inbox_server"` (not `"inbox_server"` or `"mcp.inbox_server"`).
 
+## HTML Generation Layer
+
+When working with HTML documents (design docs, bisque artifacts):
+- **Edit existing docs** via `src/htmlgen/editor.py` — never rewrite from scratch; use `list_section_ids` first, then `apply_edit` or `apply_edits`
+- **Generate new docs** via `src/htmlgen/renderer.py` with conventions loaded from `src/htmlgen/conventions.py`
+- **Load conventions first** — `load_conventions()` before any render or edit call
+- Source of truth: `~/lobster-workspace/workstreams/html-interface/`
+- The `html-generation` skill loads full context (primitives, delivery pattern, canon standards) when triggered
+
 ## IFTTT Behavioral Rules
 
 **IFTTT Behavioral Rules:** See CLAUDE.md for full reference. Key subagent distinction: you do NOT need to load all rules at the start of every subagent session — load them only if asked to act on them or if your task involves evaluating behavioral rules.
@@ -425,3 +543,10 @@ When updating a body:
 - Prioritize clarity for a future reader over preserving the original framing
 
 Apply this to both PRs and issues. When you post a comment that changes the design, resolves a concern, or updates scope — also update the body.
+
+# HYPOTHESIS
+
+<!-- Entries here are provisional. Do not treat as stable configuration.
+     Each entry carries an expiry. Review before expiry; graduate or discard.
+     Graduation = moving the entry into the main body of this file (poiema).
+     Expiry without review = entry is discarded, not silently promoted. -->

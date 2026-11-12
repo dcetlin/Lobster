@@ -38,6 +38,10 @@ SCRIPTS_DIR = REPO_DIR / "scripts"
 # expansions like  "source": "$SOURCE_VAR"  (those are dynamic, not hardcoded).
 _SOURCE_LITERAL_RE = re.compile(r'"source"\s*:\s*"([^"]+)"')
 
+# Regex: matches  "type": "some-value"  inside shell heredoc JSON payloads.
+# Same double-quoted-literal-only restriction as _SOURCE_LITERAL_RE.
+_TYPE_LITERAL_RE = re.compile(r'"type"\s*:\s*"([^"]+)"')
+
 # Shell scripts only — Python scripts under scripts/ use dynamic CLI args.
 _SHELL_SCRIPTS = list(SCRIPTS_DIR.glob("*.sh"))
 
@@ -63,6 +67,19 @@ def _extract_hardcoded_sources_from_shell(script: Path) -> list[tuple[str, int]]
     text = script.read_text(errors="replace")
     for lineno, line in enumerate(text.splitlines(), start=1):
         for match in _SOURCE_LITERAL_RE.finditer(line):
+            results.append((match.group(1), lineno))
+    return results
+
+
+def _extract_hardcoded_types_from_shell(script: Path) -> list[tuple[str, int]]:
+    """Return list of (type_value, line_number) for all hardcoded type literals.
+
+    Only matches double-quoted string literals — variable expansions are skipped.
+    """
+    results = []
+    text = script.read_text(errors="replace")
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        for match in _TYPE_LITERAL_RE.finditer(line):
             results.append((match.group(1), lineno))
     return results
 
@@ -141,3 +158,33 @@ def test_daily_update_check_writes_system_source() -> None:
         assert val == "system", (
             f"daily-update-check.sh writes unexpected source='{val}'. Expected 'system'."
         )
+
+
+def test_restart_mcp_writes_session_reconnect_type() -> None:
+    """restart-mcp.sh must write type='session_reconnect', not 'compact-reminder'.
+
+    Regression test for the consistency follow-up to postbounce #5 (PR #1510):
+    restart-mcp.sh writes its "MCP restart incoming" warning to the inbox BEFORE
+    a deliberate, transport-level MCP restart — the dispatcher process survives,
+    only the MCP session is invalidated. That is a reconnect, not a real context
+    compaction, so it must use type="session_reconnect" (routes through the
+    lightweight re-orient handler, no compact-catchup spawn) rather than reusing
+    type="compact-reminder" (which unconditionally triggers the 10-15 min
+    compact-catchup subagent).
+    """
+    script = SCRIPTS_DIR / "restart-mcp.sh"
+    assert script.exists(), f"Script not found: {script}"
+
+    types = _extract_hardcoded_types_from_shell(script)
+    assert types, "restart-mcp.sh wrote no hardcoded 'type' field — expected exactly one"
+
+    type_values = [v for v, _ in types]
+    assert "compact-reminder" not in type_values, (
+        "restart-mcp.sh still writes type='compact-reminder' — this reuses the "
+        "real-compaction message type and will make the dispatcher spawn the "
+        "10-15 min compact-catchup subagent even though nothing was lost. "
+        "Use type='session_reconnect' instead (see postbounce #5 / PR #1510)."
+    )
+    assert "session_reconnect" in type_values, (
+        f"restart-mcp.sh does not write type='session_reconnect'. Got: {type_values}"
+    )

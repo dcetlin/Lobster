@@ -17,7 +17,7 @@ If you need full behavioral context (message handlers, rules, user config), read
 
 0. Call `session_start(agent_type="dispatcher", agent_id="lobster-dispatcher", description="Lobster dispatcher main loop", chat_id=<ADMIN_CHAT_ID>)`.
    - Read `ADMIN_CHAT_ID` from `LOBSTER_ADMIN_CHAT_ID` in `~/lobster-config/config.env`.
-1. Call `session_start(agent_type="dispatcher", agent_id="lobster-dispatcher", description="Lobster dispatcher main loop", chat_id=<ADMIN_CHAT_ID>, claude_session_id=hook_input["session_id"])` — same required `agent_id`/`description`/`chat_id` as step 0 (this call replaces that row).
+1. Call `session_start(agent_type='dispatcher', claude_session_id=hook_input["session_id"])`.
 2. Call `list_rules(enabled_only=true)` to load IFTTT behavioral rules before handling any user messages.
 3. Claim any pending user messages immediately to stop the health-check staleness clock:
    - Call `check_inbox()` — for each non-system message, call `mark_processing(message_id)`.
@@ -38,17 +38,17 @@ When `wait_for_messages()` returns a message with `subtype: "compact-reminder"` 
 1. mark_processing(message_id)  <- compact-reminder ONLY
 2. Spawn session-note-polish subagent (run_in_background=True, subagent_type: "lobster-generalist"):
    - See .claude/agents/session-note-polish.md for the agent definition
-   - Pass: task_id: "session-note-polish", chat_id: 0, source: "system", task_origin: internal
+   - Pass: task_id: "session-note-polish", chat_id: 0, source: "system"
 3. Spawn compact_catchup subagent (subagent_type: "compact-catchup", run_in_background=True):
    - See .claude/agents/compact-catchup.md for the full prompt
-   - Pass task_id: "compact-catchup", chat_id: 0, source: "system", task_origin: internal
+   - Pass task_id: "compact-catchup", chat_id: 0, source: "system"
 4. mark_processed(message_id)
 5. Resume wait_for_messages() — do NOT wait for either subagent result inline
 ```
 
 > **CRITICAL — never batch the compact-reminder with other messages.** Handle it first, then return to `wait_for_messages()`.
 
-**When compact_catchup result arrives** (`task_id` has the prefix `compact-catchup`, e.g. `compact-catchup` or `compact-catchup-<suffix>`; `chat_id: 0`). Match by prefix, not exact string: the catch-up agent echoes back whatever task_id it was spawned with, which may carry a per-invocation suffix (for example a date), so an exact-match check would miss the result.
+**When compact_catchup result arrives** (`task_id: "compact-catchup"`, `chat_id: 0`):
 - Read `msg["text"]` to restore situational awareness.
 - Do NOT send_reply — this is internal context.
 - `mark_processed`.

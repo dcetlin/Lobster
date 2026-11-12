@@ -498,9 +498,21 @@ class MetricsListener:
     do not affect internal state.
 
     Thread-safe: all mutations are protected by a lock.
+
+    Memory bound: _error_timestamps is pruned on every deliver() call (not just
+    on get_snapshot()). Without per-deliver pruning, a process that never calls
+    get_snapshot() accumulates timestamps indefinitely — the original source of
+    the inbox_server.py OOM kills (issue #1436).
     """
 
     name = "metrics"
+
+    # Prune _error_timestamps every N deliveries to amortise the O(n) list-
+    # comprehension cost without allowing unbounded accumulation between calls
+    # to get_snapshot().  A value of 100 means at most 100 extra entries can
+    # accumulate before the next prune fires; with a 1-hour TTL this adds at
+    # most one extra hour of timestamps before eviction.
+    _PRUNE_INTERVAL: int = 100
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -508,9 +520,19 @@ class MetricsListener:
         self._events_by_severity: dict[str, int] = defaultdict(int)
         # Store timestamps of error/critical events for sliding-window count
         self._error_timestamps: list[datetime] = []
+        self._deliver_count: int = 0
 
     def accepts(self, event: LobsterEvent) -> bool:
         return True  # count everything
+
+    def _prune_error_timestamps(self) -> None:
+        """Remove error timestamps older than 1 hour. Must be called under self._lock."""
+        if not self._error_timestamps:
+            return
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+        self._error_timestamps = [
+            ts for ts in self._error_timestamps if ts >= cutoff
+        ]
 
     async def deliver(self, event: LobsterEvent) -> None:
         try:
@@ -519,6 +541,13 @@ class MetricsListener:
                 self._events_by_severity[event.severity] += 1
                 if event.severity in ("error", "critical"):
                     self._error_timestamps.append(event.timestamp)
+                self._deliver_count += 1
+                # Amortised prune: bound _error_timestamps without pruning on
+                # every single delivery.  Prevents unbounded growth even when
+                # get_snapshot() is never called (the original memory leak —
+                # issue #1436).
+                if self._deliver_count % self._PRUNE_INTERVAL == 0:
+                    self._prune_error_timestamps()
         except Exception:
             pass  # metrics failures must never propagate
 
@@ -530,13 +559,8 @@ class MetricsListener:
         errors_last_1h is computed from the sliding window at snapshot time.
         """
         with self._lock:
-            now = datetime.now(timezone.utc)
-            cutoff = now - timedelta(hours=1)
             # Prune old entries while holding the lock (keeps the list bounded)
-            self._error_timestamps = [
-                ts for ts in self._error_timestamps
-                if ts >= cutoff
-            ]
+            self._prune_error_timestamps()
             errors_last_1h = len(self._error_timestamps)
             return {
                 "events_by_type": dict(self._events_by_type),

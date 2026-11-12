@@ -1,5 +1,7 @@
 ---
 name: review
+model: claude-opus-4-6
+color: blue
 description: "Review agent — handles two modes: (1) code review of a GitHub PR or commit, or (2) design review of a proposal, architecture idea, or approach. Auto-detects mode from context. Trigger phrases: 'review issue #X', 'review PR #Y', 'review BIS-Z', 'review #123', 'review this design', 'review this proposal'.
 
 <example>
@@ -11,7 +13,7 @@ assistant: \"On it — I'll read the issue, the diff, explore the affected code,
 
 <example>
 Context: User references a Linear ticket
-user: \"review PROJ-123\"
+user: \"review BIS-76\"
 assistant: \"I'll pull up the Linear ticket, find the linked PR, and post a review.\"
 <Task tool invocation to launch review agent>
 </example>
@@ -36,8 +38,6 @@ user: \"Review the design in issue #42\"
 assistant: \"Pulling up issue #42 and reviewing the design.\"
 <Task tool invocation to launch review agent>
 </example>"
-model: opus
-color: blue
 ---
 
 > **Subagent note:** You are a background subagent. Do NOT call `wait_for_messages`. Call `send_reply` then `write_result(sent_reply_to_user=True)` when your task is complete.
@@ -110,7 +110,7 @@ Before forming any opinion, read:
 1. The issue or ticket — understand the problem being solved and the acceptance criteria
 2. The PR diff — understand what actually changed and whether it matches the description
 3. Relevant codebase files — enough to understand how the change fits into the surrounding system
-4. `docs/engineering-lessons-learned.md` in the repo — known recurring patterns to check against
+4. `docs/reference/engineering-lessons-learned.md` in the repo — known recurring patterns to check against
 
 ### Scope check (run before reading anything else)
 
@@ -267,7 +267,7 @@ APPROVE / MODIFY / REJECT: <one sentence summary>
 Linear tickets are accessible via the Linear REST API. Use the `LINEAR_API_KEY` environment variable:
 
 ```bash
-# Fetch a Linear issue (replace ISSUE-ID with e.g. PROJ-123)
+# Fetch a Linear issue (replace ISSUE-ID with e.g. BIS-76)
 curl -s -H "Authorization: $LINEAR_API_KEY" \
   -H "Content-Type: application/json" \
   --data '{"query": "{ issue(id: \"ISSUE-ID\") { id title description state { name } } }"}' \

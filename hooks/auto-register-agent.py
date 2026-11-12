@@ -1,31 +1,11 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: auto-register spawned agents into agent_sessions.db and
-inflight-work.jsonl.
+"""PostToolUse hook: auto-register spawned agents into agent_sessions.db.
 
 Fires after every Agent tool call. Extracts structured metadata from the
-agent prompt (YAML frontmatter or legacy "task_id is:" text), then:
-
-1. Inserts a 'running' row into agent_sessions.db so the spawned agent is
-   immediately visible to the ghost detector and status queries. No
-   intermediate 'starting' state is used — the agent IS running at the point
-   this hook fires.
-
-2. Writes a 'running' entry to inflight-work.jsonl (issue: automate-inflight-
-   work-writes), reusing scripts/save-inflight-prompt.py's actual write logic
-   (loaded dynamically — see `_load_save_inflight_prompt_module`) so the
-   JSONL schema and prompt-file-on-disk mechanism never diverge from that
-   script. This automates a step that was previously a manual dispatcher
-   instruction (see .claude/sys.dispatcher.bootup.md, "In-Flight Work
-   Tracking") and therefore depended on an LLM remembering to run it on every
-   single Agent call — confirmed unreliable in production (no new entries
-   written since 2026-05-31 despite many subsequent agent spawns). Skipped
-   when no task_id is present, since inflight-work.jsonl entries are keyed by
-   task_id.
-
-Built-in helper agents (``subagent_type`` on the allowlist in
-hooks/helper_agent_types.py, default ``Explore,Plan``) get neither: they never
-call write_result, so a row for them would stay ``running`` until the
-reconciler reported it as a completion or ghost.
+agent prompt (YAML frontmatter or legacy "task_id is:" text), then inserts
+a 'running' row into agent_sessions.db so the spawned agent is immediately
+visible to the ghost detector and status queries. No intermediate 'starting'
+state is used — the agent IS running at the point this hook fires.
 
 ## Frontmatter format (preferred)
 
@@ -34,8 +14,16 @@ reconciler reported it as a completion or ghost.
     chat_id: ADMIN_CHAT_ID_REDACTED
     reply_to_message_id: 10924
     source: telegram
-    task_origin: user        # optional: user | scheduled | internal (default user)
     ---
+
+`request_id` is an additional optional frontmatter field, present only when
+`source: local-claude` (the agent channel — see docs/reference/agent-channel.md). It is
+the correlation id the dispatcher carries into a delegated subagent so that
+subagent can address `send_reply(source="local-claude", request_id=..., ...)`
+at the correct `agent-replies/<request_id>.json` slot. Recorded here purely
+for observability/audit (`agent_sessions.request_id`) — the subagent itself
+already has the value directly in its own prompt and does not depend on this
+hook to "receive" it.
 
 ## Legacy text format (backward compat)
 
@@ -63,7 +51,6 @@ Add this to ~/.claude/settings.json under "hooks" -> "PostToolUse":
     }
 """
 
-import importlib.util
 import json
 import os
 import re
@@ -103,9 +90,6 @@ if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
 import agents.pid_liveness as _pid_liveness  # noqa: E402
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helper_agent_types import is_helper_agent_type  # noqa: E402
 
 
 def _capture_dispatcher_pid() -> int | None:
@@ -179,47 +163,20 @@ def _extract_task_id_from_text(prompt: str) -> str | None:
     return match.group(1) if match else None
 
 
-# Values accepted for the optional `task_origin` frontmatter key. Mirrors the
-# MCP session_start tool and session_store.session_start's own normalisation.
-VALID_TASK_ORIGINS = ("user", "scheduled", "internal")
-DEFAULT_TASK_ORIGIN = "user"
-
-
-def normalize_task_origin(raw: str | None) -> tuple[str, str | None]:
-    """Map a raw frontmatter value to a valid task_origin.
-
-    Returns (task_origin, warning). Absent/empty -> (DEFAULT_TASK_ORIGIN, None).
-    A recognised value (case-insensitive, optional surrounding quotes) passes
-    through with no warning. Anything else falls back to DEFAULT_TASK_ORIGIN
-    and returns a warning string for the caller to log. Pure.
-    """
-    value = (raw or "").strip().strip("\"'").strip().lower()
-    if not value:
-        return DEFAULT_TASK_ORIGIN, None
-    if value in VALID_TASK_ORIGINS:
-        return value, None
-    return DEFAULT_TASK_ORIGIN, (
-        f"unrecognised task_origin {raw!r} in spawn frontmatter; "
-        f"expected one of {'|'.join(VALID_TASK_ORIGINS)}, "
-        f"recorded as {DEFAULT_TASK_ORIGIN!r}"
-    )
-
-
 def extract_metadata(prompt: str) -> dict:
-    """Return task_id, chat_id, source, reply_to_message_id and task_origin.
+    """Return a dict with task_id, chat_id, source, reply_to_message_id, request_id from prompt.
 
     Tries YAML frontmatter first. Falls back to text parsing for task_id.
-    All values are strings (or None if absent), except task_origin, which is
-    always one of VALID_TASK_ORIGINS; task_origin_warning is a message to log
-    when the frontmatter carried an unrecognised value (None otherwise).
+    All values are strings (or None if absent). request_id has no legacy text
+    fallback — it only ever arrives via frontmatter (see module docstring).
     """
     fm = _parse_yaml_frontmatter(prompt)
-    task_origin, task_origin_warning = normalize_task_origin(fm.get("task_origin"))
 
     task_id = fm.get("task_id") or _extract_task_id_from_text(prompt)
     chat_id = fm.get("chat_id")
     source = fm.get("source", "telegram")
     reply_to_message_id = fm.get("reply_to_message_id")
+    request_id = fm.get("request_id")
 
     return {
         "task_id": task_id,
@@ -228,8 +185,7 @@ def extract_metadata(prompt: str) -> dict:
         "reply_to_message_id": (
             str(reply_to_message_id) if reply_to_message_id is not None else None
         ),
-        "task_origin": task_origin,
-        "task_origin_warning": task_origin_warning,
+        "request_id": str(request_id) if request_id is not None else None,
     }
 
 
@@ -287,8 +243,8 @@ def insert_agent_session(
     session_id: str,
     output_file: str | None,
     input_summary: str | None,
+    request_id: str | None = None,
     dispatcher_pid: int | None = None,
-    task_origin: str = DEFAULT_TASK_ORIGIN,
 ) -> None:
     """Insert a 'running' row into agent_sessions.db.
 
@@ -329,25 +285,29 @@ def insert_agent_session(
                 trigger_message_id  TEXT,
                 trigger_snippet     TEXT,
                 reply_message_ids   TEXT,
-                task_origin         TEXT DEFAULT 'user',
+                request_id          TEXT,
                 pid                 INTEGER,
                 dispatcher_pid      INTEGER,
                 pid_captured_at     TEXT
             )
         """)
-        # Additive migration for DBs created before this hook wrote the
-        # task_origin/pid/dispatcher_pid/pid_captured_at columns (mirrors session_store.py's
-        # _MIGRATION_STMTS pattern). Each ALTER is a no-op on a fresh table that
-        # already has the column from the CREATE TABLE above.
+        # Additive migrations for DBs created before these columns existed.
+        # Each is safe to re-run: sqlite3.OperationalError ("duplicate column
+        # name") is swallowed, matching the idempotent ALTER TABLE pattern
+        # used by session_store.py. request_id predates dispatcher_pid/
+        # pid_captured_at/pid on this fork; upstream's PID-capture columns
+        # (issue #2148 Phase 1) are grafted in alongside it so both feature
+        # sets migrate cleanly regardless of which columns an existing DB
+        # already has.
         for stmt in (
-            "ALTER TABLE agent_sessions ADD COLUMN task_origin TEXT DEFAULT 'user'",
+            "ALTER TABLE agent_sessions ADD COLUMN request_id TEXT",
             "ALTER TABLE agent_sessions ADD COLUMN pid INTEGER",
             "ALTER TABLE agent_sessions ADD COLUMN dispatcher_pid INTEGER",
             "ALTER TABLE agent_sessions ADD COLUMN pid_captured_at TEXT",
         ):
             try:
                 conn.execute(stmt)
-            except Exception:  # noqa: BLE001
+            except sqlite3.OperationalError:
                 pass  # Column already exists — no-op
 
         now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
@@ -356,8 +316,8 @@ def insert_agent_session(
             """
             INSERT OR IGNORE INTO agent_sessions
                 (id, task_id, agent_type, description, chat_id, source,
-                 status, output_file, input_summary, spawned_at,
-                 dispatcher_pid, pid_captured_at, task_origin)
+                 status, output_file, input_summary, spawned_at, request_id,
+                 dispatcher_pid, pid_captured_at)
             VALUES
                 (?, ?, 'subagent', 'auto-registered by PostToolUse hook', ?, ?,
                  'running', ?, ?, ?, ?, ?, ?)
@@ -370,105 +330,14 @@ def insert_agent_session(
                 output_file,
                 input_summary,
                 now,
+                request_id,
                 dispatcher_pid,
                 pid_captured_at,
-                task_origin,
             ),
         )
         conn.commit()
     finally:
         conn.close()
-
-
-# ---------------------------------------------------------------------------
-# inflight-work.jsonl "running" entry (issue: automate-inflight-work-writes)
-# ---------------------------------------------------------------------------
-
-_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
-_SAVE_INFLIGHT_PROMPT_SCRIPT = _SCRIPTS_DIR / "save-inflight-prompt.py"
-
-
-def _load_save_inflight_prompt_module():
-    """Dynamically import scripts/save-inflight-prompt.py.
-
-    The filename is hyphenated so it cannot be imported as a normal module --
-    load it via importlib.util the same way tests/unit/test_hooks/*.py already
-    load hyphenated hook files. Reusing the real module (rather than
-    reimplementing its I/O) guarantees the JSONL schema and prompt-file
-    mechanism never diverge from save-inflight-prompt.py.
-
-    Returns the loaded module, or None on any failure. Never raises.
-    """
-    try:
-        spec = importlib.util.spec_from_file_location(
-            "save_inflight_prompt", _SAVE_INFLIGHT_PROMPT_SCRIPT
-        )
-        if spec is None or spec.loader is None:
-            return None
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def write_inflight_running_entry(
-    *,
-    task_id: str | None,
-    chat_id: str | None,
-    source: str,
-    subagent_type: str | None,
-    description: str | None,
-    prompt: str,
-) -> None:
-    """Best-effort: write a 'running' entry to inflight-work.jsonl for this spawn.
-
-    Skipped entirely when task_id is None -- inflight-work.jsonl entries are
-    keyed by task_id (required by save-inflight-prompt.py's REQUIRED_FIELDS
-    and by the consumers in on-fresh-start.py / dispatcher-state-stop.py), so
-    a task_id-less spawn has nothing meaningful to record against.
-
-    Never raises -- failures are logged to hook-failures.log and swallowed,
-    mirroring insert_agent_session's failure policy so a bookkeeping problem
-    never blocks the Agent call.
-    """
-    if not task_id:
-        return
-
-    mod = _load_save_inflight_prompt_module()
-    if mod is None:
-        _log_failure(
-            f"could not load save-inflight-prompt module; "
-            f"skipped inflight-work running entry for task_id={task_id!r}"
-        )
-        return
-
-    try:
-        started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        try:
-            chat_id_value: object = int(chat_id) if chat_id is not None else 0
-        except (TypeError, ValueError):
-            chat_id_value = chat_id
-
-        payload = {
-            "task_id": task_id,
-            "type": subagent_type or "subagent",
-            "description": description or "",
-            "started_at": started_at,
-            "chat_id": chat_id_value,
-            "subagent_type": subagent_type,
-            "status": "running",
-        }
-
-        prompt_file_path = mod.write_prompt_file(
-            mod.INFLIGHT_PROMPTS_DIR, task_id, prompt or ""
-        )
-        entry = mod.build_jsonl_entry(payload, prompt_file_path)
-        mod.append_jsonl_entry(mod.INFLIGHT_WORK_FILE, entry)
-    except Exception as exc:  # noqa: BLE001
-        _log_failure(
-            f"failed to write inflight-work running entry for task_id={task_id!r}: {exc}"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -482,22 +351,20 @@ def main() -> None:
         _log_failure(f"failed to parse hook input JSON: {exc}")
         sys.exit(0)
 
-    # Only handle Agent tool calls
+    # Only handle Agent tool calls (accept both "Agent" and legacy "Task"
+    # tool_name values — see hooks/require-background-agent.py for the
+    # matcher-gap context this dual-acceptance closes).
     tool_name = data.get("tool_name", "")
-    if tool_name != "Agent":
+    if tool_name not in ("Agent", "Task"):
         sys.exit(0)
 
     try:
         tool_input = data.get("tool_input", {})
-        if is_helper_agent_type(tool_input.get("subagent_type")):
-            sys.exit(0)
         tool_response = data.get("tool_response")
         session_id = data.get("session_id", "")
 
         prompt = tool_input.get("prompt", "")
         metadata = extract_metadata(prompt)
-        if metadata["task_origin_warning"]:
-            _log_failure(f"warning: {metadata['task_origin_warning']}")
         agent_id = extract_agent_id(tool_response)
         output_file = extract_output_file(tool_response)
 
@@ -519,17 +386,8 @@ def main() -> None:
             session_id=session_id,
             output_file=output_file,
             input_summary=input_summary,
+            request_id=metadata["request_id"],
             dispatcher_pid=dispatcher_pid,
-            task_origin=metadata["task_origin"],
-        )
-
-        write_inflight_running_entry(
-            task_id=metadata["task_id"],
-            chat_id=metadata["chat_id"],
-            source=metadata["source"],
-            subagent_type=tool_input.get("subagent_type"),
-            description=tool_input.get("description"),
-            prompt=prompt,
         )
 
     except Exception as exc:  # noqa: BLE001

@@ -1,7 +1,8 @@
 ---
 name: lobster-ops
 description: Lobster system operations specialist. Use for troubleshooting services, checking logs, managing configuration, and understanding the Lobster architecture.
-model: haiku
+# Pinned to dated release; matches session-note-appender. Shorthand "claude-haiku-4-5" resolves to latest haiku point release.
+model: claude-haiku-4-5-20251001
 ---
 
 > **Subagent note:** You are a background subagent. Do NOT call `wait_for_messages`. Call `send_reply` then `write_result(sent_reply_to_user=True)` when your task is complete.
@@ -65,6 +66,8 @@ Options:
 **upgrade.sh vs. install.sh:** Use `upgrade.sh` for day-to-day updates. `install.sh` is a bootstrap installer that re-registers MCP servers unconditionally — running it on an existing install drops active MCP registrations and is disruptive.
 
 When writing a PR that ships new subagent definitions, new config file locations, new required directories, service renames, or cron entries, add a corresponding numbered migration to `upgrade.sh` following the existing pattern.
+
+**Instance-specific steps** (hardcoded `chat_id`s, dcetlin-specific issue refs, WOS orchestration content) belong in `scripts/user-update.sh`, not `upgrade.sh`. That file is sourced automatically at the end of `upgrade.sh`'s `run_migrations()` if it exists. Use `d1`, `d2`, ... numbering to avoid collisions with the core sequence.
 
 **Crontab safety:** Never write `echo "..." | crontab -` directly — it overwrites the entire crontab and destroys unrelated entries (this is how the LOBSTER-SELF-CHECK entry was lost). Always use:
 ```bash

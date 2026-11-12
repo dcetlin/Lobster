@@ -382,6 +382,345 @@ class TestClaimAndAck:
             assert reminder["type"] == "session_note_reminder"
             assert reminder["user_message_count"] == interval
 
+    def test_local_claude_ack_writes_ack_slot_not_answer_slot(self, dirs):
+        """source='local-claude' writes agent-replies/<request_id>.ack.json, and never
+        touches agent-replies/<request_id>.json (the single-shot answer slot).
+        """
+        inbox, processing, outbox, sent = dirs
+        agent_replies = inbox.parent / "agent-replies"
+        agent_replies.mkdir(exist_ok=True)
+
+        msg_id = "1700000000000-abcd1234"
+        msg = {
+            "id": msg_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "what's the status of PR 1234?",
+            "request_id": msg_id,
+            "timestamp": "2026-08-04T10:00:00.000000",
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+
+            result = asyncio.run(handle_claim_and_ack({
+                "message_id": msg_id,
+                "ack_text": "On it — checking PR 1234...",
+                "chat_id": "local-claude",
+                "source": "local-claude",
+                "request_id": msg_id,
+            }))
+
+        # Claimed successfully
+        assert not (inbox / f"{msg_id}.json").exists()
+        assert (processing / f"{msg_id}.json").exists()
+        # Ack landed in the distinct ack slot...
+        assert (agent_replies / f"{msg_id}.ack.json").exists()
+        ack = json.loads((agent_replies / f"{msg_id}.ack.json").read_text())
+        assert ack["text"] == "On it — checking PR 1234..."
+        assert ack["request_id"] == msg_id
+        # ...and the single-shot answer slot was NOT touched.
+        assert not (agent_replies / f"{msg_id}.json").exists()
+        # Never touches outbox/ — this is machine-to-machine, not a Dan-facing reply.
+        assert list(outbox.glob("*.json")) == []
+        assert "agent-replies" in result[0].text
+
+    def test_local_claude_ack_advertises_capabilities(self, dirs):
+        """Refinement 1 (agent-channel protocol v1.1): the ack written at
+        claim time advertises what this server build actually supports, so
+        a caller can do version negotiation without a protocol version bump."""
+        inbox, processing, outbox, sent = dirs
+        agent_replies = inbox.parent / "agent-replies"
+        agent_replies.mkdir(exist_ok=True)
+
+        msg_id = "1700000000003-mnop3456"
+        msg = {
+            "id": msg_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "what can you do?",
+            "request_id": msg_id,
+            "timestamp": "2026-08-05T10:00:00.000000",
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+            # Bare "agent_channel" (not "src.mcp.agent_channel") — inbox_server.py
+            # imports it via the sibling-import path (`import agent_channel`,
+            # resolved through the src/mcp sys.path entry set up above), which
+            # is a DIFFERENT module object in sys.modules than
+            # "src.mcp.agent_channel". Must patch/read the same one
+            # inbox_server.py actually calls into.
+            import agent_channel
+
+            asyncio.run(handle_claim_and_ack({
+                "message_id": msg_id,
+                "ack_text": "here's what I can do",
+                "chat_id": "local-claude",
+                "source": "local-claude",
+                "request_id": msg_id,
+            }))
+
+        ack = json.loads((agent_replies / f"{msg_id}.ack.json").read_text())
+        assert ack["capabilities"] == agent_channel.get_capabilities()
+        assert "write_progress" in ack["capabilities"]
+
+    def test_local_claude_claim_succeeds_even_when_ack_write_fails(self, dirs):
+        """Refinement 2 (agent-channel protocol v1.1): an ack write failure
+        must never block the claim itself — the message must still move to
+        processing/ and the caller must get a response back, not an
+        exception, even though the ack degrades this to a v0 exchange."""
+        inbox, processing, outbox, sent = dirs
+        agent_replies = inbox.parent / "agent-replies"
+        agent_replies.mkdir(exist_ok=True)
+
+        msg_id = "1700000000004-qrst7890"
+        msg = {
+            "id": msg_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "do the thing",
+            "request_id": msg_id,
+            "timestamp": "2026-08-05T10:00:00.000000",
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+            # Bare "agent_channel" (not "src.mcp.agent_channel") — inbox_server.py
+            # imports it via the sibling-import path (`import agent_channel`,
+            # resolved through the src/mcp sys.path entry set up above), which
+            # is a DIFFERENT module object in sys.modules than
+            # "src.mcp.agent_channel". Must patch/read the same one
+            # inbox_server.py actually calls into.
+            import agent_channel
+
+            def _boom(path, data, **kwargs):
+                raise OSError("disk full")
+
+            with patch.object(agent_channel, "atomic_write_json", side_effect=_boom):
+                result = asyncio.run(handle_claim_and_ack({
+                    "message_id": msg_id,
+                    "ack_text": "On it.",
+                    "chat_id": "local-claude",
+                    "source": "local-claude",
+                    "request_id": msg_id,
+                }))
+
+        # Claim succeeded — message moved to processing/ — despite the ack write failing.
+        assert not (inbox / f"{msg_id}.json").exists()
+        assert (processing / f"{msg_id}.json").exists()
+        assert "Warning: message claimed but local-claude ack write failed" in result[0].text
+        assert not (agent_replies / f"{msg_id}.ack.json").exists()
+
+    def test_local_claude_requires_request_id(self, dirs):
+        """source='local-claude' without request_id is rejected before claiming —
+        the message must remain in inbox/ untouched."""
+        inbox, processing, outbox, sent = dirs
+        msg_id = "1700000000001-efgh5678"
+        msg = {
+            "id": msg_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "hi",
+            "request_id": msg_id,
+            "timestamp": "2026-08-04T10:00:00.000000",
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+
+            result = asyncio.run(handle_claim_and_ack({
+                "message_id": msg_id,
+                "ack_text": "On it.",
+                "chat_id": "local-claude",
+                "source": "local-claude",
+            }))
+
+        assert "Error" in result[0].text
+        assert "request_id" in result[0].text
+        # Message must remain unclaimed — no partial state.
+        assert (inbox / f"{msg_id}.json").exists()
+        assert not (processing / f"{msg_id}.json").exists()
+
+    def test_source_mismatch_refuses_claim(self, dirs):
+        """A message that originated with source='local-claude' can never be acked
+        with source='telegram' (or vice versa) — fail-closed on source mismatch."""
+        inbox, processing, outbox, sent = dirs
+        msg_id = "1700000000002-ijkl9012"
+        msg = {
+            "id": msg_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "what's the status of PR 1234?",
+            "request_id": msg_id,
+            "timestamp": "2026-08-04T10:00:00.000000",
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+
+            # Caller forgot to pass source="local-claude" — falls back to the
+            # "telegram" default. Must be refused, not silently sent to Dan.
+            result = asyncio.run(handle_claim_and_ack({
+                "message_id": msg_id,
+                "ack_text": "On it.",
+                "chat_id": "local-claude",
+            }))
+
+        assert "Error" in result[0].text
+        assert "mismatch" in result[0].text.lower()
+        # Never claimed, never written to outbox.
+        assert (inbox / f"{msg_id}.json").exists()
+        assert not (processing / f"{msg_id}.json").exists()
+        assert list(outbox.glob("*.json")) == []
+
+    def test_missing_request_id_logs_error_and_alerts(self, dirs, caplog):
+        """A local-claude message refused for missing/invalid request_id must not
+        vanish silently (issue #1532 review fix): mark_processing's gate refuses
+        ANY local-claude message with a logged warning, but claim_and_ack's own
+        request_id validation previously had no log call at all — and
+        source='local-claude' is excluded from health-check USER_FACING_SOURCES,
+        so nothing else would ever surface a message stuck this way. Verify both
+        restored observability signals: a logged error, and a direct alert
+        written via the existing lightweight outbox-alert path."""
+        import logging
+
+        inbox, processing, outbox, sent = dirs
+        msg_id = "1700000000003-mnop3456"
+        msg = {
+            "id": msg_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "hi",
+            "request_id": msg_id,
+            "timestamp": "2026-08-04T10:00:00.000000",
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+        ), patch(
+            "src.mcp.inbox_server._get_owner_chat_id_and_source",
+            return_value=(99999, "telegram"),
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+
+            with caplog.at_level(logging.ERROR):
+                # request_id omitted from args (the message's own request_id
+                # field is irrelevant here — claim_and_ack validates the
+                # caller-supplied args["request_id"], same as send_reply).
+                result = asyncio.run(handle_claim_and_ack({
+                    "message_id": msg_id,
+                    "ack_text": "On it.",
+                    "chat_id": "local-claude",
+                    "source": "local-claude",
+                }))
+
+        assert "Error" in result[0].text
+        assert "request_id" in result[0].text
+
+        # Signal 1: a clear ERROR-level log naming claim_and_ack and the stuck
+        # message, restoring the observability mark_processing's gate has but
+        # claim_and_ack's own request_id check previously lacked.
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any(
+            "claim_and_ack" in r.getMessage() and msg_id in r.getMessage()
+            for r in error_records
+        ), f"Expected an ERROR log naming claim_and_ack and {msg_id}, got: {[r.getMessage() for r in error_records]}"
+
+        # Signal 2: a direct alert delivered via the existing lightweight
+        # outbox-alert path, so the failure surfaces even though local-claude
+        # is excluded from the staleness/health-check sweep.
+        alert_files = list(outbox.glob("*.json"))
+        assert len(alert_files) == 1
+        alert = json.loads(alert_files[0].read_text())
+        assert alert["type"] == "capability_alert"
+        assert msg_id in alert["text"]
+        assert "request_id" in alert["text"]
+
+        # Never claimed — left untouched in inbox/, matching mark_processing's
+        # gate behavior for the same failure class.
+        assert (inbox / f"{msg_id}.json").exists()
+        assert not (processing / f"{msg_id}.json").exists()
+
+    def test_missing_ack_text_returns_clean_error(self, dirs):
+        """ack_text is read directly (args['ack_text']) in multiple places
+        downstream — omitting it must return a clean, actionable error rather
+        than a bare KeyError surfacing after the message is already claimed."""
+        inbox, processing, outbox, sent = dirs
+        msg_id = self._write_inbox_message(inbox)
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+
+            result = asyncio.run(handle_claim_and_ack({
+                "message_id": msg_id,
+                "chat_id": 123456,
+                "source": "telegram",
+                # ack_text intentionally omitted.
+            }))
+
+        assert "Error" in result[0].text
+        assert "ack_text" in result[0].text
+        assert "KeyError" not in result[0].text
+        # Validated before the claim — message must remain in inbox/, untouched.
+        assert (inbox / f"{msg_id}.json").exists()
+        assert not (processing / f"{msg_id}.json").exists()
+
     def test_counter_does_not_increment_for_system_messages(self, dirs):
         """Claiming a system/subagent message via claim_and_ack must NOT increment the counter."""
         inbox, processing, outbox, sent = dirs
@@ -420,3 +759,137 @@ class TestClaimAndAck:
             assert srv._user_message_counter == 0, (
                 "System/subagent messages must not increment _user_message_counter"
             )
+
+
+class TestClaimAndAckRelationshipStamping:
+    """
+    handle_claim_and_ack stamps a claim-time `relationship` fallback (issue
+    #1536, phase 1). This is the only claim-time opportunity for
+    source="local-claude" messages, since mark_processing refuses that
+    source outright (claim_and_ack is its sole claim path). Additive-only:
+    a write-path test — no reader branches on the field yet.
+    """
+
+    @pytest.fixture
+    def dirs(self, temp_messages_dir: Path):
+        inbox = temp_messages_dir / "inbox"
+        processing = temp_messages_dir / "processing"
+        outbox = temp_messages_dir / "outbox"
+        sent = temp_messages_dir / "sent"
+        sent.mkdir(exist_ok=True)
+        return inbox, processing, outbox, sent
+
+    def test_local_claude_message_stamped_peer_agent(self, dirs):
+        """A local-claude agent-channel message gets relationship='peer_agent'."""
+        inbox, processing, outbox, sent = dirs
+        agent_replies = inbox.parent / "agent-replies"
+        agent_replies.mkdir(exist_ok=True)
+
+        msg_id = "1700000000005-peer0001"
+        msg = {
+            "id": msg_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "what's the status?",
+            "request_id": msg_id,
+            "timestamp": "2026-08-05T10:00:00.000000",
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+            asyncio.run(handle_claim_and_ack({
+                "message_id": msg_id,
+                "ack_text": "On it.",
+                "chat_id": "local-claude",
+                "source": "local-claude",
+                "request_id": msg_id,
+            }))
+
+        claimed = json.loads((processing / f"{msg_id}.json").read_text())
+        assert claimed["relationship"] == "peer_agent"
+
+    def test_telegram_message_stamped_user(self, dirs):
+        """A normal telegram message claimed via claim_and_ack gets relationship='user'."""
+        inbox, processing, outbox, sent = dirs
+        msg_id = self._telegram_msg(inbox)
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+            asyncio.run(handle_claim_and_ack({
+                "message_id": msg_id,
+                "ack_text": "On it.",
+                "chat_id": 123456,
+                "source": "telegram",
+            }))
+
+        claimed = json.loads((processing / f"{msg_id}.json").read_text())
+        assert claimed["relationship"] == "user"
+
+    def test_existing_relationship_is_not_overwritten(self, dirs):
+        """An already-stamped `relationship` field is left untouched by the
+        claim-time fallback."""
+        inbox, processing, outbox, sent = dirs
+        agent_replies = inbox.parent / "agent-replies"
+        agent_replies.mkdir(exist_ok=True)
+
+        msg_id = "1700000000006-peer0002"
+        msg = {
+            "id": msg_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "hi",
+            "request_id": msg_id,
+            "timestamp": "2026-08-05T10:00:00.000000",
+            "relationship": "user",  # deliberately "wrong" to prove no overwrite
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSING_DIR=processing,
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            from src.mcp.inbox_server import handle_claim_and_ack
+            asyncio.run(handle_claim_and_ack({
+                "message_id": msg_id,
+                "ack_text": "On it.",
+                "chat_id": "local-claude",
+                "source": "local-claude",
+                "request_id": msg_id,
+            }))
+
+        claimed = json.loads((processing / f"{msg_id}.json").read_text())
+        assert claimed["relationship"] == "user"
+
+    @staticmethod
+    def _telegram_msg(inbox: Path) -> str:
+        msg_id = "1700000000007_telegram_relationship"
+        msg = {
+            "id": msg_id,
+            "source": "telegram",
+            "chat_id": 123456,
+            "type": "text",
+            "text": "Please do the thing",
+            "timestamp": "2026-03-16T10:00:00.000000",
+        }
+        (inbox / f"{msg_id}.json").write_text(json.dumps(msg))
+        return msg_id

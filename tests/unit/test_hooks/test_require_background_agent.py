@@ -643,6 +643,173 @@ def _load_frontmatter_checker():
     return mod._has_background_true_in_frontmatter
 
 
+# ---------------------------------------------------------------------------
+# Agent-channel invariant: source: local-claude requires a valid request_id
+# ---------------------------------------------------------------------------
+#
+# These tests cover the fail-closed block introduced for the agent channel
+# (source="local-claude"). Unlike the background-intent checks above, this
+# invariant applies unconditionally — dispatcher and subagent alike — because
+# a subagent spawned without request_id has no way to address its reply.
+# ---------------------------------------------------------------------------
+
+LOCAL_CLAUDE_PROMPT_WITH_REQUEST_ID = """\
+---
+task_id: agent-channel-task
+chat_id: local-claude
+source: local-claude
+request_id: 1732900000-a1b2c3d4
+background: true
+---
+
+Answer the local-claude request."""
+
+LOCAL_CLAUDE_PROMPT_NO_REQUEST_ID = """\
+---
+task_id: agent-channel-task
+chat_id: local-claude
+source: local-claude
+background: true
+---
+
+Answer the local-claude request."""
+
+LOCAL_CLAUDE_PROMPT_BAD_REQUEST_ID = """\
+---
+task_id: agent-channel-task
+chat_id: local-claude
+source: local-claude
+request_id: ../../etc/passwd
+background: true
+---
+
+Answer the local-claude request."""
+
+LOCAL_CLAUDE_PROMPT_TOO_LONG_REQUEST_ID = (
+    "---\n"
+    "task_id: agent-channel-task\n"
+    "chat_id: local-claude\n"
+    "source: local-claude\n"
+    f"request_id: {'a' * 129}\n"
+    "background: true\n"
+    "---\n\n"
+    "Answer the local-claude request."
+)
+
+
+class TestLocalClaudeRequestIdInvariant:
+    def test_valid_request_id_exits_0_dispatcher(self, monkeypatch, tmp_path):
+        """Dispatcher spawning a local-claude subagent with a valid request_id → allowed."""
+        _patch_startup_flag(monkeypatch, tmp_path)
+        hook_input = _make_hook_input(
+            "Agent",
+            {"prompt": LOCAL_CLAUDE_PROMPT_WITH_REQUEST_ID},
+        )
+        exit_code, stdout, stderr = _run_hook(hook_input)
+        assert exit_code == 0, (
+            f"Valid local-claude request_id should be allowed, got exit {exit_code}. "
+            f"stderr={stderr!r}"
+        )
+
+    def test_valid_request_id_exits_0_subagent(self, monkeypatch, tmp_path):
+        """A subagent spawning a nested local-claude agent with a valid request_id → allowed.
+
+        Unlike the background-intent checks, this invariant is not gated on
+        is_dispatcher() — it must also hold for subagent-initiated dispatch.
+        """
+        hook_input = _make_hook_input(
+            "Agent",
+            {"prompt": LOCAL_CLAUDE_PROMPT_WITH_REQUEST_ID},
+            session_id="subagent-sess-999",
+        )
+        exit_code, stdout, stderr = _run_hook(hook_input)
+        assert exit_code == 0, (
+            f"Valid local-claude request_id should be allowed for subagents too, "
+            f"got exit {exit_code}. stderr={stderr!r}"
+        )
+
+    def test_missing_request_id_exits_2_dispatcher(self, monkeypatch, tmp_path):
+        """source: local-claude without request_id → hard block, even for the dispatcher."""
+        _patch_startup_flag(monkeypatch, tmp_path)
+        hook_input = _make_hook_input(
+            "Agent",
+            {"prompt": LOCAL_CLAUDE_PROMPT_NO_REQUEST_ID},
+        )
+        exit_code, stdout, stderr = _run_hook(hook_input)
+        assert exit_code == 2, f"Expected hard block (exit 2), got {exit_code}"
+        assert "BLOCKED" in stderr
+        assert "request_id" in stderr
+
+    def test_missing_request_id_exits_2_subagent(self, monkeypatch, tmp_path):
+        """source: local-claude without request_id → hard block even without dispatcher role.
+
+        This is the key structural difference from the background-intent checks:
+        it is NOT gated on is_dispatcher().
+        """
+        hook_input = _make_hook_input(
+            "Agent",
+            {"prompt": LOCAL_CLAUDE_PROMPT_NO_REQUEST_ID},
+            session_id="subagent-sess-999",
+        )
+        exit_code, stdout, stderr = _run_hook(hook_input)
+        assert exit_code == 2, (
+            f"Expected hard block (exit 2) regardless of dispatcher/subagent role, "
+            f"got {exit_code}. stderr={stderr!r}"
+        )
+
+    def test_invalid_charset_request_id_exits_2(self, monkeypatch, tmp_path):
+        """A request_id containing path-traversal characters is blocked."""
+        _patch_startup_flag(monkeypatch, tmp_path)
+        hook_input = _make_hook_input(
+            "Agent",
+            {"prompt": LOCAL_CLAUDE_PROMPT_BAD_REQUEST_ID},
+        )
+        exit_code, stdout, stderr = _run_hook(hook_input)
+        assert exit_code == 2, f"Expected hard block (exit 2), got {exit_code}"
+        assert "not filesystem-safe" in stderr
+
+    def test_too_long_request_id_exits_2(self, monkeypatch, tmp_path):
+        """A request_id over the max length is blocked."""
+        _patch_startup_flag(monkeypatch, tmp_path)
+        hook_input = _make_hook_input(
+            "Agent",
+            {"prompt": LOCAL_CLAUDE_PROMPT_TOO_LONG_REQUEST_ID},
+        )
+        exit_code, stdout, stderr = _run_hook(hook_input)
+        assert exit_code == 2, f"Expected hard block (exit 2), got {exit_code}"
+        assert "not filesystem-safe" in stderr
+
+    def test_non_local_claude_source_unaffected(self, monkeypatch, tmp_path):
+        """Normal telegram/slack tasks (no request_id at all) are never touched by this check."""
+        _patch_startup_flag(monkeypatch, tmp_path)
+        hook_input = _make_hook_input(
+            "Agent",
+            {"prompt": FRONTMATTER_PROMPT_BACKGROUND_TRUE},  # source: telegram
+        )
+        exit_code, stdout, stderr = _run_hook(hook_input)
+        assert exit_code == 0, (
+            f"Non-local-claude prompts must never be blocked by the request_id check, "
+            f"got exit {exit_code}. stderr={stderr!r}"
+        )
+
+    def test_local_claude_error_takes_priority_over_missing_background(self, monkeypatch, tmp_path):
+        """A local-claude prompt missing both request_id AND background: true still blocks
+        with the request_id message (checked first, unconditionally)."""
+        _patch_startup_flag(monkeypatch, tmp_path)
+        prompt = """\
+---
+task_id: agent-channel-task
+chat_id: local-claude
+source: local-claude
+---
+
+Answer the local-claude request."""
+        hook_input = _make_hook_input("Agent", {"prompt": prompt})
+        exit_code, stdout, stderr = _run_hook(hook_input)
+        assert exit_code == 2
+        assert "request_id" in stderr
+
+
 class TestHasBackgroundTrueInFrontmatter:
     """Unit tests for the _has_background_true_in_frontmatter pure helper.
 

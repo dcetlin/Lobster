@@ -1,7 +1,7 @@
 ---
 name: compact-catchup
 description: "Post-compaction catch-up agent. Recovers situational awareness for the dispatcher after a context compaction by scanning recent message history and session notes, then summarising what happened. Also populates the current session file so the dispatcher has meaningful context immediately after any restart. Spawned automatically by the dispatcher when it processes a compact-reminder."
-model: sonnet
+model: claude-sonnet-4-6
 ---
 
 > **Subagent note:** You are a background subagent. Do NOT call `wait_for_messages`. Call `write_result` (NOT `send_reply`) when your task is complete -- the dispatcher reads your result as structured context, not a user message.
@@ -146,37 +146,49 @@ You are the **compact_catchup** subagent. Your job is to:
 
 After Phase 2, update the rolling summary file at `~/lobster-user-config/memory/canonical/rolling-summary.md`.
 
-14. Read `~/lobster-user-config/memory/canonical/rolling-summary.md` if it exists. If it does not exist, create it with the following empty structure and continue:
+**Policy: overwrite, not append.** rolling-summary.md is a current-state snapshot. Each run replaces the entire file with a fresh ~50-line snapshot. Do NOT prepend or append to prior content — rewrite from scratch each time.
+
+14. Read `~/lobster-user-config/memory/canonical/rolling-summary.md` if it exists (to extract the Stable Context section, which rarely changes, so it can be carried forward). If the file does not exist, treat Stable Context as empty.
+
+15. Synthesize the new rolling-summary.md content from:
+    - The inbox scan results (catchup window)
+    - The session file content (Phase 2)
+    - The existing Stable Context section (carry forward unchanged unless inbox scan shows explicit changes to infra, contacts, or long-term goals)
+    - Live GitHub state from step 7 (for PR status)
+
+    Structure the new file as follows (target: ~50 lines total):
 
     ```markdown
     # Rolling Summary
     **Last updated:** <ISO timestamp>
+    **Policy:** Overwrite-only — this file is a current-state snapshot, not an append log. Each update replaces the entire file.
 
     ## Active PRs & Decisions
-    <!-- current open PRs and their states -->
+
+    - <bullet per open PR or key pending decision>
 
     ## Open Threads / Commitments
-    <!-- unresolved items promised or agreed upon -->
 
-    ## Recent Decisions
-    <!-- design choices, last 7 days -->
+    - <bullet per unresolved thread or commitment>
+
+    ## Recent Decisions (last 7 days)
+
+    - <YYYY-MM-DDTHH:MMZ> — <brief decision description>
 
     ## Stable Context
-    <!-- contacts, infra, long-term goals -- rarely changes -->
+
+    - <infra, contacts, long-term goals — carried from prior file>
     ```
 
-15. Merge updates from the inbox scan into the rolling summary sections:
+    Rules for each section:
+    - **Active PRs & Decisions**: Include only PRs that are currently OPEN or were resolved this session. PRs confirmed MERGED/CLOSED by the live check (step 7) should be listed as "MERGED" or removed. Do not carry stale open-PR entries forward.
+    - **Open Threads / Commitments**: Include any new unresolved threads from the inbox scan. Remove threads confirmed done/shipped. Carry forward existing threads not visibly resolved.
+    - **Recent Decisions**: Include only decisions from the past 7 days. Max 5 bullets; drop older ones.
+    - **Stable Context**: Carry forward verbatim from the prior file unless the inbox scan contains an explicit change to infrastructure, contacts, or long-term goals.
 
-    - **Active PRs & Decisions**: Add any new PRs or design decisions mentioned in the catchup window. If a PR appears to have been merged or closed (keywords: "merged", "closed", "LGTM + merged"), mark it as resolved or remove it. Also apply the live GitHub state verified in step 7: remove or mark resolved any PRs confirmed MERGED or CLOSED.
-    - **Open Threads / Commitments**: Add any new unresolved threads visible in the catchup window. Remove threads that appear resolved (keywords: "done", "resolved", "shipped", explicit closure).
-    - **Recent Decisions**: Add design decisions from this session. Prune any entries older than 7 days from today's UTC date.
-    - **Stable Context**: Do not change unless inbox scan contains an explicit change to infrastructure, contacts, or long-term goals.
+16. Size enforcement: the new file must not exceed 75 lines. If the draft exceeds this, compress in this order: (1) drop the oldest bullets in Recent Decisions beyond 3; (2) merge closely related Open Thread items; (3) abbreviate long Stable Context entries. Never drop all entries from any section if content exists.
 
-    Update the `**Last updated:**` line to the current UTC ISO timestamp.
-
-16. Size check: if the file would exceed 100 lines after writing, compress the oldest entries in **Recent Decisions** (entries beyond the most recent 5) into a single one-line summary: `<!-- [older decisions compressed: <N> entries, last: <YYYY-MM-DD>] -->`.
-
-17. Write back atomically: write to a temp file (same directory, `.rolling-summary.tmp.md`), then rename to `rolling-summary.md`. If the write fails, note it in `write_result` and continue.
+17. Write atomically: write to a temp file (same directory, `.rolling-summary.tmp.md`), then rename to `rolling-summary.md`. If the write fails, note it in `write_result` and continue.
 
 Update the `write_result` call (step 13) to include a footer line confirming the rolling summary was updated:
 ```
@@ -215,51 +227,6 @@ After Phase 3, verify that open commitments in the session notes are also captur
     Commitment carry-forward: none needed
     ```
     If `rolling-summary.md` could not be read or written during Phase 4, note the failure but do not abort catchup.
-
-### Phase 5: Debug recovery notification
-
-The "🔄 Back online" recovery notification used to be sent by the dispatcher
-manually after receiving this agent's `write_result` (only when
-`LOBSTER_DEBUG=true`). That made the signal contingent on dispatcher
-behavior: if the dispatcher skipped the step, crashed before reaching it, or
-mishandled the result, the notification silently never fired — while looking,
-when it did fire, like confirmation that recovery succeeded. A signal that
-fires "most of the time" is worse than no signal: it creates false confidence
-on success and ambiguous silence on failure (issue #1983).
-
-22. After Phase 4 completes (and before calling `write_result`), check
-    `LOBSTER_DEBUG`. If it is not `true`, skip this phase entirely — proceed
-    directly to `write_result`.
-
-23. If `LOBSTER_DEBUG=true`, determine ADMIN_CHAT_ID:
-    - Primary: `LOBSTER_ADMIN_CHAT_ID` environment variable.
-    - Fallback: the first entry in `TELEGRAM_ALLOWED_USERS` from `config.env`.
-    - If neither is available, skip this phase silently (never block
-      `write_result` on a missing admin chat id).
-
-24. Convert `window_start` and `now` (from Phase 1) from UTC ISO to ET
-    (EDT UTC-4 mid-March through early November, EST UTC-5 otherwise) and
-    send, via `send_reply`, to ADMIN_CHAT_ID:
-    `"🔄 Catchup recap: scanned activity from [window_start] ET to [now] ET. [N messages] processed, [M subagents] were running."`
-    (N and M come from the same counts used in the Phase 1 output.) This
-    wording is deliberate: `window_start` is a scan-window boundary computed
-    in Phase 1 (roughly the earlier of the last catchup/compaction timestamp,
-    clamped to a lookback horizon) — it is NOT the actual restart time, and no
-    true restart timestamp is available anywhere in the codebase
-    (`last_restart_ts` is never written by any hook; see Phase 1 note above).
-    Framing the message as "scanned activity from X to Y" describes what
-    `window_start` actually is — a scan boundary — without asserting it as the
-    moment a restart occurred, so the message reads as a summary of a past
-    scan rather than a restart-timestamp claim (issue #2192; corrected in
-    review to avoid reintroducing the same class of misleading claim).
-    Pass `proactive=True` — this send has no originating user message to
-    thread against (see `hooks/require-reply-to-message-id.py`).
-
-25. This phase never blocks or fails catchup: if the send errors for any
-    reason (missing admin chat id, tool failure), swallow the error and
-    continue to `write_result` as normal. The notification is best-effort;
-    the rest of catchup's work (session file, rolling summary) must not be
-    lost because of it.
 
 ## Session notes reading
 
@@ -346,7 +313,7 @@ Keep each line to one sentence. The dispatcher is on mobile -- brevity matters.
 
 ## Rules
 
-- Do NOT call `send_reply` -- this is internal context recovery, not a user message -- **except** the Phase 5 debug recovery notification (`LOBSTER_DEBUG=true` only), which this agent sends directly so it fires deterministically regardless of dispatcher behavior.
+- Do NOT call `send_reply` -- this is internal context recovery, not a user message.
 - Do NOT relay catch-up content to the user unless an event is urgent (e.g. a failed subagent that the user has not been notified about).
 - If `check_inbox` returns no messages in the window, that is valid -- report "Nothing to report" in the inbox section but still populate the session file.
 - If `compaction-state.json` is missing or corrupt, default to scanning the last 6 hours.
@@ -355,17 +322,15 @@ Keep each line to one sentence. The dispatcher is on mobile -- brevity matters.
 - Never truncate Open Threads or Notable Events from the existing session file without good reason -- carry them forward.
 - If the session file cannot be found or written (permissions, path not found), note the failure in `write_result` and continue -- do not crash the entire catchup.
 - If `rolling-summary.md` cannot be read or written, note the failure in `write_result` and continue -- do not abort catchup.
-- Never remove content from rolling-summary.md unless there is clear evidence in the inbox scan that the item is resolved. When in doubt, carry it forward.
+- rolling-summary.md is always fully rewritten (overwrite pattern). Never append to it. Only the Stable Context section is carried forward from the prior file; all other sections are synthesized fresh from the inbox scan and session context.
 - If `rolling-summary.md` cannot be read or written during Phase 4, note the failure in `write_result` and continue -- do not abort catchup (this is separate from the Phase 3 rolling summary update).
 - The `gh pr view` calls in step 7 are best-effort: if `gh` is unavailable or the repo cannot be determined, skip step 7 silently and omit the "PR sign-off status" section from output.
 
 ## Delivering results
 
-Pass `task_id` verbatim from the frontmatter of the prompt you were given; never a fixed string. The dispatcher chooses the task_id at spawn time (it may differ between invocations), the session row is registered under it, and `write_result` closes that row by matching the same task_id. A different literal matches no row, so the session stays `running` forever.
-
 ```python
 mcp__lobster-inbox__write_result(
-    task_id="<task_id from your prompt frontmatter>",  # verbatim; never a fixed string
+    task_id="compact-catchup",          # always use this fixed task_id
     chat_id=0,                          # internal -- not user-facing
     text=<structured summary above>,
     source="system",

@@ -146,15 +146,6 @@ LOBSTER_USER="${LOBSTER_USER:-${USER:-$(whoami)}}"
 LOBSTER_GROUP="${LOBSTER_GROUP:-${USER:-$(whoami)}}"
 LOBSTER_HOME="${LOBSTER_HOME:-$HOME}"
 CONFIG_DIR="${LOBSTER_CONFIG_DIR:-$HOME/lobster-config}"
-# NOTE: "${LOBSTER_USER_CONFIG:-default}" only falls back when the var is
-# UNSET/EMPTY. If this process inherited LOBSTER_USER_CONFIG from a parent
-# environment (e.g. a systemd unit) that itself still has the raw
-# {{USER_CONFIG_DIR}} placeholder, that bad value is "set" and defeats the
-# fallback, silently re-poisoning every service file this script generates.
-# Sanitize it before applying the default.
-case "${LOBSTER_USER_CONFIG:-}" in
-    *'{{'*) unset LOBSTER_USER_CONFIG ;;
-esac
 USER_CONFIG_DIR="${LOBSTER_USER_CONFIG:-$HOME/lobster-user-config}"
 
 #===============================================================================
@@ -424,20 +415,6 @@ HOOKEOF
         info "secret-scanner hook already configured"
     fi
 
-    # Block agent-initiated `git push` (Bash tool, no TTY) on the public repo
-    # when the outgoing diff has likely PII/secrets (agent-git-push-guard)
-    chmod +x "$INSTALL_DIR/hooks/agent-git-push-guard.py" 2>/dev/null || true
-    if ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("agent-git-push-guard"))' "$_settings" > /dev/null 2>&1; then
-        _tmp=$(mktemp)
-        jq '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
-            "matcher": "Bash",
-            "hooks": [{"type": "command", "command": "python3 '"$INSTALL_DIR"'/hooks/agent-git-push-guard.py", "timeout": 15}]
-        }]' "$_settings" > "$_tmp" && mv "$_tmp" "$_settings"
-        success "agent-git-push-guard hook installed"
-    else
-        info "agent-git-push-guard hook already configured"
-    fi
-
     # Block `claude -p` inline spawns
     chmod +x "$INSTALL_DIR/hooks/block-claude-p.py" 2>/dev/null || true
     if ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | contains("block-claude-p"))' "$_settings" > /dev/null 2>&1; then
@@ -587,11 +564,8 @@ HOOKEOF
 
     # ── SessionStart ────────────────────────────────────────────────────────────
 
-    # write-dispatcher-session-id.py is registered by the top-level SessionStart block
-    # further down (full install path) and healed by scripts/reconcile-claude-hooks.py on
-    # every dispatcher SessionStart. SessionStart hooks detect the dispatcher via the
-    # launcher-written startup flag (issue #1908); this hook then writes the session-id
-    # marker that Stop/PreToolUse hooks read (see docs/engineering-lessons-learned.md).
+    # Dispatcher detection uses the startup flag written by claude-persistent.sh (issue #1908);
+    # write-dispatcher-session-id.py hook is no longer needed and has been removed.
 
     # Inject bootup context on all fresh sessions
     chmod +x "$INSTALL_DIR/hooks/inject-bootup-context.py" 2>/dev/null || true
@@ -606,17 +580,12 @@ HOOKEOF
         info "inject-bootup-context hook already configured (all sessions)"
     fi
 
-    # Set compact flag on context compaction (on-compact).
-    # Detect it by command, not by matcher: any other SessionStart entry on matcher
-    # "compact" (e.g. the inject-bootup-context entry below) used to satisfy a
-    # matcher-only check, so on-compact was silently skipped (issue #2285).
-    # matcher="" + the script's own source=="compact" self-gate, as in the top-level
-    # block and Migration 88: matcher="compact" fires unreliably (issue #1947).
+    # Set compact flag on context compaction (on-compact)
     chmod +x "$INSTALL_DIR/hooks/on-compact.py" 2>/dev/null || true
-    if ! jq -e '.hooks.SessionStart[]? | select(.hooks[]?.command | contains("on-compact"))' "$_settings" > /dev/null 2>&1; then
+    if ! jq -e '.hooks.SessionStart[]? | select(.matcher == "compact")' "$_settings" > /dev/null 2>&1; then
         _tmp=$(mktemp)
         jq '.hooks.SessionStart = (.hooks.SessionStart // []) + [{
-            "matcher": "",
+            "matcher": "compact",
             "hooks": [{"type": "command", "command": "python3 '"$INSTALL_DIR"'/hooks/on-compact.py", "timeout": 30}]
         }]' "$_settings" > "$_tmp" && mv "$_tmp" "$_settings"
         success "on-compact hook installed"
@@ -1808,9 +1777,18 @@ success "Nightly consolidation configured (runs at 03:02 nightly)"
 # summary to ~/messages/task-outputs/ (readable via check_task_outputs).
 chmod +x "$INSTALL_DIR/scheduled-tasks/export-logs.py" 2>/dev/null || true
 "$INSTALL_DIR/scripts/cron-manage.sh" add "# LOBSTER-LOG-EXPORT" \
-    "0 3 * * * cd $INSTALL_DIR && $HOME/.local/bin/uv run scheduled-tasks/export-logs.py # LOBSTER-LOG-EXPORT"
+    "0 3 * * * cd $INSTALL_DIR && uv run scheduled-tasks/export-logs.py # LOBSTER-LOG-EXPORT"
 
 success "Log export configured (runs at 03:00 UTC daily)"
+
+# Add transcription-monitor to crontab (runs every 5 minutes, self-silencing)
+# Pings the user while whisper-cli is running so long transcriptions don't
+# appear as dead silence. Exits immediately (no outbox write) when idle.
+chmod +x "$INSTALL_DIR/scheduled-tasks/transcription-monitor.py" 2>/dev/null || true
+"$INSTALL_DIR/scripts/cron-manage.sh" add "# LOBSTER-TRANSCRIPTION-MONITOR" \
+    "*/5 * * * * cd $INSTALL_DIR && uv run scheduled-tasks/transcription-monitor.py # LOBSTER-TRANSCRIPTION-MONITOR"
+
+success "Transcription monitor configured (every 5 minutes, self-silencing)"
 
 #===============================================================================
 # Ghost Detector (agent-monitor)
@@ -1823,7 +1801,7 @@ step "Setting up ghost detector cron..."
 # and marks ghost sessions as failed in agent_sessions.db. No LLM involved.
 # Offset 2 (vs the */3 anchor) to avoid lcm-aligned overlap at :00.
 "$INSTALL_DIR/scripts/cron-manage.sh" add "# LOBSTER-GHOST-DETECTOR" \
-    "2-59/5 * * * * cd $HOME && $HOME/.local/bin/uv run $INSTALL_DIR/scripts/agent-monitor.py --alert --mark-failed >> $HOME/lobster-workspace/logs/agent-monitor.log 2>&1 # LOBSTER-GHOST-DETECTOR"
+    "2-59/5 * * * * cd $HOME && uv run $INSTALL_DIR/scripts/agent-monitor.py --alert --mark-failed >> $HOME/lobster-workspace/logs/agent-monitor.log 2>&1 # LOBSTER-GHOST-DETECTOR"
 
 success "Ghost detector configured (runs every 5 minutes)"
 
@@ -1841,7 +1819,7 @@ step "Setting up OOM monitor cron..."
 # Even offset is deliberate: it makes the */4+*/10 offset parities disagree
 # on the gcd(4,10)=2 sub-lattice, so */3+*/4+*/10 never triple-fires.
 "$INSTALL_DIR/scripts/cron-manage.sh" add "# LOBSTER-OOM-CHECK" \
-    "8-59/10 * * * * cd $HOME && $HOME/.local/bin/uv run $INSTALL_DIR/scripts/oom-monitor.py --since-minutes 10 >> $HOME/lobster-workspace/logs/oom-monitor.log 2>&1 # LOBSTER-OOM-CHECK"
+    "8-59/10 * * * * cd $HOME && uv run $INSTALL_DIR/scripts/oom-monitor.py --since-minutes 10 >> $HOME/lobster-workspace/logs/oom-monitor.log 2>&1 # LOBSTER-OOM-CHECK"
 
 success "OOM monitor configured (runs every 10 minutes, active only when LOBSTER_DEBUG=true)"
 
@@ -1873,28 +1851,11 @@ if command -v uv &>/dev/null && [ -f "$INSTALL_DIR/scripts/prune-pr-worktrees.py
     if systemctl is-enabled "lobster-prune-pr-worktrees.timer" &>/dev/null; then
         substep "prune-pr-worktrees systemd timer already enabled — skipping"
     else
-        # NOTE: We deliberately do NOT `import mcp.systemd_jobs` (or add
-        # src/mcp/__init__.py to make that importable). src/mcp/ shares its
-        # top-level name with the pip-installed `mcp` SDK; making it a real
-        # package makes it win import resolution ahead of the SDK everywhere
-        # `src/` is on sys.path (e.g. inbox_server.py), which crash-loops
-        # lobster-mcp-local (see issue #2239 / PR #2238 revert). Instead we
-        # load systemd_jobs.py directly by file path via importlib, which
-        # needs no package at all — same pattern used in Migration 83
-        # (scripts/lib/migrations.sh) and src/bisque/relay_server.py /
-        # src/bot/sms_router.py for the same collision on src/mcp/log_utils.py.
         uv run --project "$INSTALL_DIR" python -c "
-import asyncio
-import importlib.util
-import sys
-
-spec = importlib.util.spec_from_file_location('lobster_mcp_systemd_jobs', '$INSTALL_DIR/src/mcp/systemd_jobs.py')
-systemd_jobs = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = systemd_jobs  # required: systemd_jobs.py uses @dataclass, which
-                                        # resolves its module via sys.modules at class-body eval time
-spec.loader.exec_module(systemd_jobs)
-
-result = asyncio.run(systemd_jobs.create_job(
+import asyncio, sys
+sys.path.insert(0, '$INSTALL_DIR/src')
+from mcp.systemd_jobs import create_job
+result = asyncio.run(create_job(
     name='prune-pr-worktrees',
     schedule='*-*-* 03:00:00',
     command='$_PRUNE_CMD',
@@ -1917,7 +1878,7 @@ step "Setting up inflight reminders cron..."
 # check-inflight-reminders.py runs every 3 minutes to detect stale subagent work
 # and drop reminder messages into the dispatcher inbox. No LLM involved.
 "$INSTALL_DIR/scripts/cron-manage.sh" add "# LOBSTER-INFLIGHT-REMINDERS" \
-    "*/3 * * * * $HOME/.local/bin/uv run $INSTALL_DIR/scripts/check-inflight-reminders.py >> $HOME/lobster-workspace/logs/inflight-reminders.log 2>&1 # LOBSTER-INFLIGHT-REMINDERS"
+    "*/3 * * * * uv run $INSTALL_DIR/scripts/check-inflight-reminders.py >> $HOME/lobster-workspace/logs/inflight-reminders.log 2>&1 # LOBSTER-INFLIGHT-REMINDERS"
 
 success "Inflight reminders configured (runs every 3 minutes)"
 
@@ -2076,29 +2037,6 @@ else
     info "Skipping system-file-protect hook (settings.json not yet created)"
 fi
 
-# Set up Claude Code PreToolUse hook to enforce exact dependency pinning
-# (blocks unpinned ranges in manifests and silent-latest package-manager
-# invocations; see hooks/pin-dependencies-guard.py docstring for full scope)
-chmod +x "$INSTALL_DIR/hooks/pin-dependencies-guard.py" || true
-if [ -f "$CLAUDE_SETTINGS" ]; then
-    if ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | contains("pin-dependencies-guard"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
-        TMP_SETTINGS=$(mktemp)
-        jq '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
-            "matcher": "Edit|Write|NotebookEdit|Bash",
-            "hooks": [{
-                "type": "command",
-                "command": "python3 '"$INSTALL_DIR"'/hooks/pin-dependencies-guard.py",
-                "timeout": 5
-            }]
-        }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
-        success "pin-dependencies-guard hook installed"
-    else
-        info "pin-dependencies-guard hook already configured in Claude Code settings"
-    fi
-else
-    info "Skipping pin-dependencies-guard hook (settings.json not yet created)"
-fi
-
 # Set up Claude Code PostToolUse hook to restore execute bit after Edit/Write
 chmod +x "$INSTALL_DIR/hooks/restore-exec-bit.py" || true
 if [ -f "$CLAUDE_SETTINGS" ]; then
@@ -2213,6 +2151,7 @@ else
     info "Skipping pre-tool-heartbeat hook (settings.json not yet created)"
 fi
 
+
 # Set up Claude Code PreToolUse hook to block tool use after compaction without context reload.
 # Uses a shell wrapper so Python is only spawned when the sentinel file exists (~1% of calls).
 # On the 99%+ of calls where the sentinel is absent, `test ! -f ...` exits in ~1ms with no
@@ -2225,7 +2164,7 @@ if [ -f "$CLAUDE_SETTINGS" ]; then
             "matcher": "",
             "hooks": [{
                 "type": "command",
-                "command": "test ! -f '"$MESSAGES_DIR"'/config/compact-pending || python3 '"$INSTALL_DIR"'/hooks/post-compact-gate.py",
+                "command": "test ! -f /home/lobster/messages/config/compact-pending || python3 '"$INSTALL_DIR"'/hooks/post-compact-gate.py",
                 "timeout": 5
             }]
         }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
@@ -2281,26 +2220,27 @@ else
     info "Skipping secret-scanner hook (settings.json not yet created)"
 fi
 
-# Set up Claude Code PreToolUse hook to block agent-initiated `git push` on the
-# public repo when the outgoing diff has likely PII/secrets (agent-git-push-guard)
-chmod +x "$INSTALL_DIR/hooks/agent-git-push-guard.py" || true
+# Set up Claude Code PreToolUse hook to warn/block agents from spawning `claude -p` sessions
+# Deployed in warn mode (LOBSTER_BLOCK_CLAUDE_P_MODE=warn) to validate before hard-blocking.
+# See: https://github.com/SiderealPress/lobster/issues/889
+chmod +x "$INSTALL_DIR/hooks/block-claude-p.py" || true
 if [ -f "$CLAUDE_SETTINGS" ]; then
-    if ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("agent-git-push-guard"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
+    if ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("block-claude-p"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
         TMP_SETTINGS=$(mktemp)
         jq '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
             "matcher": "Bash",
             "hooks": [{
                 "type": "command",
-                "command": "python3 '"$INSTALL_DIR"'/hooks/agent-git-push-guard.py",
-                "timeout": 15
+                "command": "LOBSTER_BLOCK_CLAUDE_P_MODE=warn python3 '"$INSTALL_DIR"'/hooks/block-claude-p.py",
+                "timeout": 5
             }]
         }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
-        success "agent-git-push-guard hook installed (block mode)"
+        success "block-claude-p hook installed (warn mode)"
     else
-        info "agent-git-push-guard hook already configured in Claude Code settings"
+        info "block-claude-p hook already configured in Claude Code settings"
     fi
 else
-    info "Skipping agent-git-push-guard hook (settings.json not yet created)"
+    info "Skipping block-claude-p hook (settings.json not yet created)"
 fi
 
 # Set up Claude Code SessionStart hook to write the dispatcher session ID
@@ -2492,6 +2432,26 @@ if [ -f "$CLAUDE_SETTINGS" ]; then
     fi
 else
     info "Skipping require-auditor-context-update SubagentStop hook (settings.json not yet created)"
+fi
+
+# Set up PreToolUse hook to block duplicate `gh pr create` calls.
+# Prevents duplicate PR clusters when the WOS executor re-dispatches the same
+# UoW without knowing an open PR already exists for that branch.
+chmod +x "$INSTALL_DIR/hooks/pre-tool-use-pr-idempotency.py" || true
+if [ -f "$CLAUDE_SETTINGS" ]; then
+    if ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | contains("pre-tool-use-pr-idempotency"))' "$CLAUDE_SETTINGS" > /dev/null 2>&1; then
+        TMP_SETTINGS=$(mktemp)
+        jq --arg cmd "python3 $INSTALL_DIR/hooks/pre-tool-use-pr-idempotency.py" \
+           '.hooks.PreToolUse = (.hooks.PreToolUse // []) + [{
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": $cmd, "timeout": 15}]
+        }]' "$CLAUDE_SETTINGS" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$CLAUDE_SETTINGS"
+        success "pre-tool-use-pr-idempotency PreToolUse hook installed"
+    else
+        info "pre-tool-use-pr-idempotency hook already configured in Claude Code settings"
+    fi
+else
+    info "Skipping pre-tool-use-pr-idempotency hook (settings.json not yet created)"
 fi
 
 #===============================================================================
@@ -2814,8 +2774,8 @@ if [ -f "$CONFIG_FILE" ]; then
         step "Generating LOBSTER_INTERNAL_SECRET..."
         INTERNAL_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
         echo "" >> "$CONFIG_FILE"
-        echo "# Shared secret for the token bridge web deployment (Google Calendar refresh)" >> "$CONFIG_FILE"
-        echo "# This must match LOBSTER_INTERNAL_SECRET on your token-bridge web deployment (e.g. Vercel)." >> "$CONFIG_FILE"
+        echo "# Shared secret for myownlobster.ai token bridge (Google Calendar refresh)" >> "$CONFIG_FILE"
+        echo "# This must match LOBSTER_INTERNAL_SECRET on the myownlobster.ai Vercel deployment." >> "$CONFIG_FILE"
         echo "# Generated by installer on $(date)" >> "$CONFIG_FILE"
         echo "LOBSTER_INTERNAL_SECRET=$INTERNAL_SECRET" >> "$CONFIG_FILE"
         success "LOBSTER_INTERNAL_SECRET generated and saved to config.env"
@@ -3290,12 +3250,6 @@ generate_from_template() {
     success "Generated: $output"
 }
 
-# Rendered service files are instance-specific (they bake in real paths, users,
-# etc.) and must never land back in the tracked $INSTALL_DIR/services/ repo
-# directory. Render them to a runtime location in the user's workspace instead.
-RENDERED_SERVICES_DIR="$WORKSPACE_DIR/services"
-mkdir -p "$RENDERED_SERVICES_DIR"
-
 # Check that templates exist
 ROUTER_TEMPLATE="$INSTALL_DIR/services/lobster-router.service.template"
 CLAUDE_TEMPLATE="$INSTALL_DIR/services/lobster-claude.service.template"
@@ -3315,18 +3269,18 @@ fi
 # Generate service files from templates
 generate_from_template \
     "$ROUTER_TEMPLATE" \
-    "$RENDERED_SERVICES_DIR/lobster-router.service"
+    "$INSTALL_DIR/services/lobster-router.service"
 
 generate_from_template \
     "$CLAUDE_TEMPLATE" \
-    "$RENDERED_SERVICES_DIR/lobster-claude.service"
+    "$INSTALL_DIR/services/lobster-claude.service"
 
 # Generate Slack router service if template exists
 SLACK_ROUTER_TEMPLATE="$INSTALL_DIR/services/lobster-slack-router.service.template"
 if [ -f "$SLACK_ROUTER_TEMPLATE" ]; then
     generate_from_template \
         "$SLACK_ROUTER_TEMPLATE" \
-        "$RENDERED_SERVICES_DIR/lobster-slack-router.service"
+        "$INSTALL_DIR/services/lobster-slack-router.service"
 fi
 
 # Generate MCP HTTP bridge service if template exists
@@ -3334,7 +3288,7 @@ MCP_TEMPLATE="$INSTALL_DIR/services/lobster-mcp.service.template"
 if [ -f "$MCP_TEMPLATE" ]; then
     generate_from_template \
         "$MCP_TEMPLATE" \
-        "$RENDERED_SERVICES_DIR/lobster-mcp.service"
+        "$INSTALL_DIR/services/lobster-mcp.service"
 fi
 
 # Generate MCP local HTTP server service if template exists
@@ -3342,7 +3296,7 @@ MCP_LOCAL_TEMPLATE="$INSTALL_DIR/services/lobster-mcp-local.service.template"
 if [ -f "$MCP_LOCAL_TEMPLATE" ]; then
     generate_from_template \
         "$MCP_LOCAL_TEMPLATE" \
-        "$RENDERED_SERVICES_DIR/lobster-mcp-local.service"
+        "$INSTALL_DIR/services/lobster-mcp-local.service"
 fi
 
 # Generate observability server service if template exists
@@ -3350,7 +3304,7 @@ OBSERVABILITY_TEMPLATE="$INSTALL_DIR/services/lobster-observability.service.temp
 if [ -f "$OBSERVABILITY_TEMPLATE" ]; then
     generate_from_template \
         "$OBSERVABILITY_TEMPLATE" \
-        "$RENDERED_SERVICES_DIR/lobster-observability.service"
+        "$INSTALL_DIR/services/lobster-observability.service"
 fi
 
 # Generate transcription worker service if template exists
@@ -3358,7 +3312,7 @@ TRANSCRIPTION_TEMPLATE="$INSTALL_DIR/services/lobster-transcription.service.temp
 if [ -f "$TRANSCRIPTION_TEMPLATE" ]; then
     generate_from_template \
         "$TRANSCRIPTION_TEMPLATE" \
-        "$RENDERED_SERVICES_DIR/lobster-transcription.service"
+        "$INSTALL_DIR/services/lobster-transcription.service"
 fi
 
 #===============================================================================
@@ -3370,39 +3324,39 @@ step "Installing systemd services..."
 # Check whether systemd is running (skip service install in containers/Docker where systemd is absent)
 if ! pidof systemd >/dev/null 2>&1 && ! systemctl is-system-running >/dev/null 2>&1; then
     warn "systemd not running — skipping service installation (container environment?)"
-    info "Service files have been generated in $RENDERED_SERVICES_DIR/ — install them manually when running on a systemd host."
+    info "Service files have been generated in $INSTALL_DIR/services/ — install them manually when running on a systemd host."
 else
-    sudo cp "$RENDERED_SERVICES_DIR/lobster-router.service" /etc/systemd/system/
-    sudo cp "$RENDERED_SERVICES_DIR/lobster-claude.service" /etc/systemd/system/
+    sudo cp "$INSTALL_DIR/services/lobster-router.service" /etc/systemd/system/
+    sudo cp "$INSTALL_DIR/services/lobster-claude.service" /etc/systemd/system/
 
     # Install Slack router service if generated
-    if [ -f "$RENDERED_SERVICES_DIR/lobster-slack-router.service" ]; then
-        sudo cp "$RENDERED_SERVICES_DIR/lobster-slack-router.service" /etc/systemd/system/
+    if [ -f "$INSTALL_DIR/services/lobster-slack-router.service" ]; then
+        sudo cp "$INSTALL_DIR/services/lobster-slack-router.service" /etc/systemd/system/
         info "Slack router service installed (enable manually with: sudo systemctl enable lobster-slack-router)"
     fi
 
     # Install MCP HTTP bridge service if generated (remote read-only bridge)
-    if [ -f "$RENDERED_SERVICES_DIR/lobster-mcp.service" ]; then
-        sudo cp "$RENDERED_SERVICES_DIR/lobster-mcp.service" /etc/systemd/system/
+    if [ -f "$INSTALL_DIR/services/lobster-mcp.service" ]; then
+        sudo cp "$INSTALL_DIR/services/lobster-mcp.service" /etc/systemd/system/
         info "MCP HTTP bridge service installed (enable manually with: sudo systemctl enable lobster-mcp)"
     fi
 
     # Install MCP local HTTP server service (full-access, localhost only)
-    if [ -f "$RENDERED_SERVICES_DIR/lobster-mcp-local.service" ]; then
-        sudo cp "$RENDERED_SERVICES_DIR/lobster-mcp-local.service" /etc/systemd/system/
+    if [ -f "$INSTALL_DIR/services/lobster-mcp-local.service" ]; then
+        sudo cp "$INSTALL_DIR/services/lobster-mcp-local.service" /etc/systemd/system/
         sudo systemctl enable lobster-mcp-local 2>/dev/null || true
         success "MCP local HTTP server service installed and enabled (lobster-mcp-local)"
     fi
 
     # Install observability service if generated
-    if [ -f "$RENDERED_SERVICES_DIR/lobster-observability.service" ]; then
-        sudo cp "$RENDERED_SERVICES_DIR/lobster-observability.service" /etc/systemd/system/
+    if [ -f "$INSTALL_DIR/services/lobster-observability.service" ]; then
+        sudo cp "$INSTALL_DIR/services/lobster-observability.service" /etc/systemd/system/
         info "Observability server service installed (enable manually with: sudo systemctl enable lobster-observability)"
     fi
 
     # Install transcription worker service (always present — whisper.cpp is a hard dependency)
-    if [ -f "$RENDERED_SERVICES_DIR/lobster-transcription.service" ]; then
-        sudo cp "$RENDERED_SERVICES_DIR/lobster-transcription.service" /etc/systemd/system/
+    if [ -f "$INSTALL_DIR/services/lobster-transcription.service" ]; then
+        sudo cp "$INSTALL_DIR/services/lobster-transcription.service" /etc/systemd/system/
         sudo systemctl enable lobster-transcription 2>/dev/null || true
         success "Transcription worker service installed and enabled (lobster-transcription)"
     fi
@@ -3473,24 +3427,6 @@ if claude mcp add --transport http lobster-inbox -s user "$MCP_LOCAL_URL" 2>/dev
     success "MCP server registered (HTTP transport: $MCP_LOCAL_URL)"
 else
     warn "MCP server registration may have failed. Check with: claude mcp list"
-fi
-
-# `claude mcp add` has no --timeout flag, so set a per-server MCP idle timeout
-# directly in ~/.claude.json. Without this, wait_for_messages (which can
-# legitimately block for up to CLAUDE_WFM_TIMEOUT_S seconds with no progress
-# by design) gets silently aborted client-side after CC's default ~300s idle
-# timeout and is retried, wasting a request every cycle. 75000000ms (~20.8h)
-# comfortably exceeds wait_for_messages' own max timeout (72000s / 20h).
-if [ -f "$HOME/.claude.json" ] && command -v jq >/dev/null 2>&1; then
-    TMP_CLAUDE_JSON=$(mktemp)
-    if jq '.mcpServers."lobster-inbox".timeout = 75000000' "$HOME/.claude.json" > "$TMP_CLAUDE_JSON" 2>/dev/null \
-        && [ -s "$TMP_CLAUDE_JSON" ]; then
-        mv "$TMP_CLAUDE_JSON" "$HOME/.claude.json"
-        success "Set lobster-inbox MCP idle timeout (75000000ms) in ~/.claude.json"
-    else
-        rm -f "$TMP_CLAUDE_JSON"
-        warn "Could not set lobster-inbox MCP idle timeout in ~/.claude.json"
-    fi
 fi
 
 #===============================================================================
@@ -3580,51 +3516,6 @@ apply_private_overlay
 #===============================================================================
 
 run_hook "post-install.sh"
-
-#===============================================================================
-# Run Migrations
-#
-# install.sh previously never called this at all — migrations only ran when
-# someone explicitly invoked upgrade.sh on an existing install. A
-# reimage-via-restore (old ~/lobster-config/, ~/lobster/, etc. copied onto a
-# fresh host before install.sh runs) looks indistinguishable from a fresh
-# install here, so every config.env-touching migration was silently skipped
-# forever unless upgrade.sh was manually re-run afterward (issue #2200).
-#
-# Running the same migration runner unconditionally, on every install.sh run
-# (fresh or restored-config), guarantees config.env and other migration-
-# covered state always end up fully up to date — matching what a fresh
-# upgrade.sh run would produce. Migrations are idempotent (each checks
-# whether its change is already applied before acting), so this is safe to
-# run on a genuinely fresh install too.
-#===============================================================================
-
-step "Running migration checks..."
-
-DRY_RUN=false
-LOBSTER_DIR="$INSTALL_DIR"
-VENV_DIR="$INSTALL_DIR/.venv"
-
-# substep() and log_to_file() are used by run_migrations() (via
-# scripts/lib/migrations.sh) but install.sh has no equivalents of its own —
-# upgrade.sh's substep() is a formatted sub-step log line, and its
-# log_to_file() appends to a persistent upgrade log. install.sh keeps no such
-# log, so this is a no-op stub; substep() reuses install.sh's own info().
-substep() { info "$1"; }
-log_to_file() { :; }
-
-# Load and verify the migration library with the same guards as upgrade.sh:
-# check existence and syntax before sourcing to provide named diagnostics
-# if the library is missing or broken.
-if [ ! -f "${INSTALL_DIR}/scripts/lib/migrations.sh" ]; then
-    die "Migration library not found: ${INSTALL_DIR}/scripts/lib/migrations.sh"
-fi
-bash -n "${INSTALL_DIR}/scripts/lib/migrations.sh" \
-    || die "Migration library failed syntax check: ${INSTALL_DIR}/scripts/lib/migrations.sh"
-# shellcheck source=scripts/lib/migrations.sh
-source "${INSTALL_DIR}/scripts/lib/migrations.sh" \
-    || die "Could not load migration library: ${INSTALL_DIR}/scripts/lib/migrations.sh"
-run_migrations
 
 #===============================================================================
 # Start Services

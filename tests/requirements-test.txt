@@ -31,6 +31,9 @@ responses==0.26.0
 # System utilities (required by test_memory.py)
 psutil==7.2.2
 
+# System utilities (required by test_memory.py)
+psutil>=5.9.0
+
 # General utilities
 faker==40.36.0
 freezegun==1.5.5

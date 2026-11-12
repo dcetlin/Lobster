@@ -1,7 +1,7 @@
 ---
 name: nightly-consolidation
 description: "Synthesizes the past 24 hours of memory events into canonical memory files. Triggered at 3 AM by the nightly-consolidation.sh cron job via a consolidation inbox message."
-model: sonnet
+model: claude-sonnet-4-6
 ---
 
 > **Subagent note:** You are a background subagent. Do NOT call `wait_for_messages`. Call `write_result` (NOT `send_reply`) when your task is complete — this is an internal system operation, not a user-facing message.
@@ -27,6 +27,137 @@ Read each file. Extract:
 
 Merge this context with the memory_recent results from step 1. Session files often contain richer conversational context than memory events — prefer session file content for narrative synthesis (steps 3-6) when available.
 
+**1c. Read gate-miss observations from the past 24 hours.**
+Run:
+```bash
+obs_log=~/lobster-workspace/logs/observations.log
+if [ -f "$obs_log" ]; then
+    cutoff=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -u -v-24H +%Y-%m-%dT%H:%M:%S)
+    uv run python -c "
+import json, sys
+cutoff = '$cutoff'
+gate_misses = []
+try:
+    with open('$obs_log') as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+                if entry.get('ts', '') >= cutoff and 'gate=' in entry.get('content', '') and 'outcome=miss' in entry.get('content', ''):
+                    gate_misses.append(entry)
+            except json.JSONDecodeError:
+                pass
+except FileNotFoundError:
+    pass
+if gate_misses:
+    print(f'Gate misses in past 24h: {len(gate_misses)}')
+    from collections import Counter
+    import re
+    gate_counts = Counter()
+    for e in gate_misses:
+        m = re.search(r'gate=(\S+)', e.get('content', ''))
+        if m:
+            gate_counts[m.group(1)] += 1
+    for gate, count in gate_counts.most_common():
+        print(f'  {gate}: {count} miss(es)')
+else:
+    print('No gate misses in past 24h.')
+"
+fi
+```
+
+Collect this output as `gate_miss_summary`. Include it in step 3 (rolling-summary.md) under a **Proprioceptive** bullet: `gate_miss_summary` content verbatim if any misses occurred. If zero misses, include a single bullet: `Proprioceptive: no gate misses logged in past 24h.`
+
+Also include `gate_miss_summary` in step 4 (daily-digest.md): append one sentence after the prose summary if any gate misses occurred — e.g., "Proprioceptive note: N gate miss(es) detected (gate=X: M times)."
+
+**1d. Pull classified patterns from the event store.**
+Query `~/lobster-workspace/data/memory.db` for `pattern_observation` events from the past 24 hours, and check each pattern type's recurrence over the prior 7 days.
+
+Run:
+```python
+uv run python - << 'PYEOF'
+import sqlite3, json, os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+db_path = Path(os.environ.get("LOBSTER_WORKSPACE", Path.home() / "lobster-workspace")) / "data" / "memory.db"
+if not db_path.exists():
+    print("PATTERN_SUMMARY: memory.db not found — skipping pattern step.")
+    raise SystemExit(0)
+
+conn = sqlite3.connect(str(db_path))
+conn.row_factory = sqlite3.Row
+
+now = datetime.now(timezone.utc)
+today_cutoff = (now - timedelta(hours=24)).isoformat()
+week_cutoff = (now - timedelta(days=7)).isoformat()
+
+# Today's pattern_observation rows
+cursor = conn.execute("""
+    SELECT id, timestamp, source, content, metadata
+    FROM events
+    WHERE type = 'pattern_observation' AND timestamp >= ?
+    ORDER BY timestamp ASC
+""", (today_cutoff,))
+today_rows = cursor.fetchall()
+
+# Prior 7-day counts by pattern_type (excluding today)
+cursor = conn.execute("""
+    SELECT json_extract(metadata, '$.pattern_type') AS ptype, COUNT(*) AS cnt
+    FROM events
+    WHERE type = 'pattern_observation' AND timestamp >= ? AND timestamp < ?
+    GROUP BY ptype
+""", (week_cutoff, today_cutoff))
+prior_counts = {r["ptype"]: r["cnt"] for r in cursor.fetchall() if r["ptype"]}
+
+# Slow-v1 significant events from past 24h (elevated by cross-event analysis)
+cursor = conn.execute("""
+    SELECT ct.entry_id, ct.signal_type, ct.posture_hint, ct.notes
+    FROM classification_tags ct
+    INNER JOIN events e ON e.id = CAST(ct.entry_id AS INTEGER)
+    WHERE ct.classifier = 'slow-v1' AND ct.significant = 1 AND e.timestamp >= ?
+      AND e.type != 'pattern_observation'
+""", (today_cutoff,))
+significant_events = cursor.fetchall()
+conn.close()
+
+# Build summary
+lines = []
+if today_rows:
+    from collections import Counter
+    by_type = Counter()
+    meta_by_type = {}
+    for row in today_rows:
+        meta = json.loads(row["metadata"] or "{}")
+        ptype = meta.get("pattern_type", "unknown")
+        by_type[ptype] += 1
+        meta_by_type.setdefault(ptype, []).append(meta)
+
+    lines.append("Patterns detected today:")
+    for ptype, count in by_type.most_common():
+        prior = prior_counts.get(ptype, 0)
+        label = "recurring" if prior >= 2 else "novel"
+        valences = [m.get("valence", "neutral") for m in meta_by_type[ptype]]
+        dominant_valence = max(set(valences), key=valences.count)
+        lines.append(f"  [{label}] {ptype}: {count}x today, {prior} times prior 7d | valence={dominant_valence}")
+else:
+    lines.append("Patterns detected today: none")
+
+if significant_events:
+    lines.append(f"Slow-v1 significant events: {len(significant_events)}")
+    for ev in significant_events[:5]:
+        lines.append(f"  event={ev['entry_id']} signal={ev['signal_type']} posture={ev['posture_hint']}")
+    if len(significant_events) > 5:
+        lines.append(f"  ... and {len(significant_events) - 5} more")
+else:
+    lines.append("Slow-v1 significant events: none")
+
+print("PATTERN_SUMMARY:")
+print("\n".join(lines))
+PYEOF
+```
+
+Capture this output as `pattern_summary`. If the script fails or memory.db is absent, set `pattern_summary = "Pattern data unavailable (memory.db absent or query failed)."` and continue.
+
 2. **Search for key mentions.**
    Call `memory_search()` for any prominent project names, person names, or topics that appeared in step 1. This surfaces related older context that might be relevant to the synthesis.
 
@@ -48,24 +179,57 @@ gh issue list --repo SiderealPress/lobster --state all --limit 30 --json number,
 Include the GitHub activity summary in the synthesis for rolling-summary.md and daily-digest.md. List merged PRs under a "Code shipped" bullet. List new/closed issues under an "Issues" bullet. If no GitHub activity, omit this section.
 
 3. **Update `rolling-summary.md`.**
-   Read `~/lobster-user-config/memory/canonical/rolling-summary.md`.
-   Prepend a new dated entry (format: `## YYYY-MM-DD`) that summarizes:
-   - Key decisions or conclusions reached
-   - Active work streams that progressed
-   - Unresolved threads or blockers
-   - Any notable mood or energy signals
-   - **Code shipped** bullet: merged PRs from step 2b (if any)
-   - **Issues** bullet: opened/closed issues from step 2b (if any)
-   Keep each entry concise — 5-10 bullet points max. Do NOT rewrite past entries.
+
+   **Policy: overwrite, not append.** rolling-summary.md is a current-state snapshot. Rewrite the entire file each run — do NOT prepend, append, or preserve prior content except the Stable Context section.
+
+   Read `~/lobster-user-config/memory/canonical/rolling-summary.md` if it exists (to extract the Stable Context section for carry-forward). Then write a fresh file with this structure (target: ~50 lines):
+
+   ```markdown
+   # Rolling Summary
+   **Last updated:** <ISO timestamp>
+   **Policy:** Overwrite-only — this file is a current-state snapshot, not an append log. Each update replaces the entire file.
+
+   ## Active PRs & Decisions
+
+   - <bullet per open/recently-resolved PR or key pending decision>
+
+   ## Open Threads / Commitments
+
+   - <bullet per unresolved thread or commitment>
+
+   ## Recent Decisions (last 7 days)
+
+   - <YYYY-MM-DDTHH:MMZ> — <brief decision description>
+
+   ## Stable Context
+
+   - <carried verbatim from prior file unless changed>
+   ```
+
+   Section rules:
+   - **Active PRs**: include only open PRs or PRs resolved today; drop stale merged entries.
+   - **Open Threads**: include unresolved items from today's memory events; drop anything confirmed done/shipped.
+   - **Recent Decisions**: include the key decisions or conclusions from today (5-10 bullets max); prune any decisions older than 7 days.
+   - **Code shipped** bullet: merged PRs from step 2b (if any) — add to Recent Decisions or Active PRs section as appropriate.
+   - **Issues** bullet: opened/closed issues from step 2b (if any) — add as bullets in Open Threads or Recent Decisions.
+   - **Stable Context**: carry forward verbatim from the prior file unless today's events show an explicit change.
+   - **Proprioceptive**: if gate_miss_summary contains gate misses, add one bullet in Open Threads: `Proprioceptive: <gate_miss_summary content>`. If zero misses, add: `Proprioceptive: no gate misses in past 24h.`
+   - **Patterns**: if `pattern_summary` contains detected patterns, add a `Patterns:` bullet in Open Threads listing recurring and novel patterns. Format: `Patterns (today): [recurring] brainstorm_mode x2, [novel] philosophy_thread x1`. Omit if no patterns detected.
+
+   Size enforcement: the file must not exceed 75 lines. If the draft exceeds this, drop oldest Recent Decisions bullets first, then merge related Open Thread items.
+
+   Write atomically: write to `.rolling-summary.tmp.md` in the same directory, then rename to `rolling-summary.md`.
 
 4. **Update `daily-digest.md`.**
    Read `~/lobster-user-config/memory/canonical/daily-digest.md`.
    Prepend today's dated section with a prose summary (2-4 sentences) of what happened, followed by bullet action items if any were identified.
 
+   If `pattern_summary` is non-empty and contains detected patterns, append a `**Patterns:**` line after the prose summary (before action items). Format: one line per pattern type, e.g., `- [recurring] design_session x1 (valence: neutral)`. If no patterns, omit this section entirely — do not write "none".
+
 5. **Update project files if relevant info emerged.**
    For each project mentioned in today's memory events where new status, blockers, or decisions appeared:
 
-   a. **Match the project name to a file.** List `~/lobster-user-config/memory/canonical/projects/`. Match by partial/fuzzy name — e.g. "Lobster" → `LobsterCore.md`, "ACME-123" or "ACME" → `ACME-123.md`. If multiple files are plausible, pick the best match. If no file matches and the project appears meaningfully (more than a passing mention), create a new file (see template below).
+   a. **Match the project name to a file.** List `~/lobster-user-config/memory/canonical/projects/`. Match by partial/fuzzy name — e.g. "Lobster" → `LobsterCore.md`, "MaliniBIS" or "BIS" → `MaliniBIS.md`. If multiple files are plausible, pick the best match. If no file matches and the project appears meaningfully (more than a passing mention), create a new file (see template below).
 
    b. **Prepend a dated update section.** Do NOT rewrite the file. Prepend a new section immediately after the `# Project: Name` header (before any existing sections), using this format:
    ```
@@ -140,6 +304,23 @@ Include the GitHub activity summary in the synthesis for rolling-summary.md and 
    Read `~/lobster-user-config/memory/canonical/handoff.md`.
    Update the "Current state" section to reflect the synthesized current state. This is the first file the next session reads — keep it accurate and current.
 
+   **9a. Update the Metabolic Snapshot section.**
+   The Metabolic Snapshot section sits between the Stable Facts/Repo Mapping block and the Current State section. Update it based on what emerged in today's session activity. The goal is to keep this section tracking metabolic meaning, not just event log.
+
+   For each subsection, apply the following update rules:
+
+   - **Pearls**: Add any new well-crystallized insights that completed today — impeccable formulations, breakthrough vocabulary, closed design questions, or captured learnings that belong in long-term memory. Do NOT add incremental findings; only add items that are genuinely complete and worth preserving. Drop pearls that are more than 30 days old if they have been encoded elsewhere (linked issue, committed doc, IFTTT rule). Keep the list to 5-7 items max.
+
+   - **Active Seeds**: Add any new design seeds, unresolved generative threads, or investments-for-future-capability that surfaced today. Remove seeds that have since crystallized (issue filed + implementation started) or rotted (>60 days without germination — these are now shit). Keep the list to 7-10 items max.
+
+   - **Juice-Rich Sessions**: Replace with the 2-3 most recent sessions where juice was high — high-quality generative output, real vocabulary sharpening, momentum that carried into the next session. Only list sessions from the past 14 days. Drop older entries.
+
+   - **Shit Being Processed**: Add any new friction patterns, epistemic drift, lost subagents, structural dissonances, or anti-patterns that surfaced today and are being actively tracked. Remove items that were resolved this session (e.g., a stuck subagent that completed, a bug that was fixed). Keep the list to 5-8 items — long shit lists are themselves a smell.
+
+   - **Heat Dissipated**: Replace with 3-5 notable heat events from the past 24 hours only — cron runs that found nothing, clean oracle passes, resolved urgencies that left no residue. This is a rolling window, not a cumulative list. Older heat events are already dissipated — recording them past 24h is itself heat.
+
+   Update the `*Last updated:*` datestamp to today's date.
+
    **9b. Reconcile the handoff.md PR table against live GitHub state.**
    After updating the Current state section, reconcile any PR table present in handoff.md:
 
@@ -165,23 +346,7 @@ Include the GitHub activity summary in the synthesis for rolling-summary.md and 
 
    If handoff.md has no PR table, skip step 9b silently. If `gh` is unavailable, skip step 9b and note it in `write_result`. If the PR table format is unexpected, leave the table unchanged and note it in `write_result` — do not crash.
 
-10. **Sync canonical files into the user model DB.**
-   Run the bridge pass to push projects, priorities, and preferences from canonical markdown files into the user model DB. This also generates the pre-computed `_context.md` via `write_context_cache()`.
-
-   Invoke the tested CLI script — do not hand-write the bridge-sync Python inline. Inline copies of this logic have drifted twice already (a `ModuleNotFoundError` from a stale `mcp.`-prefixed import — #2180 — and a `TypeError` from a bare `sqlite3.connect()` missing `row_factory` — #2181), both caught only because someone happened to notice the repo's copy had already been fixed. `scripts/run_nightly_bridge_sync.py` is the single, tested vehicle for this step; call it by path instead of re-embedding its internals:
-   ```bash
-   cd ~/lobster && uv run python scripts/run_nightly_bridge_sync.py \
-     --canonical-root ~/lobster-user-config \
-     --workspace-root ~/lobster-workspace
-   ```
-   `--canonical-root` (read root for `projects/*.md` and `priorities.md`) and `--workspace-root` (write root for the user-model DB and `_context.md`) must stay independent arguments — never collapse them into one shared path (see PR #2136: `run_bridges()`'s single `workspace_path` did that and silently overwrote a populated `_context.md` with a near-empty stub).
-
-   This syncs `projects/*.md` as narrative arcs and `priorities.md` as attention items, and writes the pre-computed `~/lobster-workspace/user-model/_context.md`. The script prints a JSON summary and exits non-zero if any of the three sub-steps (`projects`, `priorities`, `context_cache`) reported an error.
-   If the script fails (e.g. DB not initialized), continue to step 11.
-
-   **Private-overlay note:** if `~/lobster-user-config/.claude/agents/nightly-consolidation.md` carries its own copy of step 10, update it to call this same script by path rather than re-embedding inline Python — that overlay file lives outside this repo and was the source of both #2180 and #2181.
-
-11. **Write `_context.md` (user model summary).**
+10. **Write `_context.md` (user model summary).**
     Call `model_user_context(deep=True)` to retrieve structured user model data from the DB.
     Combine it with today's synthesized context (from steps 1–9) to write a complete snapshot.
 
@@ -215,7 +380,7 @@ Include the GitHub activity summary in the synthesis for rolling-summary.md and 
 
 ### What NOT to do
 
-- Do NOT rewrite past entries in rolling-summary.md or daily-digest.md — prepend only.
+- Do NOT append or prepend to rolling-summary.md — overwrite the entire file each run (see step 3). Do NOT rewrite past entries in daily-digest.md — prepend only.
 - Do NOT rewrite project or people files — only prepend/append new dated sections.
 - Do NOT send any message to the user — this is a silent background operation.
 - Do NOT call `send_reply` under any circumstances.
@@ -227,7 +392,7 @@ Include the GitHub activity summary in the synthesis for rolling-summary.md and 
 mcp__lobster-inbox__write_result(
     task_id=task_id,   # from your prompt header
     chat_id=0,
-    text="Nightly consolidation complete. Updated: rolling-summary.md, daily-digest.md, handoff.md, priorities.md, _context.md. Projects updated: <list or 'none'>. People updated: <list or 'none'>. Events consolidated: <count>. Session files read: <count>. GitHub PRs merged: <count>. GitHub issues opened/closed: <count>. Priorities pruned: <count removed> items. Handoff PR table: <N open, M merged removed, K closed removed, or 'skipped: no table' or 'skipped: gh unavailable'>.",
+    text="Nightly consolidation complete. Updated: rolling-summary.md, daily-digest.md, handoff.md, priorities.md, _context.md. Projects updated: <list or 'none'>. People updated: <list or 'none'>. Events consolidated: <count>. Patterns surfaced: <count of pattern_observation rows today, e.g. '3 (2 recurring, 1 novel)' or 'none'>. Session files read: <count>. GitHub PRs merged: <count>. GitHub issues opened/closed: <count>. Priorities pruned: <count removed> items. Handoff PR table: <N open, M merged removed, K closed removed, or 'skipped: no table' or 'skipped: gh unavailable'>.",
     source="system",
     status="success",
     sent_reply_to_user=False,

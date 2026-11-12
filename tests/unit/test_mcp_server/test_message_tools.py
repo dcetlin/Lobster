@@ -25,6 +25,7 @@ if str(_MCP_DIR) not in sys.path:
 # Pre-load the module so that unittest.mock can resolve "src.mcp.inbox_server"
 # as an attribute of the `src.mcp` package before patch.multiple opens.
 import src.mcp.inbox_server  # noqa: F401
+from src.mcp.inbox_server import VALID_OUTCOME_CATEGORIES
 
 # We'll test the handlers directly by importing them
 # and patching the directory constants
@@ -262,6 +263,648 @@ class TestSendReply:
             files = list(outbox_dir.glob("*.json"))
             content = json.loads(files[0].read_text())
             assert content["source"] == "telegram"
+
+
+class TestSendReplyLocalClaude:
+    """Tests for the agent channel: send_reply(source='local-claude').
+
+    A local Claude Code session (SSH) polls ~/messages/agent-replies/<request_id>.json
+    for its answer instead of receiving a Telegram/Slack message. See docs/reference/agent-channel.md.
+    """
+
+    @pytest.fixture
+    def dirs(self, temp_messages_dir: Path):
+        outbox = temp_messages_dir / "outbox"
+        sent = temp_messages_dir / "sent"
+        agent_replies = temp_messages_dir / "agent-replies"
+        outbox.mkdir(parents=True, exist_ok=True)
+        sent.mkdir(parents=True, exist_ok=True)
+        agent_replies.mkdir(parents=True, exist_ok=True)
+        return outbox, sent, agent_replies
+
+    def test_writes_agent_reply_file_not_outbox(self, dirs):
+        """A local-claude reply lands only in agent-replies/, never outbox/ or sent/."""
+        outbox, sent, agent_replies = dirs
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local",
+                    "text": "The answer is 42.",
+                    "source": "local-claude",
+                    "request_id": "req-abc123",
+                })
+            )
+
+            assert "agent-replies/req-abc123.json" in result[0].text
+            assert list(outbox.glob("*.json")) == []
+            assert list(sent.glob("*.json")) == []
+
+            files = list(agent_replies.glob("*.json"))
+            assert len(files) == 1
+            assert files[0].name == "req-abc123.json"
+
+            content = json.loads(files[0].read_text())
+            assert content["request_id"] == "req-abc123"
+            assert content["text"] == "The answer is 42."
+            assert content["in_reply_to"] == "req-abc123"
+            assert "ts" in content
+
+    def test_missing_request_id_errors(self, dirs):
+        """source='local-claude' without request_id returns an Error, writes nothing."""
+        outbox, sent, agent_replies = dirs
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local",
+                    "text": "Hello",
+                    "source": "local-claude",
+                })
+            )
+
+            assert "Error" in result[0].text
+            assert list(agent_replies.glob("*.json")) == []
+
+    def test_message_id_marks_processed(self, dirs, temp_messages_dir: Path):
+        """message_id is still honored for local-claude — atomic mark_processed applies."""
+        outbox, sent, agent_replies = dirs
+        processing = temp_messages_dir / "processing"
+        processed = temp_messages_dir / "processed"
+        inbox = temp_messages_dir / "inbox"
+        processing.mkdir(parents=True, exist_ok=True)
+        processed.mkdir(parents=True, exist_ok=True)
+        inbox.mkdir(parents=True, exist_ok=True)
+
+        msg = {
+            "id": "req-xyz",
+            "source": "local-claude",
+            "chat_id": "local",
+            "type": "text",
+            "text": "What is the deploy status?",
+            "request_id": "req-xyz",
+            "timestamp": "2026-03-14T12:00:00.000000",
+        }
+        (processing / "req-xyz.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            PROCESSED_DIR=processed,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local",
+                    "text": "All green.",
+                    "source": "local-claude",
+                    "request_id": "req-xyz",
+                    "message_id": "req-xyz",
+                })
+            )
+
+            assert "marked processed" in result[0].text
+            assert not (processing / "req-xyz.json").exists()
+            assert (processed / "req-xyz.json").exists()
+
+    def test_source_mismatch_refuses_and_never_touches_outbox(self, dirs, temp_messages_dir: Path):
+        """A message that originated with source='local-claude' must never be
+        answered with source='telegram' (fail-closed on source mismatch) — the
+        one hard guarantee is that agent-channel traffic can never leak to Dan's
+        Telegram/Slack outbox."""
+        outbox, sent, agent_replies = dirs
+        processing = temp_messages_dir / "processing"
+        inbox = temp_messages_dir / "inbox"
+        processing.mkdir(parents=True, exist_ok=True)
+        inbox.mkdir(parents=True, exist_ok=True)
+
+        msg = {
+            "id": "req-leak",
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "what's the status of PR 1234?",
+            "request_id": "req-leak",
+            "timestamp": "2026-08-04T12:00:00.000000",
+        }
+        (processing / "req-leak.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            # Caller forgot source="local-claude" — falls back to the "telegram"
+            # default. Must be refused, not silently delivered to Dan's phone.
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": 123456,
+                    "text": "PR 1234 is merged.",
+                    "message_id": "req-leak",
+                })
+            )
+
+            assert "Error" in result[0].text
+            assert "mismatch" in result[0].text.lower()
+            assert list(outbox.glob("*.json")) == []
+            assert list(agent_replies.glob("*.json")) == []
+            # Message must remain in processing/ — never marked processed on refusal.
+            assert (processing / "req-leak.json").exists()
+
+    def test_source_match_still_succeeds(self, dirs, temp_messages_dir: Path):
+        """A correctly source-matched reply (message_id references a local-claude
+        message, reply source='local-claude') is unaffected by the mismatch guard."""
+        outbox, sent, agent_replies = dirs
+        processing = temp_messages_dir / "processing"
+        inbox = temp_messages_dir / "inbox"
+        processing.mkdir(parents=True, exist_ok=True)
+        inbox.mkdir(parents=True, exist_ok=True)
+
+        msg = {
+            "id": "req-ok",
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "what's the status of PR 1234?",
+            "request_id": "req-ok",
+            "timestamp": "2026-08-04T12:00:00.000000",
+        }
+        (processing / "req-ok.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "PR 1234 is merged.",
+                    "source": "local-claude",
+                    "request_id": "req-ok",
+                    "message_id": "req-ok",
+                })
+            )
+
+            assert "Error" not in result[0].text
+            assert (agent_replies / "req-ok.json").exists()
+
+    def test_second_writer_does_not_overwrite_first(self, dirs):
+        """Single-shot reply slot (agent-channel protocol spec, principle 1): a
+        second send_reply for the same request_id must never clobber the first
+        writer's answer, even though each individual write is itself atomic.
+        Reproduces the exact race a crash/redispatch under
+        _recover_stale_processing() can produce — two independent callers
+        racing for the same agent-replies/<request_id>.json slot."""
+        outbox, sent, agent_replies = dirs
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            first = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "First answer (correct).",
+                    "source": "local-claude",
+                    "request_id": "req-race",
+                })
+            )
+            second = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "Second answer (should NOT win).",
+                    "source": "local-claude",
+                    "request_id": "req-race",
+                })
+            )
+
+            assert "Reply written" in first[0].text
+            assert "already exists" in second[0].text.lower()
+
+            files = list(agent_replies.glob("*.json"))
+            assert len(files) == 1
+            content = json.loads(files[0].read_text())
+            assert content["text"] == "First answer (correct)."
+
+    # -- error discriminator (issue #1533) -----------------------------------
+    #
+    # send_reply(source="local-claude", error=True, error_type=...) threads
+    # through to the same single-shot reply file — not a separate envelope.
+
+    def test_error_true_is_threaded_through_to_written_reply(self, dirs):
+        outbox, sent, agent_replies = dirs
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local",
+                    "text": "The task failed after 3 retries.",
+                    "source": "local-claude",
+                    "request_id": "req-fail-1",
+                    "error": True,
+                    "error_type": "processing_failed",
+                })
+            )
+
+            content = json.loads((agent_replies / "req-fail-1.json").read_text())
+            assert content["error"] is True
+            assert content["error_type"] == "processing_failed"
+            assert content["text"] == "The task failed after 3 retries."
+
+    def test_normal_reply_has_no_error_key_when_not_requested(self, dirs):
+        """Backward-compat proof at the handle_send_reply layer: a reply
+        with no error/error_type args produces the exact same key set as
+        before this feature existed."""
+        outbox, sent, agent_replies = dirs
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local",
+                    "text": "All good.",
+                    "source": "local-claude",
+                    "request_id": "req-normal-1",
+                })
+            )
+
+            content = json.loads((agent_replies / "req-normal-1.json").read_text())
+            assert set(content.keys()) == {"request_id", "text", "ts", "in_reply_to"}
+
+
+class TestSendReplyLocalClaudeByAgentPointer:
+    """agent-channel protocol v1, §3.2 — by-agent pointer mailbox.
+
+    Purely additive: writing agent-replies/<request_id>.json for a request
+    whose inbound envelope carried a non-empty `agent` field also writes
+    agent-replies/by-agent/<agent-slug>/<request_id>.
+    """
+
+    @pytest.fixture
+    def dirs(self, temp_messages_dir: Path):
+        outbox = temp_messages_dir / "outbox"
+        sent = temp_messages_dir / "sent"
+        agent_replies = temp_messages_dir / "agent-replies"
+        processing = temp_messages_dir / "processing"
+        inbox = temp_messages_dir / "inbox"
+        for d in (outbox, sent, agent_replies, processing, inbox):
+            d.mkdir(parents=True, exist_ok=True)
+        return outbox, sent, agent_replies, processing, inbox
+
+    def _write_processing_message(self, processing: Path, request_id: str, agent: str | None):
+        msg = {
+            "id": request_id,
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "what's the status?",
+            "request_id": request_id,
+            "timestamp": "2026-08-05T10:00:00.000000",
+        }
+        if agent is not None:
+            msg["agent"] = agent
+        (processing / f"{request_id}.json").write_text(json.dumps(msg))
+
+    def test_agent_field_present_writes_pointer(self, dirs):
+        outbox, sent, agent_replies, processing, inbox = dirs
+        self._write_processing_message(processing, "req-bloom-1", agent="bloom")
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "All green.",
+                    "source": "local-claude",
+                    "request_id": "req-bloom-1",
+                    "message_id": "req-bloom-1",
+                })
+            )
+
+        pointer = agent_replies / "by-agent" / "bloom" / "req-bloom-1"
+        assert pointer.exists()
+        assert pointer.stat().st_size == 0
+
+    def test_agent_field_absent_writes_no_pointer(self, dirs):
+        """Requests with no `agent` field get no pointer — additive, not a
+        behavior change for the common case."""
+        outbox, sent, agent_replies, processing, inbox = dirs
+        self._write_processing_message(processing, "req-anon-1", agent=None)
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "All green.",
+                    "source": "local-claude",
+                    "request_id": "req-anon-1",
+                    "message_id": "req-anon-1",
+                })
+            )
+
+        assert not (agent_replies / "by-agent").exists()
+
+    def test_agent_slug_is_lowercase_normalized(self, dirs):
+        outbox, sent, agent_replies, processing, inbox = dirs
+        self._write_processing_message(processing, "req-Bloom-2", agent="Bloom")
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "All green.",
+                    "source": "local-claude",
+                    "request_id": "req-Bloom-2",
+                    "message_id": "req-Bloom-2",
+                })
+            )
+
+        assert (agent_replies / "by-agent" / "bloom" / "req-Bloom-2").exists()
+        assert not (agent_replies / "by-agent" / "Bloom").exists()
+
+    def test_invalid_agent_value_skips_pointer_but_reply_still_lands(self, dirs):
+        """A malformed `agent` field fails loudly (logged) but must never
+        block the terminal reply write itself — the pointer is a discovery
+        convenience, not load-bearing."""
+        outbox, sent, agent_replies, processing, inbox = dirs
+        self._write_processing_message(processing, "req-bad-agent", agent="bloom session")  # space -> invalid
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "All green.",
+                    "source": "local-claude",
+                    "request_id": "req-bad-agent",
+                    "message_id": "req-bad-agent",
+                })
+            )
+
+        assert "Reply written" in result[0].text
+        assert (agent_replies / "req-bad-agent.json").exists()
+        assert not (agent_replies / "by-agent").exists()
+
+    def test_lost_reply_race_writes_no_pointer(self, dirs):
+        """A second call that loses the single-shot reply-slot race must not
+        write a pointer either — nothing new was actually delivered."""
+        outbox, sent, agent_replies, processing, inbox = dirs
+        self._write_processing_message(processing, "req-race-agent", agent="bloom")
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "first",
+                    "source": "local-claude",
+                    "request_id": "req-race-agent",
+                    "message_id": "req-race-agent",
+                })
+            )
+            pointer_dir = agent_replies / "by-agent" / "bloom"
+            assert list(pointer_dir.iterdir()) == [pointer_dir / "req-race-agent"]
+            before = (pointer_dir / "req-race-agent").stat().st_mtime
+
+            # Re-write the processing message back (message_id-based mark_processed
+            # already moved it to processed/ on the first call) so message_id
+            # resolution still finds a local-claude-sourced origin on the retry.
+            (processing / "req-race-agent.json").write_text(json.dumps({
+                "id": "req-race-agent",
+                "source": "local-claude",
+                "chat_id": "local-claude",
+                "request_id": "req-race-agent",
+                "agent": "bloom",
+            }))
+
+            asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "second — should lose the race",
+                    "source": "local-claude",
+                    "request_id": "req-race-agent",
+                    "message_id": "req-race-agent",
+                })
+            )
+
+        # Still exactly one pointer file, untouched by the losing second call.
+        assert list(pointer_dir.iterdir()) == [pointer_dir / "req-race-agent"]
+        assert (pointer_dir / "req-race-agent").stat().st_mtime == before
+
+    def test_write_pointer_generic_exception_never_blocks_reply_path(self, dirs, temp_messages_dir: Path):
+        """A non-ValidationError failure from write_pointer (e.g. OSError from
+        mkdir/touch — disk full, permission error) must never skip
+        mark_processed, dedup tracking, or audit emission, nor block the
+        reply path. The pointer mailbox is a discovery convenience, not
+        load-bearing — this is the same guarantee as the invalid-agent-value
+        case above, but for filesystem failures rather than validation
+        failures, which only a broad `except Exception` around write_pointer
+        (not `except ValidationError`) can catch."""
+        outbox, sent, agent_replies, processing, inbox = dirs
+        processed = temp_messages_dir / "processed"
+        processed.mkdir(parents=True, exist_ok=True)
+        self._write_processing_message(processing, "req-oserror-agent", agent="bloom")
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            PROCESSED_DIR=processed,
+            INBOX_DIR=inbox,
+        ), patch(
+            "src.mcp.inbox_server.agent_channel.write_pointer",
+            side_effect=OSError("simulated ENOSPC from mkdir/touch"),
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "All green.",
+                    "source": "local-claude",
+                    "request_id": "req-oserror-agent",
+                    "message_id": "req-oserror-agent",
+                })
+            )
+
+        # Reply path completed: terminal reply written, response reports success.
+        assert "Reply written" in result[0].text
+        assert (agent_replies / "req-oserror-agent.json").exists()
+        # mark_processed still ran despite the write_pointer failure.
+        assert "marked processed" in result[0].text
+        assert not (processing / "req-oserror-agent.json").exists()
+        assert (processed / "req-oserror-agent.json").exists()
+        # No pointer was written (the failure was swallowed, not silently succeeded).
+        assert not (agent_replies / "by-agent").exists()
+
+    def test_request_id_fallback_writes_pointer_when_message_id_absent(self, dirs):
+        """Real-world subagent call pattern (.claude/sys.subagent.bootup.md,
+        "Agent Channel Tasks"): send_reply(chat_id, text, source="local-claude",
+        request_id=..., task_id=...) — no message_id is ever passed. By protocol
+        convention, message_id == request_id for this channel (both are the
+        inbound envelope's `id`), so handle_send_reply must fall back to looking
+        the origin file up by request_id in order to recover the `agent` label
+        and still write the by-agent/<slug>/ pointer."""
+        outbox, sent, agent_replies, processing, inbox = dirs
+        self._write_processing_message(processing, "req-bloom-nomid", agent="bloom")
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "All green.",
+                    "source": "local-claude",
+                    "request_id": "req-bloom-nomid",
+                    # message_id intentionally omitted — matches the documented
+                    # subagent call pattern.
+                })
+            )
+
+        assert "Reply written" in result[0].text
+        pointer = agent_replies / "by-agent" / "bloom" / "req-bloom-nomid"
+        assert pointer.exists()
+        assert pointer.stat().st_size == 0
+
+    def test_request_id_fallback_no_pointer_when_agent_field_absent(self, dirs):
+        """Negative case for the request_id fallback: when message_id is
+        omitted AND the origin envelope carries no `agent` field, the reply
+        must still land (soft-fail cleanly) with no pointer written."""
+        outbox, sent, agent_replies, processing, inbox = dirs
+        self._write_processing_message(processing, "req-anon-nomid", agent=None)
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            OUTBOX_DIR=outbox,
+            SENT_DIR=sent,
+            AGENT_REPLIES_DIR=agent_replies,
+            PROCESSING_DIR=processing,
+            INBOX_DIR=inbox,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_send_reply
+
+            result = asyncio.run(
+                handle_send_reply({
+                    "chat_id": "local-claude",
+                    "text": "All green.",
+                    "source": "local-claude",
+                    "request_id": "req-anon-nomid",
+                })
+            )
+
+        assert "Reply written" in result[0].text
+        assert (agent_replies / "req-anon-nomid.json").exists()
+        assert not (agent_replies / "by-agent").exists()
 
 
 class TestAutoThreading:
@@ -821,6 +1464,84 @@ class TestMarkProcessed:
 
             assert "processed" in result[0].text.lower()
             assert not (inbox / f"{msg_id}.json").exists()
+
+    def test_local_claude_dropped_reply_guard_is_per_request(self, setup_dirs, caplog):
+        """Per-request identity (protocol spec principle 3): every local-claude client
+        shares the constant chat_id="local-claude", so a reply sent for request B must
+        NOT mask the fact that request A (a different request_id, same chat_id) was
+        never answered.
+        """
+        import logging
+        inbox, processed = setup_dirs
+
+        msg_a = {
+            "id": "req-A",
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "request A — never answered",
+            "request_id": "req-A",
+            "timestamp": "2026-08-04T12:00:00.000000",
+        }
+        (inbox / "req-A.json").write_text(json.dumps(msg_a))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSED_DIR=processed,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_mark_processed, _track_reply, _reply_track_key
+
+            # A DIFFERENT request (req-B), sharing the same constant chat_id, got its
+            # reply sent. Before the fix this alone would satisfy req-A's guard too,
+            # because both were tracked under the shared key "local-claude".
+            _track_reply(_reply_track_key("local-claude", source="local-claude", request_id="req-B"))
+
+            with caplog.at_level(logging.WARNING):
+                result = asyncio.run(handle_mark_processed({"message_id": "req-A"}))
+
+            assert "processed" in result[0].text.lower()
+            # req-A's own reply was never sent — the guard must still fire.
+            assert any(
+                "mark_processed called without send_reply" in r.message
+                for r in caplog.records
+            ), "dropped-reply guard must fire for req-A even though req-B's reply was tracked"
+
+    def test_local_claude_dropped_reply_guard_satisfied_by_own_request(self, setup_dirs, caplog):
+        """The guard is satisfied when the reply was tracked under the SAME request_id."""
+        import logging
+        inbox, processed = setup_dirs
+
+        msg = {
+            "id": "req-C",
+            "source": "local-claude",
+            "chat_id": "local-claude",
+            "type": "text",
+            "text": "request C — answered",
+            "request_id": "req-C",
+            "timestamp": "2026-08-04T12:00:00.000000",
+        }
+        (inbox / "req-C.json").write_text(json.dumps(msg))
+
+        with patch.multiple(
+            "src.mcp.inbox_server",
+            INBOX_DIR=inbox,
+            PROCESSED_DIR=processed,
+        ):
+            import asyncio
+            from src.mcp.inbox_server import handle_mark_processed, _track_reply, _reply_track_key
+
+            _track_reply(_reply_track_key("local-claude", source="local-claude", request_id="req-C"))
+
+            with caplog.at_level(logging.WARNING):
+                result = asyncio.run(handle_mark_processed({"message_id": "req-C"}))
+
+            assert "processed" in result[0].text.lower()
+            assert not any(
+                "mark_processed called without send_reply" in r.message
+                for r in caplog.records
+            ), "dropped-reply guard must NOT fire when req-C's own reply was tracked"
 
     # -----------------------------------------------------------------------
     # Issue #1594 — "Noted." fallback removal
@@ -1398,9 +2119,8 @@ class TestEnqueueRecoveryNotification:
     _write_synthetic_inbox_message (in require-write-result.py) and
     _enqueue_recovery_notification (in inbox_server.py). These tests verify
     that the marker correctly identifies the boundary, that content after it
-    is used as the notification summary, and — per issue #2175 — that the
-    owner-facing Telegram notification is suppressed entirely when the marker
-    is absent (i.e. nothing was salvaged from the transcript).
+    is used as the notification summary, and that the no-content fallback
+    works when the marker is absent.
     """
 
     def _call_enqueue(self, inbox_dir: Path, msg: dict, owner_chat_id: int = 99999) -> dict:
@@ -1472,22 +2192,8 @@ class TestEnqueueRecoveryNotification:
         # The full 400-char content should not appear verbatim.
         assert long_content not in notification["text"]
 
-    def _call_enqueue_expect_no_file(self, inbox_dir: Path, msg: dict, owner_chat_id: int = 99999) -> None:
-        """Call _enqueue_recovery_notification and assert no notification file was written."""
-        from src.mcp.inbox_server import _enqueue_recovery_notification
-
-        with patch("src.mcp.inbox_server._get_owner_chat_id_and_source", return_value=(owner_chat_id, "telegram")), \
-             patch.multiple("src.mcp.inbox_server", INBOX_DIR=inbox_dir):
-            _enqueue_recovery_notification(msg)
-
-        assert list(inbox_dir.glob("*.json")) == []
-
-    def test_no_summary_marker_suppresses_notification(self, tmp_path):
-        """When text does not contain the summary marker (nothing salvaged), no
-        owner-facing Telegram notification is written — see issue #2175: this exact
-        shape ("(No recoverable transcript content found.)") was the entire content
-        of a ~140-notification overnight spam incident.
-        """
+    def test_no_summary_marker_uses_fallback(self, tmp_path):
+        """When text does not contain the summary marker, fallback message is used."""
         inbox_dir = tmp_path / "inbox"
         inbox_dir.mkdir()
 
@@ -1495,36 +2201,20 @@ class TestEnqueueRecoveryNotification:
             "task_id": "agent-no-content",
             "text": "Agent exited without calling write_result.\n\n(No recoverable transcript content found.)",
         }
-        self._call_enqueue_expect_no_file(inbox_dir, msg)
+        notification = self._call_enqueue(inbox_dir, msg)
 
-    def test_empty_text_suppresses_notification(self, tmp_path):
-        """Empty text field (no transcript content at all) suppresses the notification."""
+        assert "No recoverable transcript content was found." in notification["text"]
+        assert "Last known activity:" not in notification["text"]
+
+    def test_empty_text_uses_fallback(self, tmp_path):
+        """Empty text field (no transcript content at all) uses the fallback message."""
         inbox_dir = tmp_path / "inbox"
         inbox_dir.mkdir()
 
         msg = {"task_id": "agent-empty", "text": ""}
-        self._call_enqueue_expect_no_file(inbox_dir, msg)
-
-    def test_salvaged_content_still_sends_notification(self, tmp_path):
-        """When the transcript salvage is non-empty (real work was in flight when the
-        agent died without calling write_result), the owner-facing notification is
-        still sent — this is the case that represents genuinely lost work.
-        """
-        inbox_dir = tmp_path / "inbox"
-        inbox_dir.mkdir()
-
-        msg = {
-            "task_id": "agent-real-work",
-            "text": (
-                "Agent exited without calling write_result."
-                "\n\nRecovered content:\n\n"
-                "Drafted the fix for issue #99 and was about to open a PR."
-            ),
-        }
         notification = self._call_enqueue(inbox_dir, msg)
 
-        assert notification["type"] == "subagent_notification"
-        assert "Drafted the fix for issue #99" in notification["text"]
+        assert "No recoverable transcript content was found." in notification["text"]
 
     def test_notification_uses_owner_chat_id(self, tmp_path):
         """Recovery notification is addressed to the owner, not to chat_id=0."""
@@ -1532,31 +2222,173 @@ class TestEnqueueRecoveryNotification:
         inbox_dir.mkdir()
 
         owner_id = 123456789
-        msg = {
-            "task_id": "agent-chat",
-            "text": "Preamble.\n\nRecovered content:\n\nSomething real happened.",
-        }
+        msg = {"task_id": "agent-chat", "text": ""}
         notification = self._call_enqueue(inbox_dir, msg, owner_chat_id=owner_id)
 
         assert notification["chat_id"] == owner_id
         assert notification["type"] == "subagent_notification"
 
     def test_owner_chat_id_none_skips_notification(self, tmp_path):
-        """When owner chat_id cannot be resolved, no notification file is written —
-        even when there is salvaged content to report (distinct from the issue #2175
-        empty-content suppression, which returns before owner chat_id is even resolved).
-        """
+        """When owner chat_id cannot be resolved, no notification file is written."""
         inbox_dir = tmp_path / "inbox"
         inbox_dir.mkdir()
 
         from src.mcp.inbox_server import _enqueue_recovery_notification
 
-        msg = {
-            "task_id": "x",
-            "text": "Preamble.\n\nRecovered content:\n\nSomething real happened.",
-        }
         with patch("src.mcp.inbox_server._get_owner_chat_id_and_source", return_value=(None, "telegram")), \
              patch.multiple("src.mcp.inbox_server", INBOX_DIR=inbox_dir):
-            _enqueue_recovery_notification(msg)
+            _enqueue_recovery_notification({"task_id": "x", "text": ""})
 
         assert list(inbox_dir.glob("*.json")) == []
+
+
+# ---------------------------------------------------------------------------
+# Tests for outcome_category field on write_result (issue #754)
+# ---------------------------------------------------------------------------
+
+class TestWriteResultOutcomeCategory:
+    """write_result stores outcome_category in the inbox message and the outcome ledger.
+
+    The outcome_category field is optional and self-assessed by the subagent.
+    Valid values: heat, shit, seed, pearl.
+    Invalid or missing values are silently ignored (field absent from message).
+    """
+
+    @pytest.fixture
+    def dirs(self, inbox_server_dirs):
+        return inbox_server_dirs
+
+    def _run_write_result(self, dirs, *, task_id, chat_id, text, outcome_category=None, **extra):
+        """Helper: call handle_write_result and return the written inbox message."""
+        import asyncio
+        from src.mcp.inbox_server import handle_write_result
+
+        call_args = {
+            "task_id": task_id,
+            "chat_id": chat_id,
+            "text": text,
+            "source": "telegram",
+            **extra,
+        }
+        if outcome_category is not None:
+            call_args["outcome_category"] = outcome_category
+
+        asyncio.run(handle_write_result(call_args))
+
+        inbox_files = list(dirs["inbox"].glob("*.json"))
+        assert len(inbox_files) == 1, f"Expected 1 inbox file, found {len(inbox_files)}"
+        return json.loads(inbox_files[0].read_text())
+
+    @pytest.mark.parametrize("category", VALID_OUTCOME_CATEGORIES)
+    def test_valid_category_stored_in_inbox_message(self, dirs, category):
+        """Each valid outcome_category value is persisted in the inbox message JSON."""
+        msg = self._run_write_result(
+            dirs,
+            task_id=f"test-{category}",
+            chat_id=100,
+            text=f"Result for {category}",
+            outcome_category=category,
+        )
+        assert msg.get("outcome_category") == category, (
+            f"Expected outcome_category={category!r} in inbox message, got {msg.get('outcome_category')!r}"
+        )
+
+    def test_missing_category_not_present_in_message(self, dirs):
+        """When outcome_category is omitted, the field is absent from the inbox message."""
+        msg = self._run_write_result(
+            dirs,
+            task_id="test-no-category",
+            chat_id=101,
+            text="Result without category",
+        )
+        assert "outcome_category" not in msg, (
+            "outcome_category should be absent when not provided"
+        )
+
+    def test_invalid_category_silently_dropped(self, dirs):
+        """An unrecognized outcome_category value is silently dropped (not stored)."""
+        msg = self._run_write_result(
+            dirs,
+            task_id="test-invalid-category",
+            chat_id=102,
+            text="Result with invalid category",
+            outcome_category="trash",  # not a valid category
+        )
+        assert "outcome_category" not in msg, (
+            "Invalid outcome_category should not appear in inbox message"
+        )
+
+    @pytest.mark.parametrize("category", VALID_OUTCOME_CATEGORIES)
+    def test_valid_category_appended_to_outcome_ledger(self, dirs, category):
+        """Each valid outcome_category value is appended to the outcome ledger JSONL."""
+        import asyncio
+        from src.mcp.inbox_server import handle_write_result
+
+        asyncio.run(handle_write_result({
+            "task_id": f"ledger-test-{category}",
+            "chat_id": 200,
+            "text": f"Ledger test for {category}",
+            "source": "telegram",
+            "outcome_category": category,
+        }))
+
+        ledger_file = dirs["outcome_ledger"]
+        assert ledger_file.exists(), "outcome ledger file should be created"
+
+        entries = [json.loads(line) for line in ledger_file.read_text().splitlines() if line.strip()]
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["outcome_category"] == category
+        assert entry["task_id"] == f"ledger-test-{category}"
+        assert "ts" in entry
+
+    def test_missing_category_does_not_write_ledger_entry(self, dirs):
+        """When outcome_category is omitted, no entry is appended to the ledger."""
+        import asyncio
+        from src.mcp.inbox_server import handle_write_result
+
+        asyncio.run(handle_write_result({
+            "task_id": "no-category-ledger",
+            "chat_id": 201,
+            "text": "No category, no ledger write",
+            "source": "telegram",
+        }))
+
+        ledger_file = dirs["outcome_ledger"]
+        assert not ledger_file.exists() or ledger_file.read_text().strip() == "", (
+            "Ledger should not be written when outcome_category is absent"
+        )
+
+    def test_multiple_categories_accumulate_in_ledger(self, dirs):
+        """Multiple write_result calls append independent entries to the ledger."""
+        import asyncio
+        from src.mcp.inbox_server import handle_write_result
+
+        for i, category in enumerate(VALID_OUTCOME_CATEGORIES):
+            asyncio.run(handle_write_result({
+                "task_id": f"multi-{i}",
+                "chat_id": 300 + i,
+                "text": f"Entry {i}",
+                "source": "telegram",
+                "outcome_category": category,
+            }))
+
+        ledger_file = dirs["outcome_ledger"]
+        assert ledger_file.exists()
+        entries = [json.loads(line) for line in ledger_file.read_text().splitlines() if line.strip()]
+        assert len(entries) == len(VALID_OUTCOME_CATEGORIES)
+        recorded_categories = [e["outcome_category"] for e in entries]
+        assert sorted(recorded_categories) == sorted(VALID_OUTCOME_CATEGORIES)
+
+    def test_outcome_category_preserved_through_subagent_notification_type(self, dirs):
+        """outcome_category is stored even when sent_reply_to_user=True (subagent_notification)."""
+        msg = self._run_write_result(
+            dirs,
+            task_id="notification-with-category",
+            chat_id=400,
+            text="Already sent directly.",
+            outcome_category="pearl",
+            sent_reply_to_user=True,
+        )
+        assert msg["type"] == "subagent_notification"
+        assert msg.get("outcome_category") == "pearl"

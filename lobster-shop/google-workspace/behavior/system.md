@@ -42,10 +42,7 @@ try:
         "(expires in 30 minutes):\n"
         f"[Connect Google Workspace]({url})\n\n"
         "After connecting, I'll be able to read, create, and edit your Google Docs, "
-        "list Drive files, and read/write Sheets.\n\n"
-        "Note: Google may show an \"unverified app\" warning screen first — that's "
-        "expected for this app right now, not a sign anything is wrong. Tap "
-        "**Advanced**, then tap the \"Go to ... (unsafe)\" link near the bottom to continue."
+        "list Drive files, and read/write Sheets."
     )
 except Exception as exc:
     log.warning("generate_consent_link('workspace') failed: %s", exc)
@@ -113,10 +110,7 @@ try:
         "Tap this link to connect Google Workspace (expires in 30 minutes):\n"
         f"[Connect Google Workspace]({url})\n\n"
         "This grants access to Google Docs, Drive, and Sheets. "
-        "After connecting, try /gdocs, /gdrive, or /gsheets.\n\n"
-        "Note: Google may show an \"unverified app\" warning screen first — that's "
-        "expected for this app right now, not a sign anything is wrong. Tap "
-        "**Advanced**, then tap the \"Go to ... (unsafe)\" link near the bottom to continue."
+        "After connecting, try /gdocs, /gdrive, or /gsheets."
     )
 except Exception as exc:
     log.warning("generate_consent_link('workspace') failed — degrading gracefully: %s", exc)

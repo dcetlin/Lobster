@@ -1,0 +1,10 @@
+[Unit]
+Description=Twice-daily upstream sync — pull from upstream lobster repo
+# LOBSTER-MANAGED
+
+[Timer]
+OnCalendar=*-*-* 08,20:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

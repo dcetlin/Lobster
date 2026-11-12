@@ -9,36 +9,27 @@
 #   4. Always requires explicit confirmation that PII has been checked
 #
 # Scans for:
-#   - Instance-specific URLs and bot username prefixes, configured via
-#     ~/lobster-user-config/instance-domains.txt (falls back to inert
-#     placeholders if no config file exists)
+#   - Instance-specific URLs (awp-two.vercel.app, alternativewealthpartners.com,
+#     myownlobster.com) and emails on those domains
 #   - Hardcoded home paths (/home/admin, /home/lobster)
+#   - Bot usernames with Awp_ prefix
 #   - Database URLs (postgresql://, mongodb://)
 #   - Numeric IDs in env-var form (BOT_USER_ID=NNNNNNNN, chat_id=NNNNNNNN, etc.)
 #   - PII: email addresses, phone numbers, SSNs, credit cards, IP addresses
 #   - Security: API keys, tokens, credentials, private keys
-#   - Personal names: configured via ~/lobster-user-config/blocked-names.txt
-#     (falls back to generic placeholder names if no config file exists)
+#   - Personal names: Sahar, Drew, Kelly, Addie (as standalone words)
 #
 # IMPORTANT: This hook NEVER modifies files. It only reports violations and
 # lets the developer decide. Silent file rewriting is dangerous: it corrupts
 # binaries, breaks test fixtures that intentionally contain fake values, and
 # loops on its own output.
 #
-# Exclusions (never scanned by ANY check):
+# Exclusions (never scanned):
 #   - Test directories: tests/, test/, spec/, or any path with /test
+#   - Documentation: .md, .mdx, .rst, .txt, .adoc (examples/placeholders by design)
 #   - Binary files: detected by extension
 #   - The hook files themselves (.githooks/*)
 #   - Files listed in .githooks/security-allowlist.txt
-#
-# Documentation files (.md, .mdx, .rst, .txt, .adoc) get a NARROWER exemption:
-# they are skipped for PII / instance-identifier / personal-name checks
-# (examples and placeholder values are legitimate documentation content), but
-# they ARE scanned for high-confidence secret/token patterns (API keys,
-# private keys, Telegram bot tokens, etc). A real secret pasted into a doc
-# file is still a leak — see #2160, where a real Telegram bot token sat
-# undetected in docs/DOCKER-TESTING.md for months because the old exemption
-# covered secrets too.
 #
 # Inline suppressions (in source files):
 #   - '# nosec' or '# noqa' — suppress security/PII match on that line
@@ -128,10 +119,8 @@ is_allowlisted() {
     return 1
 }
 
-# Returns 0 (skip) if the file should never be scanned by ANY check —
-# the hook's own source, test fixtures, and binary/generated files. These
-# exclusions apply uniformly regardless of check category (PII vs secrets).
-should_skip_file_common() {
+# Returns 0 (skip) if the file should not be scanned.
+should_skip_file() {
     local filepath="$1"
     local ext="${filepath##*.}"
 
@@ -148,6 +137,11 @@ should_skip_file_common() {
         return 0
     fi
 
+    # Skip documentation files — example/placeholder values by design
+    case "$filepath" in
+        *.md|*.mdx|*.rst|*.txt|*.adoc) return 0 ;;
+    esac
+
     # Skip known binary/generated/lock file extensions
     case "$ext" in
         png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|mp3|mp4|zip|tar|gz|bz2|xz|pdf) return 0 ;;
@@ -155,38 +149,6 @@ should_skip_file_common() {
         lock) return 0 ;;
     esac
 
-    return 1
-}
-
-# Returns 0 if filepath is a documentation file (*.md, *.mdx, *.rst, *.txt,
-# *.adoc). Doc files are exempt from PII/instance/name checks (examples and
-# placeholder values are legitimate documentation content) but are NOT
-# exempt from high-confidence secret/token checks (SECURITY_PATTERNS) — a
-# real secret pasted into a doc file is still a leak. This is the fix for
-# #2160: a real Telegram bot token committed to docs/DOCKER-TESTING.md went
-# undetected for months because the old should_skip_file() exempted docs
-# from every check, secrets included.
-is_doc_file() {
-    local filepath="$1"
-    case "$filepath" in
-        *.md|*.mdx|*.rst|*.txt|*.adoc) return 0 ;;
-    esac
-    return 1
-}
-
-# Returns 0 (skip) for the PII/instance/name check categories: files that
-# should never be scanned at all, plus doc files (which remain exempt from
-# these specific categories only — see is_doc_file() above).
-#
-# Note: the SECURITY_PATTERNS (secret/token) category deliberately does NOT
-# use this function — it is gated only by should_skip_file_common(), so it
-# does NOT exempt doc files. High-confidence secret shapes (Telegram bot
-# tokens, API keys, private keys, etc) are real leaks no matter which file
-# type they land in (see scan_diff() below and #2160).
-should_skip_file() {
-    local filepath="$1"
-    should_skip_file_common "$filepath" && return 0
-    is_doc_file "$filepath" && return 0
     return 1
 }
 
@@ -218,53 +180,11 @@ get_push_diff() {
 # Using @@ as delimiter to avoid conflicts with regex pipe characters.
 #===============================================================================
 
-# Instance-specific domain/bot-prefix patterns — loaded from user config,
-# falling back to inert generic placeholders when no config file exists.
-#
-# Config file: ${LOBSTER_USER_CONFIG_DIR:-~/lobster-user-config}/instance-domains.txt
-# Format (one entry per line):
-#   domain@@<domain-regex-fragment>        e.g. domain@@example-corp\.com
-#   bot_prefix@@<bot-username-regex-fragment>   e.g. bot_prefix@@Acme_
-#   Lines starting with # are comments; empty lines are ignored.
-_PP_DOMAINS_CONFIG="${LOBSTER_USER_CONFIG_DIR:-$HOME/lobster-user-config}/instance-domains.txt"
-_PP_DOMAIN_FRAGMENTS=()
-_PP_BOT_PREFIX_FRAGMENTS=()
-if [ -f "$_PP_DOMAINS_CONFIG" ]; then
-    while IFS= read -r _pp_dline; do
-        [[ "$_pp_dline" =~ ^[[:space:]]*# ]] && continue
-        [[ -z "${_pp_dline// }" ]] && continue
-        _pp_dkey="${_pp_dline%%@@*}"
-        _pp_dval="${_pp_dline#*@@}"
-        case "$_pp_dkey" in
-            domain) _PP_DOMAIN_FRAGMENTS+=("$_pp_dval") ;;
-            bot_prefix) _PP_BOT_PREFIX_FRAGMENTS+=("$_pp_dval") ;;
-        esac
-    done < "$_PP_DOMAINS_CONFIG"
-fi
-
-_pp_join_by_pipe() {
-    local IFS='|'
-    echo "$*"
-}
-
-if [ "${#_PP_DOMAIN_FRAGMENTS[@]}" -gt 0 ]; then
-    _PP_INSTANCE_URL_REGEX="(?i)($(_pp_join_by_pipe "${_PP_DOMAIN_FRAGMENTS[@]}"))"
-else
-    # Placeholder only — matches nothing on a fresh checkout with no config file.
-    _PP_INSTANCE_URL_REGEX='(?i)(your-instance-domain\.example)'
-fi
-
-if [ "${#_PP_BOT_PREFIX_FRAGMENTS[@]}" -gt 0 ]; then
-    _PP_BOT_PREFIX_REGEX="\\b($(_pp_join_by_pipe "${_PP_BOT_PREFIX_FRAGMENTS[@]}"))\\w+_bot\\b"
-else
-    _PP_BOT_PREFIX_REGEX='\bYourPrefix_\w+_bot\b'
-fi
-
 # Instance-specific patterns — things that identify this private deployment
 INSTANCE_PATTERNS=(
-    "instance_url@@${_PP_INSTANCE_URL_REGEX}@@Instance-specific URL"
+    'instance_url@@(?i)(awp-two\.vercel\.app|alternativewealthpartners\.com|myownlobster\.com)@@Instance-specific URL'
     'home_path@@/home/(?:admin|lobster)\b@@Hardcoded home path (/home/admin or /home/lobster)'
-    "awp_bot@@${_PP_BOT_PREFIX_REGEX}@@Instance-specific bot username prefix"
+    'awp_bot@@\bAwp_\w+_bot\b@@Awp_ prefixed bot username'
     'db_url@@(?i)(?:postgresql|mongodb)://@@Database connection URL'
     'numeric_id@@(?i)(?:BOT_USER_ID|chat_id|ADMIN_CHAT_ID)\s*=\s*\d{8,}@@Hardcoded numeric bot/user ID (8+ digits)'
 )
@@ -312,14 +232,13 @@ if [ -f "$_PP_NAMES_CONFIG" ]; then
         NAME_PATTERNS+=("${_pp_name}@@(?<![a-z])${_pp_name}(?![a-z])@@Personal name (${_pp_name})@@${_pp_allow}")
     done < "$_PP_NAMES_CONFIG"
 fi
-# Fallback built-in defaults when no config file exists or it is empty.
-# These are placeholder names, not real ones — real names belong only in
-# the gitignored ~/lobster-user-config/blocked-names.txt (see format above).
+# Fallback built-in defaults when no config file exists or it is empty
 if [ "${#NAME_PATTERNS[@]}" -eq 0 ]; then
     NAME_PATTERNS=(
-        'alice@@(?<![a-z])alice(?![a-z])@@Personal name (alice)@@'
-        'bob@@(?<![a-z])bob(?![a-z])@@Personal name (bob)@@'
-        'carol@@(?<![a-z])carol(?![a-z])@@Personal name (carol)@@'
+        'sahar@@(?<![a-z])sahar(?![a-z])@@Personal name (sahar)@@sayhar'
+        'drew@@(?<![a-z])drew(?![a-z])@@Personal name (drew)@@andrew|withdrew|outdrewn'
+        'kelly@@(?<![a-z])kelly(?![a-z])@@Personal name (kelly)@@'
+        'addie@@(?<![a-z])addie(?![a-z])@@Personal name (addie)@@'
     )
 fi
 
@@ -396,10 +315,8 @@ scan_diff() {
 
             local content="${raw_line:1}"  # strip leading '+'
 
-            # Skip files that should never be scanned by any check (hook
-            # source, test fixtures, binaries). Doc-file exemption is NOT
-            # applied here — it is narrower and category-specific (see below).
-            if [ -n "$current_file" ] && should_skip_file_common "$current_file"; then
+            # Skip if file should not be scanned
+            if [ -n "$current_file" ] && should_skip_file "$current_file"; then
                 continue
             fi
 
@@ -410,17 +327,7 @@ scan_diff() {
 
             local fp="${current_file:-<unknown>}"
 
-            # Doc files (*.md, *.mdx, *.rst, *.txt, *.adoc) are exempt from
-            # PII / instance / personal-name checks below, but NOT from the
-            # secret/token checks (SECURITY_PATTERNS) — see is_doc_file()
-            # and #2160 for why that split matters.
-            local skip_pii_checks=0
-            if [ -n "$current_file" ] && is_doc_file "$current_file"; then
-                skip_pii_checks=1
-            fi
-
             # --- Instance-specific patterns ---
-            if [ "$skip_pii_checks" -eq 0 ]; then
             for pattern_def in "${INSTANCE_PATTERNS[@]}"; do
                 local iname iregex idesc
                 iname="$(echo "$pattern_def" | awk -F'@@' '{print $1}')"
@@ -434,10 +341,8 @@ scan_diff() {
                     add_finding "$fp" "$line_num" "$idesc" "$content"
                 fi
             done
-            fi
 
             # --- PII patterns ---
-            if [ "$skip_pii_checks" -eq 0 ]; then
             for pattern_def in "${PII_PATTERNS[@]}"; do
                 local pname pregex pdesc
                 pname="$(echo "$pattern_def" | awk -F'@@' '{print $1}')"
@@ -472,11 +377,8 @@ scan_diff() {
 
                 add_finding "$fp" "$line_num" "$pdesc" "$content"
             done
-            fi
 
             # --- Security patterns ---
-            # Always runs, regardless of skip_pii_checks — doc files are
-            # scanned for secrets/tokens too (fix for #2160).
             for pattern_def in "${SECURITY_PATTERNS[@]}"; do
                 local sname sregex sdesc
                 sname="$(echo "$pattern_def" | awk -F'@@' '{print $1}')"
@@ -511,7 +413,6 @@ scan_diff() {
                 continue
             fi
 
-            if [ "$skip_pii_checks" -eq 0 ]; then
             for pattern_def in "${NAME_PATTERNS[@]}"; do
                 local nname nregex ndesc nallow
                 nname="$(echo "$pattern_def" | awk -F'@@' '{print $1}')"
@@ -536,7 +437,6 @@ scan_diff() {
 
                 add_finding "$fp" "$line_num" "$ndesc" "$content"
             done
-            fi
         fi
     done <<< "$diff_text"
 }

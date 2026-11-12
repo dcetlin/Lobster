@@ -27,6 +27,26 @@ import src.mcp.inbox_server  # noqa: F401
 OWNER_CHAT_ID_PLACEHOLDER = "OWNER_CHAT_ID_PLACEHOLDER"
 
 
+class TestResolveDebugConfig:
+    """Regression coverage for issue #1481.
+
+    _resolve_debug_config() previously had a body of `pas` (a truncated
+    `pass` statement, introduced in merge commit 8f6b38dd6), which raised
+    NameError: name 'pas' is not defined on every invocation. Since
+    _resolve_debug_config() is called unconditionally as the first
+    statement in handle_write_observation(), this crashed every call to
+    the write_observation MCP tool, silently disabling gate-miss /
+    proprioceptive feedback logging system-wide.
+    """
+
+    def test_resolve_debug_config_does_not_raise(self):
+        """Calling _resolve_debug_config() directly must not raise NameError."""
+        from src.mcp.inbox_server import _resolve_debug_config
+
+        # Must not raise — this is the documented no-op stub behavior.
+        assert _resolve_debug_config() is None
+
+
 class TestHandleWriteObservation:
     """Tests for the write_observation handler."""
 
@@ -232,118 +252,6 @@ class TestHandleWriteObservation:
         )
         assert "Error" in result[0].text
         assert list(inbox_dir.glob("*.json")) == []
-
-    # ------------------------------------------------------------------
-    # observation_type parameter (Change 1)
-    # ------------------------------------------------------------------
-
-    def test_user_context_observation_writes_to_inbox(self, inbox_dir: Path):
-        """user_context observations are written to the inbox regardless of user model state."""
-        with patch.multiple(
-            "src.mcp.inbox_server",
-            INBOX_DIR=inbox_dir,
-            _user_model=None,
-        ):
-            from src.mcp.inbox_server import handle_write_observation
-            result = asyncio.run(handle_write_observation({
-                "chat_id": 123,
-                "text": "User prefers morning meetings.",
-                "category": "user_context",
-            }))
-
-        assert "Observation queued" in result[0].text
-        files = list(inbox_dir.glob("*.json"))
-        assert len(files) == 1
-        msg = json.loads(files[0].read_text())
-        assert msg["category"] == "user_context"
-        assert msg["text"] == "User prefers morning meetings."
-
-    def test_user_context_observation_chat_id_preserved(self, inbox_dir: Path):
-        """The chat_id passed to write_observation is preserved in the inbox message."""
-        with patch.multiple(
-            "src.mcp.inbox_server",
-            INBOX_DIR=inbox_dir,
-            _user_model=None,
-        ):
-            from src.mcp.inbox_server import handle_write_observation
-            asyncio.run(handle_write_observation({
-                "chat_id": 123,
-                "text": "User seems energized this morning.",
-                "category": "user_context",
-            }))
-
-        files = list(inbox_dir.glob("*.json"))
-        msg = json.loads(files[0].read_text())
-        assert msg["chat_id"] == 123
-
-    def test_user_context_without_user_model_still_writes_file(self, inbox_dir: Path):
-        """When _user_model is None, user_context observation still writes to inbox."""
-        with patch.multiple(
-            "src.mcp.inbox_server",
-            INBOX_DIR=inbox_dir,
-            _user_model=None,
-        ):
-            from src.mcp.inbox_server import handle_write_observation
-            result = asyncio.run(handle_write_observation({
-                "chat_id": 123,
-                "text": "User prefers dark mode.",
-                "category": "user_context",
-            }))
-
-        assert "Observation queued" in result[0].text
-        files = list(inbox_dir.glob("*.json"))
-        assert len(files) == 1
-
-    def test_non_user_context_does_not_call_user_model(self, inbox_dir: Path):
-        """system_context and system_error observations skip user model dispatch."""
-        dispatched: list[dict] = []
-
-        class FakeUserModel:
-            def dispatch(self, tool_name: str, args: dict) -> str:
-                dispatched.append({"tool": tool_name, "args": args})
-                return "{}"
-
-        with patch.multiple(
-            "src.mcp.inbox_server",
-            INBOX_DIR=inbox_dir,
-            _user_model=FakeUserModel(),
-        ):
-            from src.mcp.inbox_server import handle_write_observation
-            asyncio.run(handle_write_observation({
-                "chat_id": 123,
-                "text": "Config drift detected.",
-                "category": "system_context",
-            }))
-            asyncio.run(handle_write_observation({
-                "chat_id": 123,
-                "text": "API call failed.",
-                "category": "system_error",
-            }))
-
-        assert dispatched == [], "User model should not be called for non-user_context observations"
-
-    def test_user_model_dispatch_failure_is_non_fatal(self, inbox_dir: Path):
-        """If user model dispatch raises, the observation is still queued to inbox."""
-        class BrokenUserModel:
-            def dispatch(self, tool_name: str, args: dict) -> str:
-                raise RuntimeError("DB connection lost")
-
-        with patch.multiple(
-            "src.mcp.inbox_server",
-            INBOX_DIR=inbox_dir,
-            _user_model=BrokenUserModel(),
-        ):
-            from src.mcp.inbox_server import handle_write_observation
-            result = asyncio.run(handle_write_observation({
-                "chat_id": 123,
-                "text": "User prefers async communication.",
-                "category": "user_context",
-            }))
-
-        # Despite dispatch failure, the inbox file should still be written
-        assert "Observation queued" in result[0].text
-        files = list(inbox_dir.glob("*.json"))
-        assert len(files) == 1
 
     # ------------------------------------------------------------------
     # Debug mode: automatic routing (LOBSTER_DEBUG=true)

@@ -25,12 +25,11 @@ node_modules/
 # Logs
 *.log
 
-# Generated service files (rendered from services/*.service.template at
-# install/update time into $LOBSTER_WORKSPACE/services/ — a runtime dir
-# outside the repo, never committed). This rule is a defensive backstop only;
-# rendering should never target this in-repo services/ dir going forward.
-services/*.service
-!services/*.service.template
+# Generated service files (created from templates during install)
+services/lobster-router.service
+services/lobster-claude.service
+services/lobster-mcp.service
+services/lobster-slack-router.service
 
 # Local configuration (use lobster.conf.example as template)
 config/lobster.conf
@@ -47,9 +46,6 @@ config/calendar_pending_flows/
 data/
 memory/canonical/
 memory/archive/digests/*.md
-
-# Incident reports (generated at runtime by investigate-incident.sh)
-incidents/*.md
 
 # GSD framework (dev tooling, installed per-user)
 .claude/agents/gsd-*.md
@@ -72,38 +68,12 @@ PLAN-*.md
 .claude/user.md
 .claude/user/
 
-# Instance-specific / business-data files that currently exist untracked in
-# some deployments (never committed, zero git history). Listed here as a
-# defensive backstop so a future `git add -A` can't accidentally sweep them
-# into the public repo. These belong in ~/lobster-user-config/ instead —
-# see the PII remediation plan for the move-out plan for each.
-hello-world.js
-agents/eloso-test-manager.md
-scripts/apollo_enrich.py
-scripts/validate-temporal-token.py
-scheduled-tasks/ism-workshop-reminder.sh
-scheduled-tasks/outreach-queue-topup.sh
-lobster-shop/buy-things/README.md
-lobster-shop/paperclip/behavior/system.md
-lobster-shop/paperclip/context/eloso-reference.md
-lobster-shop/kissinger/context/reference.md
+# Runtime output (written by async-deep-work job)
+deep-work/
 
-# Stray backup files (should never be committed)
-*.bak
-
-# Instance-specific personal files (never commit — contain personal names/schedules)
-.claude/agents/spec-kit-engineer.md
-scheduled-tasks/ca-license-reminder.sh
-scheduled-tasks/call-alice-reminder.sh
-scheduled-tasks/drew-one-on-one.sh
-scheduled-tasks/edouard-friday-visit-reminder.sh
-scheduled-tasks/electra-weekly-tweet.sh
-scheduled-tasks/environment-prefs-checkin.sh
-scheduled-tasks/gwynn-reminder-*.sh
-scheduled-tasks/meet-alice-paprika.sh
-scheduled-tasks/melissa-reminder-*.sh
-scheduled-tasks/tasks/x-bookmarks.md
-scheduled-tasks/will-price-checkin-*.sh
-scheduled-tasks/x-bookmarks.sh
-src/bot/x_oauth_callback.py
-*.bak-pre-*
+# Workstream content is runtime data, canonical only at
+# ~/lobster-workspace/workstreams/ (see assessments/workstreams-canonicity-model-20260704.md
+# §3, "The One-Canonical-Location Rule"). It must never re-form as a fork
+# inside the code repo — kept as a safety net after PR #1464 removed the
+# existing content forks.
+/workstreams/

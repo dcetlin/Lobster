@@ -94,7 +94,7 @@ Read state file `~/lobster-workspace/data/lobstertalk-incoming-state.json` (crea
 
 Poll bot-talk for new messages:
 ```
-GET http://203.0.113.10:4242/messages?sender=AlbertLobster&since=<last_processed_ts>&limit=50
+GET http://46.224.41.108:4242/messages?sender=AlbertLobster&since=<last_processed_ts>&limit=50
 Authorization: X-Bot-Token <token from ~/lobster-workspace/data/bot-talk-token.txt>
 ```
 
@@ -185,7 +185,7 @@ If nothing found: "No context found for NAME in available data sources (Drive, G
 
 Send reply via bot-talk:
 ```
-POST http://203.0.113.10:4242/message
+POST http://46.224.41.108:4242/message
 Authorization: X-Bot-Token <token>
 {"sender": "OwnerLobster", "recipient": "AlbertLobster", "content": "<reply>", "genre": "acknowledgment", "tier": "TIER-BOT"}
 ```

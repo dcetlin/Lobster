@@ -22,6 +22,32 @@ This file provides shared context. Depending on your role, read the appropriate 
 
 User context files are private and not committed to git. They contain user-specific preferences, decisions, and constraints that extend the system defaults. When the user says "remember X" and it belongs to a specific scope, write it to the appropriate user file.
 
+## Bootup File Edit Protocol
+
+Bootup file edits fall into two categories. Use the right posture for each:
+
+**Maintenance edits** (correct an existing instruction, fix a calibration drift, remove an outdated constraint): edit the main body of the file directly.
+
+**Learning-phase edits** (new behavioral pattern, structural discovery, attunement hypothesis not yet confirmed stable): add to the `# HYPOTHESIS` section at the end of the file, not the main body. Include expiry date (default: +14 days from today), confidence level, observation basis, and a yes/no review question.
+
+**Graduation:** When a HYPOTHESIS entry's review question can be answered "yes" based on observed behavior, move the entry's core instruction into the main body of the file and remove the HYPOTHESIS entry. This is the explicit poiesis→poiema transition.
+
+**Expiry:** If a HYPOTHESIS entry reaches its expiry date without a graduation decision, discard it. Expiry without review is discard, not silent promotion.
+
+The format for a HYPOTHESIS entry is:
+
+```markdown
+## [HYPOTHESIS] <short-title>
+**Added:** YYYY-MM-DD
+**Expires:** YYYY-MM-DD (or: after N sessions)
+**Confidence:** low | medium | forming
+**Observation basis:** <one sentence — what triggered this hypothesis>
+
+<the actual behavioral instruction or configuration change>
+
+**Review question:** <the specific question a reviewer must answer yes/no to graduate this entry>
+```
+
 ## System Architecture
 
 ```
@@ -37,7 +63,7 @@ User context files are private and not committed to git. They contain user-speci
               ┌─────────────┼─────────────┐
               │               │               │
          Telegram Bot    Slack Bot      (Future: Signal, SMS)
-         (active)        (optional)     (see docs/FUTURE.md)
+         (active)        (optional)     (see docs/setup/FUTURE.md)
 ```
 
 ## Available Tools (MCP)
@@ -125,17 +151,91 @@ Rules are capped at 100 entries. Rules are never surfaced to the user unless exp
 5. **Always display times in the user's local timezone** — Convert all UTC timestamps before sending any message. The user's timezone preference is set in `~/lobster-user-config/agents/user.base.bootup.md`. Never send raw UTC times to the user.
 6. **Search first for any task requiring current or real-world information** — Do not treat training knowledge as a primary source; it cannot surface what it doesn't contain. Use available search or fetch tools before answering questions about current events, recent changes, live data, or anything where being out of date would matter.
 
+## Dispatcher: Tier-1 Gate Register
+
+These gates must survive context compaction. If any trigger cannot be stated from memory, the gate is not active.
+
+### Mode Recognition (apply before entering the gate table)
+
+Before consulting any gate, classify the message as ACTION or DESIGN_OPEN. These modes are **mutually exclusive** — exactly one applies. Run the classifier below, then go to the gate table. The classifier output determines which gate applies; do not resolve gate conflicts inside the table.
+
+**Classifier — check signals in order, stop at first match:**
+
+**Step 1 — ACTION signals (any one is sufficient → classify ACTION, apply Bias to Action):**
+- [ ] Message names a specific file, PR number, issue number, or system component to change
+- [ ] Message uses an imperative verb with a named artifact as its object ("implement X", "fix Y in Z", "open a PR for W", "update file F")
+- [ ] Message references an artifact that already exists and requests a modification to it
+- [ ] Message asks Lobster to execute a specific, named command or task with a stated target
+
+**Step 2 — DESIGN_OPEN signals (any one is sufficient → classify DESIGN_OPEN, apply Design Gate):**
+- [ ] Message asks "what should we do" or "how should we handle" without naming the output artifact
+- [ ] Message describes a problem, symptom, or observation without specifying a deliverable
+- [ ] Message uses exploratory vocabulary: "think about", "consider", "what if", "how would we", "should we"
+- [ ] The output artifact cannot be stated in one sentence using only the words in the message
+
+**Step 3 — Middle-register tiebreaker (artifact determinability check):** fires when Step 1 and Step 2 both failed to produce a classification.
+- If the output artifact can be stated in one sentence using only words in the message → classify ACTION, proceed with the most defensible implementation reading, and surface that interpretation in your first response
+- If the output artifact itself cannot be stated (not just the implementation — the *what* is unclear, not just the *how*) → classify DESIGN_OPEN, ask exactly one precise question
+
+> **Test case (Case 2 analog):** "Can you improve the onboarding flow?" — names an artifact ("onboarding flow") but does not specify what the output is (a redesigned screen? a new copy document? a code change?). The output artifact cannot be stated in one sentence from the message alone → Step 3 fires DESIGN_OPEN, ask one precise question: "What should the output be — a copy revision, a UI change, or something else?"
+
+**If no signal fires after all three steps:** default to DESIGN_OPEN — ask for clarification before acting.
+
+| Gate | Trigger (one sentence) | Enforcement |
+|------|----------------------|-------------|
+| **7-Second Rule** | Any tool call that is not `wait_for_messages`, `check_inbox`, `mark_processing`, `mark_processed`, `mark_failed`, or `send_reply` must go to a background subagent. | Structural — if you reach for any other tool, stop and delegate. |
+| **Design Gate** | A message is DESIGN_OPEN when no concrete output artifact can be stated in one sentence from the message alone. | Advisory — classify before routing; fire the gate if DESIGN_OPEN. |
+| **Bias to Action** | Classifier returned ACTION. Proceed with implementation without asking for confirmation. | Advisory — classifier output is the entry condition; no secondary check needed. |
+| **Dispatch template** | Every subagent Task call must include `Minimum viable output: [deliverable]`, `Boundary: do not produce [X]`, and `Delivery: internal (write_result only) \| user-facing (send_reply + write_result)` in its prompt. Every subagent prompt must begin with a YAML frontmatter block (preferred): `task_id: <slug>`, `chat_id: <id>`, `source: <telegram|slack|system>`. task_id must be a slug (not a UUID); the SessionStart hook rejects sessions without it. Legacy inline format `Your task_id is: <slug>` is still accepted for backward compat. A dispatch missing any of the three fields is a gate miss — log via `write_observation`. | Structural — dispatcher cannot call Agent without completing all three fields. Treat an empty Minimum viable output, Boundary, or Delivery field as a dispatch blocker, not a reminder. |
+| **No self-relay** | When `sent_reply_to_user == True` or message type is `subagent_notification`, mark_processed without calling send_reply. | Structural — the message type routes it; no discretion needed. |
+| **Relay filter** | If the key signal in a send_reply to Dan is buried past paragraph 2, move it to the lead. | Advisory — apply before every send_reply. |
+| **Behavioral Failure Gate** | A behavioral failure is detected (gate miss, misclassification, wrong routing decision). | Advisory — open a GitHub issue in `dcetlin/Lobster` with label `needs-discriminator-fix`; title: the specific failure class; body: the concrete example that triggered detection. Do NOT add advisory text to bootup docs or CLAUDE.md instead. Behavioral failure → GitHub issue, not advisory text. |
+
+### Gate-Miss Logging (Proprioceptive Feedback)
+
+When you catch a gate miss — either because you are about to violate a gate, or because you notice mid-action that a gate should have fired — call `write_observation` immediately:
+
+```python
+mcp__lobster-inbox__write_observation(
+    chat_id=<ADMIN_CHAT_ID>,
+    text="gate=<gate_name> condition=<what triggered it> outcome=miss reason=<why it was missed>",
+    category="system_error",
+    task_id=<current task_id if available>,
+)
+```
+
+Gate names for the `gate=` field: `7_second_rule`, `design_gate`, `bias_to_action`, `dispatch_template`, `no_self_relay`, `relay_filter`, `behavioral_failure_gate`.
+
+Examples:
+- You reach for `Bash` or `Glob` directly (7-second rule): log `gate=7_second_rule condition=direct_tool_call outcome=miss`
+- You route a DESIGN_OPEN message directly to action without checking the discriminator: log `gate=design_gate condition=no_artifact_stated outcome=miss`
+- You are about to add advisory text to a bootup doc encoding a previously-failed behavioral rule: log `gate=behavioral_failure_gate condition=advisory_text_addition outcome=miss` and open a GitHub issue with label `needs-discriminator-fix` instead.
+
+This fires **in addition to** the correct recovery action (e.g., delegating to a subagent). Log the miss, then do the right thing. Do not log a miss for a gate that correctly fired and was honored.
+
 ## Project Directory Convention
 
-All Lobster-managed projects live in `$LOBSTER_WORKSPACE/projects/[project-name]/`.
+All cloned code repositories live in `$LOBSTER_WORKSPACE/projects/[project-name]/`. This is a **machine concern** — tooling and the `$LOBSTER_PROJECTS` env var point here.
 
 - **Clone repos here**, not in `~/projects/` or elsewhere
-- The `projects/` directory is created automatically during install
 - Environment variable: `$LOBSTER_PROJECTS` (defaults to `$LOBSTER_WORKSPACE/projects`)
 - Default path: `~/lobster-workspace/projects/`
-- This is a system property, not a suggestion -- all project work goes here
+- This directory is for git repos only — no strategy docs, no roadmaps, no tracking here
+
+## Workstreams Convention
+
+All strategic tracking lives in `$LOBSTER_WORKSPACE/workstreams/[workstream-name]/`. This is the **semantic hierarchy** — everything we're actively working on or tracking has a workstream entry.
+
+- **Every active initiative is a workstream**, whether or not it has code
+- A workstream that has a code repo adds one line to its README: `Repo: ~/lobster-workspace/projects/foo`
+- See `~/lobster-workspace/workstreams/HOWTO.md` for the canonical workstream structure
+- GH issues and PRs reference workstreams via label: `workstream:<name>`
 
 ## Development Conventions
+
+Every naming, directory, and abstraction choice should be evaluated against one criterion: is this element in its most correct place, using the word that names what it actually is, at the level of abstraction that matches its real responsibility? The right place, the right word, the right registers, the right design primitives means that when a collaborator — human or agent — encounters a module, function, or file, the form immediately expresses the structure without requiring translation. A name that needs a comment to justify it has not found its form. A directory that contains things which share a location but not a concept has not found its boundary.
+
+The failure mode to resist is compensatory overhead: elements, layers, or explanations that exist because structural clarity was not achieved upstream. When something feels over-engineered or awkwardly named, the signal is usually that a form has been imposed rather than found — that the structure underneath requires a different shape than the one currently expressing it. The correction is not to add a wrapper or rename the symptom; it is to revisit the structural decision and find the form the concept actually requires.
 
 - **Always use `uv`** instead of bare `python`, `python3`, or `pip` for running scripts and managing packages. This applies to subagents, scheduled jobs, and any shell commands that invoke Python.
   - Run scripts: `uv run script.py` (not `python script.py`)
@@ -146,6 +246,8 @@ All Lobster-managed projects live in `$LOBSTER_WORKSPACE/projects/[project-name]
 
 For changes that affect existing installs (new cron entries, new directories, config renames, new service files), add a numbered migration to `scripts/upgrade.sh` — not just `install.sh`. See `.claude/agents/lobster-ops.md` for the migration format and upgrade procedure.
 
+**Instance-specific migrations** (steps containing hardcoded `chat_id`s, dcetlin-specific issue refs, or WOS orchestration content) go in `scripts/user-update.sh` instead. That file is sourced automatically at the end of `upgrade.sh` if it exists, and inherits all logging functions and variables. Number instance-specific steps `d1`, `d2`, … to avoid collisions with the core migration numbering in `upgrade.sh`.
+
 ## Scheduling Architecture
 
 Two scheduling layers:
@@ -154,11 +256,61 @@ Two scheduling layers:
 
 Never use cron for user-space jobs. Never use systemd tools for system-level infrastructure.
 
+### Job type distinction
+
+- **Type A (LLM subagent tasks):** Run a prompt, do work, return output. The cron + jobs.json `enabled` field is the correct dispatch gate. Systemd was intentionally excluded — job dispatch is not process management. Jobs are prompts, not processes. Runtime enable/disable lives in jobs.json without touching cron.
+- **Type B (cron-direct scripts):** Pure Python scripts invoked directly by cron — no inbox message, no LLM round-trip. Use this type when: (a) the job is a deterministic polling/recovery loop rather than an LLM reasoning task, (b) the same result would be produced on every invocation regardless of model choice, and (c) latency or LLM cost matter (e.g. runs every 3 minutes). The script handles its own error recovery and logging.
+
+  **Cron entry pattern** (unique marker per job required):
+  ```
+  */N * * * * cd ~/lobster && uv run scheduled-tasks/my-script.py >> ~/lobster-workspace/scheduled-jobs/logs/my-script.log 2>&1 # LOBSTER-MY-SCRIPT
+  ```
+
+  **Required: jobs.json gate.** Add `from src.utils.jobs import is_job_enabled` at the top of the file (after your `sys.path` setup) and call `is_job_enabled(job_name)` at the top of `main()` before any DB work. This preserves runtime enable/disable via direct jobs.json edits. See `scheduled-tasks/cc-usage-poller.py` or `scheduled-tasks/export-logs.py` for the reference implementation.
+
+  **jobs.json fields for Type B jobs:**
+  ```json
+  {
+    "type": "B",
+    "dispatch": "cron-direct",
+    "task_file": null
+  }
+  ```
+
+  **Decision rule:** If the job would run identically regardless of which LLM model responds, and it runs more frequently than every 15 minutes, prefer Type B.
+
+### Staleness gate for file-scanning scorers
+
+Type A jobs that scan a file on a schedule must
+call the staleness gate at the top of their run, before any LLM/inference call. If
+the target file has not changed since the last scan, the job should exit immediately
+with `write_task_output(..., status="success")` — no LLM call.
+
+```python
+# Reference pattern — add to the task prompt as Step 0, before any scoring:
+from src.utils.staleness_gate import file_changed, record_scan
+
+if not file_changed(target_file, job_name="my-scorer"):
+    write_task_output(job_name="my-scorer", output="<file> unchanged — skipped (heat).", status="success")
+    return  # exit without any LLM call
+
+# ... run scoring ...
+
+record_scan(target_file, job_name="my-scorer")  # update baseline after successful scan
+```
+
+The gate uses SHA-256 content hashes (not mtime) and persists records in
+`~/lobster-workspace/data/staleness-records.json`. See `src/utils/staleness_gate.py`
+for the full API. The record store is created on first use and tolerates a missing or
+corrupt file (treats as "no record" → proceed with scoring).
+
+- **Long-running services** (dispatcher, MCP servers, Telegram bot, health daemons): These are processes, not jobs. Systemd is the right tool here when/if Lobster moves to fully-automated operation. Not part of the job type taxonomy.
+
 ## Key Directories
 
 - `~/lobster/` - Repository (code only, no personal data)
   - `scheduled-tasks/` - Job runner scripts (committed, no runtime data)
-  - `memory/canonical-templates/` - Seed templates (committed)
+  - `memory/canonical-templates/` - Seed templates (committed); sweep and diagnostic agents must follow `memory/canonical-templates/sweep-instruction.template.md` (encodes contract-declaration, state-registry-read, and classification-completeness harness patterns)
 - `~/lobster-user-config/` - User-specific config and memory (private, not in repo)
   - `memory/canonical/` - Handoff, priorities, people, projects
   - `memory/archive/digests/` - Archived daily digests
@@ -171,8 +323,10 @@ Never use cron for user-space jobs. Never use systemd tools for system-level inf
   - `.claude` → symlink to `~/lobster/.claude/` — **editing files here is immediately live, no deploy needed**
   - `CLAUDE.md` → symlink to `~/lobster/CLAUDE.md` — same, live immediately
   - `projects/` - All Lobster-managed projects (`$LOBSTER_PROJECTS`)
+  - `assessments/` - Assessment documents (audits, retros, design reviews).
   - `data/memory.db` - Vector memory SQLite DB
   - `data/memory-events.jsonl` - StaticMemory event log (JSONL fallback backend)
+  - `data/decisions-ledger.md` — Decision text from `decision:` footer blocks, routed by `hooks/decision-router.py`
   - `scheduled-jobs/jobs.json` - Job registry state
   - `scheduled-jobs/tasks/` - Task definition markdown files
   - `scheduled-jobs/logs/` - Execution logs
@@ -184,6 +338,7 @@ Never use cron for user-space jobs. Never use systemd tools for system-level inf
 - `~/messages/failed/` - Failed messages (pending retry or permanently failed)
 - `~/messages/audio/` - Voice message audio files
 - `~/messages/task-outputs/` - Outputs from scheduled jobs
+- For full workspace layout and conventions, see `~/lobster-workspace/CONVENTIONS.md`
 
 ## Permissions
 
@@ -200,3 +355,15 @@ Always use the safe wrapper script instead:
 ```
 
 This script writes a warning to the inbox before restarting, giving the dispatcher a chance to see the notification. Combined with the session-lost-reminder written on server startup (Fix 1), the dispatcher has two opportunities to receive recovery guidance.
+
+**Restart coordination (issue #1537):** `restart-mcp.sh`, `dispatcher-refresh.sh`, and health-check-v3.sh's automatic restart paths (`do_restart()`, `check_session_age()`) all contend for one shared, non-blocking lock (`scripts/restart-lock-lib.sh`) before acting. A manual restart run while an automatic one is already in flight (or vice versa) aborts immediately instead of racing it — this was a real collision surfaced by failure-injection testing, not a hypothetical.
+
+## Dispatcher CLI Restart — IMPORTANT
+
+`restart-mcp.sh` restarts only the **MCP server** (`lobster-mcp-local`), NOT the dispatcher CLI — they are separate processes. Restarting the MCP server does **not** refresh the dispatcher's tool-discovery cache or re-read bootup docs. So after a deploy that **adds or changes MCP tools**, the running dispatcher won't see them until the **CLI itself** is bounced — and you should verify a new tool is actually *callable* post-deploy (via ToolSearch), not just that the code merged.
+
+Safe dispatcher refresh (graceful, auto-respawns a fresh session, and coordinates with any concurrent automatic restart via the shared lock — see above):
+```bash
+~/lobster/scripts/dispatcher-refresh.sh
+```
+Under the hood this reads `~/messages/config/dispatcher.pid`, verifies the process is alive, acquires the restart-coordination lock, and sends `kill -TERM` to it. `lobster-claude.service` (systemd) + `scripts/claude-persistent.sh` relaunch a brand-new `claude` session (never `--continue`), so bootup docs are re-read and the tool cache rebuilds. Same pattern `scripts/health-check-v3.sh:check_session_age()` uses for ~2h session rotation. Do **not** use `tmux kill-session` (no respawn) or `systemctl restart lobster-claude` (hard-restart escalation) for a routine refresh, and do **not** hand-run `kill -TERM` on the PID directly — that bypasses the coordination lock and can race an automatic restart.

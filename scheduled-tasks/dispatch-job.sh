@@ -1,11 +1,15 @@
 #!/bin/bash
 # Lobster Scheduled Job Dispatcher
 #
-# DEPRECATED (issue #1083 — Phase 1 tombstone)
+# DEPRECATED (issue #1083 — Phase 1 tombstone, merged 2026-04-12)
 # New jobs should be managed by systemd timers via the MCP create_scheduled_job tool.
 # This script remains on disk for compatibility with jobs that have not yet been
 # migrated. It will be archived to scheduled-tasks/deprecated/ in Phase 2 (after
-# 2 weeks of stable systemd-timer operation).
+# 2 weeks of stable systemd-timer operation — eligible after 2026-04-26).
+#
+# Phase 2 tracking: dcetlin/Lobster#785
+# Before archiving, bot-talk-check-dispatch.sh must be updated to replace the
+# 6 exec calls that delegate to this script.
 #
 # Writes a scheduled_reminder message into the Lobster inbox so the dispatcher
 # spawns a subagent for the job. Does NOT invoke Claude directly.
@@ -56,6 +60,7 @@ done
 unset _env_file
 
 WORKSPACE="${LOBSTER_WORKSPACE:-$HOME/lobster-workspace}"
+JOBS_FILE="$WORKSPACE/scheduled-jobs/jobs.json"
 TASK_FILE="$WORKSPACE/scheduled-jobs/tasks/${JOB_NAME}.md"
 LOG_DIR="$WORKSPACE/scheduled-jobs/logs"
 JOBS_FILE="${SCHEDULED_JOBS_FILE:-$WORKSPACE/scheduled-jobs/jobs.json}"
@@ -83,11 +88,25 @@ _send_alert() {
 LOG_FILE="$LOG_DIR/${JOB_NAME}-${TIMESTAMP}.log"
 
 # --- Check enabled flag ---
-# Query systemd for the enabled state of this job's timer unit.
-# If the unit doesn't exist or is disabled, exit silently.
-if ! systemctl is-enabled --quiet "lobster-${JOB_NAME}.timer" 2>/dev/null; then
-    echo "[$START_ISO] Job '$JOB_NAME' is disabled — skipping" >> "$LOG_FILE" 2>&1 || true
-    exit 0
+# If the job is marked enabled=false in jobs.json, exit silently.
+if [ -f "$JOBS_FILE" ]; then
+    ENABLED=$(uv run - "$JOBS_FILE" "$JOB_NAME" << 'PYEOF'
+import json, sys
+jobs_file = sys.argv[1]
+job_name  = sys.argv[2]
+try:
+    with open(jobs_file) as f:
+        data = json.load(f)
+    job = data.get('jobs', {}).get(job_name, {})
+    print(str(job.get('enabled', True)).lower())
+except Exception:
+    print('true')
+PYEOF
+    2>/dev/null)
+    if [ "$ENABLED" = "false" ]; then
+        echo "[$START_ISO] Job '$JOB_NAME' is disabled — skipping" >> "$LOG_FILE" 2>&1 || true
+        exit 0
+    fi
 fi
 
 echo "[$START_ISO] Posting dispatch for job: $JOB_NAME" | tee "$LOG_FILE"
@@ -96,7 +115,7 @@ echo "[$START_ISO] Posting dispatch for job: $JOB_NAME" | tee "$LOG_FILE"
 # If missing, auto-disable the job in jobs.json so cron stops dispatching it,
 # then alert the dispatcher and exit 0 so cron doesn't keep logging errors (#1200).
 if [ ! -f "$TASK_FILE" ]; then
-    echo "[$START_ISO] Error: Task file not found: $TASK_FILE — auto-disabling job '$JOB_NAME'" | tee -a "$LOG_FILE"
+    echo "[$START_ISO] Task file not found: $TASK_FILE — disabling job '$JOB_NAME'" | tee -a "$LOG_FILE"
     if [ -f "$JOBS_FILE" ]; then
         JOBS_LOCK="${JOBS_FILE}.lock"
         (
@@ -104,7 +123,7 @@ if [ ! -f "$TASK_FILE" ]; then
             if command -v jq &> /dev/null; then
                 TMP_FILE=$(mktemp)
                 jq --arg name "$JOB_NAME" \
-                   '.jobs[$name].enabled = false' \
+                   'if .jobs[$name] then .jobs[$name].enabled = false else . end' \
                    "$JOBS_FILE" > "$TMP_FILE" && mv "$TMP_FILE" "$JOBS_FILE"
             else
                 $PYTHON_CMD - \
@@ -125,16 +144,18 @@ if job_name in data.get('jobs', {}):
 PYEOF
             fi
         ) 9>"$JOBS_LOCK" 2>/dev/null || true
-        echo "[$START_ISO] Job '$JOB_NAME' auto-disabled in jobs.json (task file missing)" | tee -a "$LOG_FILE"
     fi
     _send_alert "Job '$JOB_NAME' was auto-disabled because its task file is missing: $TASK_FILE. Re-enable the job with a valid task file to resume."
     exit 0
 fi
 
-# --- Dedup guard: skip if a pending dispatch already exists in inbox (#1201) ---
-# This prevents inbox flooding when a job's subagent takes longer than the schedule interval.
-if ls "${INBOX_DIR}"/*_scheduled_"${JOB_NAME}".json 2>/dev/null | head -1 | grep -q .; then
-    echo "[$START_ISO] Job '$JOB_NAME' already has a pending dispatch in inbox — skipping" | tee -a "$LOG_FILE"
+# --- Inbox dedup guard ---
+# If a pending dispatch for this job already exists in the inbox (e.g. a
+# previous run is still being processed), skip writing and exit cleanly.
+# This prevents inbox flooding when a subagent outruns its schedule interval.
+EXISTING=$(grep -rl "\"job_name\": \"${JOB_NAME}\"" "$INBOX_DIR" 2>/dev/null | head -1)
+if [ -n "$EXISTING" ]; then
+    echo "[$START_ISO] Pending dispatch already exists for '$JOB_NAME' ($EXISTING) — skipping" | tee -a "$LOG_FILE"
     exit 0
 fi
 
@@ -162,12 +183,23 @@ task_file  = sys.argv[5]
 with open(task_file) as f:
     task_content = f.read()
 
+jobs_file = os.environ.get("LOBSTER_WORKSPACE", os.path.expanduser("~/lobster-workspace")) + "/scheduled-jobs/jobs.json"
+job_chat_id = 0
+try:
+    import json as _json
+    with open(jobs_file) as _jf:
+        _jobs_data = _json.load(_jf)
+    _job_record = _jobs_data.get("jobs", {}).get(job_name, {})
+    job_chat_id = _job_record.get("chat_id", 0)
+except Exception:
+    pass
+
 msg = {
     "id": msg_id,
     "source": "system",
     "type": "scheduled_reminder",
-    "chat_id": 0,
-    "user_id": 0,
+    "chat_id": job_chat_id,
+    "user_id": job_chat_id,
     "username": "lobster-cron",
     "user_name": "Cron",
     "text": f"[Cron] Dispatch job '{job_name}'",
@@ -187,5 +219,42 @@ print(f"Dispatch posted: {out_path}")
 PYEOF
 
 echo "[$START_ISO] Dispatch posted for job: $JOB_NAME — dispatcher will spawn subagent" | tee -a "$LOG_FILE"
+
+# Update jobs.json last_run to reflect when the job was dispatched.
+# Uses a lock file to serialise concurrent cron fires and always writes via
+# tmp+rename so an interrupted write never leaves jobs.json truncated (#920).
+if [ -f "$JOBS_FILE" ]; then
+    JOBS_LOCK="${JOBS_FILE}.lock"
+    (
+        # Acquire exclusive lock (fd 9) — releases automatically when subshell exits
+        flock -x 9
+        if command -v jq &> /dev/null; then
+            TMP_FILE=$(mktemp)
+            jq --arg name "$JOB_NAME" \
+               --arg last_run "$START_ISO" \
+               'if .jobs[$name] then .jobs[$name].last_run = $last_run else . end' \
+               "$JOBS_FILE" > "$TMP_FILE" && mv "$TMP_FILE" "$JOBS_FILE"
+        else
+            uv run - \
+                "$JOBS_FILE" \
+                "$JOB_NAME" \
+                "$START_ISO" \
+                << 'PYEOF'
+import json, os, sys
+jobs_file = sys.argv[1]
+job_name  = sys.argv[2]
+last_run  = sys.argv[3]
+with open(jobs_file) as f:
+    data = json.load(f)
+if job_name in data.get('jobs', {}):
+    data['jobs'][job_name]['last_run'] = last_run
+    tmp = jobs_file + '.tmp.' + str(os.getpid())
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, jobs_file)
+PYEOF
+        fi
+    ) 9>"$JOBS_LOCK" 2>/dev/null || true
+fi
 
 exit 0

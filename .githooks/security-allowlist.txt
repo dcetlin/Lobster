@@ -45,8 +45,8 @@ uv.lock:Phone number
 
 # iva-deployer documents env var names (HCLOUD_TOKEN, SECRET_KEY) as configuration
 # references — not actual credential values
-agents/iva-deployer.md:Hardcoded token
-agents/iva-deployer.md:Hardcoded secret
+.claude/agents/iva-deployer.md:Hardcoded token
+.claude/agents/iva-deployer.md:Hardcoded secret
 
 # kissinger bins contain a pre-existing email address used as a contact reference
 lobster-shop/kissinger/bin/kissinger:Email address
@@ -83,6 +83,14 @@ scripts/claude-wrapper.exp:Hardcoded token
 # value is a fallback when BOT_TALK_API_URL env var is unset — not a secret.
 scheduled-tasks/bot-talk-check-dispatch.sh:IP address
 
+# scripts/upgrade.sh contains pre-existing migration comments written before the
+# name-block hook was added. These are historical references, not new additions.
+scripts/upgrade.sh:Personal name (sahar)
+
+# file-size-monitor.py comments explain SSH remote URL format (git@github.com:owner/repo.git)
+# as inline documentation — not an email address or real credential
+scheduled-tasks/file-size-monitor.py:Email address
+
 # Slack connector onboarding uses a placeholder example email (lobster@yourcompany.com)
 # in setup instructions — not a real email address
 lobster-shop/slack-connector/src/onboarding.py:Email address
@@ -102,4 +110,9 @@ lobster-shop/prospect-enrichment/bin/find_supply_chain_contacts.py:IP address
 # (Google Drive / Gmail account names for context), not credentials.
 scheduled-tasks/lobstertalk-incoming-handler.py:IP address
 scheduled-tasks/lobstertalk-incoming-handler.py:Email address
+
+# Clay client smoke_test uses satya.nadella@microsoft.com as a well-known public
+# test probe — this is a documented public figure's corporate email used to verify
+# API connectivity, not a secret or private PII
+src/integrations/clay/client.py:Email address
 

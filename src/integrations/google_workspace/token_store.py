@@ -31,8 +31,7 @@ Token schema on disk::
         "access_token":  "<string>",
         "expires_at":    "<ISO 8601 UTC>",
         "scope":         "<space-separated scopes>",
-        "refresh_token": "<string or null>",
-        "email":         "<string or null -- authenticated account, issue #2153>"
+        "refresh_token": "<string or null>"
     }
 
 Design principles
@@ -145,7 +144,6 @@ def _token_to_dict(token: TokenData) -> dict:
         "expires_at": token.expires_at.isoformat(),
         "scope": token.scope,
         "refresh_token": token.refresh_token,
-        "email": token.email,
     }
 
 
@@ -159,7 +157,6 @@ def _dict_to_token(data: dict) -> TokenData:
         expires_at=expires_at,
         scope=data.get("scope", ""),
         refresh_token=data.get("refresh_token"),
-        email=data.get("email"),
     )
 
 
@@ -398,13 +395,12 @@ def get_valid_token(
         )
         return None
 
-    # Merge: preserve scope, refresh_token, and email from the stored token
+    # Merge: preserve scope and refresh_token from the stored token
     refreshed = TokenData(
         access_token=refreshed_partial.access_token,
         expires_at=refreshed_partial.expires_at,
         scope=token.scope,           # preserve original scope
         refresh_token=token.refresh_token,  # Google doesn't return new refresh_token here
-        email=token.email,           # preserve identity metadata across refresh
     )
 
     _save_token_local(user_id, refreshed, token_dir)

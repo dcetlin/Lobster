@@ -1,0 +1,95 @@
+conventions_version: "1.0"
+
+color_tokens:
+  dark:
+    bg: "#0b0d14"
+    surface: "#141720"
+    surface2: "#1c2030"
+    surface3: "#232840"
+    border: "#2a2f45"
+    border2: "#363d5a"
+    text: "#e4e6f0"
+    text2: "#9aa0bb"
+    text3: "#5c6480"
+    accent: "#6ea8fe"
+    accent2: "#a78bfa"
+    accent3: "#34d399"
+    warn: "#fb923c"
+  light:
+    bg: "#f8f9fb"
+    surface: "#ffffff"
+    surface2: "#f0f2f7"
+    surface3: "#e8ecf4"
+    border: "#dde1ee"
+    border2: "#c8cedf"
+    text: "#1a1d2e"
+    text2: "#4a5068"
+    text3: "#8890a8"
+    # Note: light mode uses higher-contrast accent values — not the same as dark
+    accent: "#2563eb"
+    accent2: "#7c3aed"
+    accent3: "#059669"
+    warn: "#ea580c"
+
+typography:
+  font_stack: "system-ui, -apple-system, sans-serif"
+  mono_stack: "'SF Mono', 'Fira Code', monospace"
+  base_size: "15px"
+  base_line_height: "1.7"
+  max_reading_width: "820px"
+
+layout:
+  wrap_max_width: "820px"
+  wrap_padding: "56px 28px 120px"
+
+section_ids:
+  # Canonical section ID scheme — applied to every document-class document
+  # Top-level sections: s1, s2, s3, ...
+  # Subsections: s1-1, s1-2, s2-1, ...
+  # Sub-subsections: s1-1-1, s1-1-2, ...
+  # The rendered display label (§1, §1.1) is derived from the ID at render time.
+  # IDs must be stable across document versions — never renumber sections.
+  # When a section is removed, its ID is retired, not reassigned.
+  scheme: "section-N-slug"
+  top_level_pattern: "^s[0-9]+$"
+  subsection_pattern: "^s[0-9]+-[0-9]+$"
+  sub_subsection_pattern: "^s[0-9]+-[0-9]+-[0-9]+$"
+  id_persistence: true  # IDs must survive across renders; never auto-renumber
+
+version_metadata:
+  # Every document must include these meta tags
+  required_meta_tags:
+    - name: "doc-version"
+      content_source: "content_manifest.version"
+    - name: "doc-updated"
+      content_source: "render_timestamp_iso8601"
+
+caption_rule: |
+  Captions for figures, graphs, and tables use this format:
+  <figcaption class="caption"><strong>Figure N.</strong> One-sentence description.</figcaption>
+  Caption font-size: 11px. Color: var(--text3). Margin-top: 8px.
+
+footnote_style: |
+  Footnotes rendered as a numbered list at the end of the document in a .footnotes section.
+  Each item: <li id="fn-N"><span class="fn-num">N.</span> text <a href="#fnref-N">↩</a></li>
+  In-text reference: <sup><a href="#fn-N" id="fnref-N">[N]</a></sup>
+
+document_class:
+  # Rules that apply to document-class documents only
+  required_components:
+    - theme-toggle
+    - clipboard-copy-widget
+  optional_components:
+    - d3-vocabulary-network  # use when document introduces a taxonomy
+  header_pattern: "doc-header with doc-title + doc-subtitle"
+  section_id_required: true
+  bisque_url_required: true  # URL must be sent to Dan, never a local path
+
+dashboard_class:
+  required_components:
+    - theme-toggle
+  optional_components:
+    - clipboard-copy-widget  # omit by default; add only if Dan requests it
+    - dashboard-filter-bar
+  section_id_required: false  # apply only if dashboard has readable narrative sections
+  theme_toggle_mode: "js-toggle"  # or "media-query" per template override

@@ -25,7 +25,17 @@ import sys as _sys
 _SRC_DIR = str(Path(__file__).resolve().parent.parent)
 if _SRC_DIR not in _sys.path:
     _sys.path.insert(0, _SRC_DIR)
-from utils.fs import atomic_write_json  # noqa: E402
+from src.utils.fs import atomic_write_json  # noqa: E402
+from bot.pre_handler import (  # noqa: E402
+    handle_quota_command,
+    handle_status_command,
+    handle_help_command,
+    handle_subagents_command,
+    handle_jobs_command,
+    handle_restart_command,
+    try_handle as _pre_handler_try_handle,
+    handle_restart_callback as _pre_handler_restart_callback,
+)
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -78,14 +88,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
-from telegram.error import TimedOut, NetworkError
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ChatMemberHandler, MessageReactionHandler, filters, ContextTypes
 from collections import deque
-
-# Retry policy for downloading files from Telegram (get_file + download_to_drive).
-# A single transient network hiccup should not drop a user's photo permanently.
-FILE_DOWNLOAD_MAX_ATTEMPTS = 3
-FILE_DOWNLOAD_BACKOFF_SECONDS = 1.0
 
 
 # URLs longer than this are copy-paste targets (e.g. OAuth flows).  Telegram
@@ -191,6 +195,13 @@ OUTBOX_DIR = _MESSAGES / "outbox"
 AUDIO_DIR = _MESSAGES / "audio"
 IMAGES_DIR = _MESSAGES / "images"
 DEAD_LETTER_DIR = _MESSAGES / "dead-letter"
+# Filesystem-visible delivery audit trail (issue #1538). Mirrors the
+# inbox/ -> processing/ -> processed/ lifecycle convention: once a Telegram
+# send is confirmed, the outbox file is recorded here instead of just being
+# deleted, so delivery is confirmable without shelling into journalctl.
+# Same directory src/mcp/inbox_server.py already writes enqueue-time copies
+# into (SENT_DIR there) — this call site adds the delivery-confirmed record.
+SENT_DIR = _MESSAGES / "sent"
 # Voice messages are written here first; the transcription worker picks them up,
 # runs whisper.cpp, and moves the enriched message to INBOX_DIR automatically.
 PENDING_TRANSCRIPTION_DIR = _MESSAGES / "pending-transcription"
@@ -432,6 +443,7 @@ OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 DEAD_LETTER_DIR.mkdir(parents=True, exist_ok=True)
+SENT_DIR.mkdir(parents=True, exist_ok=True)
 PENDING_TRANSCRIPTION_DIR.mkdir(parents=True, exist_ok=True)
 LOBSTER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -982,6 +994,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # Wake Claude if hibernating
     wake_claude_if_hibernating()
 
+    # Intercept pre-handler callbacks before they reach the inbox.
+    cb_data = query.data or ""
+    if cb_data.startswith("confirm-restart-") or cb_data == "cancel-restart":
+        await _pre_handler_restart_callback(query)
+        return
+
     # Create a message file for the callback
     msg_id = f"{int(time.time() * 1000)}_{query.id}"
 
@@ -996,47 +1014,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         "text": f"[Button pressed: {query.data}]",
         "callback_data": query.data,
         "original_message_text": query.message.text or query.message.caption or "",
+        # Include the Telegram message_id of the message that contained the buttons
+        # so the dispatcher can correlate the callback to the original escalation.
+        "original_telegram_message_id": query.message.message_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
     inbox_file = INBOX_DIR / f"{msg_id}.json"
     atomic_write_json(inbox_file, msg_data)
     log.info(f"Wrote callback message to inbox: {msg_id}")
-
-
-async def _download_telegram_file_with_retry(
-    context: ContextTypes.DEFAULT_TYPE,
-    file_id: str,
-    dest_path: Path,
-    *,
-    max_attempts: int = FILE_DOWNLOAD_MAX_ATTEMPTS,
-    backoff_seconds: float = FILE_DOWNLOAD_BACKOFF_SECONDS,
-) -> None:
-    """Download a Telegram file (get_file + download_to_drive) with retry.
-
-    Retries on telegram.error.TimedOut / telegram.error.NetworkError, which are
-    the transient-failure classes for a getFile + download round trip (e.g. a
-    ReadTimeout under network jitter). Note NetworkError is python-telegram-bot's
-    base class for several non-transient errors too (e.g. BadRequest), so those
-    are retried as well; only exceptions outside the NetworkError/TimedOut
-    hierarchy (e.g. Forbidden) fail fast. Uses linear backoff between attempts.
-    Re-raises the last exception if all attempts are exhausted.
-    """
-    last_exc: Optional[Exception] = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            file = await context.bot.get_file(file_id)
-            await file.download_to_drive(dest_path)
-            return
-        except (TimedOut, NetworkError) as e:
-            last_exc = e
-            log.warning(
-                f"Telegram file download attempt {attempt}/{max_attempts} failed "
-                f"for file_id={file_id}: {e}"
-            )
-            if attempt < max_attempts:
-                await asyncio.sleep(backoff_seconds * attempt)
-    raise last_exc
 
 
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE, msg_id: str):
@@ -1055,9 +1041,10 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         # Get the largest photo size
         photo = message.photo[-1]
 
-        # Download the photo (with retry on transient network/timeout errors)
+        # Download the photo
+        file = await context.bot.get_file(photo.file_id)
         image_path = IMAGES_DIR / f"{msg_id}.jpg"
-        await _download_telegram_file_with_retry(context, photo.file_id, image_path)
+        await file.download_to_drive(image_path)
         log.info(f"Downloaded photo to: {image_path}")
 
         caption = message.caption or ""
@@ -1127,16 +1114,13 @@ async def _handle_media_group_photo(update: Update, context: ContextTypes.DEFAUL
 
     try:
         photo = message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
         # Use msg_id (which is unique per photo update) as the filename
         image_path = IMAGES_DIR / f"{msg_id}.jpg"
-        await _download_telegram_file_with_retry(context, photo.file_id, image_path)
+        await file.download_to_drive(image_path)
         log.info(f"Downloaded media group photo to: {image_path}")
     except Exception as e:
         log.error(f"Error downloading media group photo: {e}", exc_info=True)
-        try:
-            await message.reply_text("❌ Failed to process a photo in this album.")
-        except Exception:
-            log.error("Failed to send media-group photo failure notice", exc_info=True)
         return
 
     if group_id not in _media_group_buffers:
@@ -1311,6 +1295,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = message.text
     if not text:
+        return
+
+    # Intercept deterministic pre-handler commands before they reach the inbox.
+    if await _pre_handler_try_handle(text, message, context):
         return
 
     # Determine group-chat engagement state before writing to inbox
@@ -1717,11 +1705,28 @@ async def handle_audio_message(
         atomic_write_json(pending_file, msg_data)
 
         log.info(f"Wrote {msg_type} message to pending-transcription: {msg_id}")
-        ack = "🎤 Voice message received. Transcribing..." if is_voice else "🎵 Audio file received. Transcribing..."
+        if is_voice:
+            duration_s = audio_obj.duration or 0
+            if duration_s > 0:
+                # Whisper typically runs ~1.5–2x real-time on this hardware;
+                # add a few seconds for ffmpeg conversion and startup overhead.
+                estimated_s = max(10, int(duration_s * 2 + 5))
+                if estimated_s < 60:
+                    time_estimate = f"~{estimated_s}s"
+                else:
+                    estimated_m = round(estimated_s / 60)
+                    time_estimate = f"~{estimated_m}m"
+                ack = f"🎤 Transcribing... ({time_estimate})"
+            else:
+                ack = "🎤 Transcribing... (~30s)"
+        else:
+            ack = "🎵 Audio file received. Transcribing..."
         if not _is_group:
             await message.reply_text(ack)
+            log.info(f"Ack sent to chat_id={message.chat_id} for {msg_type} message: {msg_id}")
         elif direct_inv or engaged:
             await message.reply_text(ack)
+            log.info(f"Ack sent to chat_id={message.chat_id} for {msg_type} message (group, direct): {msg_id}")
 
     except Exception as e:
         log.error(f"Error handling {msg_type} message: {e}", exc_info=True)
@@ -1848,6 +1853,38 @@ def build_inline_keyboard(buttons: list) -> InlineKeyboardMarkup:
             keyboard_row.append(InlineKeyboardButton(text=label, callback_data=data))
         keyboard.append(keyboard_row)
     return InlineKeyboardMarkup(keyboard)
+
+
+def _mark_delivered(filepath: str, reply: dict) -> None:
+    """Record a confirmed Telegram delivery in SENT_DIR, then remove the outbox file.
+
+    Closes the outbox->sent audit-trail gap (issue #1538): previously a delivered
+    outbox file was simply ``os.remove``'d, leaving no filesystem trace that the
+    send succeeded — confirmation was only available via journalctl. This mirrors
+    the inbox/ -> processing/ -> processed/ lifecycle pattern already used
+    elsewhere in the message pipeline.
+
+    Pure side-effecting boundary function: takes the already-successful reply
+    dict, stamps it with a delivery timestamp, and writes it to SENT_DIR under
+    the same filename the outbox file had. If the SENT_DIR write fails for any
+    reason, the outbox file is still removed (a filesystem hiccup recording the
+    audit trail must never block outbox draining or cause duplicate re-delivery).
+
+    Args:
+        filepath: Path to the outbox file that was just successfully delivered.
+        reply: The parsed reply dict that was sent.
+    """
+    try:
+        record = {**reply, "delivered_at": datetime.now(timezone.utc).isoformat()}
+        dest = SENT_DIR / Path(filepath).name
+        atomic_write_json(dest, record)
+    except Exception as exc:
+        log.warning(f"Could not write delivery record to {SENT_DIR} for {filepath}: {exc}")
+    finally:
+        try:
+            os.remove(filepath)
+        except OSError:
+            pass
 
 
 class OutboxHandler(FileSystemEventHandler):
@@ -1983,7 +2020,7 @@ class OutboxHandler(FileSystemEventHandler):
                     log.info(f"Sent voice note to {chat_id}: {voice_path}")
                     # Delete the OGG temp file now that it's been sent.
                     _cleanup_ogg(voice_path)
-                    os.remove(filepath)
+                    _mark_delivered(filepath, reply)
                     return
                 except Exception as e:
                     log.warning(f"send_voice failed for {chat_id}: {e} — falling back to text")
@@ -2005,7 +2042,7 @@ class OutboxHandler(FileSystemEventHandler):
                         reply_parameters=photo_reply_params,
                     )
                     log.info(f"Sent photo to {chat_id}: {photo_url[:80]}...")
-                    os.remove(filepath)
+                    _mark_delivered(filepath, reply)
                     return
                 except Exception as e:
                     log.warning(f"send_photo failed for {chat_id} ({photo_url[:60]}): {e} — falling back to URL in text")
@@ -2016,12 +2053,51 @@ class OutboxHandler(FileSystemEventHandler):
                     try:
                         await bot_app.bot.send_message(chat_id=chat_id, text=fallback_text)
                         log.info(f"Sent photo URL as text fallback to {chat_id}")
-                        os.remove(filepath)
+                        _mark_delivered(filepath, reply)
                         return
                     except Exception as e2:
                         log.error(f"Fallback text send also failed for {chat_id}: {e2}")
                         os.remove(filepath)
                         return
+
+            # Handle document/file messages (e.g. PDF reports)
+            if reply_type == 'document' and chat_id and bot_app:
+                doc_path = reply.get('document_path', '')
+                filename = reply.get('filename', '')
+                mime_type = reply.get('mime_type', 'application/octet-stream')
+                doc_caption = reply.get('caption', '')
+                if doc_path and os.path.exists(doc_path):
+                    try:
+                        doc_reply_params = ReplyParameters(message_id=int(reply_to_id)) if reply_to_id else None
+                        with open(doc_path, 'rb') as f:
+                            await bot_app.bot.send_document(
+                                chat_id=chat_id,
+                                document=f,
+                                filename=filename or os.path.basename(doc_path),
+                                caption=doc_caption or None,
+                                read_timeout=60,
+                                write_timeout=60,
+                                connect_timeout=30,
+                                reply_parameters=doc_reply_params,
+                            )
+                        log.info(f"Sent document to {chat_id}: {doc_path}")
+                        _mark_delivered(filepath, reply)
+                        return
+                    except Exception as e:
+                        log.error(f"send_document failed for {chat_id} ({doc_path}): {e}", exc_info=True)
+                        try:
+                            await bot_app.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"Failed to send document: {e}"
+                            )
+                        except Exception:
+                            pass
+                        os.remove(filepath)
+                        return
+                else:
+                    log.warning(f"Document outbox entry missing or file not found: {doc_path!r}")
+                    os.remove(filepath)
+                    return
 
             if chat_id and text and bot_app:
                 reply_markup = build_inline_keyboard(buttons) if buttons else None
@@ -2075,7 +2151,7 @@ class OutboxHandler(FileSystemEventHandler):
                         refresh_session(chat_id)
                     except Exception as _e:
                         log.debug(f"Session refresh failed (non-fatal): {_e}")
-                os.remove(filepath)
+                _mark_delivered(filepath, reply)
             else:
                 log.warning(f"Skipping reply {filepath}: missing chat_id={chat_id}, text={bool(text)}, bot={bool(bot_app)}")
                 os.remove(filepath)
@@ -2222,18 +2298,7 @@ async def run_bot():
     log.info("Watching outbox for replies...")
 
     # Create bot application
-    # connect_timeout/read_timeout are bumped from the python-telegram-bot
-    # default (5s) to 20s: too tight for a getFile + download round trip on
-    # photos/documents, and the source of issue #2252 (a ReadTimeout on
-    # get_file with no retry, causing total data loss for the message).
-    bot_app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .connect_timeout(20)
-        .read_timeout(20)
-        .write_timeout(30)
-        .build()
-    )
+    bot_app = Application.builder().token(BOT_TOKEN).write_timeout(30).build()
 
     # Add handlers
     bot_app.add_handler(CommandHandler("start", start_command))
@@ -2244,6 +2309,14 @@ async def run_bot():
     bot_app.add_handler(CommandHandler("whitelist", whitelist_command))
     bot_app.add_handler(CommandHandler("unwhitelist", unwhitelist_command))
     bot_app.add_handler(CommandHandler("list_groups", list_groups_command))
+    # Pre-handler: deterministic commands that bypass the dispatcher inbox entirely.
+    # These reply directly from the bot process — no LLM round-trip, no inbox write.
+    bot_app.add_handler(CommandHandler("quota", handle_quota_command))
+    bot_app.add_handler(CommandHandler("status", handle_status_command))
+    bot_app.add_handler(CommandHandler("subagents", handle_subagents_command))
+    bot_app.add_handler(CommandHandler("jobs", handle_jobs_command))
+    bot_app.add_handler(CommandHandler("restart", handle_restart_command))
+    bot_app.add_handler(CommandHandler("help", handle_help_command))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     bot_app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_message))
     bot_app.add_handler(MessageHandler(filters.PHOTO, handle_message))

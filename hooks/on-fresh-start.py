@@ -98,16 +98,6 @@ import session_role  # noqa: E402 — path insert must precede this
 
 AGENT_MONITOR = Path(os.path.expanduser("~/lobster/scripts/agent-monitor.py"))
 
-# reconcile-claude-hooks.py self-heals drift between critical hooks this
-# codebase depends on (starting with auto-register-agent.py) and what is
-# actually wired into settings.json. Existing git-based installs upgrade via
-# `.githooks/post-merge`, which never re-runs install.sh's hook-wiring logic —
-# so a hook added after initial install can silently stay unwired forever.
-# Running this on every fresh dispatcher start closes that gap (issue #2249).
-RECONCILE_CLAUDE_HOOKS = Path(
-    os.path.expanduser("~/lobster/scripts/reconcile-claude-hooks.py")
-)
-
 # on-compact.py writes last_compaction_ts to this file on every compaction.
 COMPACTION_STATE_FILE = Path(
     os.environ.get(
@@ -119,10 +109,6 @@ COMPACTION_STATE_FILE = Path(
 INBOX_DIR = Path(os.path.expanduser("~/messages/inbox"))
 PROCESSING_DIR = Path(os.path.expanduser("~/messages/processing"))
 PROCESSED_DIR = Path(os.path.expanduser("~/messages/processed"))
-# Sidecar file for debug-mode reflection prompts (issue #1998). Read-and-deleted
-# by the dispatcher directly at startup instead of flowing through the inbox --
-# avoids 2 MCP round-trips (mark_processing + mark_processed) per restart.
-BOOTUP_PROMPT_FILE = Path(os.path.expanduser("~/messages/bootup-prompt.md"))
 
 # inflight-work.jsonl path — append-only log of subagent spawns and completions.
 # On startup, stale "running" entries with no corresponding "done" are compacted out.
@@ -131,6 +117,20 @@ INFLIGHT_WORK_FILE = Path(
     os.environ.get(
         "LOBSTER_INFLIGHT_WORK_FILE_OVERRIDE",
         os.path.expanduser("~/lobster-workspace/data/inflight-work.jsonl"),
+    )
+)
+
+# Maintenance flag written by `lobster stop` to suppress health-check auto-restarts.
+# Cleared here on successful startup so that `lobster stop` is a true pause:
+# the system stays down until explicitly restarted rather than auto-restarting
+# after a timer (issue #1656).
+_MESSAGES_DIR_FOR_FLAG = Path(
+    os.environ.get("LOBSTER_MESSAGES", os.path.expanduser("~/messages"))
+)
+MAINTENANCE_FLAG = Path(
+    os.environ.get(
+        "LOBSTER_MAINTENANCE_FLAG_OVERRIDE",
+        str(_MESSAGES_DIR_FOR_FLAG / "config" / "lobster-maintenance"),
     )
 )
 
@@ -553,22 +553,44 @@ def _inject_compact_reminder() -> None:
         )
 
 
+def _reflection_already_exists(msg_id: str) -> bool:
+    """Return True if a reflection message with the given ID already exists.
+
+    Scans inbox/, processing/, and processed/ to prevent concurrent hook
+    invocations from writing duplicate reflection files with the same ID.
+    Multiple subagent SessionStart events may fire within the same second,
+    producing the same msg_id (1-second precision) but different filenames
+    (millisecond-precision).  This check short-circuits all but the first
+    invocation.
+
+    Silent on all errors — must never crash the hook.
+    """
+    for directory in (INBOX_DIR, PROCESSING_DIR, PROCESSED_DIR):
+        if not directory.exists():
+            continue
+        for f in directory.glob("*.json"):
+            try:
+                data = json.loads(f.read_text())
+                if data.get("id") == msg_id:
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+    return False
+
+
 def _schedule_reflection_prompt(trigger: str) -> None:
-    """In debug mode, write a reflection prompt to the bootup-prompt sidecar file.
+    """In debug mode, write a reflection-prompt message to the inbox.
 
-    When LOBSTER_DEBUG=true, writes a plain-text prompt asking the dispatcher
-    to reflect on the bootup/compaction experience and file GitHub issues with
-    observations. The dispatcher reads and deletes this file directly at
-    startup (one `Read` call -- see sys.dispatcher.bootup.md step 2e) instead
-    of the prompt flowing through the inbox as a regular message. This
-    eliminates the 2 MCP round-trips per restart (`mark_processing` +
-    `mark_processed`) the inbox path required (issue #1998).
+    When LOBSTER_DEBUG=true, drops a message asking the dispatcher to reflect
+    on the bootup/compaction experience and file GitHub issues with observations.
+    Written immediately — the dispatcher processes inbox messages in order so it
+    will reach this after the compact-reminder and catchup handling.
 
-    Overwrites any previous sidecar file unconditionally: at most one bootup
-    prompt is ever meaningful at a time (the dispatcher consumes and deletes it
-    on every startup before the next one could be written), so last-writer-wins
-    is correct here -- no ID-based dedup bookkeeping is needed, unlike the old
-    inbox-message path.
+    Dedup: computes the msg_id first and checks inbox/, processing/, and
+    processed/ for an existing file with the same ID.  Concurrent hook
+    invocations within the same second will share the same ID (1-second
+    precision) but write different filenames (millisecond-precision).  The
+    first invocation wins; subsequent ones skip silently.
 
     Silent on any failure — must never crash the hook.
     """
@@ -576,21 +598,51 @@ def _schedule_reflection_prompt(trigger: str) -> None:
         return
 
     try:
-        BOOTUP_PROMPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        INBOX_DIR.mkdir(parents=True, exist_ok=True)
+
+        ts = time.time()
+        msg_id = f"reflection_{trigger}_{int(ts)}"
+
+        # Dedup: skip if a reflection with this ID already exists.
+        if _reflection_already_exists(msg_id):
+            print(
+                f"[on-fresh-start] debug: reflection prompt {msg_id!r} already exists — skipping",
+                file=sys.stderr,
+            )
+            return
+
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".000000"
 
         content = (
             f"[Debug] {trigger.capitalize()} reflection prompt:\n\n"
             "How was the experience? Were there friction points, gaps, or improvements "
             "worth capturing?\n\n"
             "If you have observations: file or update GitHub issues in SiderealPress/lobster, "
-            "or open PRs for straightforward fixes. Capture it while it's fresh.\n"
+            "or open PRs for straightforward fixes. Capture it while it's fresh."
         )
 
-        tmp_path = BOOTUP_PROMPT_FILE.with_suffix(".tmp")
-        tmp_path.write_text(content)
-        tmp_path.rename(BOOTUP_PROMPT_FILE)
+        msg = {
+            "id": msg_id,
+            "source": "system",
+            "chat_id": 0,
+            "user_id": 0,
+            "username": "lobster-system",
+            "user_name": "System",
+            "type": "reflection_prompt",
+            "trigger": trigger,
+            "text": content,
+            "timestamp": timestamp,
+        }
+
+        # Use current epoch_ms so this sorts after the startup compact-reminder
+        # (ts_ms=0/1) and after any queued user messages.
+        ts_ms = int(ts * 1000)
+        msg_path = INBOX_DIR / f"{ts_ms}_reflection_{trigger}.json"
+        tmp_path = msg_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(msg, indent=2) + "\n")
+        tmp_path.rename(msg_path)
         print(
-            f"[on-fresh-start] debug: wrote reflection prompt to {BOOTUP_PROMPT_FILE}",
+            f"[on-fresh-start] debug: wrote reflection prompt to {msg_path}",
             file=sys.stderr,
         )
     except Exception as exc:  # noqa: BLE001
@@ -645,51 +697,31 @@ def _mark_all_running_failed() -> None:
         )
 
 
-def _reconcile_claude_hooks() -> None:
-    """Run reconcile-claude-hooks.py via uv to self-heal hook-wiring drift.
+def _clear_maintenance_flag() -> None:
+    """Delete the maintenance flag if it exists.
 
-    Issue #2249: hooks added to install.sh's setup_claude_hooks() after an
-    instance's initial install never reach that instance, because the
-    git-pull upgrade path (.githooks/post-merge) never re-runs install.sh.
-    Running this reconciler on every fresh dispatcher start guarantees
-    critical hooks (starting with auto-register-agent.py) are re-wired
-    automatically, not just at install time.
+    ``lobster stop`` writes this flag to tell the health check "don't
+    auto-restart, the system was intentionally stopped."  Once the dispatcher
+    starts successfully, the flag's purpose is served — Lobster is running, so
+    maintenance mode is no longer in effect.
 
-    Exit code 1 means "repaired something" — informational, not an error.
-    Exit code 2 means a fatal error (e.g. corrupt settings.json) — logged but
-    never raised, so it can't block the dispatcher from starting.
+    Clearing the flag here (on verified successful start) makes ``lobster stop``
+    a true pause: the system stays down until explicitly restarted.  The health
+    check no longer auto-clears the flag on a timer — so this is now the
+    primary flag-clearing path after an intentional stop.
+
+    See issue #1656.
     """
-    if not RECONCILE_CLAUDE_HOOKS.exists():
-        print(
-            f"[on-fresh-start] reconcile-claude-hooks not found at {RECONCILE_CLAUDE_HOOKS}; skipping",
-            file=sys.stderr,
-        )
-        return
     try:
-        result = subprocess.run(
-            ["uv", "run", str(RECONCILE_CLAUDE_HOOKS)],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        if result.returncode == 1:
+        if MAINTENANCE_FLAG.exists():
+            MAINTENANCE_FLAG.unlink()
             print(
-                f"[on-fresh-start] reconcile-claude-hooks repaired drift:\n{result.stderr.strip()}",
+                f"[on-fresh-start] cleared maintenance flag: {MAINTENANCE_FLAG}",
                 file=sys.stderr,
             )
-        elif result.returncode == 2:
-            print(
-                f"[on-fresh-start] reconcile-claude-hooks fatal error (settings.json unchanged):\n{result.stderr.strip()}",
-                file=sys.stderr,
-            )
-    except subprocess.TimeoutExpired:
-        print(
-            "[on-fresh-start] reconcile-claude-hooks timed out after 15s",
-            file=sys.stderr,
-        )
     except Exception as exc:  # noqa: BLE001
         print(
-            f"[on-fresh-start] unexpected error running reconcile-claude-hooks: {exc}",
+            f"[on-fresh-start] could not clear maintenance flag {MAINTENANCE_FLAG}: {exc}",
             file=sys.stderr,
         )
 
@@ -712,6 +744,12 @@ def main() -> None:
     if not session_role.is_dispatcher(data):
         sys.exit(0)
 
+    # Clear the maintenance flag now that the dispatcher is confirmed running.
+    # This makes `lobster stop` a true indefinite pause: the flag persists until
+    # startup genuinely succeeds, so the health check never needs to auto-clear
+    # it on a timer.  See issue #1656.
+    _clear_maintenance_flag()
+
     if not AGENT_MONITOR.exists():
         print(
             f"[on-fresh-start] agent-monitor not found at {AGENT_MONITOR}; skipping",
@@ -725,11 +763,6 @@ def main() -> None:
     _compact_inflight_work()
 
     _mark_all_running_failed()
-
-    # Self-heal hook-wiring drift (issue #2249). Settings.json is only read by
-    # Claude Code at process start, so this belongs alongside the other
-    # fresh-restart-only checks above, not the compaction path.
-    _reconcile_claude_hooks()
 
     # Safety net for issue #909: if catchup state is stale (last_catchup_ts is
     # > 30 min old or absent), inject a compact-reminder into the inbox. This

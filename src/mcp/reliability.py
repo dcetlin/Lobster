@@ -6,6 +6,7 @@ Addresses common agent failure patterns:
 - Input validation (prevents silent bad data)
 - Structured audit logging (observability)
 - Idempotency helpers (prevents duplicate processing)
+- Capability failure alerting (detects silent tool degradation)
 
 Design principles:
 - Each function is pure or has a single side effect
@@ -15,6 +16,7 @@ Design principles:
 
 import json
 import logging
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -38,7 +40,22 @@ _SRC_DIR = str(Path(__file__).resolve().parent.parent)
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from utils.fs import atomic_write_json, safe_move  # noqa: E402, F401
+from src.utils.fs import atomic_write_json, atomic_create_json, safe_move  # noqa: E402, F401
+
+# The agent-channel protocol's request_id rules and source name are owned by
+# src/protocol/agent_channel_schema.py — the single canonical schema module
+# that also generates lobster-chat's --schema/--help and
+# docs/reference/agent-channel-schema.md. Importing them here (rather than redefining
+# them) means the value this module actually enforces and the value
+# described to an external agent are the same object, not two copies that
+# could drift apart.
+from src.protocol.agent_channel_schema import (  # noqa: E402
+    REQUEST_ID_MAX_LEN as _CANONICAL_REQUEST_ID_MAX_LEN,
+    REQUEST_ID_PATTERN as _CANONICAL_REQUEST_ID_PATTERN,
+    AGENT_SLUG_MAX_LEN as _CANONICAL_AGENT_SLUG_MAX_LEN,
+    AGENT_SLUG_PATTERN as _CANONICAL_AGENT_SLUG_PATTERN,
+    SOURCE as AGENT_CHANNEL_SOURCE,
+)
 
 
 # =============================================================================
@@ -54,6 +71,75 @@ from utils.fs import atomic_write_json, safe_move  # noqa: E402, F401
 class ValidationError(Exception):
     """Raised when input validation fails. Contains a user-facing message."""
     pass
+
+
+# request_id doubles as a filesystem path component (agent-replies/<request_id>.json
+# and agent-replies/<request_id>.ack.json) for the agent channel (source="local-claude").
+# Per the agent-channel protocol spec, principle 6 ("filesystem-safe request identity"),
+# it must be sanitized at the boundary where it enters the system — reject traversal
+# characters, cap length, and use a charset allowlist rather than a blocklist so novel
+# path-unsafe characters can't slip through.
+_REQUEST_ID_MAX_LEN = _CANONICAL_REQUEST_ID_MAX_LEN
+_REQUEST_ID_PATTERN = re.compile(_CANONICAL_REQUEST_ID_PATTERN)
+
+
+def sanitize_request_id(request_id: Any) -> str:
+    """Validate and normalize a request_id for safe use as a filesystem path component.
+
+    Raises ValidationError with a descriptive message on invalid input:
+    missing/empty, too long, or containing anything outside [A-Za-z0-9_-].
+    """
+    if request_id is None or not str(request_id).strip():
+        raise ValidationError("request_id is required")
+    value = str(request_id).strip()
+    if len(value) > _REQUEST_ID_MAX_LEN:
+        raise ValidationError(
+            f"request_id exceeds max length of {_REQUEST_ID_MAX_LEN} characters"
+        )
+    if not _REQUEST_ID_PATTERN.match(value):
+        raise ValidationError(
+            "request_id contains invalid characters — only letters, digits, "
+            "'-' and '_' are allowed (no path separators or traversal sequences)"
+        )
+    return value
+
+
+# agent-slug doubles as a filesystem path component
+# (agent-replies/by-agent/<agent-slug>/<request_id>) for the durability
+# layer's by-agent pointer mailbox (agent-channel protocol v1, §3.2). Same
+# charset allowlist as request_id, with exactly one normalization exception:
+# case is folded to lowercase rather than rejected, since case is not
+# semantically load-bearing for an identity label (Open Dial 4, resolved
+# 2026-08-05). Everything else — whitespace, path separators, any other
+# out-of-charset character — fails loudly (fail-closed), never silently
+# stripped or substituted.
+_AGENT_SLUG_MAX_LEN = _CANONICAL_AGENT_SLUG_MAX_LEN
+_AGENT_SLUG_PATTERN = re.compile(_CANONICAL_AGENT_SLUG_PATTERN)
+
+
+def sanitize_agent_slug(agent: Any) -> str:
+    """Validate and normalize an `agent` label into a safe by-agent slug.
+
+    Lowercases first (the one normalization exception), then validates
+    against the same charset/length rules as request_id. Raises
+    ValidationError with a descriptive message on invalid input: missing/
+    empty, too long, or containing anything outside [a-z0-9_-] after
+    lowercasing.
+    """
+    if agent is None or not str(agent).strip():
+        raise ValidationError("agent is required")
+    value = str(agent).strip().lower()
+    if len(value) > _AGENT_SLUG_MAX_LEN:
+        raise ValidationError(
+            f"agent slug exceeds max length of {_AGENT_SLUG_MAX_LEN} characters"
+        )
+    if not _AGENT_SLUG_PATTERN.match(value):
+        raise ValidationError(
+            "agent slug contains invalid characters after lowercasing — only "
+            "letters, digits, '-' and '_' are allowed (no path separators, "
+            "whitespace, or traversal sequences)"
+        )
+    return value
 
 
 def validate_send_reply_args(args: dict) -> dict:
@@ -85,18 +171,49 @@ def validate_send_reply_args(args: dict) -> dict:
         text = text[:99_997] + "..."
 
     # source: must be a known source
-    valid_sources = {"telegram", "slack", "sms", "signal", "whatsapp", "bisque"}
+    valid_sources = {"telegram", "slack", "sms", "signal", "whatsapp", "bisque", AGENT_CHANNEL_SOURCE}
     if source not in valid_sources:
         raise ValidationError(
             f"Invalid source '{source}'. Must be one of: {', '.join(sorted(valid_sources))}"
         )
 
-    return {
-        **args,
-        "chat_id": chat_id,
-        "text": text,
-        "source": source,
-    }
+    # local-claude: request_id is required — it is the correlation key the local
+    # `lobster-chat` CLI polls on (~/messages/agent-replies/<request_id>.json).
+    normalized_args = {**args, "chat_id": chat_id, "text": text, "source": source}
+    if source == AGENT_CHANNEL_SOURCE:
+        try:
+            normalized_args["request_id"] = sanitize_request_id(args.get("request_id"))
+        except ValidationError as e:
+            # Preserve the more specific "when source='local-claude'" wording for the
+            # missing case; the sanitizer's own message covers the invalid-charset case.
+            if "is required" in str(e):
+                raise ValidationError("request_id is required when source='local-claude'") from e
+            raise
+
+    # error / error_type (issue #1533): optional agent-channel reply
+    # discriminator fields. Type-checked here so a malformed value fails at
+    # the validation boundary rather than propagating into the reply file.
+    # Presence is untouched otherwise — the permissive `{**args, ...}` above
+    # already passes them through unchanged when absent or well-typed.
+    if "error" in args and args["error"] is not None and not isinstance(args["error"], bool):
+        raise ValidationError(
+            f"error must be a boolean, got {type(args['error']).__name__}"
+        )
+    if "error_type" in args and args["error_type"] is not None and not isinstance(args["error_type"], str):
+        raise ValidationError(
+            f"error_type must be a string, got {type(args['error_type']).__name__}"
+        )
+
+    # Deliberately NOT enforced: consistency between `error`/`error_type` and the
+    # semantic content of `text` (e.g. rejecting error=True with text that reads
+    # like a success, or vice versa). That would require judging free-text prose
+    # against a boolean flag — inherently a content-interpretation problem, not a
+    # type/shape check this validation boundary can do deterministically. Callers
+    # (see sys.subagent.bootup.md "Reporting a failed task" and
+    # sys.dispatcher.bootup.md "Local-claude originated failures") are responsible
+    # for setting `error` consistently with what `text` says.
+
+    return normalized_args
 
 
 def validate_message_id(message_id: Any) -> str:
@@ -349,4 +466,206 @@ class CircuitBreaker:
             "failure_count": self._failure_count,
             "failure_threshold": self.failure_threshold,
             "cooldown_seconds": self.cooldown_seconds,
+        }
+
+
+# =============================================================================
+# Capability Failure Tracker
+# =============================================================================
+# Problem: When a core MCP tool (memory_store, send_reply, check_inbox) starts
+# returning failure responses, the degradation goes undetected for hours because
+# the dispatcher never surfaces it to the user (see 26-hour memory outage,
+# 2026-03-23).
+#
+# Solution: Track consecutive failures per tool. When a monitored tool fails
+# N consecutive times, emit a direct Telegram alert via the outbox (bypassing
+# the dispatcher inbox so no tokens are burned and the alert is unconditional).
+# Reset the counter on the first success. Re-alert on a cooldown interval to
+# prevent spam while the tool remains degraded.
+#
+# Design:
+# - Pure state transitions: record_success / record_failure return an
+#   AlertDecision dataclass describing what action to take; the caller
+#   performs the side effect (outbox write). This keeps the tracker testable
+#   without mocking I/O.
+# - No I/O inside the tracker — callers are responsible for alert delivery.
+# =============================================================================
+
+from dataclasses import dataclass
+
+
+# Tools monitored by default — the critical path for Lobster's core operation.
+DEFAULT_MONITORED_TOOLS: frozenset[str] = frozenset({
+    "memory_store",
+    "send_reply",
+    "check_inbox",
+    "wait_for_messages",
+})
+
+# Text fragments in tool responses that indicate a capability failure.
+# These are matched as substrings (case-insensitive) of the first TextContent
+# text returned by the tool handler.
+FAILURE_RESPONSE_PATTERNS: tuple[str, ...] = (
+    "memory system is not available",
+    "error storing memory",
+    "error in memory_store",
+    "error in send_reply",
+    "error in check_inbox",
+    "error in wait_for_messages",
+    "failed:",
+)
+
+# Patterns that look like failures but aren't — validation errors, empty inbox,
+# etc. These short-circuit the failure-detection path.
+NON_FAILURE_PATTERNS: tuple[str, ...] = (
+    "validation error",          # tool input was bad, not the tool itself
+    "no new messages",           # empty inbox is healthy
+    "0 message",                 # empty inbox variants
+    "0 new message",
+)
+
+
+def _response_is_failure(response_text: str) -> bool:
+    """Return True if a tool response text indicates a capability failure.
+
+    Pure function — no side effects, fully testable.
+
+    Args:
+        response_text: The text content returned by a tool handler.
+    """
+    lower = response_text.lower()
+
+    # Non-failure patterns take precedence — check first.
+    for non_failure in NON_FAILURE_PATTERNS:
+        if non_failure in lower:
+            return False
+
+    for pattern in FAILURE_RESPONSE_PATTERNS:
+        if pattern in lower:
+            return True
+
+    return False
+
+
+@dataclass(frozen=True)
+class AlertDecision:
+    """Immutable result of a failure-tracking state transition.
+
+    Returned by CapabilityFailureTracker.record_success/record_failure.
+    The caller reads should_alert and, if True, delivers the alert message.
+    """
+    should_alert: bool
+    alert_message: str
+    consecutive_failures: int
+    tool: str
+
+
+class CapabilityFailureTracker:
+    """Tracks consecutive failures per tool and signals when to alert.
+
+    State transitions are pure — record_success/record_failure return an
+    AlertDecision with the recommended action. I/O (outbox write) is the
+    caller's responsibility, keeping this class fully unit-testable.
+
+    Args:
+        monitored_tools: Set of tool names to track.
+        failure_threshold: Consecutive failures before first alert (default 3).
+        alert_cooldown_seconds: Minimum seconds between repeat alerts for a
+            tool that remains degraded (default 1800 = 30 min).
+    """
+
+    def __init__(
+        self,
+        monitored_tools: frozenset[str] = DEFAULT_MONITORED_TOOLS,
+        failure_threshold: int = 3,
+        alert_cooldown_seconds: int = 1800,
+    ) -> None:
+        self._monitored = monitored_tools
+        self._threshold = failure_threshold
+        self._cooldown = alert_cooldown_seconds
+        # Per-tool state: consecutive failure count and last-alerted timestamp
+        self._consecutive: dict[str, int] = {}
+        self._last_alerted: dict[str, float] = {}
+
+    def record_success(self, tool: str) -> AlertDecision:
+        """Record a successful tool call, resetting its failure counter.
+
+        Returns an AlertDecision with should_alert=False (success clears state).
+        """
+        if tool in self._monitored:
+            self._consecutive[tool] = 0
+        return AlertDecision(
+            should_alert=False,
+            alert_message="",
+            consecutive_failures=0,
+            tool=tool,
+        )
+
+    def record_failure(self, tool: str, response_text: str = "") -> AlertDecision:
+        """Record a failed tool call and decide whether to alert.
+
+        Returns an AlertDecision. The caller must deliver the alert if
+        should_alert is True.
+
+        Args:
+            tool: The tool name that failed.
+            response_text: The response text from the tool (used in alert body).
+        """
+        if tool not in self._monitored:
+            return AlertDecision(
+                should_alert=False,
+                alert_message="",
+                consecutive_failures=0,
+                tool=tool,
+            )
+
+        count = self._consecutive.get(tool, 0) + 1
+        self._consecutive[tool] = count
+
+        if count < self._threshold:
+            return AlertDecision(
+                should_alert=False,
+                alert_message="",
+                consecutive_failures=count,
+                tool=tool,
+            )
+
+        # At or above threshold — decide whether to alert based on cooldown.
+        now = time.time()
+        last = self._last_alerted.get(tool, 0.0)
+        is_first_alert = count == self._threshold
+        cooldown_elapsed = (now - last) >= self._cooldown
+
+        if not (is_first_alert or cooldown_elapsed):
+            return AlertDecision(
+                should_alert=False,
+                alert_message="",
+                consecutive_failures=count,
+                tool=tool,
+            )
+
+        self._last_alerted[tool] = now
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        snippet = (response_text[:200] + "...") if len(response_text) > 200 else response_text
+        message = (
+            f"CAPABILITY ALERT [{ts}]\n"
+            f"Tool '{tool}' has failed {count} consecutive time(s).\n"
+            f"Last response: {snippet or '(no response text)'}\n"
+            "This may indicate silent degradation. Check logs."
+        )
+        return AlertDecision(
+            should_alert=True,
+            alert_message=message,
+            consecutive_failures=count,
+            tool=tool,
+        )
+
+    def status(self) -> dict:
+        """Return current per-tool failure counts for observability."""
+        return {
+            tool: {
+                "consecutive_failures": self._consecutive.get(tool, 0),
+                "last_alerted": self._last_alerted.get(tool, 0.0),
+            }
+            for tool in self._monitored
         }
