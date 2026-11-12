@@ -5,7 +5,6 @@ Routing rule: output fully determined by a fixed DB/file query → pre-handler.
 Output that needs LLM context or judgment → dispatcher.
 
 Commands handled here (bypasses inbox entirely):
-  /todos      — open LOS action items from self_action_items.db
   /quota      — CC usage from ~/.claude/cc-budget/state.json
   /status     — active agents + CC usage (file reads + session DB)
   /subagents  — active subagent sessions from session store
@@ -20,7 +19,6 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from datetime import date, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -44,17 +42,9 @@ _ALLOWED_USERS: frozenset[int] = frozenset(
 )
 
 PRE_HANDLER_COMMANDS: frozenset[str] = frozenset({
-    "/todos", "/quota", "/status",
+    "/quota", "/status",
     "/subagents", "/jobs", "/restart",
 })
-
-
-def _priority_label(priority: int) -> str:
-    if priority <= 3:
-        return "urgent"
-    if priority <= 6:
-        return "medium"
-    return "low"
 
 
 async def try_handle(
@@ -75,9 +65,7 @@ async def try_handle(
         return False
 
     try:
-        if cmd == "/todos":
-            await _handle_todos(message)
-        elif cmd == "/quota":
+        if cmd == "/quota":
             await _handle_quota(message)
         elif cmd == "/status":
             await _handle_status(message)
@@ -97,16 +85,6 @@ async def try_handle(
 # ---------------------------------------------------------------------------
 # Update-style command handlers (registered via add_handler in lobster_bot.py)
 # ---------------------------------------------------------------------------
-
-async def handle_todos_command(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Pre-handler for /todos — reads self_action_items.db, sends with buttons."""
-    user = update.effective_user
-    if not user or user.id not in _ALLOWED_USERS:
-        return
-    await _handle_todos(update.message)
-
 
 async def handle_quota_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -174,41 +152,6 @@ async def handle_restart_command(
 # ---------------------------------------------------------------------------
 # Message-based private implementations (used by try_handle and command handlers)
 # ---------------------------------------------------------------------------
-
-async def _handle_todos(message: "Message") -> None:
-    from los.db import connect, get_open_items  # noqa: PLC0415
-
-    conn = connect()
-    try:
-        items = get_open_items(conn, limit=10)
-    finally:
-        conn.close()
-
-    if not items:
-        await message.reply_text("No open action items. Great job!")
-        return
-
-    await message.reply_text(f"You have {len(items)} open action item(s):")
-
-    today = date.today()
-    snooze_3d = (today + timedelta(days=3)).isoformat()
-    snooze_1w = (today + timedelta(weeks=1)).isoformat()
-
-    for item in items:
-        label = _priority_label(item.priority)
-        text = f"[{label}] {item.text}\n(source: {item.source})"
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("Done", callback_data=f"todo-done-{item.id}"),
-                InlineKeyboardButton("Dismiss", callback_data=f"todo-dismiss-{item.id}"),
-            ],
-            [
-                InlineKeyboardButton("Snooze 3d", callback_data=f"todo-snooze-{item.id}-{snooze_3d}"),
-                InlineKeyboardButton("Snooze 1w", callback_data=f"todo-snooze-{item.id}-{snooze_1w}"),
-            ],
-        ])
-        await message.reply_text(text, reply_markup=keyboard)
-
 
 async def _handle_quota(message: "Message") -> None:
     from bot.dispatcher_commands import format_quota_message, read_quota_state  # noqa: PLC0415
@@ -313,41 +256,6 @@ async def _handle_restart(message: "Message", args: list[str]) -> None:
 # ---------------------------------------------------------------------------
 # Callback query handlers (intercept before inbox write in handle_callback_query)
 # ---------------------------------------------------------------------------
-
-async def handle_todo_callback(query: "CallbackQuery") -> None:
-    """Handle todo-done-*, todo-dismiss-*, todo-snooze-*-DATE callbacks."""
-    from los.db import connect, mark_dismissed, mark_done, mark_snoozed  # noqa: PLC0415
-
-    data = query.data  # e.g. "todo-done-42"
-    parts = data.split("-")
-    # parts: ["todo", action, item_id] or ["todo", "snooze", item_id, date]
-    action = parts[1] if len(parts) > 1 else ""
-    try:
-        item_id = int(parts[2]) if len(parts) > 2 else -1
-    except ValueError:
-        await query.edit_message_text("Invalid callback data.")
-        return
-
-    conn = connect()
-    try:
-        if action == "done":
-            mark_done(conn, item_id)
-            conn.commit()
-            await query.edit_message_text(f"✓ Marked done (#{item_id})")
-        elif action == "dismiss":
-            mark_dismissed(conn, item_id)
-            conn.commit()
-            await query.edit_message_text(f"Dismissed (#{item_id})")
-        elif action == "snooze" and len(parts) > 3:
-            until_date = parts[3]
-            mark_snoozed(conn, item_id, until_date)
-            conn.commit()
-            await query.edit_message_text(f"Snoozed until {until_date} (#{item_id})")
-        else:
-            await query.edit_message_text("Unknown todo action.")
-    finally:
-        conn.close()
-
 
 async def handle_restart_callback(query: "CallbackQuery") -> None:
     """Handle confirm-restart-dispatcher and cancel-restart callbacks."""

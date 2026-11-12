@@ -27,7 +27,6 @@ if _SRC_DIR not in _sys.path:
     _sys.path.insert(0, _SRC_DIR)
 from src.utils.fs import atomic_write_json  # noqa: E402
 from bot.pre_handler import (  # noqa: E402
-    handle_todos_command,
     handle_quota_command,
     handle_status_command,
     handle_help_command,
@@ -35,7 +34,6 @@ from bot.pre_handler import (  # noqa: E402
     handle_jobs_command,
     handle_restart_command,
     try_handle as _pre_handler_try_handle,
-    handle_todo_callback as _pre_handler_todo_callback,
     handle_restart_callback as _pre_handler_restart_callback,
 )
 from watchdog.observers import Observer
@@ -998,9 +996,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Intercept pre-handler callbacks before they reach the inbox.
     cb_data = query.data or ""
-    if cb_data.startswith("todo-"):
-        await _pre_handler_todo_callback(query)
-        return
     if cb_data.startswith("confirm-restart-") or cb_data == "cancel-restart":
         await _pre_handler_restart_callback(query)
         return
@@ -2316,7 +2311,6 @@ async def run_bot():
     bot_app.add_handler(CommandHandler("list_groups", list_groups_command))
     # Pre-handler: deterministic commands that bypass the dispatcher inbox entirely.
     # These reply directly from the bot process — no LLM round-trip, no inbox write.
-    bot_app.add_handler(CommandHandler("todos", handle_todos_command))
     bot_app.add_handler(CommandHandler("quota", handle_quota_command))
     bot_app.add_handler(CommandHandler("status", handle_status_command))
     bot_app.add_handler(CommandHandler("subagents", handle_subagents_command))

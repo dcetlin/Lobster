@@ -37,12 +37,6 @@ System status:
   agents              — list active subagent sessions
   inbox               — queue depth and processing state
 
-LOS (action items):
-  /todos              — show open action items with Done/Snooze buttons
-  /todo add <text>    — add a new action item
-  /todo done <text>   — mark an item done by partial text or ID
-  /todo snooze <text> [days] — snooze an item (default: 3 days)
-
 Config (user bootup files):
   /config list                  — list all user config files with line counts
   /config read <filename>       — show file contents (chunked if long)
