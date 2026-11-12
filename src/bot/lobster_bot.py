@@ -447,20 +447,30 @@ SENT_DIR.mkdir(parents=True, exist_ok=True)
 PENDING_TRANSCRIPTION_DIR.mkdir(parents=True, exist_ok=True)
 LOBSTER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-# Logging
+# Logging — logger is created at import time but the RotatingFileHandler
+# that writes to the production log is attached only when main() runs.
+# This prevents pytest imports from polluting ~/lobster-workspace/logs/telegram-bot.log.
 LOG_DIR = _WORKSPACE / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 log = logging.getLogger("lobster")
 log.setLevel(logging.INFO)
-_file_handler = RotatingFileHandler(
-    LOG_DIR / "telegram-bot.log",
-    maxBytes=5 * 1024 * 1024,  # 5MB
-    backupCount=3,
-)
-_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-log.addHandler(_file_handler)
-log.addHandler(logging.StreamHandler())
+
+
+def _configure_file_logging() -> None:
+    """Attach the production RotatingFileHandler to the ``lobster`` logger.
+
+    Called once from ``main()`` — never at import time.  This keeps test
+    imports from opening (and writing to) the production log file.
+    """
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    file_handler = RotatingFileHandler(
+        LOG_DIR / "telegram-bot.log",
+        maxBytes=5 * 1024 * 1024,  # 5MB
+        backupCount=3,
+    )
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(file_handler)
+    log.addHandler(logging.StreamHandler())
 
 # Global reference to the bot app and event loop for sending replies
 bot_app = None
@@ -1832,24 +1842,116 @@ async def process_reply(chat_id: int, text: str, reply_markup=None, thread_ts=No
                 log.error(f"Plain text fallback also failed: {e2}")
 
 
+# Telegram enforces a hard limit on callback_data length.
+CALLBACK_DATA_MAX_BYTES = 64
+
+# Substrings in BadRequest messages that indicate a button-related,
+# deterministic (non-retryable) error from Telegram.
+_BUTTON_BAD_REQUEST_PATTERNS = (
+    "button_data_invalid",
+    "button_url_invalid",
+    "reply_markup_invalid",
+    "button_type_invalid",
+)
+
+
+def _is_button_bad_request(exc: BaseException) -> bool:
+    """Return True if *exc* is a Telegram BadRequest caused by invalid buttons.
+
+    Checks the exception type and message against known button-related error
+    patterns.  Pure predicate — no side effects.
+    """
+    try:
+        from telegram.error import BadRequest
+    except ImportError:
+        return False
+    if not isinstance(exc, BadRequest):
+        return False
+    msg = str(exc).lower()
+    return any(pat in msg for pat in _BUTTON_BAD_REQUEST_PATTERNS)
+
+
+def _is_non_retryable_bad_request(exc: BaseException) -> bool:
+    """Return True if *exc* is a Telegram BadRequest that will never succeed on retry.
+
+    Deterministic 400 errors (malformed markup, invalid chat_id, etc.) are
+    pointless to retry — the same payload produces the same rejection.  We
+    detect these by checking the exception type: any ``BadRequest`` subclass
+    of ``telegram.error`` qualifies.
+
+    Pure predicate — no side effects.
+    """
+    try:
+        from telegram.error import BadRequest
+    except ImportError:
+        return False
+    return isinstance(exc, BadRequest)
+
+
+def _sanitize_callback_data(data: str) -> str:
+    """Ensure callback_data fits within Telegram's 64-byte UTF-8 limit.
+
+    If the encoded data exceeds the limit, truncate and append a short hash
+    suffix so the result is deterministic and unique.  Logs a warning when
+    truncation occurs — callers should fix the source rather than relying
+    on this safety net.
+
+    Pure function (modulo the logging side-effect on the warning path).
+    """
+    encoded = data.encode("utf-8")
+    if len(encoded) <= CALLBACK_DATA_MAX_BYTES:
+        return data
+
+    import hashlib
+    digest = hashlib.sha256(encoded).hexdigest()[:8]
+    # Reserve space for "…" (3 bytes) + digest (8 bytes) = 11 bytes
+    prefix_budget = CALLBACK_DATA_MAX_BYTES - 11
+    # Truncate at a safe UTF-8 boundary by decoding the prefix slice
+    truncated = encoded[:prefix_budget].decode("utf-8", errors="ignore")
+    result = f"{truncated}…{digest}"
+    log.warning(
+        f"callback_data truncated: {len(encoded)} bytes -> {len(result.encode('utf-8'))} bytes "
+        f"(original: {data!r})"
+    )
+    return result
+
+
 def build_inline_keyboard(buttons: list) -> InlineKeyboardMarkup:
-    """Build a Telegram InlineKeyboardMarkup from a nested list of button labels.
+    """Build a Telegram InlineKeyboardMarkup from a nested list of button specs.
 
-    Each inner list represents a row of buttons.  Each element in the row is
-    either a plain string label (callback_data == label) or a [label, data]
-    two-element list where data is the callback_data payload.
+    Each inner list represents a row of buttons.  Each element in the row can
+    be one of three formats:
 
-    Pure function: no side effects.
+    1. ``{"text": "Label", "callback_data": "value"}`` dict — the documented
+       format used by ``send_reply`` and ``claim_and_ack``.  An optional
+       ``"url"`` key produces a URL button instead of a callback button.
+    2. ``[label, data]`` two-element list/tuple — legacy shorthand.
+    3. Plain string — used as both label and callback_data.
+
+    callback_data values exceeding Telegram's 64-byte limit are
+    deterministically truncated (with a hash suffix) rather than rejected,
+    so the message is still delivered.
+
+    Pure function (no side effects beyond logging on the truncation path).
     """
     keyboard = []
     for row in buttons:
         keyboard_row = []
         for item in row:
-            if isinstance(item, (list, tuple)) and len(item) == 2:
-                label, data = item
+            if isinstance(item, dict):
+                label = item["text"]
+                url = item.get("url")
+                if url:
+                    keyboard_row.append(InlineKeyboardButton(text=label, url=url))
+                    continue
+                data = _sanitize_callback_data(
+                    item.get("callback_data", label)
+                )
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                label, data = item[0], _sanitize_callback_data(str(item[1]))
             else:
                 label = str(item)
-                data = str(item)
+                data = _sanitize_callback_data(label)
             keyboard_row.append(InlineKeyboardButton(text=label, callback_data=data))
         keyboard.append(keyboard_row)
     return InlineKeyboardMarkup(keyboard)
@@ -1885,6 +1987,35 @@ def _mark_delivered(filepath: str, reply: dict) -> None:
             os.remove(filepath)
         except OSError:
             pass
+
+
+def _write_delivery_failure_notice(outbox_filename: str, error_msg: str) -> None:
+    """Write a system message to the inbox notifying the dispatcher of a delivery failure.
+
+    This ensures the dispatcher learns that a reply was dead-lettered so it can
+    take corrective action (e.g. notify the user, re-queue the message without
+    buttons, etc.).  Best-effort: failures writing the notice are logged but
+    never propagated.
+    """
+    try:
+        notice_id = f"delivery_failure_{int(time.time() * 1000)}"
+        notice = {
+            "id": notice_id,
+            "source": "system",
+            "type": "delivery_failure",
+            "text": (
+                f"Telegram delivery failed for outbox file {outbox_filename}: "
+                f"{error_msg}. The file has been moved to dead-letter/."
+            ),
+            "outbox_filename": outbox_filename,
+            "error": error_msg,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        notice_file = INBOX_DIR / f"{notice_id}.json"
+        atomic_write_json(notice_file, notice)
+        log.info(f"Wrote delivery-failure notice to inbox: {notice_id}")
+    except Exception as exc:
+        log.warning(f"Could not write delivery-failure notice for {outbox_filename}: {exc}")
 
 
 class OutboxHandler(FileSystemEventHandler):
@@ -2119,6 +2250,32 @@ class OutboxHandler(FileSystemEventHandler):
                             reply_parameters=chunk_reply_params,
                         )
                     except Exception as exc:
+                        # Button-related BadRequest: strip buttons and resend
+                        # the text so the user gets the content even if buttons
+                        # are malformed.  This is non-retryable — identical
+                        # retries would fail identically.
+                        if _is_button_bad_request(exc) and chunk_markup is not None:
+                            log.warning(
+                                f"Button BadRequest for {chat_id}: {exc} — "
+                                "resending without buttons"
+                            )
+                            chunk_markup = None  # strip for this and any retry
+                            try:
+                                sent_msg = await bot_app.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=html_chunk,
+                                    parse_mode="HTML",
+                                    reply_markup=None,
+                                    reply_parameters=chunk_reply_params,
+                                )
+                                continue  # successfully sent without buttons
+                            except Exception as exc2:
+                                log.warning(
+                                    f"Buttonless resend also failed for {chat_id}: {exc2}. "
+                                    "Falling back to plain text."
+                                )
+                                exc = exc2  # fall through to plain-text fallback
+
                         # Fallback to plain text if HTML parsing fails.
                         # Plain text is also subject to the hard limit so we
                         # truncate as a last resort rather than crash/drop.
@@ -2213,6 +2370,20 @@ async def sweep_outbox():
                         log.error(
                             f"Dead-lettered after TimedOut (likely delivered): {filepath.name}"
                         )
+                    elif _is_non_retryable_bad_request(e):
+                        # Deterministic 400 — retrying will produce the same
+                        # rejection. Dead-letter immediately and write a system
+                        # message to the inbox so the dispatcher learns the
+                        # reply was not delivered.
+                        dest = DEAD_LETTER_DIR / filepath.name
+                        shutil.move(fname, str(dest))
+                        _outbox_fail_counts.pop(fname, None)
+                        _processing_files.discard(fname)
+                        log.error(
+                            f"Dead-lettered after non-retryable BadRequest: "
+                            f"{filepath.name}: {e}"
+                        )
+                        _write_delivery_failure_notice(filepath.name, str(e))
                     else:
                         _outbox_fail_counts[fname] = _outbox_fail_counts.get(fname, 0) + 1
                         count = _outbox_fail_counts[fname]
@@ -2222,6 +2393,7 @@ async def sweep_outbox():
                             shutil.move(fname, str(dest))
                             _outbox_fail_counts.pop(fname, None)
                             log.error(f"Moved to dead-letter after 5 failures: {filepath.name}")
+                            _write_delivery_failure_notice(filepath.name, str(e))
         except Exception as e:
             log.error(f"Outbox sweep error: {e}")
 
@@ -2358,6 +2530,7 @@ async def run_bot():
 
 
 def main():
+    _configure_file_logging()
     asyncio.run(run_bot())
 
 
