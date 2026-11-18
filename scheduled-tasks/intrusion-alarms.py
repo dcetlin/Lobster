@@ -324,22 +324,49 @@ def check_unauthorized_ssh_logins() -> str | None:
     - Unknown keys or password logins: alert on any.
 
     Tracks seen IP/key pairs in state; alerts only on first detection of a new unauthorized pair.
+    Uses journal cursor to avoid re-processing historical entries.
     """
     state = load_state(STATE_FILE)
     seen_pairs = set(state.get("ssh_unauthorized_pairs_seen", []))
+    cursor = state.get("ssh_journal_cursor")
 
     unauthorized_pairs = set()
     try:
-        # Use journalctl -u ssh to get SSH service logs (more reliable than auth.log)
+        # Use journalctl with cursor to only read new entries since last check
+        # This prevents re-alerting on old entries when policies change
+        # --show-cursor appends cursor to output for atomic extraction from same read
+        cmd = ["sudo", "journalctl", "-u", "ssh", "--no-pager", "--show-cursor"]
+        if cursor:
+            cmd.extend(["--after-cursor", cursor])
+            # With cursor, we can read all entries since the cursor (don't limit with -n)
+            # This prevents truncation if there's a burst of logins
+        else:
+            # First run: read last 10000 entries to establish baseline
+            cmd.extend(["-n", "10000"])
+
         result = subprocess.run(
-            ["sudo", "journalctl", "-u", "ssh", "-n", "10000", "--no-pager"],
+            cmd,
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode != 0:
             log.warning("journalctl -u ssh failed: %s", result.stderr.strip())
             return None
 
-        for line in result.stdout.splitlines():
+        # Extract cursor from last line (format: "-- cursor: <cursor_value>")
+        output_lines = result.stdout.splitlines()
+        new_cursor = None
+        log_lines = []
+        for line in output_lines:
+            if line.startswith("-- cursor:"):
+                new_cursor = line.split(":", 1)[1].strip()
+            else:
+                log_lines.append(line)
+
+        # Update cursor in state before processing, so it persists even if no new violations
+        if new_cursor:
+            state["ssh_journal_cursor"] = new_cursor
+
+        for line in log_lines:
             # Match: "Accepted publickey for user from 107.208.10.1 port 12345 ssh2: ED25519 SHA256:..."
             # or:   "Accepted password for user from 107.208.10.1 port 12345 ssh2"
             m = re.search(
@@ -415,6 +442,8 @@ def check_unauthorized_ssh_logins() -> str | None:
             f"All seen unauthorized: {len(unauthorized_pairs)} unique source(s)"
         )
 
+    # Save updated state even if no new violations (to persist the cursor)
+    save_state(STATE_FILE, state)
     return None
 
 
@@ -504,9 +533,17 @@ def get_listening_sockets(container_name: str | None = None) -> set[str]:
                 log.debug("Skipping tailscaled socket: %s:%s", addr, port)
                 continue
 
-            # Skip sockets bound to tailscale0 interface
-            if addr.startswith("100.") or addr.startswith("fd7a:115c:a1e0"):
-                log.debug("Skipping tailscale0 socket: %s:%s", addr, port)
+            # Skip sockets bound to tailscale0 interface or tailnet addresses
+            # Whitelists by interface suffix, IPv4 tailnet range (100.64.0.0/10),
+            # and IPv6 tailnet prefix (fd7a:115c:a1e0::/48)
+            if "%tailscale0" in addr:
+                log.debug("Skipping tailscale0 interface socket: %s:%s", addr, port)
+                continue
+
+            # Remove brackets from IPv6 addresses for CIDR checking
+            addr_clean = addr.strip("[]")
+            if ip_in_cidr(addr_clean, BACKUP_KEY_TAILNET_CIDRS):
+                log.debug("Skipping tailnet CIDR socket: %s:%s", addr, port)
                 continue
 
             # Normalize proto and add to set
