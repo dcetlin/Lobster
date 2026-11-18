@@ -424,9 +424,6 @@ def check_unauthorized_ssh_logins() -> str | None:
     # Detect new unauthorized IP/key pairs
     new_pairs = unauthorized_pairs - seen_pairs
     if new_pairs:
-        state["ssh_unauthorized_pairs_seen"] = list(seen_pairs | unauthorized_pairs)
-        save_state(STATE_FILE, state)
-
         # Build alert message
         new_entries = []
         for pair in sorted(new_pairs):
@@ -434,7 +431,7 @@ def check_unauthorized_ssh_logins() -> str | None:
             new_entries.append(f"  {ip_part} ({auth_part}): {fp_part}")
 
         new_entries_str = "\n".join(new_entries)
-        return alert(
+        alert_result = alert(
             f"[Intrusion Alert] Accepted SSH login(s) from unauthorized source(s):\n\n"
             f"{new_entries_str}\n\n"
             f"Main key trusted IPs: {', '.join(sorted(MAIN_KEY_TRUSTED_IPS))}\n"
@@ -442,7 +439,14 @@ def check_unauthorized_ssh_logins() -> str | None:
             f"All seen unauthorized: {len(unauthorized_pairs)} unique source(s)"
         )
 
-    # Save updated state even if no new violations (to persist the cursor)
+        # Only save state (advance cursor and seen_pairs) if alert succeeded.
+        # If alert failed, state remains unchanged so next run will retry the alert.
+        if alert_result != "failed":
+            state["ssh_unauthorized_pairs_seen"] = list(seen_pairs | unauthorized_pairs)
+            save_state(STATE_FILE, state)
+        return alert_result
+
+    # No new violations: save state to persist the cursor for next run
     save_state(STATE_FILE, state)
     return None
 
