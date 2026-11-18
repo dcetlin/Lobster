@@ -5715,6 +5715,42 @@ PY145B
         fi
     fi
 
+    # Migration 147: Remove vault-sync units and vault-watcher cron entries
+    # vault-watcher.py and vault-processor.py have been failing with ModuleNotFoundError
+    # since Nov 12 (obsidian_sync_core was deleted). This migration removes the broken
+    # infrastructure: systemd units (lobster-obsidian-vault-sync.timer/.service) and
+    # cron entries (LOBSTER-VAULT-WATCHER).
+    local _M147_VAULT_UNITS=0
+    local _M147_VAULT_CRON=0
+
+    # Remove vault-sync systemd units
+    for unit in lobster-obsidian-vault-sync.timer lobster-obsidian-vault-sync.service; do
+        if [ -f "/etc/systemd/system/$unit" ] || systemctl list-units --all 2>/dev/null | grep -q "$unit"; then
+            substep "Migration 147: Removing systemd unit: $unit"
+            sudo systemctl stop "$unit" 2>/dev/null || true
+            sudo systemctl disable "$unit" 2>/dev/null || true
+            sudo rm -f "/etc/systemd/system/$unit"
+            _M147_VAULT_UNITS=$((_M147_VAULT_UNITS + 1))
+        fi
+    done
+
+    if [ "$_M147_VAULT_UNITS" -gt 0 ]; then
+        sudo systemctl daemon-reload
+        migrated=$((migrated + 1))
+    fi
+
+    # Remove vault-watcher cron entries (both regular and half-offset entries)
+    if crontab -l 2>/dev/null | grep -q "LOBSTER-VAULT-WATCHER"; then
+        substep "Migration 147: Removing vault-watcher cron entries..."
+        crontab -l 2>/dev/null | grep -v "LOBSTER-VAULT-WATCHER" | crontab - 2>/dev/null || true
+        migrated=$((migrated + 1))
+        _M147_VAULT_CRON=1
+    fi
+
+    if [ "$_M147_VAULT_UNITS" -gt 0 ] || [ "$_M147_VAULT_CRON" -eq 1 ]; then
+        success "Migration 147: Removed $_M147_VAULT_UNITS vault-sync unit(s) and vault-watcher cron entries"
+    fi
+
     if [ "$migrated" -eq 0 ]; then
         success "No migrations needed"
     else
