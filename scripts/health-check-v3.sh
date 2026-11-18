@@ -1476,7 +1476,7 @@ except:
 # Check 9: Dashboard server - silently restart if not listening on port 9100
 check_dashboard_server() {
     local install_dir="${LOBSTER_INSTALL_DIR:-$HOME/lobster}"
-    local dashboard_cmd="$install_dir/.venv/bin/python3 $install_dir/src/dashboard/server.py --host 0.0.0.0 --port 9100"
+    local dashboard_cmd="$install_dir/.venv/bin/python3 $install_dir/src/dashboard/server.py --host 127.0.0.1 --port 9100"
 
     if ss -tlnp | grep -q 9100; then
         log_info "Dashboard server OK: listening on port 9100"

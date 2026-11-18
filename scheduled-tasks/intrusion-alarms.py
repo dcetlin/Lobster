@@ -86,14 +86,17 @@ JOB_NAME = "intrusion-alarms"
 ADMIN_CHAT_ID = 8075091586
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
-# SSH: trusted IP (configurable).
-# Note: May be overridden via INTRUSION_ALARM_TRUSTED_SSH_IP env var.
-TRUSTED_SSH_IP = os.environ.get("INTRUSION_ALARM_TRUSTED_SSH_IP", "107.208.10.157")
+# SSH: trusted main key and its authorized IPs.
+# This is Dan's primary laptop key, trusted only from these IPs.
+MAIN_KEY_SHA256 = "SHA256:kaTJe9LWyc8kBBLcyfAKEiksg52qtXGjCzNJsRaXLcc"
+MAIN_KEY_TRUSTED_IPS = {"100.64.58.63", "107.208.10.157"}  # Tailscale and fallback public IP
 
-# SSH: ledger-backup-pull key fingerprint (read-only rrsync key, any IP is trusted for this key).
+# SSH: ledger-backup-pull key (read-only rrsync key).
 # This key is restricted to: command="/usr/bin/rrsync -ro /home/lobster/backups/ledger"
-# No alert is raised for this key regardless of source IP.
+# Restricted to the Tailscale tailnet via authorized_keys from= directive.
+# Alert on use from outside the tailnet; logins from inside stay quiet.
 LEDGER_BACKUP_PULL_KEY_SHA256 = "SHA256:Oz16/2lD0G7U+GAk6zNtbzaxrWFdYm0yB0Ntp7pn8Ho"
+BACKUP_KEY_TAILNET_CIDRS = {"100.64.0.0/10", "fd7a:115c:a1e0::/48"}  # Tailscale tailnet
 
 # Data paths
 STATE_DIR = Path.home() / "lobster-workspace" / "data" / "intrusion-alarms"
@@ -104,6 +107,25 @@ BASELINES_DIR = STATE_DIR / "baselines"
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
+
+
+def ip_in_cidr(ip: str, cidrs: set[str]) -> bool:
+    """Check if an IP address is within any of the given CIDR ranges.
+
+    Supports both IPv4 (using ipaddress module) and IPv6.
+    Returns True if IP is in any of the CIDR ranges, False otherwise.
+    """
+    try:
+        import ipaddress
+        ip_obj = ipaddress.ip_address(ip)
+        for cidr_str in cidrs:
+            cidr_obj = ipaddress.ip_network(cidr_str, strict=False)
+            if ip_obj in cidr_obj:
+                return True
+        return False
+    except (ValueError, ipaddress.NetmaskValueError):
+        # Invalid IP or CIDR format
+        return False
 
 
 def load_state(state_file: Path) -> dict:
@@ -295,9 +317,11 @@ def check_unauthorized_ssh_logins() -> str | None:
     Extracts: IP, key type (publickey/password), and key fingerprint (if present).
 
     Key-aware logic:
-    - If key fingerprint == LEDGER_BACKUP_PULL_KEY_SHA256: no alert (read-only backup key, any IP OK)
-    - Else if IP == TRUSTED_SSH_IP: no alert (trusted primary IP)
-    - Else: alert on first detection of this IP/key combination
+    - Main key (SHA256:kaTJe9LWyc8kBBLcyfAKEiksg52qtXGjCzNJsRaXLcc):
+      Trusted from MAIN_KEY_TRUSTED_IPS only. Alert if from any other IP.
+    - Backup key (SHA256:Oz16/2lD0G7U+GAk6zNtbzaxrWFdYm0yB0Ntp7pn8Ho):
+      Trusted only from tailnet CIDRS. Alert if from outside tailnet.
+    - Unknown keys or password logins: alert on any.
 
     Tracks seen IP/key pairs in state; alerts only on first detection of a new unauthorized pair.
     """
@@ -338,23 +362,30 @@ def check_unauthorized_ssh_logins() -> str | None:
 
             # Determine if this login should trigger an alert
             should_alert = False
-            reason = None
 
-            if fingerprint == LEDGER_BACKUP_PULL_KEY_SHA256:
-                # Ledger backup key: trusted from any IP, no alert
-                log.debug("Accepted %s from %s with trusted ledger-backup-pull key", auth_type, ip)
-                continue
-            elif ip == TRUSTED_SSH_IP:
-                # Trusted IP: no alert
-                log.debug("Accepted %s from trusted IP %s", auth_type, ip)
-                continue
+            if fingerprint == MAIN_KEY_SHA256:
+                # Main key: trusted only from MAIN_KEY_TRUSTED_IPS
+                if ip in MAIN_KEY_TRUSTED_IPS:
+                    log.debug("Accepted %s from %s with trusted main key (from trusted IP)", auth_type, ip)
+                    continue
+                else:
+                    should_alert = True
+                    log.warning("Main key login from untrusted IP: %s", ip)
+            elif fingerprint == LEDGER_BACKUP_PULL_KEY_SHA256:
+                # Backup key: trusted only from tailnet
+                if ip_in_cidr(ip, BACKUP_KEY_TAILNET_CIDRS):
+                    log.debug("Accepted %s from %s with backup key (from tailnet)", auth_type, ip)
+                    continue
+                else:
+                    should_alert = True
+                    log.warning("Backup key login from outside tailnet: %s", ip)
             else:
-                # Non-trusted source: should alert
+                # Unknown key or password login: always alert
                 should_alert = True
-                pair = f"{ip}:{auth_type}:{fingerprint or 'none'}"
-                reason = f"Accepted {auth_type} from {ip} (key: {fingerprint or 'password/unknown'})"
+                log.warning("Unknown key or password login from %s", ip)
 
             if should_alert:
+                pair = f"{ip}:{auth_type}:{fingerprint or 'none'}"
                 unauthorized_pairs.add(pair)
     except subprocess.TimeoutExpired:
         log.warning("journalctl -u ssh timeout")
@@ -377,10 +408,10 @@ def check_unauthorized_ssh_logins() -> str | None:
 
         new_entries_str = "\n".join(new_entries)
         return alert(
-            f"[Intrusion Alert] Accepted SSH login(s) from unauthorized IP(s):\n\n"
+            f"[Intrusion Alert] Accepted SSH login(s) from unauthorized source(s):\n\n"
             f"{new_entries_str}\n\n"
-            f"Trusted IP: {TRUSTED_SSH_IP}\n"
-            f"Trusted key: ledger-backup-pull (any IP)\n"
+            f"Main key trusted IPs: {', '.join(sorted(MAIN_KEY_TRUSTED_IPS))}\n"
+            f"Backup key trusted: Tailscale tailnet only\n"
             f"All seen unauthorized: {len(unauthorized_pairs)} unique source(s)"
         )
 
@@ -395,12 +426,16 @@ def check_unauthorized_ssh_logins() -> str | None:
 def get_listening_sockets(container_name: str | None = None) -> set[str]:
     """Get set of listening TCP/UDP sockets for the host or a docker container.
 
-    Format: 'protocol:port' (e.g., 'tcp:22', 'udp:53').
+    Format: 'protocol:port:addr:process' (e.g., 'tcp:22:0.0.0.0:sshd').
     container_name=None means the host namespace.
 
-    For containers, uses nsenter to enter the container's network namespace
-    instead of docker exec, as netstat may not be installed in containers.
-    Uses `ss` (socket statistics) which is more likely to be available.
+    For containers, uses nsenter to enter the container's network namespace.
+    Includes process info so we can filter tailscaled and other processes.
+
+    Automatically whitelists:
+    - Sockets owned by tailscaled process
+    - Sockets bound to tailscale0 interface
+    - Docker embedded DNS (127.0.0.11)
     """
     sockets = set()
     try:
@@ -419,11 +454,11 @@ def get_listening_sockets(container_name: str | None = None) -> set[str]:
                 log.warning("Container %s is not running or has invalid PID", container_name)
                 return set()
 
-            # Use nsenter to enter the container's network namespace and run ss
-            cmd = ["sudo", "nsenter", "-t", container_pid, "-n", "ss", "-tulnH"]
+            # Use nsenter to enter the container's network namespace and run ss with process info
+            cmd = ["sudo", "nsenter", "-t", container_pid, "-n", "ss", "-tulnpH"]
         else:
-            # Host namespace: use ss directly
-            cmd = ["ss", "-tulnH"]
+            # Host namespace: use ss directly with process info
+            cmd = ["ss", "-tulnpH"]
 
         result = subprocess.run(
             cmd,
@@ -433,8 +468,8 @@ def get_listening_sockets(container_name: str | None = None) -> set[str]:
             log.warning("ss command failed for %s: %s", container_name or "host", result.stderr.strip())
             return set()
 
-        # ss -tulnH output format: "Netid  State  Recv-Q Send-Q Local Address:Port  Peer Address:Port"
-        # Lines with LISTEN state: "tcp    LISTEN  0      128    0.0.0.0:22         0.0.0.0:*"
+        # ss -tulnpH output format: "Netid  State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process"
+        # Lines with LISTEN state: "tcp    LISTEN  0      128    0.0.0.0:22         0.0.0.0:*    users:(("sshd",pid=1234,fd=3))"
         for line in result.stdout.splitlines():
             if "LISTEN" not in line:
                 continue
@@ -444,14 +479,40 @@ def get_listening_sockets(container_name: str | None = None) -> set[str]:
             proto = parts[0].lower()  # tcp, udp, tcp6, udp6
             if not proto.startswith(("tcp", "udp")):
                 continue
-            # Extract port from "address:port" (typically the 5th field in ss output)
+            # Extract port and address from "address:port" (typically the 5th field in ss output)
             local_addr = parts[4]
             if ":" in local_addr:
                 addr, port = local_addr.rsplit(":", 1)
-                # Skip Docker embedded DNS resolver (127.0.0.11) — port changes on every container restart
-                if addr == "127.0.0.11":
-                    continue
-                sockets.add(f"{proto.replace('6', '')}:{port}")  # normalize tcp6 -> tcp
+            else:
+                continue
+
+            # Skip Docker embedded DNS resolver
+            if addr == "127.0.0.11":
+                continue
+
+            # Extract process info (usually last field, format: "users:(("process_name",pid=...)")
+            process_name = ""
+            if len(parts) > 6:
+                process_field = parts[-1]
+                # Extract process name from "users:(("process_name",pid=..."
+                pm = re.search(r'\(\("([^"]+)"', process_field)
+                if pm:
+                    process_name = pm.group(1)
+
+            # Skip tailscaled process
+            if process_name == "tailscaled":
+                log.debug("Skipping tailscaled socket: %s:%s", addr, port)
+                continue
+
+            # Skip sockets bound to tailscale0 interface
+            if addr.startswith("100.") or addr.startswith("fd7a:115c:a1e0"):
+                log.debug("Skipping tailscale0 socket: %s:%s", addr, port)
+                continue
+
+            # Normalize proto and add to set
+            proto_normalized = proto.replace('6', '')
+            socket_key = f"{proto_normalized}:{port}:{addr}:{process_name}"
+            sockets.add(socket_key)
     except subprocess.TimeoutExpired:
         log.warning("ss/nsenter timeout for %s", container_name or "host")
     except (OSError, IOError) as e:

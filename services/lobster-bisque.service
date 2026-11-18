@@ -16,7 +16,7 @@ Environment=LOBSTER_WORKSPACE=/home/lobster/lobster-workspace
 EnvironmentFile=-/home/lobster/lobster/config/config.env
 EnvironmentFile=-/home/lobster/lobster-config/config.env
 EnvironmentFile=-/home/lobster/lobster-config/global.env
-ExecStart=/home/lobster/lobster/.venv/bin/python /home/lobster/lobster/src/bisque/relay_server.py --host 0.0.0.0 --port 9101
+ExecStart=/home/lobster/lobster/.venv/bin/python /home/lobster/lobster/src/bisque/relay_server.py --host 127.0.0.1 --port 9101
 Restart=always
 RestartSec=10
 
