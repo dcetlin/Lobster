@@ -1397,6 +1397,53 @@ check_disk() {
     return 0
 }
 
+# Check: Stale reboot required file (auto-reboot failure detection)
+# If /var/run/reboot-required exists and is older than 2 days, it means
+# the auto-reboot failed — the system should have rebooted but didn't.
+# Alert Dan but do not trigger a health-check restart (the auto-reboot
+# mechanism is independent of Lobster liveness). This check is advisory-only.
+check_stale_reboot_required() {
+    local reboot_file="/var/run/reboot-required"
+    local max_age_seconds=172800  # 2 days
+
+    if [[ ! -f "$reboot_file" ]]; then
+        # No reboot required — system is current
+        return 0
+    fi
+
+    # Reboot file exists. Check how old it is.
+    local now
+    now=$(date +%s)
+    local file_mtime
+    file_mtime=$(stat -c %Y "$reboot_file" 2>/dev/null)
+
+    if [[ -z "$file_mtime" ]]; then
+        log_warn "Could not stat $reboot_file"
+        return 0
+    fi
+
+    local age=$((now - file_mtime))
+
+    if [[ $age -gt $max_age_seconds ]]; then
+        local days=$((age / 86400))
+        log_error "Stale reboot-required file: $reboot_file is $days days old"
+        send_telegram_alert_deduped "stale-reboot-required" "Lobster: Automatic reboot failed — /var/run/reboot-required exists and is ${days} days old.
+
+The system should have rebooted but did not. This may indicate:
+- auto-reboot timer disabled or failed
+- unattended-upgrades not running
+- system in maintenance mode
+
+Manual reboot or restart of unattended-upgrades may be needed."
+        return 0  # Advisory only, never triggers restart
+    else
+        local remaining=$((max_age_seconds - age))
+        local remaining_hours=$((remaining / 3600))
+        log_info "Reboot-required file detected, age=${age}s, will alert if not cleared in ${remaining_hours}h"
+        return 0
+    fi
+}
+
 # Check 8: Claude auth token validity
 # Uses `claude auth status` as the single source of truth.
 #
@@ -2762,6 +2809,10 @@ Update CLAUDE_CODE_OAUTH_TOKEN in ~/lobster-config/config.env, then restart lobs
         fi
         log_warn "Disk space low - restart won't help, needs manual cleanup"
     fi
+
+    # --- Stale reboot-required check (auto-reboot failure detection) ---
+
+    check_stale_reboot_required
 
     # --- Agent-channel staleness (alert-only, never triggers restart) ---
 
