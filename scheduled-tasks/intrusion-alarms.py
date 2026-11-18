@@ -90,6 +90,11 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 # Note: May be overridden via INTRUSION_ALARM_TRUSTED_SSH_IP env var.
 TRUSTED_SSH_IP = os.environ.get("INTRUSION_ALARM_TRUSTED_SSH_IP", "107.208.10.157")
 
+# SSH: ledger-backup-pull key fingerprint (read-only rrsync key, any IP is trusted for this key).
+# This key is restricted to: command="/usr/bin/rrsync -ro /home/lobster/backups/ledger"
+# No alert is raised for this key regardless of source IP.
+LEDGER_BACKUP_PULL_KEY_SHA256 = "SHA256:Oz16/2lD0G7U+GAk6zNtbzaxrWFdYm0yB0Ntp7pn8Ho"
+
 # Data paths
 STATE_DIR = Path.home() / "lobster-workspace" / "data" / "intrusion-alarms"
 STATE_FILE = STATE_DIR / "state.json"
@@ -284,15 +289,22 @@ def alert(text: str) -> str:
 
 
 def check_unauthorized_ssh_logins() -> str | None:
-    """Alert on any accepted SSH login from IP != TRUSTED_SSH_IP.
+    """Alert on accepted SSH logins from non-trusted sources.
 
-    Reads SSH service journal via journalctl for "Accepted" lines, extracts remote IP.
-    Tracks seen IPs in state; alerts only on first detection of a new IP.
+    Reads SSH service journal via journalctl for "Accepted" lines.
+    Extracts: IP, key type (publickey/password), and key fingerprint (if present).
+
+    Key-aware logic:
+    - If key fingerprint == LEDGER_BACKUP_PULL_KEY_SHA256: no alert (read-only backup key, any IP OK)
+    - Else if IP == TRUSTED_SSH_IP: no alert (trusted primary IP)
+    - Else: alert on first detection of this IP/key combination
+
+    Tracks seen IP/key pairs in state; alerts only on first detection of a new unauthorized pair.
     """
     state = load_state(STATE_FILE)
-    seen_ips = set(state.get("ssh_unauthorized_ips_seen", []))
+    seen_pairs = set(state.get("ssh_unauthorized_pairs_seen", []))
 
-    unauthorized_ips = set()
+    unauthorized_pairs = set()
     try:
         # Use journalctl -u ssh to get SSH service logs (more reliable than auth.log)
         result = subprocess.run(
@@ -304,16 +316,46 @@ def check_unauthorized_ssh_logins() -> str | None:
             return None
 
         for line in result.stdout.splitlines():
-            # Match: "Accepted publickey for user from 107.208.10.1 port 12345 ssh2"
+            # Match: "Accepted publickey for user from 107.208.10.1 port 12345 ssh2: ED25519 SHA256:..."
+            # or:   "Accepted password for user from 107.208.10.1 port 12345 ssh2"
             m = re.search(
-                r"Accepted \w+ for .+ from ([0-9a-f.:]+) port \d+",
+                r"Accepted (\w+) for .+ from ([0-9a-f.:]+) port \d+",
                 line,
                 re.IGNORECASE,
             )
-            if m:
-                ip = m.group(1)
-                if ip != TRUSTED_SSH_IP:
-                    unauthorized_ips.add(ip)
+            if not m:
+                continue
+
+            auth_type = m.group(1).lower()  # "publickey" or "password"
+            ip = m.group(2)
+
+            # Try to extract key fingerprint (format: "SHA256:...")
+            # Pattern: "ssh2: ED25519 SHA256:..." or similar
+            fingerprint = None
+            fp_match = re.search(r"(SHA256:[A-Za-z0-9+/]+)", line)
+            if fp_match:
+                fingerprint = fp_match.group(1)
+
+            # Determine if this login should trigger an alert
+            should_alert = False
+            reason = None
+
+            if fingerprint == LEDGER_BACKUP_PULL_KEY_SHA256:
+                # Ledger backup key: trusted from any IP, no alert
+                log.debug("Accepted %s from %s with trusted ledger-backup-pull key", auth_type, ip)
+                continue
+            elif ip == TRUSTED_SSH_IP:
+                # Trusted IP: no alert
+                log.debug("Accepted %s from trusted IP %s", auth_type, ip)
+                continue
+            else:
+                # Non-trusted source: should alert
+                should_alert = True
+                pair = f"{ip}:{auth_type}:{fingerprint or 'none'}"
+                reason = f"Accepted {auth_type} from {ip} (key: {fingerprint or 'password/unknown'})"
+
+            if should_alert:
+                unauthorized_pairs.add(pair)
     except subprocess.TimeoutExpired:
         log.warning("journalctl -u ssh timeout")
         return None
@@ -321,16 +363,25 @@ def check_unauthorized_ssh_logins() -> str | None:
         log.error("Failed to read SSH journal: %s", e)
         return None
 
-    # Detect new unauthorized IPs
-    new_ips = unauthorized_ips - seen_ips
-    if new_ips:
-        state["ssh_unauthorized_ips_seen"] = list(seen_ips | unauthorized_ips)
+    # Detect new unauthorized IP/key pairs
+    new_pairs = unauthorized_pairs - seen_pairs
+    if new_pairs:
+        state["ssh_unauthorized_pairs_seen"] = list(seen_pairs | unauthorized_pairs)
         save_state(STATE_FILE, state)
+
+        # Build alert message
+        new_entries = []
+        for pair in sorted(new_pairs):
+            ip_part, auth_part, fp_part = pair.rsplit(":", 2)
+            new_entries.append(f"  {ip_part} ({auth_part}): {fp_part}")
+
+        new_entries_str = "\n".join(new_entries)
         return alert(
             f"[Intrusion Alert] Accepted SSH login(s) from unauthorized IP(s):\n\n"
-            f"{', '.join(sorted(new_ips))}\n\n"
+            f"{new_entries_str}\n\n"
             f"Trusted IP: {TRUSTED_SSH_IP}\n"
-            f"All seen unauthorized IPs: {', '.join(sorted(unauthorized_ips)) if unauthorized_ips else '(none yet)'}"
+            f"Trusted key: ledger-backup-pull (any IP)\n"
+            f"All seen unauthorized: {len(unauthorized_pairs)} unique source(s)"
         )
 
     return None
