@@ -457,6 +457,24 @@ def main() -> None:
     # startup and never accumulates a stale "compaction" entry.
     # Only the dispatcher acts on the cause — subagents ignore it.
     startup_cause = read_and_reset_startup_cause()
+
+    # Issue #1561 — session_rotation discriminator:
+    # When the dispatcher is detected via UUID match only (no PID flag), the
+    # Claude Code process was replaced (session rotation, health-check restart)
+    # but the MCP server survived.  Override the startup cause to
+    # "session_rotation" so the dispatcher knows compact-catchup is unnecessary.
+    # This prevents the conflicting-signal problem where both a session_reconnect
+    # and a compact-reminder land in the same WFM cycle.
+    # Exception: compaction always wins — if on-compact.py wrote the cause file,
+    # the UUID match is a post-compact session and catchup IS needed.
+    if is_dispatcher and uuid_dispatcher and not pid_flag_dispatcher:
+        if startup_cause != "compaction":
+            startup_cause = "session_rotation"
+            print(
+                f"[{HOOK_NAME}] UUID-only detection: overriding startup cause to "
+                f"'session_rotation' (issue #1561 — no PID flag, MCP reconnect)",
+                file=sys.stderr,
+            )
     if is_dispatcher:
         print(
             f"[{HOOK_NAME}] startup cause: {startup_cause}",

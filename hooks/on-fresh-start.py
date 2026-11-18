@@ -445,6 +445,35 @@ def _compact_reminder_already_queued() -> bool:
     return False
 
 
+def _session_reconnect_in_inbox() -> bool:
+    """Return True if a session_reconnect message is already in inbox/.
+
+    The MCP server writes ``type: "session_reconnect"`` via
+    ``_write_session_lost_reminder()`` when it starts and finds the
+    dispatcher PID dead. When this message is present, the reconnect
+    is classified as lightweight — compact-catchup is unnecessary
+    (issue #1561).
+
+    Only checks inbox/ (not processing/) because on-fresh-start.py fires
+    on SessionStart, before any mark_processing call could move the file.
+    """
+    try:
+        if not INBOX_DIR.exists():
+            return False
+        for path in INBOX_DIR.iterdir():
+            if path.suffix != ".json":
+                continue
+            try:
+                data = json.loads(path.read_text())
+                if data.get("type") == "session_reconnect":
+                    return True
+            except (json.JSONDecodeError, OSError):
+                continue
+    except OSError:
+        pass
+    return False
+
+
 def _clear_stale_claim(message_id: str) -> None:
     """Delete any stale message_claims row for message_id.
 
@@ -774,7 +803,21 @@ def main() -> None:
     # last_catchup_ts is recent. A mid-session restart can leave in-flight
     # activity in the session file that the new session needs to recover,
     # regardless of when catchup last ran.
-    if _is_catchup_stale() or _has_recent_session_file():
+    #
+    # Issue #1561 — session_reconnect discriminator:
+    # When a session_reconnect message is already in the inbox, the MCP
+    # server has signalled that this is a lightweight reconnect — compact-
+    # catchup is unnecessary. Skip the injection to prevent contradictory
+    # signals from reaching the dispatcher in the same WFM cycle.
+    # The startup protocol's step 4 (startup-catchup) still runs on
+    # "restart" cause, providing a safety net for genuine context gaps.
+    if _session_reconnect_in_inbox():
+        print(
+            "[on-fresh-start] session_reconnect in inbox — skipping compact-reminder "
+            "injection (issue #1561: lightweight reconnect, catchup unnecessary)",
+            file=sys.stderr,
+        )
+    elif _is_catchup_stale() or _has_recent_session_file():
         _inject_compact_reminder()
 
     _schedule_reflection_prompt("bootup")
