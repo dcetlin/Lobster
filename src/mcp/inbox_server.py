@@ -11,6 +11,7 @@ Provides tools for Claude Code to interact with the message queue:
 """
 
 import asyncio
+import atexit
 import json
 import logging
 from collections import OrderedDict
@@ -69,6 +70,56 @@ if sys.path[0] != _MCP_SRC_DIR:
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+
+
+# ---------------------------------------------------------------------------
+# Long-lived inotify Observer (issue #1560)
+#
+# Previous implementation created a fresh Observer on every wait_for_messages()
+# call, leaking one inotify fd per call when observer.join(timeout=1) returned
+# before the emitter thread closed its fd.  A single long-lived Observer
+# eliminates the leak: each WFM call schedule()s a handler on the existing
+# Observer and unschedule()s it in the finally block.
+# ---------------------------------------------------------------------------
+_wfm_observer: Observer | None = None
+_wfm_observer_lock = threading.Lock()
+
+
+def _get_or_create_observer() -> Observer:
+    """Return the long-lived watchdog Observer, creating it on first call.
+
+    Thread-safe via _wfm_observer_lock.  If the Observer's thread has died
+    (e.g. from an unhandled exception in a handler), a new one is created.
+    """
+    global _wfm_observer
+    with _wfm_observer_lock:
+        if _wfm_observer is None or not _wfm_observer.is_alive():
+            obs = Observer()
+            obs.daemon = True  # die with the process
+            obs.start()
+            _wfm_observer = obs
+        return _wfm_observer
+
+
+def _shutdown_observer() -> None:
+    """Stop the long-lived Observer at process exit.
+
+    Registered via atexit so the inotify fd is closed cleanly.
+    Silent on any error — must never crash during shutdown.
+    """
+    global _wfm_observer
+    with _wfm_observer_lock:
+        if _wfm_observer is not None:
+            try:
+                _wfm_observer.stop()
+                _wfm_observer.join(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+            _wfm_observer = None
+
+
+atexit.register(_shutdown_observer)
+
 
 # IFTTT behavioral rules store
 from src.utils.ifttt_rules import (
@@ -4972,9 +5023,9 @@ async def handle_wait_for_messages(args: dict) -> list[TextContent]:
         )
         sessions_prefix = (drain_notice + "\n\n" + sessions_prefix) if sessions_prefix else drain_notice
 
-    # Start the observer BEFORE the initial glob check to eliminate the TOCTOU
-    # race window: a message that arrives between the glob and observer.start()
-    # would previously be missed until the next timeout/self-check.
+    # Reuse the long-lived Observer (issue #1560) — schedule a fresh handler
+    # per call instead of creating/destroying an Observer.  This eliminates the
+    # inotify fd leak: one Observer = one fd for the process lifetime.
     message_arrived = threading.Event()
 
     class InboxHandler(FileSystemEventHandler):
@@ -4985,9 +5036,8 @@ async def handle_wait_for_messages(args: dict) -> list[TextContent]:
             if not event.is_directory and event.dest_path.endswith('.json'):
                 message_arrived.set()
 
-    observer = Observer()
-    observer.schedule(InboxHandler(), str(INBOX_DIR), recursive=False)
-    observer.start()
+    observer = _get_or_create_observer()
+    watch = observer.schedule(InboxHandler(), str(INBOX_DIR), recursive=False)
 
     # Start a daemon thread to refresh the WFM-active heartbeat on wall-clock
     # time, independent of the asyncio event loop (issue #1823).  The event
@@ -5083,8 +5133,12 @@ async def handle_wait_for_messages(args: dict) -> list[TextContent]:
         # so no stale heartbeat can overwrite the tombstone after _clear_wfm_active_signal().
         _hb_stop.set()
         _hb_thread.join(timeout=1)
-        observer.stop()
-        observer.join(timeout=1)
+        # Unschedule the watch instead of stopping the Observer (issue #1560).
+        # The long-lived Observer keeps running; only this call's handler is removed.
+        try:
+            observer.unschedule(watch)
+        except Exception:  # noqa: BLE001
+            pass  # watch may already be gone if Observer died
         # Write tombstone to WFM_ACTIVE_FILE instead of deleting it (issue #1730).
         # Deleting the file creates a TOCTOU race: the health check's -f gate can
         # pass just before unlink(), then cat returns empty and declares RED.
