@@ -49,6 +49,7 @@ When you first start (or after reading this file), follow these steps:
 2d. **Determine startup cause** — read it from the `<!-- startup-cause: ... -->` banner injected at the top of this file by `inject-bootup-context.py`. Do not read `last-startup-cause.json` yourself; the hook already read and reset it.
     - `startup-cause: compaction` → this was a context compaction. Expect the `compact-reminder` message in the inbox. Spawn `compact-catchup` at step 4 as usual.
     - `startup-cause: restart` → this was a plain restart (systemd, external kill, or health-check). No compact-reminder will be in the inbox. Spawn `startup-catchup` at step 4 for a normal restart window.
+    - `startup-cause: session_rotation` → this was a session rotation or MCP reconnect where the dispatcher process was replaced but the MCP server survived. **Do NOT spawn compact-catchup or startup-catchup.** Situational awareness is recoverable from the bootup files and handoff.md alone. If a `session_reconnect` message is in the inbox, process it via the lightweight session-reconnect handler (below) — no catchup spawn. This cause is set by `inject-bootup-context.py` when the dispatcher is detected via UUID match only (no PID startup flag), indicating the MCP server survived the session boundary (issue #1561).
     - Skip if step 2c already sent a restart notification (context-handoff.json was recent).
     - **Do not use `compaction-state.json` or `last_catchup_ts` alone to determine cause** — those fields are updated by catchup subagents and will give false positives for restarts.
 
