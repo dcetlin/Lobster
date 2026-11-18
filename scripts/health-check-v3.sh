@@ -1398,36 +1398,55 @@ check_disk() {
 }
 
 # Check: Stale reboot required file (auto-reboot failure detection)
-# If /var/run/reboot-required exists and is older than 2 days, it means
-# the auto-reboot failed — the system should have rebooted but didn't.
-# Alert Dan but do not trigger a health-check restart (the auto-reboot
-# mechanism is independent of Lobster liveness). This check is advisory-only.
+# Uses first_seen timestamp tracking to detect when auto-reboot has failed
+# (i.e., the file exists and hasn't been cleared for 2+ days).
+# This avoids false negatives when the file is rewritten by packages that
+# need a reboot — we track when the file *first appeared*, not its mtime.
+#
+# State transitions:
+# - File doesn't exist: clear first_seen state if it exists
+# - File exists, no first_seen: record current timestamp
+# - File exists, first_seen > 2 days: alert Dan
+# - File exists, first_seen <= 2 days: log progress
 check_stale_reboot_required() {
     local reboot_file="/var/run/reboot-required"
+    local first_seen_state_file="$WORKSPACE_DIR/logs/health-reboot-first-seen"
     local max_age_seconds=172800  # 2 days
-
-    if [[ ! -f "$reboot_file" ]]; then
-        # No reboot required — system is current
-        return 0
-    fi
-
-    # Reboot file exists. Check how old it is.
     local now
     now=$(date +%s)
-    local file_mtime
-    file_mtime=$(stat -c %Y "$reboot_file" 2>/dev/null)
 
-    if [[ -z "$file_mtime" ]]; then
-        log_warn "Could not stat $reboot_file"
+    # Ensure the state file directory exists
+    mkdir -p "$(dirname "$first_seen_state_file")"
+
+    if [[ ! -f "$reboot_file" ]]; then
+        # Reboot file no longer exists — clear the first_seen state
+        if [[ -f "$first_seen_state_file" ]]; then
+            rm -f "$first_seen_state_file"
+            log_info "Reboot-required file cleared. First-seen state cleaned up."
+        fi
         return 0
     fi
 
-    local age=$((now - file_mtime))
+    # Reboot file exists. Check if we have a first_seen timestamp recorded.
+    local first_seen
+    if [[ -f "$first_seen_state_file" ]]; then
+        first_seen=$(cat "$first_seen_state_file" 2>/dev/null || true)
+    fi
+
+    if [[ -z "$first_seen" ]]; then
+        # First time we see the file — record the timestamp now
+        echo "$now" > "$first_seen_state_file"
+        log_info "Reboot-required file detected for the first time. First-seen timestamp recorded."
+        return 0
+    fi
+
+    # We have a first_seen timestamp. Check how long the file has existed.
+    local age=$((now - first_seen))
 
     if [[ $age -gt $max_age_seconds ]]; then
         local days=$((age / 86400))
-        log_error "Stale reboot-required file: $reboot_file is $days days old"
-        send_telegram_alert_deduped "stale-reboot-required" "Lobster: Automatic reboot failed — /var/run/reboot-required exists and is ${days} days old.
+        log_error "Reboot-required file has persisted for ${days} days (first seen $(date -d @$first_seen))"
+        send_telegram_alert_deduped "stale-reboot-required" "Lobster: Automatic reboot failed — /var/run/reboot-required has existed for ${days} days.
 
 The system should have rebooted but did not. This may indicate:
 - auto-reboot timer disabled or failed
@@ -1439,7 +1458,7 @@ Manual reboot or restart of unattended-upgrades may be needed."
     else
         local remaining=$((max_age_seconds - age))
         local remaining_hours=$((remaining / 3600))
-        log_info "Reboot-required file detected, age=${age}s, will alert if not cleared in ${remaining_hours}h"
+        log_info "Reboot-required file has existed for ${age}s, will alert if not cleared in ${remaining_hours}h (first seen $(date -d @$first_seen))"
         return 0
     fi
 }
