@@ -1486,6 +1486,14 @@ check_auth_token() {
     # Auth is managed via CLAUDE_CODE_OAUTH_TOKEN env var in config.env.
     # Unset CLAUDECODE/CLAUDE_CODE_ENTRYPOINT to avoid nested-session errors.
     #
+    # Ensure CLAUDE_CODE_OAUTH_TOKEN is set from config.env if not already in env.
+    # This prevents false negatives when the health check runs in a minimal
+    # shell environment and the credentials file is stale (issue #1540).
+    if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" && -f "$CONFIG_ENV" ]]; then
+        CLAUDE_CODE_OAUTH_TOKEN=$(grep '^CLAUDE_CODE_OAUTH_TOKEN=' "$CONFIG_ENV" 2>/dev/null | cut -d'=' -f2- | tr -d '[:space:]"' || true)
+    fi
+    export CLAUDE_CODE_OAUTH_TOKEN
+    #
     # NOTE: `claude auth status` outputs JSON by default. Do NOT pass
     # --output-format json — that flag does not exist and causes an error,
     # leaving auth_json empty and making the parse return "unknown" every run.

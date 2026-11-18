@@ -321,6 +321,20 @@ Include the GitHub activity summary in the synthesis for rolling-summary.md and 
 
    Update the `*Last updated:*` datestamp to today's date.
 
+   **9a-archive. Archive "As of" blocks older than 14 days.**
+   After updating the Current State section, prune old entries to prevent file bloat. The handoff.md file grows ~20–30 lines per night with each new "As of" prepend; without truncation, it will reach 2000+ lines in 2–3 months.
+
+   - Parse all `### As of <date>` blocks in the Current State section.
+   - Calculate the age of each block: today's date minus the block's date.
+   - Blocks older than 14 days should be **archived** (not deleted):
+     - Extract the full block (from `### As of <date>` to the next `### As of` or end of section).
+     - Write it to `~/lobster-user-config/memory/archive/digests/handoff-digest-YYYY-MM-DD.md` (use the block's date in the filename).
+     - Remove the block from handoff.md entirely after archiving.
+   - Blocks 14 days old or newer remain in handoff.md.
+   - Log the count of archived blocks in `write_result`.
+
+   This keeps the handoff.md file at a stable, readable size (~300–400 lines for a week's worth of data) while preserving the full history in the archive.
+
    **9b. Reconcile the handoff.md PR table against live GitHub state.**
    After updating the Current state section, reconcile any PR table present in handoff.md:
 
@@ -392,7 +406,7 @@ Include the GitHub activity summary in the synthesis for rolling-summary.md and 
 mcp__lobster-inbox__write_result(
     task_id=task_id,   # from your prompt header
     chat_id=0,
-    text="Nightly consolidation complete. Updated: rolling-summary.md, daily-digest.md, handoff.md, priorities.md, _context.md. Projects updated: <list or 'none'>. People updated: <list or 'none'>. Events consolidated: <count>. Patterns surfaced: <count of pattern_observation rows today, e.g. '3 (2 recurring, 1 novel)' or 'none'>. Session files read: <count>. GitHub PRs merged: <count>. GitHub issues opened/closed: <count>. Priorities pruned: <count removed> items. Handoff PR table: <N open, M merged removed, K closed removed, or 'skipped: no table' or 'skipped: gh unavailable'>.",
+    text="Nightly consolidation complete. Updated: rolling-summary.md, daily-digest.md, handoff.md, priorities.md, _context.md. Projects updated: <list or 'none'>. People updated: <list or 'none'>. Events consolidated: <count>. Patterns surfaced: <count of pattern_observation rows today, e.g. '3 (2 recurring, 1 novel)' or 'none'>. Session files read: <count>. GitHub PRs merged: <count>. GitHub issues opened/closed: <count>. Priorities pruned: <count removed> items. Handoff PR table: <N open, M merged removed, K closed removed, or 'skipped: no table' or 'skipped: gh unavailable'>. Handoff archived: <count> As-of blocks archived to digests/.",
     source="system",
     status="success",
     sent_reply_to_user=False,
